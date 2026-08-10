@@ -36,7 +36,7 @@
 //!    the per-gate table and the `EXPLAIN` output.
 //! 2. The runner is unusually loaded. The budget carries deliberate headroom
 //!    over the reference measurement precisely so this is rare; if it happens,
-//!    `HARVEST_CLAIM_BUDGET_P99_MS` overrides it for a one-off run.
+//!    `HARVEST_CLAIM_BUDGET_MS` overrides it for a one-off run.
 //! 3. The measurement itself is unsound — see the sample-count, truncation,
 //!    `claim_ratio` and backlog-drain assertions below, which fail loudly rather
 //!    than reporting a meaningless percentile.
@@ -59,8 +59,9 @@ use super::claim_bench_support::{
 // rendered a verdict. See its doc comment for how the number was derived and
 // why it is a cliff detector rather than a drift detector.
 //
-// Override for a one-off run with `HARVEST_CLAIM_BUDGET_P99_MS` (the env var
-// keeps its historical name; it overrides whichever statistic the gate asserts).
+// Override for a one-off run with `HARVEST_CLAIM_BUDGET_MS`, deliberately not
+// named for a statistic so it stays honest if the gate ever asserts a different
+// one.
 
 /// Minimum fraction of measured operations that must actually return a task.
 ///
@@ -275,6 +276,20 @@ async fn enqueue_throughput_is_measured_against_a_non_empty_queue() {
         report.stats.p99_ms > 0.0,
         "enqueue p99 must be a real measurement",
     );
+
+    // The point of the scenario is in its name: these writes went into a queue
+    // that already had `backlog` rows in it, because a start-storm hits a live
+    // queue, not an empty one. Without this the harness could silently stop
+    // seeding and the test would still pass while measuring the easy case.
+    let mut conn = db::connect(&db.url).await;
+    let pending = db::pending_count(&mut conn).await;
+    let expected = i64::try_from(backlog + report.rows).expect("row count fits i64");
+    assert_eq!(
+        pending, expected,
+        "enqueue must have written into a non-empty queue: expected the seeded \
+         {backlog}-row backlog plus {} enqueued rows, found {pending} PENDING",
+        report.rows,
+    );
 }
 
 /// Every accreted gate must still be *measurable* — a scenario that silently
@@ -466,7 +481,10 @@ async fn the_paused_rows_control_seeds_equal_total_depth() {
 }
 
 /// The gate and the benchmark must agree on what "the headline scenario" is.
-/// A pure assertion, so it runs on every OS with no database.
+///
+/// Needs no database, but this file is `#[cfg(feature = "db")]` as a whole, so
+/// it runs wherever the `db` feature does. The OS-independent copies of this
+/// contract live in `claim_bench_support::pure_tests`.
 #[test]
 fn headline_scenario_matches_the_published_contract() {
     let s = headline_scenario();

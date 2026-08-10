@@ -18,7 +18,12 @@ and the one that has accreted roughly a `WHERE` predicate per phase since 3.7:
 | capability labels | #382 |
 | sticky routing | #235 |
 
-Each was added for correctness. None was measured. This page is the measurement.
+Each was added for correctness. None was measured. This page is the measurement
+— for six of them. The attribution table below varies build-id routing, per-key
+concurrency, the rate-limit gate, the circuit-breaker tracked set and the PAUSED
+skip; queue pauses is exercised but folded into the baseline. The remaining four
+are present in the query and held constant; see
+[known limitations](#known-limitations).
 
 > **These are starter reference numbers, not an SLO.** They were taken on one
 > machine with one Postgres configuration (below). Your hardware, your
@@ -29,17 +34,26 @@ Each was added for correctness. None was measured. This page is the measurement.
 ## TL;DR
 
 * **Claim latency scales superlinearly with pending-backlog depth.** 1k → 10k
-  rows (10x) costs ~23x latency; 10k → 100k (10x) costs a further ~14x. Claim
+  rows (10x) costs ~24x latency; 10k → 100k (10x) costs a further ~15x. Claim
   cost is a function of how deep your queue is, not how much work you dispatch.
+  **This is the single biggest lever on this page** — bigger than any individual
+  predicate, and it dominates the per-gate table below.
 * **The cause is structural, not incidental.** The claim query's `ORDER BY`
   leads with a non-indexable `CASE` expression, so `idx_harvest_tq_poll` cannot
   serve the ordering. Postgres sequentially scans and sorts every eligible
   pending row on every single claim. See [the plan](#the-plan) below.
-* **The two expensive gates are per-key concurrency (+306% p50) and the
-  PAUSED-execution skip (+1319% p50).** Build-id routing, the rate-limit gate,
-  and the circuit-breaker tracked set are all within noise of free.
-* **Enqueue is not the problem.** ~4 000 rows/s sustained at p50 1.5 ms,
-  essentially flat from 1k to 100k backlog.
+* **Only one predicate is genuinely expensive: per-key concurrency (+590% p50).**
+  Build-id routing (+15%), the rate-limit gate (+5%) and the circuit-breaker
+  tracked set (+1%) are cheap or free.
+* **Paused executions cost as much as live ones (+1321% p50), but not because
+  the PAUSED predicate is expensive.** An equal-depth control with *no* PAUSED
+  predicate costs the same (+1357%). The anti-join is free; the rows sitting in
+  the table are what you pay for. See
+  [the control that changed the conclusion](#the-control-that-changed-the-conclusion).
+* **Enqueue is not the problem.** ~3 500 rows/s sustained at p50 ~1.8 ms, flat
+  from 1k to 100k backlog (7% spread, inside run-to-run noise). At 100k the write
+  side sustains ~3 650 rows/s while the read side manages ~2 claims/s — **a queue
+  that deep does not drain.**
 * Issue #786 deliberately **measures without tuning**: the claim query is
   byte-for-byte unchanged by this work.
 
@@ -60,9 +74,12 @@ cargo test -p autumn-harvest --features db --test integration -- \
   claim_budget_tests --test-threads=1
 ```
 
-Two figures on this page are **not** from a single run of those commands, and
-say so where they appear: the budget derivation (a distribution over 8 runs) and
-the debug-vs-release comparison (two profiles, back to back).
+Every table on this page is from **one** run of the first command, on an
+otherwise-idle box. Figures that are *not* from that run say so where they
+appear: the budget derivation (a distribution over repeated runs), the
+reproducibility paragraph (three independent runs), the p50-vs-p99 comparison
+(idle and loaded), and the debug-vs-release comparison (two profiles, back to
+back).
 
 | | |
 |:--|:--|
@@ -99,16 +116,16 @@ instead; with neither available it prints a skip notice and exits 0.
 Baseline gate (no build policy, no concurrency key, no rate limit, no pauses),
 8 concurrent claimers across 4 queues:
 
-| backlog | p50 ms | p99 ms | max ms | claims/s |
-|--:|--:|--:|--:|--:|
-| 1 000 | 9.35 | 19.39 | 20.92 | 626 |
-| 10 000 | 219.69 | 264.11 | 284.01 | 29 |
-| 100 000 † | 3 142.97 | 3 442.05 | 3 453.71 | 2 |
+| backlog | n | p50 ms | p99 ms | max ms | claims/s |
+|--:|--:|--:|--:|--:|--:|
+| 1 000 | 184 | 9.92 | 19.48 | 19.83 | 549 |
+| 10 000 | 720 | 234.22 | 304.21 | 348.03 | 22 |
+| 100 000 ⚠ | 345 | 3 531.95 | 10 020.10 | 11 827.86 | 2 |
 
-† Cut short by the per-scenario wall-clock budget (60 s, override with
-`HARVEST_BENCH_SCENARIO_SECS`). The percentiles describe the 144 claims it did
-observe. That the scenario *cannot* finish 800 claims in a minute is itself the
-finding.
+⚠ Cut short by the per-scenario wall-clock budget (180 s for this run; the
+default is 240 s, override with `HARVEST_BENCH_SCENARIO_SECS`). The percentiles
+describe the 345 claims it did observe. That the scenario *cannot* finish its
+planned 800 claims in three minutes is itself the finding.
 
 These rows run at 8 concurrent claimers against a 4-core box, so they measure
 the claim path **under contention** — the operational number a worker actually
@@ -119,9 +136,9 @@ the same reason.
 
 **Read this table as a sharding trigger.** A queue that stays around a thousand
 pending rows claims in single-digit milliseconds. A queue that sits at ten
-thousand claims in a fifth of a second — still workable, but each worker poll is
-now a real cost. A queue parked at a hundred thousand pending rows spends
-multiple seconds per claim, and the fleet's throughput collapses to a couple of
+thousand claims in roughly a quarter of a second — still workable, but each worker
+poll is now a real cost. A queue parked at a hundred thousand pending rows spends
+several seconds per claim, and the fleet's throughput collapses to a couple of
 claims per second regardless of how many workers you add. If your steady-state
 backlog is trending toward the 100k row, the answer is to shard
 (`docs/sharding.md`) or to shed the backlog — adding workers will not help,
@@ -138,50 +155,109 @@ next) even though the p50 deltas held steady — the tails were measuring
 run-queue scheduling, not the query. Below saturation the numbers isolate
 predicate cost.
 
-**`p50 vs baseline` is the attribution statistic.**
+**`p50 vs` is the attribution statistic**, and it is measured against the row
+named in `vs what` — which is not always `baseline`. See
+[the control that changed the conclusion](#the-control-that-changed-the-conclusion).
 
-| gate | seeded rows | claimable | n | p50 ms | p50 vs baseline |
-|:--|--:|--:|--:|--:|--:|
-| `baseline` | 10 000 | 10 000 | 504 | 100.89 | — |
-| `circuit_breaker_set` | 10 000 | 10 000 | 532 | 104.27 | +3% |
-| `rate_limited` | 10 000 | 10 000 | 490 | 108.30 | +7% |
-| `build_policy` | 10 000 | 10 000 | 454 | 116.10 | +15% |
-| `concurrency_key` | 10 000 | 10 000 | 174 | 409.26 | **+306%** |
-| `paused_rows` | 20 000 | 10 000 | 77 | 1 431.27 | **+1319%** |
-| `all_gates` | 20 000 | 10 000 | 66 | 1 695.00 | **+1580%** |
+| gate | seeded rows | claimable | n | p50 ms | p50 vs | vs what |
+|:--|--:|--:|--:|--:|--:|:--|
+| `baseline` | 10 000 | 10 000 | 720 | 106.67 | — | |
+| `circuit_breaker_set` | 10 000 | 10 000 | 720 | 107.91 | +1% | `baseline` |
+| `rate_limited` | 10 000 | 10 000 | 720 | 111.56 | +5% | `baseline` |
+| `build_policy` | 10 000 | 10 000 | 720 | 122.91 | +15% | `baseline` |
+| `concurrency_key` ⚠ | 10 000 | 10 000 | 450 | 736.44 | **+590%** | `baseline` |
+| `double_backlog` ⚠ | 20 000 | 20 000 | 196 | 1 553.66 | **+1357%** | `baseline` |
+| `paused_rows` ⚠ | 20 000 | 10 000 | 215 | 1 516.05 | **−2%** | `double_backlog` |
+| `all_gates` ⚠ | 20 000 | 10 000 | 173 | 1 908.90 | **+1690%** | `baseline` |
 
-Reproducibility: a second independent run gave +1%, −3%, +13%, +283%, +1346%,
-+1462% for the same rows — the ordering and the order of magnitude are stable,
-the exact percentages are not. Treat these as "free / cheap / expensive", not as
-three significant figures.
+⚠ Cut short by the per-scenario wall-clock budget; the percentiles describe the
+`n` samples shown. A scenario that cannot finish 800 claims in three minutes is
+itself a finding.
+
+`double_backlog` is a **control, not a gate** — it seeds no predicate at all.
+
+**How much of this reproduces.** Across three independent runs on the reference
+machine, `build_policy` is the only row that repeats to the point: +15%, +13%,
++15%. `rate_limited` and `circuit_breaker_set` each land within a few points of
+zero and have **swapped rank with each other** between runs (one run put
+`rate_limited` at −3%), so read them as "free", not as an ordering — the gap
+between them is smaller than the noise. `concurrency_key` was +306%, +283% and
++590%; `paused_rows` vs `baseline` was +1319%, +1346% and +1321%. So: the
+*classification* into free / modest / expensive is stable, and the expensive
+rows are reproducibly expensive, but only `build_policy` and the paused-vs-
+baseline figure are reproducible to better than a factor of two. Treat every
+percentage here as one significant figure.
+
+### The control that changed the conclusion
+
+An earlier revision of this page compared `paused_rows` against `baseline`,
+measured +1319%, and concluded that the PAUSED-execution skip was the most
+expensive predicate on the claim path. That conclusion was wrong, and the
+`double_backlog` control is what caught it.
+
+`paused_rows` seeds its PAUSED ballast *in addition to* the claimable backlog,
+so it walks a table twice as deep as `baseline`. Claim latency is strongly
+superlinear in depth (see [the sweep table](#claim-latency-vs-backlog-depth)),
+so any delta measured against `baseline` charges the predicate for the extra
+rows too. `double_backlog` removes that confound: same 20 000 total rows, all of
+them plain and claimable, **no PAUSED predicate anywhere**.
+
+It costs **+1357%** — slightly *more* than `paused_rows` does. Measured against
+that honest comparand the anti-join costs **−2%**, which at n=196/215 truncated
+samples is indistinguishable from zero.
+
+So there are two different questions and two different numbers:
+
+| comparison | question it answers | answer |
+|:--|:--|--:|
+| `paused_rows` vs `baseline` | what does a paused population cost an operator? | **+1321%** |
+| `paused_rows` vs `double_backlog` | is the PAUSED anti-join predicate expensive? | **−2%** |
+
+**The operational finding survives; the attribution does not.** Pausing
+executions still does not take their work out of the claim path — the rows stay
+`PENDING`, every worker still scans them on every claim, and a fleet with a large
+paused population still pays roughly the same 14x that an equal number of *live*
+rows would cost. But it pays that because the rows are *there*, not because
+`NOT EXISTS (… state = 'PAUSED')` is expensive to evaluate. Deleting the
+predicate would buy you nothing; draining the rows would buy you everything.
 
 What each row exercises, and what it means:
 
-* **`circuit_breaker_set` (+3%)** — the worker passes a populated tracked-activity
+* **`circuit_breaker_set` (+1%)** — the worker passes a populated tracked-activity
   set, so the rate-limit gate and debit are skipped via `= ANY($5)` (#369).
   Free, as designed.
-* **`rate_limited` (+7%)** — rows carry a `rate_limit_key` with a funded bucket,
+* **`rate_limited` (+5%)** — rows carry a `rate_limit_key` with a funded bucket,
   exercising the candidate-side `EXISTS` gate and the `rate_limit_debit` CTE
   (#332 / #699). Effectively free at this backlog.
 * **`build_policy` (+15%)** — rows carry `required_build_id` and the worker's
   build matches only through a `harvest_build_compat` declaration, forcing the
   `EXISTS` branch rather than the cheap `required_build_id = $3` equality
   (#171). A real but modest cost; safe-deploy ramps (#604) are not expensive.
-* **`concurrency_key` (+306%)** — rows carry `concurrency_key` + `concurrency_cap`,
+* **`concurrency_key` (+590%)** — rows carry `concurrency_key` + `concurrency_cap`,
   exercising both the candidate-side `COUNT(*)` subquery and the
   `pg_try_advisory_xact_lock` re-check in the `claimed` CTE (#247). This is
   measured with 256 distinct keys and a cap high enough never to block, so it is
-  the *predicate* cost with contention deliberately minimised. **Per-key
-  concurrency is not free — budget for it.**
-* **`paused_rows` (+1319%)** — the scenario seeds 10 000 rows belonging to PAUSED
-  executions *in addition to* the claimable backlog, so the claimable pool is
-  identical to baseline and the only variable is the extra rows the scan walks
-  past through the `NOT EXISTS` anti-join (#383). This is the single most
-  important operational finding on this page: **pausing executions does not take
-  their work out of the claim path.** The rows stay `PENDING`, they stay in the
-  scan, and every claim by every worker pays for them. A fleet with a large
-  paused population is paying that cost continuously.
-* **`all_gates` (+1580%)** — everything at once, for an upper bound.
+  the *predicate* cost with contention deliberately minimised. **This is the one
+  genuinely expensive predicate on the claim path — budget for it.** Its measured
+  multiplier is also the least stable on this page: it grows as a run progresses
+  (a shorter earlier run reported +306% over 174 samples; this 450-sample run
+  reports +590%), which is consistent with the `COUNT(*)` subquery counting a
+  `RUNNING` population that the benchmark itself is growing. Read it as
+  "expensive and load-dependent", not as a fixed multiplier.
+* **`double_backlog` (+1357%)** — the control described above. Not a predicate:
+  the cost of doubling table depth, full stop.
+* **`paused_rows` (−2% vs the control)** — 10 000 rows belonging to PAUSED
+  executions on top of the claimable backlog, exercising the `NOT EXISTS`
+  anti-join (#383). Free as a predicate; expensive as table depth.
+* **`all_gates` (+1690%)** — every gate at once. Read it as "a deployment using
+  all of these features", **not** as a strict upper bound on the claim path: the
+  circuit-breaker tracked set short-circuits the rate-limit `EXISTS` and the
+  debit CTE (`= ANY($5)` wins, #369), so a deployment with rate limiting and
+  *no* breaker executes strictly more work per claim than this row does. Note
+  what happens when depth is controlled for: `all_gates` runs at the same 20 000
+  rows as `double_backlog`, and against *that* comparand every predicate in the
+  engine combined costs **+23%**. At this depth the scan and sort dominate so
+  completely that the predicates are a rounding error on top of them.
 
 ## The plan
 
@@ -197,33 +273,49 @@ of — but not all of — the operation the tables above time (see
 [what is actually timed](#what-is-actually-timed)).
 
 ```text
-->  Sort (actual rows=1 loops=1)
-      Sort Key: (CASE WHEN ((sticky_worker_id = 'worker-0') AND (sticky_until > now()))
-                 THEN 1 ELSE 0 END) DESC, priority DESC, scheduled_at
-      Sort Method: quicksort  Memory: 1400kB
-      Buffers: shared hit=20223
-      ->  Nested Loop Anti Join (actual rows=10000 loops=1)
-            ->  Seq Scan on harvest_task_queue (actual rows=10000 loops=1)
-                  Buffers: shared hit=223
-            ->  Index Scan using harvest_queue_pauses_pkey on harvest_queue_pauses qp
-                  (actual rows=0 loops=10000)
-                  Buffers: shared hit=20000
+->  Limit (actual rows=1 loops=1)
+      Buffers: shared hit=20224
+      ->  LockRows (actual rows=1 loops=1)
+            ->  Sort (actual rows=1 loops=1)
+                  Sort Key: (CASE WHEN ((sticky_worker_id = 'worker-0')
+                             AND (sticky_until > now())) THEN 1 ELSE 0 END) DESC,
+                            priority DESC, scheduled_at
+                  Sort Method: quicksort  Memory: 1400kB
+                  Buffers: shared hit=20223
+                  ->  Nested Loop Anti Join (actual rows=10000 loops=1)
+                        ->  Seq Scan on harvest_task_queue (actual rows=10000 loops=1)
+                              Buffers: shared hit=223
+                        ->  Index Scan using harvest_queue_pauses_pkey
+                              on harvest_queue_pauses qp (actual rows=0 loops=10000)
+                              Buffers: shared hit=20000
 ```
 
-Two things to read here:
+Three things to read here:
 
 1. **`Seq Scan` + `Sort`, not an index scan.** `idx_harvest_tq_poll` is
    `(queue_name, state, priority DESC, scheduled_at) WHERE state = 'PENDING'` —
    exactly the right index for the *filter*, but it cannot serve the *ordering*,
-   because the claim query sorts by a `CASE` expression on
-   `sticky_worker_id`/`sticky_until` first (#235) and by a second `CASE` for
-   priority aging. Neither is indexable. So every claim reads and sorts all
-   eligible pending rows to return one. That is the superlinear scaling in the
-   table above.
-2. **`loops=10000` on the queue-pause anti-join.** The `NOT EXISTS` against
+   because the claim query's leading sort key is a `CASE` expression on
+   `sticky_worker_id`/`sticky_until` (#235), which is not indexable. One
+   non-indexable leading key is enough: the remaining `priority DESC,
+   scheduled_at` cannot rescue it. So every claim reads and sorts all eligible
+   pending rows to return one. That is the superlinear scaling in the table
+   above.
+2. **`actual rows=10000` feeding a `Limit 1`.** The plan materialises and sorts
+   ten thousand rows in order to return a single task. That ratio — not the
+   absolute time — is the shape of the problem, and it is why doubling the
+   backlog doubles the work per claim.
+3. **`loops=10000` on the queue-pause anti-join.** The `NOT EXISTS` against
    `harvest_queue_pauses` (#619) runs once per candidate row — 20 000 of the
    20 223 buffer hits. It is an index lookup, so it is cheap *per row*, but it is
    paid per row.
+
+One number in the full output is deliberately **not** comparable to the tables
+above: this plan's `Execution Time` was 1 625 ms, against a measured p50 of
+107 ms for the same scenario. The `EXPLAIN` is a single *cold* claim on a fresh
+connection against a freshly-seeded table — precisely the plan-cache and
+buffer-cache cost the warmup trim exists to exclude. Read the plan for its
+*shape*; read the tables for timing.
 
 In the full plan (which the benchmark prints, and which is trimmed out of the
 excerpt above) the `SubPlan` nodes for the concurrency, rate-limit, capability
@@ -245,23 +337,30 @@ of work, and tuning without a published baseline is how you get an unfalsifiable
 
 8 concurrent writers enqueueing into an already-populated queue:
 
-| backlog | rows | p50 ms | p99 ms | max ms | rows/s |
-|--:|--:|--:|--:|--:|--:|
-| 1 000 | 800 | 1.75 | 22.00 | 22.73 | 3 108 |
-| 10 000 | 800 | 1.51 | 3.10 | 4.54 | 4 269 |
-| 100 000 | 800 | 1.52 | 3.48 | 7.05 | 4 246 |
+| backlog | rows | n | p50 ms | p99 ms | max ms | rows/s |
+|--:|--:|--:|--:|--:|--:|--:|
+| 1 000 | 800 | 720 | 1.70 | 3.19 | 4.70 | 3 668 |
+| 10 000 | 800 | 720 | 1.83 | 5.10 | 7.15 | 3 425 |
+| 100 000 | 800 | 720 | 1.72 | 4.10 | 5.88 | 3 653 |
 
-Enqueue is **flat in backlog depth** — the write side does not degrade as the
-queue fills, which is the expected and desired asymmetry. A start-storm is
-bounded by your connection pool and by Postgres write throughput, not by
-anything Harvest does.
+Enqueue is **flat in backlog depth** — a 100x deeper queue moves p50 by 0.1 ms
+and throughput by 7%, which is inside this box's run-to-run noise. That is the
+expected and desired asymmetry: reads pay for depth, writes do not. A
+start-storm is bounded by your connection pool and by Postgres write throughput,
+not by anything Harvest does.
+
+Put the two sides together and the operational picture is stark: at a 100 000-row
+backlog this machine sustains ~3 650 enqueues/s against ~2 claims/s. **A queue
+that deep does not drain.** Nothing in the write path warns you about it; the
+backlog table above is the warning.
 
 Two caveats on this table. `queue::enqueue` is not a bare `INSERT`: it resolves
 defaults and writes one row inside its own transaction, so the per-row latency
 includes transaction and round-trip overhead — which is exactly why it is worth
 measuring rather than assuming. And the throughput column is a **floor**, not a
 peak: it divides all rows by the whole wall clock including warmup and task
-spawn/join.
+spawn/join, so the `n` column (post-warmup samples behind the latency columns)
+is below the `rows` column by design.
 
 ## The CI gate
 
@@ -274,9 +373,9 @@ exceeds its budget.
 | | |
 |:--|:--|
 | Statistic | **p50** (see below — deliberately not p99) |
-| Reference p50 | ~220 ms idle, ~516 ms under load |
-| Budget | **1 500 ms** (~2.9x the worst observation, ~6.8x the idle one) |
-| Override | `HARVEST_CLAIM_BUDGET_P99_MS` (historical name; overrides whichever statistic the gate asserts) |
+| Reference p50 | 234 ms on a quiet reference box; ~516 ms observed on a loaded one |
+| Budget | **1 500 ms** (~2.9x the worst observation, ~6.4x the quiet one) |
+| Override | `HARVEST_CLAIM_BUDGET_MS` |
 
 ### Why the gate asserts p50, not p99
 
@@ -285,17 +384,17 @@ purpose — contention is the point of the scenario. But that makes the database
 oversubscribed, and an oversubscribed tail measures the run queue rather than
 the claim path. Measured across repeated runs on the reference machine:
 
-| statistic | idle box | loaded box | spread |
+| statistic | quiet box | loaded box | spread |
 |:--|--:|--:|--:|
-| p50 | ~220 ms | ~516 ms | **~2.3x** |
+| p50 | ~220–234 ms | ~516 ms | **~2.3x** |
 | p99 | ~300 ms | ~4 665 ms | **~15x** |
 
-A p99 gate at this budget failed roughly **one run in three** during review, on
-the same hardware class and Postgres version that produced the published
-numbers. It was not detecting regressions; it was detecting the scheduler. (The
-sweep table above, captured on a moderately busy box, shows the same thing at
-the headline depth: p50 283 ms against a p99 of 1 652 ms — a number that would
-have failed a 1 500 ms p99 gate while nothing about the claim path had changed.)
+A p99 gate at this budget failed **2 runs out of 6** during review, on the same
+hardware class and Postgres version that produced the published numbers. It was
+not detecting regressions; it was detecting the scheduler. A separate run on a
+moderately busy box measured p50 283 ms against a p99 of 1 652 ms at this same
+scenario — the p99 alone would have failed a 1 500 ms gate while nothing about
+the claim path had changed.
 
 p99 is still measured, still published above, and printed in the gate's failure
 message so a genuine tail regression is visible to whoever reads it. It is
@@ -305,11 +404,19 @@ simply not the assertion.
 predicate that makes claims 50% slower — the reference p50 itself moves 2.3x
 with machine load, so no threshold on this hardware could. It catches the kind
 of change that adds another per-row subplan to a scan already walking the whole
-pending backlog. For drift, run the benchmark and compare against the per-gate
-table above, which runs below saturation precisely so it can resolve smaller
-differences.
+pending backlog; the measured predicates that do that land at 6.9x and 14.6x, so
+6.4x headroom sits below them and above the noise. For drift, run the benchmark
+and compare against the per-gate table above, which runs below saturation
+precisely so it can resolve smaller differences.
 
-The gate also asserts three soundness properties, each of which fails loudly
+**The budget was derived on the reference machine, not on a CI runner.** CI
+hardware is slower and shared, so the first Linux CI runs are the real
+calibration. If the gate proves flaky there rather than catching anything, the
+fix is to re-derive the number from CI observations — not to widen it by
+guesswork and not to delete it; `HARVEST_CLAIM_BUDGET_MS` exists for the
+one-off, and the failure message always carries the full stat line.
+
+The gate also asserts four soundness properties, each of which fails loudly
 rather than reporting a meaningless percentile:
 
 * **at least 100 samples were collected** — a severe regression could otherwise
@@ -420,6 +527,12 @@ from the benchmark are directly comparable.
   sessions (#606) and sticky routing (#235), which are cheap inline column
   tests. Queue pauses (#619) *is* exercised but is folded into the baseline, so
   its cost shows up in the `EXPLAIN` buffer counts rather than as a table row.
+* **Queue count is a parameter, but it is not swept.** `Scenario.queues`
+  parameterizes how many distinct queues the backlog spreads across, and every
+  published row holds it at 4. Backlog depth and claimer count *are* varied.
+  Spreading the same backlog over more queues does not obviously help — the
+  claim filter is `queue_name = ANY($1)`, so a worker bound to all four still
+  scans all four — but that is an expectation, not a measurement.
 * **The scheduler tick and the timeout scanner are not benchmarked here.** They
   are separate hot paths and separate work.
 

@@ -240,21 +240,20 @@ async fn gate_breakdown(db: &BenchDb) {
     // rather than always against baseline. `paused_rows` seeds 2x the table
     // depth, and claim latency is superlinear in depth, so comparing it to
     // baseline would charge the anti-join for the extra rows too.
+    // Streamed, not buffered: a full sweep takes tens of minutes and an operator
+    // watching it should see each row land. Sound because every comparand is
+    // ordered before its dependent in `ClaimGate::all()` — pinned by
+    // `every_gate_is_ordered_after_its_comparand`.
     let mut p50_by_gate: HashMap<&'static str, f64> = HashMap::new();
-    let mut reports = Vec::new();
     for gate in ClaimGate::all() {
         let scenario = Scenario { gate, ..headline };
         let report = db::run_claim_scenario(db, scenario).await;
         if report.stats.count > 0 {
             p50_by_gate.insert(gate.as_str(), report.stats.p50_ms);
         }
-        reports.push((gate, report));
-    }
-
-    for (gate, report) in &reports {
         let comparand = gate.comparand();
         // A delta is only meaningful when BOTH sides are real measurements.
-        let (delta, vs) = if *gate == comparand {
+        let (delta, vs) = if gate == comparand {
             ("—".to_string(), String::new())
         } else {
             let base = p50_by_gate.get(comparand.as_str()).copied();

@@ -392,27 +392,33 @@ impl LatencyStats {
     }
 }
 
-/// Outcome of comparing a measured p99 against the published budget.
+/// Outcome of comparing a measured latency against the published budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetVerdict {
     WithinBudget,
     Exceeded,
 }
 
-/// Decide whether a measured p99 is within budget.
+/// Decide whether a measured latency is within budget.
+///
+/// Statistic-agnostic on purpose: the gate applies it to p50 (see
+/// [`HEADLINE_P50_BUDGET_MS`] for why), but nothing here depends on that.
 ///
 /// The budget is an **inclusive** ceiling: exactly-at-budget passes.
 #[must_use]
-pub fn budget_verdict(measured_p99_ms: f64, budget_ms: f64) -> BudgetVerdict {
-    if measured_p99_ms > budget_ms {
+pub fn budget_verdict(measured_ms: f64, budget_ms: f64) -> BudgetVerdict {
+    if measured_ms > budget_ms {
         BudgetVerdict::Exceeded
     } else {
         BudgetVerdict::WithinBudget
     }
 }
 
-/// Environment variable that overrides the compiled-in claim p99 budget.
-pub const BUDGET_ENV_VAR: &str = "HARVEST_CLAIM_BUDGET_P99_MS";
+/// Environment variable that overrides the compiled-in claim-latency budget.
+///
+/// Deliberately not named for a statistic: the gate asserts p50 today, and a
+/// name like `..._P99_MS` would be a lie the moment it was read.
+pub const BUDGET_ENV_VAR: &str = "HARVEST_CLAIM_BUDGET_MS";
 
 /// Resolve a budget from an optional string override, falling back to
 /// `default_ms`.
@@ -603,6 +609,33 @@ mod pure_tests {
              truncation instead of the latency verdict. Raise \
              DEFAULT_SCENARIO_BUDGET_SECS or lower HEADLINE_P50_BUDGET_MS.",
         );
+    }
+
+    #[test]
+    fn every_gate_is_ordered_after_its_comparand() {
+        // The report renders a row's `p50 vs` against its comparand's already
+        // measured p50, streaming each row as it completes rather than
+        // buffering the whole table — a full sweep takes tens of minutes and an
+        // operator should not stare at a blank table for all of it. That is
+        // only sound if a comparand is always measured first. Reordering
+        // `all()` without this test would silently print `n/a` deltas.
+        let all = ClaimGate::all();
+        for (i, gate) in all.iter().enumerate() {
+            let comparand = gate.comparand();
+            if comparand == *gate {
+                continue;
+            }
+            let at = all
+                .iter()
+                .position(|g| *g == comparand)
+                .expect("comparand must be in all()");
+            assert!(
+                at < i,
+                "{} is reported against {}, which must be measured first but sits later in all()",
+                gate.as_str(),
+                comparand.as_str(),
+            );
+        }
     }
 
     #[test]
