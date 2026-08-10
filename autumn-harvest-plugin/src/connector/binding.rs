@@ -68,6 +68,24 @@ pub struct MappedMessage {
     pub payload: serde_json::Value,
 }
 
+impl MappedMessage {
+    /// The mapping function's return value: which workflow id this message
+    /// belongs to, and the JSON payload to hand the workflow.
+    ///
+    /// ```
+    /// # use autumn_harvest_plugin::connector::MappedMessage;
+    /// let m = MappedMessage::new("order-A-1001", serde_json::json!({"total": 4999}));
+    /// assert_eq!(m.workflow_id.as_str(), "order-A-1001");
+    /// ```
+    #[must_use]
+    pub fn new(workflow_id: impl Into<String>, payload: serde_json::Value) -> Self {
+        Self {
+            workflow_id: WorkflowId::new(workflow_id),
+            payload,
+        }
+    }
+}
+
 /// The type-erased mapping function stored on a binding.
 pub type MessageMapper =
     Arc<dyn Fn(&MessageCtx) -> Result<MappedMessage, MappingError> + Send + Sync>;

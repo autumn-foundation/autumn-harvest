@@ -37,6 +37,7 @@ Stop at any chapter — each one ends in a runnable state.
 10. [Operating the service](10-operations.md) — preflight, dashboard, CLI, DLQ, worker drain, reuse policies.
 11. [Testing your workflow code](11-testing.md) — unit tests and `WorkflowReplayer` regression coverage.
 12. [Inbound webhooks](12-webhooks.md) — `#[webhook]`, `[security.webhooks]` verification, idempotent dispatch.
+13. [Broker connectors](13-broker-connectors.md) — Kafka and SQS topics/queues as workflow triggers: idempotent redelivery, ack ordering, poison isolation, backpressure.
 
 Start with [Chapter 1 →](01-project-skeleton.md)
 

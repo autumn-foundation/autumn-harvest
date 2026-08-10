@@ -108,6 +108,17 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features metrics -- -D warnings
       - name: Clippy autumn-harvest-plugin (webhooks feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features webhooks -- -D warnings
+      # issue #944. `connectors` alone is the broker-agnostic layer (no broker
+      # client), so it lints without any system dependency. `kafka` needs the
+      # libcurl headers vendored librdkafka's cmake build looks for.
+      - name: Clippy autumn-harvest-plugin (connectors feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features connectors -- -D warnings
+      - name: Clippy autumn-harvest-plugin (sqs feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
+      - name: Install librdkafka build deps
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      - name: Clippy autumn-harvest-plugin (kafka feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features kafka -- -D warnings
       - name: Clippy autumn-harvest-macros
         run: cargo clippy -p autumn-harvest-macros -- -D warnings
       - name: Clippy autumn-harvest-cli
@@ -161,6 +172,9 @@ jobs:
       - name: Run plugin lib tests (webhooks feature, issue #618 outbound-delegate gating)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features webhooks --lib
+      - name: Run plugin connector tests (issue #944)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-plugin --features connectors --lib connector
       - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests
@@ -170,6 +184,17 @@ jobs:
       - name: Compile plugin metrics scrape example
         if: needs.changes.outputs.code == 'true'
         run: cargo build -p autumn-harvest-plugin --example metrics_scrape_quickstart --features metrics
+      # issue #944: the Kafka example is the success metric's measured artifact
+      # (see tests/connector_example_budget.rs), so it must keep compiling.
+      # Linux-only for the same librdkafka reason as the broker suite.
+      - name: Compile plugin SQS connector example (issue #944)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo build -p autumn-harvest-plugin --example sqs_connector_quickstart --features sqs
+      - name: Compile plugin Kafka connector example (issue #944, Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+          cargo build -p autumn-harvest-plugin --example kafka_connector_quickstart --features kafka
       - name: Run macros tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-macros
@@ -247,6 +272,18 @@ jobs:
       - name: Run Docker-backed signal/update metric integration tests (issue #684)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --test integration -- metrics_integration::update_completed_metric_fires_on_the_suspend_path nd_block_tests::genuine_terminal_with_undrained_signal_emits_signal_unhandled nd_block_tests::nd_blocked_cycle_does_not_emit_signal_unhandled --test-threads=1
+      # Issue #944's Kafka broker suite stays a literal Linux-only step rather
+      # than a manifest row: it needs the apt install below first, and the
+      # manifest's `compile` mode would try to build vendored librdkafka on the
+      # macOS and Windows legs too. Its ALLOWLIST entry in `ci_run_coverage.rs`
+      # points here. (The SQS broker suite IS a manifest row — `aws-sdk-sqs` is
+      # pure Rust and compiles everywhere.)
+      - name: Install librdkafka build deps (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      - name: Run plugin Kafka broker connector tests (issue #944)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-plugin --features kafka --test connector_kafka_broker -- --test-threads=1
 
   quickstart:
     name: Quickstart example builds

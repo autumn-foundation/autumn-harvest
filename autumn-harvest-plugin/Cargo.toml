@@ -112,3 +112,11 @@ required-features = ["webhooks"]
 [[example]]
 name = "metrics_scrape_quickstart"
 required-features = ["metrics"]
+
+[[example]]
+name = "kafka_connector_quickstart"
+required-features = ["kafka"]
+
+[[example]]
+name = "sqs_connector_quickstart"
+required-features = ["sqs"]
