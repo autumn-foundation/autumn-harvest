@@ -45,8 +45,12 @@
 #[path = "../tests/integration/claim_bench_support.rs"]
 mod support;
 
+use std::collections::HashMap;
+
 use support::db::{self, BenchDb, ClaimReport, EnqueueReport};
-use support::{BACKLOG_SWEEP, ClaimGate, LatencyStats, Scenario, headline_scenario};
+use support::{
+    BACKLOG_SWEEP, ClaimGate, LatencyStats, MIN_MEANINGFUL_SAMPLES, Scenario, headline_scenario,
+};
 
 /// Writers used for the enqueue measurement.
 const ENQUEUE_WRITERS: usize = 8;
@@ -125,6 +129,34 @@ const fn truncation_note(truncated: bool) -> &'static str {
     if truncated { " ⚠" } else { "" }
 }
 
+/// Marks a row whose sample count is below [`MIN_MEANINGFUL_SAMPLES`].
+///
+/// The gate refuses to defend a budget on fewer samples than this; the report
+/// must not silently publish one either, or a thin row gets transcribed into
+/// `docs/performance.md` and quoted as though it were a steady-state number.
+const fn thin_sample_note(stats: LatencyStats) -> &'static str {
+    if stats.count > 0 && stats.count < MIN_MEANINGFUL_SAMPLES {
+        " ‡"
+    } else {
+        ""
+    }
+}
+
+/// Legend for the two row markers, printed under every table that can emit them.
+fn marker_legend() -> String {
+    format!(
+        "> `⚠` marks a row cut short by the per-scenario wall-clock budget \
+         (`{}`, default {}s): its percentiles describe the claims it did observe, \
+         but it is not a full sample. `‡` marks a row with fewer than {} samples \
+         — below the floor the CI gate itself will accept, so treat it as \
+         directional only. `n/a` means the scenario collected no post-warmup \
+         samples at all.",
+        support::SCENARIO_BUDGET_ENV_VAR,
+        support::scenario_time_budget().as_secs(),
+        MIN_MEANINGFUL_SAMPLES,
+    )
+}
+
 /// How claim latency scales with backlog depth — the number that answers
 /// "when do I add a shard?".
 async fn scaling_sweep(db: &BenchDb) {
@@ -152,20 +184,21 @@ async fn scaling_sweep(db: &BenchDb) {
         headline.backlog, headline.backlog, headline.claimers, headline.queues
     );
     println!(
-        "> A `⚠` marks a row cut short by the per-scenario wall-clock budget \
-         (`{}`, default {}s): its percentiles describe the claims it did observe, \
-         but it is not a full sample. `n/a` means the scenario collected no \
-         post-warmup samples at all.",
-        support::SCENARIO_BUDGET_ENV_VAR,
-        support::scenario_time_budget().as_secs(),
+        "> These rows run at {} concurrent claimers, so they measure the claim \
+         path *under contention* — the operational number — not the isolated \
+         query cost. The attribution table below deliberately runs below \
+         saturation instead.",
+        headline.claimers,
     );
+    println!("{}", marker_legend());
     println!();
 }
 
 fn print_claim_row(report: &ClaimReport, label: &str) {
     println!(
-        "| {label}{} | {} | {} | {} | {:.0} | {} | {} |",
+        "| {label}{}{} | {} | {} | {} | {:.0} | {} | {} |",
         truncation_note(report.truncated),
+        thin_sample_note(report.stats),
         report.scenario.claimers,
         report.scenario.queues,
         stats_cells(report.stats),
@@ -199,29 +232,45 @@ async fn gate_breakdown(db: &BenchDb) {
     );
     println!();
     println!(
-        "| gate | seeded rows | claimable | n | p50 ms | p99 ms | max ms | p50 vs baseline | claims/s |"
+        "| gate | seeded rows | claimable | n | p50 ms | p99 ms | max ms | p50 vs | vs what | claims/s |"
     );
-    println!("|:--|--:|--:|--:|--:|--:|--:|--:|--:|");
+    println!("|:--|--:|--:|--:|--:|--:|--:|--:|:--|--:|");
 
-    let mut baseline_p50: Option<f64> = None;
+    // Every gate's p50, so a row can be compared against its own comparand
+    // rather than always against baseline. `paused_rows` seeds 2x the table
+    // depth, and claim latency is superlinear in depth, so comparing it to
+    // baseline would charge the anti-join for the extra rows too.
+    let mut p50_by_gate: HashMap<&'static str, f64> = HashMap::new();
+    let mut reports = Vec::new();
     for gate in ClaimGate::all() {
         let scenario = Scenario { gate, ..headline };
         let report = db::run_claim_scenario(db, scenario).await;
-        // A delta is only meaningful when BOTH sides are real measurements.
-        let delta = match baseline_p50 {
-            None => "—".to_string(),
-            Some(base) if base > 0.0 && report.stats.count > 0 => {
-                format!("{:+.0}%", (report.stats.p50_ms / base - 1.0) * 100.0)
-            }
-            Some(_) => "n/a".to_string(),
-        };
-        if gate == ClaimGate::Baseline && report.stats.count > 0 {
-            baseline_p50 = Some(report.stats.p50_ms);
+        if report.stats.count > 0 {
+            p50_by_gate.insert(gate.as_str(), report.stats.p50_ms);
         }
+        reports.push((gate, report));
+    }
+
+    for (gate, report) in &reports {
+        let comparand = gate.comparand();
+        // A delta is only meaningful when BOTH sides are real measurements.
+        let (delta, vs) = if *gate == comparand {
+            ("—".to_string(), String::new())
+        } else {
+            let base = p50_by_gate.get(comparand.as_str()).copied();
+            let cell = match base {
+                Some(b) if b > 0.0 && report.stats.count > 0 => {
+                    format!("{:+.0}%", (report.stats.p50_ms / b - 1.0) * 100.0)
+                }
+                _ => "n/a".to_string(),
+            };
+            (cell, format!("`{}`", comparand.as_str()))
+        };
         println!(
-            "| `{}`{} | {} | {} | {} | {} | {delta} | {:.0} |",
+            "| `{}`{}{} | {} | {} | {} | {} | {delta} | {vs} | {:.0} |",
             gate.as_str(),
             truncation_note(report.truncated),
+            thin_sample_note(report.stats),
             report.seed.seeded_rows,
             report.seed.claimable_rows,
             report.stats.count,
@@ -231,18 +280,32 @@ async fn gate_breakdown(db: &BenchDb) {
     }
     println!();
     println!(
-        "> `paused_rows` and `all_gates` seed unclaimable PAUSED-execution ballast \
-         *in addition to* the claimable backlog, so their claimable pool matches \
-         the baseline and the only variable is the extra rows the scan walks past."
+        "> `paused_rows` seeds unclaimable PAUSED-execution ballast *in addition \
+         to* the claimable backlog, so it walks a table twice as deep as \
+         `baseline`. Because claim latency is strongly superlinear in depth, it \
+         is reported against the equal-depth `double_backlog` control — which \
+         seeds the same total rows, all claimable — so the delta is the \
+         anti-join's cost rather than the extra depth's."
+    );
+    println!(
+        "> `double_backlog` is a control, not a gate: `double_backlog vs baseline` \
+         is the cost of doubling table depth on its own."
+    );
+    println!(
+        "> `all_gates` is **not** a strict upper bound: its circuit-breaker \
+         tracked set short-circuits the rate-limit `EXISTS` and the debit CTE via \
+         `= ANY($5)`, so a deployment with rate limiting and no breaker executes \
+         strictly more work than this row shows."
     );
     println!(
         "> Attribution runs at {ATTRIBUTION_CLAIMERS} claimers rather than the \
          headline scenario's {}, so the numbers isolate predicate cost instead of \
-         run-queue contention. **`p50 vs baseline` is the attribution statistic**; \
+         run-queue contention. **`p50 vs` is the attribution statistic**; \
          tail columns at this backlog depth still pick up background stalls \
          (autovacuum, the OS scheduler) and are reported for completeness only.",
         headline_scenario().claimers,
     );
+    println!("{}", marker_legend());
     println!();
 }
 
@@ -250,19 +313,34 @@ async fn gate_breakdown(db: &BenchDb) {
 async fn enqueue_section(db: &BenchDb) {
     println!("## Enqueue throughput into a non-empty queue");
     println!();
-    println!("| backlog | writers | rows | p50 ms | p99 ms | max ms | rows/s |");
-    println!("|--:|--:|--:|--:|--:|--:|--:|");
+    println!("| backlog | writers | rows | n | p50 ms | p99 ms | max ms | rows/s |");
+    println!("|--:|--:|--:|--:|--:|--:|--:|--:|");
     for backlog in BACKLOG_SWEEP {
         let report: EnqueueReport =
             db::run_enqueue_scenario(db, backlog, ENQUEUE_WRITERS, ENQUEUE_ROWS_PER_WRITER).await;
         println!(
-            "| {backlog} | {} | {} | {} | {:.0} |",
+            "| {}{} | {} | {} | {} | {} | {:.0} |",
+            // Read the report, not the loop variable: a transcription bug here
+            // would silently mislabel which backlog a row describes.
+            report.backlog,
+            thin_sample_note(report.stats),
             report.writers,
             report.rows,
+            report.stats.count,
             stats_cells(report.stats),
             report.rows_per_sec(),
         );
     }
+    println!();
+    println!(
+        "> `rows` counts every row written; `n` is the post-warmup sample count \
+         behind the latency columns (the same one-in-{} head trim the claim path \
+         uses). `rows/s` divides *all* rows by the *whole* wall clock, warmup \
+         included, so it is a conservative floor on sustained throughput rather \
+         than a peak.",
+        support::warmup_divisor(),
+    );
+    println!("{}", marker_legend());
     println!();
 }
 

@@ -73,10 +73,26 @@ pub enum ClaimGate {
     /// The worker passes a populated circuit-breaker tracked-activity set, so
     /// the rate-limit gate and debit are skipped via `= ANY($5)` (issue #369).
     CircuitBreakerSet,
-    /// Half the backlog belongs to `PAUSED` executions, so the scan walks past
-    /// unclaimable rows via the `NOT EXISTS` anti-join (issue #383).
+    /// **Control for [`Self::PausedRows`], not a gate.**
+    ///
+    /// Seeds `2 * backlog` rows, all of them plain and claimable. This is the
+    /// same total table depth `PausedRows` produces, with no PAUSED subplan —
+    /// so `DoubleBacklog - Baseline` is the cost of *depth alone* and
+    /// `PausedRows - DoubleBacklog` is the cost of the anti-join. Without it,
+    /// the `PausedRows` delta conflates the two and overstates the predicate.
+    DoubleBacklog,
+    /// An *additional* `backlog` rows belong to `PAUSED` executions, on top of
+    /// the claimable backlog, so the scan walks past unclaimable rows via the
+    /// `NOT EXISTS` anti-join (issue #383). Total seeded depth is
+    /// `2 * backlog`; compare against [`Self::DoubleBacklog`], not
+    /// [`Self::Baseline`], to isolate the predicate from the depth.
     PausedRows,
-    /// Every gate above at once — the realistic worst case.
+    /// Every gate above at once.
+    ///
+    /// Not a strict upper bound: the circuit-breaker tracked set short-circuits
+    /// the rate-limit `EXISTS` and the debit CTE (`= ANY($5)` wins), so a
+    /// deployment with rate limiting and *no* breaker executes strictly more
+    /// work than this scenario does.
     AllGates,
 }
 
@@ -90,24 +106,39 @@ impl ClaimGate {
             Self::ConcurrencyKey => "concurrency_key",
             Self::RateLimited => "rate_limited",
             Self::CircuitBreakerSet => "circuit_breaker_set",
+            Self::DoubleBacklog => "double_backlog",
             Self::PausedRows => "paused_rows",
             Self::AllGates => "all_gates",
         }
     }
 
     /// Every gate, in report order. `Baseline` is first so the table reads as
-    /// "baseline, then what each predicate adds".
+    /// "baseline, then what each predicate adds". `DoubleBacklog` sits directly
+    /// before `PausedRows` because it is that row's control.
     #[must_use]
-    pub const fn all() -> [Self; 7] {
+    pub const fn all() -> [Self; 8] {
         [
             Self::Baseline,
             Self::BuildPolicy,
             Self::ConcurrencyKey,
             Self::RateLimited,
             Self::CircuitBreakerSet,
+            Self::DoubleBacklog,
             Self::PausedRows,
             Self::AllGates,
         ]
+    }
+
+    /// Which gate a row's `vs` column should be measured against.
+    ///
+    /// Every gate compares to `Baseline` except `PausedRows`, whose honest
+    /// comparand is the equal-depth [`Self::DoubleBacklog`] control.
+    #[must_use]
+    pub const fn comparand(self) -> Self {
+        match self {
+            Self::PausedRows => Self::DoubleBacklog,
+            _ => Self::Baseline,
+        }
     }
 }
 
@@ -139,6 +170,37 @@ pub const fn headline_scenario() -> Scenario {
     }
 }
 
+/// The published budget CI defends for [`headline_scenario`], in milliseconds.
+///
+/// **Applied to p50, not p99 — deliberately, from measurement.** The headline
+/// scenario runs 8 concurrent claimers against a 4-core reference box, so the
+/// database is genuinely oversubscribed and the *tail* stops describing the
+/// claim path. Measured across repeated runs on that box:
+///
+/// | statistic | idle box | loaded box | spread |
+/// |:--|--:|--:|--:|
+/// | p50 | ~220 ms | ~516 ms | **~2.3x** |
+/// | p99 | ~300 ms | ~4 665 ms | **~15x** |
+///
+/// A p99 gate at this budget failed roughly one run in three during review —
+/// on the *same hardware class and Postgres version* that produced the
+/// published numbers. It was not measuring a regression; it was measuring the
+/// run queue. p50 is the statistic that tracks the query under the same load,
+/// so it is the one asserted. p99 is still measured, still published, and still
+/// printed in the failure message for diagnosis — it is simply not the
+/// assertion, because a gate that flakes is a gate everyone learns to ignore.
+///
+/// The number itself is derived, not chosen: reference p50 sits near 220 ms
+/// idle and 516 ms loaded, so this is ~2.9x the worst observation and ~6.8x the
+/// idle one. That headroom is what makes it a **cliff detector, not a drift
+/// detector** — it will not catch a predicate that makes claims 50% slower.
+/// `docs/performance.md`'s per-gate table is the tool for that.
+///
+/// Lives here rather than in the gate test so that
+/// [`pure_tests::wall_clock_budget_admits_a_run_at_the_latency_budget`] can hold
+/// it and [`DEFAULT_SCENARIO_BUDGET_SECS`] to a consistent pair.
+pub const HEADLINE_P50_BUDGET_MS: f64 = 1_500.0;
+
 /// Backlog depths the exploratory benchmark sweeps.
 pub const BACKLOG_SWEEP: [usize; 3] = [1_000, 10_000, 100_000];
 
@@ -163,7 +225,16 @@ const MAX_MEASURED_CLAIMS: usize = 800;
 /// report carries however many samples were collected, with
 /// [`ClaimReport::truncated`] set so a short sample is visible rather than
 /// silently thin.
-const DEFAULT_SCENARIO_BUDGET_SECS: u64 = 60;
+///
+/// **It must be large enough that a run sitting exactly at
+/// [`HEADLINE_P50_BUDGET_MS`] still completes.** Otherwise a slow-but-passing
+/// run truncates first and the gate reports "measurement unsound" instead of
+/// the latency verdict it exists to give — the wall-clock ceiling would have
+/// silently become the real budget. At the headline scenario that floor is
+/// `(800 ops / 8 claimers) x 1.5s = 150s`;
+/// [`pure_tests::wall_clock_budget_admits_a_run_at_the_latency_budget`] pins the
+/// relationship so the two constants cannot drift into an incoherent pair.
+const DEFAULT_SCENARIO_BUDGET_SECS: u64 = 240;
 
 /// Environment variable overriding [`DEFAULT_SCENARIO_BUDGET_SECS`].
 pub const SCENARIO_BUDGET_ENV_VAR: &str = "HARVEST_BENCH_SCENARIO_SECS";
@@ -177,6 +248,25 @@ pub fn scenario_time_budget() -> std::time::Duration {
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_SCENARIO_BUDGET_SECS);
     std::time::Duration::from_secs(secs)
+}
+
+/// How many claim operations claimer `index` of `claimers` should perform.
+///
+/// Distributes `total_ops` exactly: the first `total_ops % claimers` claimers
+/// take one extra operation and the sum over all claimers is exactly
+/// `total_ops`. A naive `(total_ops / claimers).max(1)` per claimer would
+/// *exceed* `total_ops` whenever `claimers > total_ops`, breaking the
+/// [`MAX_DRAIN_FRACTION`] guarantee that a run never consumes more than a fifth
+/// of the backlog. Claimers past `total_ops` get 0 and do no work, which is the
+/// correct outcome — the drain bound wins over keeping every task busy.
+#[must_use]
+pub const fn claims_for_claimer(total_ops: usize, claimers: usize, index: usize) -> usize {
+    if claimers == 0 {
+        return 0;
+    }
+    let base = total_ops / claimers;
+    let remainder = total_ops % claimers;
+    if index < remainder { base + 1 } else { base }
 }
 
 /// Fewest measured samples for a percentile to be worth reporting.
@@ -224,6 +314,12 @@ const WARMUP_DIVISOR: usize = 10;
 #[must_use]
 pub const fn warmup_claims_for(collected: usize) -> usize {
     collected / WARMUP_DIVISOR
+}
+
+/// The one-in-N head trim [`warmup_claims_for`] applies, for report legends.
+#[must_use]
+pub const fn warmup_divisor() -> usize {
+    WARMUP_DIVISOR
 }
 
 /// Nearest-rank percentile over a sample of millisecond latencies.
@@ -352,7 +448,8 @@ mod pure_tests {
     #![allow(unused_imports)]
 
     use super::{
-        BACKLOG_SWEEP, BudgetVerdict, ClaimGate, LatencyStats, budget_from_str, budget_verdict,
+        BACKLOG_SWEEP, BudgetVerdict, ClaimGate, DEFAULT_SCENARIO_BUDGET_SECS,
+        HEADLINE_P50_BUDGET_MS, LatencyStats, budget_from_str, budget_verdict, claims_for_claimer,
         headline_scenario, measured_claims_for, percentile_ms, warmup_claims_for,
     };
 
@@ -454,6 +551,76 @@ mod pure_tests {
                 "backlog {backlog}: {claims} claims would drain more than 20%",
             );
             assert!(claims > 0, "backlog {backlog}: must measure something");
+        }
+    }
+
+    #[test]
+    fn claimer_split_is_exact_so_the_drain_bound_actually_holds() {
+        // The invariant above is about the *planned* total; this one is about
+        // what the claimers between them actually execute. A naive
+        // `(total / claimers).max(1)` per claimer overshoots whenever there are
+        // more claimers than operations, which is how a 20-row backlog ends up
+        // 40% drained.
+        for (total, claimers) in [(800, 8), (800, 7), (4, 8), (0, 8), (1, 1), (13, 5)] {
+            let sum: usize = (0..claimers)
+                .map(|i| claims_for_claimer(total, claimers, i))
+                .sum();
+            assert_eq!(
+                sum, total,
+                "total {total} across {claimers} claimers must be distributed exactly",
+            );
+        }
+        // Fewer operations than claimers: the surplus claimers do nothing rather
+        // than each being floored up to one and blowing the bound.
+        assert_eq!(claims_for_claimer(4, 8, 3), 1);
+        assert_eq!(claims_for_claimer(4, 8, 4), 0);
+        // Degenerate input must not divide by zero.
+        assert_eq!(claims_for_claimer(10, 0, 0), 0);
+    }
+
+    #[test]
+    fn wall_clock_budget_admits_a_run_at_the_latency_budget() {
+        // The gate asserts both "p99 within budget" AND "the run was not
+        // truncated". Those two assertions are only coherent if a run sitting
+        // exactly at the p99 budget can finish inside the wall-clock ceiling.
+        // If it cannot, the wall clock silently becomes the real budget: a
+        // slow-but-passing run trips the truncation assertion first and the
+        // gate reports "measurement unsound" instead of a latency verdict.
+        let s = headline_scenario();
+        let total = measured_claims_for(s.backlog);
+        let per_claimer = claims_for_claimer(total, s.claimers, 0);
+
+        #[allow(clippy::cast_precision_loss)]
+        let worst_case_secs = (per_claimer as f64) * HEADLINE_P50_BUDGET_MS / 1000.0;
+        #[allow(clippy::cast_precision_loss)]
+        let ceiling_secs = DEFAULT_SCENARIO_BUDGET_SECS as f64;
+
+        assert!(
+            ceiling_secs >= worst_case_secs,
+            "incoherent budgets: a claimer performing {per_claimer} ops at the \
+             {HEADLINE_P50_BUDGET_MS}ms p99 budget needs {worst_case_secs:.0}s, but the \
+             wall-clock ceiling is {ceiling_secs:.0}s. The gate would report \
+             truncation instead of the latency verdict. Raise \
+             DEFAULT_SCENARIO_BUDGET_SECS or lower HEADLINE_P50_BUDGET_MS.",
+        );
+    }
+
+    #[test]
+    fn paused_rows_has_an_equal_depth_control() {
+        // `paused_rows` seeds 2x the table depth of `baseline`, and claim
+        // latency is strongly superlinear in depth — so comparing it against
+        // `baseline` charges the anti-join for the extra rows too. Its
+        // comparand must be the equal-depth control.
+        assert_eq!(ClaimGate::PausedRows.comparand(), ClaimGate::DoubleBacklog);
+        for gate in ClaimGate::all() {
+            if gate != ClaimGate::PausedRows {
+                assert_eq!(
+                    gate.comparand(),
+                    ClaimGate::Baseline,
+                    "{}: only paused_rows needs a non-baseline comparand",
+                    gate.as_str(),
+                );
+            }
         }
     }
 
@@ -788,6 +955,14 @@ pub mod db {
         matches!(gate, ClaimGate::PausedRows | ClaimGate::AllGates)
     }
 
+    /// Whether the scenario seeds `2 * backlog` *claimable* rows.
+    ///
+    /// This is the equal-depth control for [`ClaimGate::PausedRows`]: both seed
+    /// the same number of table rows, and only `PausedRows` adds the anti-join.
+    const fn wants_double_backlog(gate: ClaimGate) -> bool {
+        matches!(gate, ClaimGate::DoubleBacklog)
+    }
+
     /// Seed the worker fleet.
     ///
     /// `claim_task`'s `worker_info` CTE reads `harvest_workers` for capability
@@ -806,9 +981,14 @@ pub mod db {
         .await;
     }
 
-    /// Seed the build-routing tables so the claim resolves through the
-    /// `harvest_build_compat` `EXISTS` branch (issue #171).
-    async fn seed_build_routing(conn: &mut AsyncPgConnection, queues: usize) {
+    /// Seed the build-routing compatibility declaration so the claim resolves
+    /// through the `harvest_build_compat` `EXISTS` branch (issue #171).
+    ///
+    /// Deliberately does *not* seed `harvest_build_policies`: that table is read
+    /// at workflow-start time to stamp `assigned_build_id`, and the benchmark
+    /// writes `required_build_id` onto task rows directly. `claim_task` itself
+    /// never touches it, so seeding it would be measurement theatre.
+    async fn seed_build_routing(conn: &mut AsyncPgConnection) {
         exec(
             conn,
             &format!(
@@ -817,17 +997,6 @@ pub mod db {
             ),
         )
         .await;
-        for q in 0..queues {
-            exec(
-                conn,
-                &format!(
-                    "INSERT INTO harvest_build_policies (queue_name, build_id) \
-                     VALUES ('{}', '{BENCH_OLD_BUILD}')",
-                    queue_name(q)
-                ),
-            )
-            .await;
-        }
     }
 
     /// Seed token buckets funded high enough never to throttle, so the
@@ -943,14 +1112,22 @@ pub mod db {
 
         seed_workers(conn, gate).await;
         if wants_build_id(gate) {
-            seed_build_routing(conn, queues).await;
+            seed_build_routing(conn).await;
         }
         if wants_rate_limit(gate) {
             seed_rate_limit_buckets(conn).await;
         }
-        seed_backlog(conn, gate, backlog, queues).await;
 
-        let mut seeded_rows = backlog;
+        // The `DoubleBacklog` control seeds twice the claimable rows so it
+        // matches `PausedRows`' table depth with no anti-join.
+        let claimable_rows = if wants_double_backlog(gate) {
+            backlog * 2
+        } else {
+            backlog
+        };
+        seed_backlog(conn, gate, claimable_rows, queues).await;
+
+        let mut seeded_rows = claimable_rows;
         if wants_paused_rows(gate) {
             seed_paused_ballast(conn, backlog, queues).await;
             seeded_rows += backlog;
@@ -961,7 +1138,7 @@ pub mod db {
 
         SeedOutcome {
             seeded_rows,
-            claimable_rows: backlog,
+            claimable_rows,
         }
     }
 
@@ -1031,16 +1208,19 @@ pub mod db {
         let build_id = worker_build_id(scenario.gate).to_string();
 
         let total_ops = measured_claims_for(scenario.backlog);
-        let per_claimer = (total_ops / scenario.claimers.max(1)).max(1);
+        let claimers = scenario.claimers.max(1);
         let budget = super::scenario_time_budget();
 
         let started = Instant::now();
-        let mut handles = Vec::with_capacity(scenario.claimers);
-        for c in 0..scenario.claimers.max(1) {
+        let mut handles = Vec::with_capacity(claimers);
+        for c in 0..claimers {
             let pool = pool.clone();
             let queues = Arc::clone(&queues);
             let cb_set = Arc::clone(&cb_set);
             let build_id = build_id.clone();
+            // Exact split, so the sum across claimers never exceeds the
+            // drain bound (see `claims_for_claimer`).
+            let per_claimer = super::claims_for_claimer(total_ops, claimers, c);
             handles.push(tokio::spawn(async move {
                 let worker = format!("{BENCH_PREFIX}-worker-{c}");
                 // (latency_ms, claimed_a_task) in observation order, so warmup
@@ -1125,12 +1305,23 @@ pub mod db {
         /// Backlog depth the writes were issued against.
         pub backlog: usize,
         pub writers: usize,
+        /// Total rows written, including the warmup rows excluded from
+        /// [`Self::stats`]. This is the throughput numerator.
         pub rows: usize,
+        /// Rows discarded from the head of each writer's samples as warmup.
+        pub warmup_rows: usize,
+        /// Latency over the post-warmup rows only.
         pub stats: LatencyStats,
         pub wall_secs: f64,
     }
 
     impl EnqueueReport {
+        /// Sustained write rate across the whole measured phase.
+        ///
+        /// Deliberately divides *all* rows by the *whole* wall clock, warmup
+        /// included, so this is a conservative floor on sustained throughput
+        /// rather than a peak. It therefore spans a slightly wider window than
+        /// [`Self::stats`], which excludes warmup.
         #[must_use]
         pub fn rows_per_sec(&self) -> f64 {
             if self.wall_secs <= 0.0 {
@@ -1187,6 +1378,10 @@ pub mod db {
     ) -> EnqueueReport {
         let scenario = Scenario {
             backlog,
+            // `Scenario` is the seeding vocabulary; `seed` and `queue_names`
+            // read only `backlog`/`queues`/`gate`. Carrying the writer count
+            // here keeps one struct rather than adding a near-duplicate, but it
+            // is never interpreted as a claimer count on this path.
             claimers: writers,
             queues: headline_queue_count(),
             gate: ClaimGate::Baseline,
@@ -1219,16 +1414,26 @@ pub mod db {
             }));
         }
 
+        let mut rows = 0usize;
+        let mut warmup_rows = 0usize;
         let mut all_samples = Vec::with_capacity(writers * rows_per_writer);
         for h in handles {
-            all_samples.extend(h.await.expect("writer task panicked"));
+            let samples = h.await.expect("writer task panicked");
+            rows += samples.len();
+            // Same post-hoc warmup trim as the claim path: the first writes on
+            // a fresh connection pay plan-cache and connection setup costs that
+            // are not representative of a sustained start-storm.
+            let warmup = super::warmup_claims_for(samples.len());
+            warmup_rows += warmup;
+            all_samples.extend(samples.into_iter().skip(warmup));
         }
         let wall_secs = started.elapsed().as_secs_f64();
 
         EnqueueReport {
             backlog,
             writers,
-            rows: all_samples.len(),
+            rows,
+            warmup_rows,
             stats: LatencyStats::from_samples(&all_samples),
             wall_secs,
         }
@@ -1266,13 +1471,28 @@ pub mod db {
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        let sql = queue::claim_task_query()
-            .replace("$1", &format!("'{BENCH_PREFIX}-worker-0'"))
-            .replace("$2", &format!("ARRAY[{queue_list}]::text[]"))
-            .replace("$3", &format!("'{}'", worker_build_id(scenario.gate)))
-            .replace("$4", "NULL")
-            .replace("$5", &format!("ARRAY[{cb_list}]::text[]"))
-            .replace("$6", "ARRAY[]::text[]");
+        let literals = [
+            format!("'{BENCH_PREFIX}-worker-0'"),
+            format!("ARRAY[{queue_list}]::text[]"),
+            format!("'{}'", worker_build_id(scenario.gate)),
+            "NULL".to_string(),
+            format!("ARRAY[{cb_list}]::text[]"),
+            "ARRAY[]::text[]".to_string(),
+        ];
+        let raw = queue::claim_task_query();
+        // Fail loudly rather than silently explaining a *different* query if the
+        // claim query grows a seventh bind. A naive `.replace("$1", ..)` sweep
+        // would also corrupt `$10`+, so substitute highest-numbered first.
+        assert!(
+            !raw.contains(&format!("${}", literals.len() + 1)),
+            "claim_task_query() has more than {} binds; extend `literals` in \
+             explain_claim before the EXPLAIN can be trusted",
+            literals.len(),
+        );
+        let mut sql = raw.to_string();
+        for (i, literal) in literals.iter().enumerate().rev() {
+            sql = sql.replace(&format!("${}", i + 1), literal);
+        }
 
         // `EXPLAIN ANALYZE` really executes the statement — including the
         // `UPDATE` CTEs — so it runs inside a transaction that is rolled back.
@@ -1316,6 +1536,90 @@ pub mod db {
         // `into_iter().next()` rather than `.first()`: diesel's `RunQueryDsl`
         // is in scope and its `first(self, conn)` method shadows `slice::first`.
         rows.into_iter().next().map_or(0, |r| r.n)
+    }
+
+    /// How many seeded rows actually carry each gate's trigger column.
+    ///
+    /// The per-gate cost table in `docs/performance.md` is only meaningful if
+    /// each scenario genuinely puts its predicate on the execution path. A
+    /// scenario that silently stopped setting its column would still claim every
+    /// row at a 100% ratio — the claim would just take the cheap `IS NULL` leg —
+    /// so "did it claim?" cannot detect that failure. This census can.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SeedCensus {
+        /// Rows with `required_build_id` set (build-routing filter, #171).
+        pub with_build_id: i64,
+        /// Rows with `concurrency_key` set (per-key concurrency, #247).
+        pub with_concurrency_key: i64,
+        /// Rows with `rate_limit_key` set (rate-limit gate, #332 / #699).
+        pub with_rate_limit_key: i64,
+        /// Pending rows belonging to a PAUSED execution (pause skip, #383).
+        pub paused_ballast: i64,
+        /// `harvest_build_compat` declarations, without which a build-routed
+        /// claim would take the cheap equality leg instead of the `EXISTS`.
+        pub build_compat_rows: i64,
+        /// Pending rows *not* blocked by a PAUSED execution — i.e. the rows a
+        /// claim can actually take. Load-bearing for the `double_backlog`
+        /// control: if it silently seeded one backlog instead of two, it would
+        /// stop being an equal-depth comparand and the `paused_rows`
+        /// attribution would quietly go back to conflating depth with
+        /// predicate cost.
+        pub claimable_rows: i64,
+    }
+
+    /// Census the currently-seeded backlog.
+    ///
+    /// # Panics
+    /// Panics if any census query fails.
+    pub async fn seed_census(conn: &mut AsyncPgConnection) -> SeedCensus {
+        async fn count(conn: &mut AsyncPgConnection, sql: &str) -> i64 {
+            let rows: Vec<CountRow> = diesel::sql_query(sql)
+                .load(conn)
+                .await
+                .unwrap_or_else(|e| panic!("census query failed: {e}\n--- sql ---\n{sql}"));
+            rows.into_iter().next().map_or(0, |r| r.n)
+        }
+
+        SeedCensus {
+            with_build_id: count(
+                conn,
+                "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue \
+                 WHERE state = 'PENDING' AND required_build_id IS NOT NULL",
+            )
+            .await,
+            with_concurrency_key: count(
+                conn,
+                "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue \
+                 WHERE state = 'PENDING' AND concurrency_key IS NOT NULL",
+            )
+            .await,
+            with_rate_limit_key: count(
+                conn,
+                "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue \
+                 WHERE state = 'PENDING' AND rate_limit_key IS NOT NULL",
+            )
+            .await,
+            paused_ballast: count(
+                conn,
+                "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue t \
+                 JOIN harvest_workflow_executions e ON e.id = t.workflow_exec_id \
+                 WHERE t.state = 'PENDING' AND e.state = 'PAUSED'",
+            )
+            .await,
+            build_compat_rows: count(
+                conn,
+                "SELECT COUNT(*)::bigint AS n FROM harvest_build_compat",
+            )
+            .await,
+            claimable_rows: count(
+                conn,
+                "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue t \
+                 LEFT JOIN harvest_workflow_executions e ON e.id = t.workflow_exec_id \
+                 WHERE t.state = 'PENDING' \
+                   AND (e.id IS NULL OR e.state <> 'PAUSED')",
+            )
+            .await,
+        }
     }
 
     /// Postgres server version string, so a published baseline records which

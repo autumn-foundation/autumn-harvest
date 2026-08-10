@@ -8,11 +8,24 @@
 //! until this suite, none was measured.
 //!
 //! This is the gate. It runs the single published **headline scenario** and
-//! fails the build when p99 claim latency exceeds the budget in
+//! fails the build when **p50** claim latency exceeds the budget in
 //! `docs/performance.md`. The exploratory report — every gate at every backlog
 //! depth, plus `EXPLAIN (ANALYZE, BUFFERS)` — lives in `benches/claim_bench.rs`
 //! and shares this crate's [`claim_bench_support`] harness, so the gate and the
 //! benchmark can never drift apart.
+//!
+//! # Why p50 and not p99
+//!
+//! The headline scenario runs 8 concurrent claimers against a 4-core reference
+//! box, so the database is deliberately oversubscribed — contention is the point
+//! of the scenario. That makes the *tail* a measurement of the run queue rather
+//! than of the claim path: across repeated reference runs p50 moved ~2.3x
+//! between an idle and a loaded box (~220 ms → ~516 ms) while p99 moved ~15x
+//! (~300 ms → ~4 665 ms). A p99 gate at this budget failed about one run in
+//! three during review, on the same hardware class that produced the published
+//! numbers. p99 is still measured, still published, and printed below on
+//! failure — it is simply not the assertion. See
+//! [`HEADLINE_P50_BUDGET_MS`] for the full derivation.
 //!
 //! # Reading a failure
 //!
@@ -24,9 +37,9 @@
 //! 2. The runner is unusually loaded. The budget carries deliberate headroom
 //!    over the reference measurement precisely so this is rare; if it happens,
 //!    `HARVEST_CLAIM_BUDGET_P99_MS` overrides it for a one-off run.
-//! 3. The measurement itself is unsound — see the `claim_ratio` and
-//!    backlog-drain assertions below, which fail loudly rather than reporting a
-//!    meaningless percentile.
+//! 3. The measurement itself is unsound — see the sample-count, truncation,
+//!    `claim_ratio` and backlog-drain assertions below, which fail loudly rather
+//!    than reporting a meaningless percentile.
 //!
 //! [`claim_bench_support`]: super::claim_bench_support
 
@@ -34,32 +47,26 @@
 
 use super::claim_bench_support::db::{self, BenchDb};
 use super::claim_bench_support::{
-    BUDGET_ENV_VAR, BudgetVerdict, ClaimGate, LatencyStats, MIN_MEANINGFUL_SAMPLES, Scenario,
-    budget_from_env, budget_verdict, headline_scenario, measured_claims_for,
+    BUDGET_ENV_VAR, BudgetVerdict, ClaimGate, HEADLINE_P50_BUDGET_MS, LatencyStats,
+    MIN_MEANINGFUL_SAMPLES, SCENARIO_BUDGET_ENV_VAR, Scenario, budget_from_env, budget_verdict,
+    headline_scenario, measured_claims_for, scenario_time_budget,
 };
 
-/// Published p99 budget for the headline scenario, in milliseconds.
-///
-/// **This is a regression tripwire, not an SLO.** Derived from the reference
-/// measurement in `docs/performance.md`: across 8 runs on a quiet 4-core box
-/// (5 release, 3 debug) the headline p99 landed between 268ms and 599ms, median
-/// ~296ms. The budget is ~2.5x the worst observation and ~5x the median.
-///
-/// That headroom is deliberate, and it is the reason this gate is honest about
-/// what it does **not** do: it will not catch a predicate that makes claims 50%
-/// slower. It catches a *cliff* — the kind of change that adds another per-row
-/// subplan to a scan already walking the whole pending backlog. For drift, run
-/// the benchmark and compare against the published table; a shared CI runner
-/// with a containerised Postgres is far too noisy to defend a tighter number,
-/// and a gate that flakes is a gate everyone learns to ignore.
-///
-/// Override for a one-off run with `HARVEST_CLAIM_BUDGET_P99_MS`.
-const HEADLINE_P99_BUDGET_MS: f64 = 1_500.0;
+// The published budget lives in the shared harness as
+// `HEADLINE_P50_BUDGET_MS`, not here, so a pure test can hold it and the
+// wall-clock ceiling to a coherent pair — a latency budget the wall clock does
+// not admit would make the truncation assertion fire before this gate ever
+// rendered a verdict. See its doc comment for how the number was derived and
+// why it is a cliff detector rather than a drift detector.
+//
+// Override for a one-off run with `HARVEST_CLAIM_BUDGET_P99_MS` (the env var
+// keeps its historical name; it overrides whichever statistic the gate asserts).
 
 /// Minimum fraction of measured operations that must actually return a task.
 ///
 /// Without this floor the gate could "pass" while measuring nothing: a harness
-/// that claimed zero tasks would report a tiny p99 for a queue it never touched.
+/// that claimed zero tasks would report a tiny latency for a queue it never
+/// touched.
 const MIN_CLAIM_RATIO: f64 = 0.90;
 
 /// Acquire a benchmark database, or decide how to proceed without one.
@@ -97,15 +104,17 @@ fn render(stats: LatencyStats) -> String {
 }
 
 /// The headline gate: 10k pending tasks, 8 concurrent claimers, 4 queues.
+///
+/// Asserts **p50**; see the module docs for why the tail is not the assertion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn claim_p99_at_headline_scenario_is_within_budget() {
+async fn claim_p50_at_headline_scenario_is_within_budget() {
     let Some(db) = bench_db_or_skip().await else {
         return;
     };
 
     let scenario = headline_scenario();
     let report = db::run_claim_scenario(&db, scenario).await;
-    let budget = budget_from_env(HEADLINE_P99_BUDGET_MS);
+    let budget = budget_from_env(HEADLINE_P50_BUDGET_MS);
 
     eprintln!(
         "claim[{}] backlog={} claimers={} queues={} :: {} :: {:.0} claims/s \
@@ -124,7 +133,7 @@ async fn claim_p99_at_headline_scenario_is_within_budget() {
 
     // Soundness zero: a percentile over a handful of samples is noise. The
     // harness stops early on a wall-clock budget, so a severe regression could
-    // otherwise leave the gate defending a two-sample p99.
+    // otherwise leave the gate defending a two-sample percentile.
     assert!(
         report.stats.count >= MIN_MEANINGFUL_SAMPLES,
         "measurement unsound: only {} samples collected (need >= {MIN_MEANINGFUL_SAMPLES}). \
@@ -133,11 +142,26 @@ async fn claim_p99_at_headline_scenario_is_within_budget() {
         report.stats.count,
     );
 
+    // Soundness zero-and-a-half: `count >= MIN_MEANINGFUL_SAMPLES` can be
+    // satisfied by a run that was cut off part way, and a truncated run's
+    // percentiles describe a shorter, differently-warmed window than the
+    // published ones. The gate defends a *complete* scenario or it says so.
+    assert!(
+        !report.truncated,
+        "measurement unsound: the scenario hit its {}s wall-clock budget and \
+         stopped early with {} samples. The percentiles below are over a partial run. \
+         Raise {} for a one-off, but a headline scenario that cannot finish in \
+         the default budget is itself the regression signal.",
+        scenario_time_budget().as_secs(),
+        report.stats.count,
+        SCENARIO_BUDGET_ENV_VAR,
+    );
+
     // Soundness first: a percentile over a run that claimed nothing is noise.
     assert!(
         report.claim_ratio() >= MIN_CLAIM_RATIO,
         "measurement unsound: only {:.0}% of {} operations claimed a task \
-         (claimed={}, empty={}). The reported p99 would not describe the claim \
+         (claimed={}, empty={}). The reported latency would not describe the claim \
          path. Investigate contention or seeding before trusting the budget.",
         report.claim_ratio() * 100.0,
         report.claimed + report.empty,
@@ -159,16 +183,19 @@ async fn claim_p99_at_headline_scenario_is_within_budget() {
         scenario.backlog,
     );
 
-    // The gate itself.
+    // The gate itself. Asserted on p50 rather than p99: at 8 claimers against a
+    // 4-core box the tail measures the run queue, not the claim path (see the
+    // module docs). The full stat line — p99 included — is in the message, so a
+    // tail regression is still visible to whoever reads the failure.
     assert_eq!(
-        budget_verdict(report.stats.p99_ms, budget),
+        budget_verdict(report.stats.p50_ms, budget),
         BudgetVerdict::WithinBudget,
-        "CLAIM PATH REGRESSION: p99 {:.2}ms exceeds the {budget:.2}ms budget for \
+        "CLAIM PATH REGRESSION: p50 {:.2}ms exceeds the {budget:.2}ms budget for \
          the headline scenario ({} pending / {} claimers / {} queues). {}\n\
          Run `cargo bench -p autumn-harvest --features db --bench claim_bench` \
          for the per-gate cost table and EXPLAIN output, and see \
          docs/performance.md. Override for a one-off run with {BUDGET_ENV_VAR}.",
-        report.stats.p99_ms,
+        report.stats.p50_ms,
         scenario.backlog,
         scenario.claimers,
         scenario.queues,
@@ -179,11 +206,12 @@ async fn claim_p99_at_headline_scenario_is_within_budget() {
 /// The gate must be falsifiable against **real measured data**, not just in the
 /// unit tests of the comparison function.
 ///
-/// Runs the same measurement and asserts that a budget below the observed p99
-/// would have tripped it. Without this, a harness bug that reported `0.0` for
-/// every percentile would let the gate pass forever.
+/// Runs the same measurement and asserts that a budget below the observed p50 —
+/// the statistic the gate actually asserts on — would have tripped it. Without
+/// this, a harness bug that reported `0.0` for every percentile would let the
+/// gate pass forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn gate_would_trip_on_a_budget_below_the_measured_p99() {
+async fn gate_would_trip_on_a_budget_below_the_measured_p50() {
     let Some(db) = bench_db_or_skip().await else {
         return;
     };
@@ -199,18 +227,18 @@ async fn gate_would_trip_on_a_budget_below_the_measured_p99() {
     let report = db::run_claim_scenario(&db, scenario).await;
 
     assert!(
-        report.stats.p99_ms > 0.0,
-        "measured p99 was {:.6}ms — a claim against Postgres cannot be free, so \
+        report.stats.p50_ms > 0.0,
+        "measured p50 was {:.6}ms — a claim against Postgres cannot be free, so \
          the harness is not measuring anything",
-        report.stats.p99_ms,
+        report.stats.p50_ms,
     );
 
-    let impossible_budget = report.stats.p99_ms / 2.0;
+    let impossible_budget = report.stats.p50_ms / 2.0;
     assert_eq!(
-        budget_verdict(report.stats.p99_ms, impossible_budget),
+        budget_verdict(report.stats.p50_ms, impossible_budget),
         BudgetVerdict::Exceeded,
-        "gate is vacuous: measured p99 {:.2}ms did not exceed a {impossible_budget:.2}ms budget",
-        report.stats.p99_ms,
+        "gate is vacuous: measured p50 {:.2}ms did not exceed a {impossible_budget:.2}ms budget",
+        report.stats.p50_ms,
     );
 }
 
@@ -291,6 +319,150 @@ async fn every_accreted_gate_scenario_still_claims_tasks() {
             gate.as_str(),
         );
     }
+}
+
+/// Each gate scenario must actually put its predicate on the execution path.
+///
+/// [`every_accreted_gate_scenario_still_claims_tasks`] proves the rows are
+/// claimable, but that assertion cannot detect a scenario that stopped setting
+/// its trigger column: such a run still claims 100% of its operations — the
+/// claim just takes the cheap `IS NULL` leg. The published per-gate cost table
+/// would then be reporting the baseline under six different names.
+///
+/// This test censuses the seeded rows and asserts each gate sets what it claims
+/// to, and — just as importantly — that it does *not* set the others, so a
+/// "seed everything always" regression is caught too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_gate_scenario_actually_seeds_its_trigger_column() {
+    let Some(db) = bench_db_or_skip().await else {
+        return;
+    };
+
+    let backlog = 200;
+    let mut conn = db::connect(&db.url).await;
+
+    for gate in ClaimGate::all() {
+        let scenario = Scenario {
+            backlog,
+            claimers: 1,
+            queues: 2,
+            gate,
+        };
+        db::seed(&mut conn, scenario).await;
+        let census = db::seed_census(&mut conn).await;
+        let want = i64::try_from(backlog).expect("backlog fits i64");
+
+        let expect_build = matches!(gate, ClaimGate::BuildPolicy | ClaimGate::AllGates);
+        let expect_conc = matches!(gate, ClaimGate::ConcurrencyKey | ClaimGate::AllGates);
+        // The circuit-breaker scenario deliberately seeds rate-limit keys: its
+        // whole point is that a tracked activity SHORT-CIRCUITS the rate-limit
+        // EXISTS via `= ANY($5)`. Without the keys present there would be
+        // nothing for the tracked set to short-circuit past.
+        let expect_rl = matches!(
+            gate,
+            ClaimGate::RateLimited | ClaimGate::CircuitBreakerSet | ClaimGate::AllGates
+        );
+        let expect_paused = matches!(gate, ClaimGate::PausedRows | ClaimGate::AllGates);
+        // The equal-depth control seeds twice the claimable rows and nothing
+        // else; every other gate seeds exactly one backlog of claimable rows.
+        let expect_claimable = if gate == ClaimGate::DoubleBacklog {
+            want * 2
+        } else {
+            want
+        };
+
+        let name = gate.as_str();
+        assert_eq!(
+            census.claimable_rows, expect_claimable,
+            "gate `{name}`: claimable-row census wrong ({census:?})",
+        );
+        assert_eq!(
+            census.with_build_id,
+            if expect_build { want } else { 0 },
+            "gate `{name}`: required_build_id column census wrong ({census:?})",
+        );
+        assert_eq!(
+            census.with_concurrency_key,
+            if expect_conc { want } else { 0 },
+            "gate `{name}`: concurrency_key column census wrong ({census:?})",
+        );
+        assert_eq!(
+            census.with_rate_limit_key,
+            if expect_rl { want } else { 0 },
+            "gate `{name}`: rate_limit_key column census wrong ({census:?})",
+        );
+        assert_eq!(
+            census.paused_ballast,
+            if expect_paused { want } else { 0 },
+            "gate `{name}`: PAUSED ballast census wrong ({census:?})",
+        );
+
+        // A build-routed claim only reaches the expensive `EXISTS` branch when a
+        // compat declaration exists; without it the worker's build would have to
+        // match by equality and the scenario would measure the cheap leg.
+        assert_eq!(
+            census.build_compat_rows,
+            i64::from(expect_build),
+            "gate `{name}`: build-compat declaration census wrong ({census:?})",
+        );
+    }
+}
+
+/// `double_backlog` is only a valid control if it is genuinely equal-depth.
+///
+/// The `paused_rows` attribution in `docs/performance.md` is reported against
+/// `double_backlog` rather than `baseline` specifically because claim latency is
+/// superlinear in table depth: comparing a 2x-deep scenario against a 1x-deep
+/// one charges the anti-join for the extra rows as well as for itself. That
+/// correction is worthless unless the two scenarios really do seed the same
+/// number of pending rows, which is what this asserts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_paused_rows_control_seeds_equal_total_depth() {
+    let Some(db) = bench_db_or_skip().await else {
+        return;
+    };
+
+    let backlog = 200;
+    let mut conn = db::connect(&db.url).await;
+    let mut totals = Vec::new();
+    for gate in [ClaimGate::DoubleBacklog, ClaimGate::PausedRows] {
+        let outcome = db::seed(
+            &mut conn,
+            Scenario {
+                backlog,
+                claimers: 1,
+                queues: 2,
+                gate,
+            },
+        )
+        .await;
+        let pending = db::pending_count(&mut conn).await;
+        assert_eq!(
+            pending,
+            i64::try_from(outcome.seeded_rows).expect("fits i64"),
+            "gate `{}`: seeded_rows disagrees with the rows actually in the table",
+            gate.as_str(),
+        );
+        totals.push((gate, outcome.seeded_rows, outcome.claimable_rows));
+    }
+
+    let (_, double_total, double_claimable) = totals[0];
+    let (_, paused_total, paused_claimable) = totals[1];
+    assert_eq!(
+        double_total, paused_total,
+        "control is not equal-depth: double_backlog seeded {double_total} rows, \
+         paused_rows seeded {paused_total}. The per-gate delta for paused_rows \
+         would be measuring table depth, not the anti-join.",
+    );
+    assert_eq!(
+        double_total,
+        backlog * 2,
+        "both scenarios should seed 2x the backlog",
+    );
+    // And the thing that differs must actually differ: the control's rows are
+    // all claimable, the paused scenario's are half blocked.
+    assert_eq!(double_claimable, backlog * 2);
+    assert_eq!(paused_claimable, backlog);
 }
 
 /// The gate and the benchmark must agree on what "the headline scenario" is.

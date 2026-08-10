@@ -155,8 +155,14 @@ jobs:
       # `docs/performance.md` report from bit-rotting; `cargo bench` itself is
       # deliberately NOT run per-PR, since the measurement is minutes-long and
       # the *gate* is the test, not the report.
+      #
+      # Linux-only: bit-rot protection needs exactly one OS, and the benchmark is
+      # only ever *run* on Linux (see the manifest). The macOS and Windows legs
+      # already compile the same harness module through the `--all-features
+      # --tests --no-run` step above, so restricting this one costs no coverage
+      # and saves two legs' worth of minutes.
       - name: Compile claim/enqueue benchmark (issue #786)
-        if: needs.changes.outputs.code == 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo bench -p autumn-harvest --features db --bench claim_bench --no-run
       - name: Run all-features lib tests
         if: needs.changes.outputs.code == 'true'
