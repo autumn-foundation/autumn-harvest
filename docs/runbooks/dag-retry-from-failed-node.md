@@ -198,6 +198,40 @@ over upstream node outputs, which are now tombstones, so a re-executing
 downstream node bound with `.input_from(...)` would receive
 `{"_harvest_erased": true}` as its input. **Start a fresh run.**
 
+The check runs **twice**, and the second one is the guarantee. The first is a
+pre-flight on an unlocked read — it gives you the error above without paying for
+the history load. But the handler then releases its database connection to
+inflate offloaded blobs, and only afterwards opens the fork's transaction, so an
+`erase-payloads` call can land in that window. The fork therefore re-reads the
+row **under the same `FOR UPDATE` lock it takes to seal the source**, before
+copying a single event. Erasure either committed before that lock (the fork sees
+it and refuses) or has to wait behind it (the fork completes on intact events);
+there is no interleaving where a tombstoned run is forked. A retry refused at the
+second check reports the same `409`, so you never need to care which one caught
+it.
+
+### An offloaded payload with no store configured is refused
+
+Signal 2 reads a payload field, so the endpoint inflates offloaded payloads
+(issue #524) before applying it. If the deployment that *wrote* the run had a
+payload store and the current one does not — the store was unregistered, or
+failed to construct at boot — there is nothing to inflate with, and the raw
+`_harvest_offload_envelope` reference would otherwise flow through as if it were
+the real payload, hiding the compensation envelope.
+
+The endpoint fails closed with a `503`, naming the blob key and the store id the
+history points at:
+
+```
+history still carries an offloaded payload reference (key '…', store 's3-main')
+after the inflate pass; no payload store is configured for that store id, so the
+real payload cannot be read — register the payload store this deployment wrote
+with
+```
+
+**What to do:** re-register that payload store and retry. This is a
+configuration problem, not a problem with the run.
+
 ## Limitation: build-id routing and topology changes
 
 The retry resolves the fork point and the re-execute / carry-over node sets from
@@ -235,6 +269,7 @@ build-compatibility gate is tracked as follow-up work; v1 does not enforce it.
 | `400` | `from_nodes` empty; an unknown node (the response lists the declared nodes); a node that was never attempted; or a node that already succeeded. |
 | `400` | The DAG is classic (non-unified). |
 | `404` | The DAG name is not registered, or the run is not a run of that DAG. |
-| `409` | The run succeeded (use a fresh run); the run is still running (cancel first); the run **already compensated** ([see above](#a-compensated-run-is-not-retryable-issue-780)); the run's payloads were **erased** ([see above](#a-pii-erased-run-is-refused-outright)); or the fork point lands inside an unresolved upstream side effect (remediation hint included). |
+| `409` | The run succeeded (use a fresh run); the run is still running (cancel first); the run **already compensated** ([see above](#a-compensated-run-is-not-retryable-issue-780)); the run's payloads were **erased**, caught either pre-flight or under the fork's row lock ([see above](#a-pii-erased-run-is-refused-outright)); or the fork point lands inside an unresolved upstream side effect (remediation hint included). |
+| `503` | The history carries an offloaded payload reference and no matching payload store is configured ([see above](#an-offloaded-payload-with-no-store-configured-is-refused)). Re-register the store and retry. |
 | `201` | Retry committed; `new_run_exec_id` identifies the forked run. |
 | `200` | Dry-run plan (no write performed). |

@@ -5300,6 +5300,22 @@ fn graph_history_needs_inflation(events: &[WorkflowEvent]) -> bool {
 /// timings, attempts, and a truncated `error` (which is not a payload-bearing
 /// field). So this needs no issue #608 read-decode opt-in or audit row, exactly
 /// like the awaitables endpoint's replay drive.
+///
+/// # Residual offload references are an error, not a pass-through
+///
+/// A payload store is *optional*, so `offloader` is `None` on the default
+/// deployment — and on a deployment that used to have one. In the latter case
+/// the stored history still carries `_harvest_offload_envelope` references, the
+/// inflate pass is skipped entirely, and [`PayloadCodecs::decode_event`] returns
+/// the reference verbatim (it is not a codec envelope, so nothing rejects it).
+/// Every payload-reading guard downstream would then be looking at an opaque
+/// blob pointer while believing it had the real value.
+///
+/// Any reference that survives the pass is therefore an error. When an offloader
+/// *is* configured this is unreachable — `inflate_event_value` either resolves
+/// the reference or rejects a foreign `store_id` — so the check only ever fires
+/// on the configuration-removal case, and costs a handful of key lookups per
+/// event otherwise.
 async fn inflate_and_decode_events(
     events: &[WorkflowEvent],
     codecs: &PayloadCodecs,
@@ -5310,6 +5326,22 @@ async fn inflate_and_decode_events(
         let mut value = serde_json::to_value(event)?;
         if let Some(offloader) = offloader {
             offloader.inflate_event_value(&mut value).await?;
+        }
+        // `.into_iter().next()` rather than `.first()`: `diesel::prelude::*` is
+        // in scope here and its `RunQueryDsl::first` shadows `slice::first`.
+        if let Some(residual) = autumn_harvest::payload_store::refs_in_event_value(&value)
+            .into_iter()
+            .next()
+        {
+            return Err(autumn_harvest::error::HarvestError::PayloadOffload(
+                format!(
+                    "history still carries an offloaded payload reference (key '{}', store '{}') \
+                 after the inflate pass; no payload store is configured for that store id, so \
+                 the real payload cannot be read — register the payload store this deployment \
+                 wrote with",
+                    residual.blob_key, residual.store_id
+                ),
+            ));
         }
         out.push(codecs.decode_event(value)?);
     }
@@ -16960,6 +16992,11 @@ async fn batch_reset_workflows(
                         operator_id: request.operator_id.clone(),
                         signal_reapply: request.signal_reapply,
                         allow_terminal_source: true,
+                        // Left `false` deliberately: this is the batch-reset
+                        // endpoint, not the issue #780 DAG retry, and refusing
+                        // an erased source here would be an unrelated behavior
+                        // change to an already-shipped surface.
+                        refuse_erased_source: false,
                     };
                     match reset_workflow_execution(
                         conn,
@@ -19867,6 +19904,22 @@ fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
             }),
         )
             .into_response(),
+        // Same `409` and the same operator instruction as the DAG-retry
+        // pre-flight guard, so a caller cannot tell whether the erasure was
+        // already committed or landed in the race window — only that the
+        // source is unusable and a fresh run is the answer.
+        WorkflowResetError::ErasedSource { exec_id } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "workflow execution {exec_id} had its payloads erased (issue #495), so its \
+                     carried-over node outputs are tombstones and whether it already compensated \
+                     cannot be determined; retrying would resume on unreadable state — start a \
+                     fresh DAG run instead"
+                ),
+            }),
+        )
+            .into_response(),
         WorkflowResetError::Harvest(error) => map_error(error).into_response(),
     }
 }
@@ -20346,6 +20399,13 @@ pub(crate) async fn retry_dag_run_inner(
         operator_id: operator_id.trim().to_string(),
         signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
         allow_terminal_source: true,
+        // Recheck erasure under the fork's own row lock. The pre-flight guard
+        // above ran on an unlocked read, and the connection was dropped for blob
+        // inflation before this transaction opens — so `erase-payloads` can
+        // commit in that window. Without this, the fork would carry tombstoned
+        // outputs and the issue #780 compensated-run guard would have been
+        // decided on evidence that no longer exists.
+        refuse_erased_source: true,
     };
 
     // Dry-run: validate the boundary and return the plan without writing.
@@ -42323,6 +42383,65 @@ mod tests {
             graph_history_needs_inflation(&[opaque_marker]),
             "an opaque MarkerRecorded.details must trigger the inflate/decode pass"
         );
+    }
+
+    /// An offload reference that survives the pass must FAIL the retry, not
+    /// silently pass through as an opaque payload (issue #780 round 9).
+    ///
+    /// The reachable shape is a *configuration removal*: a deployment that had a
+    /// `PayloadStore` registered offloaded an oversized compensation envelope,
+    /// and the store was later unregistered (or failed to construct at boot). On
+    /// the next read `offloader` is `None`, so the inflate pass is skipped
+    /// entirely and `decode_event` happily returns the reference verbatim — it
+    /// is not a codec envelope, so nothing else rejects it. The issue #780
+    /// signal-2 guard then looks for `dag_compensate` inside
+    /// `{"_harvest_offload_envelope": 1, ...}` and finds nothing, so a run that
+    /// fully rolled back reads as retryable.
+    #[tokio::test]
+    async fn a_residual_offload_reference_fails_closed_when_no_store_is_configured() {
+        use autumn_harvest::WorkflowEvent;
+
+        // The stored shape: an `ActivityScheduled.input` that is an offload
+        // reference rather than the real compensation envelope.
+        let mut value = serde_json::to_value(compensation_dispatch_event()).expect("ser");
+        value["data"]["input"] = serde_json::json!({
+            "_harvest_offload_envelope": 1,
+            "store_id": "s3-main",
+            "key": "blob-abc",
+            "len": 4096,
+            "checksum": "deadbeef",
+        });
+        let stored: WorkflowEvent = serde_json::from_value(value).expect("re-deser");
+
+        let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+        let err = inflate_and_decode_events(&[stored], &codecs, None)
+            .await
+            .expect_err(
+                "a history still carrying an offload reference must fail closed: with no store \
+                 configured the compensation envelope is unreadable, and degrading to the raw \
+                 reference would let an already-rolled-back run be retried",
+            );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("offload") && msg.contains("s3-main"),
+            "the error must name the offload reference and the store it points at, so an \
+             operator can restore the right configuration; got: {msg}"
+        );
+    }
+
+    /// The default deployment — no payload store, no offloaded payloads — must
+    /// stay byte-for-byte on the pre-round-9 path.
+    #[tokio::test]
+    async fn a_plain_history_still_passes_with_no_store_configured() {
+        let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+        let decoded = inflate_and_decode_events(
+            &[forward_dispatch_event("a"), compensation_dispatch_event()],
+            &codecs,
+            None,
+        )
+        .await
+        .expect("a history with no offload reference must pass untouched");
+        assert_eq!(decoded.len(), 2, "every event must survive the pass");
     }
 
     #[tokio::test]

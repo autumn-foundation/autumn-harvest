@@ -652,6 +652,18 @@ resolver cannot recover this itself: an offloaded input is indistinguishable
 from a large ordinary forward input, so treating one as a compensation signal
 would reject every legitimate retry of a big-payload compensating DAG.
 
+Inflating is only possible when a payload store is actually registered, and a
+store is optional — so a reference can outlive the configuration that wrote it.
+If the store is unregistered (or fails to construct at boot), the inflate pass is
+skipped entirely and `decode_event` returns the reference verbatim, because it is
+not a codec envelope and nothing else rejects it. Signal 2 would then be reading
+`{"_harvest_offload_envelope": 1, …}` while believing it had the real payload.
+Any reference that survives the pass is therefore an **error**, naming the blob
+key and the store id so the operator can restore the right configuration. When a
+store *is* configured this is unreachable — inflation either resolves the
+reference or rejects a foreign `store_id` — so the check only fires on the
+configuration-removal case.
+
 A DAG run that failed **without** compensators (and every pre-#780 history)
 triggers neither signal and stays fully retryable.
 
@@ -669,6 +681,18 @@ The retry endpoint therefore refuses an erased source run up front, with a `409`
 naming erasure as the blocker. It is an O(1) check on the execution row's own
 `input` column (erasure always tombstones it first) — the same guard the issue
 #612 terminal-query path uses.
+
+That up-front check is a fast path, not the guarantee. It reads the row *without
+a lock*, and the handler then releases its database connection to inflate
+offloaded blobs before opening the fork's transaction — so `erase-payloads`,
+which takes its own `FOR UPDATE` lock, can commit tombstones anywhere in that
+window and the pre-flight would have already passed on the intact row. The fork
+therefore rechecks erasure **under the same row lock it takes to seal the
+source** (`WorkflowResetRequest::refuse_erased_source`), before copying a single
+event. That serialises the two operations: erasure either committed before the
+lock, in which case the fork sees it and refuses, or it queues behind the lock
+and the fork completes on intact events. The flag is `#[serde(skip)]`, so the
+public reset endpoint cannot set it and is byte-for-byte unchanged.
 
 The refusal is correct **independently of compensation**: the issue #148 fork
 carries over the upstream events, whose `output` fields are now tombstones, so a

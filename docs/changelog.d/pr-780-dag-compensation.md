@@ -1101,3 +1101,64 @@ the change) and its mirror `a_started_compensator_with_no_terminal_still_blocks_
 fixtures were made realistic — a compensator that reaches a terminal event always
 carried an `ActivityStarted` in a real history; they had omitted it only because
 nothing read it.
+
+### Round 9 — the erasure guard's TOCTOU window, and offload references that outlive their store
+
+Two P1 review findings, both the same shape as rounds 6–8: a way for the
+compensated-run guard to be reading something other than what it believes.
+
+**(a) Recheck erasure under the fork's own row lock.** The round-7 guard reads
+the execution row *without* a lock, and the handler then deliberately releases
+its database connection to inflate blobs off the pool before opening the reset
+transaction. `POST /workflows/{id}/erase-payloads` takes its own `FOR UPDATE`
+lock, so it can commit tombstones anywhere in that window — the pre-flight
+having already passed on the intact row. The fork would then copy tombstoned
+events, and the compensation decision would have been made on evidence that no
+longer existed.
+
+`WorkflowResetRequest` gains `refuse_erased_source: bool` (`#[serde(skip)]`,
+mirroring `allow_terminal_source`), and `reset_workflow_execution` rechecks
+erasure immediately after `load_source_execution(.., lock = true)` and **before
+`load_event_rows`** — under the lock, before copying a single event — returning
+the new `WorkflowResetError::ErasedSource`. That serialises the two operations:
+erasure either committed before the lock (the fork sees it and refuses) or
+queues behind it (the fork completes on intact events). There is no interleaving
+that forks a tombstoned run.
+
+The DAG retry handler sets the flag; the batch-reset endpoint deliberately does
+not (refusing an erased source there would be an unrelated behavior change), and
+the public reset endpoint cannot set it from the wire, so it is byte-for-byte
+unchanged. The round-7 pre-flight check is kept as the fast path — it answers
+without paying for the history load and blob I/O — and both refusals surface the
+same `409`, so a caller cannot tell which one caught it.
+
+Pinned by `refuse_erased_source_is_not_settable_from_the_wire` (pure; RED as a
+compile error before the field existed), and by two DB tests that stage the race
+outcome deterministically: `reset_refuses_an_erased_source_under_its_own_row_lock`
+drives `reset_workflow_execution` directly against an already-erased run — the
+exact state the race leaves behind, with the pre-flight guard bypassed by
+construction, so the refusal can only come from the locked recheck — and
+`reset_without_the_flag_still_forks_an_erased_source` pins the unchanged
+behavior with the flag off.
+
+**(b) Fail closed on an offload reference with no store configured.** A payload
+store is optional, so `offloader` is `None` both on the default deployment and on
+one that *removed* its store. In the latter case the stored history still carries
+`_harvest_offload_envelope` references, `inflate_and_decode_events` skips the
+inflate pass entirely, and `decode_event` returns the reference verbatim — it is
+not a codec envelope, so nothing rejects it. Signal 2 would then look for
+`dag_compensate` inside a blob pointer and find nothing, leaving a marker-less
+rolled-back run retryable.
+
+Any reference surviving the pass is now an error naming the blob key and store
+id. Placing the check inside `inflate_and_decode_events` gives both callers the
+right posture for free: the retry endpoint propagates it (fails closed), and the
+run-graph reader catches it and degrades to the raw history with a warning, as it
+already does for a decode failure. When a store *is* configured the check is
+unreachable — inflation either resolves the reference or rejects a foreign
+`store_id` — so it only fires on the configuration-removal case and otherwise
+costs a few key lookups per event.
+
+Pinned by `a_residual_offload_reference_fails_closed_when_no_store_is_configured`
+(RED before the change) with `a_plain_history_still_passes_with_no_store_configured`
+as the control that the default deployment is untouched.
