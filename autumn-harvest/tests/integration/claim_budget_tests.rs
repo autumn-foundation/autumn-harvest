@@ -51,7 +51,7 @@ use super::claim_bench_support::db::{self, BenchDb};
 use super::claim_bench_support::{
     BUDGET_ENV_VAR, BudgetVerdict, ClaimGate, HEADLINE_P50_BUDGET_MS, LatencyStats,
     MIN_MEANINGFUL_SAMPLES, SCENARIO_BUDGET_ENV_VAR, Scenario, budget_from_env, budget_verdict,
-    headline_scenario, measured_claims_for, scenario_time_budget,
+    db_name_from_url, headline_scenario, measured_claims_for, scenario_time_budget,
 };
 
 // The published budget lives in the shared harness as
@@ -561,12 +561,13 @@ async fn an_idle_bench_database_still_holds_a_visible_lease() {
         return;
     };
 
-    // `with_db_name` put the database in the path; read it back out.
-    let datname = bench
-        .url
-        .rsplit('/')
-        .next()
-        .and_then(|tail| tail.split('?').next())
+    // `with_db_name` put the database in the path; read it back out with the
+    // parser that is its inverse. A naive `rsplit('/')` here would reintroduce
+    // the exact bug `with_db_name` exists to avoid: against an admin URL like
+    // `?sslrootcert=/etc/ssl/root.crt` the last slash sits inside the query, so
+    // the name would come back as `root.crt` and this test would fail against a
+    // perfectly healthy lease.
+    let datname = db_name_from_url(&bench.url)
         .expect("bench url always carries a database path")
         .to_string();
 

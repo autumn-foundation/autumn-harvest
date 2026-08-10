@@ -499,6 +499,72 @@ pub fn with_db_name(url: &str, db: &str) -> String {
     format!("{prefix}{authority}/{db}{}", &tail[suffix_start..])
 }
 
+/// Read the database name back out of a connection URL.
+///
+/// The inverse of [`with_db_name`], and deliberately its neighbour: reading the
+/// name back with a naive `rsplit('/')` reintroduces exactly the bug that
+/// function exists to avoid — against `?sslrootcert=/etc/ssl/root.crt` the last
+/// slash sits inside the *query*, so the "database name" comes back as
+/// `root.crt`. Parse the path first, then stop at the query.
+///
+/// `None` when the URL carries no path component at all (`postgres://host`).
+#[must_use]
+pub fn db_name_from_url(url: &str) -> Option<&str> {
+    let rest = url.find("://").map_or(url, |i| &url[i + 3..]);
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let tail = &rest[authority_end..];
+    // Only a leading `/` introduces a path; `?`/`#` mean there is none.
+    let path = tail.strip_prefix('/')?;
+    let path_end = path.find(['?', '#']).unwrap_or(path.len());
+    Some(&path[..path_end])
+}
+
+/// What the stale-database sweep should do with one candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepStep {
+    /// Leave it alone without asking the server.
+    Skip,
+    /// Let the server-visible lease decide.
+    AskServer,
+}
+
+/// Decide the fate of one candidate database, without touching a database.
+///
+/// Split out so the *platform-conditional* half is testable on every OS. The
+/// rule that matters: only a definite `Some(true)` from the host may veto the
+/// server. Where liveness cannot be answered — every non-Linux host — the
+/// answer is `None`, and the sweep must fall through to the lease rather than
+/// treat "I cannot tell" as "in use". Reading an unanswerable check as a veto
+/// is what previously made every completed benchmark leak its database forever
+/// on macOS and Windows, because the server check was then never reached.
+///
+/// Ownership is keyed on the run token, not the pid: two containerised runs on
+/// different hosts both report pid 1, so a pid would make one run exempt the
+/// other's databases from reclamation and, worse, claim them as its own.
+#[must_use]
+pub fn sweep_step(
+    owner_token: Option<&str>,
+    my_token: &str,
+    owner_pid: Option<u32>,
+    same_host_pid_alive: Option<bool>,
+) -> SweepStep {
+    // Ours — including the database we are about to create, whose lease does
+    // not exist yet between `CREATE DATABASE` and the connect that takes it.
+    if owner_token == Some(my_token) {
+        return SweepStep::Skip;
+    }
+    // A name we did not mint: not ours to reclaim.
+    if owner_pid.is_none() {
+        return SweepStep::Skip;
+    }
+    // Another *local* run inside its own create-to-lease window, which the
+    // server cannot see yet.
+    if same_host_pid_alive == Some(true) {
+        return SweepStep::Skip;
+    }
+    SweepStep::AskServer
+}
+
 // ---------------------------------------------------------------------------
 // Pure unit tests (run on every OS, no Docker, no `db` feature).
 // ---------------------------------------------------------------------------
@@ -515,9 +581,9 @@ mod pure_tests {
 
     use super::{
         BACKLOG_SWEEP, BudgetVerdict, ClaimGate, DEFAULT_SCENARIO_BUDGET_SECS,
-        HEADLINE_P50_BUDGET_MS, LatencyStats, budget_from_str, budget_verdict, claims_for_claimer,
-        headline_scenario, measured_claims_for, percentile_ms, redact_url, warmup_claims_for,
-        with_db_name,
+        HEADLINE_P50_BUDGET_MS, LatencyStats, SweepStep, budget_from_str, budget_verdict,
+        claims_for_claimer, db_name_from_url, headline_scenario, measured_claims_for,
+        percentile_ms, redact_url, sweep_step, warmup_claims_for, with_db_name,
     };
 
     #[test]
@@ -711,6 +777,116 @@ mod pure_tests {
         );
     }
 
+    /// A run never reclaims its own database, whatever the host reports.
+    #[test]
+    fn sweep_step_skips_our_own_run() {
+        assert_eq!(
+            sweep_step(Some("mytoken"), "mytoken", Some(1), Some(false)),
+            SweepStep::Skip
+        );
+        // Even mid create-to-lease, when the server would report no backends.
+        assert_eq!(
+            sweep_step(Some("mytoken"), "mytoken", Some(1), None),
+            SweepStep::Skip
+        );
+    }
+
+    /// Two containerised runs on different hosts both report pid 1. Ownership
+    /// must key on the run token, or one would treat the other's live database
+    /// as its own.
+    #[test]
+    fn sweep_step_does_not_confuse_a_foreign_run_sharing_our_pid() {
+        assert_eq!(
+            sweep_step(Some("theirs"), "mine", Some(1), None),
+            SweepStep::AskServer,
+        );
+    }
+
+    /// The headline of this fix: where liveness cannot be answered, the sweep
+    /// must consult the server rather than read "I cannot tell" as "in use".
+    /// Reading it as a veto leaked every completed benchmark's database.
+    #[test]
+    fn sweep_step_asks_the_server_when_liveness_is_unanswerable() {
+        assert_eq!(
+            sweep_step(Some("theirs"), "mine", Some(4242), None),
+            SweepStep::AskServer,
+        );
+    }
+
+    /// A definite live same-host pid still protects another local run inside
+    /// its create-to-lease window.
+    #[test]
+    fn sweep_step_defers_to_a_definite_live_local_pid() {
+        assert_eq!(
+            sweep_step(Some("theirs"), "mine", Some(4242), Some(true)),
+            SweepStep::Skip,
+        );
+        assert_eq!(
+            sweep_step(Some("theirs"), "mine", Some(4242), Some(false)),
+            SweepStep::AskServer,
+        );
+    }
+
+    /// A name this harness did not mint is never reclaimed.
+    #[test]
+    fn sweep_step_leaves_unparseable_names_alone() {
+        assert_eq!(sweep_step(None, "mine", None, Some(false)), SweepStep::Skip);
+        assert_eq!(
+            sweep_step(Some("notapid"), "mine", None, None),
+            SweepStep::Skip
+        );
+    }
+
+    /// The inverse of `with_db_name` must not reintroduce the last-slash bug.
+    ///
+    /// A slash inside a query value is the exact case that makes `rsplit('/')`
+    /// return a certificate filename instead of the database.
+    #[test]
+    fn db_name_from_url_reads_the_path_not_the_last_slash() {
+        assert_eq!(
+            db_name_from_url("postgres://u:p@h:5432/bench_1"),
+            Some("bench_1")
+        );
+        assert_eq!(
+            db_name_from_url("postgres://u:p@h:5432/bench_1?sslmode=require"),
+            Some("bench_1")
+        );
+        assert_eq!(
+            db_name_from_url("postgres://u:p@h:5432/bench_1?sslrootcert=/etc/ssl/root.crt"),
+            Some("bench_1"),
+        );
+        assert_eq!(
+            db_name_from_url("postgres://u:p@h:5432/bench_1#frag"),
+            Some("bench_1")
+        );
+    }
+
+    /// No path component at all, so there is no name to report.
+    #[test]
+    fn db_name_from_url_is_none_without_a_path() {
+        assert_eq!(db_name_from_url("postgres://host"), None);
+        assert_eq!(db_name_from_url("postgres://host?sslmode=require"), None);
+    }
+
+    /// Round-trips with the writer it is the inverse of, including the awkward
+    /// URLs that motivated both functions.
+    #[test]
+    fn db_name_from_url_round_trips_with_with_db_name() {
+        for base in [
+            "postgres://u:p@h:5432/postgres",
+            "postgres://u:p@h:5432/postgres?sslmode=require",
+            "postgres://u:p@h:5432/postgres?sslrootcert=/etc/ssl/root.crt",
+            "postgres://host",
+        ] {
+            let rewritten = with_db_name(base, "harvest_claim_bench_1_deadbeefdeadbeef_0");
+            assert_eq!(
+                db_name_from_url(&rewritten),
+                Some("harvest_claim_bench_1_deadbeefdeadbeef_0"),
+                "round trip failed for {base}",
+            );
+        }
+    }
+
     #[test]
     fn with_db_name_preserves_query_parameters() {
         // Dropping `?sslmode=require` makes a TLS-requiring server unreachable
@@ -860,6 +1036,34 @@ pub mod db {
 
     static DB_SEQ: AtomicU64 = AtomicU64::new(0);
 
+    /// A token unique to this *run*, mixed into every database name.
+    ///
+    /// A pid alone does not identify a run once an admin URL is shared across
+    /// hosts: PID 1 is the norm for a containerised process, so two runs on
+    /// different machines would both mint `harvest_claim_bench_1_0` and race at
+    /// `CREATE DATABASE` — failing one perfectly valid benchmark. It would also
+    /// make the sweep's self-exemption wrong in the other direction, since a
+    /// foreign run's database would look like our own.
+    ///
+    /// `RandomState` is seeded from OS entropy per process, so hashing the
+    /// current time and pid through it yields a value that differs across hosts
+    /// and across runs on one host. Std-only: the harness deliberately pulls in
+    /// no RNG crate for a name suffix.
+    fn run_token() -> &'static str {
+        static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        TOKEN.get_or_init(|| {
+            use std::hash::{BuildHasher, Hasher};
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u128(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos()),
+            );
+            h.write_u32(std::process::id());
+            format!("{:016x}", h.finish())
+        })
+    }
+
     /// Why a bench/gate run was skipped rather than executed.
     #[derive(Debug)]
     pub struct SkipReason(pub String);
@@ -912,7 +1116,16 @@ pub mod db {
                 .map_err(|e| SkipReason(format!("connect {safe_url}: {e}")))?;
             drop_stale_bench_databases(&mut admin).await;
             let n = DB_SEQ.fetch_add(1, Ordering::SeqCst);
-            let db = format!("harvest_claim_bench_{}_{}", std::process::id(), n);
+            // Shape: harvest_claim_bench_{pid}_{run_token}_{seq}. The pid is a
+            // cheap same-host liveness handle for the sweep; the run token is
+            // what actually makes the name unique when the admin URL is shared
+            // across hosts (see `run_token`).
+            let db = format!(
+                "{BENCH_DB_PREFIX}{}_{}_{}",
+                std::process::id(),
+                run_token(),
+                n
+            );
             diesel::sql_query(format!("CREATE DATABASE {db}"))
                 .execute(&mut admin)
                 .await
@@ -995,28 +1208,34 @@ pub mod db {
             return;
         };
 
-        let me = std::process::id();
         for row in rows {
-            // Name shape: harvest_claim_bench_{pid}_{seq}. Ours, or another
-            // live process's, is left alone.
-            let owner_pid = row
+            // Name shape: harvest_claim_bench_{pid}_{run_token}_{seq}.
+            let mut parts = row
                 .datname
                 .strip_prefix(BENCH_DB_PREFIX)
-                .and_then(|rest| rest.split('_').next())
-                .and_then(|pid| pid.parse::<u32>().ok());
-            match owner_pid {
-                Some(pid) if pid == me || process_is_alive(pid) => continue,
-                Some(_) => {}
-                // Unparseable name: not ours to reclaim.
-                None => continue,
+                .into_iter()
+                .flat_map(|rest| rest.split('_'));
+            let owner_pid = parts.next().and_then(|pid| pid.parse::<u32>().ok());
+            let owner_token = parts.next();
+
+            // `None` on a platform that cannot answer, so it never vetoes.
+            #[cfg(target_os = "linux")]
+            let same_host_pid_alive = owner_pid.map(process_is_alive);
+            #[cfg(not(target_os = "linux"))]
+            let same_host_pid_alive: Option<bool> = None;
+
+            if super::sweep_step(owner_token, run_token(), owner_pid, same_host_pid_alive)
+                == super::SweepStep::Skip
+            {
+                continue;
             }
-            // The pid check above only answers for *this* host. When several
-            // machines share one admin URL, a run on another host has a pid
-            // that is absent from the local `/proc` and therefore looks dead —
-            // and `WITH (FORCE)` would terminate it mid-measurement. So ask the
-            // server, which is the one party that can see every client: a
-            // benchmark in flight holds a pool open against its own database,
-            // so any backend at all means "in use, not ours to reclaim".
+
+            // The authority. A pid answers only for this host, so when several
+            // machines share one admin URL a foreign run looks dead and
+            // `WITH (FORCE)` would terminate it mid-measurement. The server is
+            // the one party that can see every client, and a live run holds a
+            // lease connection for the whole life of its database (see
+            // `BenchDb::_lease`), so any backend at all means "in use".
             if database_has_connections(admin, &row.datname).await {
                 continue;
             }

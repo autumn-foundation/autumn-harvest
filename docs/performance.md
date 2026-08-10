@@ -101,14 +101,17 @@ Two more things worth knowing before pointing this at a server you care about:
   that is what reclaims databases orphaned by a run that panicked, which a
   teardown hook can never do. It skips any database whose owning pid is still
   alive, so concurrent runs cannot delete each other's working set. The liveness
-  check is Linux-only (`/proc/{pid}`); everywhere else it conservatively assumes
-  the pid is alive, so on macOS and Windows stale databases accumulate until
-  removed by hand. A pid says nothing about a run on *another* host sharing the
-  same server, so the sweep also asks the server itself whether anything holds a
-  backend against the database — and each run keeps one idle connection open for
-  the whole life of its database precisely so that question has an answer even
-  between scenarios. Credentials never reach a log line: the URL is redacted to
-  `scheme://***@host:port/db` before it is printed.
+  authority is the **server**, not the local process table: the sweep asks
+  whether anything holds a backend against the database, and each run keeps one
+  idle connection open for the whole life of its database precisely so that
+  question has an answer even between scenarios. A pid cannot answer for a run
+  on another host, and on non-Linux hosts it cannot answer at all — so a pid is
+  only ever allowed to *protect* (a definitely-live local pid covers another
+  local run's create-to-lease window, which the server cannot see yet), never to
+  veto. Ownership is keyed on a per-run token rather than the pid, since two
+  containerised runs on different hosts both report pid 1. Credentials never
+  reach a log line: the URL is redacted to `scheme://***@host:port/db` before it
+  is printed.
 * **`HARVEST_BENCH_SCENARIO_SECS`** caps each scenario's measured phase
   (default 240 s). It is the knob to raise when a row comes back marked `⚠` or
   `‡` — see [measurement hygiene](#measurement-hygiene).
