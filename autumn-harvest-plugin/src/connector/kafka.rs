@@ -161,6 +161,24 @@ fn to_inbound(
     }
 }
 
+/// Whether a `recv()` error should be deferred so the records already drained
+/// in this pass are still returned.
+///
+/// **This is a message-loss guard, not a nicety.** Every record handed back by
+/// `recv()` has advanced librdkafka's *local* consumer position, whether or
+/// not it ever reaches the runtime. If a mid-batch error discarded them, the
+/// next poll would start at a higher offset, that offset would establish the
+/// [`OffsetTracker`][t]'s floor for the partition, and committing it would
+/// assert every lower offset is done — silently skipping records that were
+/// never dispatched. Returning the partial batch keeps them on the normal
+/// dispatch-then-commit path; the error resurfaces on the next poll, which by
+/// then has nothing drained to lose.
+///
+/// [t]: crate::connector::OffsetTracker
+const fn defer_recv_error(drained: usize) -> bool {
+    drained > 0
+}
+
 #[async_trait]
 impl EventSource for KafkaSource {
     fn stream(&self) -> &str {
@@ -179,8 +197,24 @@ impl EventSource for KafkaSource {
         while batch.len() < max {
             let next = tokio::time::timeout(budget, self.consumer.recv()).await;
             let Ok(result) = next else { break };
-            let message =
-                result.map_err(|e| ConnectorError::Broker(format!("kafka receive: {e}")))?;
+            let message = match result {
+                Ok(message) => message,
+                Err(e) if defer_recv_error(batch.len()) => {
+                    // Hand back what we already drained; the next poll surfaces
+                    // the error with an empty batch. Dropping these records
+                    // would lose them permanently (see `defer_recv_error`).
+                    tracing::warn!(
+                        topic = %self.topic,
+                        drained = batch.len(),
+                        error = %e,
+                        "kafka receive failed mid-batch; yielding the drained records first"
+                    );
+                    return Ok(batch);
+                }
+                Err(e) => {
+                    return Err(ConnectorError::Broker(format!("kafka receive: {e}")));
+                }
+            };
 
             let headers = message.headers().map_or_else(BTreeMap::new, |hs| {
                 (0..hs.count())
@@ -341,5 +375,23 @@ mod tests {
             .await
             .expect_err("an opaque handle cannot address a Kafka offset");
         assert!(format!("{err}").contains("partition/offset"));
+    }
+
+    #[test]
+    fn a_recv_error_after_partial_drain_yields_the_batch_instead_of_dropping_it() {
+        // Records already drained from the consumer have advanced librdkafka's
+        // LOCAL position, whether or not they ever reach the runtime. Dropping
+        // them on a later `recv()` error is silent message loss: the next poll
+        // starts at a higher offset, that offset establishes the tracker's
+        // floor, its completion commits, and the dropped records are asserted
+        // done by the high-water mark without ever having been dispatched.
+        assert!(
+            defer_recv_error(1),
+            "a partial batch must be returned, not dropped",
+        );
+        assert!(defer_recv_error(12));
+        // With nothing drained there is nothing to lose, so the error is the
+        // only useful thing to report.
+        assert!(!defer_recv_error(0));
     }
 }

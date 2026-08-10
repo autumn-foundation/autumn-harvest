@@ -243,6 +243,39 @@ build time rather than at the first message.
 `signals_with_start` bindings always use broker coordinates: the signal path's
 key is a body field with no such mutual exclusion.
 
+### The dedupe guarantee has a lifetime — size it to your broker
+
+Coordinate dedupe rides harvest's start-idempotency claim, and that claim is
+**purged** after `start_idempotency_window` (default **24 hours**). So the
+guarantee is *"one execution per message for the window's lifetime"*, not
+unconditionally forever.
+
+That matters because brokers can replay far older than a day:
+
+* **Kafka** — a consumer-group offset reset or a deliberate topic replay can
+  re-deliver an offset from anywhere inside the topic's retention.
+* **SQS** — message retention runs up to 14 days, and a message that keeps
+  failing can be redelivered across many receives, well past 24 hours.
+
+A redelivery that lands *after* the claim is purged reserves the key as fresh,
+so if the first run has already reached a terminal state you get a **second
+execution**. Set the window to at least how far back your broker can replay:
+
+```rust
+HarvestPlugin::new()
+    // Cover the topic's full retention, so a replay can never look fresh.
+    .start_idempotency_window(std::time::Duration::from_secs(7 * 24 * 60 * 60))
+```
+
+Harvest logs a warning at startup for any coordinate-dedupe binding when the
+window is left at its default, naming the binding. Setting the window
+explicitly — to any value — silences it, on the assumption that an explicit
+value is a considered one.
+
+The cost of a longer window is retained rows in `harvest_start_idempotency`
+(one small row per keyed start until it is purged), so size it to the replay
+lifetime you actually need rather than the largest number you can think of.
+
 ## Poison messages
 
 A message that can never succeed must not wedge its partition. Two classes:

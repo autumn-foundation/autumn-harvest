@@ -283,6 +283,24 @@ impl HarvestPlugin {
         self
     }
 
+    /// How long a keyed workflow start's idempotency claim is retained
+    /// (issue #808; default 24 h).
+    ///
+    /// Load-bearing for broker connectors (issue #944): a `BrokerCoordinates`
+    /// binding dedupes through this claim, so the "one execution per message"
+    /// guarantee lasts exactly as long as the window. Brokers replay much
+    /// older than a day — a Kafka consumer-group reset or topic replay, an SQS
+    /// message redelivered across many receives — and a redelivery arriving
+    /// after the claim is purged reserves the key as *fresh*, starting a
+    /// second execution. Size this to how far back your broker can replay;
+    /// harvest warns at startup if a coordinate-dedupe binding is registered
+    /// while this is left at its default.
+    #[must_use]
+    pub fn start_idempotency_window(mut self, window: std::time::Duration) -> Self {
+        self.builder = self.builder.start_idempotency_window(window);
+        self
+    }
+
     /// Mount the Harvest management API under `path`.
     #[must_use]
     pub fn api(mut self, path: impl Into<String>) -> Self {
@@ -641,6 +659,31 @@ impl HarvestPlugin {
 /// Panics when a binding is invalid or when its adapter's `stream()` does not
 /// match the binding's declared `stream` — both are startup misconfigurations
 /// that would otherwise surface as a silently idle consumer.
+/// Whether a binding's coordinate dedupe is left bounded by the *default*
+/// start-idempotency window (issue #944, Codex review).
+///
+/// A `BrokerCoordinates` binding feeds its derived key to harvest's
+/// start-idempotency machinery (#808), whose claim is **purged** after
+/// `HarvestBuilder::start_idempotency_window` (default 24 h). So the dedupe
+/// guarantee is bounded by that window, not unconditional: a Kafka offset can
+/// be replayed arbitrarily later (a consumer-group reset, a topic replay), and
+/// an SQS message can be redelivered past 24 h across repeated receives. A
+/// redelivery arriving after the claim is purged reserves the key as *fresh*
+/// and starts a second execution once the first run is terminal.
+///
+/// Returns true only when the operator has not tuned the window at all, which
+/// is the case worth telling them about; an explicitly configured window means
+/// they have already weighed it. Pure so the decision is unit-testable without
+/// capturing `tracing` output, mirroring [`mcp_tools_unprotected`].
+#[cfg(feature = "connectors")]
+const fn coordinate_dedupe_window_untuned(
+    mode: crate::connector::IdempotencyMode,
+    configured_window: Option<std::time::Duration>,
+) -> bool {
+    matches!(mode, crate::connector::IdempotencyMode::BrokerCoordinates)
+        && configured_window.is_none()
+}
+
 /// Whether a binding's declared stream matches the stream its adapter
 /// actually consumes (issue #944).
 ///
@@ -848,6 +891,32 @@ impl Plugin for HarvestPlugin {
                     registration.binding.stream,
                     registration.source.stream()
                 );
+                // Not fatal: a bounded dedupe guarantee is correct for most
+                // deployments, and only the operator knows how far back their
+                // broker can replay. But the bound is invisible otherwise, so
+                // say it out loud once at startup.
+                if coordinate_dedupe_window_untuned(
+                    crate::connector::resolve_idempotency_mode(
+                        registration.binding.target,
+                        registration.binding.idempotency_mode,
+                        builder
+                            .workflow_infos()
+                            .iter()
+                            .find(|w| w.name == registration.binding.target.workflow()),
+                    ),
+                    builder.start_idempotency_window_config(),
+                ) {
+                    tracing::warn!(
+                        binding = registration.binding.name,
+                        stream = registration.binding.stream,
+                        "harvest connector dedupes on broker coordinates, but \
+                         `start_idempotency_window` is the 24h default: a redelivery \
+                         arriving after the claim is purged would start a SECOND \
+                         execution. Size the window to how far back your broker can \
+                         replay (Kafka retention / SQS message retention) via \
+                         `HarvestBuilder::start_idempotency_window`"
+                    );
+                }
                 assert!(
                     broker_native_dead_letter_is_supported(
                         registration.binding.dead_letter_mode,
@@ -2859,6 +2928,39 @@ mod tests {
         // Length-equal but different, so a naive length check cannot pass.
         assert!(!binding_stream_matches_adapter("orders", "ordera"));
         assert!(binding_stream_matches_adapter("", ""));
+    }
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn coordinate_dedupe_warns_only_when_the_window_is_left_at_its_default() {
+        use crate::connector::IdempotencyMode;
+        use std::time::Duration;
+
+        // The connector's dedupe claim lives in harvest's start-idempotency
+        // table, which PURGES after the window -- so "idempotent by
+        // construction" is really "idempotent for the window's lifetime". A
+        // broker that can replay older than that gets a second execution.
+        assert!(
+            coordinate_dedupe_window_untuned(IdempotencyMode::BrokerCoordinates, None),
+            "an untuned window leaves the dedupe bound invisible; say it once",
+        );
+        // Explicitly configured: the operator has already weighed it, so do
+        // not nag on every boot.
+        assert!(!coordinate_dedupe_window_untuned(
+            IdempotencyMode::BrokerCoordinates,
+            Some(Duration::from_secs(14 * 24 * 60 * 60)),
+        ));
+        // Even a *shorter* explicit window is a deliberate choice.
+        assert!(!coordinate_dedupe_window_untuned(
+            IdempotencyMode::BrokerCoordinates,
+            Some(Duration::from_secs(60)),
+        ));
+        // WorkflowId mode does not use the start-idempotency claim at all, so
+        // the window is irrelevant to it.
+        assert!(!coordinate_dedupe_window_untuned(
+            IdempotencyMode::WorkflowId,
+            None,
+        ));
     }
 
     #[cfg(feature = "connectors")]
