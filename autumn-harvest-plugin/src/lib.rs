@@ -10,6 +10,12 @@ pub mod api_token;
 pub mod callback_deliverer;
 pub mod canary;
 pub mod config;
+/// Broker event-source connectors for workflow triggers (issue #944).
+///
+/// The core `autumn-harvest` crate gains **zero** broker dependencies: every
+/// broker client lives behind this plugin's `kafka` / `sqs` features.
+#[cfg(feature = "connectors")]
+pub mod connector;
 pub mod dag_graph;
 pub mod dag_retry;
 pub mod lineage;

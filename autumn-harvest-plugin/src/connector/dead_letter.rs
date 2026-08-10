@@ -1,0 +1,273 @@
+//! Durable dead-letter destination for poison broker messages (issue #944).
+//!
+//! # Why a plugin-owned table, not `harvest_dead_letters`
+//!
+//! The engine's `harvest_dead_letters` table is keyed to a *task*:
+//! `original_task_id` is `NOT NULL` and `task_type` carries a
+//! `CHECK (task_type IN ('workflow','activity'))`. A poison broker message has
+//! neither — it never became a task, and by definition never produced an
+//! execution. Reusing that table would mean relaxing a **core** schema
+//! constraint; issue #944 explicitly forbids a core migration for the trigger
+//! path and explicitly sanctions a plugin-owned table instead.
+//!
+//! `harvest_connector_dead_letters` therefore lives in the plugin's own
+//! migrations directory, alongside `harvest_workflow_outbox` — both are
+//! app-side ingestion/egress tables rather than engine state. **No
+//! `WorkflowEvent` variant, no core migration.**
+
+use async_trait::async_trait;
+use autumn_harvest::telemetry::PoisonReason;
+use chrono::{DateTime, Utc};
+use diesel_async::AsyncPgConnection;
+use uuid::Uuid;
+
+use super::source::ConnectorError;
+
+/// One poison message, captured with everything needed to diagnose and replay
+/// it by hand.
+#[derive(Debug, Clone)]
+pub struct ConnectorDeadLetter {
+    /// The binding the message arrived on.
+    pub binding: String,
+    /// The logical stream (topic or queue).
+    pub stream: String,
+    /// Rendered broker coordinates, e.g. `orders:0:91`.
+    pub coordinates: String,
+    /// The derived idempotency key, so an operator can correlate this record
+    /// with a redelivery.
+    pub idempotency_key: String,
+    /// The target workflow type.
+    pub workflow_name: String,
+    /// Bounded poison classification.
+    pub reason: PoisonReason,
+    /// Human-readable detail (the decode error, the rejection, the refusal).
+    pub detail: String,
+    /// Consecutive strikes at the point of dead-lettering.
+    pub attempts: i32,
+    /// The raw message body, so the message can be replayed after a fix.
+    pub payload: Vec<u8>,
+    /// When the message was dead-lettered.
+    pub failed_at: DateTime<Utc>,
+}
+
+/// Where a binding's poison messages are written.
+#[async_trait]
+pub trait DeadLetterSink: Send + Sync {
+    /// Durably record a poison message.
+    ///
+    /// The runtime acknowledges the broker message **only after** this
+    /// returns `Ok`, so a sink failure leaves the message for redelivery
+    /// rather than losing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorError::Broker`] (or [`ConnectorError::Config`]) when
+    /// the record could not be written.
+    async fn write(&self, entry: &ConnectorDeadLetter) -> Result<(), ConnectorError>;
+}
+
+/// A sink that writes to `harvest_connector_dead_letters`.
+pub struct PostgresDeadLetterSink {
+    pool: autumn_harvest::worker::DbPool,
+}
+
+impl std::fmt::Debug for PostgresDeadLetterSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresDeadLetterSink")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PostgresDeadLetterSink {
+    /// Write dead letters to `pool`'s database.
+    #[must_use]
+    pub const fn new(pool: autumn_harvest::worker::DbPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl DeadLetterSink for PostgresDeadLetterSink {
+    async fn write(&self, entry: &ConnectorDeadLetter) -> Result<(), ConnectorError> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| ConnectorError::Broker(format!("dead-letter pool: {e}")))?;
+
+        insert_dead_letter(&mut conn, entry).await
+    }
+}
+
+/// Insert one dead-letter row.
+///
+/// Split out from the sink so integration tests can drive it against a
+/// caller-owned connection.
+///
+/// # Errors
+///
+/// Returns [`ConnectorError::Broker`] when the insert fails.
+pub async fn insert_dead_letter(
+    conn: &mut AsyncPgConnection,
+    entry: &ConnectorDeadLetter,
+) -> Result<(), ConnectorError> {
+    use diesel::sql_types::{Binary, Int4, Text, Timestamptz, Uuid as SqlUuid};
+    use diesel_async::RunQueryDsl;
+
+    // `ON CONFLICT (idempotency_key) DO NOTHING` makes dead-lettering itself
+    // idempotent: a redelivery that dead-letters again (e.g. after a
+    // connector restart reset the strike counter) must not create a second
+    // record for the same message.
+    diesel::sql_query(
+        "INSERT INTO harvest_connector_dead_letters \
+         (id, binding, stream, coordinates, idempotency_key, workflow_name, reason, detail, \
+          attempts, payload, failed_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         ON CONFLICT (idempotency_key) DO NOTHING",
+    )
+    .bind::<SqlUuid, _>(Uuid::new_v4())
+    .bind::<Text, _>(&entry.binding)
+    .bind::<Text, _>(&entry.stream)
+    .bind::<Text, _>(&entry.coordinates)
+    .bind::<Text, _>(&entry.idempotency_key)
+    .bind::<Text, _>(&entry.workflow_name)
+    .bind::<Text, _>(entry.reason.as_str())
+    .bind::<Text, _>(&entry.detail)
+    .bind::<Int4, _>(entry.attempts)
+    .bind::<Binary, _>(&entry.payload)
+    .bind::<Timestamptz, _>(entry.failed_at)
+    .execute(conn)
+    .await
+    .map_err(|e| ConnectorError::Broker(format!("dead-letter insert: {e}")))?;
+
+    Ok(())
+}
+
+/// A sink that records nothing.
+///
+/// Used with [`super::disposition::DeadLetterMode::BrokerNative`], where the
+/// broker's own redrive policy owns the dead-letter destination and the
+/// runtime abandons the message rather than acknowledging it. Also useful in
+/// tests.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopDeadLetterSink;
+
+#[async_trait]
+impl DeadLetterSink for NoopDeadLetterSink {
+    async fn write(&self, _entry: &ConnectorDeadLetter) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+}
+
+/// A sink that records into memory, exported for tests and local development.
+///
+/// Lets an embedder assert *what* would have been dead-lettered — reason,
+/// coordinates, raw payload — without provisioning a database, and is what the
+/// connector's own poison-isolation suite runs against.
+#[derive(Debug, Default, Clone)]
+pub struct RecordingDeadLetterSink {
+    entries: std::sync::Arc<std::sync::Mutex<Vec<ConnectorDeadLetter>>>,
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RecordingDeadLetterSink {
+    /// An empty recording sink.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Make every subsequent [`DeadLetterSink::write`] fail, so a caller can
+    /// assert the runtime leaves the message for redelivery rather than
+    /// acknowledging a dead letter it never durably recorded.
+    pub fn fail_writes(&self, fail: bool) {
+        self.fail.store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Everything written so far, in order.
+    #[must_use]
+    pub fn entries(&self) -> Vec<ConnectorDeadLetter> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait]
+impl DeadLetterSink for RecordingDeadLetterSink {
+    async fn write(&self, entry: &ConnectorDeadLetter) -> Result<(), ConnectorError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ConnectorError::Broker("recording sink failure".to_string()));
+        }
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(entry.clone());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn noop_sink_accepts_everything() {
+        let sink = NoopDeadLetterSink;
+        let entry = ConnectorDeadLetter {
+            binding: "orders".to_string(),
+            stream: "orders".to_string(),
+            coordinates: "orders:0:1".to_string(),
+            idempotency_key: "conn:L6:orders:L0::L11:orders:0:1".to_string(),
+            workflow_name: "order_flow".to_string(),
+            reason: PoisonReason::Malformed,
+            detail: "bad json".to_string(),
+            attempts: 1,
+            payload: b"{".to_vec(),
+            failed_at: Utc::now(),
+        };
+        assert!(sink.write(&entry).await.is_ok());
+    }
+
+    fn entry() -> ConnectorDeadLetter {
+        ConnectorDeadLetter {
+            binding: "orders".to_string(),
+            stream: "orders".to_string(),
+            coordinates: "orders:0:1".to_string(),
+            idempotency_key: "k".to_string(),
+            workflow_name: "order_flow".to_string(),
+            reason: PoisonReason::Malformed,
+            detail: "bad json".to_string(),
+            attempts: 1,
+            payload: b"{".to_vec(),
+            failed_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_sink_captures_entries_in_order() {
+        let sink = RecordingDeadLetterSink::new();
+        sink.write(&entry()).await.unwrap();
+        let mut second = entry();
+        second.coordinates = "orders:0:2".to_string();
+        sink.write(&second).await.unwrap();
+
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].coordinates, "orders:0:1");
+        assert_eq!(entries[1].coordinates, "orders:0:2");
+    }
+
+    #[tokio::test]
+    async fn recording_sink_can_be_made_to_fail() {
+        let sink = RecordingDeadLetterSink::new();
+        sink.fail_writes(true);
+        assert!(sink.write(&entry()).await.is_err());
+        assert!(sink.entries().is_empty(), "a failed write records nothing");
+
+        sink.fail_writes(false);
+        assert!(sink.write(&entry()).await.is_ok());
+        assert_eq!(sink.entries().len(), 1);
+    }
+}

@@ -2443,6 +2443,61 @@ impl StartWorkflowRequest {
             start_source_ref_override: None,
         }
     }
+
+    /// Request carrying the deterministic `workflow_id` a broker connector's
+    /// mapping function returned (issue #944).
+    ///
+    /// Differs from [`Self::from_webhook`] in one way: the connector may also
+    /// supply an explicit start `idempotency_key` (issue #808) derived from the
+    /// message's broker coordinates, so a redelivery converges on exactly one
+    /// execution even when the mapper's `workflow_id` is not itself a stable
+    /// event identity. It is `None` when the binding resolved to
+    /// `IdempotencyMode::WorkflowId` — a keyed start is mutually exclusive with
+    /// a throttle / debounce / batch admission policy (`400`), so a target with
+    /// deferred admission dedupes on the mapper's `workflow_id` instead.
+    ///
+    /// `start_source_ref_override` carries the rendered broker coordinates
+    /// (`orders:3:91`), so an operator can trace an execution back to the exact
+    /// message that produced it.
+    ///
+    /// Only called from `connector/dispatch.rs`, which is entirely excluded
+    /// from the build without the `connectors` cargo feature; without this,
+    /// a default build sees zero callers and clippy's `-D warnings` treats
+    /// that as a hard error.
+    #[cfg_attr(not(feature = "connectors"), allow(dead_code))]
+    pub(crate) const fn from_broker(
+        workflow_id: String,
+        input: Value,
+        queue: Option<String>,
+        idempotency_key: Option<String>,
+        coordinates: Option<String>,
+    ) -> Self {
+        Self {
+            workflow_id: Some(workflow_id),
+            input: Some(input),
+            queue,
+            memo: None,
+            search_attrs: None,
+            execution_timeout_secs: None,
+            sla_secs: None,
+            reuse_policy: None,
+            conflict_policy: None,
+            start_at: None,
+            delay: None,
+            batch_key: None,
+            batch_max_size: None,
+            batch_max_wait: None,
+            completion_callbacks: None,
+            context_headers: None,
+            priority: None,
+            idempotency_key,
+            shard_id: None,
+            residency_key: None,
+            // Broker-delegated starts record `broker` provenance (#740/#944).
+            start_source_override: Some(autumn_harvest::StartSource::Broker),
+            start_source_ref_override: coordinates,
+        }
+    }
 }
 
 /// Response body for a 409 Conflict returned by `RejectDuplicate` policy.
@@ -2519,6 +2574,42 @@ impl SignalWithStartRequest {
             // Webhook-delegated signal-with-start records `webhook` provenance
             // on a fresh run (#740/#344).
             start_source_override: Some(autumn_harvest::StartSource::Webhook),
+        }
+    }
+
+    /// Request built by a broker connector's `SignalsWithStart` binding
+    /// (issue #944).
+    ///
+    /// The `idempotency_key` is the connector's derived key, namespaced by the
+    /// binding and signal name exactly as the webhook receiver namespaces
+    /// `{path}:{signal_name}:{delivery_id}` — so a redelivery of the same
+    /// broker message delivers the signal exactly once, and two bindings that
+    /// happen to target the same `(workflow_name, workflow_id)` never collide.
+    ///
+    /// Only called from `connector/dispatch.rs`, which is entirely excluded
+    /// from the build without the `connectors` cargo feature.
+    #[cfg_attr(not(feature = "connectors"), allow(dead_code))]
+    pub(crate) fn from_broker(
+        workflow_id: String,
+        signal_input: Value,
+        signal_name: String,
+        idempotency_key: Option<String>,
+        queue: Option<String>,
+    ) -> Self {
+        Self {
+            workflow_id,
+            start_input: Some(signal_input.clone()),
+            signal_name,
+            signal_payload: Some(signal_input),
+            queue,
+            memo: None,
+            search_attrs: None,
+            execution_timeout_secs: None,
+            id_reuse_policy: None,
+            idempotency_key,
+            // Broker-delegated signal-with-start records `broker` provenance on
+            // a fresh run (#740/#944).
+            start_source_override: Some(autumn_harvest::StartSource::Broker),
         }
     }
 }
