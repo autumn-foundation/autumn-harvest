@@ -42,6 +42,7 @@ mod cross_workflow_signal_tests;
 #[cfg(feature = "db")]
 mod ctx_info_tests;
 mod dag_builder;
+mod dag_compensation_tests;
 mod dag_execution_timeout_tests;
 mod dag_input_binding_tests;
 mod dag_mapping_tests;

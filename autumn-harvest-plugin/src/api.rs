@@ -5288,6 +5288,162 @@ pub(crate) async fn read_path_decoder(
     Some(api_state.payload_codecs())
 }
 
+/// `true` when a payload-bearing field holds a stored envelope this process
+/// has not yet inflated / decoded — either the payload-offload reference
+/// envelope (issue #524) or a codec envelope (issue #608).
+///
+/// Both predicates are the crates' own authoritative shape checks, so this can
+/// never drift from what the inflater / decoder actually recognises.
+fn payload_field_is_opaque(value: &Value) -> bool {
+    autumn_harvest::payload_store::extract_offload_ref(value).is_some()
+        || autumn_harvest::payload_codec::is_codec_envelope(value)
+}
+
+/// Does this history need an inflate/decode pass before the DAG run-graph
+/// derivation reads it?
+///
+/// The run graph derives two things from payload-bearing fields:
+///
+/// * `ActivityScheduled.input` — the issue #780 compensation-dispatch filter
+///   (`dag_retry::is_compensation_dispatch`), which excludes a compensator's
+///   dispatch from a same-named forward node. Handed an opaque envelope the
+///   predicate returns `false`, so on a codec-encrypting or payload-offloading
+///   deployment the exclusion silently stops working and a never-executed node
+///   is reported with the old compensation's status, timings and attempts.
+/// * `MarkerRecorded.details` — the `dag_skip:{idx}` task fingerprint. That one
+///   already degrades gracefully to index-only matching when the field is
+///   opaque, so decoding merely restores its reorder-safety.
+///
+/// Answering `false` (the default deployment: identity codecs, no payload
+/// store) lets the caller skip the pass entirely, so no history is
+/// re-serialized and the pre-#780 read path is byte-for-byte unchanged. The
+/// scan itself is one `get` per payload field, never a deep walk.
+fn graph_history_needs_inflation(events: &[WorkflowEvent]) -> bool {
+    events.iter().any(|event| match event {
+        WorkflowEvent::ActivityScheduled { input, .. } => payload_field_is_opaque(input),
+        WorkflowEvent::MarkerRecorded { details, .. } => payload_field_is_opaque(details),
+        _ => false,
+    })
+}
+
+/// Inflate offloaded payloads (issue #524) and decode codec envelopes (issue
+/// #608) for a history that was loaded RAW, **after** its pooled DB connection
+/// has been released.
+///
+/// This is the `api.rs` awaitables discipline (see the `drop(conn)` there)
+/// factored out: blob inflation is network I/O, so a slow or unavailable
+/// payload store must never hold a database pool slot. `store::load_history_inflated`
+/// deliberately does the opposite — it fetches every blob sequentially while
+/// still holding the connection it loaded the rows with — so a caller that
+/// cares about pool pressure loads raw, drops, and calls this.
+///
+/// Callers choose their own failure posture:
+///
+/// * The DAG **retry** endpoint must fail CLOSED. Its issue #780 guard reads
+///   `ActivityScheduled.input` to recognise a compensation envelope; a decode
+///   failure that degraded to the raw history would hide the envelope and let
+///   an already-rolled-back run be retried onto rolled-back state.
+/// * The DAG **run graph** (API + UI) degrades to the raw history with a
+///   warning: it is a read-only observability surface, and failing the whole
+///   page is worse than the narrow cross-version display inaccuracy.
+///
+/// No payload is ever surfaced by either caller — the retry plan carries only
+/// node names and an event id, and the run graph carries node names, statuses,
+/// timings, attempts, and a truncated `error` (which is not a payload-bearing
+/// field). So this needs no issue #608 read-decode opt-in or audit row, exactly
+/// like the awaitables endpoint's replay drive.
+///
+/// # Residual offload references are an error, not a pass-through
+///
+/// A payload store is *optional*, so `offloader` is `None` on the default
+/// deployment — and on a deployment that used to have one. In the latter case
+/// the stored history still carries `_harvest_offload_envelope` references, the
+/// inflate pass is skipped entirely, and [`PayloadCodecs::decode_event`] returns
+/// the reference verbatim (it is not a codec envelope, so nothing rejects it).
+/// Every payload-reading guard downstream would then be looking at an opaque
+/// blob pointer while believing it had the real value.
+///
+/// Any reference that survives the pass is therefore an error. When an offloader
+/// *is* configured this is unreachable — `inflate_event_value` either resolves
+/// the reference or rejects a foreign `store_id` — so the check only ever fires
+/// on the configuration-removal case, and costs a handful of key lookups per
+/// event otherwise.
+async fn inflate_and_decode_events(
+    events: &[WorkflowEvent],
+    codecs: &PayloadCodecs,
+    offloader: Option<&autumn_harvest::payload_store::PayloadOffloader>,
+) -> autumn_harvest::error::HarvestResult<Vec<WorkflowEvent>> {
+    let mut out = Vec::with_capacity(events.len());
+    for event in events {
+        let mut value = serde_json::to_value(event)?;
+        if let Some(offloader) = offloader {
+            offloader.inflate_event_value(&mut value).await?;
+        }
+        // `.into_iter().next()` rather than `.first()`: `diesel::prelude::*` is
+        // in scope here and its `RunQueryDsl::first` shadows `slice::first`.
+        if let Some(residual) = autumn_harvest::payload_store::refs_in_event_value(&value)
+            .into_iter()
+            .next()
+        {
+            return Err(autumn_harvest::error::HarvestError::PayloadOffload(
+                format!(
+                    "history still carries an offloaded payload reference (key '{}', store '{}') \
+                 after the inflate pass; no payload store is configured for that store id, so \
+                 the real payload cannot be read — register the payload store this deployment \
+                 wrote with",
+                    residual.blob_key, residual.store_id
+                ),
+            ));
+        }
+        out.push(codecs.decode_event(value)?);
+    }
+    Ok(out)
+}
+
+/// Decode a timestamped run-graph history in place, degrading to the raw rows
+/// on any failure.
+///
+/// Shared by the two DAG run-graph readers — the issue #690 API handler and the
+/// issue #957 Vantage UI page — so they can never disagree about whether the
+/// issue #780 compensation filter is looking at real payloads. Both load raw
+/// (`store::load_history_with_timestamps`, whose contract explicitly leaves
+/// payload fields undecoded) and must therefore decode before deriving.
+///
+/// Skips the pass entirely when nothing in the history is opaque, so the
+/// default deployment does no extra work. Degrades — never errors — because
+/// this is a read-only observability surface: the worst case is the narrow
+/// cross-version display inaccuracy the filter exists to fix, which is strictly
+/// better than failing the page.
+pub(crate) async fn decode_graph_history(
+    rows: Vec<(chrono::DateTime<chrono::Utc>, WorkflowEvent)>,
+    exec_id: ExecutionId,
+    codecs: &PayloadCodecs,
+    offloader: Option<&autumn_harvest::payload_store::PayloadOffloader>,
+    surface: &'static str,
+) -> Vec<(chrono::DateTime<chrono::Utc>, WorkflowEvent)> {
+    let events: Vec<WorkflowEvent> = rows.iter().map(|(_, e)| e.clone()).collect();
+    if !graph_history_needs_inflation(&events) {
+        return rows;
+    }
+    match inflate_and_decode_events(&events, codecs, offloader).await {
+        Ok(decoded) => rows
+            .into_iter()
+            .zip(decoded)
+            .map(|((ts, _), event)| (ts, event))
+            .collect(),
+        Err(err) => {
+            tracing::warn!(
+                execution_id = %exec_id,
+                error = %err,
+                surface,
+                "payload inflate/decode failed; rendering the run graph from the raw history \
+                 (a compensator dispatch may be read as a same-named forward node)"
+            );
+            rows
+        }
+    }
+}
+
 /// Unwrap the optional `Session` extension extractor that handlers feed into
 /// [`read_path_decoder`]. An absent extension (no session middleware
 /// installed) resolves to `None`, which the admin predicate treats as
@@ -16907,6 +17063,11 @@ async fn batch_reset_workflows(
                         operator_id: request.operator_id.clone(),
                         signal_reapply: request.signal_reapply,
                         allow_terminal_source: true,
+                        // Left `false` deliberately: this is the batch-reset
+                        // endpoint, not the issue #780 DAG retry, and refusing
+                        // an erased source here would be an unrelated behavior
+                        // change to an already-shipped surface.
+                        refuse_erased_source: false,
                     };
                     match reset_workflow_execution(
                         conn,
@@ -20334,6 +20495,22 @@ fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
             }),
         )
             .into_response(),
+        // Same `409` and the same operator instruction as the DAG-retry
+        // pre-flight guard, so a caller cannot tell whether the erasure was
+        // already committed or landed in the race window — only that the
+        // source is unusable and a fresh run is the answer.
+        WorkflowResetError::ErasedSource { exec_id } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "workflow execution {exec_id} had its payloads erased (issue #495), so its \
+                     carried-over node outputs are tombstones and whether it already compensated \
+                     cannot be determined; retrying would resume on unreadable state — start a \
+                     fresh DAG run instead"
+                ),
+            }),
+        )
+            .into_response(),
         WorkflowResetError::Harvest(error) => map_error(error).into_response(),
     }
 }
@@ -20366,11 +20543,31 @@ struct DagRetryConflictResponse {
     remediation: String,
 }
 
+/// Operator-facing message for a retry of a run that already compensated
+/// (issue #780). Shared by the HTTP `409` body and the Vantage UI flash so the
+/// two surfaces cannot drift.
+const DAG_RETRY_COMPENSATED_RUN_MESSAGE: &str = "this run already executed its compensation unwind, so its succeeded nodes' side effects \
+     were rolled back; retrying would resume on rolled-back state — start a fresh DAG run instead";
+
 fn dag_retry_resolve_error_response(
     error: crate::dag_retry::DagRetryResolveError,
 ) -> axum::response::Response {
     use crate::dag_retry::DagRetryResolveError as E;
     use axum::response::IntoResponse as _;
+
+    // Issue #780: a run that already unwound its compensations is a STATE
+    // conflict about the run (its carried-over side effects were rolled back),
+    // not a malformed node request — so it is the one resolver rejection that
+    // maps to `409`, alongside the sibling COMPLETED/RUNNING state conflicts.
+    if matches!(error, E::CompensatedRun) {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: DAG_RETRY_COMPENSATED_RUN_MESSAGE.to_string(),
+            }),
+        )
+            .into_response();
+    }
 
     let body = match error {
         E::EmptyFromNodes => DagRetryNodeErrorResponse {
@@ -20407,6 +20604,12 @@ fn dag_retry_resolve_error_response(
         },
         E::NoSchedulePoint => DagRetryNodeErrorResponse {
             message: "could not resolve a reset point for the requested nodes".to_string(),
+            unknown_nodes: None,
+            declared_nodes: None,
+        },
+        // Handled above as a `409`; unreachable here.
+        E::CompensatedRun => DagRetryNodeErrorResponse {
+            message: DAG_RETRY_COMPENSATED_RUN_MESSAGE.to_string(),
             unknown_nodes: None,
             declared_nodes: None,
         },
@@ -20511,6 +20714,7 @@ impl DagRetryFailure {
                 R::NoSchedulePoint => {
                     "could not resolve a reset point for the requested nodes".to_string()
                 }
+                R::CompensatedRun => DAG_RETRY_COMPENSATED_RUN_MESSAGE.to_string(),
             },
             Self::Reset(e) => match e {
                 WorkflowResetError::InvalidPoint(invalid) => format!(
@@ -20683,6 +20887,36 @@ pub(crate) async fn retry_dag_run_inner(
         }
     }
 
+    // Refuse a source run whose payloads were PII-erased (issue #495).
+    //
+    // Two independent reasons, either sufficient:
+    //
+    //  1. The issue #780 compensated-run guard goes BLIND. Erasure tombstones
+    //     every payload field, so `ActivityScheduled.input` is
+    //     `{"_harvest_erased": true}` and the compensation envelope is gone
+    //     (signal 2). Signal 1 normally still holds — the marker's *name* is not
+    //     a payload field, and the positional "dispatch after the marker" check
+    //     needs no payload — but a DAG that unwound at a drained signal frontier
+    //     (issue #801) recorded no marker at all, so on that intersection BOTH
+    //     signals are blind and an already-rolled-back run would look retryable.
+    //     Nothing downstream can recover this: erasure is irreversible.
+    //  2. Independent of compensation, the retry itself would produce garbage.
+    //     The #148 fork CARRIES OVER the upstream events, whose `output` fields
+    //     are now tombstones, so a re-executing downstream node with an
+    //     `input_from` binding (issue #702) would be handed
+    //     `{"_harvest_erased": true}` as its input.
+    //
+    // O(1) row check, matching the issue #612 terminal-query precedent: erasure
+    // always tombstones the execution row's own `input` column first.
+    if erase::execution_input_is_erased(&execution.input) {
+        return Err(DagRetryFailure::StateConflict(
+            "DAG run's payloads were erased (issue #495), so whether it already compensated \
+             cannot be determined and its carried-over node outputs are tombstones; retrying \
+             would resume on unreadable state — start a fresh DAG run instead"
+                .to_string(),
+        ));
+    }
+
     // Walk the recorded history and resolve the node request to a reset point.
     //
     // NOTE (v1 limitation, issue #366): this resolves the cut and node sets from
@@ -20692,11 +20926,55 @@ pub(crate) async fn retry_dag_run_inner(
     // an incompatible deploy, the worker that replays the fork may run a
     // different definition than the one used to pick the cut. v1 does not gate on
     // build compatibility; see docs/runbooks/dag-retry-from-failed-node.md.
-    let history = store::load_history(&mut conn, exec_id)
+    // Load INFLATED + codec-decoded history: `resolve_retry_plan`'s
+    // compensated-run guard (issue #780) reads `ActivityScheduled.input` to
+    // recognise a compensation envelope, and `input` is a payload-bearing field.
+    // Plain `store::load_history` would hand the resolver an
+    // `_harvest_offload_envelope` reference (issue #524) or a codec envelope
+    // (issue #608) instead of the real value, hiding the envelope signal — a
+    // silent fail-OPEN that lets an already-rolled-back run be retried onto
+    // rolled-back state. The resolver cannot compensate for this itself: an
+    // offloaded input is indistinguishable from a large ordinary forward input
+    // (see `dag_retry::tests::
+    // an_offloaded_compensation_envelope_is_invisible_and_must_be_inflated_by_the_caller`).
+    //
+    // With no `PayloadStore` registered the inflate pass is a pure in-memory
+    // codec decode, so the default deployment costs no blob fetch. Only
+    // oversized payloads do, and this is a low-frequency operator endpoint.
+    // Passing the runtime's real codecs (rather than the identity default
+    // `load_history` uses) additionally lets the guard see envelopes on a
+    // codec-encrypting deployment, where the endpoint previously failed closed
+    // with `UnknownPayloadCodec`. No payload is surfaced to the caller — the
+    // plan carries only node names and an event id.
+    //
+    // Deliberately NOT `store::load_history_inflated`: that fetches every blob
+    // sequentially while still holding the connection it loaded the rows with,
+    // so a slow or unavailable payload store (or a few concurrent retries over
+    // large histories) would pin database pool slots and stall unrelated API and
+    // worker work. Load raw, release the pool slot, inflate/decode in memory,
+    // then reacquire for the preview/reset below — the same discipline the
+    // awaitables endpoint established.
+    let codecs = api_state.payload_codecs();
+    let offloader = runtime.registry.payload_offloader();
+    let raw = store::load_history_undecoded(&mut conn, exec_id)
         .await
         .map_err(|e| DagRetryFailure::Other(map_error(e)))?;
-    let plan = crate::dag_retry::resolve_retry_plan(&dag.definition, &history.events, &from_nodes)
+    drop(conn);
+
+    // Fails CLOSED on any inflate/decode error: the issue #780 compensated-run
+    // guard reads `ActivityScheduled.input`, so degrading to the raw history
+    // would hide a compensation envelope and let an already-rolled-back run be
+    // retried onto rolled-back state.
+    let events = inflate_and_decode_events(&raw.events, &codecs, offloader)
+        .await
+        .map_err(|e| DagRetryFailure::Other(map_error(e)))?;
+    let plan = crate::dag_retry::resolve_retry_plan(&dag.definition, &events, &from_nodes)
         .map_err(DagRetryFailure::Resolve)?;
+
+    // Reacquire for the preview/reset writes below.
+    let mut conn = db_conn_for_execution(api_state, exec_id)
+        .await
+        .map_err(DagRetryFailure::Other)?;
 
     // Compose the reset request: the reason carries the DAG-retry annotation so
     // the audit trail (#158) and the WorkflowResetFork event read cleanly.
@@ -20712,6 +20990,13 @@ pub(crate) async fn retry_dag_run_inner(
         operator_id: operator_id.trim().to_string(),
         signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
         allow_terminal_source: true,
+        // Recheck erasure under the fork's own row lock. The pre-flight guard
+        // above ran on an unlocked read, and the connection was dropped for blob
+        // inflation before this transaction opens — so `erase-payloads` can
+        // commit in that window. Without this, the fork would carry tombstoned
+        // outputs and the issue #780 compensated-run guard would have been
+        // decided on evidence that no longer exists.
+        refuse_erased_source: true,
     };
 
     // Dry-run: validate the boundary and return the plan without writing.
@@ -21520,6 +21805,16 @@ async fn get_dag_run_graph(
         Ok(evts) => evts,
         Err(e) => return map_error(e).into_response(),
     };
+
+    // No further DB reads: release the pool slot before any payload-store fetch
+    // below (the awaitables pool-slot discipline — offload inflation is network
+    // I/O and must never hold a database connection).
+    drop(conn);
+
+    let codecs = api_state.payload_codecs();
+    let offloader = runtime.registry.payload_offloader();
+    let ts_events =
+        decode_graph_history(ts_events, exec_id, &codecs, offloader, "dag run graph").await;
 
     let nodes = crate::dag_graph::build_run_graph(&dag.definition, &ts_events, &execution.state);
 
@@ -42717,6 +43012,204 @@ mod tests {
         assert!(
             !decoded_frame.contains("_harvest_codec_envelope"),
             "decoded frame must not leak the envelope: {decoded_frame}"
+        );
+    }
+
+    // ── issue #780: the run-graph readers must see DECODED payloads ────────
+    //
+    // `dag_retry::is_compensation_dispatch` reads `ActivityScheduled.input`, a
+    // payload-bearing field. On a codec-encrypting or payload-offloading
+    // deployment a raw history hands it an opaque envelope, the predicate
+    // returns `false`, and the compensator is read back as a forward node —
+    // the exact defect the exclusion exists to close.
+
+    /// Build a codec registry whose default is the byte-reversal test codec, so
+    /// `encode_event` produces the real `_harvest_codec_envelope` shape.
+    fn reversing_codecs() -> autumn_harvest::payload_codec::PayloadCodecs {
+        let mut codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+        codecs.set_default(Arc::new(ReverseReadPathCodec));
+        codecs
+    }
+
+    /// A compensation dispatch exactly as `unwind_dag_compensations` records it.
+    fn compensation_dispatch_event() -> autumn_harvest::WorkflowEvent {
+        autumn_harvest::WorkflowEvent::ActivityScheduled {
+            activity_id: autumn_harvest::types::ActivityExecId::new(),
+            name: "undo_a".to_string(),
+            input: serde_json::json!({
+                "dag_compensate": "a",
+                "input": serde_json::Value::Null,
+                "output": serde_json::Value::Null,
+            }),
+            queue: "default".to_string(),
+        }
+    }
+
+    /// The forward dispatch of node `a`, which is what makes the compensation
+    /// envelope's `dag_compensate` corroborate (issue #780 round 4: the
+    /// corroboration is *dispatch*, not completion).
+    fn forward_dispatch_event(name: &str) -> autumn_harvest::WorkflowEvent {
+        autumn_harvest::WorkflowEvent::ActivityScheduled {
+            activity_id: autumn_harvest::types::ActivityExecId::new(),
+            name: name.to_string(),
+            input: serde_json::json!({"payload": "ordinary user input"}),
+            queue: "default".to_string(),
+        }
+    }
+
+    #[test]
+    fn graph_history_needs_inflation_detects_opaque_payload_fields() {
+        // A plain history needs no inflation pass at all — the default
+        // deployment (identity codecs, no payload store) must stay byte-for-byte
+        // on the pre-#780 path.
+        let clean = vec![forward_dispatch_event("a"), compensation_dispatch_event()];
+        assert!(
+            !graph_history_needs_inflation(&clean),
+            "a history with no envelope must skip the inflate/decode pass entirely"
+        );
+
+        // A codec-encoded `ActivityScheduled.input` must trigger it.
+        let codecs = reversing_codecs();
+        let encoded_value = codecs
+            .encode_event(&compensation_dispatch_event())
+            .expect("encode");
+        assert_eq!(
+            encoded_value["data"]["input"]["_harvest_codec_envelope"], 1,
+            "fixture sanity: the stored event carries a codec envelope on `input`"
+        );
+        let encoded: autumn_harvest::WorkflowEvent =
+            serde_json::from_value(encoded_value).expect("re-deserialize stored shape");
+        assert!(
+            graph_history_needs_inflation(&[encoded]),
+            "an opaque ActivityScheduled.input must trigger the inflate/decode pass"
+        );
+
+        // A `MarkerRecorded.details` envelope must trigger it too: the run
+        // graph's `dag_skip` fingerprint validation reads that field.
+        let opaque_marker = autumn_harvest::WorkflowEvent::MarkerRecorded {
+            name: "dag_skip:2".to_string(),
+            details: serde_json::json!({
+                "_harvest_offload_envelope": 1,
+                "store_id": "s3",
+                "key": "blob-1",
+                "len": 4096,
+                "checksum": "deadbeef",
+            }),
+        };
+        assert!(
+            graph_history_needs_inflation(&[opaque_marker]),
+            "an opaque MarkerRecorded.details must trigger the inflate/decode pass"
+        );
+    }
+
+    /// An offload reference that survives the pass must FAIL the retry, not
+    /// silently pass through as an opaque payload (issue #780 round 9).
+    ///
+    /// The reachable shape is a *configuration removal*: a deployment that had a
+    /// `PayloadStore` registered offloaded an oversized compensation envelope,
+    /// and the store was later unregistered (or failed to construct at boot). On
+    /// the next read `offloader` is `None`, so the inflate pass is skipped
+    /// entirely and `decode_event` happily returns the reference verbatim — it
+    /// is not a codec envelope, so nothing else rejects it. The issue #780
+    /// signal-2 guard then looks for `dag_compensate` inside
+    /// `{"_harvest_offload_envelope": 1, ...}` and finds nothing, so a run that
+    /// fully rolled back reads as retryable.
+    #[tokio::test]
+    async fn a_residual_offload_reference_fails_closed_when_no_store_is_configured() {
+        use autumn_harvest::WorkflowEvent;
+
+        // The stored shape: an `ActivityScheduled.input` that is an offload
+        // reference rather than the real compensation envelope.
+        let mut value = serde_json::to_value(compensation_dispatch_event()).expect("ser");
+        value["data"]["input"] = serde_json::json!({
+            "_harvest_offload_envelope": 1,
+            "store_id": "s3-main",
+            "key": "blob-abc",
+            "len": 4096,
+            "checksum": "deadbeef",
+        });
+        let stored: WorkflowEvent = serde_json::from_value(value).expect("re-deser");
+
+        let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+        let err = inflate_and_decode_events(&[stored], &codecs, None)
+            .await
+            .expect_err(
+                "a history still carrying an offload reference must fail closed: with no store \
+                 configured the compensation envelope is unreadable, and degrading to the raw \
+                 reference would let an already-rolled-back run be retried",
+            );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("offload") && msg.contains("s3-main"),
+            "the error must name the offload reference and the store it points at, so an \
+             operator can restore the right configuration; got: {msg}"
+        );
+    }
+
+    /// The default deployment — no payload store, no offloaded payloads — must
+    /// stay byte-for-byte on the pre-round-9 path.
+    #[tokio::test]
+    async fn a_plain_history_still_passes_with_no_store_configured() {
+        let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+        let decoded = inflate_and_decode_events(
+            &[forward_dispatch_event("a"), compensation_dispatch_event()],
+            &codecs,
+            None,
+        )
+        .await
+        .expect("a history with no offload reference must pass untouched");
+        assert_eq!(decoded.len(), 2, "every event must survive the pass");
+    }
+
+    #[tokio::test]
+    async fn a_codec_encoded_compensation_dispatch_is_only_recognised_after_decoding() {
+        use autumn_harvest::WorkflowEvent;
+
+        let codecs = reversing_codecs();
+        let plain = [forward_dispatch_event("a"), compensation_dispatch_event()];
+
+        // The stored shape: exactly what `load_history_with_timestamps` hands a
+        // run-graph reader on a codec-encrypting deployment.
+        let stored: Vec<WorkflowEvent> = plain
+            .iter()
+            .map(|e| {
+                serde_json::from_value(codecs.encode_event(e).expect("encode")).expect("re-deser")
+            })
+            .collect();
+
+        // RED without the fix: the predicate cannot see through the envelope, so
+        // the compensator reads as an ordinary forward dispatch.
+        let stored_dispatched = crate::dag_retry::dispatched_activity_names(&stored);
+        let WorkflowEvent::ActivityScheduled { input, .. } = &stored[1] else {
+            panic!("fixture");
+        };
+        assert!(
+            !crate::dag_retry::is_compensation_dispatch(input, &stored_dispatched),
+            "fixture sanity: on the RAW stored history the envelope is opaque, which is \
+             precisely why the caller must decode before applying the filter"
+        );
+
+        // GREEN: after the caller's in-memory pass the predicate sees the real
+        // envelope and excludes the compensator.
+        let decoded = inflate_and_decode_events(&stored, &codecs, None)
+            .await
+            .expect("decode must succeed with the codec registered");
+        let decoded_dispatched = crate::dag_retry::dispatched_activity_names(&decoded);
+        let WorkflowEvent::ActivityScheduled { input, .. } = &decoded[1] else {
+            panic!("fixture");
+        };
+        assert!(
+            crate::dag_retry::is_compensation_dispatch(input, &decoded_dispatched),
+            "after decoding, the compensation envelope must be recognised so the run graph \
+             excludes it from a same-named forward node"
+        );
+
+        // And the ordinary forward dispatch is untouched by the pass.
+        // (`WorkflowEvent` has no `PartialEq`; compare the serialized form.)
+        assert_eq!(
+            serde_json::to_value(&decoded[0]).expect("ser"),
+            serde_json::to_value(&plain[0]).expect("ser"),
+            "the forward dispatch round-trips through the pass unchanged"
         );
     }
 

@@ -801,6 +801,7 @@ async fn reset_re_anchors_chain_deadline_to_the_fork_start() {
             operator_id: "test-operator".to_string(),
             signal_reapply: ResetSignalReapplyPolicy::default(),
             allow_terminal_source: false,
+            refuse_erased_source: false,
         },
         None,
     )

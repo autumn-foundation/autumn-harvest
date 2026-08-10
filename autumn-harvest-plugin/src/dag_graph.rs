@@ -238,13 +238,26 @@ fn is_live_state(exec_state: &str) -> bool {
 /// Find the index (and activity id) of the **latest** `ActivityScheduled` for
 /// `node`. Mirrors [`node_outcome`]'s latest-attempt selection so timing,
 /// attempts, and error all describe the same authoritative attempt.
+///
+/// That mirroring includes [`node_outcome`]'s issue #780 compensator exclusion
+/// (`dag_retry::is_compensation_dispatch`): a compensator dispatch is not a
+/// forward node's dispatch, and a later definition may introduce a forward node
+/// named after an older definition's compensator. Skipping it here keeps
+/// `status` (from `node_outcome`) and the timing/attempts/error this selects
+/// describing the same attempt — without it a name-reused node would report
+/// `pending` alongside the old compensation's timestamps.
 fn latest_scheduled(events: &[WorkflowEvent], node: &str) -> Option<(usize, ActivityExecId)> {
+    let dispatched = crate::dag_retry::dispatched_activity_names(events);
     events.iter().enumerate().rev().find_map(|(idx, event)| {
         if let WorkflowEvent::ActivityScheduled {
-            activity_id, name, ..
+            activity_id,
+            name,
+            input,
+            ..
         } = event
         {
-            (name == node).then_some((idx, *activity_id))
+            (name == node && !crate::dag_retry::is_compensation_dispatch(input, &dispatched))
+                .then_some((idx, *activity_id))
         } else {
             None
         }
@@ -850,6 +863,7 @@ mod tests {
     fn c() {}
     fn d() {}
     fn e() {}
+    fn undo_a() {}
 
     fn linear_dag() -> DagDefinition {
         // a -> b -> c -> d
@@ -896,6 +910,26 @@ mod tests {
             activity_id: id,
             name: name.to_string(),
             input: Value::Null,
+            queue: "default".to_string(),
+        }
+    }
+
+    /// A compensator dispatch exactly as issue #780's `unwind_dag_compensations`
+    /// records it: the compensator's own activity name, plus the three-key
+    /// envelope naming the **forward node** being rolled back.
+    fn compensator_sched(
+        compensator_name: &str,
+        compensates_node: &str,
+        id: ActivityExecId,
+    ) -> WorkflowEvent {
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id,
+            name: compensator_name.to_string(),
+            input: serde_json::json!({
+                "dag_compensate": compensates_node,
+                "input": Value::Null,
+                "output": Value::Null,
+            }),
             queue: "default".to_string(),
         }
     }
@@ -1510,6 +1544,59 @@ mod tests {
         // Both carry the same name-keyed status (ambiguous by construction).
         assert_eq!(dupes[0].status, dupes[1].status);
         assert_eq!(dupes[0].status, DagNodeStatus::Succeeded);
+    }
+
+    /// Issue #780 introduced the compensator dispatch — a *new class* of
+    /// `ActivityScheduled` this name-keyed view had never seen. Within one
+    /// definition version `CompensatorNameCollidesWithNode` keeps it
+    /// distinguishable from a forward node, but that is a per-version
+    /// guarantee: a later definition may introduce a **forward** node named
+    /// after an older definition's compensator. Reading the old compensation
+    /// dispatch would report that never-executed node as succeeded, with the
+    /// compensation's timestamps.
+    ///
+    /// Both halves are asserted, because `status` (via `node_outcome`) and the
+    /// timing/attempts (via `latest_scheduled`) are separate readers that must
+    /// agree — the exclusion lives in both.
+    #[test]
+    fn a_compensation_dispatch_is_not_read_as_a_same_named_forward_node() {
+        // CURRENT definition: `undo_a` is an ordinary forward node downstream of
+        // `a` — it never ran on this history.
+        let def = {
+            let mut builder = DagBuilder::new();
+            let na = builder.activity(a);
+            let _nu = builder.activity(undo_a).upstream(&na);
+            builder.build().expect("name-reuse dag builds")
+        };
+
+        let (id_a, id_u) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            (ts(0), started()),
+            (ts(1), sched("a", id_a)),
+            (ts(2), completed(id_a)),
+            // The OLD definition's unwind rolled `a` back via a compensator
+            // that happened to be named `undo_a`.
+            (ts(3), compensator_sched("undo_a", "a", id_u)),
+            (ts(4), completed(id_u)),
+        ];
+        let nodes = build_run_graph(&def, &events, "FAILED");
+
+        let n = node(&nodes, "undo_a");
+        assert_eq!(
+            n.status,
+            DagNodeStatus::Pending,
+            "a compensation dispatch must not be reported as a forward node's outcome"
+        );
+        assert_eq!(
+            n.started_at, None,
+            "nor may it contribute that node's timing (latest_scheduled must skip it too)"
+        );
+        assert_eq!(n.attempts, 0);
+        assert_eq!(
+            node(&nodes, "a").status,
+            DagNodeStatus::Succeeded,
+            "the genuinely-executed forward node is unaffected"
+        );
     }
 
     #[test]

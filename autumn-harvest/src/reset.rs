@@ -284,6 +284,26 @@ pub struct WorkflowResetRequest {
     /// set it via struct construction.
     #[serde(skip)]
     pub allow_terminal_source: bool,
+    /// When `true`, a source execution whose payloads were PII-erased (issue
+    /// #495) is rejected with [`WorkflowResetError::ErasedSource`], checked
+    /// **under the same `FOR UPDATE` row lock the fork itself takes** and before
+    /// any event is copied.
+    ///
+    /// Used by the DAG retry-from-failed-node surface (issue #366), whose issue
+    /// #780 compensated-run guard reads payload fields: erasure tombstones them,
+    /// so an already-rolled-back run would look retryable. Its pre-flight check
+    /// runs on an *unlocked* read and then releases the connection to do blob
+    /// I/O, so `POST /workflows/{id}/erase-payloads` — which takes its own
+    /// `FOR UPDATE` lock — can commit tombstones in that window. This flag is
+    /// the recheck that closes the race, and it independently protects the fork
+    /// from carrying over tombstoned node outputs into an `input_from` binding
+    /// (issue #702).
+    ///
+    /// **Not settable from the wire** (`#[serde(skip)]`), like
+    /// `allow_terminal_source`: the failure posture belongs to the in-process
+    /// caller. Left `false`, the plain reset endpoint is byte-for-byte unchanged.
+    #[serde(skip)]
+    pub refuse_erased_source: bool,
 }
 
 impl WorkflowResetRequest {
@@ -400,6 +420,17 @@ pub enum WorkflowResetError {
         "workflow execution {exec_id} holds durable mutex '{key}'; release it before resetting"
     )]
     HolderHoldsMutex { exec_id: ExecutionId, key: String },
+    /// The source execution's payloads were PII-erased (issue #495) and the
+    /// caller opted into refusing such a source (`refuse_erased_source`).
+    ///
+    /// Raised under the fork's own `FOR UPDATE` row lock, before any event is
+    /// copied, so an erasure that commits between a caller's pre-flight check
+    /// and the fork cannot slip through.
+    #[error(
+        "workflow execution {exec_id} had its payloads erased; its recorded outputs are \
+         tombstones, so a fork would resume on unreadable state"
+    )]
+    ErasedSource { exec_id: ExecutionId },
     /// An underlying storage or database error occurred during the reset operation.
     #[error(transparent)]
     Harvest(#[from] HarvestError),
@@ -774,6 +805,25 @@ pub async fn reset_workflow_execution(
         ), WorkflowResetError, _>(async |conn| {
             let source = load_source_execution(conn, exec_id, true).await?;
             validate_source_execution(exec_id, &source, request.allow_terminal_source)?;
+
+            // Recheck PII erasure (issue #495) HERE — under the `FOR UPDATE`
+            // lock taken just above, and before a single event is copied.
+            //
+            // A caller's own pre-flight check cannot stand in for this. The DAG
+            // retry surface (issue #366/#780) reads the execution row without a
+            // lock, then deliberately releases its connection to inflate blobs
+            // off the pool, and only afterwards opens this transaction — a wide
+            // window in which `erase_workflow_payloads` can take its own
+            // `FOR UPDATE` lock and commit tombstones over the row and its
+            // events. Re-reading here, on the locked row, is what makes the
+            // decision consistent with the fork it guards: erasure either
+            // committed before this lock (we see it and refuse) or must wait
+            // behind it (the fork completes on intact events).
+            if request.refuse_erased_source
+                && crate::erase::execution_input_is_erased(&source.input)
+            {
+                return Err(WorkflowResetError::ErasedSource { exec_id });
+            }
 
             let rows = load_event_rows(conn, exec_id).await?;
             let events = decode_events(&rows)?;
@@ -2025,6 +2075,27 @@ mod tests {
         assert!(
             !request.allow_terminal_source,
             "allow_terminal_source must remain false when set via the request body"
+        );
+    }
+
+    #[test]
+    fn refuse_erased_source_is_not_settable_from_the_wire() {
+        // Same escape-hatch discipline as `allow_terminal_source`, in the other
+        // direction: this flag makes the reset REFUSE an erased source, so the
+        // public endpoint must not be able to turn it on either. Its posture is
+        // the caller's to choose in-process — the DAG retry handler (issue #780)
+        // sets it, the plain reset endpoint stays byte-for-byte unchanged.
+        let body = serde_json::json!({
+            "reset_to_event_id": 1,
+            "reason": "x",
+            "operator_id": "y",
+            "refuse_erased_source": true
+        });
+        let request: super::WorkflowResetRequest =
+            serde_json::from_value(body).expect("body deserializes");
+        assert!(
+            !request.refuse_erased_source,
+            "refuse_erased_source must remain false when set via the request body"
         );
     }
 
