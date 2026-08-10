@@ -871,6 +871,25 @@ pub mod db {
     pub struct BenchDb {
         pub url: String,
         _container: Option<ContainerAsync<Postgres>>,
+        /// Idle connection held open for the whole lifetime of the database.
+        ///
+        /// The stale-database sweep asks the server "does anything hold a
+        /// backend against this database?" — but between scenarios (and in the
+        /// window right after setup) a run holds none of its own: each scenario
+        /// opens a connection, seeds, drops it, builds a pool, and drops that
+        /// too. A concurrent run on another host would see zero backends,
+        /// conclude the database is abandoned, and `DROP DATABASE ... WITH
+        /// (FORCE)` it out from under us.
+        ///
+        /// So the migration connection is retained rather than dropped: an idle
+        /// backend still appears in `pg_stat_activity`, which makes ownership
+        /// continuously visible to every other client for exactly as long as
+        /// this `BenchDb` lives. Never used for queries — held purely as a
+        /// lease.
+        ///
+        /// `None` on the testcontainer path: nothing outside this process can
+        /// see that server, so there is no one to defend against.
+        _lease: Option<AsyncPgConnection>,
     }
 
     /// Connect to a benchmark database, or explain why we cannot.
@@ -908,6 +927,9 @@ pub mod db {
             return Ok(BenchDb {
                 url,
                 _container: None,
+                // Retained, not dropped: this is the ownership lease. See the
+                // field docs on `BenchDb::_lease`.
+                _lease: Some(conn),
             });
         }
 
@@ -932,6 +954,9 @@ pub mod db {
         Ok(BenchDb {
             url: format!("postgres://postgres:postgres@{host}:{port}/postgres"),
             _container: Some(container),
+            // No lease: the container is the ownership boundary, and nothing
+            // outside this process can reach that server to sweep it.
+            _lease: None,
         })
     }
 
@@ -1412,6 +1437,13 @@ pub mod db {
         let budget = super::scenario_time_budget();
 
         let started = Instant::now();
+        // One ceiling for the whole scenario, fixed *before* any claimer runs.
+        // Deriving it inside the task (after `pool.get()`) would restart the
+        // clock behind an unbounded await: a stalled or exhausted pool would
+        // park every claimer indefinitely with no deadline yet in existence,
+        // and the advertised cap would be a fiction. A scenario-wide deadline
+        // also means the cap bounds the scenario, not each claimer separately.
+        let deadline = started + budget;
         let mut handles = Vec::with_capacity(claimers);
         for c in 0..claimers {
             let pool = pool.clone();
@@ -1427,8 +1459,20 @@ pub mod db {
                 // can be trimmed from the front once we know how many
                 // observations this claimer actually managed to take.
                 let mut observed: Vec<(f64, bool)> = Vec::with_capacity(per_claimer);
-                let mut conn = pool.get().await.expect("pool checkout");
-                let deadline = Instant::now() + budget;
+                // Bounded by the same deadline the claim loop uses: checkout is
+                // an unbounded await, so a stalled or exhausted pool would
+                // otherwise hang here past the ceiling. Failing to check out is
+                // terminal for this claimer — it takes no samples and reports
+                // truncated, so the gate calls the measurement unsound rather
+                // than publishing a percentile from the claimers that did run.
+                let Ok(Ok(mut conn)) = tokio::time::timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    pool.get(),
+                )
+                .await
+                else {
+                    return (Vec::new(), 0usize, 0usize, true);
+                };
                 let mut truncated = false;
                 for _ in 0..per_claimer {
                     // Wall-clock ceiling: claim latency scales with backlog

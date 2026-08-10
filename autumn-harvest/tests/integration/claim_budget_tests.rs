@@ -45,6 +45,8 @@
 
 #![cfg(feature = "db")]
 
+use std::time::Duration;
+
 use super::claim_bench_support::db::{self, BenchDb};
 use super::claim_bench_support::{
     BUDGET_ENV_VAR, BudgetVerdict, ClaimGate, HEADLINE_P50_BUDGET_MS, LatencyStats,
@@ -156,6 +158,24 @@ async fn claim_p50_at_headline_scenario_is_within_budget() {
         scenario_time_budget().as_secs(),
         report.stats.count,
         SCENARIO_BUDGET_ENV_VAR,
+    );
+
+    // Soundness zero-and-three-quarters: `truncated` is set only where the
+    // harness *checks* the deadline, so it cannot catch an await that never
+    // returns to a check — a stalled pool checkout, say. Assert the ceiling
+    // the harness advertises directly, against the clock, so an unbounded
+    // wait anywhere in the scenario surfaces as a failure rather than as a
+    // job that quietly runs for minutes past its cap. The slack absorbs task
+    // join and report assembly under an oversubscribed runner; it is far
+    // smaller than the overruns this is meant to catch.
+    let ceiling = scenario_time_budget() + Duration::from_secs(30);
+    assert!(
+        report.wall_secs <= ceiling.as_secs_f64(),
+        "measurement unsound: the scenario ran {:.1}s, past its {}s wall-clock \
+         budget (+30s slack). Some await in the scenario is not bounded by the \
+         deadline, so the advertised ceiling is not being honoured.",
+        report.wall_secs,
+        scenario_time_budget().as_secs(),
     );
 
     // Soundness first: a percentile over a run that claimed nothing is noise.
@@ -495,4 +515,82 @@ fn headline_scenario_matches_the_published_contract() {
     );
     // ...and the measurement must not drain it.
     assert!(measured_claims_for(s.backlog) * 5 <= s.backlog);
+}
+
+/// A benchmark database is defended by a live backend, not just by its name.
+///
+/// The stale-database sweep reclaims anything with no server-visible
+/// connections. Between scenarios a run holds none of its own — each scenario
+/// opens a connection, seeds, drops it, builds a pool, drops that — so without
+/// a retained lease a concurrent run on another host sees zero backends and
+/// `DROP DATABASE ... WITH (FORCE)`s a live working set out from under it.
+///
+/// Scoped to the existing-server mode on purpose: that is the only mode where
+/// a foreign client can reach the database at all. On the testcontainer path
+/// the server is private to this process, so there is nothing to defend
+/// against and the invariant does not apply.
+#[tokio::test]
+async fn an_idle_bench_database_still_holds_a_visible_lease() {
+    use diesel::QueryableByName;
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+
+    #[derive(QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    async fn count(admin: &mut AsyncPgConnection, datname: &str) -> i64 {
+        diesel::sql_query("SELECT count(*) AS n FROM pg_stat_activity WHERE datname = $1")
+            .bind::<diesel::sql_types::Text, _>(datname.to_string())
+            .get_result::<CountRow>(admin)
+            .await
+            .expect("pg_stat_activity is always readable")
+            .n
+    }
+
+    let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+        eprintln!(
+            "SKIP an_idle_bench_database_still_holds_a_visible_lease: \
+             existing-server mode only (HARVEST_TEST_DATABASE_URL unset)"
+        );
+        return;
+    };
+    let Ok(bench) = db::setup_bench_db().await else {
+        eprintln!("SKIP an_idle_bench_database_still_holds_a_visible_lease: no database");
+        return;
+    };
+
+    // `with_db_name` put the database in the path; read it back out.
+    let datname = bench
+        .url
+        .rsplit('/')
+        .next()
+        .and_then(|tail| tail.split('?').next())
+        .expect("bench url always carries a database path")
+        .to_string();
+
+    let Ok(mut admin) = AsyncPgConnection::establish(&admin_url).await else {
+        eprintln!("SKIP an_idle_bench_database_still_holds_a_visible_lease: admin connect failed");
+        return;
+    };
+    // No scenario is running, and this test holds no connection of its own to
+    // the benchmark database — so any backend here is the lease.
+    let idle = count(&mut admin, &datname).await;
+    assert!(
+        idle > 0,
+        "an idle bench database reported {idle} backends: the sweep would treat \
+         a live run as abandoned and drop it"
+    );
+
+    // The lease must also *end*, or a crashed run's database could never be
+    // reclaimed and the sweep would be permanently defeated.
+    drop(bench);
+    for _ in 0..40 {
+        if count(&mut admin, &datname).await == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("lease survived BenchDb drop: the stale sweep can never reclaim {datname}");
 }

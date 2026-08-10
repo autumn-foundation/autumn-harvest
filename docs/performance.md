@@ -103,7 +103,12 @@ Two more things worth knowing before pointing this at a server you care about:
   alive, so concurrent runs cannot delete each other's working set. The liveness
   check is Linux-only (`/proc/{pid}`); everywhere else it conservatively assumes
   the pid is alive, so on macOS and Windows stale databases accumulate until
-  removed by hand.
+  removed by hand. A pid says nothing about a run on *another* host sharing the
+  same server, so the sweep also asks the server itself whether anything holds a
+  backend against the database — and each run keeps one idle connection open for
+  the whole life of its database precisely so that question has an answer even
+  between scenarios. Credentials never reach a log line: the URL is redacted to
+  `scheme://***@host:port/db` before it is printed.
 * **`HARVEST_BENCH_SCENARIO_SECS`** caps each scenario's measured phase
   (default 240 s). It is the knob to raise when a row comes back marked `⚠` or
   `‡` — see [measurement hygiene](#measurement-hygiene).
@@ -484,6 +489,14 @@ ANALYZE` of the claim query.
   wrapped in a timeout derived from the remaining budget; expiry marks the run
   truncated, which the gate treats as "measurement unsound" rather than
   publishing a percentile from a partial run.
+* **One deadline for the scenario, established before any claimer starts.**
+  Deriving it inside each claimer — after its pool checkout — would restart the
+  clock behind an unbounded `await`: a stalled or exhausted pool parks every
+  claimer with no deadline yet in existence. The checkout is bounded by the same
+  deadline as the claims, and the gate additionally asserts the scenario's
+  measured wall clock against that ceiling, because `truncated` is only set
+  where the harness *checks* the deadline and so cannot catch an `await` that
+  never returns to a check.
 * **`ANALYZE` runs after every seed.** Without it the planner works from stale
   statistics on a freshly bulk-loaded table and picks plans that are neither
   representative nor stable.
