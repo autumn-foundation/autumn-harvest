@@ -22,6 +22,26 @@ pub enum ConnectorError {
     /// The source has been shut down and will yield no further messages.
     #[error("connector source is closed")]
     Closed,
+    /// A partition's commit prefix is permanently blocked: a message was
+    /// retried rather than settled, and on a positional broker nothing hands
+    /// it back until the consumer is rebuilt.
+    ///
+    /// Distinct from [`Self::Broker`] because the response differs: a broker
+    /// error is transient and worth re-polling the same consumer after a
+    /// backoff, whereas re-polling a wedged consumer accomplishes nothing —
+    /// it has to be rebuilt (see [`EventSource::recover`]).
+    #[error(
+        "partition {partition} commit prefix is blocked: {held} completed offsets held behind an \
+         unsettled head (bound {threshold}); the consumer must be rebuilt to redeliver it"
+    )]
+    Stalled {
+        /// The partition whose prefix cannot advance.
+        partition: i32,
+        /// How many completed offsets are held behind the blocked head.
+        held: usize,
+        /// The configured bound that was exceeded.
+        threshold: usize,
+    },
 }
 
 /// A broker-agnostic pull-based message source.
@@ -122,6 +142,31 @@ pub trait EventSource: Send + Sync {
     /// never emits the `harvest.connector.lag` gauge.
     async fn lag(&self) -> Option<i64> {
         None
+    }
+
+    /// Rebuild this source's underlying client, so messages it has already
+    /// drained but not settled are handed back.
+    ///
+    /// Called when the runtime detects that a partition's commit prefix is
+    /// **permanently blocked**: a message was retried rather than settled, and
+    /// on a positional broker [`Self::abandon`] cannot force redelivery
+    /// in-session because the local consumer position has already advanced
+    /// past it. Rebuilding the consumer makes it re-read from the last
+    /// committed offset, which is what actually performs the retry.
+    ///
+    /// Returns `true` when the source rebuilt itself, `false` when it has no
+    /// such capability — the two must be distinguishable, or the runtime would
+    /// loop forever believing it had fixed something. The default is `false`,
+    /// which is correct for every source that does not need this: SQS's
+    /// visibility timeout already redelivers an abandoned message, so its
+    /// prefix cannot wedge in the first place.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorError::Config`] or [`ConnectorError::Broker`] when
+    /// the rebuild itself fails.
+    async fn recover(&self) -> Result<bool, ConnectorError> {
+        Ok(false)
     }
 
     /// Whether this broker has a dead-letter destination of its own that

@@ -278,13 +278,34 @@ coordinates, so a run traces back to the exact message.
   meanwhile looked healthy — messages flowing, all dispatching, only the commit
   frozen. New `ConnectorRuntimeConfig::stall_threshold`: when a
   partition holds that many completed offsets behind an unsettled head, the
-  pass **fails loudly**, naming the partition, the depth and the remedy, so the
-  supervisor recreates the consumer and the re-read performs the retry. Checked
-  on idle passes too, since a stalled partition usually goes quiet. **On by
-  default** — a stall nobody configured a detector for is exactly the one that
-  goes unnoticed — with the bound derived from the binding's `max_in_flight`
-  (×4, floored at 32), which is what bounds *healthy* out-of-order settlement.
-  `Some(0)` opts out.
+  pass fails with a distinct `ConnectorError::Stalled` carrying the partition,
+  the depth and the bound. Checked *before* each receive, both because a
+  stalled partition usually goes quiet (so a check that only ran when messages
+  arrived would miss the stalls that matter most) and because pulling a batch
+  only to drop it on the error is pure churn that advances a positional
+  consumer past undispatched messages. **On by default** — a stall nobody
+  configured a detector for is exactly the one that goes unnoticed — with the
+  bound derived from the binding's `max_in_flight` (×4, floored at 32), which
+  is what bounds *healthy* out-of-order settlement. `Some(0)` opts out.
+
+  The first cut only *signalled* the stall: `run`'s generic error arm caught it,
+  slept, and re-polled the same wedged consumer forever, and nothing in-tree
+  supervises the connector task, so the promised "a supervisor recreates the
+  consumer" never happened. Detection without recovery is not a fix, so the
+  runtime now performs the retry itself. New defaulted `EventSource::recover()`
+  returns whether the source rebuilt its own client; `run` handles `Stalled`
+  as its own case (re-polling a wedged consumer accomplishes nothing) by
+  calling it and then clearing that partition's tracker state — without which
+  the redelivered offsets arrive below the stale mark and the prefix stays
+  blocked. Poison strikes are deliberately not cleared, so a repeatedly-rejected
+  message still reaches its threshold instead of restarting its count on every
+  recovery. `KafkaSource` implements `recover` by rebuilding its consumer
+  (held behind a short-lived `Mutex`, never locked across an `.await`), which
+  rejoins the group from the last committed offset — genuinely redelivering the
+  blocked message. The default is `Ok(false)`, correct for SQS, whose
+  visibility timeout already redelivers so its prefix cannot wedge this way; a
+  source that both stalls and cannot rebuild itself stops the binding with an
+  error rather than spinning.
 
 - **A directly-built runtime silently discarded every poison message.**
   `ConnectorRuntime::new` / `for_binding` are both public, and both installed

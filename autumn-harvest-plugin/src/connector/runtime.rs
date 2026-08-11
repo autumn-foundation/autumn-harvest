@@ -275,6 +275,25 @@ impl ConnectorRuntime {
                         tracing::info!(source = source_name, "connector source closed");
                         break;
                     }
+                    // A wedged consumer is not a transient error: re-polling
+                    // the same one accomplishes nothing, which is why this
+                    // cannot fall into the backoff arm below. Rebuild it so
+                    // the blocked message is actually redelivered; if the
+                    // source cannot rebuild itself there is no in-process
+                    // recovery, so stop rather than spin forever pretending to
+                    // retry.
+                    Err(ConnectorError::Stalled { partition, .. }) => {
+                        if !self.recover_from_stall(partition).await {
+                            tracing::error!(
+                                source = source_name,
+                                partition,
+                                "connector stalled and its source cannot rebuild itself; stopping \
+                                 this binding. Restart the process, or supply a source that \
+                                 implements `EventSource::recover`"
+                            );
+                            break;
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(source = source_name, error = %e, "connector poll failed");
                         tokio::select! {
@@ -300,6 +319,14 @@ impl ConnectorRuntime {
     /// Propagates the source's own errors; [`ConnectorError::Closed`] means
     /// the source will yield nothing further.
     pub async fn run_once(&self) -> Result<PassSummary, ConnectorError> {
+        // Checked BEFORE receiving, for two reasons. A stalled partition often
+        // goes quiet (its head is blocked and the producer moves on), so a
+        // check that only ran when messages arrived would never report the
+        // stalls that matter most. And pulling a batch we are about to drop on
+        // the stall error is pure churn — on a positional broker it also
+        // advances the consumer past messages that were never dispatched.
+        self.check_commit_stall().await?;
+
         let batch = self
             .source
             .receive(
@@ -315,12 +342,6 @@ impl ConnectorRuntime {
         {
             self.metrics.record_connector_lag(self.binding.name, lag);
         }
-
-        // Checked BEFORE the idle short-circuit: a stalled partition often
-        // goes quiet (its head is blocked and the producer moves on), so a
-        // check that only ran when messages arrived would never report the
-        // stalls that matter most.
-        self.check_commit_stall().await?;
 
         if batch.is_empty() {
             return Ok(PassSummary::default());
@@ -414,14 +435,51 @@ impl ConnectorRuntime {
             held,
             threshold,
             "connector commit prefix is stalled; the head offset has not settled while later \
-             offsets pile up behind it. Recreate the consumer to re-read from the last commit"
+             offsets pile up behind it. Rebuilding the consumer to re-read from the last commit"
         );
-        Err(ConnectorError::Broker(format!(
-            "connector '{}' commit prefix stalled on partition {partition}: {held} completed \
-             offsets are held behind an unsettled head (threshold {threshold}). The blocked \
-             message is only redelivered by re-reading from the last commit",
-            self.binding.name,
-        )))
+        Err(ConnectorError::Stalled {
+            partition,
+            held,
+            threshold,
+        })
+    }
+
+    /// Perform the retry a detected stall calls for: rebuild the source's
+    /// consumer and discard the wedged generation's offset state.
+    ///
+    /// Returns whether the source could rebuild itself. Clearing the tracker
+    /// is what makes the rebuild stick — a fresh consumer re-reads from the
+    /// last commit, so the redelivered offsets arrive *below* the stale
+    /// in-memory mark and would be mistaken for already-settled redeliveries,
+    /// leaving the prefix blocked exactly as it was.
+    ///
+    /// Only the offsets are forgotten, never the poison strikes: a message
+    /// that has been rejected N times is still on strike N after the rebuild,
+    /// so it still reaches its threshold and dead-letters rather than
+    /// restarting its count on every recovery.
+    pub async fn recover_from_stall(&self, partition: i32) -> bool {
+        match self.source.recover().await {
+            Ok(true) => {
+                self.offsets.lock().await.forget(partition);
+                tracing::warn!(
+                    source = self.binding.name,
+                    partition,
+                    "connector consumer rebuilt after a commit stall; re-reading from the last \
+                     commit so the blocked message is redelivered"
+                );
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                tracing::error!(
+                    source = self.binding.name,
+                    partition,
+                    error = %e,
+                    "connector consumer rebuild failed after a commit stall"
+                );
+                false
+            }
+        }
     }
 
     /// Whether enough time has passed to re-sample the consumer-lag gauge.
@@ -1411,11 +1469,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_permanently_blocked_prefix_fails_the_pass_so_the_supervisor_recreates_the_consumer()
-    {
+    async fn a_permanently_blocked_prefix_fails_the_pass_with_its_own_error() {
         // Kafka's `abandon` is a no-op by design (not committing is not a
         // nack), so a retried message is only handed back when the consumer is
-        // recreated and re-reads from the last commit. Left unreported the
+        // rebuilt and re-reads from the last commit. Left unreported the
         // partition's prefix stays blocked forever and its commit never
         // advances -- silently, because every later message settles fine.
         let rt = stalled_runtime(Some(3), 4).await;
@@ -1428,14 +1485,24 @@ mod tests {
             .await
             .expect_err("a blocked prefix past the bound must fail the pass");
 
+        // Structured, not a string: `run` has to tell this apart from a
+        // transient broker error, because re-polling the same wedged consumer
+        // accomplishes nothing.
+        assert!(
+            matches!(
+                err,
+                ConnectorError::Stalled {
+                    partition: 0,
+                    held: 4,
+                    threshold: 3,
+                }
+            ),
+            "the error must carry the partition, depth and bound: {err:?}"
+        );
         let rendered = err.to_string();
         assert!(
-            rendered.contains("stalled") && rendered.contains("partition 0"),
-            "the error must name the stall and the blocked partition: {rendered}"
-        );
-        assert!(
-            rendered.contains("re-reading from the last commit"),
-            "the error must name the remedy: {rendered}"
+            rendered.contains("partition 0") && rendered.contains("rebuilt"),
+            "the message must name the blocked partition and the remedy: {rendered}"
         );
     }
 
@@ -1593,6 +1660,149 @@ mod tests {
         assert_eq!(
             summary.received, 1,
             "a misconfigured batch size must not stall the binding"
+        );
+    }
+
+    /// A source that can rebuild its own consumer, so the runtime can perform
+    /// the retry in-process instead of hoping something external notices.
+    #[derive(Debug)]
+    struct RecoverableSource {
+        inner: MockSource,
+        recovered: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecoverableSource {
+        fn new(stream: &str) -> Self {
+            Self {
+                inner: MockSource::new(stream),
+                recovered: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn recover_count(&self) -> usize {
+            self.recovered.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventSource for RecoverableSource {
+        fn stream(&self) -> &str {
+            self.inner.stream()
+        }
+        async fn receive(
+            &self,
+            max: usize,
+            timeout: std::time::Duration,
+        ) -> Result<Vec<InboundMessage>, ConnectorError> {
+            self.inner.receive(max, timeout).await
+        }
+        async fn ack(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            self.inner.ack(handle).await
+        }
+        async fn abandon(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            self.inner.abandon(handle).await
+        }
+        async fn recover(&self) -> Result<bool, ConnectorError> {
+            self.recovered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
+    /// The whole justification for detecting a stall is that something then
+    /// *performs the retry*. Failing the pass only signals; the runtime has to
+    /// rebuild the consumer and clear the dead generation, or the partition
+    /// stays wedged exactly as it was before the detector existed.
+    #[tokio::test]
+    async fn a_detected_stall_rebuilds_the_consumer_and_clears_the_dead_generation() {
+        let source = Arc::new(RecoverableSource::new("orders"));
+        let erased: Arc<dyn EventSource> = Arc::clone(&source) as Arc<dyn EventSource>;
+        let rt = ConnectorRuntime::new(
+            malformed_binding(),
+            erased,
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
+        )
+        .with_dead_letter_sink(Arc::new(RecordingDeadLetterSink::new()))
+        .with_config(ConnectorRuntimeConfig {
+            stall_threshold: Some(3),
+            ..ConnectorRuntimeConfig::default()
+        });
+
+        // A blocked head with enough settled offsets behind it to trip the bound.
+        rt.offsets.lock().await.observe(0, 0);
+        for offset in 1..=4 {
+            rt.offsets.lock().await.observe(0, offset);
+            rt.ack(&MessageHandle::positioned(
+                format!("orders:0:{offset}"),
+                0,
+                offset,
+            ))
+            .await;
+        }
+        assert_eq!(rt.offsets.lock().await.held(0), 4, "the prefix is blocked");
+
+        let err = rt.run_once().await.expect_err("a stalled pass must fail");
+        assert!(
+            matches!(err, ConnectorError::Stalled { partition: 0, .. }),
+            "a stall must be its own error, not a transient broker error: {err:?}"
+        );
+
+        // `run`'s handling is what actually performs the retry.
+        let recovered = rt.recover_from_stall(0).await;
+
+        assert!(recovered, "a recoverable source must be rebuilt");
+        assert_eq!(source.recover_count(), 1, "the consumer was recreated once");
+        assert_eq!(
+            rt.offsets.lock().await.held(0),
+            0,
+            "the dead generation must be cleared, else the stall latches forever"
+        );
+    }
+
+    /// Not every source can rebuild itself. Saying so must be distinguishable
+    /// from a successful recovery, or the runtime would loop forever believing
+    /// it had fixed something.
+    #[tokio::test]
+    async fn a_source_that_cannot_rebuild_itself_reports_so() {
+        let rt = stalled_runtime(Some(3), 4).await;
+        assert!(
+            !rt.recover_from_stall(0).await,
+            "the default source cannot self-heal and must say so"
+        );
+    }
+
+    /// A wedged binding must stop pulling. Receiving a batch and then dropping
+    /// it on the stall error is pure churn — and on a positional broker it
+    /// advances the consumer past messages that were never dispatched.
+    #[tokio::test]
+    async fn a_stalled_pass_never_pulls_a_batch_it_would_only_drop() {
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_kafka(1, 1, b"{{{");
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let rt = runtime(malformed_binding(), Arc::clone(&source), Arc::clone(&sink)).with_config(
+            ConnectorRuntimeConfig {
+                stall_threshold: Some(3),
+                ..ConnectorRuntimeConfig::default()
+            },
+        );
+        rt.offsets.lock().await.observe(0, 0);
+        for offset in 1..=4 {
+            rt.offsets.lock().await.observe(0, offset);
+            rt.ack(&MessageHandle::positioned(
+                format!("orders:0:{offset}"),
+                0,
+                offset,
+            ))
+            .await;
+        }
+
+        let _ = rt.run_once().await.expect_err("stalled");
+
+        assert_eq!(
+            source.pending(),
+            1,
+            "the message must still be on the broker, not drained and discarded"
         );
     }
 }

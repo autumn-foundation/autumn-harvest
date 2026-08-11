@@ -247,13 +247,27 @@ is recreated and re-reads from the last commit. The stall is silent, because
 the connector otherwise looks healthy: messages keep flowing, they all dispatch,
 only the commit stops moving.
 
-The connector detects this. When a partition holds more than
-`ConnectorRuntimeConfig::stall_threshold` completed offsets behind an unsettled
-head, the pass **fails loudly** — naming the partition, the depth, and the
-remedy — instead of continuing to look healthy. `run` then backs off and
-re-polls, and a supervisor that recreates the consumer performs the retry by
-re-reading from the last commit. It is checked on idle passes too, because a
-stalled partition usually goes quiet.
+The connector detects this **and fixes it in process**. When a partition holds
+more than `ConnectorRuntimeConfig::stall_threshold` completed offsets behind an
+unsettled head, the pass fails with a distinct `ConnectorError::Stalled`
+carrying the partition, depth and bound. `run` treats that as its own case
+rather than a transient error — re-polling a wedged consumer accomplishes
+nothing — and instead calls `EventSource::recover()`, which rebuilds the
+consumer. A fresh consumer rejoins the group from the **last committed offset**,
+so the blocked message is genuinely redelivered; the runtime then clears that
+partition's tracker state, without which the redelivered offsets would arrive
+below the stale in-memory mark and the prefix would stay blocked. Poison
+strikes are deliberately *not* cleared, so a repeatedly-rejected message still
+reaches its threshold and dead-letters rather than restarting its count on
+every recovery. The check runs before each receive, so a wedged binding also
+stops pulling batches it would only drop.
+
+`recover()` defaults to "I cannot rebuild myself" (`Ok(false)`) — correct for
+SQS, whose visibility timeout already redelivers an abandoned message, so its
+prefix cannot wedge this way. Kafka implements it. If a source that *cannot*
+rebuild itself does stall, there is no in-process recovery available, so the
+binding logs an error and **stops** rather than spinning forever pretending to
+retry; restart the process, or supply a source that implements `recover`.
 
 The check is **on by default**, since a stall nobody configured a detector for
 is precisely the one that goes unnoticed. The default bound is derived from the

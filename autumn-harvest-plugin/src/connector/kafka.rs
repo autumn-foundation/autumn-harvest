@@ -97,8 +97,14 @@ impl KafkaSourceConfig {
 
 /// A Kafka-backed [`EventSource`].
 pub struct KafkaSource {
-    consumer: Arc<StreamConsumer>,
+    /// Swappable so [`EventSource::recover`] can rebuild it in place when the
+    /// commit prefix wedges. Guarded by a `std::sync::Mutex` that is only ever
+    /// held long enough to clone the `Arc` out — never across an `.await`, so
+    /// it cannot block the runtime or deadlock with a concurrent rebuild.
+    consumer: std::sync::Mutex<Arc<StreamConsumer>>,
     topic: String,
+    /// Retained so a rebuild produces an identically-configured consumer.
+    config: KafkaSourceConfig,
 }
 
 impl std::fmt::Debug for KafkaSource {
@@ -117,6 +123,15 @@ impl KafkaSource {
     /// Returns [`ConnectorError::Config`] when the client cannot be created or
     /// the subscription fails.
     pub fn connect(config: &KafkaSourceConfig) -> Result<Self, ConnectorError> {
+        Ok(Self {
+            consumer: std::sync::Mutex::new(Self::build_consumer(config)?),
+            topic: config.topic.clone(),
+            config: config.clone(),
+        })
+    }
+
+    /// Create a consumer subscribed to `config.topic`.
+    fn build_consumer(config: &KafkaSourceConfig) -> Result<Arc<StreamConsumer>, ConnectorError> {
         let consumer: StreamConsumer = config
             .to_client_config()
             .create()
@@ -124,10 +139,20 @@ impl KafkaSource {
         consumer
             .subscribe(&[config.topic.as_str()])
             .map_err(|e| ConnectorError::Config(format!("kafka subscribe: {e}")))?;
-        Ok(Self {
-            consumer: Arc::new(consumer),
-            topic: config.topic.clone(),
-        })
+        Ok(Arc::new(consumer))
+    }
+
+    /// The current consumer.
+    ///
+    /// Clones the `Arc` out under a short lock so callers can `.await` on it
+    /// without holding the mutex.
+    fn consumer(&self) -> Arc<StreamConsumer> {
+        Arc::clone(
+            &self
+                .consumer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 }
 
@@ -191,11 +216,14 @@ impl EventSource for KafkaSource {
         timeout: std::time::Duration,
     ) -> Result<Vec<InboundMessage>, ConnectorError> {
         let mut batch = Vec::new();
+        // Snapshot the consumer once: a rebuild mid-pass must not split this
+        // batch across two generations.
+        let consumer = self.consumer();
         // Wait `timeout` for the first message, then drain whatever else is
         // already buffered without blocking again.
         let mut budget = timeout;
         while batch.len() < max {
-            let next = tokio::time::timeout(budget, self.consumer.recv()).await;
+            let next = tokio::time::timeout(budget, consumer.recv()).await;
             let Ok(result) = next else { break };
             let message = match result {
                 Ok(message) => message,
@@ -257,7 +285,7 @@ impl EventSource for KafkaSource {
         // offset in this partition is settled.
         tpl.add_partition_offset(&self.topic, partition, Offset::Offset(offset + 1))
             .map_err(|e| ConnectorError::Broker(format!("kafka offset list: {e}")))?;
-        self.consumer
+        self.consumer()
             .commit(&tpl, CommitMode::Async)
             .map_err(|e| ConnectorError::Broker(format!("kafka commit: {e}")))
     }
@@ -269,8 +297,38 @@ impl EventSource for KafkaSource {
         Ok(())
     }
 
+    /// Rebuild the consumer so the blocked offset is re-read.
+    ///
+    /// This is the retry a stalled prefix calls for. `recv()` has already
+    /// advanced librdkafka's *local* position past the blocked message, so
+    /// nothing hands it back while this consumer lives — but a fresh consumer
+    /// rejoins the group and starts from the last **committed** offset, which
+    /// is precisely the message the runtime is waiting on.
+    ///
+    /// The old consumer is dropped once the last in-flight `Arc` to it goes,
+    /// which closes its group membership and triggers a rebalance.
+    async fn recover(&self) -> Result<bool, ConnectorError> {
+        let config = self.config.clone();
+        // Creating and subscribing a consumer are blocking librdkafka calls.
+        let rebuilt = tokio::task::spawn_blocking(move || Self::build_consumer(&config))
+            .await
+            .map_err(|e| {
+                ConnectorError::Broker(format!("kafka consumer rebuild panicked: {e}"))
+            })??;
+
+        *self
+            .consumer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rebuilt;
+        tracing::warn!(
+            topic = %self.topic,
+            "kafka consumer rebuilt; re-reading from the last committed offset"
+        );
+        Ok(true)
+    }
+
     async fn lag(&self) -> Option<i64> {
-        let consumer = Arc::clone(&self.consumer);
+        let consumer = self.consumer();
         let topic = self.topic.clone();
         // `fetch_watermarks` is a blocking librdkafka call.
         tokio::task::spawn_blocking(move || {
