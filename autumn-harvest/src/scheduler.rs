@@ -675,7 +675,8 @@ pub fn registration_backoff_key(kind: &str, name: &str, shard: ShardId) -> Strin
 /// this fix suppresses would persist at roughly full rate, merely spread across
 /// processes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RegistrationOutcome {
+#[doc(hidden)]
+pub enum RegistrationOutcome {
     /// The row was reconciled, or was already converged. Clears any penalty.
     Settled,
     /// A peer held the registration lock. Leaves any penalty untouched.
@@ -892,9 +893,7 @@ async fn register_workflow_schedules_for_shard(
         let outcome = if schedule_targets_shard(ws, router, shard) {
             register_one_workflow_schedule_locked(conn, ws).await
         } else if ws.dag_name.is_some() {
-            delete_stale_dag_workflow_schedule(conn, ws)
-                .await
-                .map(|()| RegistrationOutcome::Settled)
+            delete_stale_dag_workflow_schedule_locked(conn, ws).await
         } else {
             Ok(RegistrationOutcome::Settled)
         };
@@ -911,6 +910,96 @@ async fn register_workflow_schedules_for_shard(
     Ok(())
 }
 
+/// The rows a non-owning shard considers stale for `ws`.
+///
+/// Single-sourced so the convergence probe and the `DELETE` cannot drift: a
+/// probe narrower than the delete would leave stale rows uncollected, and one
+/// wider would take the registration lock for a delete that removes nothing.
+///
+/// `SqlType` is `Nullable<Bool>` because both columns are nullable; Postgres
+/// treats a `NULL` predicate as false in a `WHERE` clause, which is exactly the
+/// pre-existing inline semantics this alias preserves.
+type StaleDagRowFilter<'a> = Box<
+    dyn diesel::BoxableExpression<
+            crate::schema::harvest_schedules::table,
+            diesel::pg::Pg,
+            SqlType = diesel::sql_types::Nullable<diesel::sql_types::Bool>,
+        > + 'a,
+>;
+
+fn stale_dag_row_filter<'a>(workflow_name: &'a str, dag_name: &'a str) -> StaleDagRowFilter<'a> {
+    use crate::schema::harvest_schedules::dsl;
+
+    Box::new(
+        dsl::workflow_name
+            .eq(workflow_name)
+            .or(dsl::workflow_name.is_null())
+            .and(dsl::dag_name.eq(dag_name).or(dsl::dag_name.is_null())),
+    )
+}
+
+/// Does this shard actually hold a stale row for `ws`?
+///
+/// The convergence probe for the non-owning-shard cleanup path (issue #1157,
+/// defect 3). Without it the tick issued an unconditional `DELETE` once per
+/// second per DAG on **every** non-owning shard, forever — replica-scaled write
+/// statements and table locks on a fleet that is already converged, which is
+/// the storm this change exists to remove.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the probe cannot be executed.
+#[doc(hidden)]
+pub async fn stale_dag_rows_exist(
+    conn: &mut AsyncPgConnection,
+    ws: &WorkflowSchedule,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_schedules::dsl;
+
+    let Some(dag_name) = ws.dag_name.as_deref() else {
+        return Ok(false);
+    };
+
+    let stale: i64 = dsl::harvest_schedules
+        .filter(stale_dag_row_filter(&ws.workflow_name, dag_name))
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(stale > 0)
+}
+
+/// Drop this shard's stale rows for `ws`, skipping when a peer is reconciling.
+///
+/// Mirrors [`register_one_workflow_schedule_locked`]: probe outside the
+/// transaction, and take the fleet-wide registration lock around the write so a
+/// converged fleet performs 1× the deletes rather than N× (issue #1157,
+/// defects 3 and 4). A lock skip returns [`RegistrationOutcome::Skipped`] so it
+/// is not mistaken for a settled pass and does not clear accumulated backoff.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the probe or the delete fails.
+#[doc(hidden)]
+pub async fn delete_stale_dag_workflow_schedule_locked(
+    conn: &mut AsyncPgConnection,
+    ws: &WorkflowSchedule,
+) -> HarvestResult<RegistrationOutcome> {
+    if !stale_dag_rows_exist(conn, ws).await? {
+        return Ok(RegistrationOutcome::Settled);
+    }
+    // See `register_one_dag_schedule` for why the isolation level is pinned.
+    let mut tx = conn.build_transaction().read_committed();
+    Box::pin(tx.run(async |c| {
+        if !try_take_registration_lock(c).await? {
+            return Ok(RegistrationOutcome::Skipped);
+        }
+        delete_stale_dag_workflow_schedule(c, ws).await?;
+        Ok(RegistrationOutcome::Settled)
+    }))
+    .await
+}
+
 async fn delete_stale_dag_workflow_schedule(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
@@ -922,13 +1011,7 @@ async fn delete_stale_dag_workflow_schedule(
     };
 
     diesel::delete(
-        dsl::harvest_schedules
-            .filter(
-                dsl::workflow_name
-                    .eq(&ws.workflow_name)
-                    .or(dsl::workflow_name.is_null()),
-            )
-            .filter(dsl::dag_name.eq(dag_name).or(dsl::dag_name.is_null())),
+        dsl::harvest_schedules.filter(stale_dag_row_filter(&ws.workflow_name, dag_name)),
     )
     .execute(conn)
     .await

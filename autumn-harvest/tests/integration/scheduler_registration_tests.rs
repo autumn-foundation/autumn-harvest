@@ -771,3 +771,120 @@ async fn a_failing_schedule_is_suppressed_on_the_very_next_tick() {
          identical failing write -- that re-issue is the storm"
     );
 }
+
+// ── Defect 3 + 4 — the *non-owning* shard's stale-row DELETE ────────────────
+//
+// `register_workflow_schedules_for_shard` has two branches. Every test above
+// drives the owning-shard branch (`register_one_workflow_schedule_locked`).
+// The other branch — a DAG-backed schedule that does *not* target this shard —
+// deletes any stale row this shard still holds. It is only reachable in a
+// genuinely multi-shard deployment (`schedule_targets_shard` is unconditionally
+// true single-shard), so these tests call the primitive directly rather than
+// through `tick_once`, which would never take that branch.
+
+#[tokio::test]
+async fn a_converged_shard_takes_no_lock_to_delete_nothing() {
+    let (mut conn, db) = setup_db().await;
+
+    // A peer holds the registration lock for the whole test.
+    let mut holder = AsyncPgConnection::establish(&db.url)
+        .await
+        .expect("holder connect");
+    holder
+        .batch_execute("BEGIN")
+        .await
+        .expect("holder transaction");
+    diesel::sql_query(autumn_harvest::scheduler::registration_lock_stmt())
+        .bind::<diesel::sql_types::Text, _>(autumn_harvest::scheduler::REGISTRATION_LOCK_KEY)
+        .execute(&mut holder)
+        .await
+        .expect("holder takes the lock");
+
+    // This shard holds no row for the schedule, so there is nothing to delete.
+    let outcome = autumn_harvest::scheduler::delete_stale_dag_workflow_schedule_locked(
+        &mut conn,
+        &dag_schedule("nightly"),
+    )
+    .await
+    .expect("a converged shard must not error");
+
+    // The convergence probe must short-circuit BEFORE contending for the lock.
+    // Without it this returns `Skipped`, which would also *hold the schedule's
+    // backoff penalty forever* on an already-healthy fleet.
+    assert_eq!(
+        outcome,
+        autumn_harvest::scheduler::RegistrationOutcome::Settled,
+        "an already-converged shard must settle without taking the fleet lock -- \
+         issuing a DELETE that removes nothing, once per second per replica, is \
+         the storm this fix eliminates"
+    );
+
+    holder.batch_execute("ROLLBACK").await.expect("rollback");
+}
+
+#[tokio::test]
+async fn a_stale_row_delete_is_guarded_by_the_registration_lock() {
+    let (mut conn, db) = setup_db().await;
+
+    // This shard still holds a row for a schedule that has moved elsewhere.
+    let stale = insert_raw_row(
+        &mut conn,
+        Some("nightly"),
+        Some("nightly"),
+        "cron:0 1 * * *",
+    )
+    .await;
+
+    let mut holder = AsyncPgConnection::establish(&db.url)
+        .await
+        .expect("holder connect");
+    holder
+        .batch_execute("BEGIN")
+        .await
+        .expect("holder transaction");
+    diesel::sql_query(autumn_harvest::scheduler::registration_lock_stmt())
+        .bind::<diesel::sql_types::Text, _>(autumn_harvest::scheduler::REGISTRATION_LOCK_KEY)
+        .execute(&mut holder)
+        .await
+        .expect("holder takes the lock");
+
+    let outcome = autumn_harvest::scheduler::delete_stale_dag_workflow_schedule_locked(
+        &mut conn,
+        &dag_schedule("nightly"),
+    )
+    .await
+    .expect("losing the lock must skip, not fail");
+
+    assert_eq!(
+        outcome,
+        autumn_harvest::scheduler::RegistrationOutcome::Skipped,
+        "a peer already reconciling must suppress this process's DELETE"
+    );
+    assert_eq!(
+        row_by_id(&mut conn, stale).await,
+        (Some("nightly".to_string()), Some("nightly".to_string())),
+        "the row must survive while a peer holds the lock -- the DELETE is a \
+         fleet-wide write and must not race the peer's reconciliation"
+    );
+
+    // Release the peer; the collection converges on the next pass.
+    holder.batch_execute("ROLLBACK").await.expect("rollback");
+    drop(holder);
+
+    let outcome = autumn_harvest::scheduler::delete_stale_dag_workflow_schedule_locked(
+        &mut conn,
+        &dag_schedule("nightly"),
+    )
+    .await
+    .expect("delete after the peer released the lock");
+
+    assert_eq!(
+        outcome,
+        autumn_harvest::scheduler::RegistrationOutcome::Settled
+    );
+    assert_eq!(
+        schedule_count(&mut conn).await,
+        0,
+        "collection must resume once the peer releases the lock"
+    );
+}
