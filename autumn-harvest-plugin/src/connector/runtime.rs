@@ -106,6 +106,24 @@ pub struct ConnectorRuntimeConfig {
     /// It is on by default because a stall that nobody configured a detector
     /// for is exactly the one that goes unnoticed. Set `Some(0)` to opt out.
     pub stall_threshold: Option<usize>,
+    /// How long a broker-native dead-lettered message's strike history is kept
+    /// after its last delivery.
+    ///
+    /// [`MessageDisposition::AbandonToBrokerDeadLetter`] is terminal for
+    /// harvest but not for the broker: SQS resets visibility, redelivers, and
+    /// eventually moves the message to its own DLQ — **without notifying this
+    /// process**. So no later delivery and no terminal path can ever clear the
+    /// key, and the queue's redrive policy bounds *deliveries of one message*,
+    /// not the size of the in-process tracker across a stream of distinct
+    /// poison messages.
+    ///
+    /// The window therefore has to be long enough for the broker's own redrive
+    /// to finish — roughly `visibility_timeout × (maxReceiveCount −
+    /// poison_threshold)` — because expiring mid-redrive restarts the strike
+    /// countdown, which is the churn keeping the strikes avoids. Expiring
+    /// *late* costs only memory, so the default is deliberately generous.
+    /// [`MAX_TERMINAL_POISON_ENTRIES`] is the hard backstop.
+    pub poison_retention: std::time::Duration,
 }
 
 /// Never derive a bound below this, so a binding with tiny `max_in_flight`
@@ -148,6 +166,11 @@ impl Default for ConnectorRuntimeConfig {
             // Derived from the binding's `max_in_flight` (see
             // `effective_stall_threshold`), so the detector is on by default.
             stall_threshold: None,
+            // Generous on purpose: expiring late costs memory, expiring early
+            // costs a redelivered poison message a full strike countdown.
+            // An hour covers a 30s visibility timeout against SQS's
+            // `maxReceiveCount` maximum of 1000 with room to spare.
+            poison_retention: std::time::Duration::from_secs(60 * 60),
         }
     }
 }
@@ -298,6 +321,21 @@ impl ConnectorRuntime {
                             );
                             break;
                         }
+                        // Rebuilding a Kafka consumer is not a free local
+                        // operation: it triggers a GROUP rebalance, revoking
+                        // and reassigning partitions across every consumer in
+                        // the group. The cause of a stall is usually a
+                        // downstream outage (Postgres, an admission gate), so
+                        // the redelivered head fails again immediately —
+                        // without this pause the loop would rebuild as fast as
+                        // the group can rejoin, amplifying one binding's
+                        // outage into a rebalance storm across unrelated
+                        // partitions. Same knob as the transient-error arm
+                        // below, for the same reason.
+                        tokio::select! {
+                            () = cancel.cancelled() => break,
+                            () = tokio::time::sleep(self.config.error_backoff) => {}
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(source = source_name, error = %e, "connector poll failed");
@@ -331,6 +369,16 @@ impl ConnectorRuntime {
         // the stall error is pure churn — on a positional broker it also
         // advances the consumer past messages that were never dispatched.
         self.check_commit_stall().await?;
+
+        // Retire broker-native terminal strikes whose redrive window has
+        // elapsed. Here rather than only at the mark, so a binding that
+        // dead-letters a burst and then goes quiet still releases them: `run`
+        // calls this every pass regardless of whether messages arrive. O(number
+        // expired), so a pass with nothing to retire costs one front peek.
+        self.poison
+            .lock()
+            .await
+            .expire_terminal_as_of(std::time::Instant::now(), self.config.poison_retention);
 
         let batch = self
             .source
@@ -606,11 +654,18 @@ impl ConnectorRuntime {
         // strikes makes every later delivery re-nack on sight and lets the
         // broker's own count be what ends it.
         //
-        // The cost is that such an entry outlives harvest's view of the
-        // message, exactly as a forever-retried one does; the broker's redrive
-        // policy is what bounds it.
+        // Such an entry outlives harvest's view of the message, and *nothing
+        // downstream can ever clear it*: SQS moves the message to its DLQ
+        // without notifying this process, so there is no later delivery and no
+        // terminal path to hook. The queue's redrive policy bounds deliveries
+        // of one message, not this map across a stream of distinct poison
+        // messages — so the entry carries a retention deadline instead, run
+        // from its LAST delivery (see `ConnectorRuntimeConfig::poison_retention`).
         if matches!(effective, MessageDisposition::AbandonToBrokerDeadLetter(_)) {
-            // Keep the strikes; nothing else to do.
+            self.poison
+                .lock()
+                .await
+                .mark_terminal_as_of(&key, std::time::Instant::now());
         } else if matches!(effective, MessageDisposition::Retry) {
             // On a source whose `abandon` cannot force a redelivery, this
             // offset is now a permanently blocked prefix head: the local
@@ -1136,6 +1191,50 @@ mod tests {
         assert!(
             sink.entries().is_empty(),
             "broker-native dead-lettering never writes to the harvest sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_native_strikes_do_not_accumulate_without_bound() {
+        // The other half of the contract above. Keeping the strikes is right
+        // for the redrive lifetime, but SQS moves the message to its DLQ
+        // *without telling this process*: there is no later delivery and no
+        // terminal path that can ever clear the key. The redrive policy bounds
+        // deliveries of one message, not this map across a stream of distinct
+        // poison messages -- so the retention window has to.
+        let binding = Arc::new(
+            SourceBinding::starts("orders", "orders", "order_flow")
+                .map_raw(|_ctx| Err(MappingError::Rejected("no thanks".to_string())))
+                .poison_threshold(1)
+                .broker_native_dead_letter(),
+        );
+        let source = Arc::new(MockSource::new("orders"));
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let rt = runtime(binding, Arc::clone(&source), Arc::clone(&sink)).with_config(
+            ConnectorRuntimeConfig {
+                poison_retention: std::time::Duration::from_millis(30),
+                ..ConnectorRuntimeConfig::default()
+            },
+        );
+
+        // Ten distinct poison messages, each nacked to the broker's redrive.
+        for offset in 0..10 {
+            source.push_kafka(0, offset, b"{}");
+            assert_eq!(rt.run_once().await.unwrap().dead_lettered, 1);
+        }
+        assert_eq!(
+            rt.poison.lock().await.tracked(),
+            10,
+            "each is retained so a redelivery re-nacks on sight"
+        );
+
+        // Once every redrive window has elapsed, the entries retire.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        rt.run_once().await.unwrap();
+        assert_eq!(
+            rt.poison.lock().await.tracked(),
+            0,
+            "terminal strikes must expire; nothing else can ever clear them"
         );
     }
 
@@ -2037,6 +2136,131 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(true)
         }
+    }
+
+    /// A positional source that wedges itself on every pass and can rebuild.
+    ///
+    /// Models the shape of a downstream outage on Kafka: each pass receives a
+    /// fresh record, its dispatch fails, and because `abandon` cannot force a
+    /// redelivery the offset becomes a permanently blocked prefix head — so
+    /// the next pass stalls, recovers, and the cycle repeats for as long as
+    /// the outage lasts.
+    #[derive(Debug)]
+    struct WedgingRecoverableSource {
+        inner: MockSource,
+        next_offset: std::sync::atomic::AtomicI64,
+        recovered: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WedgingRecoverableSource {
+        fn new(stream: &str) -> Self {
+            Self {
+                inner: MockSource::new(stream).without_redelivery(),
+                next_offset: std::sync::atomic::AtomicI64::new(0),
+                recovered: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn recover_count(&self) -> usize {
+            self.recovered.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventSource for WedgingRecoverableSource {
+        fn stream(&self) -> &str {
+            self.inner.stream()
+        }
+        async fn receive(
+            &self,
+            max: usize,
+            timeout: std::time::Duration,
+        ) -> Result<Vec<InboundMessage>, ConnectorError> {
+            let offset = self
+                .next_offset
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.push_kafka(0, offset, b"{{{");
+            self.inner.receive(max, timeout).await
+        }
+        async fn ack(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            self.inner.ack(handle).await
+        }
+        async fn abandon(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            self.inner.abandon(handle).await
+        }
+        fn abandon_redelivers(&self) -> bool {
+            false
+        }
+        async fn recover(&self) -> Result<bool, ConnectorError> {
+            self.recovered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
+    /// Rebuilding a Kafka consumer is not a free local operation: it triggers
+    /// a **group rebalance**, which revokes and reassigns partitions across
+    /// every consumer in the group, not just this one. During a downstream
+    /// outage the redelivered head fails again immediately, so a loop that
+    /// recovers without pausing rebuilds as fast as the group can rejoin —
+    /// amplifying one binding's outage into a rebalance storm that disrupts
+    /// unrelated partitions and every other consumer in the group.
+    ///
+    /// The recovery arm therefore has to honour the same `error_backoff` the
+    /// transient-error arm does.
+    #[tokio::test]
+    async fn a_recovered_stall_backs_off_before_retrying_the_blocked_head() {
+        let source = Arc::new(WedgingRecoverableSource::new("orders"));
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        // Every message ends up `Retry`, which on this source wedges the head.
+        sink.fail_writes(true);
+        let backoff = std::time::Duration::from_millis(50);
+        let rt = Arc::new(
+            ConnectorRuntime::new(
+                malformed_binding(),
+                Arc::clone(&source) as Arc<dyn EventSource>,
+                HarvestApiState::new(),
+                Arc::new(NoOpMetrics),
+                IdempotencyMode::BrokerCoordinates,
+            )
+            .with_dead_letter_sink(sink)
+            .with_config(ConnectorRuntimeConfig {
+                error_backoff: backoff,
+                poll_timeout: std::time::Duration::from_millis(1),
+                idle_backoff: std::time::Duration::from_millis(1),
+                ..ConnectorRuntimeConfig::default()
+            }),
+        );
+
+        let window = std::time::Duration::from_millis(300);
+        let cancel = CancellationToken::new();
+        let handle = {
+            let rt = Arc::clone(&rt);
+            let cancel = cancel.clone();
+            tokio::spawn(async move { rt.run(cancel).await })
+        };
+        tokio::time::sleep(window).await;
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("run must observe cancellation")
+            .expect("run task must not panic");
+
+        let recoveries = source.recover_count();
+        assert!(
+            recoveries >= 1,
+            "the fixture must actually wedge and recover, or this bound is \
+             vacuous (saw {recoveries})"
+        );
+        // 300ms / 50ms = 6 in theory; 12 leaves generous slack for a loaded
+        // CI runner while staying orders of magnitude below an unthrottled
+        // loop, which rebuilds as fast as the runtime can schedule it.
+        let ceiling = 2 * (window.as_millis() / backoff.as_millis()) as usize;
+        assert!(
+            recoveries <= ceiling,
+            "a recovered stall must back off before rebuilding again; saw \
+             {recoveries} consumer rebuilds in {window:?} with a {backoff:?} \
+             backoff (ceiling {ceiling})"
+        );
     }
 
     /// The whole justification for detecting a stall is that something then

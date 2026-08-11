@@ -205,8 +205,32 @@ const fn dead_letter(reason: PoisonReason, mode: DeadLetterMode) -> MessageDispo
 /// which at worst costs `threshold` extra redeliveries of one message.
 #[derive(Debug, Default)]
 pub struct PoisonTracker {
-    strikes: HashMap<String, u32>,
+    strikes: HashMap<String, StrikeState>,
+    /// Expiry order for terminal entries, oldest first.
+    ///
+    /// `Instant` is monotonic, so pushing on every mark keeps this sorted by
+    /// construction and expiry is O(expired) rather than a scan of the map. A
+    /// key may appear more than once (a broker-native message is re-nacked on
+    /// every redelivery); only the entry whose instant matches the key's
+    /// current `terminal_at` actually retires it, so the retention window
+    /// runs from the *last* delivery.
+    expiry: std::collections::VecDeque<(std::time::Instant, String)>,
 }
+
+#[derive(Debug, Default)]
+struct StrikeState {
+    count: u32,
+    /// When this key was last handed to the broker's own redrive, if ever.
+    terminal_at: Option<std::time::Instant>,
+}
+
+/// Hard ceiling on retained broker-native terminal strikes.
+///
+/// Time-based retention alone is still unbounded against a sustained stream
+/// of *distinct* poison messages arriving faster than the window; this is what
+/// makes the bound hard. Evicting early only costs the evicted message one
+/// extra retry lap before it re-reaches the threshold — never correctness.
+pub const MAX_TERMINAL_POISON_ENTRIES: usize = 10_000;
 
 impl PoisonTracker {
     /// A tracker with no recorded strikes.
@@ -218,27 +242,93 @@ impl PoisonTracker {
     /// Record one more consecutive rejection for `key` and return the new
     /// count (saturating, so a pathological message cannot overflow).
     pub fn strike(&mut self, key: &str) -> u32 {
-        let entry = self.strikes.entry(key.to_string()).or_insert(0);
-        *entry = entry.saturating_add(1);
-        *entry
+        let entry = self.strikes.entry(key.to_string()).or_default();
+        entry.count = entry.count.saturating_add(1);
+        entry.count
     }
 
-    /// Forget `key`'s strikes — called once a message reaches any terminal
-    /// disposition, so the map cannot grow without bound.
+    /// Forget `key`'s strikes — called once a message reaches a terminal
+    /// disposition *harvest owns*, so the map cannot grow without bound.
     pub fn clear(&mut self, key: &str) {
         self.strikes.remove(key);
+    }
+
+    /// Note that `key` was handed to the broker's own redrive at `now`.
+    ///
+    /// This is terminal for harvest but not for the broker, so the strikes are
+    /// deliberately kept (see the call site in `ConnectorRuntime::settle`) —
+    /// but nothing downstream will ever clear them, which is why they carry a
+    /// retention deadline instead.
+    pub fn mark_terminal_as_of(&mut self, key: &str, now: std::time::Instant) {
+        if let Some(state) = self.strikes.get_mut(key) {
+            state.terminal_at = Some(now);
+        } else {
+            // Marking a key with no strike recorded would otherwise queue an
+            // expiry entry for nothing.
+            return;
+        }
+        self.expiry.push_back((now, key.to_string()));
+        // Applied at mark time, not at expiry time: a burst between passes
+        // must not be able to outrun the bound.
+        while self.expiry.len() > MAX_TERMINAL_POISON_ENTRIES {
+            self.pop_oldest_terminal();
+        }
+    }
+
+    /// Retire terminal entries whose retention window has elapsed.
+    ///
+    /// Returns how many keys were retired, for diagnostics.
+    pub fn expire_terminal_as_of(
+        &mut self,
+        now: std::time::Instant,
+        retention: std::time::Duration,
+    ) -> usize {
+        let mut retired = 0;
+        while let Some((at, _)) = self.expiry.front() {
+            if now.saturating_duration_since(*at) < retention {
+                break;
+            }
+            if self.pop_oldest_terminal() {
+                retired += 1;
+            }
+        }
+        retired
+    }
+
+    /// Pop the oldest queued expiry entry, retiring its key when that entry is
+    /// still the key's current terminal mark.
+    ///
+    /// Returns whether a key was actually retired: a stale entry (the key was
+    /// re-marked later, or `clear`ed and re-struck) must be a no-op rather
+    /// than disturbing live state.
+    fn pop_oldest_terminal(&mut self) -> bool {
+        let Some((at, key)) = self.expiry.pop_front() else {
+            return false;
+        };
+        if self.strikes.get(&key).and_then(|s| s.terminal_at) == Some(at) {
+            self.strikes.remove(&key);
+            return true;
+        }
+        false
     }
 
     /// Current strike count for `key`, for assertions and diagnostics.
     #[must_use]
     pub fn strikes(&self, key: &str) -> u32 {
-        self.strikes.get(key).copied().unwrap_or(0)
+        self.strikes.get(key).map_or(0, |s| s.count)
     }
 
     /// Number of messages currently holding strikes.
     #[must_use]
     pub fn tracked(&self) -> usize {
         self.strikes.len()
+    }
+
+    /// Force `key`'s count, so a test can reach the saturation boundary
+    /// without calling `strike` four billion times.
+    #[cfg(test)]
+    fn set_strikes_for_test(&mut self, key: &str, count: u32) {
+        self.strikes.entry(key.to_string()).or_default().count = count;
     }
 }
 
@@ -908,8 +998,115 @@ mod tests {
     #[test]
     fn poison_tracker_saturates_rather_than_overflowing() {
         let mut t = PoisonTracker::new();
-        t.strikes.insert("k".to_string(), u32::MAX);
+        t.strike("k");
+        t.set_strikes_for_test("k", u32::MAX);
         assert_eq!(t.strike("k"), u32::MAX);
+    }
+
+    #[test]
+    fn broker_native_terminal_strikes_expire_after_the_redrive_window() {
+        // `AbandonToBrokerDeadLetter` is terminal for harvest but NOT for the
+        // broker: SQS resets visibility, redelivers, and eventually moves the
+        // message to its own DLQ -- without telling this process. So no later
+        // delivery and no terminal path can ever clear the key, and the
+        // redrive policy bounds *deliveries of one message*, not the size of
+        // this map across a stream of distinct poison messages. The retention
+        // window is what bounds it.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        let retention = std::time::Duration::from_secs(60);
+
+        t.strike("m-1");
+        t.mark_terminal_as_of("m-1", t0);
+
+        // Inside the window the strikes survive, so a redelivery re-nacks on
+        // sight instead of crawling back through the strike countdown.
+        t.expire_terminal_as_of(t0 + std::time::Duration::from_secs(59), retention);
+        assert_eq!(t.strikes("m-1"), 1, "the redrive is still in progress");
+
+        // Past it the entry retires: nothing else will ever clear this key.
+        t.expire_terminal_as_of(t0 + std::time::Duration::from_secs(61), retention);
+        assert_eq!(t.tracked(), 0, "a terminal strike must not leak forever");
+    }
+
+    #[test]
+    fn a_redelivered_broker_native_message_restarts_its_retention_window() {
+        // The clock has to run from the LAST delivery, not the first: a
+        // message whose `maxReceiveCount` is well above the binding's
+        // `poison_threshold` comes back several times, and expiring it
+        // mid-redrive would restart its strike countdown -- exactly the churn
+        // keeping the strikes is meant to avoid.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        let retention = std::time::Duration::from_secs(60);
+
+        t.strike("m-1");
+        t.mark_terminal_as_of("m-1", t0);
+        // Redelivered at +50s and re-nacked.
+        t.strike("m-1");
+        t.mark_terminal_as_of("m-1", t0 + std::time::Duration::from_secs(50));
+
+        t.expire_terminal_as_of(t0 + std::time::Duration::from_secs(70), retention);
+        assert_eq!(
+            t.strikes("m-1"),
+            2,
+            "the window runs from the last delivery, not the first"
+        );
+
+        t.expire_terminal_as_of(t0 + std::time::Duration::from_secs(111), retention);
+        assert_eq!(t.tracked(), 0, "and it does expire once redrive is done");
+    }
+
+    #[test]
+    fn terminal_strikes_are_hard_capped_so_a_poison_storm_cannot_exhaust_memory() {
+        // Time-based retention alone is still unbounded against a sustained
+        // stream of DISTINCT poison messages arriving faster than the window.
+        // The cap is what makes the bound hard.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        for i in 0..(MAX_TERMINAL_POISON_ENTRIES + 500) {
+            let key = format!("m-{i}");
+            t.strike(&key);
+            t.mark_terminal_as_of(&key, t0);
+        }
+        assert!(
+            t.tracked() <= MAX_TERMINAL_POISON_ENTRIES,
+            "terminal strikes must be hard-capped; saw {}",
+            t.tracked()
+        );
+        assert_eq!(
+            t.strikes("m-0"),
+            0,
+            "the cap evicts oldest-first, so the earliest entry is gone"
+        );
+        assert_eq!(
+            t.strikes(&format!("m-{}", MAX_TERMINAL_POISON_ENTRIES + 499)),
+            1,
+            "and the newest is the one retained"
+        );
+    }
+
+    #[test]
+    fn a_cleared_key_is_not_resurrected_by_a_stale_expiry_entry() {
+        // `clear` (any non-broker-native terminal) removes the strike while a
+        // queued expiry entry may still name that key. Popping it later must
+        // be a no-op rather than disturbing a fresh count for the same key.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        let retention = std::time::Duration::from_secs(60);
+
+        t.strike("k");
+        t.mark_terminal_as_of("k", t0);
+        t.clear("k");
+        // The same coordinate comes back as a genuinely new strike run.
+        t.strike("k");
+
+        t.expire_terminal_as_of(t0 + std::time::Duration::from_secs(61), retention);
+        assert_eq!(
+            t.strikes("k"),
+            1,
+            "the stale expiry entry must not drop the fresh, non-terminal count"
+        );
     }
 
     // ---- OffsetTracker (Kafka contiguous-prefix commit) ----

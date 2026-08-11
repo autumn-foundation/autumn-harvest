@@ -465,9 +465,9 @@ coordinates, so a run traces back to the exact message.
   on the way out sent each redelivery back through ordinary
   visibility-timeout retries and emitted a fresh `dead_lettered` sample per lap.
   The strikes are now kept for that disposition alone, so every later delivery
-  re-nacks on sight and the broker's own count is what ends it. The trade is
-  that such an entry outlives harvest's view of the message exactly as a
-  forever-retried one does; the redrive policy is what bounds it.
+  re-nacks on sight and the broker's own count is what ends it. Such an entry
+  outlives harvest's view of the message, which is what the retention window
+  below exists to bound.
 
 - **Consumer lag was measured from the fetch position, not the committed
   offset.** `lag()` subtracted `consumer.position()` from the high watermark,
@@ -484,6 +484,39 @@ coordinates, so a run traces back to the exact message.
   processed nothing). Covered by a broker-suite test that drives the source
   directly so records are fetched but never acked — the honest reproduction of
   a blocked prefix, which read zero under the old computation.
+
+- **A recovered stall rebuilt the consumer with no backoff at all.** The
+  `Stalled` arm called `recover_from_stall` and looped straight back, bypassing
+  the `error_backoff` every other failure honours. But rebuilding a Kafka
+  consumer is not a free local operation: it triggers a **group rebalance**,
+  revoking and reassigning partitions across every consumer in the group. A
+  stall is almost always caused by a downstream outage (Postgres, an admission
+  gate), so the redelivered head fails again immediately — turning one
+  binding's outage into a rebalance storm that disrupts unrelated partitions
+  and every other consumer in the group, for as long as the outage lasts. The
+  arm now applies the same cancellation-aware `error_backoff` the transient
+  arm does. The RED measurement is not subtle: a fixture that wedges on every
+  pass drove **13,968 consumer rebuilds in 300 ms** (≈ 46 per millisecond)
+  before the fix, against a post-fix ceiling of 12 for a 50 ms backoff.
+
+- **Broker-native poison strikes could never be released.** The fix above kept
+  a message's strike history through `AbandonToBrokerDeadLetter`, justified at
+  the time by "the redrive policy is what bounds it". That reasoning was
+  wrong, and the review was right to challenge it: SQS moves the message to its
+  DLQ **without notifying this process**, so there is no later delivery and no
+  terminal path that can ever clear the key — and a redrive policy bounds
+  *deliveries of one message*, not the size of an in-process `HashMap` across a
+  sustained stream of *distinct* poison messages. `PoisonTracker` now carries a
+  bounded retention for terminal entries: a monotonic-`Instant` FIFO makes
+  expiry O(expired) rather than a scan, the window runs from the message's
+  **last** delivery (expiring mid-redrive would restart the very countdown
+  keeping the strikes avoids), and `MAX_TERMINAL_POISON_ENTRIES` (10 000) is a
+  hard cap applied at mark time so a burst between passes cannot outrun the
+  bound. Time-based retention alone is still unbounded against a fast enough
+  stream; the cap is what makes it hard. Window configurable via
+  `ConnectorRuntimeConfig::poison_retention`, defaulting to one hour —
+  deliberately generous, because expiring late costs only memory while
+  expiring early costs a redelivered poison message a full strike countdown.
 
 ### Success metric
 
