@@ -41,7 +41,7 @@ use super::disposition::{
     DeadLetterMode, DispatchOutcome, MessageDisposition, OffsetTracker, PoisonTracker,
     decide_disposition, success_outcome,
 };
-use super::idempotency::message_idempotency_key;
+use super::idempotency::message_idempotency_key_in;
 use super::message::{InboundMessage, MessageCtx, MessageHandle};
 use super::source::{ConnectorError, EventSource};
 use crate::api::HarvestApiState;
@@ -171,6 +171,18 @@ pub const ADAPTER_LAG_SAMPLE_CEILING: std::time::Duration = std::time::Duration:
 /// stranded record until the adapter's own lease expires; blocking here costs
 /// the shutdown the deadline was there to bound.
 const HARD_STOP_ABANDON_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long the drain waits for the dispatches it hard-stopped to finish
+/// handing their messages back.
+///
+/// Each straggler's recovery is itself bounded by
+/// [`HARD_STOP_ABANDON_BUDGET`] and they run concurrently, so this is that
+/// bound plus slack for the runtime to actually schedule them under the load
+/// that caused the timeout. Defined *as* that constant rather than merely
+/// sized against it, so lengthening the per-message budget cannot silently
+/// outrun the wait that joins it.
+const HARD_STOP_CLEANUP_BUDGET: std::time::Duration =
+    HARD_STOP_ABANDON_BUDGET.saturating_add(std::time::Duration::from_secs(1));
 
 /// How many held offsets count as a stall, given the configured knob and the
 /// binding's concurrency.
@@ -523,6 +535,28 @@ impl ConnectorRuntime {
                  being abandoned and their messages will be redelivered"
             );
             self.hard_stop.cancel();
+
+            // Cancelling only *wakes* the stragglers. The recovery that hands
+            // each message back runs inside a task this shutdown has already
+            // detached, so returning now would let `stop_harvest_runtime` see
+            // this connector as finished and the process exit before any
+            // `abandon` reaches the broker — trading a leaked task for a
+            // leaked message, which is what the hard stop exists to prevent.
+            //
+            // Re-acquiring joins exactly that cleanup: a straggler releases
+            // its permit only after its recovery returns. Bounded for the
+            // same reason the drain above is — a hard stop already means
+            // something is wedged, and the process must still be able to exit.
+            if tokio::time::timeout(HARD_STOP_CLEANUP_BUDGET, self.permits.acquire_many(permits))
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    source = self.binding.name,
+                    "harvest connector could not confirm its hard-stopped dispatches handed their \
+                     messages back; the adapter may hold them until its own lease expires"
+                );
+            }
         }
     }
 
@@ -900,10 +934,11 @@ impl ConnectorRuntime {
     /// Map, dispatch and settle one message.
     async fn process(&self, message: InboundMessage) -> MessageDisposition {
         let coordinates = message.coordinates.render();
-        let key = message_idempotency_key(
+        let key = message_idempotency_key_in(
             self.binding.name,
             self.binding.target.signal_name(),
             &coordinates,
+            self.binding.key_incarnation,
         );
 
         let outcome = self.map_and_dispatch(&message, &key, &coordinates).await;
@@ -2446,6 +2481,88 @@ mod tests {
         assert!(
             source.acked().is_empty(),
             "giving up must never acknowledge"
+        );
+        blocker.cancel();
+    }
+
+    /// The binding's incarnation must actually reach the derived key.
+    ///
+    /// A rotation knob nothing threads is worse than none: the operator
+    /// believes the cutover is namespaced and the silent replay-classification
+    /// happens anyway. Asserted end-to-end through a pass, using the key the
+    /// dead-letter record carries for exactly this correlation purpose.
+    #[tokio::test]
+    async fn the_binding_incarnation_reaches_the_derived_key() {
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_opaque("m1", b"not json");
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let binding = Arc::new(
+            SourceBinding::starts("orders", "orders", "order_flow")
+                .map_raw(|_ctx| Err(MappingError::Deserialize("not json".to_string())))
+                .key_incarnation("2026-08-cutover"),
+        );
+        let rt = runtime(binding, Arc::clone(&source), Arc::clone(&sink));
+
+        rt.run_once().await.expect("pass");
+
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 1, "the malformed message must dead-letter");
+        assert_eq!(
+            entries[0].idempotency_key,
+            message_idempotency_key_in("orders", None, "orders:m1", Some("2026-08-cutover"),),
+            "the key must be derived within the binding's incarnation, or a \
+             cutover keeps colliding with the claims it meant to leave behind"
+        );
+    }
+
+    /// Giving up must not outrun the handing-back it triggers.
+    ///
+    /// Cancelling `hard_stop` only *wakes* the stragglers. The recovery that
+    /// actually returns each message runs inside a task this shutdown has
+    /// already detached, so returning the instant the token is cancelled lets
+    /// `stop_harvest_runtime` observe this connector as finished and the
+    /// process exit before any `abandon` reaches the broker — trading a
+    /// leaked task for a leaked message, which is the very thing the hard
+    /// stop exists to prevent.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_waits_for_the_stragglers_it_hard_stopped() {
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_opaque("m1", b"not json");
+        let blocker = Arc::new(tokio_util::sync::CancellationToken::new());
+        let mut rt = runtime(
+            malformed_binding(),
+            Arc::clone(&source),
+            Arc::new(RecordingDeadLetterSink::new()),
+        )
+        .with_dead_letter_sink(Arc::new(BlockingDeadLetterSink(Arc::clone(&blocker))));
+        rt.config.shutdown_timeout = std::time::Duration::from_secs(30);
+        let rt = Arc::new(rt);
+
+        let driver = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { rt.run_once().await }
+        });
+
+        // Let the pass reach the sink, then detach it exactly as cancelling
+        // `run` does: dropping `run_once` drops the join loop, and a dropped
+        // `JoinHandle` does not abort the dispatch it was holding. Awaiting
+        // the aborted handle is what makes the detached state deterministic.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        driver.abort();
+        assert!(driver.await.is_err(), "the pass must have been cancelled");
+
+        rt.drain_in_flight().await;
+
+        assert!(
+            rt.hard_stop.is_cancelled(),
+            "the straggler held its permit, so the drain must have given up"
+        );
+        assert_eq!(
+            source.abandoned().len(),
+            1,
+            "the drain must not return until the dispatches it hard-stopped have \
+             handed their messages back, or the process can exit first and the \
+             adapter keeps custody"
         );
         blocker.cancel();
     }

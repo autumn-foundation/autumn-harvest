@@ -97,12 +97,52 @@ pub fn message_idempotency_key(
     signal_name: Option<&str>,
     coordinates_render: &str,
 ) -> String {
-    format!(
+    message_idempotency_key_in(binding, signal_name, coordinates_render, None)
+}
+
+/// Derive the key within a named *incarnation* of the binding's stream.
+///
+/// # Why an incarnation is needed
+///
+/// Broker coordinates are only unique within one incarnation of the thing
+/// they address. Kafka's `{topic}:{partition}:{offset}` restarts at zero when
+/// a topic is deleted and recreated, and means nothing across a cutover to a
+/// different cluster — so the same coordinates come back around while the
+/// claims from their previous life are still live, and fresh records are
+/// classified as replays and acknowledged without ever dispatching. Neither
+/// half is observable from the consumer API: Kafka exposes no topic
+/// incarnation, and a bootstrap list is not a stable cluster identity.
+///
+/// The binding name is already the key namespace, so renaming the binding
+/// also rotates it — but that name is the `source` metric label too, so the
+/// remedy would cost every dashboard and alert built on the binding. This
+/// separates the two: rotate the dedupe namespace, keep the identity.
+///
+/// # Encoding
+///
+/// The component is appended, and *only* when set, so a binding that never
+/// rotates derives byte-identical keys to a build without this parameter —
+/// the key is persisted, and changing the derivation would invalidate every
+/// live claim on upgrade. Appending stays injective for the same reason the
+/// other components are: each is self-delimiting, so a key with a trailing
+/// component can never read as one without.
+#[must_use]
+pub fn message_idempotency_key_in(
+    binding: &str,
+    signal_name: Option<&str>,
+    coordinates_render: &str,
+    incarnation: Option<&str>,
+) -> String {
+    let base = format!(
         "{CONNECTOR_KEY_PREFIX}:{}:{}:{}",
         bound_key_component(binding),
         bound_key_component(signal_name.unwrap_or("")),
         bound_key_component(coordinates_render),
-    )
+    );
+    match incarnation {
+        None => base,
+        Some(incarnation) => format!("{base}:{}", bound_key_component(incarnation)),
+    }
 }
 
 #[cfg(test)]
@@ -131,6 +171,48 @@ mod tests {
         let a = message_idempotency_key("orders", None, &kafka("orders", 0, 7));
         let b = message_idempotency_key("orders", None, &kafka("orders", 0, 8));
         assert_ne!(a, b);
+    }
+
+    /// Kafka coordinates are only unique *within one incarnation* of a topic.
+    ///
+    /// Cut a binding over to another cluster, or delete and recreate its
+    /// topic, and offsets restart at zero — so `(topic, partition, offset)`
+    /// repeats values whose claims are still live. Without a way to rotate
+    /// the namespace those fresh records are classified as replays and acked
+    /// without ever dispatching: silent loss, exactly the failure the key
+    /// exists to prevent.
+    #[test]
+    fn a_rotated_incarnation_separates_a_recreated_topic_from_the_old_one() {
+        let before = message_idempotency_key_in("orders", None, &kafka("orders", 0, 7), None);
+        let after = message_idempotency_key_in(
+            "orders",
+            None,
+            &kafka("orders", 0, 7),
+            Some("2026-08-cutover"),
+        );
+        assert_ne!(
+            before, after,
+            "a rotated incarnation must not collide with the claims it is \
+             rotating away from"
+        );
+    }
+
+    /// Rotating is opt-in, and the default must stay byte-identical.
+    ///
+    /// This key is persisted: changing the derivation for bindings that set
+    /// no incarnation would invalidate every live claim on upgrade and
+    /// re-dispatch whatever the broker still holds. Pinned against a literal
+    /// so an accidental format change cannot pass.
+    #[test]
+    fn an_unset_incarnation_leaves_the_key_byte_identical() {
+        assert_eq!(
+            message_idempotency_key_in("orders", None, &kafka("orders", 0, 7), None),
+            "conn:L6:orders:L0::L10:orders:0:7",
+        );
+        assert_eq!(
+            message_idempotency_key_in("orders", None, &kafka("orders", 0, 7), None),
+            message_idempotency_key("orders", None, &kafka("orders", 0, 7)),
+        );
     }
 
     #[test]

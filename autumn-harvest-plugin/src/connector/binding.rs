@@ -173,6 +173,10 @@ pub struct SourceBinding {
     /// Operator-declared binding name. Used as the `source` metric label and
     /// as the idempotency-key namespace, so it must be unique and is required
     /// to be low-cardinality by construction.
+    ///
+    /// Because it is both, renaming it to rotate the dedupe namespace also
+    /// breaks every dashboard built on the label — use
+    /// [`Self::key_incarnation`] to rotate one without the other.
     pub name: &'static str,
     /// The logical stream (topic or queue) this binding consumes.
     pub stream: String,
@@ -191,6 +195,14 @@ pub struct SourceBinding {
     /// Explicit dedupe mode for a `Starts` target; `None` resolves
     /// automatically (see [`resolve_idempotency_mode`]).
     pub idempotency_mode: Option<IdempotencyMode>,
+    /// Rotates the idempotency-key namespace without renaming the binding.
+    ///
+    /// Set this when the binding is cut over to a different cluster, or its
+    /// topic is deleted and recreated: broker coordinates are only unique
+    /// within one incarnation of the thing they address, so the old ones come
+    /// back around while their claims are still live. See
+    /// [`SourceBinding::key_incarnation`] for the full rationale.
+    pub key_incarnation: Option<&'static str>,
     /// Set by `map_raw`/`map_json`. Private so `validate_bindings` can tell
     /// "never configured a mapper" from "configured one that rejects", and so
     /// a binding can only be built through the constructors.
@@ -208,6 +220,7 @@ impl std::fmt::Debug for SourceBinding {
             .field("max_in_flight", &self.max_in_flight)
             .field("dead_letter_mode", &self.dead_letter_mode)
             .field("idempotency_mode", &self.idempotency_mode)
+            .field("key_incarnation", &self.key_incarnation)
             .finish_non_exhaustive()
     }
 }
@@ -255,8 +268,46 @@ impl SourceBinding {
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             dead_letter_mode: DeadLetterMode::HarvestSink,
             idempotency_mode: None,
+            key_incarnation: None,
             mapper_configured: false,
         }
+    }
+
+    /// Rotate the idempotency-key namespace for this binding.
+    ///
+    /// # When you need it
+    ///
+    /// The connector derives its dedupe key from broker coordinates, and
+    /// those are only unique within one *incarnation* of the stream they
+    /// address. Kafka's `{topic}:{partition}:{offset}` restarts at zero when
+    /// a topic is deleted and recreated, and means nothing at all across a
+    /// cutover to a different cluster. Point an existing binding at either
+    /// and the same coordinates come back around while the claims from their
+    /// previous life are still live, so genuinely new records are classified
+    /// as replays and acknowledged **without being dispatched**.
+    ///
+    /// Nothing detects this for you: Kafka exposes no topic incarnation to a
+    /// consumer, and a bootstrap broker list is not a stable cluster
+    /// identity. Set any value that changes when the stream underneath does —
+    /// a date, a cluster name, a ticket id.
+    ///
+    /// # Why not just rename the binding
+    ///
+    /// You can — [`SourceBinding::name`] is already the key namespace. But it
+    /// is also the `source` metric label, so renaming rotates the dedupe
+    /// namespace and breaks every dashboard, alert and runbook built on the
+    /// binding at the same time. This separates the two.
+    ///
+    /// # Cost of setting it
+    ///
+    /// Rotating deliberately invalidates the binding's live claims, so
+    /// anything the broker still holds unacknowledged is dispatched again.
+    /// That is the point on a genuine cutover — the records are new — but it
+    /// makes this a cutover knob, not something to churn.
+    #[must_use]
+    pub const fn key_incarnation(mut self, incarnation: &'static str) -> Self {
+        self.key_incarnation = Some(incarnation);
+        self
     }
 
     /// Map raw message bytes directly — the primary contract (issue #944

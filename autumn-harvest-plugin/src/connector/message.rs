@@ -20,6 +20,15 @@ use std::collections::BTreeMap;
 ///   all; see [`coordinate_id`](crate::connector::sqs::coordinate_id) for why
 ///   that order and not the reverse).
 ///
+/// They are stable across a *redelivery*, not across a *reincarnation* of the
+/// stream. Kafka's offset restarts at zero when a topic is deleted and
+/// recreated, and means nothing across a cutover to a different cluster — so
+/// the old coordinates return while their claims are still live, and fresh
+/// records are classified as replays. Neither is observable here (Kafka
+/// exposes no topic incarnation to a consumer), so it is the operator's to
+/// declare: see
+/// [`SourceBinding::key_incarnation`](crate::connector::binding::SourceBinding::key_incarnation).
+///
 /// The variants are deliberately *not* `#[non_exhaustive]`: a new adapter that
 /// cannot express its coordinates in one of these shapes should use
 /// [`Self::Opaque`] rather than growing the enum.

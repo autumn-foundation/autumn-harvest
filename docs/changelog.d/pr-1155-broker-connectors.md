@@ -1191,6 +1191,41 @@ coordinates, so a run traces back to the exact message.
   pre-existing `an_over_budget_lag_sample_is_abandoned_so_the_pass_still_polls`
   moved to a paused clock (it had used a 30ms interval purely to keep the real
   wait short) and was re-verified to still catch a genuinely unbounded sample.
+- **The drain gave up on stragglers without waiting for them to hand their
+  messages back.** Cancelling `hard_stop` only *wakes* a straggler; the
+  recovery that returns its message runs inside a task the shutdown has
+  already detached. `drain_in_flight` returned the instant it cancelled, so
+  `stop_harvest_runtime` could see the connector finished and the process exit
+  before any `abandon` reached the broker — trading a leaked task for a leaked
+  message, which is what the hard stop exists to prevent. It now re-acquires
+  the permits after cancelling, which joins exactly that cleanup (a straggler
+  releases its permit only once its recovery returns), bounded by the new
+  `HARD_STOP_CLEANUP_BUDGET` — defined *as* `HARD_STOP_ABANDON_BUDGET` plus
+  scheduling slack, so lengthening the per-message budget cannot silently
+  outrun the wait that joins it. RED:
+  `the_drain_waits_for_the_stragglers_it_hard_stopped` (a real dispatch
+  detached by aborting its pass, exactly as cancelling `run` does; pre-fix the
+  drain reports `hard_stop` cancelled while `abandoned()` is still empty).
+- **A broker cutover silently dropped messages.** Broker coordinates are
+  unique only within one *incarnation* of the stream they address: Kafka's
+  `{topic}:{partition}:{offset}` restarts at zero when a topic is deleted and
+  recreated, and means nothing across a cutover to another cluster. Pointing
+  an existing binding at either replayed coordinates whose claims were still
+  live, so genuinely new records were classified as replays and acked
+  **without dispatching**. Nothing can detect this — Kafka exposes no topic
+  incarnation to a consumer and a bootstrap list is not a cluster identity —
+  so it is now declarable: `SourceBinding::key_incarnation` rotates the dedupe
+  namespace, and `message_idempotency_key_in` appends it. Renaming the binding
+  already rotated the namespace, but the name is also the `source` metric
+  label, so that remedy cost every dashboard built on it; this separates the
+  two. The component is appended and *only* when set, so an unrotated binding
+  derives byte-identical keys — the key is persisted, and changing the
+  derivation would invalidate every live claim on upgrade. RED:
+  `a_rotated_incarnation_separates_a_recreated_topic_from_the_old_one`,
+  `an_unset_incarnation_leaves_the_key_byte_identical` (pinned against a
+  literal), and `the_binding_incarnation_reaches_the_derived_key` end-to-end
+  through a pass, because a rotation knob nothing threads is worse than none.
+  The cutover procedure is documented in the connector guide.
 
 ### Success metric
 

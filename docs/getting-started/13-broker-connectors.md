@@ -422,6 +422,39 @@ because the window is the wrong remedy here — size retention (globally or via 
 per-workflow-type override) to at least your broker's replay horizon, or accept
 the bound knowingly.
 
+### Cutting a binding over to a new cluster or a recreated topic
+
+Broker coordinates are unique only within one **incarnation** of the stream
+they address. Kafka's `{topic}:{partition}:{offset}` restarts at zero when a
+topic is deleted and recreated, and means nothing at all across a cutover to a
+different cluster. Point an existing binding at either and the old coordinates
+come back around while their claims are still live, so genuinely new records
+are classified as replays and **acknowledged without being dispatched** —
+silent loss, for as long as the claim lifetime above.
+
+Nothing detects this for you, and nothing can: Kafka exposes no topic
+incarnation to a consumer, and a bootstrap broker list is not a stable cluster
+identity. Rotate the namespace yourself as part of the cutover:
+
+```rust
+SourceBinding::starts("orders", "orders", "order_flow")
+    .map_json(|order: OrderPlaced| Ok(WorkflowId::new(order.order_id)))
+    // Bump on any cutover: new cluster, or a deleted-and-recreated topic.
+    .key_incarnation("2026-08-cutover")
+```
+
+Any value that changes when the stream underneath does will do — a date, a
+cluster name, a ticket id. Renaming the binding works too (the name is already
+the key namespace), but the name is also the `source` metric label, so that
+remedy breaks every dashboard and alert built on the binding at the same time.
+
+Rotating deliberately invalidates the binding's live claims, so anything the
+broker still holds unacknowledged is dispatched again. On a genuine cutover
+that is exactly right — those records are new — but it makes this a cutover
+knob rather than something to churn. **A cutover is not the only trigger**:
+recreating a topic in staging to reset it has the same effect, within the
+claim lifetime.
+
 ## Poison messages
 
 A message that can never succeed must not wedge its partition. Two classes:
