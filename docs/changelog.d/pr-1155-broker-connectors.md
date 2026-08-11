@@ -668,6 +668,26 @@ coordinates, so a run traces back to the exact message.
   message handle is now cloned out before `message` moves into the task, and
   the arm abandons on a redelivering source while keeping the offset marking
   for the positional one.
+- **A panicked dispatch was missing from the settlement breakdown.**
+  `harvest.connector.received` is counted before the task is spawned, but a
+  panicked task never reaches `record_metrics`, so it emitted no
+  `harvest.connector.dispatched` sample. Both ADR-0001 §7 and
+  `docs/telemetry.md` state that series is the breakdown of `received` — one
+  sample per message — so every panic permanently widened the gap and hid the
+  retry the runtime had just performed, on the dashboard that exists to show
+  it. The join arm now emits `ConnectorOutcome::Retried` itself, and the test
+  asserts the invariant directly (`dispatched().len() == received().len()`)
+  rather than only the sample's presence.
+- **Two operator-facing lag descriptions still documented pre-fix semantics.**
+  The connector guide's own table was corrected when the SQS gauge started
+  summing `ApproximateNumberOfMessagesNotVisible`, but the `docs/telemetry.md`
+  catalogue row and the dashboard panel still described the visible attribute
+  alone — so during an outage, the two places an operator is most likely to be
+  reading would have them interpret a gauge containing in-flight work as
+  visible backlog. Both now match the implementation. The **Kafka** half of the
+  same row was stale for the same reason (the retention clamp above is not
+  mentioned anywhere an operator reads), so it was corrected in the same pass,
+  including the one remaining incomplete sentence in the connector guide.
 
 ### Success metric
 

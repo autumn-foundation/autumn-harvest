@@ -524,6 +524,15 @@ impl ConnectorRuntime {
                         // ever will.
                         self.offsets.lock().await.retried(partition, position);
                     }
+                    // `record_metrics` lives inside `process`, which this task
+                    // died before finishing, so the settlement sample has to
+                    // be emitted here. `received` was already counted before
+                    // the spawn, and the dispatched series is documented as
+                    // the breakdown of it (ADR-0001 §7), so skipping this
+                    // would permanently widen the gap by one per panic and
+                    // hide the retry the runtime just performed.
+                    self.metrics
+                        .record_connector_dispatched(self.binding.name, ConnectorOutcome::Retried);
                     summary.retried += 1;
                 }
             }
@@ -1278,6 +1287,45 @@ mod tests {
             source.pending(),
             1,
             "the abandoned message must be queued again, not stranded in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicked_dispatch_records_a_retried_sample() {
+        // `received` is incremented before the task is spawned, but a panicked
+        // task never reaches `record_metrics`. Both ADR-0001 §7 and
+        // `docs/telemetry.md` state that `harvest.connector.dispatched` is the
+        // settlement breakdown -- one sample per received message, so the
+        // series sums to `harvest.connector.received`. Without a sample here
+        // every panic permanently widens that gap, and the retry the runtime
+        // performed is invisible on the dashboard that exists to show it.
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_kafka(0, 7, b"{{{");
+        let metrics = Arc::new(RecordingMetrics::default());
+        let rt = ConnectorRuntime::new(
+            malformed_binding(),
+            Arc::clone(&source) as Arc<dyn EventSource>,
+            HarvestApiState::new(),
+            Arc::clone(&metrics) as Arc<dyn MetricsRecorder>,
+            IdempotencyMode::BrokerCoordinates,
+        )
+        .with_dead_letter_sink(Arc::new(PanickingDeadLetterSink));
+
+        let summary = rt.run_once().await.unwrap();
+        assert_eq!(summary.retried, 1);
+
+        assert_eq!(metrics.received().len(), 1);
+        assert_eq!(
+            metrics.dispatched(),
+            vec![("orders".to_string(), ConnectorOutcome::Retried)],
+            "a panicked dispatch must still emit its settlement sample"
+        );
+        // The invariant itself, stated as the test asserts it: the breakdown
+        // accounts for every received message.
+        assert_eq!(
+            metrics.dispatched().len(),
+            metrics.received().len(),
+            "the dispatched breakdown must sum to received"
         );
     }
 
