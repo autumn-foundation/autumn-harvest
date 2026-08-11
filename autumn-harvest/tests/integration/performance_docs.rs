@@ -239,6 +239,131 @@ fn per_gate_bullets_quote_the_published_gate_table() {
     );
 }
 
+/// Extract the body of a top-level `pub async fn NAME(` from a Rust source file.
+///
+/// Terminates at the first line that is exactly `}` — the closing brace of a
+/// top-level item. Good enough to read one function's call sites out of a file
+/// this test does not otherwise need to understand.
+fn top_level_fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+    let signature = format!("pub async fn {name}(");
+    let start = src.find(&signature)?;
+    let rest = &src[start..];
+    let end = rest.find("\n}\n")?;
+    Some(&rest[..end])
+}
+
+/// True when `needle` appears in `haystack` as a whole identifier.
+///
+/// Plain `contains` is not enough here: `release_claim` is a prefix of
+/// `release_claim_if_queue_paused`, so a doc that named only the longer call
+/// would look like it had named both.
+fn mentions_identifier(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(idx, _)| {
+        let after = haystack[idx + needle.len()..].chars().next();
+        !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+    })
+}
+
+/// Pull the blank-line-delimited paragraph that opens with `opener`.
+fn paragraph_starting_with<'a>(doc: &'a str, opener: &str) -> Option<&'a str> {
+    let start = doc.find(opener)?;
+    let rest = &doc[start..];
+    let end = rest.find("\n\n").unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Pull one `### ` section out of the Markdown, heading excluded.
+fn doc_section<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
+    let start = doc.find(heading)? + heading.len();
+    let rest = &doc[start..];
+    let end = rest.find("\n### ").unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Every statement in the claim transaction must be named in the docs.
+///
+/// "What is actually timed" publishes a round-trip count, and a reader sizing a
+/// remote deployment multiplies their network RTT by it. That count is only
+/// trustworthy while the enumeration matches the transaction, and nothing about
+/// adding a statement to `claim_task` would otherwise disturb this page.
+#[test]
+fn claim_transaction_statements_are_all_named_in_the_docs() {
+    let queue_src =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/queue.rs"))
+            .expect("read src/queue.rs");
+    let body = top_level_fn_body(&queue_src, "claim_task")
+        .expect("queue.rs must define `pub async fn claim_task(`");
+
+    let mut called: Vec<&str> = Vec::new();
+    for (idx, _) in body.match_indices("crate::queue_pause::") {
+        let tail = &body[idx + "crate::queue_pause::".len()..];
+        let end = tail
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(tail.len());
+        let name = &tail[..end];
+        if !name.is_empty() && !called.contains(&name) {
+            called.push(name);
+        }
+    }
+    assert!(
+        called.len() >= 2,
+        "expected to find the queue-pause statements in `claim_task`; found {called:?}"
+    );
+
+    let doc = read_performance_doc();
+    let section = doc_section(&doc, "### What is actually timed")
+        .expect("docs/performance.md must have a `What is actually timed` section");
+    for name in called {
+        assert!(
+            mentions_identifier(section, name),
+            "`claim_task` issues `queue_pause::{name}`, but the \"What is actually \
+             timed\" section does not name it. Its published round-trip count is \
+             therefore describing a different transaction than the code runs."
+        );
+    }
+}
+
+/// The enqueue caveat must defer to the one authoritative window definition.
+///
+/// The page described the throughput denominator in two places and they
+/// disagreed: the caveat claimed it spanned "warmup and task spawn/join" while
+/// the hygiene bullet correctly described a barrier-to-completion span that
+/// excludes everything outside the worker closures. Restating the endpoints in
+/// two voices is what let them drift, so the caveat now links instead.
+#[test]
+fn enqueue_throughput_caveat_defers_to_the_authoritative_window_definition() {
+    let doc = read_performance_doc();
+
+    assert!(
+        doc.contains("earliest resume after the barrier through the last completion"),
+        "the authoritative throughput-window definition is missing from Measurement hygiene"
+    );
+
+    let caveat = paragraph_starting_with(&doc, "Two caveats on this table.")
+        .expect("the enqueue table must carry its `Two caveats on this table.` paragraph");
+
+    assert!(
+        caveat.contains("#measurement-hygiene"),
+        "the enqueue throughput caveat must link to `#measurement-hygiene` rather \
+         than restate the window's endpoints; restating them is what let the two \
+         descriptions drift apart. Caveat text:\n{caveat}"
+    );
+
+    // The caveat may mention spawn/join — but only to place them *outside* the
+    // window. A sentence that mentions them without saying so is the exact
+    // regression this guards: it reads as "the denominator includes them".
+    let flowed = caveat.replace('\n', " ");
+    for sentence in flowed.split(". ") {
+        assert!(
+            !sentence.contains("spawn") || sentence.contains("outside"),
+            "the enqueue throughput caveat mentions task spawn without placing it \
+             outside the measured window. The spans are captured at barrier resume \
+             and closed inside the worker closure, so spawn and join are not in the \
+             denominator. Sentence:\n{sentence}"
+        );
+    }
+}
+
 /// The truncated rows must describe the sample count they actually published.
 #[test]
 fn truncated_sample_counts_in_prose_match_the_table() {
