@@ -2663,17 +2663,36 @@ pub mod db {
     }
 
     pub async fn setup_bench_db() -> Result<BenchDb, SkipReason> {
+        // One ceiling for the whole provisioning phase, fixed before the first
+        // await on *either* path. See `with_provision_deadline`. Hoisted above
+        // the branch deliberately: the container path is the one CI actually
+        // runs, so a ceiling that covered only the existing-server path would
+        // protect the mode nobody exercises.
+        let deadline = Instant::now() + super::scenario_time_budget();
         if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
             // Redacted: this message is printed by both the bench and the CI
             // gate, and an admin URL normally carries a password.
             let safe_url = super::redact_url(&admin_url);
-            // One ceiling for the whole provisioning phase, fixed before the
-            // first await. See `with_provision_deadline`.
-            let deadline = Instant::now() + super::scenario_time_budget();
+            // Through `SWEEP_LOCK_DB`, not the database the operator named.
+            //
+            // This session is held from here until the lease connects, which
+            // includes the whole wait for the sweep lock. If the operator's URL
+            // named `template1`, that wait would leave a backend attached to the
+            // template — and the lock *holder's* plain `CREATE DATABASE` copies
+            // `template1` by default, so it would fail with "source database is
+            // being accessed by other users". One client waiting would break
+            // another client's create.
+            //
+            // Costs no reachability: `take_sweep_lock` already refuses to start
+            // a run that cannot connect to `SWEEP_LOCK_DB`, so this adds no
+            // requirement the harness did not already have. Every statement
+            // this session issues — the sweep's catalog query and `DROP`s, the
+            // `CREATE DATABASE` — is cluster-scoped and works from anywhere.
+            let admin_conn_url = admin_connection_url(&admin_url);
             let mut admin = with_provision_deadline(
                 "connect to the admin database",
                 deadline,
-                AsyncPgConnection::establish(&admin_url),
+                AsyncPgConnection::establish(&admin_conn_url),
             )
             .await?
             .map_err(|e| SkipReason(format!("connect {safe_url}: {e}")))?;
@@ -2753,24 +2772,43 @@ pub mod db {
             });
         }
 
-        let container = Postgres::default()
-            .with_init_sql(autumn_harvest::full_migrations_sql().as_bytes().to_vec())
-            .with_tag("16")
-            .start()
-            .await
-            .map_err(|e| {
-                SkipReason(format!(
-                    "no Docker daemon and HARVEST_TEST_DATABASE_URL unset ({e})"
-                ))
-            })?;
-        let host = container
-            .get_host()
-            .await
-            .map_err(|e| SkipReason(format!("container host: {e}")))?;
-        let port = container
-            .get_host_port_ipv4(5432)
-            .await
-            .map_err(|e| SkipReason(format!("container port: {e}")))?;
+        setup_container_bench_db(deadline).await
+    }
+
+    /// Provision the Docker-backed database, under the same ceiling.
+    ///
+    /// Split out so `setup_bench_db` stays readable, but bounded for a reason
+    /// that is not cosmetic: this is the path the checked CI manifest runs, so
+    /// leaving it unbounded would mean the provisioning ceiling only guards the
+    /// mode CI never exercises. A daemon that accepts the socket and then stops
+    /// answering — mid-pull, mid-create, mid-metadata — parks the gate until the
+    /// outer job timeout otherwise.
+    async fn setup_container_bench_db(deadline: Instant) -> Result<BenchDb, SkipReason> {
+        let container = with_provision_deadline(
+            "start the benchmark container",
+            deadline,
+            Postgres::default()
+                .with_init_sql(autumn_harvest::full_migrations_sql().as_bytes().to_vec())
+                .with_tag("16")
+                .start(),
+        )
+        .await?
+        .map_err(|e| {
+            SkipReason(format!(
+                "no Docker daemon and HARVEST_TEST_DATABASE_URL unset ({e})"
+            ))
+        })?;
+        let host =
+            with_provision_deadline("read the container host", deadline, container.get_host())
+                .await?
+                .map_err(|e| SkipReason(format!("container host: {e}")))?;
+        let port = with_provision_deadline(
+            "read the container port",
+            deadline,
+            container.get_host_port_ipv4(5432),
+        )
+        .await?
+        .map_err(|e| SkipReason(format!("container port: {e}")))?;
         Ok(BenchDb {
             url: format!("postgres://postgres:postgres@{host}:{port}/postgres"),
             _container: Some(container),
@@ -2906,6 +2944,25 @@ pub mod db {
     /// The timeout exists so a wedged peer surfaces as a diagnosable failure
     /// rather than an unbounded hang.
     const SWEEP_LOCK_TIMEOUT: &str = "60s";
+
+    /// Where the provisioning session connects, given the operator's admin URL.
+    ///
+    /// Always [`SWEEP_LOCK_DB`], never the database the operator named. That
+    /// session is held from the first connect until the lease is armed, which
+    /// spans the whole wait for the sweep lock — so if the operator's URL named
+    /// `template1`, a client *waiting* here would keep a backend on the
+    /// template, and the lock holder's plain `CREATE DATABASE` (which copies
+    /// `template1`) would fail with "source database is being accessed by other
+    /// users". One client waiting would break another client's create.
+    ///
+    /// Costs no reachability: [`take_sweep_lock`] already refuses to start a run
+    /// that cannot reach `SWEEP_LOCK_DB`.
+    ///
+    /// Extracted so the choice is assertable rather than buried in a connect
+    /// call — see `provisioning_connects_through_the_fixed_database`.
+    pub fn admin_connection_url(admin_url: &str) -> String {
+        super::with_db_name(admin_url, SWEEP_LOCK_DB)
+    }
 
     /// Take the sweep lock, blocking until a peer releases it.
     ///
@@ -3055,10 +3112,40 @@ pub mod db {
         .bind::<diesel::sql_types::Text, _>(name)
         .execute(conn)
         .await;
+
+        // One-argument `pg_terminate_backend` *signals*; it does not wait. A
+        // backend unwinding a transaction can still hold the database when the
+        // `DROP` arrives, which fails with "is being accessed by other users" —
+        // and that error is discarded here, so the database would leak exactly
+        // as if we had never terminated anything. The two-argument form that
+        // waits is `PostgreSQL` 14+, and version-neutrality is this helper's
+        // whole reason to exist, so poll instead.
+        //
+        // Bounded, and the `DROP` runs either way: a backend that refuses to
+        // leave is not worth hanging a best-effort cleanup over, and attempting
+        // the `DROP` anyway is strictly no worse than the unpolled version.
+        let wait_until = Instant::now() + TERMINATE_WAIT;
+        while database_has_connections(conn, name).await {
+            if Instant::now() >= wait_until {
+                break;
+            }
+            tokio::time::sleep(TERMINATE_POLL).await;
+        }
+
         let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {name}"))
             .execute(conn)
             .await;
     }
+
+    /// How long to wait for signalled backends to actually exit.
+    ///
+    /// Generous relative to the work: a terminated backend normally goes within
+    /// milliseconds, and the only slow case is one unwinding a long
+    /// transaction. See [`drop_database_version_neutral`].
+    const TERMINATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Gap between checks while waiting for signalled backends to exit.
+    const TERMINATE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
     /// Does any backend currently hold a connection to `datname`?
     ///

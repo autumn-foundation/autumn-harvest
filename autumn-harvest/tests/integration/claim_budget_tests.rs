@@ -1432,8 +1432,16 @@ async fn provision_deadline_preserves_a_step_that_finishes_in_time() {
 /// Replacing the clause is therefore only safe if the replacement handles the
 /// same case — which is what this asserts, by holding a connection open across
 /// the drop. Its partner
-/// `no_cleanup_emits_the_postgres_13_only_force_clause` covers the half CI
-/// cannot reach: that the clause stays gone on a server old enough to reject it.
+/// `no_cleanup_emits_the_postgres_13_only_force_clause` covers the half no CI
+/// server can reach: that the clause stays gone on a version old enough to
+/// reject it.
+///
+/// Provisioned through [`db::setup_bench_db`] rather than
+/// `HARVEST_TEST_DATABASE_URL` so it runs in **both** modes. The checked CI
+/// manifest runs this suite Docker-backed and sets no such variable, so gating
+/// on it would have meant the one test proving terminate-then-drop still works
+/// never ran in CI at all. Any database can issue `CREATE`/`DROP DATABASE`, so
+/// the bench database serves as the admin session here.
 #[tokio::test]
 async fn version_neutral_drop_evicts_a_live_backend() {
     use diesel::QueryableByName;
@@ -1445,14 +1453,11 @@ async fn version_neutral_drop_evicts_a_live_backend() {
         n: i64,
     }
 
-    let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
-        eprintln!(
-            "SKIP version_neutral_drop_evicts_a_live_backend: \
-             existing-server mode only (HARVEST_TEST_DATABASE_URL unset)"
-        );
+    let Ok(bench) = db::setup_bench_db().await else {
+        eprintln!("SKIP version_neutral_drop_evicts_a_live_backend: no database available");
         return;
     };
-    let Ok(mut admin) = AsyncPgConnection::establish(&admin_url).await else {
+    let Ok(mut admin) = AsyncPgConnection::establish(&bench.url).await else {
         eprintln!("SKIP version_neutral_drop_evicts_a_live_backend: admin connect failed");
         return;
     };
@@ -1472,8 +1477,8 @@ async fn version_neutral_drop_evicts_a_live_backend() {
     // Hold a connection open across the drop. Kept in scope deliberately — this
     // is the condition under test, and dropping it early would make the
     // assertion pass without exercising the terminate step at all.
-    let occupant_url = with_db_name(&admin_url, &victim);
-    let occupant = AsyncPgConnection::establish(&occupant_url)
+    let victim_url = with_db_name(&bench.url, &victim);
+    let occupant = AsyncPgConnection::establish(&victim_url)
         .await
         .expect("connect to the victim database");
 
@@ -1510,4 +1515,116 @@ async fn version_neutral_drop_evicts_a_live_backend() {
          DROP DATABASE fails there, and cleanup sites discard the error, so the \
          database would leak on every crashed run",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Provisioning connects through the fixed database (issue #786, round 21).
+// ---------------------------------------------------------------------------
+
+/// The provisioning session never sits on the database the operator named.
+///
+/// Pure counterpart to `a_template1_backend_blocks_create_database_but_ours_does_not`
+/// below: that one proves the hazard is real against a live server, this one
+/// pins the decision that avoids it, cheaply and on every run.
+#[test]
+fn provisioning_connects_through_the_fixed_database() {
+    for admin_url in [
+        "postgres://u:p@h:5432/template1",
+        "postgres://u:p@h:5432/some_other_admin_db",
+        "host=h user=u dbname=template1",
+    ] {
+        let chosen = db::admin_connection_url(admin_url);
+        assert_eq!(
+            db_name_from_url(&chosen).as_deref(),
+            Some(db::SWEEP_LOCK_DB),
+            "provisioning would connect to the operator's own database for \
+             {admin_url}: a client waiting for the sweep lock would hold that \
+             backend, and if it is template1 the lock holder's CREATE DATABASE \
+             fails",
+        );
+    }
+}
+
+/// A backend on `template1` blocks `CREATE DATABASE`; ours does not.
+///
+/// `CREATE DATABASE` copies `template1` by default and Postgres refuses while
+/// any *other* session is attached to the template. The provisioning session is
+/// held across the whole sweep-lock wait, so an admin URL naming `template1`
+/// would turn every waiting client into a blocker for whichever client actually
+/// holds the lock.
+///
+/// Both halves are asserted deliberately. The first shows the hazard is real
+/// rather than theoretical; the second is the regression guard — it opens its
+/// connection through [`db::admin_connection_url`], so reverting that to the
+/// operator's URL puts this backend back on `template1` and the create fails.
+///
+/// Existing-server mode only: it needs an admin URL an operator could plausibly
+/// have pointed at `template1`.
+#[tokio::test]
+async fn a_template1_backend_blocks_create_database_but_ours_does_not() {
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+
+    let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+        eprintln!(
+            "SKIP a_template1_backend_blocks_create_database_but_ours_does_not: \
+             existing-server mode only (HARVEST_TEST_DATABASE_URL unset)"
+        );
+        return;
+    };
+    let Ok(mut creator) = AsyncPgConnection::establish(&with_db_name(&admin_url, "postgres")).await
+    else {
+        eprintln!("SKIP a_template1_backend_blocks_create_database_but_ours_does_not: no server");
+        return;
+    };
+
+    let probe = format!(
+        "harvest_tmpl_probe_{}_{}",
+        std::process::id(),
+        db::run_token(),
+    );
+
+    // An admin URL an operator could plausibly hold, pointed at the template.
+    let operator_url = with_db_name(&admin_url, "template1");
+
+    // Half one: the hazard. Under the old behaviour this is where a waiting
+    // client's provisioning session sat.
+    {
+        let Ok(_waiter) = AsyncPgConnection::establish(&operator_url).await else {
+            eprintln!(
+                "SKIP a_template1_backend_blocks_create_database_but_ours_does_not: \
+                 template1 not connectable"
+            );
+            return;
+        };
+        let blocked = diesel::sql_query(format!("CREATE DATABASE {probe}"))
+            .execute(&mut creator)
+            .await;
+        assert!(
+            blocked.is_err(),
+            "CREATE DATABASE succeeded while another session held template1, so \
+             this test cannot show the hazard it exists to guard",
+        );
+    }
+
+    // Half two: the regression guard. Same operator URL, but opened the way the
+    // harness now opens it.
+    let Ok(_ours) = AsyncPgConnection::establish(&db::admin_connection_url(&operator_url)).await
+    else {
+        eprintln!(
+            "SKIP a_template1_backend_blocks_create_database_but_ours_does_not: \
+             fixed database not connectable"
+        );
+        return;
+    };
+    let created = diesel::sql_query(format!("CREATE DATABASE {probe}"))
+        .execute(&mut creator)
+        .await;
+    assert!(
+        created.is_ok(),
+        "CREATE DATABASE failed while the provisioning session was open: it is \
+         holding template1, so a client waiting for the sweep lock breaks the \
+         lock holder's create ({created:?})",
+    );
+
+    db::drop_database_version_neutral(&mut creator, &probe).await;
 }
