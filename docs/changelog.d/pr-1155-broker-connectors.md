@@ -1472,6 +1472,28 @@ coordinates, so a run traces back to the exact message.
   `settling_releases_the_in_flight_copy` covered only the opaque (SQS) shape,
   which is why the positional leak went unpinned.
 
+* **The AC6 poison test asserted a single-pass receive under a capped
+  prefetch.** The first CI run ever to reach the Test matrix on this branch
+  failed `one_poison_message_does_not_block_a_hundred_valid_ones` with
+  `received: 16` against an expected `101` — 16 being exactly the binding's
+  `max_in_flight`. The production code is right and the test was stale: a
+  *later* fix in this same PR ("cap prefetch at capacity") made `run_once`
+  receive at most `effective_max_batch(max_batch, max_in_flight)`, because
+  capping the prefetch at in-flight capacity **is** the AC5 backpressure
+  guarantee. The test predated that change, kept its one-pass assumption, and
+  nothing caught the contradiction because this suite needs Docker and had
+  never executed — not locally, and not in CI, since every push cancelled the
+  prior run before the matrix registered. Asserting a 101-message single pass
+  was asserting the cap is absent. Fixed by draining across passes, the same
+  loop the soak already uses, which also makes the test *stronger*: the poison
+  sits at offset 0, so it is in the first batch and every later batch has to
+  get past it — precisely the head-of-line blocking AC6 forbids — and only a
+  multi-pass drain exercises that. Bounded at 64 passes so a genuine block
+  fails on the counts rather than hanging CI, and `retried == 0` added so a
+  quarantined poison can never be silently recycled as a retry. RED reproduced
+  locally against a real Postgres 16, byte-identical to CI (`left: 16, right:
+  101`), then green — with the full 11-test suite, soak included, passing.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

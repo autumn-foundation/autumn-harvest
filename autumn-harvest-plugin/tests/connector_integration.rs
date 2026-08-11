@@ -663,11 +663,34 @@ async fn one_poison_message_does_not_block_a_hundred_valid_ones() {
     };
     let rt = rt.with_config(config);
 
-    let summary = rt.run_once().await.expect("pass");
+    // Drained across passes, NOT in one: a pass receives at most
+    // `effective_max_batch(max_batch, max_in_flight)` — 16 here, not the
+    // configured 200 — because capping the prefetch at in-flight capacity IS
+    // the backpressure guarantee. Asserting a 101-message single pass would be
+    // asserting that the cap is absent. The poison sits at offset 0, so it is
+    // in the FIRST batch and every later batch has to get past it; that is
+    // exactly the head-of-line blocking AC6 forbids, and draining is what
+    // exposes it. Bounded so a genuine block fails on the counts below rather
+    // than hanging CI.
+    let mut total = autumn_harvest_plugin::connector::PassSummary::default();
+    for _ in 0..64 {
+        let pass = rt.run_once().await.expect("pass");
+        if pass.received == 0 {
+            break;
+        }
+        total.received += pass.received;
+        total.acked += pass.acked;
+        total.retried += pass.retried;
+        total.dead_lettered += pass.dead_lettered;
+    }
 
-    assert_eq!(summary.received, 101);
-    assert_eq!(summary.dead_lettered, 1, "exactly the poison message");
-    assert_eq!(summary.acked, 100);
+    assert_eq!(total.received, 101);
+    assert_eq!(total.dead_lettered, 1, "exactly the poison message");
+    assert_eq!(total.acked, 100);
+    assert_eq!(
+        total.retried, 0,
+        "the poison is quarantined, never recycled as a retry"
+    );
     assert_eq!(
         count(
             &mut conn,
