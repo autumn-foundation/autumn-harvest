@@ -1156,6 +1156,42 @@ coordinates, so a run traces back to the exact message.
   drain hangs the suite outright rather than merely failing) and
   `a_clean_drain_never_hard_stops`.
 
+- **The shutdown hard-stop gave up on a message without handing it back.**
+  Round X's `hard_stop` cut `process` short and returned `Retry` — but `settle`
+  is the only thing that releases the adapter's custody, so on a source whose
+  redelivery *is* an explicit nack (`MockSource`, SQS, any adapter needing a
+  real `abandon`) the message was stranded with nothing left to hand it back:
+  the process is shutting down, so there is no later pass. Returning `Retry`
+  did not help either — that value goes to a join loop a real shutdown has
+  already dropped along with `run_once`. New
+  `release_custody_after_hard_stop` performs the same two-step recovery the
+  panic arm does (`abandon` on a redelivering source, else mark the positional
+  head retried) plus the owed `Retried` settlement sample, **inside** the
+  spawned task. Bounded at 2s, unlike the panic arm's: this runs after the
+  drain already spent its full deadline, so an unbounded `abandon` against the
+  same wedged broker would reintroduce the hang the deadline exists to
+  prevent — one stranded message is cheaper than the process. RED:
+  `a_hard_stopped_dispatch_hands_the_message_back` (a dispatch parked in a
+  blocking sink; pre-fix `retried == 1` yet `abandoned()` is empty — the
+  summary claims redelivery the adapter never got).
+- **A short lag cadence let abandoned samples pile up.** `lag_sample_budget()`
+  was the sample *interval*, conflating two different concerns, while the Kafka
+  walk bounds itself at a fixed 10s. Configuring `lag_sample_interval` below
+  that made the runtime give up first — which stops nothing, because the walk
+  runs on `spawn_blocking` and a blocking task is never cancelled — so a new
+  walk was armed on top of the old one, several overlapping, each holding a
+  pool thread and hammering the very broker whose slowness caused the timeout.
+  The budget is now floored at the new `ADAPTER_LAG_SAMPLE_CEILING`, which
+  Kafka's bound is *defined as* rather than merely equal to, so the two cannot
+  drift; `EventSource::lag` documents it as a contract adapters must honour.
+  The floor raises and never caps, so the default and every generous cadence
+  are unchanged. Giving up earlier bought nothing anyway — the gauge is stale
+  either way and the work continues regardless. RED:
+  `a_short_cadence_never_shortens_the_budget_below_the_adapter_ceiling`. The
+  pre-existing `an_over_budget_lag_sample_is_abandoned_so_the_pass_still_polls`
+  moved to a paused clock (it had used a 30ms interval purely to keep the real
+  wait short) and was re-verified to still catch a genuinely unbounded sample.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

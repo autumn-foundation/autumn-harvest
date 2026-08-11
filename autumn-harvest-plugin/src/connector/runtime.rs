@@ -146,6 +146,32 @@ pub struct ConnectorRuntimeConfig {
 /// does not fail its pass the moment a couple of messages settle out of order.
 pub const MIN_DERIVED_STALL_THRESHOLD: usize = 32;
 
+/// The longest an [`EventSource::lag`] implementation may take to abort its
+/// own sample — and so the floor under the runtime's budget for one.
+///
+/// This is a **contract**, not merely a default. The runtime's `timeout` around
+/// `lag()` drops its own future; it cannot stop the adapter's work, and for a
+/// Kafka walk it definitively cannot — that runs on `spawn_blocking`, and a
+/// blocking task is never cancelled. Only the adapter's own internal bound
+/// stops it.
+///
+/// So the two have to agree: an adapter bounds its walk at or below this, the
+/// runtime never gives up sooner, and an abandoned sample is therefore always
+/// finished before the next one is armed. Without the floor a cadence shorter
+/// than the adapter's bound lets abandoned walks accumulate — one blocking
+/// thread and one round of broker traffic each, against the very broker whose
+/// slowness caused the timeout.
+pub const ADAPTER_LAG_SAMPLE_CEILING: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a hard-stopped dispatch may spend handing its message back.
+///
+/// Short on purpose. By the time this runs the shutdown drain has already
+/// waited its full deadline, so the broker this call talks to is quite possibly
+/// the one that caused the timeout. Losing custody of one message costs a
+/// stranded record until the adapter's own lease expires; blocking here costs
+/// the shutdown the deadline was there to bound.
+const HARD_STOP_ABANDON_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How many held offsets count as a stall, given the configured knob and the
 /// binding's concurrency.
 ///
@@ -604,6 +630,7 @@ impl ConnectorRuntime {
                 .map_err(|e| ConnectorError::Broker(format!("connector semaphore closed: {e}")))?;
 
             let this = self.clone_handles();
+            let abandon_handle = handle.clone();
             handles.push((
                 handle,
                 positional,
@@ -617,7 +644,18 @@ impl ConnectorRuntime {
                     // wedged forever in a process that outlives harvest.
                     let disposition = tokio::select! {
                         d = this.process(message) => d,
-                        () = this.hard_stop.cancelled() => MessageDisposition::Retry,
+                        () = this.hard_stop.cancelled() => {
+                            // Cutting `process` short skipped `settle`, which
+                            // is the only thing that releases the adapter's
+                            // custody — so the same recovery the panic arm
+                            // performs is owed here, and for the same reason
+                            // it has to happen INSIDE this task: the returned
+                            // disposition goes to a join loop that a real
+                            // shutdown has already dropped along with
+                            // `run_once`.
+                            this.release_custody_after_hard_stop(&abandon_handle, positional).await;
+                            MessageDisposition::Retry
+                        }
                     };
                     drop(permit);
                     disposition
@@ -822,16 +860,24 @@ impl ConnectorRuntime {
 
     /// How long a single lag sample may block the message path.
     ///
-    /// Derived from the cadence rather than configured separately: a sample
-    /// that cannot finish within the interval it is taken at is, by
-    /// definition, too expensive for that cadence, and the operator's remedy
-    /// is the knob they already have. Together with the completion re-stamp
-    /// this bounds the worst case at half the wall clock (budget, then a full
-    /// interval of polling) instead of leaving it unbounded — and in the
-    /// normal case a healthy sample is milliseconds and the bound never
-    /// engages.
-    const fn lag_sample_budget(&self) -> std::time::Duration {
-        self.config.lag_sample_interval
+    /// Derived from the cadence — a sample that cannot finish within the
+    /// interval it is taken at is, by definition, too expensive for that
+    /// cadence, and the operator's remedy is the knob they already have —
+    /// but floored at [`ADAPTER_LAG_SAMPLE_CEILING`], because a budget shorter
+    /// than the adapter's own bound does not make the sample stop sooner. It
+    /// only makes the runtime stop *watching*, while the walk runs on and the
+    /// next one is armed on top of it.
+    ///
+    /// The floor raises; it never caps. A cadence already past the ceiling
+    /// keeps its own budget, so the default (and every generous cadence) is
+    /// unchanged. Together with the completion re-stamp this leaves the worst
+    /// case at budget-then-a-full-interval-of-polling, with the added
+    /// guarantee that an abandoned sample has finished before its successor
+    /// starts.
+    fn lag_sample_budget(&self) -> std::time::Duration {
+        self.config
+            .lag_sample_interval
+            .max(ADAPTER_LAG_SAMPLE_CEILING)
     }
 
     fn clone_handles(&self) -> Self {
@@ -1210,6 +1256,49 @@ impl ConnectorRuntime {
         }
     }
 
+    /// Hand a hard-stopped message back to its adapter, bounded.
+    ///
+    /// Mirrors the panic arm's two-step recovery, because the cause is the
+    /// same — a dispatch that ended without reaching `settle` — and so is the
+    /// remedy. Which step is load-bearing depends on the source: an adapter
+    /// whose redelivery *is* an explicit nack needs the `abandon`, while a
+    /// positional source needs its head marked so recovery fires on it rather
+    /// than waiting for offsets to pile up behind a partition that has stopped.
+    ///
+    /// **Bounded, unlike the panic arm's.** This runs after the shutdown drain
+    /// has already spent its full deadline, so an unbounded `abandon` against
+    /// the same wedged broker that caused the timeout would reintroduce exactly
+    /// the hang the deadline exists to prevent. Failing to release custody
+    /// costs one stranded message; failing to return costs the process. The
+    /// budget is deliberately short — this is a courtesy on the way out, not a
+    /// second drain.
+    async fn release_custody_after_hard_stop(
+        &self,
+        handle: &MessageHandle,
+        positional: Option<(i32, i64)>,
+    ) {
+        if self.source.abandon_redelivers() {
+            if tokio::time::timeout(HARD_STOP_ABANDON_BUDGET, self.abandon(handle))
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    source = self.binding.name,
+                    "connector could not hand a hard-stopped message back within its budget; \
+                     the adapter may hold it until the process exits"
+                );
+            }
+        } else if let Some((partition, position)) = positional {
+            self.offsets.lock().await.retried(partition, position);
+        }
+        // `record_metrics` lives inside `process`, which this dispatch never
+        // finished, so the settlement sample is owed here — same reason as the
+        // panic arm. Without it the dispatched series silently under-counts
+        // its own `received` total by one per hard stop.
+        self.metrics
+            .record_connector_dispatched(self.binding.name, ConnectorOutcome::Retried);
+    }
+
     async fn abandon(&self, handle: &MessageHandle) {
         if let Err(e) = self.source.abandon(handle).await {
             tracing::warn!(
@@ -1407,6 +1496,26 @@ mod tests {
             _entry: &crate::connector::dead_letter::ConnectorDeadLetter,
         ) -> Result<(), ConnectorError> {
             panic!("engine-side dead-letter sink panic");
+        }
+    }
+
+    /// A sink that parks until released, so a dispatch can be caught mid-flight.
+    ///
+    /// The hard stop only means anything while a task is genuinely running;
+    /// holding a bare permit stands in for that in the drain tests, but proving
+    /// the *message* is handed back needs a real dispatch parked inside
+    /// `process`.
+    #[derive(Debug)]
+    struct BlockingDeadLetterSink(Arc<tokio_util::sync::CancellationToken>);
+
+    #[async_trait::async_trait]
+    impl crate::connector::dead_letter::DeadLetterSink for BlockingDeadLetterSink {
+        async fn write(
+            &self,
+            _entry: &crate::connector::dead_letter::ConnectorDeadLetter,
+        ) -> Result<(), ConnectorError> {
+            self.0.cancelled().await;
+            Ok(())
         }
     }
 
@@ -2282,6 +2391,65 @@ mod tests {
         drop(wedged);
     }
 
+    /// Giving up on a dispatch must hand the message back to the adapter.
+    ///
+    /// The hard stop cuts `process` short, so `settle` never runs — and
+    /// `settle` is the only thing that releases the adapter's custody. On a
+    /// source whose redelivery *is* an explicit `abandon` (`MockSource`, SQS,
+    /// any adapter needing a real nack) the message is otherwise stranded in
+    /// the adapter with nothing left to hand it back: the process is shutting
+    /// down, so there is no later pass, and reusing the source across a
+    /// restart keeps the leak.
+    ///
+    /// Returning `Retry` is not enough. That is a value handed to the join
+    /// loop, and during a real shutdown the join loop has already been dropped
+    /// with `run_once` — nobody is left to read it. The recovery has to happen
+    /// *inside* the spawned task, which is the same conclusion the panic arm
+    /// reached for the same reason.
+    #[tokio::test(start_paused = true)]
+    async fn a_hard_stopped_dispatch_hands_the_message_back() {
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_opaque("m1", b"not json");
+        // Park the dispatch inside the sink so the task is genuinely in flight
+        // when the hard stop fires, rather than asserting against a stand-in.
+        let blocker = Arc::new(tokio_util::sync::CancellationToken::new());
+        let rt = Arc::new(
+            runtime(
+                malformed_binding(),
+                Arc::clone(&source),
+                Arc::new(RecordingDeadLetterSink::new()),
+            )
+            .with_dead_letter_sink(Arc::new(BlockingDeadLetterSink(Arc::clone(&blocker)))),
+        );
+
+        let driver = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { rt.run_once().await }
+        });
+
+        // Let the pass reach the sink.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        rt.hard_stop.cancel();
+
+        let summary = driver.await.expect("driver").expect("pass");
+        assert_eq!(
+            summary.retried, 1,
+            "the message must be left for redelivery"
+        );
+
+        assert_eq!(
+            source.abandoned().len(),
+            1,
+            "a hard-stopped dispatch must abandon the message on a source whose \
+             redelivery depends on it, or the adapter holds it forever"
+        );
+        assert!(
+            source.acked().is_empty(),
+            "giving up must never acknowledge"
+        );
+        blocker.cancel();
+    }
+
     /// The normal path is unchanged: a clean drain never hard-stops anything.
     ///
     /// The hard stop is a last resort — it abandons a dispatch at its next
@@ -2598,6 +2766,59 @@ mod tests {
     /// every pass sampling and only a sliver of each consuming. Measuring the
     /// gap from COMPLETION guarantees a full interval of message polling
     /// between samples no matter how expensive one turns out to be.
+    /// A short cadence must not shorten the budget below what an adapter can
+    /// actually abort within, or abandoned samples pile up.
+    ///
+    /// The runtime's timeout only drops its own future. It cannot stop the
+    /// work: a Kafka sample runs on `spawn_blocking`, and a blocking task is
+    /// never cancelled — only the adapter's own internal bound stops it. So
+    /// when the runtime gives up FIRST, the walk keeps running while the next
+    /// one is armed, and at a sub-ceiling cadence several overlap — each
+    /// holding a blocking-pool thread and hammering the very broker whose
+    /// slowness caused the timeout.
+    ///
+    /// Flooring the budget at the ceiling every adapter honours makes overlap
+    /// impossible for ANY cadence: the next sample is armed a full interval
+    /// after the budget elapses, and the walk has already stopped by then.
+    /// Giving up earlier bought nothing anyway — the gauge is stale either
+    /// way, and the work continues regardless.
+    #[test]
+    fn a_short_cadence_never_shortens_the_budget_below_the_adapter_ceiling() {
+        let short = ConnectorRuntime::new(
+            malformed_binding(),
+            Arc::new(MockSource::new("orders")),
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
+        )
+        .with_config(ConnectorRuntimeConfig {
+            lag_sample_interval: std::time::Duration::from_secs(3),
+            ..ConnectorRuntimeConfig::default()
+        });
+
+        assert_eq!(
+            short.lag_sample_budget(),
+            ADAPTER_LAG_SAMPLE_CEILING,
+            "a 3s cadence must not abandon at 3s while the adapter's own walk \
+             runs on to its ceiling — that is what lets abandoned samples overlap"
+        );
+
+        // A cadence already past the ceiling keeps its own budget: the floor
+        // raises, it never caps.
+        let long = ConnectorRuntime::new(
+            malformed_binding(),
+            Arc::new(MockSource::new("orders")),
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
+        )
+        .with_config(ConnectorRuntimeConfig {
+            lag_sample_interval: std::time::Duration::from_secs(60),
+            ..ConnectorRuntimeConfig::default()
+        });
+        assert_eq!(long.lag_sample_budget(), std::time::Duration::from_secs(60));
+    }
+
     #[tokio::test]
     async fn a_slow_lag_sample_does_not_immediately_re_arm_the_throttle() {
         let config = ConnectorRuntimeConfig {
@@ -2632,7 +2853,7 @@ mod tests {
     /// broker makes the sample slow AND makes the backlog grow. The sample is
     /// therefore budgeted, and an over-budget one is abandoned so the pass
     /// still polls.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_over_budget_lag_sample_is_abandoned_so_the_pass_still_polls() {
         let source = Arc::new(CallOrderSource::new("orders"));
         source.inner.set_lag(Some(42));
@@ -2648,13 +2869,18 @@ mod tests {
         )
         .with_dead_letter_sink(Arc::new(RecordingDeadLetterSink::new()))
         .with_config(ConnectorRuntimeConfig {
-            // A small budget keeps the real wall-clock wait tiny; the point is
-            // that it is BOUNDED, not how large it is.
             lag_sample_interval: std::time::Duration::from_millis(30),
             ..ConnectorRuntimeConfig::default()
         });
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), rt.run_once())
+        // Paused clock: the budget is floored at `ADAPTER_LAG_SAMPLE_CEILING`
+        // (a short cadence must not abandon before the adapter's own walk can
+        // stop), so waiting it out for real would put ten seconds on every
+        // run of this suite. The guard sits above that floor so it catches an
+        // UNBOUNDED sample — which parks forever and so never lets the clock
+        // reach the guard's own deadline either — rather than the budget
+        // simply doing its job.
+        tokio::time::timeout(std::time::Duration::from_secs(60), rt.run_once())
             .await
             .expect("an unbounded lag sample must not block the pass")
             .expect("the pass itself must succeed");

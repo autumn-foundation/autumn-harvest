@@ -140,6 +140,18 @@ pub trait EventSource: Send + Sync {
     ///
     /// The default returns `None`, so an adapter that cannot report lag simply
     /// never emits the `harvest.connector.lag` gauge.
+    ///
+    /// # Contract: bound your own sample
+    ///
+    /// An implementation must abort within
+    /// [`ADAPTER_LAG_SAMPLE_CEILING`](super::runtime::ADAPTER_LAG_SAMPLE_CEILING).
+    /// The runtime budgets this call, but a timeout only drops the runtime's
+    /// own future — it cannot stop work already under way, and for a sample
+    /// running on `spawn_blocking` it definitively cannot, because a blocking
+    /// task is never cancelled. The runtime floors its budget at that ceiling
+    /// so it never gives up first; an implementation that outruns the ceiling
+    /// breaks the other half of the bargain, and abandoned samples accumulate
+    /// against a broker that is already struggling.
     async fn lag(&self) -> Option<i64> {
         None
     }

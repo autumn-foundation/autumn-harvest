@@ -1085,7 +1085,13 @@ const ANCHOR_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Without it the runtime's timeout only drops the `JoinHandle` — the blocking
 /// walk runs on to completion regardless, so abandoned walks pile up one per
 /// sample interval and the broker load grows rather than shrinks.
-const LAG_SAMPLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+///
+/// Defined AS the runtime's [`ADAPTER_LAG_SAMPLE_CEILING`] rather than merely
+/// equal to it, so the two cannot drift: the runtime floors its own budget at
+/// that value precisely so it never gives up before this bound does. A local
+/// constant would let a future edit here silently reintroduce the overlap.
+const LAG_SAMPLE_BUDGET: std::time::Duration =
+    crate::connector::runtime::ADAPTER_LAG_SAMPLE_CEILING;
 
 /// Per-call librdkafka timeout, further clamped by whatever budget is left.
 const LAG_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
