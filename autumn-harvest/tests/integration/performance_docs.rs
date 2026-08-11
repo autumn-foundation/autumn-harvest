@@ -1157,9 +1157,13 @@ fn changelog_leading_entry_per_gate_figures_match_the_published_table() {
 /// the page needs no such extension: regenerating any table drops its old
 /// values off the page, and the stale quote fails here.
 ///
-/// Scoped to the headline findings for the same reason the AC2 guard is scoped
-/// to its list: the entry quotes other runs on purpose elsewhere (the
-/// reproducibility spread), which the page publishes as a spread.
+/// Scoped to the two regions that summarise *current* measurements — the
+/// headline findings and the gate's budget rationale — rather than the whole
+/// entry. The entry also narrates superseded runs on purpose ("an earlier
+/// revision ... read ~2 900 ms instead of ~300 ms"), and the page publishes that
+/// history deliberately, so a whole-entry sweep would fail on text that is
+/// correct. The excluded region is narrative about the past; these two are
+/// claims about the present.
 #[test]
 fn changelog_headline_millisecond_figures_still_appear_on_the_page() {
     let doc = read_performance_doc();
@@ -1175,7 +1179,24 @@ fn changelog_headline_millisecond_figures_still_appear_on_the_page() {
     let end = leading[start..]
         .find("An equal-depth control")
         .map_or(leading.len(), |o| start + o);
-    let headline = &leading[start..end];
+
+    // The budget sentence quotes the reference p50 the gate is derived from, so
+    // it goes stale on exactly the same regeneration. It sat outside the
+    // headline block and drifted independently: round 5 widened the reference
+    // to a 200-234 ms range and the entry kept quoting a flat "234 ms", which
+    // by then also contradicted the entry's own corrected headline.
+    let budget_start = leading
+        .find("fails the build when")
+        .expect("the leading entry must state the gate's budget");
+    let budget_end = leading[budget_start..]
+        .find("It asserts p50")
+        .map_or(leading.len(), |o| budget_start + o);
+
+    let headline = &format!(
+        "{} {}",
+        &leading[start..end],
+        &leading[budget_start..budget_end]
+    );
 
     // `9.92 ms`, `234.22 ms`, `3 531.95 ms` — digits with optional ASCII-space
     // thousands separators, two decimals, followed by the unit.
@@ -1190,10 +1211,12 @@ fn changelog_headline_millisecond_figures_still_appear_on_the_page() {
         }
         let rest: String = bytes[i..].iter().collect();
         let num_len = rest.find(" ms").filter(|&n| n > 0 && n <= 12).filter(|&n| {
+            // Integer figures count too. Requiring a decimal point is what let
+            // the budget sentence's flat `234 ms` reference drift undetected
+            // while every decimal figure beside it was being checked.
             let s = &rest[..n];
-            s.contains('.')
-                && s.chars()
-                    .all(|c| c.is_ascii_digit() || c == '.' || c == ' ')
+            s.chars()
+                .all(|c| c.is_ascii_digit() || c == '.' || c == ' ')
         });
         if let Some(n) = num_len {
             quoted.push(rest[..n].to_string());
