@@ -34,7 +34,7 @@ this page says nothing about what they cost; see
 ## TL;DR
 
 * **Claim latency scales superlinearly with pending-backlog depth.** 1k → 10k
-  rows (10x) costs ~24x latency; 10k → 100k (10x) costs a further ~15x. Claim
+  rows (10x) costs ~19x latency; 10k → 100k (10x) costs a further ~15x. Claim
   cost is a function of how deep your queue is, not how much work you dispatch.
   **This is the single biggest lever on this page** — bigger than any individual
   predicate, and it dominates the per-gate table below.
@@ -42,12 +42,12 @@ this page says nothing about what they cost; see
   leads with a non-indexable `CASE` expression, so `idx_harvest_tq_poll` cannot
   serve the ordering. Postgres sequentially scans and sorts every eligible
   pending row on every single claim. See [the plan](#the-plan) below.
-* **Only one predicate is genuinely expensive: per-key concurrency (+532% p50).**
-  Build-id routing (+12%), the rate-limit gate (+3%) and the circuit-breaker
-  tracked set (−1%) are cheap or free.
-* **Paused executions cost as much as live ones (+1301% p50), but not because
+* **Only one predicate is genuinely expensive: per-key concurrency (+644% p50).**
+  Build-id routing (+13%), the rate-limit gate (+2%) and the circuit-breaker
+  tracked set (+4%) are cheap or free.
+* **Paused executions cost as much as live ones (+1403% p50), but not because
   the PAUSED predicate is expensive.** An equal-depth control with *no* PAUSED
-  predicate costs the same (+1314%). The anti-join is free; the rows sitting in
+  predicate costs the same (+1383%). The anti-join is free; the rows sitting in
   the table are what you pay for. See
   [the control that changed the conclusion](#the-control-that-changed-the-conclusion).
 * **Enqueue is not the problem.** ~4 800 rows/s sustained at p50 ~1.5 ms, flat
@@ -171,7 +171,7 @@ Baseline gate (no build policy, no concurrency key, no rate limit, no pauses),
 
 ⚠ Cut short by the per-scenario wall-clock budget (180 s for this run; the
 default is 240 s, override with `HARVEST_BENCH_SCENARIO_SECS`). The percentiles
-describe the 430 claims it did observe. That the scenario *cannot* finish its
+describe the 583 claims it did observe. That the scenario *cannot* finish its
 planned 800 claims in three minutes is itself the finding.
 
 These rows run at 8 concurrent claimers against a 4-core box, so they measure
@@ -258,9 +258,12 @@ so any delta measured against `baseline` charges the predicate for the extra
 rows too. `double_backlog` removes that confound: same 20 000 total rows, all of
 them plain and claimable, **no PAUSED predicate anywhere**.
 
-It costs **+1314%** — slightly *more* than `paused_rows` does. Measured against
-that honest comparand the anti-join costs **−1%**, which at n=240/240 truncated
-samples is indistinguishable from zero.
+It costs **+1383%**, within about a percent of what `paused_rows` costs.
+Measured against that honest comparand the anti-join costs **+1%** — and the
+*sign* of that last figure flips between runs (an earlier run measured the
+control as the slower of the two, putting the anti-join at −1%), which is
+itself the evidence that at n=325/322 truncated samples the predicate is
+indistinguishable from zero. Do not read the ±1% as a direction.
 
 So there are two different questions and two different numbers:
 
@@ -272,47 +275,47 @@ So there are two different questions and two different numbers:
 **The operational finding survives; the attribution does not.** Pausing
 executions still does not take their work out of the claim path — the rows stay
 `PENDING`, every worker still scans them on every claim, and a fleet with a large
-paused population still pays roughly the same 14x that an equal number of *live*
+paused population still pays roughly the same 15x that an equal number of *live*
 rows would cost. But it pays that because the rows are *there*, not because
 `NOT EXISTS (… state = 'PAUSED')` is expensive to evaluate. Deleting the
 predicate would buy you nothing; draining the rows would buy you everything.
 
 What each row exercises, and what it means:
 
-* **`circuit_breaker_set` (−1%)** — the worker passes a populated tracked-activity
+* **`circuit_breaker_set` (+4%)** — the worker passes a populated tracked-activity
   set, so the rate-limit gate and debit are skipped via `= ANY($5)` (#369).
   Free, as designed.
-* **`rate_limited` (+3%)** — rows carry a `rate_limit_key` with a funded bucket,
+* **`rate_limited` (+2%)** — rows carry a `rate_limit_key` with a funded bucket,
   exercising the candidate-side `EXISTS` gate and the `rate_limit_debit` CTE
   (#332 / #699). Effectively free at this backlog.
-* **`build_policy` (+12%)** — rows carry `required_build_id` and the worker's
+* **`build_policy` (+13%)** — rows carry `required_build_id` and the worker's
   build matches only through a `harvest_build_compat` declaration, forcing the
   `EXISTS` branch rather than the cheap `required_build_id = $3` equality
   (#171). A real but modest cost; safe-deploy ramps (#604) are not expensive.
-* **`concurrency_key` (+532%)** — rows carry `concurrency_key` + `concurrency_cap`,
+* **`concurrency_key` (+644%)** — rows carry `concurrency_key` + `concurrency_cap`,
   exercising both the candidate-side `COUNT(*)` subquery and the
   `pg_try_advisory_xact_lock` re-check in the `claimed` CTE (#247). This is
   measured with 256 distinct keys and a cap high enough never to block, so it is
   the *predicate* cost with contention deliberately minimised. **This is the one
   genuinely expensive predicate on the claim path — budget for it.** Its measured
   multiplier is also the least stable on this page: it grows as a run progresses
-  (a shorter earlier run reported +306% over 174 samples; this 513-sample run
-  reports +532%), which is consistent with the `COUNT(*)` subquery counting a
+  (a shorter earlier run reported +306% over 174 samples; this 657-sample run
+  reports +644%), which is consistent with the `COUNT(*)` subquery counting a
   `RUNNING` population that the benchmark itself is growing. Read it as
   "expensive and load-dependent", not as a fixed multiplier.
-* **`double_backlog` (+1314%)** — the control described above. Not a predicate:
+* **`double_backlog` (+1383%)** — the control described above. Not a predicate:
   the cost of doubling table depth, full stop.
-* **`paused_rows` (−1% vs the control)** — 10 000 rows belonging to PAUSED
+* **`paused_rows` (+1% vs the control)** — 10 000 rows belonging to PAUSED
   executions on top of the claimable backlog, exercising the `NOT EXISTS`
   anti-join (#383). Free as a predicate; expensive as table depth.
-* **`all_gates` (+1665%)** — every gate at once. Read it as "a deployment using
+* **`all_gates` (+1797%)** — every gate at once. Read it as "a deployment using
   all of these features", **not** as a strict upper bound on the claim path: the
   circuit-breaker tracked set short-circuits the rate-limit `EXISTS` and the
   debit CTE (`= ANY($5)` wins, #369), so a deployment with rate limiting and
   *no* breaker executes strictly more work per claim than this row does. Note
   what happens when depth is controlled for: `all_gates` runs at the same 20 000
   rows as `double_backlog`, and against *that* comparand every predicate in the
-  engine combined costs **+23%**. At this depth the scan and sort dominate so
+  engine combined costs **+28%**. At this depth the scan and sort dominate so
   completely that the predicates are a rounding error on top of them.
 
 ## The plan
@@ -401,14 +404,15 @@ of work, and tuning without a published baseline is how you get an unfalsifiable
 
 Enqueue is **flat in backlog depth** — a 100x deeper queue moves p50 by 0.2 ms,
 and the throughput spread across the sweep is inside this box's run-to-run
-noise (the deepest backlog measured *fastest* here, which is the tell that the
-variation is noise rather than depth). That is the expected and desired
+noise (the *middle* backlog measured fastest here, and the deepest beat the
+shallowest — throughput does not order by depth at all, which is the tell that
+the variation is noise rather than depth). That is the expected and desired
 asymmetry: reads pay for depth, writes do not. A
 start-storm is bounded by your connection pool and by Postgres write throughput,
 not by anything Harvest does.
 
 Put the two sides together and the operational picture is stark: at a 100 000-row
-backlog this machine sustains ~5 300 enqueues/s against ~3 claims/s — three
+backlog this machine sustains ~4 600 enqueues/s against ~3 claims/s — three
 orders of magnitude apart. **A queue that deep does not drain.** Nothing in the
 write path warns you about it; the backlog table above is the warning.
 
@@ -467,13 +471,13 @@ quiet-box reference spans 200–234 ms and the budget is therefore 6.4–7.5x it
 
 | regression scale | example | quiet box (200 ms) | quiet box (234 ms) | loaded box (516 ms) |
 |:--|:--|:--|:--|:--|
-| ~6.9x | a second `concurrency_key`-class subplan | 1 380 ms — **misses** | 1 615 ms — trips | 3 560 ms — trips |
+| ~7.4x | a second `concurrency_key`-class subplan | 1 488 ms — **misses** | 1 741 ms — trips | 3 839 ms — trips |
 | ~14.6x | doubling the rows every claim walks | 2 914 ms — trips | 3 409 ms — trips | 7 519 ms — trips |
 
 So a depth-class regression trips everywhere, while a single-subplan-class one
 trips on a loaded box and at the slow end of the quiet range but can slip
 through on the fastest quiet runs. That is inherent rather than a tuning miss:
-the reference moves 2.3x with load, so no single threshold separates 6.9x from
+the reference moves 2.3x with load, so no single threshold separates 7.4x from
 noise on this hardware. It also matters less than it looks, because the gate
 runs in CI, and CI is the loaded case — 2.9x headroom, where even the smaller
 cliff clears the budget by more than 2x. For drift below either cliff, run the

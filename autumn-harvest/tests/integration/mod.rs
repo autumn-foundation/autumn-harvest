@@ -91,6 +91,7 @@ mod payload_cap_tests;
 mod payload_offload_db_tests;
 #[cfg(feature = "testing")]
 mod payload_offload_replay_tests;
+mod performance_docs;
 mod poison_pill_tests;
 mod priority_tests;
 #[cfg(feature = "testing")]
