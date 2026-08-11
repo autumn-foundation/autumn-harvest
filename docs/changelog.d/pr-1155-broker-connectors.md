@@ -1384,6 +1384,57 @@ coordinates, so a run traces back to the exact message.
   the loss it set out to prevent. RED:
   `an_idle_pass_still_retries_an_anchor_commit_it_owes`.
 
+- **A settled Kafka commit could rewind a partition this replica had lost.**
+  `committable_anchors` filters the *anchor* commit down to partitions this
+  consumer still owns, precisely because a commit speaks for the whole group —
+  but `commit_settled_offset`, the path `ack`/`commit_position` take on every
+  settlement, committed unconditionally. A dispatch routinely outlives the
+  rebalance that revoked its partition: it settles afterwards and commits an
+  offset the new owner has long since advanced past, rewinding the group so
+  those records replay well after their idempotency claims expired — landing as
+  duplicate executions rather than deduplicated retries. Kafka does not stop
+  this: the classic rebalance protocol validates a committing member's
+  *generation*, not its assignment, so a live member may commit for a partition
+  it does not own. Guarded now by the named `may_commit_settled` — the
+  **assigned** half of `committable_anchors`, on the path that runs far more
+  often — reading the local (not round-tripped) assignment. A suppressed commit
+  returns `Ok` with a warning rather than an error, because the settlement was
+  real and only the group-wide statement is declined; the records are re-read by
+  whoever owns the partition now and dedupe on their key. Two things fell out of
+  writing it: the commit now uses the *same* consumer snapshot the assignment
+  was read from (a rebuild in between would have committed against a consumer
+  whose assignment was never checked — the guard bypassed), and the **raises**
+  half is documented as a deliberate residual, since it needs a
+  `committed_offsets` round-trip the anchor path can afford per pass and this
+  one cannot per settlement. The cheap alternative, generation fencing, has
+  nowhere to live: it needs the generation the message was *read* at carried
+  through to its commit, and a positional commit deliberately arrives without
+  the reading message's handle, because the mark it commits belongs to no single
+  message. So the residual narrows from "outlived one rebalance" to "outlived
+  two". RED: `a_settled_commit_is_suppressed_for_a_partition_this_replica_lost`
+  (the mutation *is* the RED — the predicate written as the previous
+  unconditional `true` fails exactly this test).
+
+- **Documented why the panic arm's recovery needs neither a bound nor a
+  permit.** `release_custody_after_hard_stop` advertises itself as "bounded,
+  unlike the panic arm's" without saying why the unbounded one is safe, which
+  invites the reasonable objection that it is not: the join loop holds no
+  permit, so `drain_in_flight` does not wait for it and an ordinary shutdown
+  drops it mid-await along with `run_once`. That would strand a message if the
+  call did broker I/O — and for both shipped adapters it does none. Kafka
+  overrides `abandon_redelivers()` to `false` and takes the mark-the-head
+  branch, a local mutex write; SQS's `abandon` is a deliberate no-op returning
+  `Ok(())` without touching the network, because its visibility timeout is what
+  redelivers. The residual is a *custom* adapter whose `abandon` both blocks on
+  the network and is its only redelivery mechanism, costing one message held
+  until that adapter's lease expires — the same cost the hard-stop path already
+  accepts, minus the warning. The complete fix and why the obvious one does not
+  work are both recorded: catch the dispatch panic *inside* the spawned task so
+  the recovery runs while its permit is still held (the reason the hard-stop arm
+  is inline rather than in the join loop), because re-acquiring a permit in the
+  join loop cannot help — a cancelled `run` drops `run_once` and its permit
+  before the drain starts.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

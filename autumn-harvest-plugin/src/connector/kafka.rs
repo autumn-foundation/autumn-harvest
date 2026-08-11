@@ -370,6 +370,47 @@ fn covered_anchor_partitions(owed: &[(i32, i64)], assigned: &[i32]) -> Vec<i32> 
         .collect()
 }
 
+/// Whether this replica may commit a settled offset for `partition`.
+///
+/// The **assigned** half of [`committable_anchors`], on the path that runs far
+/// more often. A commit speaks for the whole group, and a dispatch routinely
+/// outlives the rebalance that revoked its partition: it settles afterwards,
+/// commits an offset the new owner has long since advanced past, and rewinds
+/// the group. Those records then replay well after the connector's idempotency
+/// claims for them expired, so they land as **duplicate executions** rather
+/// than deduplicated retries — the hazard `committable_anchors` was written
+/// for, reached through `ack`/`commit_position` instead of through an anchor.
+///
+/// Kafka will not stop this for us. A consumer that is still a live member of
+/// the group at the current generation may commit an offset for a partition it
+/// does not own; the classic rebalance protocol validates the generation, not
+/// the assignment. Ownership has to be checked here.
+///
+/// Suppressing is always the safe direction: nothing is committed, so the
+/// records are simply re-read and deduped on their idempotency key — the same
+/// outcome the runtime already documents for a failed ack. That is also why
+/// a briefly-empty mid-rebalance assignment needs no special case.
+///
+/// # Residual: revoked, advanced elsewhere, and handed back
+///
+/// Ownership alone is not the whole guard, and [`committable_anchors`] pairs it
+/// with a **raises** check for exactly that reason. A partition revoked,
+/// advanced to 5000 by another replica, and then reassigned here is owned
+/// again, so a dispatch from before the gap still commits its stale offset.
+/// Closing it needs the group's committed offset — a `committed_offsets`
+/// broker round-trip, which the anchor path can afford because it runs rarely
+/// and this path cannot because it runs per settlement.
+///
+/// The generation fencing that *would* close it cheaply has nowhere to live:
+/// it needs the assignment generation the message was read at, carried on the
+/// handle to its commit — and a positional commit deliberately arrives without
+/// the reading message's handle at all, because the mark it commits belongs to
+/// no single message. So the residual is narrowed to "outlived two rebalances"
+/// rather than "outlived one", and left documented.
+fn may_commit_settled(partition: i32, assigned: &[i32]) -> bool {
+    assigned.contains(&partition)
+}
+
 /// The anchors that must be made durable *before* their records are dispatched.
 ///
 /// [`PartitionAnchors`] is in-process state, and only [`EventSource::recover`]
@@ -669,16 +710,46 @@ impl KafkaSource {
 
     /// Commit a settled offset for one partition and raise its anchor.
     ///
-    /// Split out of [`EventSource::ack`] only so the coordinate check reads as
-    /// a guard clause; the behaviour is unchanged.
+    /// Guarded by [`may_commit_settled`]: a settlement that arrives after a
+    /// rebalance took its partition away must not speak for the group. The
+    /// assignment read is a local librdkafka call, not a broker round-trip, so
+    /// it costs a list walk per settled prefix advance rather than a request.
     fn commit_settled_offset(&self, partition: i32, offset: i64) -> Result<(), ConnectorError> {
+        let consumer = self.consumer();
+        let assigned: Vec<i32> = consumer
+            .assignment()
+            .map_err(|e| ConnectorError::Broker(format!("kafka assignment: {e}")))?
+            .elements_for_topic(&self.topic)
+            .iter()
+            .map(rdkafka::topic_partition_list::TopicPartitionListElem::partition)
+            .collect();
+        if !may_commit_settled(partition, &assigned) {
+            // Not an error: the settlement was real, this replica simply no
+            // longer speaks for the partition. Returning `Ok` keeps the
+            // runtime's "ack failed" warning for actual failures; the records
+            // are re-read by whoever owns the partition now and dedupe on
+            // their idempotency key.
+            tracing::warn!(
+                topic = %self.topic,
+                partition,
+                offset,
+                "kafka settlement landed after its partition was revoked; not committing, \
+                 the new owner's offset stands and these records dedupe on redelivery"
+            );
+            return Ok(());
+        }
+
         let mut tpl = TopicPartitionList::new();
         // Kafka's committed offset is the NEXT offset to read, so commit
         // `offset + 1`. The runtime has already established that every lower
         // offset in this partition is settled.
         tpl.add_partition_offset(&self.topic, partition, Offset::Offset(offset + 1))
             .map_err(|e| ConnectorError::Broker(format!("kafka offset list: {e}")))?;
-        self.consumer()
+        // The SAME consumer the assignment was read from, deliberately. A
+        // rebuild between the two would commit against a consumer whose
+        // assignment was never checked, which is precisely the guard above
+        // being bypassed.
+        consumer
             .commit(&tpl, CommitMode::Async)
             .map_err(|e| ConnectorError::Broker(format!("kafka commit: {e}")))?;
         // Raise the resume floor. The commit above is ASYNC, so it may not be
@@ -1473,6 +1544,38 @@ mod tests {
         assert!(
             covered_anchor_partitions(&owed, &[]).is_empty(),
             "a pass that owns nothing retires nothing",
+        );
+    }
+
+    /// A settled-offset commit speaks for the group, so it needs the same
+    /// ownership guard the anchor commit has.
+    ///
+    /// A dispatch outlives the rebalance that revoked its partition: it settles
+    /// afterwards and commits an offset for a partition another replica has
+    /// since advanced, rewinding the group. Those records replay long after
+    /// their idempotency claims expired, so they land as duplicate executions
+    /// rather than deduplicated retries — the exact hazard `committable_anchors`
+    /// documents, on the path that runs far more often than the anchor commit.
+    #[test]
+    fn a_settled_commit_is_suppressed_for_a_partition_this_replica_lost() {
+        assert!(
+            !may_commit_settled(1, &[0, 2]),
+            "a revoked partition's late settlement must not commit: this replica \
+             no longer speaks for it, and the commit would rewind whatever the \
+             new owner has advanced to",
+        );
+
+        // The ordinary case is untouched: an owned partition still commits.
+        assert!(may_commit_settled(0, &[0, 2]));
+        assert!(may_commit_settled(2, &[0, 2]));
+
+        // Mid-rebalance `assignment()` is briefly empty. Suppressing is the
+        // safe direction and matches the anchor path: with no assignment there
+        // is no partition this replica may speak for, and the message is simply
+        // redelivered and deduped.
+        assert!(
+            !may_commit_settled(0, &[]),
+            "with no assignment there is nothing this replica may commit for",
         );
     }
 

@@ -1434,6 +1434,28 @@ impl ConnectorRuntime {
     /// costs one stranded message; failing to return costs the process. The
     /// budget is deliberately short — this is a courtesy on the way out, not a
     /// second drain.
+    ///
+    /// # Why the panic arm needs neither the bound nor a permit
+    ///
+    /// The panic arm runs its recovery in `run_once`'s join loop, which holds
+    /// no permit — so [`Self::drain_in_flight`] does not wait for it, and an
+    /// ordinary shutdown drops it mid-await along with `run_once`. That would
+    /// matter if the call did broker I/O. For both shipped adapters it does
+    /// not: Kafka overrides `abandon_redelivers()` to `false` and takes the
+    /// mark-the-head branch, a local mutex write; SQS's `abandon` is a
+    /// deliberate no-op returning `Ok(())` without touching the network, since
+    /// its visibility timeout is what redelivers. Neither can hang the join
+    /// loop and neither has custody to strand.
+    ///
+    /// The residual is a *custom* adapter whose `abandon` both blocks on the
+    /// network and is its only redelivery mechanism. There the dropped call
+    /// costs one message held until that adapter's own lease expires — the
+    /// same cost this function already accepts above, minus the warning.
+    /// Closing it properly means catching the dispatch panic *inside* the
+    /// spawned task so the recovery runs while its permit is still held (the
+    /// reason the hard-stop arm above is inline rather than in the join loop);
+    /// re-acquiring a permit in the join loop does not work, because a
+    /// cancelled `run` drops `run_once` and its permit before the drain starts.
     async fn release_custody_after_hard_stop(
         &self,
         handle: &MessageHandle,
