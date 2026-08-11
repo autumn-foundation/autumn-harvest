@@ -99,19 +99,23 @@ Two more things worth knowing before pointing this at a server you care about:
 
 * **Setup sweeps stale `harvest_claim_bench_%` databases**, not just teardown —
   that is what reclaims databases orphaned by a run that panicked, which a
-  teardown hook can never do. It skips any database whose owning pid is still
-  alive, so concurrent runs cannot delete each other's working set. The liveness
-  authority is the **server**, not the local process table: the sweep asks
-  whether anything holds a backend against the database, and each run keeps one
-  idle connection open for the whole life of its database precisely so that
-  question has an answer even between scenarios. A pid cannot answer for a run
-  on another host, and on non-Linux hosts it cannot answer at all — so a pid is
-  only ever allowed to *protect* (a definitely-live local pid covers another
-  local run's create-to-lease window, which the server cannot see yet), never to
-  veto. Ownership is keyed on a per-run token rather than the pid, since two
-  containerised runs on different hosts both report pid 1. Credentials never
-  reach a log line: the URL is redacted to `scheme://***@host:port/db` before it
-  is printed.
+  teardown hook can never do. The sole liveness authority is the **server**: the
+  sweep drops a database only when nothing holds a backend against it, and each
+  run keeps one idle connection open for the whole life of its database
+  precisely so that question has an answer even between scenarios. A local pid
+  is deliberately *not* consulted — it cannot answer for a run on another host,
+  it cannot answer at all on non-Linux, and two containerised runs on different
+  hosts both report pid 1, so treating it as a liveness signal would either veto
+  every reclaim or protect nothing. There is one window the server cannot see —
+  between `CREATE DATABASE` and the first connection to it, the database exists
+  with zero backends and looks abandoned — so setup holds an advisory lock
+  across that whole span, and every sweep takes the same lock first. The lock
+  lives on its own connection to the `postgres` database rather than on the
+  admin connection, because Postgres advisory locks are scoped to the session's
+  database, not the cluster: taken on the admin connection, two runs reaching
+  one server through different admin databases would not serialize at all.
+  Credentials never reach a log line: the URL is redacted to
+  `scheme://***@host:port/db` before it is printed.
 * **`HARVEST_BENCH_SCENARIO_SECS`** caps each scenario's measured phase
   (default 240 s). It is the knob to raise when a row comes back marked `⚠` or
   `‡` — see [measurement hygiene](#measurement-hygiene).

@@ -1243,11 +1243,11 @@ pub mod db {
             let mut admin = AsyncPgConnection::establish(&admin_url)
                 .await
                 .map_err(|e| SkipReason(format!("connect {safe_url}: {e}")))?;
-            // Everything from here to the lease runs under a cluster-wide
-            // advisory lock, so no other client can sweep while we are between
-            // `CREATE DATABASE` and holding a backend on it. See
-            // `SWEEP_LOCK_KEY`.
-            take_sweep_lock(&mut admin).await?;
+            // Everything from here to the lease runs under an advisory lock, so
+            // no other client can sweep while we are between `CREATE DATABASE`
+            // and holding a backend on it. The lock lives on its own connection
+            // to a fixed database — see `SWEEP_LOCK_KEY` for why that matters.
+            let lock = take_sweep_lock(&admin_url).await?;
             drop_stale_bench_databases(&mut admin).await;
             let n = DB_SEQ.fetch_add(1, Ordering::SeqCst);
             // Shape: harvest_claim_bench_{pid}_{run_token}_{seq}. The pid is a
@@ -1272,9 +1272,9 @@ pub mod db {
             // `pg_stat_activity` and defends itself. Release before the
             // migration — that is the slow part, and holding the lock across it
             // would serialize concurrent runs for no benefit. Every `?` above
-            // drops `admin`, which ends the session and releases the lock too,
+            // drops `lock`, which ends that session and releases the lock too,
             // so an early return cannot strand it.
-            release_sweep_lock(&mut admin).await;
+            release_sweep_lock(lock).await;
             conn.batch_execute(autumn_harvest::full_migrations_sql())
                 .await
                 .map_err(|e| SkipReason(format!("migrate {db}: {e}")))?;
@@ -1326,16 +1326,33 @@ pub mod db {
     /// abandoned. No amount of naming fixes that; the window has to be closed
     /// by making the two operations mutually exclusive.
     ///
-    /// Postgres advisory locks are cluster-wide rather than per-database, so a
-    /// lock taken on the admin connection is visible to exactly the set of
-    /// clients that could sweep us — including ones on other hosts, which is
-    /// the case that motivated it. The value is arbitrary but must never
-    /// change: two harness versions using different keys would not serialize
-    /// against each other, which is the same as no lock at all.
+    /// Postgres advisory locks are scoped to the database the session is
+    /// connected to, **not** to the cluster: two sessions on different
+    /// databases can hold the same key simultaneously (verified against a live
+    /// server — `pg_try_advisory_lock` on the same key returns true from a
+    /// second database while the first still holds it). So the lock cannot ride
+    /// the admin connection, whose database is whatever the operator happened
+    /// to put in `HARVEST_TEST_DATABASE_URL`: two runs pointed at the same
+    /// cluster through different admin databases would not serialize at all,
+    /// which is the same as no lock. It is taken on its own connection to
+    /// [`SWEEP_LOCK_DB`] instead, so every client agrees on where it lives.
     ///
-    /// Public so the regression test that proves setup actually takes the lock
-    /// references this constant rather than a copy of the literal.
+    /// The value is arbitrary but must never change: two harness versions using
+    /// different keys would not serialize against each other either.
+    ///
+    /// Public so the regression tests that prove setup takes this lock, in this
+    /// database, reference these constants rather than copies of the literals.
     pub const SWEEP_LOCK_KEY: i64 = 786_0786_0786;
+
+    /// The database the sweep lock is taken in. See [`SWEEP_LOCK_KEY`].
+    ///
+    /// `postgres` because it is the one database every server is guaranteed to
+    /// have and every admin URL can reach. Deliberately **not** `template1`,
+    /// which is equally universal but is the default template for
+    /// `CREATE DATABASE`: holding a connection to it would make our own
+    /// create — the very operation the lock exists to protect — fail with
+    /// "source database is being accessed by other users".
+    pub const SWEEP_LOCK_DB: &str = "postgres";
 
     /// How long to wait for a peer's sweep-and-create before giving up.
     ///
@@ -1346,31 +1363,63 @@ pub mod db {
     const SWEEP_LOCK_TIMEOUT: &str = "60s";
 
     /// Take the sweep lock, blocking until a peer releases it.
-    async fn take_sweep_lock(admin: &mut AsyncPgConnection) -> Result<(), SkipReason> {
+    ///
+    /// Returns the connection holding it. The lock lives on its own session in
+    /// [`SWEEP_LOCK_DB`] rather than on the caller's admin connection, because
+    /// advisory locks are database-scoped — see [`SWEEP_LOCK_KEY`]. Dropping
+    /// the returned connection releases the lock, so a caller that bails out
+    /// with `?` cannot strand it.
+    ///
+    /// Public so the regression test can prove the lock is taken in the fixed
+    /// database rather than in whichever one the admin URL names.
+    pub async fn take_sweep_lock(admin_url: &str) -> Result<AsyncPgConnection, SkipReason> {
+        // Falling back to the admin URL's own database keeps a run working on a
+        // server whose `postgres` database has been dropped or revoked. It
+        // narrows coordination to clients sharing that database, which is worse
+        // than nothing only if it is silent — hence the warning.
+        let mut lock = match AsyncPgConnection::establish(&super::with_db_name(
+            admin_url,
+            SWEEP_LOCK_DB,
+        ))
+        .await
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!(
+                    "warning: sweep lock falling back to the admin URL's own database \
+                         (connect {SWEEP_LOCK_DB}: {e}); concurrent runs reaching this \
+                         cluster through a different admin database will not serialize"
+                );
+                AsyncPgConnection::establish(admin_url)
+                    .await
+                    .map_err(|e| SkipReason(format!("connect for sweep lock: {e}")))?
+            }
+        };
         // `lock_timeout` covers advisory locks, so a peer that wedges while
         // holding the lock aborts our wait with an error instead of hanging.
         diesel::sql_query(format!("SET lock_timeout = '{SWEEP_LOCK_TIMEOUT}'"))
-            .execute(&mut *admin)
+            .execute(&mut lock)
             .await
             .map_err(|e| SkipReason(format!("set lock_timeout: {e}")))?;
         diesel::sql_query("SELECT pg_advisory_lock($1)")
             .bind::<diesel::sql_types::BigInt, _>(SWEEP_LOCK_KEY)
-            .execute(admin)
+            .execute(&mut lock)
             .await
-            .map(|_| ())
             .map_err(|e| {
                 SkipReason(format!(
                     "waited {SWEEP_LOCK_TIMEOUT} for another benchmark run's \
                      sweep-and-create to finish: {e}"
                 ))
-            })
+            })?;
+        Ok(lock)
     }
 
-    /// Release the sweep lock. Best-effort: dropping `admin` also releases it.
-    async fn release_sweep_lock(admin: &mut AsyncPgConnection) {
+    /// Release the sweep lock. Best-effort: dropping the connection also
+    /// releases it, which is why this consumes it.
+    pub async fn release_sweep_lock(mut lock: AsyncPgConnection) {
         let _ = diesel::sql_query("SELECT pg_advisory_unlock($1)")
             .bind::<diesel::sql_types::BigInt, _>(SWEEP_LOCK_KEY)
-            .execute(admin)
+            .execute(&mut lock)
             .await;
     }
 
@@ -1421,20 +1470,32 @@ pub mod db {
             }
 
             // The authority. A pid answers only for this host, so when several
-            // machines share one admin URL a foreign run looks dead and
-            // `WITH (FORCE)` would terminate it mid-measurement. The server is
+            // machines share one admin URL a foreign run looks dead and a
+            // forced drop would terminate it mid-measurement. The server is
             // the one party that can see every client, and a live run holds a
             // lease connection for the whole life of its database (see
             // `BenchDb::_lease`), so any backend at all means "in use".
             if database_has_connections(admin, &row.datname).await {
                 continue;
             }
-            let _ = diesel::sql_query(format!(
-                "DROP DATABASE IF EXISTS {} WITH (FORCE)",
-                row.datname
-            ))
+            // `DROP DATABASE ... WITH (FORCE)` would be tidier but is
+            // PostgreSQL 13+, and the engine supports 12+ (see the README); on
+            // 12 it is a syntax error, and the error is ignored here, so bench
+            // databases would accumulate forever. Terminate-then-drop is
+            // version-neutral and equivalent in effect: we only reach this line
+            // for a database just observed to have zero connections, so the
+            // terminate is belt-and-braces against a backend arriving in the
+            // gap between that check and the drop.
+            let _ = diesel::sql_query(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE datname = $1 AND pid <> pg_backend_pid()",
+            )
+            .bind::<diesel::sql_types::Text, _>(&row.datname)
             .execute(admin)
             .await;
+            let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {}", row.datname))
+                .execute(admin)
+                .await;
         }
     }
 

@@ -51,7 +51,7 @@ use super::claim_bench_support::db::{self, BenchDb};
 use super::claim_bench_support::{
     BUDGET_ENV_VAR, BudgetVerdict, ClaimGate, HEADLINE_P50_BUDGET_MS, LatencyStats,
     MIN_MEANINGFUL_SAMPLES, SCENARIO_BUDGET_ENV_VAR, Scenario, budget_from_env, budget_verdict,
-    db_name_from_url, headline_scenario, measured_claims_for, scenario_time_budget,
+    db_name_from_url, headline_scenario, measured_claims_for, scenario_time_budget, with_db_name,
 };
 
 // The published budget lives in the shared harness as
@@ -689,13 +689,17 @@ async fn a_later_setup_reclaims_this_processes_finished_databases() {
 /// it cannot have one until it exists. Between `CREATE DATABASE` and the lease
 /// connection, a sweep running on another host sees a real database with zero
 /// connections and correctly concludes it is abandoned — no naming scheme fixes
-/// that. Setup therefore holds a cluster-wide advisory lock across the whole
-/// span, which is the same lock every sweep must take.
+/// that. Setup therefore holds an advisory lock across the whole span, which is
+/// the same lock every sweep must take.
 ///
 /// This proves the mechanism rather than trying to hit the window: hold the
 /// lock externally and assert setup blocks, then release it and assert setup
 /// completes. If the lock is ever dropped from the setup path, setup stops
 /// blocking and this fails.
+///
+/// The holder connects to `db::SWEEP_LOCK_DB`, not to the admin URL's own
+/// database, because advisory locks are database-scoped: taking it anywhere
+/// else would only conflict when the two happen to coincide.
 ///
 /// Existing-server mode only — the testcontainer path has no foreign clients.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -709,7 +713,8 @@ async fn setup_waits_for_a_peers_sweep_before_creating_its_database() {
         );
         return;
     };
-    let Ok(mut holder) = AsyncPgConnection::establish(&admin_url).await else {
+    let lock_url = with_db_name(&admin_url, db::SWEEP_LOCK_DB);
+    let Ok(mut holder) = AsyncPgConnection::establish(&lock_url).await else {
         eprintln!("SKIP setup_waits_for_a_peers_sweep_before_creating_its_database: no server");
         return;
     };
@@ -749,4 +754,129 @@ async fn setup_waits_for_a_peers_sweep_before_creating_its_database() {
         "setup failed after the lock was released: {:?}",
         finished.err().map(|e| e.0),
     );
+}
+
+/// The sweep lock is taken in a fixed database, not in whichever one the admin
+/// URL happens to name.
+///
+/// Postgres advisory locks are scoped to the session's database, not to the
+/// cluster: two sessions on different databases hold the same key at the same
+/// time without conflicting. If the lock rode the admin connection, two runs
+/// reaching the same server through different admin databases would not
+/// serialize at all — each would sweep while the other sat in its
+/// create-to-lease window, which is exactly the hole the lock exists to close.
+///
+/// Falsifiable independently of how this suite is configured: the holder sits
+/// in `SWEEP_LOCK_DB` while the lock is requested through an admin URL naming a
+/// *different* database. Locking the passed URL's own database — the bug —
+/// finds no conflict and returns immediately.
+///
+/// Existing-server mode only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_lock_is_taken_in_a_fixed_database_not_the_admin_url_s() {
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+
+    let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+        eprintln!(
+            "SKIP the_sweep_lock_is_taken_in_a_fixed_database_not_the_admin_url_s: \
+             existing-server mode only (HARVEST_TEST_DATABASE_URL unset)"
+        );
+        return;
+    };
+    let Ok(mut admin) = AsyncPgConnection::establish(&admin_url).await else {
+        eprintln!(
+            "SKIP the_sweep_lock_is_taken_in_a_fixed_database_not_the_admin_url_s: no server"
+        );
+        return;
+    };
+
+    // A scratch database standing in for an operator whose admin URL points
+    // somewhere other than `SWEEP_LOCK_DB`. Named outside the bench prefix so
+    // the sweep never touches it.
+    let scratch = format!("harvest_sweep_scope_probe_{}", std::process::id());
+    let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {scratch}"))
+        .execute(&mut admin)
+        .await;
+    if diesel::sql_query(format!("CREATE DATABASE {scratch}"))
+        .execute(&mut admin)
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "SKIP the_sweep_lock_is_taken_in_a_fixed_database_not_the_admin_url_s: \
+             cannot create a scratch database"
+        );
+        return;
+    }
+    // Nothing between the create above and the drop below may panic: `scratch`
+    // sits outside the swept `harvest_claim_bench_%` prefix precisely so a
+    // concurrent sweep cannot delete it mid-probe, which also means nothing
+    // would ever reclaim it. So the probe reports failures instead of
+    // `expect`ing them, and the assertions run after cleanup.
+    let outcome = probe_sweep_lock_scope(&with_db_name(&admin_url, &scratch), &admin_url).await;
+
+    let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {scratch}"))
+        .execute(&mut admin)
+        .await;
+
+    match outcome {
+        Ok(timed_out) => assert!(
+            timed_out,
+            "taking the sweep lock through an admin URL naming `{scratch}` did \
+             not block while a peer held it in `{}`: the lock is being taken in \
+             the admin URL's own database, so runs reaching one cluster through \
+             different admin databases never serialize",
+            db::SWEEP_LOCK_DB,
+        ),
+        Err(e) => panic!("sweep-lock scope probe could not run: {e}"),
+    }
+}
+
+/// Hold the sweep lock in [`db::SWEEP_LOCK_DB`] and report whether requesting
+/// it through `probe_admin_url` blocks.
+///
+/// Split out so the caller can drop its scratch database before asserting: a
+/// panic in here would strand that database on a shared server forever.
+/// Returns `Ok(true)` when the request blocked (the contract holds).
+async fn probe_sweep_lock_scope(probe_admin_url: &str, admin_url: &str) -> Result<bool, String> {
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+
+    // The peer, holding the lock where the harness agrees it lives.
+    let mut holder = AsyncPgConnection::establish(&with_db_name(admin_url, db::SWEEP_LOCK_DB))
+        .await
+        .map_err(|e| format!("connect {}: {e}", db::SWEEP_LOCK_DB))?;
+    diesel::sql_query("SELECT pg_advisory_lock($1)")
+        .bind::<diesel::sql_types::BigInt, _>(db::SWEEP_LOCK_KEY)
+        .execute(&mut holder)
+        .await
+        .map_err(|e| format!("take the sweep lock: {e}"))?;
+
+    let probe_url = probe_admin_url.to_string();
+    let mut taking = tokio::spawn(async move { db::take_sweep_lock(&probe_url).await });
+    // A timeout `Err` means still waiting on the lock, which is the pass. `Ok`
+    // means it returned early — keep that join result rather than polling the
+    // handle again below, which would panic and bury the real diagnosis.
+    let finished_early = tokio::time::timeout(std::time::Duration::from_millis(1_500), &mut taking)
+        .await
+        .ok();
+    let timed_out = finished_early.is_none();
+
+    // Release before returning either way, so a failure cannot strand the lock
+    // for the rest of the suite.
+    let unlocked = diesel::sql_query("SELECT pg_advisory_unlock($1)")
+        .bind::<diesel::sql_types::BigInt, _>(db::SWEEP_LOCK_KEY)
+        .execute(&mut holder)
+        .await;
+    let acquired = match finished_early {
+        Some(joined) => Some(joined),
+        None => tokio::time::timeout(std::time::Duration::from_secs(60), taking)
+            .await
+            .ok(),
+    };
+    if let Some(Ok(Ok(lock))) = acquired {
+        db::release_sweep_lock(lock).await;
+    }
+    drop(holder);
+    unlocked.map_err(|e| format!("release the sweep lock: {e}"))?;
+    Ok(timed_out)
 }
