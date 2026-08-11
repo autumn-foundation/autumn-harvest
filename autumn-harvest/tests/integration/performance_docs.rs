@@ -59,6 +59,17 @@ fn read_performance_doc() -> String {
     read_normalized(&performance_doc_path())
 }
 
+/// Collapse every run of whitespace to a single space.
+///
+/// Guards that require a *phrase* to be present must survive the Markdown being
+/// re-wrapped: a hard wrap inserted between two words of the phrase makes a
+/// plain `contains` miss, and the failure reads as "the correction is absent"
+/// when the correction is right there. Round 35 hit exactly that on its own
+/// fix, so the normalisation lives here rather than being a per-guard quirk.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Does `haystack` state `phrase` in its own voice, rather than quoting it?
 ///
 /// Several guards in this module ban a specific superseded phrasing. Every one
@@ -72,11 +83,13 @@ fn read_performance_doc() -> String {
 /// The signal is the character immediately preceding the phrase: a retraction
 /// reads `... does not support a "predicates are a rounding error" reading`,
 /// while an assertion runs straight on from prose. Straight and curly quotes
-/// both count, since Markdown prose mixes them.
+/// both count, since Markdown prose mixes them — as does a backtick, because a
+/// Markdown code span is quoting too: a guard that lists the words it bans has
+/// to write them down, and it writes them as `` `floor` ``.
 fn asserted_in_own_voice(haystack: &str, phrase: &str) -> bool {
     haystack.match_indices(phrase).any(|(idx, _)| {
         let before = haystack[..idx].chars().next_back();
-        !matches!(before, Some('"' | '\u{201c}' | '\u{2018}' | '\''))
+        !matches!(before, Some('"' | '\u{201c}' | '\u{2018}' | '\'' | '`'))
     })
 }
 
@@ -930,8 +943,11 @@ fn every_bench_database_await_is_bounded() {
 /// 20 000 rows but sorts only 10 000, while its would-be `double_backlog`
 /// comparand sorts 20 000. Comparing them charges the row for every predicate
 /// while crediting it with half the sort — the same confound round 24 retracted
-/// for `paused_rows`, in the same direction, and therefore a *floor* rather
-/// than a bound.
+/// for `paused_rows`. Round 35: not a *floor* either. A floor is a lower bound,
+/// and adding the sort saving back to derive one assumes the difference
+/// decomposes into predicate cost plus sort cost; the scenarios also filter to
+/// different post-filter populations and can reach different plans, so it does
+/// not. The comparison bounds nothing in either direction.
 ///
 /// This is a separate guard from
 /// [`the_paused_rows_delta_is_not_attributed_to_the_predicate`] because the two
@@ -954,19 +970,26 @@ fn the_all_gates_delta_is_not_published_as_a_predicate_bound() {
             "docs/performance.md states \"{banned}\", which treats the \
              `all_gates` delta as a bound on combined predicate cost. \
              `all_gates` sorts 10 000 rows where `double_backlog` sorts 20 000, \
-             so that comparison understates the cost by the sort saving and \
-             bounds nothing."
+             so that comparison charges the row for every predicate while \
+             crediting it with half the sort, and bounds nothing in either \
+             direction."
         );
     }
 
     // And the correction must be present, so the claim cannot simply be deleted
     // and leave the reader to draw the retracted conclusion from the table.
+    //
+    // Round 35: this used to require the phrase "floor, not a bound". That was
+    // itself the retracted claim — a floor *is* a lower bound — so the guard
+    // was mandating the error it existed to prevent. Requiring the *direction-
+    // free* conclusion instead is what [`the_all_gates_figure_is_not_published_
+    // as_a_directional_bound`] then enforces the other half of.
     assert!(
-        doc.contains("floor, not a bound"),
+        collapse_ws(&doc).contains("bounds nothing in either direction"),
         "docs/performance.md must say explicitly that the `all_gates` \
-         comparison yields a floor rather than a bound on combined predicate \
-         cost. Deleting the claim without stating the direction of the bias \
-         leaves the +28% in the table for a reader to misread the same way."
+         comparison bounds combined predicate cost in neither direction. \
+         Deleting the claim without the correction leaves the +28% in the \
+         table for a reader to misread the same way."
     );
 }
 
@@ -1131,12 +1154,94 @@ fn the_changelog_leading_entry_does_not_publish_the_retracted_bound() {
     }
 
     assert!(
-        leading.contains("floor, not a bound"),
+        collapse_ws(leading).contains("bounds nothing in either direction"),
         "the changelog fragment's leading entry must carry the narrowed \
-         conclusion, including the direction of the bias (\"floor, not a \
-         bound\"). Deleting the claim without it leaves +28% in the release \
+         conclusion. Deleting the claim without it leaves +28% in the release \
          note for a reader to draw the retracted conclusion from."
     );
+}
+
+/// `+28%` must not be published as a bound in *either* direction.
+///
+/// Round 28 retracted "the surviving bound on combined predicate cost" and
+/// round 29 replaced it with "a floor, not a bound" — but a floor **is** a
+/// lower bound, so that wording restated the retracted claim in the one
+/// direction it was still tempting to keep, and contradicted the "cannot bound
+/// in either direction" conclusion sitting a few lines below it.
+///
+/// The reasoning that produced it does not hold either: adding the unmeasured
+/// sort saving back to the difference assumes the difference decomposes into
+/// predicate cost plus sort cost. It does not — the two scenarios also filter
+/// to different post-filter populations and can reach different plans, so
+/// there is neither a measured term to add back nor an established direction
+/// for the bias.
+///
+/// Scoped to a window around each `28%` rather than to the whole file, because
+/// the enqueue-throughput column *is* a genuine floor (it divides every row,
+/// warmup included, by the whole wall clock — an arithmetic property of one
+/// measurement, not a cross-scenario comparison) and must stay sayable.
+#[test]
+fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
+    // Every phrasing that asserts a *direction* for the bias. "at least" and
+    // "no lower than" are included because they are how the same claim reads
+    // once the word "floor" is gone.
+    /// How much text either side of a `28%` counts as "about that figure".
+    /// Wide enough to cover the sentence it sits in and its neighbour, narrow
+    /// enough that the enqueue-throughput floor — a different claim, hundreds
+    /// of lines away — stays sayable.
+    const WINDOW: usize = 400;
+
+    const DIRECTIONAL: [&str; 6] = [
+        "floor",
+        "understate",
+        "at least",
+        "lower bound",
+        "no lower than",
+        "conservative",
+    ];
+
+    for (label, path) in [
+        ("docs/performance.md", performance_doc_path()),
+        ("the changelog fragment", changelog_fragment_path()),
+    ] {
+        // A character window, not a line window: `docs/performance.md` is hard
+        // wrapped at ~78 columns while the changelog fragment's released entry
+        // is a single 40 000-character line, so any line-based span is either
+        // too small for one document or the whole of the other.
+        let text = collapse_ws(&read_normalized(&path));
+        for (idx, _) in text.match_indices("28%") {
+            let lo = idx.saturating_sub(WINDOW);
+            let hi = (idx + WINDOW).min(text.len());
+            // Never split a UTF-8 character: the prose uses em dashes.
+            let lo = (lo..=idx)
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(idx);
+            let hi = (idx..=hi)
+                .rev()
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(idx);
+            let window = &text[lo..hi];
+            for banned in DIRECTIONAL {
+                // Quoted occurrences are exempt, by the same rule the rest of
+                // this module uses: a retraction has to reproduce the claim it
+                // retracts in order to name it, and the diary below records
+                // exactly that. See [`asserted_in_own_voice`].
+                assert!(
+                    !asserted_in_own_voice(window, banned),
+                    "{label} describes the `all_gates` +28% comparison as \
+                     \"{banned}\", which asserts a direction for the bias. That \
+                     is the retracted claim in softer words: a floor is a lower \
+                     bound. The comparison charges `all_gates` for every \
+                     predicate while crediting it with half the sort, and the \
+                     saving cannot be added back — the scenarios differ in \
+                     post-filter population and can differ in plan, so the \
+                     difference does not decompose into predicate cost plus \
+                     sort cost. Say it bounds nothing in either direction.\n\
+                     window: {window}",
+                );
+            }
+        }
+    }
 }
 
 /// Every per-gate figure the changelog's *leading* entry quotes must be the one

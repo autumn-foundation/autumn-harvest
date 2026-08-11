@@ -328,9 +328,13 @@ these two scenarios, and it is not settled by the `all_gates` row either — tha
 row carries the same confound, in the same direction. `all_gates` also seeds
 PAUSED ballast, so it too sorts 10 000 rows where `double_backlog` sorts 20 000;
 comparing the two charges the predicates while *crediting* them with a sort half
-the size. The +28% that comparison yields is therefore a floor, not a bound: the
-population-matched cost is higher by whatever the 10 000-row sort saving is
-worth, and nothing here measures that.
+the size. The +28% that comparison yields therefore bounds nothing in either
+direction. Deriving a direction for it would mean adding the unmeasured
+10 000-row sort saving back to the difference, which assumes the difference
+decomposes into predicate cost plus sort cost. It does not: the two scenarios
+also filter to different post-filter populations and can reach different plans,
+so there is neither a measured term to add back nor an established direction for
+the bias.
 
 What *is* population-matched is the top of the table. `rate_limited`,
 `circuit_breaker_set`, `build_policy` and `concurrency_key` all seed exactly the
@@ -382,9 +386,9 @@ What each row exercises, and what it means:
   depth-controlled reading sound: `all_gates` seeds the same PAUSED ballast
   `paused_rows` does, so it *scans* 20 000 rows like `double_backlog` but
   *sorts* only 10 000. Comparing the two (which yields +28%) charges this row
-  for every predicate while crediting it with half the sort, so that figure
-  understates the combined cost by an unmeasured amount and is not quoted as a
-  bound. See [what that control does not
+  for every predicate while crediting it with half the sort, so that figure is
+  not interpretable as a bound in either direction and is not quoted as one.
+  See [what that control does not
   establish](#what-that-control-does-not-establish).
 
 ## The plan
