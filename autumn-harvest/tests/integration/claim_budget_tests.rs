@@ -1238,3 +1238,86 @@ async fn probe_sweep_lock_scope(probe_admin_url: &str, admin_url: &str) -> Resul
     unlocked.map_err(|e| format!("release the sweep lock: {e}"))?;
     Ok(timed_out)
 }
+
+/// A `dbname` query parameter must not outrank the path `with_db_name` sets.
+///
+/// `tokio-postgres` applies the path first and the query second, assigning the
+/// same `Config::dbname`, so an admin URL carrying `?dbname=...` silently wins.
+/// Every connection this harness derives — the sweep lock, the lease, the
+/// migration connection — is built by `with_db_name`, and the benchmark issues
+/// `TRUNCATE` through them. The consequence of getting this wrong is that a
+/// benchmark run migrates and truncates the operator's *admin* database.
+///
+/// Asserting `current_database()` is the point: this is the one claim that
+/// cannot be established by reading the URL, because the whole bug is that the
+/// URL reads correctly while the connection goes somewhere else.
+#[tokio::test]
+async fn a_dbname_query_parameter_cannot_redirect_the_connection() {
+    use diesel::QueryableByName;
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+
+    #[derive(QueryableByName)]
+    struct DbRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        current_database: String,
+    }
+
+    let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+        eprintln!(
+            "SKIP a_dbname_query_parameter_cannot_redirect_the_connection: \
+             existing-server mode only (HARVEST_TEST_DATABASE_URL unset)"
+        );
+        return;
+    };
+    let Ok(mut admin) = AsyncPgConnection::establish(&admin_url).await else {
+        eprintln!(
+            "SKIP a_dbname_query_parameter_cannot_redirect_the_connection: admin connect failed"
+        );
+        return;
+    };
+
+    // The decoy the contaminated URL points at. Run-unique for the same reason
+    // every other probe here is: a shared admin server may be hosting a
+    // concurrent run with our pid.
+    let decoy = format!(
+        "harvest_dbname_probe_{}_{}",
+        std::process::id(),
+        db::run_token(),
+    );
+    diesel::sql_query(format!("CREATE DATABASE {decoy}"))
+        .execute(&mut admin)
+        .await
+        .expect("create the decoy database");
+
+    // An operator's admin URL that selects its database by query parameter —
+    // valid libpq, and the shape that triggers the bug.
+    let normalized = with_db_name(&admin_url, "postgres");
+    let joiner = if normalized.contains('?') { '&' } else { '?' };
+    let contaminated = format!("{normalized}{joiner}dbname={decoy}");
+
+    // Exactly what the harness does to reach the sweep-lock database.
+    let rewritten = with_db_name(&contaminated, "postgres");
+
+    let landed = async {
+        let mut conn = AsyncPgConnection::establish(&rewritten).await.ok()?;
+        diesel::sql_query("SELECT current_database() AS current_database")
+            .get_result::<DbRow>(&mut conn)
+            .await
+            .ok()
+            .map(|r| r.current_database)
+    }
+    .await;
+
+    // Clean up before asserting, so a failure does not also leak a database.
+    let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {decoy} WITH (FORCE)"))
+        .execute(&mut admin)
+        .await;
+
+    let landed = landed.expect("the rewritten URL must be connectable");
+    assert_eq!(
+        landed, "postgres",
+        "a dbname query parameter redirected the connection to {landed}: \
+         the harness would migrate and TRUNCATE there, not in the database \
+         the rewritten URL names",
+    );
+}

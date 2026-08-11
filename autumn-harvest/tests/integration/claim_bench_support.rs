@@ -533,24 +533,92 @@ const PRINTABLE_CONN_PARAMS: &[&str] = &[
     "target_session_attrs",
 ];
 
+/// The key of a `key=value` token, or the whole token when it has no `=`.
+fn token_key(token: &str) -> &str {
+    token.split_once('=').map_or(token, |(k, _)| k).trim()
+}
+
+/// Split a libpq keyword/value connection string into whole `key=value` tokens.
+///
+/// Splitting on whitespace is wrong, and wrong in the direction that leaks: a
+/// value may be single-quoted and may carry backslash escapes, so
+/// `password='hunter two'` is **one** token. Cutting it at the space yields
+/// `password='hunter` (redacted) and `two'` (no `=`, so passed through as if it
+/// were a separate parameter) — printing half the password.
+///
+/// Escapes are consumed as a unit, so `\'` does not close the quote. Iterating
+/// `char_indices` keeps every slice on a UTF-8 boundary without needing an
+/// argument about where multi-byte characters can land.
+fn keyword_value_tokens(s: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut quoted = false;
+    let mut escape = false;
+
+    for (i, ch) in s.char_indices() {
+        if escape {
+            // Consume the escaped character whatever it is, so `\'` cannot
+            // close the quote and `\ ` cannot end the token.
+            escape = false;
+            continue;
+        }
+        if ch.is_whitespace() && !quoted {
+            if let Some(st) = start.take() {
+                tokens.push(&s[st..i]);
+            }
+            continue;
+        }
+        if start.is_none() {
+            start = Some(i);
+        }
+        match ch {
+            '\\' => escape = true,
+            '\'' => quoted = !quoted,
+            _ => {}
+        }
+    }
+    // An unterminated quote runs to the end of the string, which is what libpq
+    // would reject — but redacting it as one token is the safe reading.
+    if let Some(st) = start {
+        tokens.push(&s[st..]);
+    }
+    tokens
+}
+
 /// Hide the value of every `key=value` pair outside [`PRINTABLE_CONN_PARAMS`].
 ///
 /// Keys stay visible: knowing *which* options were set is diagnostic, and a key
-/// is not a secret. `sep` is `&` for a URL query and a space for the libpq
-/// keyword/value form.
-fn redact_param_values(params: &str, sep: char) -> String {
-    params
-        .split(sep)
-        .map(|pair| match pair.split_once('=') {
-            Some((key, _))
-                if !PRINTABLE_CONN_PARAMS.contains(&key.trim().to_ascii_lowercase().as_str()) =>
-            {
-                format!("{key}=***")
-            }
-            _ => pair.to_string(),
-        })
+/// is not a secret. A token with no `=` at all is passed through — it carries no
+/// value, and under a *correct* tokenizer it cannot be the tail of one.
+fn redact_query_values(query: &str) -> String {
+    query
+        .split('&')
+        .map(redact_one_token)
         .collect::<Vec<_>>()
-        .join(&sep.to_string())
+        .join("&")
+}
+
+/// The keyword/value counterpart of [`redact_query_values`].
+///
+/// Rejoins on a single space, so runs of whitespace between parameters are
+/// collapsed. That is a cosmetic change to a log line, not a semantic one.
+fn redact_keyword_values(params: &str) -> String {
+    keyword_value_tokens(params)
+        .into_iter()
+        .map(redact_one_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_one_token(token: &str) -> String {
+    match token.split_once('=') {
+        Some((key, _))
+            if !PRINTABLE_CONN_PARAMS.contains(&key.trim().to_ascii_lowercase().as_str()) =>
+        {
+            format!("{key}=***")
+        }
+        _ => token.to_string(),
+    }
 }
 
 /// Strip credentials from a connection string so it is safe to print.
@@ -587,7 +655,7 @@ fn redact_param_values(params: &str, sep: char) -> String {
 pub fn redact_url(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         // No scheme: the libpq keyword/value form, space-separated.
-        return redact_param_values(url, ' ');
+        return redact_keyword_values(url);
     };
     let (prefix, rest) = url.split_at(scheme_end + 3);
     // Userinfo, if present, runs to the last '@' before the authority ends.
@@ -601,7 +669,7 @@ pub fn redact_url(url: &str) -> String {
             let (query, fragment) = after
                 .split_once('#')
                 .map_or((after, None), |(q, f)| (q, Some(f)));
-            let mut out = format!("{path}?{}", redact_param_values(query, '&'));
+            let mut out = format!("{path}?{}", redact_query_values(query));
             if let Some(f) = fragment {
                 out.push('#');
                 out.push_str(f);
@@ -628,14 +696,66 @@ pub fn redact_url(url: &str) -> String {
 ///
 /// Userinfo may not contain an unencoded `/`, `?` or `#` in a valid URI, so
 /// locating the authority by the first such character is sound.
+///
+/// # Why the query cannot simply be carried over
+///
+/// `dbname` is a legal *query* parameter as well as the path, and
+/// `tokio-postgres` applies it second: `UrlParser::parse` calls `parse_path`
+/// and then `parse_params`, both assigning the same `Config::dbname`. Carrying
+/// `?dbname=admin` past a path rewrite therefore leaves the connection pointing
+/// at the original admin database while the URL *reads* as though it targets
+/// the new one — and this harness runs migrations and `TRUNCATE` through
+/// exactly these rewritten strings. Any `dbname` parameter is dropped, so the
+/// path is the single selector.
+///
+/// The libpq keyword/value form has no path at all, so there the database is
+/// selected by replacing `dbname` rather than by appending a path component.
 #[must_use]
 pub fn with_db_name(url: &str, db: &str) -> String {
-    let (prefix, rest) = url.find("://").map_or(("", url), |i| url.split_at(i + 3));
+    // Keyword/value form (`host=h dbname=admin`): no `://`, no path.
+    if !url.contains("://") {
+        let mut kept: Vec<&str> = keyword_value_tokens(url)
+            .into_iter()
+            .filter(|t| !token_key(t).eq_ignore_ascii_case("dbname"))
+            .collect();
+        let replacement = format!("dbname={db}");
+        kept.push(&replacement);
+        return kept.join(" ");
+    }
+
+    let (prefix, rest) = url.split_at(url.find("://").map_or(0, |i| i + 3));
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(authority_end);
-    // Whatever follows the path — query and/or fragment — is carried over.
     let suffix_start = tail.find(['?', '#']).unwrap_or(tail.len());
-    format!("{prefix}{authority}/{db}{}", &tail[suffix_start..])
+    let suffix = &tail[suffix_start..];
+
+    // Separate query from fragment so `dbname` can be dropped from the query
+    // without disturbing a fragment that follows it.
+    let (query, fragment) = suffix.strip_prefix('?').map_or_else(
+        || (None, suffix.strip_prefix('#')),
+        |after| {
+            after
+                .split_once('#')
+                .map_or((Some(after), None), |(q, f)| (Some(q), Some(f)))
+        },
+    );
+
+    let kept: Vec<&str> = query
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .filter(|pair| !pair.is_empty() && !token_key(pair).eq_ignore_ascii_case("dbname"))
+        .collect();
+
+    let mut out = format!("{prefix}{authority}/{db}");
+    if !kept.is_empty() {
+        out.push('?');
+        out.push_str(&kept.join("&"));
+    }
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
 }
 
 /// Read the database name back out of a connection URL.
@@ -1104,6 +1224,47 @@ mod pure_tests {
         );
     }
 
+    /// libpq lets a keyword value be quoted, so it may contain spaces.
+    ///
+    /// Splitting the form on whitespace therefore cuts `password='hunter two'`
+    /// in half: the first token redacts, and the second has no `=` in it, so it
+    /// is passed through as though it were a separator and the tail of the
+    /// password is printed. Round 13 advertised support for this form without
+    /// implementing its value grammar, which is the narrow gap this pins.
+    #[test]
+    fn redact_url_removes_a_quoted_keyword_password_containing_spaces() {
+        let redacted = redact_url("host=db.internal password='hunter two' sslmode=require");
+        assert!(
+            !redacted.contains("hunter"),
+            "password survived: {redacted}"
+        );
+        assert!(
+            !redacted.contains("two"),
+            "password tail survived: {redacted}"
+        );
+        // Still diagnostic on both sides of the quoted value, which is the
+        // whole reason for parsing rather than dropping the form wholesale.
+        assert!(
+            redacted.contains("host=db.internal") && redacted.contains("sslmode=require"),
+            "endpoint lost: {redacted}"
+        );
+    }
+
+    /// A backslash-escaped quote keeps the value open past the next `'`.
+    #[test]
+    fn redact_url_removes_a_keyword_password_containing_an_escaped_quote() {
+        let redacted = redact_url(r"host=h password='hun\'ter two' sslmode=require");
+        assert!(!redacted.contains("hun"), "password survived: {redacted}");
+        assert!(
+            !redacted.contains("two"),
+            "password tail survived: {redacted}"
+        );
+        assert!(
+            redacted.contains("sslmode=require"),
+            "endpoint lost: {redacted}"
+        );
+    }
+
     /// The keyword/value form carries the same secret and has no `://` at all.
     ///
     /// `Config::from_str` falls through to it when the URL parser declines, so
@@ -1380,6 +1541,53 @@ mod pure_tests {
                 "bench_1",
             ),
             "postgres://h:5432/bench_1?sslrootcert=/etc/ssl/root.crt",
+        );
+    }
+
+    /// A `dbname` query parameter silently outranks the path we just rewrote.
+    ///
+    /// `tokio-postgres`'s `UrlParser::parse` runs `parse_path` (`config.rs:997`)
+    /// and *then* `parse_params` (`:998`), and both assign the same
+    /// `Config::dbname` field — so the query wins. Carrying the query over
+    /// verbatim, which round 3 introduced to keep `sslmode` alive, therefore
+    /// pointed the sweep lock, the lease and the migration connection back at
+    /// the operator's admin database. The harness runs `TRUNCATE` there.
+    #[test]
+    fn with_db_name_removes_an_overriding_dbname_query_parameter() {
+        assert_eq!(
+            with_db_name("postgres://h:5432/admin?dbname=admin&sslmode=require", "b"),
+            "postgres://h:5432/b?sslmode=require",
+        );
+        // Case-insensitive, and the sole-parameter case must not leave a `?`.
+        assert_eq!(
+            with_db_name("postgres://h:5432/admin?DBName=admin", "b"),
+            "postgres://h:5432/b",
+        );
+        // A fragment is still carried, and `dbname` is dropped from before it.
+        assert_eq!(
+            with_db_name("postgres://h/admin?dbname=admin#frag", "b"),
+            "postgres://h/b#frag",
+        );
+    }
+
+    /// The keyword/value form selects the database by keyword, not by path.
+    ///
+    /// Appending `/{db}` to `host=h dbname=admin` would produce a connection
+    /// string whose database is literally `admin/bench_1` — so the rewrite has
+    /// to replace the keyword instead.
+    #[test]
+    fn with_db_name_replaces_dbname_in_the_keyword_value_form() {
+        assert_eq!(
+            with_db_name("host=h port=5432 dbname=admin", "b"),
+            "host=h port=5432 dbname=b",
+        );
+        // Absent entirely: append it rather than leaving the target implicit
+        // (libpq would otherwise default the database to the username).
+        assert_eq!(with_db_name("host=h", "b"), "host=h dbname=b");
+        // A quoted value elsewhere must survive the round trip intact.
+        assert_eq!(
+            with_db_name("host=h password='hunter two' dbname=admin", "b"),
+            "host=h password='hunter two' dbname=b",
         );
     }
 
