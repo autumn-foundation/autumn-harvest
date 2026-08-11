@@ -297,6 +297,15 @@ impl EventSource for KafkaSource {
         Ok(())
     }
 
+    fn abandon_redelivers(&self) -> bool {
+        // Not committing is the whole mechanism, so `abandon` above is a no-op
+        // and `recv()` has already advanced the local position past the
+        // message: nothing hands it back while this consumer lives. The
+        // runtime must treat a retry here as a wedge and rebuild the consumer
+        // (`recover`), which re-reads from the last commit.
+        false
+    }
+
     /// Rebuild the consumer so the blocked offset is re-read.
     ///
     /// This is the retry a stalled prefix calls for. `recv()` has already

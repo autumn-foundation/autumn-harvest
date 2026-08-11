@@ -271,7 +271,7 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_UPDATE_DURATION`   | `harvest.update.duration`     | Histogram    | `workflow` (= `METRIC_LABEL_WORKFLOW`), `name` (update name, bounded — `__unregistered__` for an unresolved name), `queue`, `outcome` (`completed`/`failed`, bounded — rejected excluded) | `execution.id`, `update_id` |
 | `METRIC_CONNECTOR_RECEIVED` | `harvest.connector.received` | Counter      | `source` (= `METRIC_LABEL_SOURCE`, the binding's registered `source_name` — a closed set fixed at build time) | `execution.id`, message key, partition, offset, `MessageId` |
 | `METRIC_CONNECTOR_DISPATCHED` | `harvest.connector.dispatched` | Counter   | `source`, `outcome` (5 values: dispatched/idempotent_replay/deferred/dead_lettered/retried — one sample per received message, so the series sums to `harvest.connector.received`) | `execution.id`, message key, partition, offset |
-| `METRIC_CONNECTOR_POISONED` | `harvest.connector.poisoned` | Counter      | `source`, `reason` (3 values: deserialize_failed/mapping_rejected/permanent_failure) | `execution.id`, message key, partition, offset |
+| `METRIC_CONNECTOR_POISONED` | `harvest.connector.poisoned` | Counter      | `source`, `reason` (3 values: malformed/mapping_rejected/target_rejected) | `execution.id`, message key, partition, offset |
 | `METRIC_CONNECTOR_LAG`     | `harvest.connector.lag`       | Gauge        | `source` — only emitted for sources whose broker client exposes lag (Kafka, SQS); others never emit | `execution.id`, partition |
 
 **Broker-connector labels (issue #944).** A broker message's own coordinates —

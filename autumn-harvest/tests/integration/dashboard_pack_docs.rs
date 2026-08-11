@@ -17,6 +17,7 @@
 //! - template variables are only applied to series that carry the label;
 //! - every alert-pack rule maps to a panel and a resolvable runbook anchor.
 
+use autumn_harvest::telemetry::PoisonReason;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -929,6 +930,59 @@ fn dashboard_readme_documents_prerequisites() {
             readme.contains(required),
             "docs/dashboards/README.md must document {required}"
         );
+    }
+}
+
+#[test]
+fn documented_poison_reasons_match_the_emitted_labels() {
+    // An operator builds an alert or a query by copying a `reason` value out
+    // of these tables. A documented value the code never emits selects no
+    // series at all, which reads as "this never happens" rather than "you
+    // typed the wrong label" — so the docs must enumerate exactly what
+    // `PoisonReason::as_str()` produces, no more and no less.
+    //
+    // The enum is the source of truth: a new variant appears here
+    // automatically and fails until every doc surface names it.
+    let emitted: Vec<&str> = [
+        PoisonReason::Malformed,
+        PoisonReason::MappingRejected,
+        PoisonReason::TargetRejected,
+    ]
+    .iter()
+    .map(|r| r.as_str())
+    .collect();
+
+    // Values that were documented once and are not emitted by anything.
+    // Listing them explicitly keeps the guard falsifiable: without this the
+    // test would pass on a doc that names every real value *and* a stale one.
+    let stale = ["deserialize_failed", "permanent_failure"];
+
+    for path in ["docs/telemetry.md", "docs/adr/0001-otel-trace-contract.md"] {
+        let doc = read_doc(path);
+        let poison_lines: Vec<&str> = doc
+            .lines()
+            .filter(|line| line.contains("harvest.connector.poisoned"))
+            .collect();
+        assert!(
+            !poison_lines.is_empty(),
+            "{path} must document harvest.connector.poisoned"
+        );
+        let block = poison_lines.join("\n");
+
+        for reason in &emitted {
+            assert!(
+                block.contains(reason),
+                "{path} must document the emitted poison reason `{reason}`; \
+                 documented rows were:\n{block}"
+            );
+        }
+        for bogus in stale {
+            assert!(
+                !block.contains(bogus),
+                "{path} documents `{bogus}`, which PoisonReason::as_str() \
+                 never emits — that selector matches no series"
+            );
+        }
     }
 }
 

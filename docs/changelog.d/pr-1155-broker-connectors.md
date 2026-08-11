@@ -336,6 +336,51 @@ coordinates, so a run traces back to the exact message.
   `effective_max_batch`, mutation-verified: reverting it to the identity makes
   both new tests report `received: 0`.
 
+- **A backward reposition before the first commit skipped every offset in
+  between.** `OffsetTracker::observe`'s reset guard was anchored on the
+  committed mark, so it was disabled precisely while `committed` was `None` —
+  which is the *normal* state of a partition whose head never settles, since
+  the prefix cannot advance. Stale `floor`/`ceiling` therefore survived a
+  reposition, and `ceiling` is what licenses stepping over an undelivered
+  offset as a "broker hole". With offset 10 held in flight and 11 completed, a
+  rebalance delivering offset 5 alone would commit through **9** — offsets
+  6..=9 were never delivered in that generation and are still to come, so
+  committing past them loses them outright. Anchored on `committed.or(floor)`
+  instead. Mutation-verified: reverting the anchor makes the new test report
+  `Some(9)` where `Some(5)` is required — the loss, exactly.
+
+- **The stall detector could not see a retry at the tail of a quiet
+  partition.** `stalled()` fired only once `threshold`-many *later* offsets
+  had settled behind the blocked head, so the one case with nothing behind it
+  — a transient failure on the last message of an idle partition — was never
+  detected, and on Kafka that message is simply dropped (`abandon` is a no-op
+  and the read position has already advanced past it). The volume bound was
+  always the wrong primary signal; it is now a *backstop* for a head blocked
+  without going through the retry path, and the primary signal is the retried
+  head itself, recorded on the tracker (`OffsetTracker::retried`) and reported
+  immediately.
+
+  Gated on a new `EventSource::abandon_redelivers()` (default `true`, Kafka
+  overrides to `false`) rather than on "any retry": SQS's visibility timeout
+  genuinely does hand the message back, so firing there would recycle the
+  consumer on every transient blip. The capability is explicit because it
+  cannot be inferred — both brokers carry partition/offset coordinates, and
+  the difference is only in whether `abandon` means anything. `Some(0)` now
+  disables **only** the backlog heuristic; the retried head is a correctness
+  signal, not a tunable. Mutation-verified in both directions: neutering the
+  retried signal makes the tail case report `None` where a stall is required,
+  and ignoring the capability makes eight redelivering-source tests fail.
+
+- **Two of the three documented poison `reason` labels matched no series.**
+  `docs/telemetry.md` and ADR-0001 advertised `deserialize_failed` /
+  `permanent_failure`, but `PoisonReason::as_str()` emits `malformed` /
+  `target_rejected`. An operator copying a selector out of those tables would
+  build an alert that silently never fires — which reads as "this never
+  happens" rather than "you typed the wrong label". Corrected, and pinned by a
+  new anti-drift test that enumerates the enum and asserts every emitted value
+  appears on each doc surface *and* that neither stale value does, so a future
+  variant fails the build until it is documented.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

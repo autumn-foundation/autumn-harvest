@@ -247,9 +247,19 @@ is recreated and re-reads from the last commit. The stall is silent, because
 the connector otherwise looks healthy: messages keep flowing, they all dispatch,
 only the commit stops moving.
 
-The connector detects this **and fixes it in process**. When a partition holds
-more than `ConnectorRuntimeConfig::stall_threshold` completed offsets behind an
-unsettled head, the pass fails with a distinct `ConnectorError::Stalled`
+The connector detects this **and fixes it in process**, on either of two
+signals:
+
+- **A retried head**, reported immediately. When the runtime retries a message
+  on a source that declares `abandon_redelivers() == false` (Kafka), that
+  offset is a wedge *by construction* — nothing will hand it back — so there is
+  nothing to wait for. This is the only signal that catches a retry at the tail
+  of a **quiet** partition, where no later message ever settles behind it.
+- **A backlog** of at least `ConnectorRuntimeConfig::stall_threshold` completed
+  offsets behind an unsettled head, as a backstop for a head blocked without
+  going through the retry path (a dispatch task lost to a panic).
+
+Either way the pass fails with a distinct `ConnectorError::Stalled`
 carrying the partition, depth and bound. `run` treats that as its own case
 rather than a transient error — re-polling a wedged consumer accomplishes
 nothing — and instead calls `EventSource::recover()`, which rebuilds the
@@ -259,8 +269,9 @@ partition's tracker state, without which the redelivered offsets would arrive
 below the stale in-memory mark and the prefix would stay blocked. Poison
 strikes are deliberately *not* cleared, so a repeatedly-rejected message still
 reaches its threshold and dead-letters rather than restarting its count on
-every recovery. The check runs before each receive, so a wedged binding also
-stops pulling batches it would only drop.
+every recovery. The check runs both before each receive — so a wedged binding
+stops pulling batches it would only drop — and again after settling the batch,
+so a stall that forms *during* a pass is acted on in that same pass.
 
 `recover()` defaults to "I cannot rebuild myself" (`Ok(false)`) — correct for
 SQS, whose visibility timeout already redelivers an abandoned message, so its
@@ -275,7 +286,9 @@ binding's `max_in_flight` (×4, floored at 32) because that is what bounds
 *healthy* out-of-order settlement: only `max_in_flight` messages are ever
 outstanding, so a held depth well past it means the head is not settling at all
 rather than settling late. Set it explicitly to tune it, or to `Some(0)` to opt
-out entirely.
+out of the backlog heuristic. `Some(0)` does **not** disable the retried-head
+signal: that one is a correctness guarantee, not a tunable, and suppressing it
+on a positional broker would silently drop every retried message.
 
 ## Idempotency
 

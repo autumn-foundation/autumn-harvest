@@ -169,6 +169,29 @@ pub trait EventSource: Send + Sync {
         Ok(false)
     }
 
+    /// Whether [`Self::abandon`] actually causes the message to come back.
+    ///
+    /// True for any broker with per-message acknowledgement and its own
+    /// redelivery clock — SQS, whose visibility timeout lapses and hands the
+    /// message back with no further action from us.
+    ///
+    /// **False for a positional broker.** On Kafka `abandon` is a no-op by
+    /// construction (not committing *is* the mechanism), and the consumer's
+    /// local read position has already advanced past the message, so nothing
+    /// hands it back within the session: the message is not retried, it is
+    /// dropped, and its offset blocks the partition's commit prefix forever.
+    /// The runtime treats a retry on such a source as an immediate wedge and
+    /// rebuilds the consumer (see [`Self::recover`]), which re-reads from the
+    /// last commit and is what actually performs the retry.
+    ///
+    /// The default is `true` — the conservative choice, because it only ever
+    /// declines to rebuild. An adapter that returns `true` when it should not
+    /// silently loses retried messages, so a positional adapter must override
+    /// this.
+    fn abandon_redelivers(&self) -> bool {
+        true
+    }
+
     /// Whether this broker has a dead-letter destination of its own that
     /// [`Self::abandon`] actually feeds.
     ///

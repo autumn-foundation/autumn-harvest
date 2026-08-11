@@ -29,17 +29,33 @@ pub struct MockSource {
     stream: String,
     state: Arc<Mutex<MockState>>,
     lag: Arc<Mutex<Option<i64>>>,
+    abandon_redelivers: bool,
 }
 
 impl MockSource {
     /// A source for `stream` with no messages queued.
+    ///
+    /// Models a broker that **does** redeliver an abandoned message (SQS's
+    /// visibility timeout), matching the default in
+    /// [`EventSource::abandon_redelivers`]. Use
+    /// [`Self::without_redelivery`] for positional semantics.
     #[must_use]
     pub fn new(stream: impl Into<String>) -> Self {
         Self {
             stream: stream.into(),
             state: Arc::new(Mutex::new(MockState::default())),
             lag: Arc::new(Mutex::new(None)),
+            abandon_redelivers: true,
         }
+    }
+
+    /// Model a positional broker whose `abandon` cannot force a redelivery
+    /// (Kafka), so a retried offset wedges its partition until the consumer is
+    /// rebuilt.
+    #[must_use]
+    pub const fn without_redelivery(mut self) -> Self {
+        self.abandon_redelivers = false;
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MockState> {
@@ -149,6 +165,10 @@ impl MockSource {
 impl EventSource for MockSource {
     fn stream(&self) -> &str {
         &self.stream
+    }
+
+    fn abandon_redelivers(&self) -> bool {
+        self.abandon_redelivers
     }
 
     async fn receive(

@@ -286,6 +286,11 @@ struct PartitionOffsets {
     inflight: std::collections::BTreeSet<i64>,
     /// Offsets completed out of order, awaiting a contiguous prefix.
     completed: std::collections::BTreeSet<i64>,
+    /// Offsets abandoned for retry and not since settled. On a positional
+    /// broker these never come back on their own, so each one is a permanently
+    /// blocked prefix — the stall signal, independent of how much settles
+    /// behind it.
+    retried: std::collections::BTreeSet<i64>,
     /// Highest offset known contiguous-complete, if any.
     committed: Option<i64>,
     /// Lowest offset this tracker has ever seen for the partition, which
@@ -319,14 +324,29 @@ impl OffsetTracker {
     /// silently skip everything between. A redelivery of an offset that is
     /// still in flight (or completed and held) is *not* a reposition, so it
     /// leaves the live prefix alone.
+    ///
+    /// The generation is anchored on the committed mark when there is one, and
+    /// otherwise on `floor` — the lowest offset this generation has seen. A
+    /// prefix whose head never settles never commits, so `committed` stays
+    /// `None` indefinitely while `floor`/`ceiling` accumulate; anchoring only
+    /// on `committed` would leave that stale `ceiling` in place across a
+    /// reposition, and `ceiling` is precisely what licenses stepping over an
+    /// undelivered offset as a broker hole. The mark would then leap over
+    /// offsets that were never delivered in this generation and are still to
+    /// come — committing past messages that were never dispatched.
     pub fn observe(&mut self, partition: i32, offset: i64) {
         let entry = self.partitions.entry(partition).or_default();
-        if entry.committed.is_some_and(|c| offset <= c)
+        if entry
+            .committed
+            .or(entry.floor)
+            .is_some_and(|mark| offset <= mark)
             && !entry.inflight.contains(&offset)
             && !entry.completed.contains(&offset)
         {
             *entry = PartitionOffsets::default();
         }
+        // The broker handed it back, so it is no longer a wedge.
+        entry.retried.remove(&offset);
         entry.floor = Some(entry.floor.map_or(offset, |f| f.min(offset)));
         entry.ceiling = Some(entry.ceiling.map_or(offset, |c| c.max(offset)));
         // Below the mark it is already settled; re-adding would re-block a
@@ -346,6 +366,8 @@ impl OffsetTracker {
         entry.floor = Some(entry.floor.map_or(offset, |f| f.min(offset)));
         entry.ceiling = Some(entry.ceiling.map_or(offset, |c| c.max(offset)));
         entry.inflight.remove(&offset);
+        // It settled after all, so it is no longer a blocked head.
+        entry.retried.remove(&offset);
 
         // A redelivery at or below the high-water mark is ALREADY durably
         // settled — a rebalance or an un-acked crash replays it. Report the
@@ -396,7 +418,31 @@ impl OffsetTracker {
         self.partitions.get(&partition).and_then(|p| p.committed)
     }
 
-    /// Drop all state for `partition` (a rebalance revoked it).
+    /// Note that `offset` on `partition` was abandoned for retry.
+    ///
+    /// On a positional broker this is a **permanent** block by construction:
+    /// `abandon` cannot force a redelivery (not committing is the whole
+    /// mechanism) and the consumer's local position has already advanced past
+    /// the offset, so nothing hands it back until the consumer is rebuilt.
+    /// Recording it makes the stall visible immediately rather than only once
+    /// enough later offsets happen to settle behind it — which never happens
+    /// at the tail of a quiet partition.
+    ///
+    /// Only called for coordinates that carry a partition and offset, and only
+    /// when the source reports
+    /// [`abandon_redelivers() == false`][super::source::EventSource::abandon_redelivers]
+    /// — a broker that genuinely hands the message back (SQS's visibility
+    /// timeout) is not wedged by a retry and must not trigger a rebuild.
+    pub fn retried(&mut self, partition: i32, offset: i64) {
+        self.partitions
+            .entry(partition)
+            .or_default()
+            .retried
+            .insert(offset);
+    }
+
+    /// Drop all state for `partition` (a rebalance revoked it, or recovery
+    /// rebuilt the consumer).
     pub fn forget(&mut self, partition: i32) {
         self.partitions.remove(&partition);
     }
@@ -414,28 +460,42 @@ impl OffsetTracker {
             .map_or(0, |p| p.completed.len())
     }
 
-    /// The first partition holding at least `threshold` completed offsets.
+    /// The first partition whose commit prefix is wedged, with how many
+    /// completed offsets are piled up behind it.
     ///
-    /// This is the stall signal. A prefix head that never settles — a message
-    /// abandoned for retry on a broker whose `abandon` cannot force a
-    /// redelivery (Kafka: not committing is not a nack) — blocks its
-    /// partition's commit **permanently** while every later message settles
-    /// behind it. The tracker cannot fix that on its own: only re-reading from
-    /// the last commit will hand the message back. Reporting the stall lets
-    /// the runtime fail its pass loudly so the supervisor recreates the
-    /// consumer, which is what performs the retry.
+    /// A prefix head that never settles blocks its partition's commit
+    /// **permanently**: the tracker cannot fix that on its own, because only
+    /// re-reading from the last commit hands the message back. Reporting it
+    /// lets the runtime rebuild the source (see
+    /// [`EventSource::recover`][super::source::EventSource::recover]), which is
+    /// what actually performs the retry.
     ///
-    /// `threshold == 0` disables the check.
+    /// Two independent signals, because either alone misses real wedges:
+    ///
+    /// - **A retried head** ([`Self::retried`]) is a wedge *by construction* on
+    ///   a positional broker, and is reported immediately. This is the only
+    ///   signal that catches a retry at the tail of a quiet partition, where
+    ///   nothing ever settles behind it, so a volume bound would wait forever.
+    /// - **A backlog** of at least `threshold` completed offsets is a
+    ///   heuristic backstop for a head that is blocked without having gone
+    ///   through the retry path (a dispatch task lost to a panic, say). Under
+    ///   healthy out-of-order settlement the backlog is bounded by
+    ///   `max_in_flight`, so a threshold above that only fires on a genuine
+    ///   wedge.
+    ///
+    /// `threshold == 0` disables **only** the backlog heuristic. The retried
+    /// head is a correctness signal, not a tunable: suppressing it on a
+    /// positional broker means silently dropping the retried message.
     #[must_use]
     pub fn stalled(&self, threshold: usize) -> Option<(i32, usize)> {
-        if threshold == 0 {
-            return None;
-        }
+        let wedged = |p: &&PartitionOffsets| {
+            !p.retried.is_empty() || (threshold > 0 && p.completed.len() >= threshold)
+        };
         // Deterministic: report the lowest-numbered blocked partition rather
         // than whichever the hash map happens to yield first.
         self.partitions
             .iter()
-            .filter(|(_, p)| p.completed.len() >= threshold)
+            .filter(|(_, p)| wedged(p))
             .min_by_key(|(partition, _)| **partition)
             .map(|(partition, p)| (*partition, p.completed.len()))
     }
@@ -491,6 +551,88 @@ mod tests {
             Some(1),
             "the rebuilt prefix commits what this generation actually settled"
         );
+    }
+
+    #[test]
+    fn a_backward_reposition_resets_the_generation_even_before_the_first_commit() {
+        // The reset above is anchored on the committed mark, but a partition
+        // can be repositioned backward while the prefix has NEVER committed —
+        // exactly the shape a retried head leaves, since the head blocks the
+        // prefix forever and `committed` stays `None` while later offsets
+        // settle behind it. Stale `floor`/`ceiling` survive that reset, and
+        // `ceiling` is what licenses stepping over a gap as a "broker hole".
+        let mut t = OffsetTracker::new();
+        t.observe(0, 10);
+        t.observe(0, 11);
+        assert_eq!(t.complete(0, 11), None, "the unsettled head blocks");
+        assert_eq!(t.committable(0), None, "so nothing has committed yet");
+
+        // A rebalance hands the partition back positioned behind us at 5.
+        // 6..=9 were never delivered in THIS generation; they are still to
+        // come, not holes the broker skipped.
+        t.observe(0, 5);
+        let advanced = t.complete(0, 5);
+
+        assert_eq!(
+            advanced,
+            Some(5),
+            "the rebuilt prefix commits only what this generation settled; \
+             against the stale ceiling of 11 it would leap to 9 and Kafka \
+             would never redeliver 6..=9"
+        );
+        assert_eq!(t.committable(0), Some(5));
+    }
+
+    #[test]
+    fn a_retried_head_stalls_its_partition_with_nothing_piled_behind_it() {
+        // The volume signal cannot see a retry at the tail of a quiet
+        // partition: nothing settles behind it, so `held` stays 0 forever
+        // while the message is never redelivered (Kafka's `abandon` is a
+        // no-op and the consumer position already moved past it).
+        let mut t = OffsetTracker::new();
+        t.observe(0, 7);
+        t.retried(0, 7);
+
+        assert_eq!(t.held(0), 0, "a quiet tail piles up nothing");
+        assert_eq!(
+            t.stalled(64),
+            Some((0, 0)),
+            "the blocked head is the stall, not the backlog behind it"
+        );
+    }
+
+    #[test]
+    fn an_in_flight_head_that_was_never_retried_is_not_a_stall() {
+        // A message merely being dispatched must not trip recovery, or every
+        // healthy pass would rebuild the consumer.
+        let mut t = OffsetTracker::new();
+        t.observe(0, 7);
+        assert_eq!(t.stalled(64), None);
+    }
+
+    #[test]
+    fn forgetting_a_partition_clears_its_retry_mark() {
+        // Recovery forgets the partition; if the mark survived, the very next
+        // pass would report the same stall and rebuild forever.
+        let mut t = OffsetTracker::new();
+        t.observe(0, 7);
+        t.retried(0, 7);
+        assert!(t.stalled(64).is_some());
+        t.forget(0);
+        assert_eq!(t.stalled(64), None);
+    }
+
+    #[test]
+    fn a_retried_offset_that_settles_anyway_no_longer_stalls() {
+        // A retry the broker DOES redeliver (SQS's visibility timeout, or a
+        // Kafka rebuild) settles normally. Once settled it is not a wedge, so
+        // it must not keep reporting one.
+        let mut t = OffsetTracker::new();
+        t.observe(0, 7);
+        t.retried(0, 7);
+        t.observe(0, 7);
+        assert_eq!(t.complete(0, 7), Some(7));
+        assert_eq!(t.stalled(64), None);
     }
 
     #[test]

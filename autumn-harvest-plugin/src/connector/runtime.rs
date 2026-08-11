@@ -80,10 +80,16 @@ pub struct ConnectorRuntimeConfig {
     /// behind a prefix head that has not settled.
     ///
     /// `None` (the default) derives the bound from the binding's
-    /// `max_in_flight`; `Some(0)` disables the check; `Some(n)` sets it
-    /// explicitly. See [`effective_stall_threshold`].
+    /// `max_in_flight`; `Some(0)` disables **this heuristic**; `Some(n)` sets
+    /// it explicitly. See [`effective_stall_threshold`].
     ///
-    /// This detects a **permanently blocked prefix**. On a positionally-ordered
+    /// This is the *backstop* half of stall detection — a head blocked without
+    /// having gone through the retry path (a dispatch task lost to a panic).
+    /// A head the runtime knows it retried is reported immediately and is not
+    /// governed by this knob, because a volume bound cannot see a retry at the
+    /// tail of a quiet partition: nothing ever settles behind it.
+    ///
+    /// Both detect a **permanently blocked prefix**. On a positionally-ordered
     /// broker the commit mark can only advance over a contiguous completed
     /// prefix, so a message that is retried rather than settled blocks its
     /// partition. On Kafka that block is permanent by construction: `abandon`
@@ -93,10 +99,9 @@ pub struct ConnectorRuntimeConfig {
     /// **silent** — the partition simply stops committing while the connector
     /// otherwise looks healthy.
     ///
-    /// Failing the pass is the fix precisely because it is loud and because
-    /// the supervisor's response *is* the retry: `run` backs off and polls
-    /// again, and a supervisor that recreates the consumer re-reads from the
-    /// last commit, which redelivers the blocked message.
+    /// Failing the pass is the fix because the runtime's response *is* the
+    /// retry: `run` rebuilds the source, which re-reads from the last commit
+    /// and redelivers the blocked message.
     ///
     /// It is on by default because a stall that nobody configured a detector
     /// for is exactly the one that goes unnoticed. Set `Some(0)` to opt out.
@@ -418,10 +423,14 @@ impl ConnectorRuntime {
     /// broker whose `abandon` cannot force a redelivery — Kafka, where not
     /// committing is not a nack. The tracker cannot resolve that on its own:
     /// only re-reading from the last commit hands the message back. So the
-    /// pass fails loudly, `run` backs off and re-polls, and a supervisor that
-    /// recreates the consumer performs the retry.
+    /// pass fails with [`ConnectorError::Stalled`], and `run` rebuilds the
+    /// source ([`EventSource::recover`]), which is what performs the retry.
     ///
-    /// Opt-in via [`ConnectorRuntimeConfig::stall_threshold`]; `0` disables.
+    /// Two signals feed this (see [`OffsetTracker::stalled`]): a retried head,
+    /// which is a wedge by construction and reported immediately, and a
+    /// backlog of at least [`ConnectorRuntimeConfig::stall_threshold`]
+    /// completed offsets as a backstop. `0` disables only the backlog
+    /// heuristic; the retried head is a correctness signal and always fires.
     async fn check_commit_stall(&self) -> Result<(), ConnectorError> {
         let threshold =
             effective_stall_threshold(self.config.stall_threshold, self.binding.max_in_flight);
@@ -560,7 +569,25 @@ impl ConnectorRuntime {
         // Once a message reaches a terminal disposition its strike history is
         // no longer needed; dropping it keeps the tracker bounded. A message
         // left for redelivery keeps its strikes so the threshold still bites.
-        if !matches!(effective, MessageDisposition::Retry) {
+        if matches!(effective, MessageDisposition::Retry) {
+            // On a source whose `abandon` cannot force a redelivery, this
+            // offset is now a permanently blocked prefix head: the local
+            // position has already moved past it, so nothing hands it back.
+            // Record it so recovery fires on the head itself rather than
+            // waiting for later offsets to pile up behind it — at the tail of
+            // a quiet partition, none ever will.
+            //
+            // A broker that does redeliver (SQS's visibility timeout) is not
+            // wedged and must not trigger a rebuild, or every transient
+            // dispatch failure would recycle the consumer.
+            if let (false, Some(partition), Some(position)) = (
+                self.source.abandon_redelivers(),
+                message.handle.partition,
+                message.handle.position,
+            ) {
+                self.offsets.lock().await.retried(partition, position);
+            }
+        } else {
             self.poison.lock().await.clear(&key);
         }
 
@@ -1162,6 +1189,59 @@ mod tests {
             source.nacked_for_dead_letter().is_empty(),
             "a transient retry must not use the poison nack"
         );
+    }
+
+    #[tokio::test]
+    async fn a_retry_at_the_tail_of_a_quiet_partition_still_stalls_it() {
+        // The volume signal cannot see this: one message at the tail of an
+        // otherwise idle partition is retried, so nothing ever settles behind
+        // it and `held` stays 0 under any threshold. On Kafka that message is
+        // simply lost — `abandon` is a no-op and the consumer position has
+        // already moved past it — so the wedge must be reported on the head.
+        let source = Arc::new(MockSource::new("orders").without_redelivery());
+        source.push_kafka(0, 7, b"{{{");
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        sink.fail_writes(true); // downgrades the dead-letter to a Retry
+        let rt = runtime(malformed_binding(), Arc::clone(&source), Arc::clone(&sink));
+
+        // Reported by the end-of-pass check, in the very pass that retried —
+        // no second poll needed, and nothing further is pulled meanwhile.
+        let err = rt
+            .run_once()
+            .await
+            .expect_err("a retried head must stall the pass");
+        assert!(
+            matches!(err, ConnectorError::Stalled { partition: 0, .. }),
+            "expected a stall on partition 0, got {err:?}"
+        );
+        assert_eq!(
+            rt.offsets.lock().await.held(0),
+            0,
+            "and it is reported with nothing at all piled up behind it, which \
+             is exactly what the backlog bound cannot see"
+        );
+        assert_eq!(source.abandoned().len(), 1, "the retry did happen");
+    }
+
+    #[tokio::test]
+    async fn a_retry_on_a_redelivering_source_never_reports_a_stall() {
+        // The mirror image, and the reason the signal is a source capability
+        // rather than "any retry": SQS's visibility timeout genuinely does
+        // hand the message back, so a transient dispatch failure is not a
+        // wedge. Firing here would recycle the consumer on every blip.
+        //
+        // Kafka-shaped coordinates, so the only thing distinguishing this from
+        // the test above is `abandon_redelivers`.
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_kafka(0, 7, b"{{{");
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        sink.fail_writes(true);
+        let rt = runtime(malformed_binding(), Arc::clone(&source), Arc::clone(&sink));
+
+        assert_eq!(rt.run_once().await.unwrap().retried, 1);
+        rt.run_once()
+            .await
+            .expect("a broker that redelivers is not wedged by a retry");
     }
 
     #[tokio::test]
