@@ -738,8 +738,14 @@ impl ConnectorRuntime {
         // of one message, not this map across a stream of distinct poison
         // messages — so the entry carries a retention deadline instead, run
         // from its LAST delivery (see `ConnectorRuntimeConfig::poison_retention`).
+        // One physical poison message must contribute one `poisoned` sample,
+        // not one per redrive lap: the retained strikes above make every later
+        // redelivery re-nack on sight, so this arm is reached repeatedly for
+        // the same message until the broker's own count ends it.
+        let mut count_poison = true;
         if matches!(effective, MessageDisposition::AbandonToBrokerDeadLetter(_)) {
-            self.poison
+            count_poison = self
+                .poison
                 .lock()
                 .await
                 .mark_terminal_as_of(&key, std::time::Instant::now());
@@ -765,7 +771,7 @@ impl ConnectorRuntime {
             self.poison.lock().await.clear(&key);
         }
 
-        self.record_metrics(&outcome, &effective);
+        self.record_metrics(&outcome, &effective, count_poison);
         effective
     }
 
@@ -818,7 +824,14 @@ impl ConnectorRuntime {
         .await
     }
 
-    fn record_metrics(&self, outcome: &DispatchOutcome, disposition: &MessageDisposition) {
+    /// `count_poison` is false for a broker-native redrive lap whose poison
+    /// message was already counted on its first handoff — see `settle`.
+    fn record_metrics(
+        &self,
+        outcome: &DispatchOutcome,
+        disposition: &MessageDisposition,
+        count_poison: bool,
+    ) {
         let source = self.binding.name;
         // Prefer the finer-grained success outcome (fresh / replay / deferred)
         // over the disposition's coarse "acked".
@@ -827,8 +840,10 @@ impl ConnectorRuntime {
         } else {
             disposition.outcome()
         };
+        // Always: every received message settles exactly once, and this
+        // family's documented invariant is that it sums to `received`.
         self.metrics.record_connector_dispatched(source, reported);
-        if let Some(reason) = disposition.poison_reason() {
+        if let Some(reason) = disposition.poison_reason().filter(|_| count_poison) {
             self.metrics.record_connector_poisoned(source, reason);
         }
     }
@@ -1432,6 +1447,61 @@ mod tests {
             sink.entries().is_empty(),
             "broker-native dead-lettering never writes to the harvest sink"
         );
+    }
+
+    #[tokio::test]
+    async fn one_poison_message_is_counted_once_across_redrive_laps() {
+        // `harvest.connector.poisoned` counts poison MESSAGES. Because the
+        // retained strikes make every redelivery re-nack on sight, the same
+        // physical message reaches the broker-native handoff once per redrive
+        // lap -- and with SQS's `maxReceiveCount` above the binding threshold
+        // (the normal configuration) that is several laps. Counting each one
+        // would inflate poison alerts and dashboards by the lap count.
+        let binding = Arc::new(
+            SourceBinding::starts("orders", "orders", "order_flow")
+                .map_raw(|_ctx| Err(MappingError::Rejected("no thanks".to_string())))
+                .poison_threshold(2)
+                .broker_native_dead_letter(),
+        );
+        let source = Arc::new(MockSource::new("orders"));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let rt = runtime_with_metrics(
+            binding,
+            Arc::clone(&source),
+            Arc::new(RecordingDeadLetterSink::new()),
+            Arc::clone(&metrics),
+        );
+
+        // One message, three deliveries: strike 1 retries, strike 2 hands it
+        // to the broker, and lap 3 re-nacks the SAME message on sight.
+        source.push_kafka(0, 1, b"{}");
+        rt.run_once().await.unwrap();
+        rt.run_once().await.unwrap();
+        source.push_kafka(0, 1, b"{}");
+        rt.run_once().await.unwrap();
+
+        assert_eq!(
+            metrics.poisoned().len(),
+            1,
+            "one physical poison message must contribute exactly one sample, \
+             not one per redrive lap"
+        );
+        // `dispatched` is deliberately NOT deduped: every redelivery is a
+        // received message, and that family's documented invariant is that it
+        // sums to `received`.
+        assert_eq!(
+            metrics.dispatched().len(),
+            metrics.received().len(),
+            "the settlement invariant must survive the poison dedupe"
+        );
+        assert_eq!(metrics.dispatched().len(), 3);
+
+        // A DIFFERENT poison message is a different message and does count.
+        source.push_kafka(0, 2, b"{}");
+        rt.run_once().await.unwrap();
+        source.push_kafka(0, 2, b"{}");
+        rt.run_once().await.unwrap();
+        assert_eq!(metrics.poisoned().len(), 2);
     }
 
     #[tokio::test]

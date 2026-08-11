@@ -774,6 +774,31 @@ fn first_shared_identity<T: PartialEq>(identities: &[Option<T>]) -> Option<(usiz
     None
 }
 
+/// Index pair of the first two bindings that consume the same logical
+/// `(stream, target)` pair (issue #944).
+///
+/// Not an error, unlike a shared *physical* subscription: two independent
+/// brokers can expose the same stream name and legitimately feed one workflow
+/// (active/active, or a cluster migration), and only the operator knows which
+/// they meant. But on ONE broker it double-dispatches every message — each
+/// binding derives its own idempotency key, because the binding name
+/// namespaces it — so it is worth saying out loud once at startup.
+///
+/// Callers pass `(stream, workflow, signal_name)` triples; taking plain tuples
+/// keeps the decision unit-testable without constructing bindings, mirroring
+/// [`first_shared_source`].
+#[cfg(feature = "connectors")]
+fn first_duplicate_stream_target<'a>(
+    pairs: &[(&'a str, &'a str, Option<&'a str>)],
+) -> Option<(usize, usize)> {
+    for (i, p) in pairs.iter().enumerate() {
+        if let Some(j) = pairs[i + 1..].iter().position(|other| other == p) {
+            return Some((i, i + 1 + j));
+        }
+    }
+    None
+}
+
 /// Index registered workflows by name the way the engine itself resolves them:
 /// **last-wins** (issue #944).
 ///
@@ -1007,6 +1032,36 @@ impl Plugin for HarvestPlugin {
                     connectors[i].binding.name,
                     connectors[j].binding.name,
                     subscriptions[i].as_deref().unwrap_or("<unknown>"),
+                );
+            }
+            // Two bindings on DISTINCT subscriptions consuming the same
+            // logical stream into the same target is legitimate fan-in across
+            // independent brokers, so it is not rejected -- but on one broker
+            // it double-dispatches every message (each binding derives its own
+            // idempotency key, since the name namespaces it), so say it once.
+            // Reached only when the identity check above passed, i.e. the two
+            // are genuinely different subscriptions.
+            let pairs: Vec<(&str, &str, Option<&str>)> = connectors
+                .iter()
+                .map(|r| {
+                    (
+                        r.binding.stream.as_str(),
+                        r.binding.target.workflow(),
+                        r.binding.target.signal_name(),
+                    )
+                })
+                .collect();
+            if let Some((i, j)) = first_duplicate_stream_target(&pairs) {
+                tracing::warn!(
+                    first = connectors[i].binding.name,
+                    second = connectors[j].binding.name,
+                    stream = connectors[i].binding.stream,
+                    workflow = connectors[i].binding.target.workflow(),
+                    "two harvest connector bindings consume the same stream into the same \
+                     target from different subscriptions: every message is dispatched TWICE \
+                     (each binding namespaces its own idempotency key by binding name, so \
+                     the two do not dedupe each other). Intentional for fan-in across \
+                     independent brokers; otherwise consolidate them or retarget one"
                 );
             }
             // Last-wins, so this warning describes the definition the engine
@@ -3151,6 +3206,59 @@ mod tests {
             Some((0, 1))
         );
         assert_eq!(first_shared_identity::<String>(&[]), None);
+    }
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn a_duplicate_stream_target_pair_is_warned_about_not_rejected() {
+        // Rejecting this would break legitimate fan-in from two independent
+        // brokers exposing the same stream name, which no operator can work
+        // around (a Kafka source's `stream()` IS the topic, and the plugin
+        // requires the binding to match it). It still double-dispatches on one
+        // broker, so it is worth a warning -- which is what this drives.
+        let p = |stream, wf, sig| (stream, wf, sig);
+        assert_eq!(
+            first_duplicate_stream_target(&[
+                p("orders", "order_flow", None),
+                p("orders", "order_flow", None),
+            ]),
+            Some((0, 1)),
+        );
+        // A different target on one stream is an ordinary fan-out.
+        assert_eq!(
+            first_duplicate_stream_target(&[
+                p("orders", "order_flow", None),
+                p("orders", "audit_flow", None),
+            ]),
+            None,
+        );
+        // The signal name is part of the target: two `signals_with_start`
+        // bindings delivering DIFFERENT signals from one stream is normal.
+        assert_eq!(
+            first_duplicate_stream_target(&[
+                p("orders", "cart", Some("add_item")),
+                p("orders", "cart", Some("remove_item")),
+            ]),
+            None,
+        );
+        assert_eq!(
+            first_duplicate_stream_target(&[
+                p("orders", "cart", Some("add_item")),
+                p("orders", "cart", Some("add_item")),
+            ]),
+            Some((0, 1)),
+        );
+        // Reports the FIRST offending pair, matching its siblings.
+        assert_eq!(
+            first_duplicate_stream_target(&[
+                p("a", "w", None),
+                p("a", "w", None),
+                p("b", "w", None),
+                p("b", "w", None),
+            ]),
+            Some((0, 1)),
+        );
+        assert_eq!(first_duplicate_stream_target(&[]), None);
     }
 
     #[cfg(feature = "connectors")]

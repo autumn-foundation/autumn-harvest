@@ -211,10 +211,7 @@ impl EventSource for KafkaSource {
     }
 
     fn subscription_identity(&self) -> Option<String> {
-        Some(subscription_identity_for(
-            &self.config.group_id,
-            &self.topic,
-        ))
+        Some(subscription_identity_for(&self.config))
     }
 
     async fn receive(
@@ -389,8 +386,24 @@ impl EventSource for KafkaSource {
 /// The separator is `\u{1}`, a byte no Kafka group id or topic name may
 /// contain, so `("a", "b/c")` and `("a/b", "c")` cannot alias each other.
 #[must_use]
-fn subscription_identity_for(group_id: &str, topic: &str) -> String {
-    format!("kafka:{group_id}\u{1}{topic}")
+fn subscription_identity_for(config: &KafkaSourceConfig) -> String {
+    // Read the values back out of the built config rather than off the struct
+    // fields, so the identity is whatever librdkafka will ACTUALLY join.
+    // `to_client_config` applies `extra` after the declared fields, so a
+    // `.property("group.id", ...)` override wins — and reading `config.group_id`
+    // here would accept two configs that land in one group, which then splits
+    // the partitions between them and silently starves both targets. Deriving
+    // from the built config makes the precedence single-sourced: there is no
+    // second copy of the ordering rule to drift.
+    let built = config.to_client_config();
+    let brokers = built.get("bootstrap.servers").unwrap_or(&config.brokers);
+    let group = built.get("group.id").unwrap_or(&config.group_id);
+    // Brokers are load-bearing in the other direction: two independent
+    // clusters exposing the same topic under the same group id are two
+    // subscriptions, not one, and omitting them would reject that fan-in.
+    // `\u{1}` cannot appear in a broker list, group id or topic, so no triple
+    // can alias another.
+    format!("kafka:{brokers}\u{1}{group}\u{1}{}", config.topic)
 }
 
 /// Outstanding records for one partition, from its watermarks and the group's
@@ -417,29 +430,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn subscription_identity_uses_the_effective_group_and_brokers() {
+        // `to_client_config` applies `extra` AFTER the declared fields, so a
+        // `.property("group.id", ...)` override is what librdkafka actually
+        // joins. Reading the declared field instead would accept two configs
+        // that end up in one group, and the group would then split the
+        // partitions between them -- each target silently missing messages.
+        let overridden = KafkaSourceConfig::new("b:9092", "declared", "orders")
+            .property("group.id", "effective");
+        assert_eq!(
+            subscription_identity_for(&overridden),
+            subscription_identity_for(&KafkaSourceConfig::new("b:9092", "effective", "orders")),
+            "an overridden group.id must be what the identity reports"
+        );
+        // Two DIFFERENT declared groups colliding on one override is exactly
+        // the case the pointer check and the declared-field check both miss.
+        let a = KafkaSourceConfig::new("b:9092", "g1", "orders").property("group.id", "shared");
+        let b = KafkaSourceConfig::new("b:9092", "g2", "orders").property("group.id", "shared");
+        assert_eq!(subscription_identity_for(&a), subscription_identity_for(&b));
+        // A `bootstrap.servers` override is identity-bearing for the same
+        // reason, in the other direction: two clusters are independent
+        // subscriptions even when the group and topic match exactly, so
+        // omitting the brokers would REJECT a legitimate multi-cluster fan-in.
+        assert_ne!(
+            subscription_identity_for(&KafkaSourceConfig::new("east:9092", "g", "orders")),
+            subscription_identity_for(&KafkaSourceConfig::new("west:9092", "g", "orders")),
+            "two independent clusters are not one subscription"
+        );
+        assert_eq!(
+            subscription_identity_for(
+                &KafkaSourceConfig::new("declared:9092", "g", "orders")
+                    .property("bootstrap.servers", "effective:9092")
+            ),
+            subscription_identity_for(&KafkaSourceConfig::new("effective:9092", "g", "orders")),
+        );
+    }
+
+    #[test]
     fn subscription_identity_pairs_the_group_with_the_topic() {
         // The group is load-bearing: two consumers on one topic under
         // DISTINCT group ids each get the full stream, which is the fan-out
         // the duplicate-source panic message itself recommends. Identifying a
         // subscription by topic alone would reject it.
+        let id = |brokers, group, topic| {
+            subscription_identity_for(&KafkaSourceConfig::new(brokers, group, topic))
+        };
         assert_eq!(
-            subscription_identity_for("g1", "orders"),
-            "kafka:g1\u{1}orders"
+            id("b:9092", "g1", "orders"),
+            "kafka:b:9092\u{1}g1\u{1}orders"
         );
-        assert_ne!(
-            subscription_identity_for("g1", "orders"),
-            subscription_identity_for("g2", "orders"),
-        );
+        assert_ne!(id("b:9092", "g1", "orders"), id("b:9092", "g2", "orders"));
         // Same group, different topics are also distinct subscriptions.
         assert_ne!(
-            subscription_identity_for("g1", "orders"),
-            subscription_identity_for("g1", "shipments"),
+            id("b:9092", "g1", "orders"),
+            id("b:9092", "g1", "shipments")
         );
-        // A `/` in a topic name must not let one pair alias another.
-        assert_ne!(
-            subscription_identity_for("a", "b/c"),
-            subscription_identity_for("a/b", "c"),
-        );
+        // A `/` in a topic name must not let one triple alias another.
+        assert_ne!(id("b:9092", "a", "b/c"), id("b:9092", "a/b", "c"));
     }
 
     #[test]

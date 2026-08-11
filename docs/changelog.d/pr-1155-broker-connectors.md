@@ -722,6 +722,41 @@ coordinates, so a run traces back to the exact message.
   name concurrent dispatch as the reason, and point at `.max_in_flight(1)` as
   the one knob that does buy order.
 
+- **The Kafka subscription identity read the declared group, not the effective
+  one.** `to_client_config` applies `extra` *after* the declared fields, so a
+  `.property("group.id", "shared")` override is what librdkafka actually joins
+  — but the identity read `config.group_id`. Two configs declaring different
+  groups and both overriding to one value therefore passed the
+  duplicate-subscription guard while landing in the same group, which splits
+  the partitions between them and starves both targets. The identity is now
+  read back **out of the built config**, so the precedence rule is
+  single-sourced and cannot drift. `bootstrap.servers` joined it for the
+  opposite reason: two independent clusters exposing one topic under one group
+  id are two subscriptions, and omitting the brokers would have *rejected* that
+  legitimate fan-in.
+- **A logical `(stream, target)` duplicate was rejected outright.** Two
+  independent brokers exposing the same stream name and feeding one workflow is
+  legitimate fan-in (active/active, or a cluster migration), and an operator
+  could not work around the rejection: a Kafka source's `stream()` *is* the
+  topic and the plugin separately requires the binding's stream to match it.
+  The hard error is replaced by the physical-subscription check, which sees
+  what a binding alone cannot. The genuine hazard the logical check also caught
+  — a duplicate pair on *distinct* subscriptions double-dispatching every
+  message, since the binding name namespaces each idempotency key — is now a
+  startup **warning**, matching the warn-rather-than-enforce precedent already
+  set twice on this PR for cases where only the operator knows the intent.
+- **One poison message was counted once per redrive lap.** With SQS's
+  `maxReceiveCount` above the binding's `poison_threshold` — the normal
+  configuration — the deliberately-retained strikes make every redelivery
+  resolve to `AbandonToBrokerDeadLetter` again, and the metric call was
+  unconditional, so a single physical message inflated
+  `harvest.connector.poisoned` by its lap count. `mark_terminal_as_of` now
+  reports whether the handoff was the **first**, and only that one counts. The
+  `dispatched` family is deliberately *not* deduped the same way: every
+  redelivery is a received message, and that family's documented invariant is
+  that it sums to `received` — asserted alongside the fix so the two rules
+  cannot be conflated later.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

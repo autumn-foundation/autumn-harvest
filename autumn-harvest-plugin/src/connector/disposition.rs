@@ -313,17 +313,29 @@ impl PoisonTracker {
     /// deliberately kept (see the call site in `ConnectorRuntime::settle`) —
     /// but nothing downstream will ever clear them, which is why they carry a
     /// retention deadline instead.
-    pub fn mark_terminal_as_of(&mut self, key: &str, now: std::time::Instant) {
+    ///
+    /// Returns whether this was the **first** handoff for `key`. Because the
+    /// retained strikes make every later redelivery re-nack on sight, the same
+    /// physical message reaches this path once per redrive lap; the caller
+    /// counts `harvest.connector.poisoned` only on the first, so one poison
+    /// message contributes one sample rather than one per lap. (The
+    /// `dispatched` counter is deliberately *not* gated this way — every
+    /// redelivery is a received message, and that family's documented
+    /// invariant is that it sums to `received`.)
+    pub fn mark_terminal_as_of(&mut self, key: &str, now: std::time::Instant) -> bool {
+        let first;
         if let Some(state) = self.strikes.get_mut(key) {
+            first = state.terminal_at.is_none();
             state.terminal_at = Some(now);
             state.last_seen = now;
         } else {
             // Marking a key with no strike recorded would otherwise queue an
             // expiry entry for nothing.
-            return;
+            return false;
         }
         self.expiry.push_back((now, key.to_string()));
         self.enforce_cap();
+        first
     }
 
     /// Evict oldest-first until *both* the live map and the expiry queue are
@@ -1163,6 +1175,36 @@ mod tests {
         // Past it the entry retires: nothing else will ever clear this key.
         t.expire_stale_as_of(t0 + std::time::Duration::from_secs(61), retention);
         assert_eq!(t.tracked(), 0, "a terminal strike must not leak forever");
+    }
+
+    #[test]
+    fn only_the_first_broker_native_handoff_is_reported_as_poisoned() {
+        // `harvest.connector.poisoned` counts POISON MESSAGES, so one physical
+        // message must contribute exactly one sample no matter how many redrive
+        // laps the broker takes. With `maxReceiveCount` above the binding's
+        // threshold -- the normal configuration -- the retained strikes make
+        // every redelivery resolve to `AbandonToBrokerDeadLetter` again, so an
+        // unconditional count would inflate poison alerts by the lap count.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+
+        t.strike("m-1", t0);
+        assert!(
+            t.mark_terminal_as_of("m-1", t0),
+            "the first handoff is the one that counts"
+        );
+        // Redelivered and re-nacked: same physical message, already counted.
+        t.strike("m-1", t0 + std::time::Duration::from_secs(50));
+        assert!(
+            !t.mark_terminal_as_of("m-1", t0 + std::time::Duration::from_secs(50)),
+            "a redrive lap must not report a second poison message"
+        );
+        // A DIFFERENT message is a different poison message and does count.
+        t.strike("m-2", t0);
+        assert!(t.mark_terminal_as_of("m-2", t0));
+        // Marking a key with no strikes recorded is a no-op, so it cannot
+        // manufacture a sample either.
+        assert!(!t.mark_terminal_as_of("never-struck", t0));
     }
 
     #[test]

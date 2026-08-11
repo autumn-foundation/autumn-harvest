@@ -421,8 +421,6 @@ pub fn validate_bindings_refs(
         .collect::<HashMap<_, _>>();
 
     let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut seen_stream_targets: HashMap<(String, &'static str, Option<&'static str>), &str> =
-        HashMap::new();
 
     for b in bindings {
         if b.name.trim().is_empty() {
@@ -455,19 +453,18 @@ pub fn validate_bindings_refs(
             ));
         }
 
-        let key = (
-            b.stream.clone(),
-            b.target.workflow(),
-            b.target.signal_name(),
-        );
-        if let Some(first) = seen_stream_targets.insert(key, b.name) {
-            return Err(format!(
-                "connector bindings '{first}' and '{}' both consume stream '{}' into the same \
-                 target: consolidate them, or give one a different target",
-                b.name, b.stream
-            ));
-        }
-
+        // NOTE: a duplicate `(stream, target)` pair is deliberately NOT an
+        // error here. Two independent brokers can expose the same stream name
+        // and legitimately feed one workflow (active/active, or a cluster
+        // migration), and nothing visible from a binding distinguishes that
+        // from an accidental duplicate: a Kafka source's `stream()` is fixed
+        // to the topic and the plugin separately requires the binding's stream
+        // to match it, so an operator has no way to alias around a rejection.
+        // The real hazard -- two bindings on one *physical* subscription
+        // splitting the stream between them -- is caught in
+        // `HarvestPlugin::build`, which can compare source identities; the
+        // same place warns about a duplicate pair on distinct subscriptions,
+        // since that double-dispatches every message.
         let workflow = b.target.workflow();
         if registered_dag_names.iter().any(|d| d == workflow) {
             return Err(format!(
@@ -733,13 +730,25 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_duplicate_stream_target_pairs() {
+    fn validate_allows_independent_sources_to_feed_one_stream_target_pair() {
+        // Two independent Kafka clusters both exposing `orders` and both
+        // feeding `order_flow` is legitimate fan-in (active/active, or a
+        // cluster migration). Nothing in the binding can distinguish them:
+        // `KafkaSource::stream()` is fixed to the topic and the plugin
+        // separately asserts the binding's stream matches it, so an operator
+        // cannot alias either one to get past a logical duplicate check.
+        //
+        // The genuine hazard -- two consumers on ONE physical subscription
+        // splitting the stream -- is caught by the source-identity check in
+        // `HarvestPlugin::build`, which can see what this cannot.
         let bindings = vec![
             SourceBinding::starts("a", "orders", "order_flow").map_raw(|_| Ok(ok_mapped())),
             SourceBinding::starts("b", "orders", "order_flow").map_raw(|_| Ok(ok_mapped())),
         ];
-        let err = validate_bindings(&bindings, &[wf("order_flow")], &[]).unwrap_err();
-        assert!(err.contains("both consume stream"), "{err}");
+        assert!(
+            validate_bindings(&bindings, &[wf("order_flow")], &[]).is_ok(),
+            "a logical stream+target pair is not evidence of a physical clash"
+        );
     }
 
     #[test]
