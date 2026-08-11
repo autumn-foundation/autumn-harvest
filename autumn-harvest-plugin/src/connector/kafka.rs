@@ -181,14 +181,33 @@ impl KafkaSourceConfig {
 /// All this does is make that decision durable instead of leaving it to be
 /// re-derived against a tail that has since moved.
 ///
+/// # Scope: a local fact, not a group one
+///
+/// An anchor records what **this source instance** read. Nothing evicts one
+/// when a rebalance moves the partition elsewhere, so a long-lived source
+/// accumulates floors for partitions another replica now owns. That matters
+/// asymmetrically, and the two uses are guarded differently:
+///
+/// * **Committing** speaks for the whole group, so it is filtered by
+///   [`committable_anchors`] down to partitions this consumer still owns and to
+///   floors that strictly raise what the group has committed. Unfiltered, a
+///   stale floor rewinds another replica's partition and replays records whose
+///   idempotency claims have long expired — duplicate executions, not
+///   deduplicated retries.
+/// * **The lag baseline** is read-only and per-replica, so a stale anchor there
+///   can only skew one gauge sample. It is deliberately *not* filtered by the
+///   assignment: mid-rebalance `assignment()` is briefly empty, and dropping
+///   anchors then would re-open the `latest` under-report above — a false
+///   all-clear on the gauge, which is the failure direction that hurts. A
+///   best-effort local baseline is the better trade there.
+///
 /// # Residual
 ///
-/// Anchors are per-source-instance and cover the partitions **this replica has
-/// read from**. A partition owned by another replica, or a fresh process whose
-/// group never committed, has no anchor and falls back to the reset policy —
-/// which is the honest answer, since no local fact establishes otherwise.
-/// Closing that would need cross-replica state this adapter deliberately does
-/// not keep.
+/// A partition this replica has never read — one owned by another replica, or
+/// any partition of a fresh process whose group never committed — has no anchor
+/// and falls back to the reset policy. That is the honest answer, since no
+/// local fact establishes otherwise; closing it would need cross-replica state
+/// this adapter deliberately does not keep.
 #[derive(Debug, Default)]
 pub struct PartitionAnchors {
     /// `partition -> next offset to read`. `BTreeMap` so `pending_anchors` is
@@ -219,11 +238,54 @@ impl PartitionAnchors {
         self.floors.get(&partition).copied()
     }
 
-    /// Every known floor, to be committed before a rebuild.
+    /// Every known floor, to be filtered by [`committable_anchors`] and
+    /// committed before a rebuild.
     #[must_use]
     pub fn pending_anchors(&self) -> Vec<(i32, i64)> {
         self.floors.iter().map(|(p, o)| (*p, *o)).collect()
     }
+}
+
+/// The subset of `anchors` this replica may commit on behalf of the group.
+///
+/// A retained anchor is a fact about **this source's read history**, not about
+/// the group. Nothing evicts one when a rebalance moves the partition
+/// elsewhere, so the two diverge the moment ownership changes — and a commit
+/// speaks for the whole group. Two conditions, each closing a hole the other
+/// leaves open:
+///
+/// * **Assigned.** Only a partition this consumer currently owns. A stale
+///   anchor for a partition another replica is advancing would assert a resume
+///   point for work this replica is not doing: rewind it, and that replica's
+///   successor replays everything from the stale floor — long after the
+///   connector's idempotency claims for those records expired, so the replay
+///   lands as duplicate executions rather than deduplicated retries.
+/// * **Raises.** Only where the anchor is strictly ahead of what the group has
+///   committed. Ownership alone is not enough, because [`record_read`] is
+///   first-read-wins: correct within one continuous ownership span, stale
+///   across a revoke-and-return. A partition read at 100, revoked, advanced to
+///   5000 by another replica and then handed back still carries a floor of 100.
+///
+/// Together they make an anchor commit **monotonic and local**: it can only
+/// raise a partition this replica owns. The case the anchor exists for — a
+/// `latest` group that has never committed anywhere — passes both trivially,
+/// since the partition was just read from and any floor raises "no floor".
+///
+/// `committed` returns the group's durable next-offset for a partition, or
+/// `None` when it has never committed one.
+///
+/// [`record_read`]: PartitionAnchors::record_read
+fn committable_anchors(
+    anchors: &[(i32, i64)],
+    assigned: &[i32],
+    committed: impl Fn(i32) -> Option<i64>,
+) -> Vec<(i32, i64)> {
+    anchors
+        .iter()
+        .filter(|(partition, _)| assigned.contains(partition))
+        .filter(|(partition, anchor)| committed(*partition).is_none_or(|c| *anchor > c))
+        .copied()
+        .collect()
 }
 
 /// A Kafka-backed [`EventSource`].
@@ -481,11 +543,17 @@ impl EventSource for KafkaSource {
     /// The rebuild would skip that record permanently while the runtime
     /// reported a successful retry: message loss dressed as a retry.
     ///
-    /// So every known resume floor is committed **synchronously on the old
-    /// consumer, before the new one is built** (see [`PartitionAnchors`]). That
-    /// makes the docstring's promise true rather than conditional, and as a
-    /// side effect makes any in-flight async ack-commit durable instead of
-    /// racing the rebuild.
+    /// So every resume floor this replica may speak for is committed
+    /// **synchronously on the old consumer, before the new one is built** (see
+    /// [`PartitionAnchors`]). That makes the docstring's promise true rather
+    /// than conditional, and as a side effect makes any in-flight async
+    /// ack-commit durable instead of racing the rebuild.
+    ///
+    /// "May speak for" is [`committable_anchors`]: a partition this consumer
+    /// still owns, and a floor that strictly raises the group's committed
+    /// offset. An anchor is a local read-history fact, and a commit is a
+    /// group-wide statement; the filter is what keeps a retained floor from
+    /// rewinding a partition that has since moved to another replica.
     ///
     /// A failed anchor commit fails the whole recovery rather than rebuilding
     /// anyway. Rebuilding on an unanchored group is exactly the skip this
@@ -506,16 +574,58 @@ impl EventSource for KafkaSource {
             // no-op to librdkafka (it commits the current assignment), and
             // there is no floor to assert anyway.
             if !anchors.is_empty() {
-                let mut tpl = TopicPartitionList::new();
-                for (partition, next_offset) in anchors {
-                    tpl.add_partition_offset(&topic, partition, Offset::Offset(next_offset))
-                        .map_err(|e| {
-                            ConnectorError::Broker(format!("kafka anchor offset list: {e}"))
-                        })?;
+                // Partitions this consumer still owns. A retained anchor is a
+                // fact about local read history, not about the group, and the
+                // two diverge once a rebalance moves a partition away -- see
+                // `committable_anchors`.
+                let assigned: Vec<i32> = previous
+                    .assignment()
+                    .map_err(|e| ConnectorError::Broker(format!("kafka assignment: {e}")))?
+                    .elements_for_topic(&topic)
+                    .iter()
+                    .map(rdkafka::topic_partition_list::TopicPartitionListElem::partition)
+                    .collect();
+
+                // What the group has already committed for those, so an anchor
+                // can only ever raise it. Skipped when nothing is assigned:
+                // `committed_offsets` on an empty list would ask about the
+                // whole assignment, and there is nothing to filter anyway.
+                let mut wanted = TopicPartitionList::new();
+                for partition in &assigned {
+                    wanted.add_partition(&topic, *partition);
                 }
-                previous
-                    .commit(&tpl, CommitMode::Sync)
-                    .map_err(|e| ConnectorError::Broker(format!("kafka anchor commit: {e}")))?;
+                let committed = if assigned.is_empty() {
+                    TopicPartitionList::new()
+                } else {
+                    previous
+                        .committed_offsets(wanted, ANCHOR_COMMIT_TIMEOUT)
+                        .map_err(|e| {
+                            ConnectorError::Broker(format!("kafka committed offsets: {e}"))
+                        })?
+                };
+
+                let committable = committable_anchors(&anchors, &assigned, |partition| {
+                    match committed
+                        .find_partition(&topic, partition)
+                        .map(|p| p.offset())
+                    {
+                        Some(Offset::Offset(o)) => Some(o),
+                        _ => None,
+                    }
+                });
+
+                if !committable.is_empty() {
+                    let mut tpl = TopicPartitionList::new();
+                    for (partition, next_offset) in committable {
+                        tpl.add_partition_offset(&topic, partition, Offset::Offset(next_offset))
+                            .map_err(|e| {
+                                ConnectorError::Broker(format!("kafka anchor offset list: {e}"))
+                            })?;
+                    }
+                    previous
+                        .commit(&tpl, CommitMode::Sync)
+                        .map_err(|e| ConnectorError::Broker(format!("kafka anchor commit: {e}")))?;
+                }
             }
             Self::build_consumer(&config)
         })
@@ -689,6 +799,14 @@ fn canonical_broker_list(brokers: &str) -> String {
     seeds.dedup();
     seeds.join(",")
 }
+
+/// Bound on the metadata round-trip that reads the group's committed offsets
+/// before an anchor commit.
+///
+/// One call on the recovery path, which is already slow and rare, so this only
+/// needs to stop a wedged broker turning a recovery into an indefinite hang:
+/// the runtime's answer to a failed `recover` is to back off and retry.
+const ANCHOR_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Overall wall-clock budget for one lag sample.
 ///
@@ -929,6 +1047,73 @@ mod tests {
         anchors.record_read(2, 7);
         anchors.record_read(1, 3);
         assert_eq!(anchors.pending_anchors(), vec![(0, 101), (1, 3), (2, 7)]);
+    }
+
+    /// A retained anchor is only committable for a partition this replica still
+    /// owns.
+    ///
+    /// Nothing evicts a floor when a rebalance moves the partition elsewhere, so
+    /// a long-lived source accumulates anchors for partitions another replica is
+    /// now advancing. Committing one of those on behalf of the group asserts a
+    /// resume point for work this replica is not doing.
+    #[test]
+    fn an_anchor_for_a_partition_this_replica_no_longer_owns_is_never_committed() {
+        // p0 is still ours; p7 was read before a rebalance moved it away.
+        let anchors = vec![(0, 101), (7, 100)];
+
+        assert_eq!(
+            committable_anchors(&anchors, &[0], |_| None),
+            vec![(0, 101)],
+            "an anchor for a partition owned by another replica is not ours to assert"
+        );
+
+        // Mid-rebalance the assignment can be empty. Committing nothing is the
+        // conservative answer: the rebuild rejoins and resumes from the group.
+        assert!(
+            committable_anchors(&anchors, &[], |_| None).is_empty(),
+            "with no assignment there is no partition this replica may speak for"
+        );
+    }
+
+    /// An anchor commit may only ever RAISE a partition's committed offset.
+    ///
+    /// Ownership alone is not enough: `record_read` is first-read-wins, which is
+    /// right within one continuous ownership span but stale across a
+    /// revoke-and-return. A partition we read at 100, lost, and got back after
+    /// another replica advanced it to 5000 still carries a floor of 100 —
+    /// writing that back rewinds the group and replays settled records.
+    #[test]
+    fn an_anchor_never_rewinds_a_partition_the_group_has_moved_past() {
+        let anchors = vec![(0, 100)];
+
+        assert!(
+            committable_anchors(&anchors, &[0], |_| Some(5_000)).is_empty(),
+            "a stale floor behind the group's committed offset must not be written back"
+        );
+        assert!(
+            committable_anchors(&anchors, &[0], |_| Some(100)).is_empty(),
+            "re-writing the offset already there is not a raise, so it is not worth a commit"
+        );
+        assert_eq!(
+            committable_anchors(&anchors, &[0], |_| Some(40)),
+            vec![(0, 100)],
+            "a floor ahead of the group makes this replica's settled work durable"
+        );
+    }
+
+    /// The case the anchor exists for still commits.
+    ///
+    /// A `latest` binding whose first message keeps failing has nothing
+    /// committed anywhere, so both guards pass trivially: the partition is
+    /// assigned (it was just read from) and any floor raises "no floor at all".
+    /// Guarding the commit must not cost the loss fix it was added for.
+    #[test]
+    fn an_uncommitted_owned_partition_still_commits_its_anchor() {
+        assert_eq!(
+            committable_anchors(&[(0, 100)], &[0], |_| None),
+            vec![(0, 100)],
+            "with nothing committed there is nothing to rewind, and a floor prevents the skip"
+        );
     }
 
     /// The walk stops once its budget is spent, and each call is clamped to

@@ -700,13 +700,34 @@ than racing the rebuild.
 If the anchor commit fails, recovery fails with it and the runtime backs off and
 retries rather than rebuilding into a possible skip.
 
-Two residuals, both deliberate. Anchors cover the partitions **this replica has
-read from**, so a partition owned by another replica still falls back to the
-reset policy for its lag baseline — no local fact establishes otherwise, and
-closing it would need cross-replica state. And a process that restarts before
-its group ever commits genuinely has no anchor: it starts at the then-current
-tail, which is what `latest` asks for. Neither applies to the default
-(`earliest`), which is anchored at the low watermark by definition.
+**An anchor is a local fact, and a commit is a group-wide statement.** Nothing
+evicts an anchor when a rebalance moves that partition to another replica, so a
+long-lived consumer accumulates floors for partitions it no longer owns. Before
+committing, Harvest therefore keeps only the anchors it may speak for: a
+partition this consumer **still owns**, and a floor that **strictly raises** what
+the group has already committed. Both are needed. Ownership alone would still let
+a stale floor through, because the first-read-wins rule is right within one
+continuous ownership span but stale across a revoke-and-return — a partition read
+at 100, lost, advanced to 5000 elsewhere and then handed back still carries a
+floor of 100. Writing that back rewinds the group and replays records whose
+idempotency claims expired long ago, which lands as **duplicate executions**
+rather than deduplicated retries. Mid-rebalance the assignment is briefly empty
+and nothing is committed at all, which is the conservative answer: the rebuild
+rejoins and resumes from the group.
+
+The lag baseline deliberately does **not** apply that assignment filter. It is
+read-only and per-replica, so a stale anchor can only skew one sample — whereas
+dropping anchors during a rebalance would re-open the `latest` under-report and
+show a false all-clear, which is the failure direction that actually hurts.
+
+Two residuals, both deliberate. A partition this replica has **never read** —
+one owned by another replica, or any partition of a fresh process whose group
+never committed — has no anchor and falls back to the reset policy for its lag
+baseline; no local fact establishes otherwise, and closing it would need
+cross-replica state. And a process that restarts before its group ever commits
+genuinely has no anchor: it starts at the then-current tail, which is what
+`latest` asks for. Neither applies to the default (`earliest`), which is anchored
+at the low watermark by definition.
 
 A broker-triggered execution also records `start_source = 'broker'` with
 `start_source_ref` set to the rendered coordinates, so a run traces back to the

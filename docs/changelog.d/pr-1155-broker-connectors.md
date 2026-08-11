@@ -995,6 +995,30 @@ coordinates, so a run traces back to the exact message.
   problem for another when the guarantee needed is a bound, not a speedup. Three
   RED-first tests, each mutation-verified against its own fix in isolation.
 
+- **Anchor commits are filtered to what this replica may speak for.** A
+  `PartitionAnchors` floor is a fact about *this source instance's* read history,
+  but nothing evicts one when a rebalance moves that partition elsewhere — while
+  an offset commit is a statement about the whole **group**. A long-lived
+  consumer therefore accumulated floors for partitions another replica was
+  advancing, and `recover()` wrote every one of them back synchronously. Kafka's
+  coordinator accepts an `OffsetCommit` for any partition from a current group
+  member regardless of assignment, so that rewound the other replica's durable
+  offset; the replay it caused lands **after** the connector's idempotency claims
+  for those records have expired, so it creates duplicate executions rather than
+  deduplicated retries. New pure `committable_anchors` keeps only anchors for a
+  partition this consumer **still owns** *and* whose floor **strictly raises**
+  the group's committed offset. Both guards are needed: ownership alone leaves
+  the revoke-and-return case, where first-read-wins (correct within one
+  continuous ownership span) is stale across it — a partition read at 100, lost,
+  advanced to 5000 elsewhere, then handed back still carries a floor of 100. Both
+  pass trivially in the case the anchor exists for (a `latest` group that has
+  never committed anywhere), so the loss fix is unaffected. The **lag baseline**
+  deliberately keeps using unfiltered anchors: it is read-only and per-replica,
+  so a stale one skews at most a sample, whereas dropping anchors during a
+  rebalance (when `assignment()` is briefly empty) would re-open the `latest`
+  under-report and show a false all-clear — the failure direction that hurts.
+  Three RED-first tests, both guards mutation-verified in isolation.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of
