@@ -83,6 +83,19 @@ response-level `truncated` flag that is probed directly and is therefore
 admits nothing would be a silent-loss trap, and disabling persistence is what
 *omitting* the builder call already means.
 
+The marker is **terminal** (Codex review, P2): once it exists the gate stays
+shut, even if `max_lines` is later RAISED. `max_lines` is per-worker-process
+config, so on a rolling deployment a run can truncate under an old worker's cap
+and have its next decision cycle handled by a new worker with a larger one.
+Re-deciding admission against the current policy would store a line *after* the
+one that was dropped, leaving a hole in the stored prefix and a marker whose
+"subsequent lines were dropped" claim is false. Latching keeps the stored rows a
+contiguous prefix of the run and keeps the marker honest; the already-dropped
+lines are unrecoverable either way, so re-opening the gate buys nothing.
+Rejecting a post-marker batch wholesale loses nothing, since every line in such
+a batch is either already stored (and would have been collapsed by the conflict
+clause) or was deliberately dropped.
+
 **Retention (AC4)** is tied to workflow-history retention with **zero janitor
 code**: the `workflow_exec_id` FK carries `ON DELETE CASCADE`, so the retention
 janitor's execution delete takes the logs with it in the same statement. There

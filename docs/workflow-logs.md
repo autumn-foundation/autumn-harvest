@@ -192,6 +192,18 @@ Drop-newest is deliberate: the first lines of a run are the ones that explain ho
 it got where it is. A run that logs 10,000 lines has a logging problem, and the
 early lines are what diagnose it.
 
+**The marker is terminal.** Once an execution has truncated, later lines stay
+rejected even if `max_lines` is subsequently **raised**. `max_lines` is
+per-worker-process config, so on a rolling deployment a run can truncate under an
+old worker's cap and have its next decision cycle handled by a new worker with a
+larger one. Re-deciding admission against the current policy would store a line
+*after* the one that was dropped — leaving a hole in the stored prefix and a
+marker whose "subsequent lines were dropped" claim is false. Latching keeps the
+stored rows a contiguous prefix of the run and keeps the marker honest; the
+already-dropped lines are unrecoverable either way, so re-opening the gate buys
+nothing. Raise the cap for *future* runs; an already-truncated one stays
+truncated.
+
 Both caps clamp **up to 1** rather than accepting zero: `max_lines(0)` would
 store nothing at all (silent total loss — exactly what the visible truncation
 marker exists to prevent) and `max_message_bytes(0)` would empty every message.

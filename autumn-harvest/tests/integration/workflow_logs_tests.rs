@@ -336,6 +336,112 @@ async fn truncation_marker_is_recorded_at_most_once() {
     );
 }
 
+/// The truncation marker is **terminal**: once an execution has truncated, a
+/// later batch is rejected even if `max_lines` has since been RAISED.
+///
+/// Reachable on any rolling deployment. `max_lines` is per-worker-process
+/// config, so a run can truncate under an old worker's cap and then have its
+/// next decision cycle handled by a new worker with a larger one. Without the
+/// latch, the count that decides admission excludes the marker, so the raised
+/// cap re-opens the gate and stores a line *after* the one that was dropped —
+/// leaving a hole in the stored prefix and a marker whose "subsequent lines
+/// were dropped" claim is false.
+///
+/// Latching keeps two properties that matter more than recovering a raised cap
+/// mid-run (the already-dropped lines are gone either way): the stored rows are
+/// always a contiguous prefix of the run, and the marker never lies.
+#[tokio::test]
+async fn a_raised_cap_does_not_reopen_the_gate_after_truncation() {
+    let (url, _c) = setup_database().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut conn, exec_id, "rolling_deploy").await;
+
+    // Old worker, cap 2: lines 0 and 1 land, line 2 is dropped, marker written.
+    store::append_workflow_logs(
+        &mut conn,
+        exec_id,
+        &[
+            line(0, "info", "kept 0"),
+            line(1, "info", "kept 1"),
+            line(2, "info", "dropped 2"),
+        ],
+        2,
+    )
+    .await
+    .expect("append under the old cap");
+
+    let before = read_all(&mut conn, exec_id).await;
+    assert_eq!(before.len(), 3, "2 real lines + the marker: {before:?}");
+
+    // New worker on the SAME still-running execution, cap raised to 100.
+    let written = store::append_workflow_logs(
+        &mut conn,
+        exec_id,
+        &[line(3, "info", "must not be stored")],
+        100,
+    )
+    .await
+    .expect("append under the raised cap");
+
+    assert_eq!(
+        written, 0,
+        "a raised cap must not admit a line after the marker exists"
+    );
+
+    let rows = read_all(&mut conn, exec_id).await;
+    let messages: Vec<&str> = rows.iter().map(|(_, _, m)| m.as_str()).collect();
+    assert_eq!(
+        messages,
+        vec!["kept 0", "kept 1", WORKFLOW_LOG_TRUNCATION_MESSAGE],
+        "the stored rows must stay a contiguous prefix + the marker -- storing \
+         line 3 while line 2 is missing would leave a hole AND make the \
+         marker's claim false: {rows:?}"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.0 == WORKFLOW_LOG_TRUNCATION_SEQ)
+            .count(),
+        1,
+        "and the marker stays a single row"
+    );
+}
+
+/// The latch must not swallow a re-drive of lines that are ALREADY stored.
+///
+/// Rejecting post-marker batches wholesale is only safe because every line in
+/// such a batch is either already stored (so `ON CONFLICT DO NOTHING` would
+/// have collapsed it anyway) or was deliberately dropped. This pins that: a
+/// re-driven cycle after truncation changes nothing, rather than losing rows.
+#[tokio::test]
+async fn re_driving_a_cycle_after_truncation_preserves_the_stored_prefix() {
+    let (url, _c) = setup_database().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut conn, exec_id, "redrive_after_cap").await;
+
+    let cycle = vec![
+        line(0, "info", "a"),
+        line(1, "info", "b"),
+        line(2, "info", "c"),
+    ];
+    store::append_workflow_logs(&mut conn, exec_id, &cycle, 2)
+        .await
+        .expect("first drive");
+    let after_first = read_all(&mut conn, exec_id).await;
+
+    // Same cycle, same cap -- the crash-recovery / spurious-wake shape.
+    store::append_workflow_logs(&mut conn, exec_id, &cycle, 2)
+        .await
+        .expect("re-drive");
+
+    assert_eq!(
+        read_all(&mut conn, exec_id).await,
+        after_first,
+        "a re-drive after truncation must be a no-op, not a row loss"
+    );
+}
+
 #[tokio::test]
 async fn appending_nothing_is_a_no_op() {
     let (url, _c) = setup_database().await;

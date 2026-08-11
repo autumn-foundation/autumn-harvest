@@ -1677,6 +1677,22 @@ pub struct WorkflowLogLine {
 /// workflow's setup and branch decisions are) and costs one bounded `COUNT`
 /// per decision cycle rather than a `DELETE` per line.
 ///
+/// **The marker is terminal.** Once it exists the gate stays shut: a later
+/// batch is rejected even if `max_lines` has since been RAISED. This is not
+/// hypothetical — `max_lines` is per-worker-process config, so on a rolling
+/// deployment a run can truncate under an old worker's cap and have its next
+/// decision cycle handled by a new worker with a larger one. Re-deciding
+/// admission against the current policy would store a line *after* the one that
+/// was dropped, leaving a hole in the stored prefix and a marker whose
+/// "subsequent lines were dropped" claim is false. Latching keeps the stored
+/// rows a contiguous prefix of the run and keeps the marker honest; the
+/// already-dropped lines are unrecoverable either way, so re-opening the gate
+/// buys nothing.
+///
+/// Rejecting a post-marker batch wholesale loses nothing: every line in such a
+/// batch is either already stored (so `ON CONFLICT DO NOTHING` would have
+/// collapsed it) or was deliberately dropped.
+///
 /// Returns the number of real (non-marker) rows actually inserted.
 pub async fn append_workflow_logs(
     conn: &mut AsyncPgConnection,
@@ -1687,6 +1703,22 @@ pub async fn append_workflow_logs(
     use crate::schema::harvest_workflow_logs::dsl;
 
     if lines.is_empty() {
+        return Ok(0);
+    }
+
+    // The marker latches the cap decision (see the doc comment): once it is
+    // present, no previously unseen line is admitted, whatever `max_lines`
+    // currently says. Checked BEFORE the count so a raised cap cannot re-open
+    // the gate on a rolling deployment.
+    let truncated: bool = diesel::select(diesel::dsl::exists(
+        dsl::harvest_workflow_logs
+            .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(dsl::seq.eq(WORKFLOW_LOG_TRUNCATION_SEQ)),
+    ))
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    if truncated {
         return Ok(0);
     }
 

@@ -292,7 +292,67 @@ fn workflow_list_and_query_use_get_requests() {
     );
     assert_eq!(timeline_request.body, None);
 
-    // Durable per-execution author logs (issue #790).
+    let awaitables = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "awaitables",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow awaitables args should parse");
+    let awaitables_request = awaitables
+        .api_request()
+        .expect("awaitables request should build");
+    assert_eq!(awaitables_request.method, ApiMethod::Get);
+    assert_eq!(
+        awaitables_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/awaitables"
+    );
+    assert_eq!(awaitables_request.body, None);
+
+    let run_chain = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "run-chain",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow run-chain args should parse");
+    let run_chain_request = run_chain
+        .api_request()
+        .expect("run-chain request should build");
+    assert_eq!(run_chain_request.method, ApiMethod::Get);
+    assert_eq!(
+        run_chain_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/run-chain"
+    );
+    assert_eq!(run_chain_request.body, None);
+
+    let replay_diagnosis = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "replay-diagnosis",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow replay-diagnosis args should parse");
+    let replay_diagnosis_request = replay_diagnosis
+        .api_request()
+        .expect("replay-diagnosis request should build");
+    assert_eq!(replay_diagnosis_request.method, ApiMethod::Post);
+    assert_eq!(
+        replay_diagnosis_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/replay-diagnosis"
+    );
+    assert_eq!(replay_diagnosis_request.body, None);
+}
+
+/// Durable per-execution author logs (issue #790) — `harvest workflow logs`.
+///
+/// Its own test rather than more assertions on
+/// `workflow_list_and_query_use_get_requests`: that function is already at the
+/// `clippy::too_many_lines` ceiling, and the logs route has three distinct
+/// query-shaping behaviours worth naming (bare, fully-filtered, repeated
+/// `--level`).
+#[test]
+fn workflow_logs_maps_to_the_logs_route_with_query_filters() {
     let logs = Cli::try_parse_from([
         "harvest",
         "workflow",
@@ -354,57 +414,6 @@ fn workflow_list_and_query_use_get_requests() {
             .path,
         "/workflows/00000000-0000-0000-0000-000000000001/logs?level=warn&level=error"
     );
-
-    let awaitables = Cli::try_parse_from([
-        "harvest",
-        "workflow",
-        "awaitables",
-        "00000000-0000-0000-0000-000000000001",
-    ])
-    .expect("workflow awaitables args should parse");
-    let awaitables_request = awaitables
-        .api_request()
-        .expect("awaitables request should build");
-    assert_eq!(awaitables_request.method, ApiMethod::Get);
-    assert_eq!(
-        awaitables_request.path,
-        "/workflows/00000000-0000-0000-0000-000000000001/awaitables"
-    );
-    assert_eq!(awaitables_request.body, None);
-
-    let run_chain = Cli::try_parse_from([
-        "harvest",
-        "workflow",
-        "run-chain",
-        "00000000-0000-0000-0000-000000000001",
-    ])
-    .expect("workflow run-chain args should parse");
-    let run_chain_request = run_chain
-        .api_request()
-        .expect("run-chain request should build");
-    assert_eq!(run_chain_request.method, ApiMethod::Get);
-    assert_eq!(
-        run_chain_request.path,
-        "/workflows/00000000-0000-0000-0000-000000000001/run-chain"
-    );
-    assert_eq!(run_chain_request.body, None);
-
-    let replay_diagnosis = Cli::try_parse_from([
-        "harvest",
-        "workflow",
-        "replay-diagnosis",
-        "00000000-0000-0000-0000-000000000001",
-    ])
-    .expect("workflow replay-diagnosis args should parse");
-    let replay_diagnosis_request = replay_diagnosis
-        .api_request()
-        .expect("replay-diagnosis request should build");
-    assert_eq!(replay_diagnosis_request.method, ApiMethod::Post);
-    assert_eq!(
-        replay_diagnosis_request.path,
-        "/workflows/00000000-0000-0000-0000-000000000001/replay-diagnosis"
-    );
-    assert_eq!(replay_diagnosis_request.body, None);
 }
 
 #[test]
