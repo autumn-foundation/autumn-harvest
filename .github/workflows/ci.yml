@@ -114,6 +114,23 @@ jobs:
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
       - name: Clippy autumn-harvest-sqlite
         run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
+      # Issue #786: the `docs/performance.md` prose-vs-table guards must run on
+      # DOCS-ONLY pull requests — which is the change class most likely to break
+      # them, and the one the `test` matrix below skips entirely (every step
+      # there is gated on `changes.outputs.code == 'true'`). The Clippy step
+      # above only *compiles* these tests; it never executes them. So they run
+      # here, in the job that is deliberately ungated.
+      #
+      # Unconditional rather than `if: code == 'false'`: "the guards always run"
+      # is a stronger property than "the guards run when the other place did
+      # not", and does not silently break the day someone edits the matrix's
+      # gating. The duplicate run on code PRs is 7 tests against a
+      # `--no-default-features` build, which is cheap and cached.
+      #
+      # Guarded by `performance_docs::performance_guards_run_on_docs_only_changes`,
+      # which fails if this step is removed or becomes conditional.
+      - name: Run docs/performance.md guards (also on docs-only PRs)
+        run: cargo test -p autumn-harvest --no-default-features --features testing --test integration performance_docs::
 
   test:
     name: Test (${{ matrix.os }})

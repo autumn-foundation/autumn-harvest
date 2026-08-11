@@ -448,6 +448,128 @@ fn structural_helpers_survive_crlf_line_endings() {
     );
 }
 
+/// The page must not attribute the `paused_rows` +1% to the predicate itself.
+///
+/// `double_backlog` controls for *total* rows, not for the population that
+/// reaches the sort: the PAUSED anti-join is a `WHERE` predicate, so it removes
+/// half the table before the `ORDER BY` in `paused_rows` and removes nothing in
+/// the control (20 000 rows sorted vs 10 000). The +1% is therefore the probe
+/// cost minus the sort saving — two effects with opposite signs that this
+/// measurement cannot separate — and the page said "the anti-join is free" for
+/// several revisions on the strength of it.
+///
+/// The claim reads so naturally that it came back once already after being
+/// narrowed. This pins the narrowing: the page must keep the subsection that
+/// explains the confound, and must not re-assert the isolated-cost reading.
+#[test]
+fn the_paused_rows_delta_is_not_attributed_to_the_predicate() {
+    let doc = read_performance_doc();
+
+    assert!(
+        doc.contains("#### What that control does *not* establish"),
+        "docs/performance.md must keep the subsection explaining why the \
+         `double_backlog` control cannot isolate the anti-join predicate. \
+         Without it the +1% reads as the predicate's own cost."
+    );
+    assert!(
+        doc.contains("rows fed to the sort"),
+        "the confound is the differing sort input (20 000 vs 10 000); the \
+         subsection must show it rather than assert it in prose"
+    );
+
+    // Phrases that assert the isolated-cost reading the control cannot support.
+    for banned in [
+        "The anti-join is free",
+        "the anti-join is free",
+        "Free as a predicate",
+        "free as a predicate",
+        "the anti-join costs **+1%**",
+        "Deleting the predicate would buy you nothing",
+    ] {
+        assert!(
+            !doc.contains(banned),
+            "docs/performance.md says \"{banned}\", which attributes the \
+             `paused_rows` +1% to the anti-join predicate in isolation. The \
+             `double_backlog` control does not support that: it sorts 20 000 \
+             rows where `paused_rows` sorts 10 000, so the delta mixes the \
+             predicate's probe cost with a sort saving of opposite sign. \
+             Publish the depth-controlled finding, not a predicate cost."
+        );
+    }
+}
+
+/// These guards must actually execute on a docs-only pull request.
+///
+/// The whole point of this file is to catch prose that drifts from the tables
+/// in `docs/performance.md`. The change most likely to cause that drift is a
+/// pull request that edits *only* that file — and that is precisely the one CI
+/// used to skip: the `changes` job classifies `docs/**` as `code=false`, and
+/// every step of the `test` matrix is gated on `code == 'true'`. The `lint`
+/// job runs ungated, but its Clippy invocation only *compiles* this file.
+///
+/// So for three rounds these guards could not have fired on the change class
+/// they were written for. The fix is a `cargo test` step in the ungated `lint`
+/// job; this asserts that step is there and has not acquired a condition that
+/// would put it back behind the same gate.
+#[test]
+fn performance_guards_run_on_docs_only_changes() {
+    let workflow = read_normalized(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate directory must have a parent")
+            .join(".github/workflows/ci.yml"),
+    );
+
+    // The step must exist, and must name this module as its filter — a step
+    // that ran some *other* test would satisfy a looser check while leaving
+    // these guards just as unexecuted.
+    let step = workflow
+        .lines()
+        .find(|line| line.contains("--test integration performance_docs::"))
+        .expect(
+            "ci.yml must run the performance_docs guards from a step that is not \
+             gated on `changes.outputs.code`, or a docs-only PR — the change class \
+             these guards exist for — skips them entirely",
+        );
+    assert!(
+        step.trim_start().starts_with("run:"),
+        "expected the guard invocation to be a step `run:` line, found: {step}"
+    );
+
+    // It must live in `lint`, the ungated job. `test` is gated per-step on
+    // `changes.outputs.code`, so a step there proves nothing for docs-only PRs.
+    let lint_start = workflow
+        .find("\n  lint:")
+        .expect("ci.yml must define a `lint` job");
+    let test_start = workflow
+        .find("\n  test:")
+        .expect("ci.yml must define a `test` job");
+    let step_at = workflow
+        .find("--test integration performance_docs::")
+        .expect("located above");
+    assert!(
+        step_at > lint_start && step_at < test_start,
+        "the performance_docs guard step must live in the ungated `lint` job; \
+         a step in the `test` matrix is gated on `changes.outputs.code` and so \
+         does not run on a docs-only PR"
+    );
+
+    // And it must be unconditional. A step that grew an `if:` is back behind a
+    // gate — which is the exact regression this test exists to prevent.
+    let block: &str = &workflow[lint_start..test_start];
+    let step_idx = block
+        .find("--test integration performance_docs::")
+        .expect("step is inside the lint block");
+    let step_line_start = block[..step_idx].rfind("\n      - name:").unwrap_or(0);
+    let stanza = &block[step_line_start..step_idx];
+    assert!(
+        !stanza.contains("\n        if:"),
+        "the performance_docs guard step has acquired an `if:` condition. It must \
+         run unconditionally: a condition is how these guards stopped running on \
+         docs-only PRs in the first place. Stanza:\n{stanza}"
+    );
+}
+
 /// The truncated rows must describe the sample count they actually published.
 #[test]
 fn truncated_sample_counts_in_prose_match_the_table() {

@@ -52,7 +52,7 @@ use super::claim_bench_support::{
     BUDGET_ENV_VAR, BudgetVerdict, ClaimGate, HEADLINE_P50_BUDGET_MS, LatencyStats,
     MIN_MEANINGFUL_SAMPLES, SCENARIO_BUDGET_ENV_VAR, Scenario, budget_from_env, budget_verdict,
     db_name_from_url, headline_scenario, measured_claims_for, scenario_time_budget,
-    sweep_probe_decoy_name, with_db_name, with_setup_deadline,
+    sweep_probe_decoy_name, with_db_name, with_setup_deadline, with_verify_deadline,
 };
 
 // The published budget lives in the shared harness as
@@ -201,8 +201,14 @@ async fn claim_p50_at_headline_scenario_is_within_budget() {
     // Soundness second: the backlog must still be deep. `claim_task` is
     // destructive, so a run that drained the queue would be timing claims
     // against an increasingly empty table.
-    let mut conn = db::connect(&db.url).await;
-    let remaining = db::pending_count(&mut conn).await;
+    let mut conn =
+        with_verify_deadline("connect", scenario_time_budget(), db::connect(&db.url)).await;
+    let remaining = with_verify_deadline(
+        "backlog depth check",
+        scenario_time_budget(),
+        db::pending_count(&mut conn),
+    )
+    .await;
     let floor = i64::try_from(scenario.backlog * 4 / 5).expect("backlog fits i64");
     assert!(
         remaining >= floor,
@@ -336,8 +342,14 @@ async fn enqueue_throughput_is_measured_against_a_non_empty_queue() {
     // that already had `backlog` rows in it, because a start-storm hits a live
     // queue, not an empty one. Without this the harness could silently stop
     // seeding and the test would still pass while measuring the easy case.
-    let mut conn = db::connect(&db.url).await;
-    let pending = db::pending_count(&mut conn).await;
+    let mut conn =
+        with_verify_deadline("connect", scenario_time_budget(), db::connect(&db.url)).await;
+    let pending = with_verify_deadline(
+        "non-empty queue check",
+        scenario_time_budget(),
+        db::pending_count(&mut conn),
+    )
+    .await;
     let expected = i64::try_from(backlog + report.rows).expect("row count fits i64");
     assert_eq!(
         pending, expected,
@@ -474,7 +486,8 @@ async fn each_gate_scenario_actually_seeds_its_trigger_column() {
     };
 
     let backlog = 200;
-    let mut conn = db::connect(&db.url).await;
+    let mut conn =
+        with_verify_deadline("connect", scenario_time_budget(), db::connect(&db.url)).await;
 
     for gate in ClaimGate::all() {
         let scenario = Scenario {
@@ -483,8 +496,18 @@ async fn each_gate_scenario_actually_seeds_its_trigger_column() {
             queues: 2,
             gate,
         };
-        db::seed(&mut conn, scenario).await;
-        let census = db::seed_census(&mut conn).await;
+        with_verify_deadline(
+            "seed",
+            scenario_time_budget(),
+            db::seed(&mut conn, scenario),
+        )
+        .await;
+        let census = with_verify_deadline(
+            "seed census",
+            scenario_time_budget(),
+            db::seed_census(&mut conn),
+        )
+        .await;
         let want = i64::try_from(backlog).expect("backlog fits i64");
 
         let expect_build = matches!(gate, ClaimGate::BuildPolicy | ClaimGate::AllGates);
@@ -558,20 +581,30 @@ async fn the_paused_rows_control_seeds_equal_total_depth() {
     };
 
     let backlog = 200;
-    let mut conn = db::connect(&db.url).await;
+    let mut conn =
+        with_verify_deadline("connect", scenario_time_budget(), db::connect(&db.url)).await;
     let mut totals = Vec::new();
     for gate in [ClaimGate::DoubleBacklog, ClaimGate::PausedRows] {
-        let outcome = db::seed(
-            &mut conn,
-            Scenario {
-                backlog,
-                claimers: 1,
-                queues: 2,
-                gate,
-            },
+        let outcome = with_verify_deadline(
+            "seed",
+            scenario_time_budget(),
+            db::seed(
+                &mut conn,
+                Scenario {
+                    backlog,
+                    claimers: 1,
+                    queues: 2,
+                    gate,
+                },
+            ),
         )
         .await;
-        let pending = db::pending_count(&mut conn).await;
+        let pending = with_verify_deadline(
+            "pending count",
+            scenario_time_budget(),
+            db::pending_count(&mut conn),
+        )
+        .await;
         assert_eq!(
             pending,
             i64::try_from(outcome.seeded_rows).expect("fits i64"),
@@ -1369,6 +1402,56 @@ async fn setup_deadline_in_the_past_trips_immediately() {
         .checked_sub(std::time::Duration::from_secs(1))
         .expect("the process has been up for at least a second");
     let () = with_setup_deadline("connect", deadline, std::future::pending::<()>()).await;
+}
+
+/// The *post*-measurement soundness checks must not park the gate either.
+///
+/// `with_setup_deadline` closed the hole at the front of a scenario. The gate
+/// tests then reconnect *after* the measured phase to verify the run was sound
+/// (the backlog was not drained; the enqueue really did write into a non-empty
+/// queue), and those awaits sat outside every deadline: the measured phase had
+/// already consumed its own, so nothing bounded them. A server that stopped
+/// answering between the last claim and the verification would hold the CI gate
+/// until the outer workflow timeout.
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "post-measurement check stalled")]
+async fn verify_deadline_refuses_to_wait_out_a_stalled_server() {
+    let () = with_verify_deadline(
+        "backlog depth check",
+        std::time::Duration::from_secs(240),
+        std::future::pending::<()>(),
+    )
+    .await;
+}
+
+/// The bound is a ceiling, not a delay: a check that finishes passes through.
+#[tokio::test(start_paused = true)]
+async fn verify_deadline_returns_a_check_that_finishes_in_time() {
+    let value = with_verify_deadline(
+        "pending count",
+        std::time::Duration::from_secs(240),
+        async { 11_i64 },
+    )
+    .await;
+    assert_eq!(value, 11, "a completed check must return its own value");
+}
+
+/// The verify ceiling is *fresh*, not what the measured phase left over.
+///
+/// This is the whole reason it takes a `Duration` rather than the measured
+/// phase's `Instant`. A scenario is allowed to consume its entire budget — that
+/// is the contract — so a deadline shared with the measurement would have zero
+/// left by the time verification starts, and every soundness check would "time
+/// out" against a perfectly healthy server. Simulated by burning the full
+/// scenario budget on the paused clock before verifying.
+#[tokio::test(start_paused = true)]
+async fn verify_deadline_is_not_consumed_by_the_measured_phase() {
+    tokio::time::sleep(scenario_time_budget() + Duration::from_secs(60)).await;
+    let value = with_verify_deadline("connect", scenario_time_budget(), async { 3_u8 }).await;
+    assert_eq!(
+        value, 3,
+        "a fresh ceiling must survive a measured phase that used its whole budget"
+    );
 }
 
 /// Provisioning must skip rather than hang when the server stops answering.

@@ -1316,6 +1316,45 @@ pub async fn with_setup_deadline<T>(
     })
 }
 
+/// Run one *post*-measurement soundness check under its own wall-clock ceiling.
+///
+/// The sibling of [`with_setup_deadline`], for the other end of a scenario.
+/// After the measured phase completes, the gate tests reconnect and count rows
+/// to verify the run was sound — the backlog was not drained, the enqueue
+/// really did write into a non-empty queue. Those awaits sit *after* the
+/// measured phase and therefore after its deadline has already been consumed,
+/// so nothing bounded them: a server that stopped answering between the last
+/// claim and the verification would park the gate until the outer CI workflow
+/// timeout, which is the same hole [`with_setup_deadline`] closed at the front.
+///
+/// A fresh ceiling rather than a shared one, for the same reason setup gets its
+/// own: the measured phase legitimately consumes its entire budget, so a shared
+/// deadline would have nothing left and every verification would "time out"
+/// against a perfectly healthy server.
+///
+/// # Panics
+///
+/// Panics when the check does not finish in time. The measurement itself
+/// succeeded, so the numbers are real — but the invariant that says they
+/// *describe what they claim to describe* could not be confirmed, and a gate
+/// that passes on an unverified measurement is worth less than one that fails
+/// loudly. The message says which check stalled so the failure is not confused
+/// with a genuine backlog-drain regression.
+pub async fn with_verify_deadline<T>(
+    what: &str,
+    budget: std::time::Duration,
+    fut: impl std::future::Future<Output = T> + Send,
+) -> T {
+    (tokio::time::timeout(budget, fut).await).unwrap_or_else(|_| {
+        panic!(
+            "post-measurement check stalled: {what} did not finish within \
+             {budget:?}. The measured phase completed, so the latency numbers are \
+             real, but the soundness invariant behind them could not be confirmed. \
+             Failing rather than passing an unverified measurement."
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Pure unit tests (run on every OS, no Docker, no `db` feature).
 // ---------------------------------------------------------------------------

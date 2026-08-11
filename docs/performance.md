@@ -45,10 +45,12 @@ this page says nothing about what they cost; see
 * **Only one predicate is genuinely expensive: per-key concurrency (+644% p50).**
   Build-id routing (+13%), the rate-limit gate (+2%) and the circuit-breaker
   tracked set (+4%) are cheap or free.
-* **Paused executions cost as much as live ones (+1403% p50), but not because
-  the PAUSED predicate is expensive.** An equal-depth control with *no* PAUSED
-  predicate costs the same (+1383%). The anti-join is free; the rows sitting in
-  the table are what you pay for. See
+* **Paused executions cost as much as live ones (+1403% p50), and the cost is
+  table depth rather than anything specific to pausing.** An equal-*depth*
+  control with no PAUSED rows costs the same (+1383%), so the operational
+  finding is about rows in the table. That control does **not** isolate the
+  anti-join predicate itself — the two scenarios take different query plans —
+  so this page does not publish a cost for the predicate in isolation. See
   [the control that changed the conclusion](#the-control-that-changed-the-conclusion).
 * **Enqueue is not the problem.** ~4 800 rows/s sustained at p50 ~1.5 ms, flat
   from 1k to 100k backlog (inside run-to-run noise). At 100k the write side
@@ -258,27 +260,74 @@ so any delta measured against `baseline` charges the predicate for the extra
 rows too. `double_backlog` removes that confound: same 20 000 total rows, all of
 them plain and claimable, **no PAUSED predicate anywhere**.
 
-It costs **+1383%**, within about a percent of what `paused_rows` costs.
-Measured against that honest comparand the anti-join costs **+1%** — and the
-*sign* of that last figure flips between runs (an earlier run measured the
-control as the slower of the two, putting the anti-join at −1%), which is
-itself the evidence that at n=325/322 truncated samples the predicate is
-indistinguishable from zero. Do not read the ±1% as a direction.
+It costs **+1383%**, within about a percent of what `paused_rows` costs. So the
+operational finding stands on a depth-controlled comparison: at equal table
+depth, a paused population costs what a live one does.
 
-So there are two different questions and two different numbers:
+#### What that control does *not* establish
+
+It is tempting to read the remaining **+1%** as "the anti-join predicate is
+free". That reading does not survive looking at the two plans, and this page
+does not make it.
+
+`double_backlog` controls for *total rows in the table*. It does not control for
+the population that reaches the sort, and that is where the claim query spends
+its time (see [the plan](#the-plan)). The PAUSED anti-join is a `WHERE`
+predicate, so it is evaluated *before* the `ORDER BY`:
+
+| | `double_backlog` (control) | `paused_rows` |
+|:--|:--|:--|
+| rows scanned | 20 000 | 20 000 |
+| rows surviving the filter | 20 000 | 10 000 |
+| **rows fed to the sort** | **20 000** | **10 000** |
+| PAUSED `SubPlan` | **never executed** | executed |
+
+Two consequences. First, the control does not merely lack a PAUSED *population*
+— its PAUSED `SubPlan` never runs at all, because every row it seeds is
+`task_type = 'activity'` and the guard short-circuits on the type test (the same
+mechanism described [at the end of the plan section](#the-plan)). Second, and
+more importantly, the two scenarios sort *different numbers of rows*: the
+anti-join removes half the table before the sort in `paused_rows` and removes
+nothing in the control.
+
+So the +1% is the sum of two effects with opposite signs — the anti-join's probe
+cost, minus the sort saving from 10 000 fewer sorted rows — and this
+measurement cannot separate them. (On a single-shot `EXPLAIN ANALYZE` the two
+scenarios do not even take the same plan: the control gets a sequential scan
+with a hash anti-join, `paused_rows` gets an index scan with a merge anti-join
+and a hashed subplan.) The *sign* of the +1% also flips between runs — an
+earlier run measured the control as the slower of the two, putting the figure at
+−1% — which is what you would expect from two effects that roughly cancel,
+measured at n=325/322 truncated samples. Do not read the ±1% as a direction, and
+do not read it as a predicate cost.
+
+**Isolating the predicate would need a control that matches the post-filter
+population, not the pre-filter one** — same 20 000 rows scanned, same 10 000
+sorted, excluded by a mechanism cheap enough not to be the thing under test.
+That control does not exist yet, so no cost for the predicate in isolation is
+published here.
+
+So there are two different questions, and this page answers only one of them:
 
 | comparison | question it answers | answer |
 |:--|:--|--:|
 | `paused_rows` vs `baseline` | what does a paused population cost an operator? | **+1403%** |
-| `paused_rows` vs `double_backlog` | is the PAUSED anti-join predicate expensive? | **+1%** |
+| `paused_rows` vs `double_backlog` | what does that cost at equal table depth? | **+1%** |
 
-**The operational finding survives; the attribution does not.** Pausing
-executions still does not take their work out of the claim path — the rows stay
-`PENDING`, every worker still scans them on every claim, and a fleet with a large
-paused population still pays roughly the same 15x that an equal number of *live*
-rows would cost. But it pays that because the rows are *there*, not because
-`NOT EXISTS (… state = 'PAUSED')` is expensive to evaluate. Deleting the
-predicate would buy you nothing; draining the rows would buy you everything.
+The second row is *not* the cost of the anti-join predicate; see the subsection
+above for why the comparison cannot support that reading.
+
+**The operational finding survives; the attribution is the part that does not.**
+Pausing executions still does not take their work out of the claim path — the
+rows stay `PENDING`, every worker still scans them on every claim, and a fleet
+with a large paused population still pays roughly the same 15x that an equal
+number of *live* rows would cost. That is the depth-controlled result, and it is
+the actionable one: **drain the rows.** Whether the `NOT EXISTS (… state =
+'PAUSED')` predicate is *additionally* expensive to evaluate is not settled by
+these two scenarios. What bounds it is the `all_gates` row below: at this depth
+every predicate in the engine *combined* costs +28% against an equal-depth
+comparand, against the ~15x that depth alone costs. Predicate cost is not where
+the problem is, at any depth this page measures.
 
 What each row exercises, and what it means:
 
@@ -307,7 +356,10 @@ What each row exercises, and what it means:
   the cost of doubling table depth, full stop.
 * **`paused_rows` (+1% vs the control)** — 10 000 rows belonging to PAUSED
   executions on top of the claimable backlog, exercising the `NOT EXISTS`
-  anti-join (#383). Free as a predicate; expensive as table depth.
+  anti-join (#383). Expensive as table depth. The +1% is *not* the predicate's
+  isolated cost — the control sorts 20 000 rows where this scenario sorts
+  10 000, so the two effects cancel to an unknown degree; see
+  [what that control does not establish](#what-that-control-does-not-establish).
 * **`all_gates` (+1797%)** — every gate at once. Read it as "a deployment using
   all of these features", **not** as a strict upper bound on the claim path: the
   circuit-breaker tracked set short-circuits the rate-limit `EXISTS` and the
