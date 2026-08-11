@@ -338,6 +338,33 @@ impl StrikeState {
 /// queue by one owned `String` per strike until the retention window drains it.
 pub const MAX_POISON_ENTRIES: usize = 10_000;
 
+/// Shortest window an **active** (non-terminal) strike streak is held for,
+/// regardless of `poison_retention`.
+///
+/// A terminal entry is waiting out a window the *operator* chose: nothing will
+/// ever clear it, so `poison_retention` is exactly the right clock. An active
+/// streak is waiting for something else entirely — the next **redelivery** —
+/// and that interval belongs to the broker. SQS hides a nacked message for its
+/// visibility timeout, legally up to 12 hours, while the default
+/// `poison_retention` is one; sweeping both on the operator's clock therefore
+/// retires every strike before its message can come back, so every delivery is
+/// strike 1, no message ever reaches `poison_threshold`, and the harvest
+/// dead-letter sink never fires. The failure is silent — the tracker looks
+/// healthy and the message looks freshly rejected each time.
+///
+/// The value is SQS's **maximum** visibility timeout, so no legal broker
+/// configuration can redeliver later than this. It is a floor, never a cap: an
+/// operator who sets a longer `poison_retention` still gets the longer window
+/// for both kinds.
+///
+/// Holding active entries longer is safe because time was never the hard bound
+/// — [`MAX_POISON_ENTRIES`] is, and its eviction stays kind-blind precisely so
+/// this cannot outgrow it. What changes is *which* mechanism retires a stale
+/// active entry under load, and the cap already reports that as degradation via
+/// [`PoisonTracker::strike_progress_discarded`].
+pub const ACTIVE_STRIKE_RETENTION_FLOOR: std::time::Duration =
+    std::time::Duration::from_secs(12 * 60 * 60);
+
 impl PoisonTracker {
     /// A tracker with no recorded strikes.
     #[must_use]
@@ -466,18 +493,33 @@ impl PoisonTracker {
     ///
     /// Returns how many keys were retired, for diagnostics.
     ///
-    /// Non-terminal entries age out on the same clock because a strike streak
-    /// is *consecutive* by definition: a key nothing has rejected in an hour
-    /// is not mid-streak, it is a leak. Retiring one only costs that message
-    /// an extra lap if it does come back.
+    /// Non-terminal entries age out too, but never sooner than
+    /// [`ACTIVE_STRIKE_RETENTION_FLOOR`]: what advances an active streak is a
+    /// *redelivery*, so the interval it has to survive belongs to the broker,
+    /// not to the operator. See that constant.
+    ///
+    /// The queue is FIFO and this breaks at its front, so a not-yet-due active
+    /// entry holds back the due terminal entries behind it. That is memory
+    /// only, and [`MAX_POISON_ENTRIES`] — whose eviction is deliberately
+    /// kind-blind — is what bounds it. Skipping past instead would turn an
+    /// O(expired) pass into a scan of the whole queue on every sweep.
     pub fn expire_stale_as_of(
         &mut self,
         now: std::time::Instant,
         retention: std::time::Duration,
     ) -> usize {
         let mut retired = 0;
-        while let Some((at, _)) = self.expiry.front() {
-            if now.saturating_duration_since(*at) < retention {
+        while let Some((at, key)) = self.expiry.front() {
+            let due_after = if self
+                .strikes
+                .get(key)
+                .is_some_and(|s| s.terminal_at.is_none())
+            {
+                retention.max(ACTIVE_STRIKE_RETENTION_FLOOR)
+            } else {
+                retention
+            };
+            if now.saturating_duration_since(*at) < due_after {
                 break;
             }
             // `false`: retiring a stale entry is by design, not degradation. A
@@ -1585,7 +1627,10 @@ mod tests {
         // be a no-op rather than disturbing a fresh count for the same key.
         let mut t = PoisonTracker::new();
         let t0 = std::time::Instant::now();
-        let retention = std::time::Duration::from_secs(60);
+        // Above `ACTIVE_STRIKE_RETENTION_FLOOR`, so the pass genuinely POPS the
+        // stale entries and exercises the staleness guard, rather than stopping
+        // at a front entry the floor is still holding.
+        let retention = ACTIVE_STRIKE_RETENTION_FLOOR * 2;
 
         t.strike("k", t0);
         t.mark_terminal_as_of("k", t0);
@@ -1593,7 +1638,10 @@ mod tests {
         // The same coordinate comes back as a genuinely new strike run.
         t.strike("k", t0 + std::time::Duration::from_secs(30));
 
-        t.expire_stale_as_of(t0 + std::time::Duration::from_secs(61), retention);
+        t.expire_stale_as_of(
+            t0 + retention + std::time::Duration::from_secs(1),
+            retention,
+        );
         assert_eq!(
             t.strikes("k"),
             1,
@@ -1621,23 +1669,129 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_non_terminal_strike_run_ages_out() {
+    fn an_active_strike_survives_a_sweep_shorter_than_the_broker_retry_delay() {
+        // An ACTIVE strike streak is only ever advanced by a REDELIVERY, so the
+        // interval it has to survive is the broker's, not the operator's. SQS
+        // hides a nacked message for its visibility timeout -- legally up to 12
+        // hours -- and the default `poison_retention` is one. Sweeping the two
+        // on the same clock therefore retires every strike before the message
+        // can come back, so every delivery is strike 1, no message ever reaches
+        // `poison_threshold`, and the harvest dead-letter sink never fires.
+        //
+        // A TERMINAL entry has the opposite need: nothing will ever clear it,
+        // so it retires on exactly the window the operator configured.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        let retention = std::time::Duration::from_secs(60 * 60);
+        let two_hours = std::time::Duration::from_secs(2 * 60 * 60);
+
+        // Terminal first: the queue is FIFO and breaks at its front, so a young
+        // active entry ahead of this one would hold it back (see
+        // `a_young_active_strike_holds_back_the_terminal_entries_behind_it`).
+        t.mark_terminal_as_of("handed-to-broker", t0);
+        t.strike("slow-redelivery", t0);
+
+        t.expire_stale_as_of(t0 + two_hours, retention);
+
+        assert_eq!(
+            t.strikes("slow-redelivery"),
+            1,
+            "an active strike must survive until the broker could plausibly have redelivered \
+             it; expiring it restarts the countdown and the threshold is never reached"
+        );
+        assert_eq!(
+            t.tracked(),
+            1,
+            "a terminal entry still retires on the operator's own retention clock"
+        );
+    }
+
+    #[test]
+    fn a_young_active_strike_holds_back_the_terminal_entries_behind_it() {
+        // The cost of the active floor, pinned so it stays deliberate: expiry
+        // is a FIFO queue swept from the front, so a not-yet-due active entry
+        // stops the pass before the due terminal entries behind it. That is
+        // memory only -- `MAX_POISON_ENTRIES` is the hard bound, and its
+        // eviction is kind-blind precisely so this cannot grow past it.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        let retention = std::time::Duration::from_secs(60 * 60);
+        let two_hours = std::time::Duration::from_secs(2 * 60 * 60);
+
+        t.strike("slow-redelivery", t0);
+        t.mark_terminal_as_of("handed-to-broker", t0);
+
+        t.expire_stale_as_of(t0 + two_hours, retention);
+
+        assert_eq!(
+            t.tracked(),
+            2,
+            "the terminal entry is retired late because the active entry ahead of it is not \
+             yet due; the hard cap, not the clock, is what bounds this"
+        );
+    }
+
+    #[test]
+    fn a_stale_non_terminal_strike_run_ages_out_after_the_broker_retry_floor() {
         // A strike streak is CONSECUTIVE by definition, so a key nothing has
-        // rejected for a whole retention window is not mid-streak -- it is a
-        // leak. Retiring it costs that message one extra lap if it returns.
+        // rejected in a whole window is not mid-streak -- it is a leak, and
+        // retiring it costs that message one extra lap if it returns. The
+        // window is just the broker's rather than the operator's, because a
+        // redelivery is the only thing that can advance an active streak.
         let mut t = PoisonTracker::new();
         let t0 = std::time::Instant::now();
         let retention = std::time::Duration::from_secs(60);
+        let floor = ACTIVE_STRIKE_RETENTION_FLOOR;
 
         t.strike("k", t0);
-        t.expire_stale_as_of(t0 + std::time::Duration::from_secs(59), retention);
-        assert_eq!(t.strikes("k"), 1, "still inside the window");
+        // Well past the operator's own retention -- the clock this used to be
+        // swept on -- and nowhere near the interval a redelivery can take.
+        t.expire_stale_as_of(
+            t0 + retention + std::time::Duration::from_secs(1),
+            retention,
+        );
+        assert_eq!(
+            t.strikes("k"),
+            1,
+            "still inside the window a redelivery could arrive in"
+        );
 
-        t.expire_stale_as_of(t0 + std::time::Duration::from_secs(61), retention);
+        t.expire_stale_as_of(t0 + floor + std::time::Duration::from_secs(1), retention);
         assert_eq!(
             t.tracked(),
             0,
             "a non-terminal strike must not leak forever"
+        );
+    }
+
+    #[test]
+    fn a_longer_configured_retention_still_wins_for_active_strikes() {
+        // The floor is a floor, not a cap: an operator whose broker redelivers
+        // even more slowly than SQS's maximum can still widen the window, and
+        // widening it must apply to BOTH kinds.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        let retention = ACTIVE_STRIKE_RETENTION_FLOOR * 2;
+
+        t.strike("k", t0);
+        t.expire_stale_as_of(
+            t0 + ACTIVE_STRIKE_RETENTION_FLOOR + std::time::Duration::from_secs(1),
+            retention,
+        );
+        assert_eq!(
+            t.strikes("k"),
+            1,
+            "the configured retention exceeds the floor, so the floor must not shorten it"
+        );
+
+        t.expire_stale_as_of(
+            t0 + retention + std::time::Duration::from_secs(1),
+            retention,
+        );
+        assert_eq!(
+            t.tracked(),
+            0,
+            "and it still ages out at the configured window"
         );
     }
 

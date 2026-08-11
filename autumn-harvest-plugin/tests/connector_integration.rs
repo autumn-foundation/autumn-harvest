@@ -13,6 +13,7 @@
 //! | AC4 harvest failure never acks | `a_rejected_dispatch_is_never_acked_as_success` |
 //! | AC5 throttle deferral | `a_throttle_deferred_start_is_acked_not_retried` |
 //! | AC6 poison isolation | `one_poison_message_does_not_block_a_hundred_valid_ones` |
+//! | AC6 idempotent dead-lettering | `a_second_dead_letter_for_one_key_is_reported_as_already_recorded` |
 //! | AC8 provenance | `a_broker_started_execution_records_broker_provenance` |
 //! | metric | `soak_ten_thousand_messages_with_redeliveries_and_poison` |
 //!
@@ -38,8 +39,8 @@ use autumn_harvest::{WorkflowInfo, context::WorkflowContext};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime};
 use autumn_harvest_plugin::connector::{
-    ConnectorRuntime, IdempotencyMode, MappedMessage, MappingError, MockSource,
-    PostgresDeadLetterSink, SourceBinding,
+    ConnectorDeadLetter, ConnectorRuntime, DeadLetterOutcome, IdempotencyMode, MappedMessage,
+    MappingError, MockSource, PostgresDeadLetterSink, SourceBinding, insert_dead_letter,
 };
 use diesel::sql_types::{BigInt, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -514,6 +515,66 @@ async fn a_rejected_dispatch_is_never_acked_as_success() {
     .expect("dlq rows");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].v, "target_rejected");
+}
+
+#[tokio::test]
+async fn a_second_dead_letter_for_one_key_is_reported_as_already_recorded() {
+    // `ON CONFLICT (idempotency_key) DO NOTHING` makes the write idempotent,
+    // and the affected-row count is that conflict made observable. It is the
+    // only DURABLE answer to "is this a new poison message": the in-process
+    // tracker is emptied by the very restart that causes the redelivery (the
+    // process died between writing the record and acking the broker), so
+    // without this the `poisoned` counter gains a sample per restart.
+    let (url, _c) = setup_database().await;
+    let mut conn = connect(&url).await;
+    reset(&mut conn).await;
+
+    let entry = |detail: &str| ConnectorDeadLetter {
+        binding: "orders".to_string(),
+        stream: "orders".to_string(),
+        coordinates: "orders:0:1".to_string(),
+        idempotency_key: "conn:L6:orders:L0::L11:orders:0:1".to_string(),
+        workflow_name: "fulfil_order".to_string(),
+        reason: autumn_harvest::telemetry::PoisonReason::Malformed,
+        detail: detail.to_string(),
+        attempts: 1,
+        payload: b"{".to_vec(),
+        failed_at: chrono::Utc::now(),
+    };
+
+    assert_eq!(
+        insert_dead_letter(&mut conn, &entry("bad json"))
+            .await
+            .expect("first insert"),
+        DeadLetterOutcome::Recorded,
+        "the first write creates the record"
+    );
+    assert_eq!(
+        insert_dead_letter(&mut conn, &entry("bad json (again)"))
+            .await
+            .expect("second insert"),
+        DeadLetterOutcome::AlreadyRecorded,
+        "the same message came back; the row was already there, and the caller \
+         needs to know so it does not count the poison message twice"
+    );
+
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM harvest_connector_dead_letters"
+        )
+        .await,
+        1,
+        "one record per poison message, however many times it is redelivered"
+    );
+    let rows = diesel::sql_query("SELECT detail AS v FROM harvest_connector_dead_letters")
+        .load::<TextRow>(&mut conn)
+        .await
+        .expect("dlq rows");
+    assert_eq!(
+        rows[0].v, "bad json",
+        "DO NOTHING leaves the original row untouched"
+    );
 }
 
 // ─────────────────────────── AC5 ───────────────────────────

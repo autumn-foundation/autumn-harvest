@@ -114,12 +114,14 @@ pub use binding::{
     resolve_idempotency_mode, validate_bindings, validate_bindings_refs,
 };
 pub use dead_letter::{
-    ConnectorDeadLetter, DeadLetterSink, NoopDeadLetterSink, PostgresDeadLetterSink,
-    RecordingDeadLetterSink, UnconfiguredDeadLetterSink, insert_dead_letter,
+    ConnectorDeadLetter, DeadLetterOutcome, DeadLetterSink, NoopDeadLetterSink,
+    PostgresDeadLetterSink, RecordingDeadLetterSink, UnconfiguredDeadLetterSink,
+    insert_dead_letter,
 };
 pub use disposition::{
-    DeadLetterMode, DispatchOutcome, MessageDisposition, OffsetTracker, PoisonTracker,
-    broker_native_dead_letter_is_supported, decide_disposition, success_outcome,
+    ACTIVE_STRIKE_RETENTION_FLOOR, DeadLetterMode, DispatchOutcome, MessageDisposition,
+    OffsetTracker, PoisonTracker, broker_native_dead_letter_is_supported, decide_disposition,
+    success_outcome,
 };
 pub use idempotency::{
     CONNECTOR_KEY_PREFIX, MAX_KEY_COMPONENT_LEN, bound_key_component, message_idempotency_key,

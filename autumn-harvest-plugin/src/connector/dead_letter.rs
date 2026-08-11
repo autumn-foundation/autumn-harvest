@@ -50,6 +50,32 @@ pub struct ConnectorDeadLetter {
     pub failed_at: DateTime<Utc>,
 }
 
+/// Whether a [`DeadLetterSink::write`] created the record or found it already
+/// there.
+///
+/// Dead-lettering is idempotent by idempotency key, so the *same physical
+/// message* can reach a sink more than once — the runtime acks only after the
+/// write succeeds and `ack` is deliberately best-effort, so a lost commit (or a
+/// process death between the two) brings the message back. The in-process
+/// poison tracker dedupes that within one process; this is what still knows
+/// across a **restart**, which is precisely when the redelivery is most likely.
+///
+/// The runtime counts `harvest.connector.poisoned` only on
+/// [`Self::Recorded`], so one poison message contributes one sample however
+/// many times it is redelivered or however often the process restarts.
+///
+/// A sink that genuinely cannot tell — because its store has no conflict
+/// signal — returns `Recorded`, which is the pre-existing behaviour: at worst
+/// the metric over-counts a redelivery, exactly as it did before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadLetterOutcome {
+    /// This write created the record: a new poison message.
+    Recorded,
+    /// A record for this idempotency key already existed, so the write was a
+    /// no-op and this is a redelivery of an already-quarantined message.
+    AlreadyRecorded,
+}
+
 /// Where a binding's poison messages are written.
 #[async_trait]
 pub trait DeadLetterSink: Send + Sync {
@@ -59,11 +85,18 @@ pub trait DeadLetterSink: Send + Sync {
     /// returns `Ok`, so a sink failure leaves the message for redelivery
     /// rather than losing it.
     ///
+    /// Must be **idempotent by [`ConnectorDeadLetter::idempotency_key`]**: the
+    /// same physical message can arrive more than once (see
+    /// [`DeadLetterOutcome`]), and a second record for it would double-count
+    /// every dashboard built on the table. Report which of the two happened —
+    /// a sink whose store cannot tell returns [`DeadLetterOutcome::Recorded`].
+    ///
     /// # Errors
     ///
     /// Returns [`ConnectorError::Broker`] (or [`ConnectorError::Config`]) when
     /// the record could not be written.
-    async fn write(&self, entry: &ConnectorDeadLetter) -> Result<(), ConnectorError>;
+    async fn write(&self, entry: &ConnectorDeadLetter)
+    -> Result<DeadLetterOutcome, ConnectorError>;
 }
 
 /// A sink that writes to `harvest_connector_dead_letters`.
@@ -88,7 +121,10 @@ impl PostgresDeadLetterSink {
 
 #[async_trait]
 impl DeadLetterSink for PostgresDeadLetterSink {
-    async fn write(&self, entry: &ConnectorDeadLetter) -> Result<(), ConnectorError> {
+    async fn write(
+        &self,
+        entry: &ConnectorDeadLetter,
+    ) -> Result<DeadLetterOutcome, ConnectorError> {
         let mut conn = self
             .pool
             .get()
@@ -99,7 +135,7 @@ impl DeadLetterSink for PostgresDeadLetterSink {
     }
 }
 
-/// Insert one dead-letter row.
+/// Insert one dead-letter row, reporting whether it created it.
 ///
 /// Split out from the sink so integration tests can drive it against a
 /// caller-owned connection.
@@ -110,7 +146,7 @@ impl DeadLetterSink for PostgresDeadLetterSink {
 pub async fn insert_dead_letter(
     conn: &mut AsyncPgConnection,
     entry: &ConnectorDeadLetter,
-) -> Result<(), ConnectorError> {
+) -> Result<DeadLetterOutcome, ConnectorError> {
     use diesel::sql_types::{Binary, Int4, Text, Timestamptz, Uuid as SqlUuid};
     use diesel_async::RunQueryDsl;
 
@@ -118,7 +154,13 @@ pub async fn insert_dead_letter(
     // idempotent: a redelivery that dead-letters again (e.g. after a
     // connector restart reset the strike counter) must not create a second
     // record for the same message.
-    diesel::sql_query(
+    //
+    // The affected-row count is that conflict made observable: zero rows means
+    // the record was already there, which is the only durable answer to "is
+    // this a NEW poison message" once a restart has emptied the in-process
+    // tracker. Discarding it left `harvest.connector.poisoned` counting one
+    // sample per restart-redelivery of a message already quarantined.
+    let inserted = diesel::sql_query(
         "INSERT INTO harvest_connector_dead_letters \
          (id, binding, stream, coordinates, idempotency_key, workflow_name, reason, detail, \
           attempts, payload, failed_at) \
@@ -140,7 +182,11 @@ pub async fn insert_dead_letter(
     .await
     .map_err(|e| ConnectorError::Broker(format!("dead-letter insert: {e}")))?;
 
-    Ok(())
+    if inserted == 0 {
+        Ok(DeadLetterOutcome::AlreadyRecorded)
+    } else {
+        Ok(DeadLetterOutcome::Recorded)
+    }
 }
 
 /// A sink that records nothing.
@@ -162,8 +208,14 @@ pub struct NoopDeadLetterSink;
 
 #[async_trait]
 impl DeadLetterSink for NoopDeadLetterSink {
-    async fn write(&self, _entry: &ConnectorDeadLetter) -> Result<(), ConnectorError> {
-        Ok(())
+    async fn write(
+        &self,
+        _entry: &ConnectorDeadLetter,
+    ) -> Result<DeadLetterOutcome, ConnectorError> {
+        // Records nothing, so it can never observe a conflict. `Recorded` is
+        // the honest answer for a sink that cannot tell — see
+        // [`DeadLetterOutcome`].
+        Ok(DeadLetterOutcome::Recorded)
     }
 }
 
@@ -194,7 +246,10 @@ pub struct UnconfiguredDeadLetterSink;
 
 #[async_trait]
 impl DeadLetterSink for UnconfiguredDeadLetterSink {
-    async fn write(&self, _entry: &ConnectorDeadLetter) -> Result<(), ConnectorError> {
+    async fn write(
+        &self,
+        _entry: &ConnectorDeadLetter,
+    ) -> Result<DeadLetterOutcome, ConnectorError> {
         Err(ConnectorError::Config(
             "no dead-letter sink installed: this binding dead-letters into harvest, but the \
              runtime has no sink to write to. Call `with_dead_letter_sink(...)`, or switch the \
@@ -242,15 +297,34 @@ impl RecordingDeadLetterSink {
 
 #[async_trait]
 impl DeadLetterSink for RecordingDeadLetterSink {
-    async fn write(&self, entry: &ConnectorDeadLetter) -> Result<(), ConnectorError> {
+    async fn write(
+        &self,
+        entry: &ConnectorDeadLetter,
+    ) -> Result<DeadLetterOutcome, ConnectorError> {
         if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ConnectorError::Broker("recording sink failure".to_string()));
         }
-        self.entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(entry.clone());
-        Ok(())
+        // Idempotent by key, exactly like the Postgres sink's
+        // `ON CONFLICT (idempotency_key) DO NOTHING`. This sink stands in for
+        // that one in the poison-isolation suite, so diverging here would let a
+        // double-record bug pass every no-database test. The check and the push
+        // share one guard so the pair is atomic, as the SQL statement is.
+        let outcome = {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if entries
+                .iter()
+                .any(|e| e.idempotency_key == entry.idempotency_key)
+            {
+                DeadLetterOutcome::AlreadyRecorded
+            } else {
+                entries.push(entry.clone());
+                DeadLetterOutcome::Recorded
+            }
+        };
+        Ok(outcome)
     }
 }
 
@@ -330,12 +404,48 @@ mod tests {
         sink.write(&entry()).await.unwrap();
         let mut second = entry();
         second.coordinates = "orders:0:2".to_string();
+        // Distinct messages carry distinct keys -- the key is derived from the
+        // coordinates, so sharing one here would model two deliveries of the
+        // SAME message rather than two different ones.
+        second.idempotency_key = "k2".to_string();
         sink.write(&second).await.unwrap();
 
         let entries = sink.entries();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].coordinates, "orders:0:1");
         assert_eq!(entries[1].coordinates, "orders:0:2");
+    }
+
+    #[tokio::test]
+    async fn recording_sink_is_idempotent_by_key_and_says_so() {
+        // Mirrors the Postgres sink's `ON CONFLICT (idempotency_key) DO
+        // NOTHING`. The no-database poison suite runs against this sink, so a
+        // divergence here would let a double-record bug pass every test that
+        // does not need Docker.
+        let sink = RecordingDeadLetterSink::new();
+
+        assert_eq!(
+            sink.write(&entry()).await.unwrap(),
+            DeadLetterOutcome::Recorded
+        );
+
+        // The same message comes back -- a lost ack, or a restart between the
+        // write and the commit.
+        let mut redelivered = entry();
+        redelivered.detail = "bad json (again)".to_string();
+        assert_eq!(
+            sink.write(&redelivered).await.unwrap(),
+            DeadLetterOutcome::AlreadyRecorded,
+            "the key already has a record, and the caller needs to know that to \
+             avoid counting the same poison message twice"
+        );
+
+        assert_eq!(sink.entries().len(), 1, "one record per poison message");
+        assert_eq!(
+            sink.entries()[0].detail,
+            "bad json",
+            "the first record wins, exactly as DO NOTHING leaves the original row"
+        );
     }
 
     #[tokio::test]

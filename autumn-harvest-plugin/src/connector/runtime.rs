@@ -35,7 +35,9 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::binding::{IdempotencyMode, MappingError, SourceBinding, resolve_idempotency_mode};
-use super::dead_letter::{ConnectorDeadLetter, DeadLetterSink, UnconfiguredDeadLetterSink};
+use super::dead_letter::{
+    ConnectorDeadLetter, DeadLetterOutcome, DeadLetterSink, UnconfiguredDeadLetterSink,
+};
 use super::dispatch::{DispatchRequest, dispatch};
 use super::disposition::{
     DeadLetterMode, DispatchOutcome, MessageDisposition, OffsetTracker, PoisonTracker,
@@ -302,6 +304,34 @@ pub struct PassSummary {
     pub retried: usize,
     /// Messages routed to a dead-letter destination.
     pub dead_lettered: usize,
+}
+
+/// What settling a message actually did to the broker.
+///
+/// Carries more than the disposition because the harvest-sink dead-letter path
+/// learns something the disposition cannot express: whether the sink already
+/// held a record for this idempotency key. That is the *durable* half of the
+/// poison dedupe — the in-process tracker only answers it within one process,
+/// and a restart between the sink write and the ack is exactly when the
+/// redelivery happens.
+#[derive(Debug)]
+struct Settlement {
+    /// What actually happened, which may be a downgrade of what was decided.
+    disposition: MessageDisposition,
+    /// The sink's verdict, on the one path that has one: `None` for every
+    /// disposition that never reaches a sink (including a dead-letter whose
+    /// write *failed*, which is downgraded to a retry and recorded nothing).
+    dead_letter: Option<DeadLetterOutcome>,
+}
+
+impl Settlement {
+    /// A settlement that never consulted a dead-letter sink.
+    const fn of(disposition: MessageDisposition) -> Self {
+        Self {
+            disposition,
+            dead_letter: None,
+        }
+    }
 }
 
 impl ConnectorRuntime {
@@ -1008,7 +1038,10 @@ impl ConnectorRuntime {
         // dead-letter whose sink write failed becomes a retry), and both the
         // metrics and the strike bookkeeping must describe what actually
         // happened rather than what was intended.
-        let effective = self
+        let Settlement {
+            disposition: effective,
+            dead_letter,
+        } = self
             .settle(
                 &message,
                 &coordinates,
@@ -1072,11 +1105,18 @@ impl ConnectorRuntime {
                 .await
                 .mark_terminal_as_of(&key, std::time::Instant::now());
         } else if matches!(effective, MessageDisposition::DeadLetter(_)) {
-            count_poison = self
+            let first_here = self
                 .poison
                 .lock()
                 .await
                 .mark_sink_terminal_as_of(&key, std::time::Instant::now());
+            // The in-process mark cannot survive a restart, and a restart is
+            // exactly when the redelivery happens: the process died between
+            // writing the record and acking. The sink's own conflict signal is
+            // the durable half of the same question, so both must agree before
+            // this counts as a new poison message.
+            count_poison =
+                first_here && !matches!(dead_letter, Some(DeadLetterOutcome::AlreadyRecorded));
         } else if matches!(effective, MessageDisposition::Retry) {
             // A `Retry` reaches here for three different reasons, and only two
             // of them may keep the strikes:
@@ -1208,6 +1248,10 @@ impl ConnectorRuntime {
     /// downgraded to [`MessageDisposition::Retry`], because the message was
     /// *not* recorded anywhere and must come back rather than be counted as
     /// quarantined.
+    ///
+    /// [`Settlement::dead_letter`] carries the sink's own verdict on whether
+    /// the record already existed — the durable half of the poison-dedupe
+    /// question the in-process tracker answers only within one process.
     async fn settle(
         &self,
         message: &InboundMessage,
@@ -1216,11 +1260,11 @@ impl ConnectorRuntime {
         outcome: &DispatchOutcome,
         disposition: MessageDisposition,
         attempts: u32,
-    ) -> MessageDisposition {
+    ) -> Settlement {
         match disposition {
             MessageDisposition::Ack => {
                 self.ack(&message.handle).await;
-                MessageDisposition::Ack
+                Settlement::of(MessageDisposition::Ack)
             }
             MessageDisposition::Retry => {
                 tracing::warn!(
@@ -1230,23 +1274,27 @@ impl ConnectorRuntime {
                     "connector dispatch not durable; leaving message for redelivery"
                 );
                 self.abandon(&message.handle).await;
-                MessageDisposition::Retry
+                Settlement::of(MessageDisposition::Retry)
             }
             MessageDisposition::DeadLetter(reason) => {
                 let entry =
                     self.dead_letter_entry(message, coordinates, key, outcome, reason, attempts);
                 match self.sink.write(&entry).await {
-                    Ok(()) => {
+                    Ok(recorded) => {
                         tracing::warn!(
                             source = self.binding.name,
                             coordinates,
                             reason = reason.as_str(),
+                            already_recorded = recorded == DeadLetterOutcome::AlreadyRecorded,
                             "connector message dead-lettered"
                         );
                         // Ack only after the dead-letter record is durable, so
                         // a sink failure can never silently drop the message.
                         self.ack(&message.handle).await;
-                        MessageDisposition::DeadLetter(reason)
+                        Settlement {
+                            disposition: MessageDisposition::DeadLetter(reason),
+                            dead_letter: Some(recorded),
+                        }
                     }
                     Err(e) => {
                         tracing::error!(
@@ -1256,7 +1304,7 @@ impl ConnectorRuntime {
                             "dead-letter write failed; leaving message for redelivery"
                         );
                         self.abandon(&message.handle).await;
-                        MessageDisposition::Retry
+                        Settlement::of(MessageDisposition::Retry)
                     }
                 }
             }
@@ -1272,7 +1320,7 @@ impl ConnectorRuntime {
                 // threshold), unlike `abandon`, which is the gentler
                 // transient-retry return.
                 self.nack_for_dead_letter(&message.handle).await;
-                MessageDisposition::AbandonToBrokerDeadLetter(reason)
+                Settlement::of(MessageDisposition::AbandonToBrokerDeadLetter(reason))
             }
         }
     }
@@ -1608,7 +1656,7 @@ mod tests {
         async fn write(
             &self,
             _entry: &crate::connector::dead_letter::ConnectorDeadLetter,
-        ) -> Result<(), ConnectorError> {
+        ) -> Result<DeadLetterOutcome, ConnectorError> {
             panic!("engine-side dead-letter sink panic");
         }
     }
@@ -1627,9 +1675,9 @@ mod tests {
         async fn write(
             &self,
             _entry: &crate::connector::dead_letter::ConnectorDeadLetter,
-        ) -> Result<(), ConnectorError> {
+        ) -> Result<DeadLetterOutcome, ConnectorError> {
             self.0.cancelled().await;
-            Ok(())
+            Ok(DeadLetterOutcome::Recorded)
         }
     }
 
@@ -1942,6 +1990,59 @@ mod tests {
         // A genuinely different poison message still counts.
         source.push_kafka(0, 2, b"not json");
         rt.run_once().await.unwrap();
+        assert_eq!(metrics.poisoned().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_poison_already_in_the_dead_letter_table_is_not_recounted_after_a_restart() {
+        // The in-process dedupe above cannot survive a restart, and the restart
+        // is exactly when a redelivery is most likely: the process died between
+        // writing the dead-letter record and acking the broker. The durable
+        // table is what still knows, and its insert is already
+        // `ON CONFLICT (idempotency_key) DO NOTHING` -- so whether that insert
+        // won is the authoritative "is this a new poison message" answer, and
+        // it has to reach the metric.
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let metrics = Arc::new(RecordingMetrics::default());
+
+        let source = Arc::new(MockSource::new("orders"));
+        let rt = runtime_with_metrics(
+            malformed_binding(),
+            Arc::clone(&source),
+            Arc::clone(&sink),
+            Arc::clone(&metrics),
+        );
+        source.push_kafka(0, 1, b"not json");
+        rt.run_once().await.unwrap();
+        assert_eq!(metrics.poisoned().len(), 1, "the first quarantine counts");
+
+        // Restart: a brand-new runtime -- so an EMPTY poison tracker -- over the
+        // same durable sink, and the broker hands the message back.
+        let restarted_source = Arc::new(MockSource::new("orders"));
+        let restarted = runtime_with_metrics(
+            malformed_binding(),
+            Arc::clone(&restarted_source),
+            Arc::clone(&sink),
+            Arc::clone(&metrics),
+        );
+        restarted_source.push_kafka(0, 1, b"not json");
+        restarted.run_once().await.unwrap();
+
+        assert_eq!(
+            metrics.poisoned().len(),
+            1,
+            "the durable record already existed, so this is the same physical poison message; \
+             counting it again inflates poison alerts by one per restart-redelivery"
+        );
+        assert_eq!(
+            sink.entries().len(),
+            1,
+            "and dead-lettering stays idempotent -- one record per poison message"
+        );
+
+        // A genuinely different message is still a new poison message.
+        restarted_source.push_kafka(0, 2, b"not json");
+        restarted.run_once().await.unwrap();
         assert_eq!(metrics.poisoned().len(), 2);
     }
 

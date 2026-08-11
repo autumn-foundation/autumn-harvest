@@ -1275,6 +1275,46 @@ coordinates, so a run traces back to the exact message.
   budget doing it. `run` now refuses, and `ConnectorRuntime` documents itself
   as single-use. RED: `a_hard_stopped_runtime_refuses_to_run_again` spun for
   the full 5s bound and now returns having consumed nothing.
+- **A long visibility timeout silently disabled strike-based quarantine.**
+  Expiry swept active strikes and terminal entries on the same
+  `poison_retention` clock, but the two are waiting for different things: a
+  terminal entry waits out a window the *operator* chose, while an active
+  streak is only ever advanced by a **redelivery**, whose interval belongs to
+  the broker. SQS may hide a nacked message for up to 12 hours and the default
+  retention is one, so every strike expired before its message came back —
+  every delivery was strike 1, nothing ever reached `poison_threshold`, and the
+  harvest dead-letter sink never fired. Silently: the tracker looked healthy and
+  each delivery looked freshly rejected. Active entries now hold for at least
+  `ACTIVE_STRIKE_RETENTION_FLOOR` (SQS's *maximum* visibility timeout, so no
+  legal configuration can redeliver later), as a floor and never a cap — a
+  longer configured retention still wins, for both kinds. Time was never the
+  hard bound (`MAX_POISON_ENTRIES` is, and its eviction stays kind-blind), so
+  this changes *which* mechanism retires a stale active entry under load, and
+  that one already reports itself via `strike_progress_discarded`. The cost is
+  pinned rather than left to be discovered: the queue is FIFO and breaks at its
+  front, so a not-yet-due active entry holds back the due terminal entries
+  behind it. RED:
+  `an_active_strike_survives_a_sweep_shorter_than_the_broker_retry_delay`, plus
+  `a_young_active_strike_holds_back_the_terminal_entries_behind_it` and
+  `a_longer_configured_retention_still_wins_for_active_strikes`.
+- **`harvest.connector.poisoned` gained a sample per restart-redelivery.** The
+  dedupe above is in-process, and a restart is exactly when the redelivery
+  happens — the process died between writing the dead-letter record and acking
+  the broker. The durable table already knew (`ON CONFLICT (idempotency_key) DO
+  NOTHING`), but `insert_dead_letter` discarded the affected-row count, so the
+  one authoritative answer to "is this a new poison message" was thrown away.
+  `DeadLetterSink::write` now returns `DeadLetterOutcome::{Recorded,
+  AlreadyRecorded}` and the runtime counts only when *both* the local mark and
+  the sink's verdict say new. A sink whose store cannot tell returns
+  `Recorded`, which is the status quo. `RecordingDeadLetterSink` became
+  idempotent by key to match the Postgres one — it stands in for it across the
+  whole no-database poison suite, so diverging there would let a double-record
+  bug pass every test that does not need Docker. The trait ships for the first
+  time in this PR, so the signature change breaks no implementor. RED:
+  `a_poison_already_in_the_dead_letter_table_is_not_recounted_after_a_restart`
+  (two runtimes, one sink — a restart), plus
+  `recording_sink_is_idempotent_by_key_and_says_so` and, against a real
+  Postgres, `a_second_dead_letter_for_one_key_is_reported_as_already_recorded`.
 
 ### Success metric
 
