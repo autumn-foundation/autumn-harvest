@@ -1104,8 +1104,16 @@ pub fn redact_url(url: &str) -> String {
 /// `[a-z0-9_]` by construction — [`BENCH_DB_PREFIX`] plus a pid, a hex run
 /// token and a counter — so the constraint is satisfied without an encoder that
 /// would never run.
-#[must_use]
-pub fn with_db_name(url: &str, db: &str) -> String {
+///
+/// # Errors
+///
+/// Returns `Err` when the keyword/value form has a tail the tokenizer cannot
+/// consume. Every such stop is one libpq also rejects, so the input would not
+/// connect as written; it is refused rather than repaired because a repaired
+/// string could silently select a *different* database, and this harness runs
+/// migrations and `TRUNCATE` through the result. The URL form is always
+/// rewritable and never errors.
+pub fn with_db_name(url: &str, db: &str) -> Result<String, String> {
     // Keyword/value form (`host=h dbname=admin`): no `://`, no path.
     let Some(parts) = split_driver_url(url) else {
         let (pairs, stopped) = keyword_value_pairs(url);
@@ -1117,18 +1125,36 @@ pub fn with_db_name(url: &str, db: &str) -> String {
             // ` dbname=…` suffix. See [`requote_keyword_value`].
             .map(|p| format!("{}={}", p.key, requote_keyword_value(p.raw_value)))
             .collect();
-        // Anything the parser could not consume is carried verbatim rather
-        // than dropped: silently losing `sslmode=require` is the exact
-        // unreachable-server failure this function exists to avoid. It is
-        // carried *before* the replacement, so libpq's last-wins assignment
-        // still resolves to our database even if the remainder hides a
-        // `dbname` we could not parse out.
+        // A tail the tokenizer could not consume is **refused**, not carried and
+        // not dropped. Carrying it is unsafe in both possible orderings, and
+        // dropping it would silently discard part of the operator's config.
+        //
+        // Every stop condition here is one the driver itself rejects — a stray
+        // `=`, a keyword with no `=`, an empty value, an unterminated quote —
+        // so the tail is never valid text we are failing to understand. Carried
+        // *before* the selector, an incomplete pair swallows it: the driver
+        // skips whitespace after `=`, so `application_name= dbname=<db>` reads
+        // the selector as the application name, and with the original `dbname`
+        // already filtered out the string selects nothing and libpq falls back
+        // to the username database. Carried *after* the selector, a `dbname`
+        // hidden in the tail would win on libpq's last-wins rule. There is no
+        // third position, and the tail cannot be quoted because it is not a
+        // value.
         let rest = url[stopped..].trim();
         if !rest.is_empty() {
-            out.push(rest.to_string());
+            return Err(format!(
+                "cannot rewrite the database of a connection string this harness \
+                 cannot fully parse: stopped at byte {stopped}, remaining tail \
+                 {rest:?}. Every stop here is one libpq also rejects (a stray \
+                 `=`, a keyword with no `=`, an empty value, or an unterminated \
+                 quote), so this string would not connect as written. It is \
+                 refused rather than repaired because the repaired form could \
+                 silently select a different database, and this harness runs \
+                 migrations and TRUNCATE through the result."
+            ));
         }
         out.push(format!("dbname={db}"));
-        return out.join(" ");
+        return Ok(out.join(" "));
     };
 
     let kept: Vec<&str> = parts
@@ -1148,7 +1174,7 @@ pub fn with_db_name(url: &str, db: &str) -> String {
         out.push('?');
         out.push_str(&kept.join("&"));
     }
-    out
+    Ok(out)
 }
 
 /// Read the database name back out of a connection string.
@@ -1852,7 +1878,8 @@ mod pure_tests {
     /// Read as keyword form, `dbname` is replaced and every other pair is kept.
     #[test]
     fn with_db_name_treats_a_scheme_inside_a_value_as_keyword_form() {
-        let rewritten = with_db_name("host=db dbname=admin password=http://hunter2", "bench");
+        let rewritten =
+            with_db_name("host=db dbname=admin password=http://hunter2", "bench").expect("valid");
         assert!(
             rewritten.contains("dbname=bench"),
             "target not rewritten: {rewritten}"
@@ -1926,7 +1953,8 @@ mod pure_tests {
         let rewritten = with_db_name(
             "postgres://alice:sec/ret@db.internal:5432/postgres",
             "bench",
-        );
+        )
+        .expect("valid");
         assert_eq!(rewritten, "postgres://alice:sec/ret@db.internal:5432/bench");
     }
 
@@ -2286,7 +2314,8 @@ mod pure_tests {
             "postgres://u:p@h:5432/postgres?sslrootcert=/etc/ssl/root.crt",
             "postgres://host",
         ] {
-            let rewritten = with_db_name(base, "harvest_claim_bench_1_deadbeefdeadbeef_0");
+            let rewritten =
+                with_db_name(base, "harvest_claim_bench_1_deadbeefdeadbeef_0").expect("valid");
             assert_eq!(
                 db_name_from_url(&rewritten).as_deref(),
                 Some("harvest_claim_bench_1_deadbeefdeadbeef_0"),
@@ -2300,7 +2329,8 @@ mod pure_tests {
         // Dropping `?sslmode=require` makes a TLS-requiring server unreachable
         // through the advertised existing-server mode.
         assert_eq!(
-            with_db_name("postgres://u:p@h:5432/postgres?sslmode=require", "bench_1"),
+            with_db_name("postgres://u:p@h:5432/postgres?sslmode=require", "bench_1")
+                .expect("valid"),
             "postgres://u:p@h:5432/bench_1?sslmode=require",
         );
     }
@@ -2313,7 +2343,8 @@ mod pure_tests {
             with_db_name(
                 "postgres://h:5432/postgres?sslrootcert=/etc/ssl/root.crt",
                 "bench_1",
-            ),
+            )
+            .expect("valid"),
             "postgres://h:5432/bench_1?sslrootcert=/etc/ssl/root.crt",
         );
     }
@@ -2329,19 +2360,20 @@ mod pure_tests {
     #[test]
     fn with_db_name_removes_an_overriding_dbname_query_parameter() {
         assert_eq!(
-            with_db_name("postgres://h:5432/admin?dbname=admin&sslmode=require", "b"),
+            with_db_name("postgres://h:5432/admin?dbname=admin&sslmode=require", "b")
+                .expect("valid"),
             "postgres://h:5432/b?sslmode=require",
         );
         // Case-insensitive, and the sole-parameter case must not leave a `?`.
         assert_eq!(
-            with_db_name("postgres://h:5432/admin?DBName=admin", "b"),
+            with_db_name("postgres://h:5432/admin?DBName=admin", "b").expect("valid"),
             "postgres://h:5432/b",
         );
         // No fragment concept: the driver's `parse_params` terminates a value
         // only at `&`, so `admin#frag` is the whole `dbname` value and the
         // whole thing is what gets dropped.
         assert_eq!(
-            with_db_name("postgres://h/admin?dbname=admin#frag", "b"),
+            with_db_name("postgres://h/admin?dbname=admin#frag", "b").expect("valid"),
             "postgres://h/b",
         );
     }
@@ -2361,7 +2393,8 @@ mod pure_tests {
             with_db_name(
                 "postgres://h:5432/admin?db%6Eame=admin&sslmode=require",
                 "b"
-            ),
+            )
+            .expect("valid"),
             "postgres://h:5432/b?sslmode=require",
         );
         // The reader must agree with the writer about which key counts, or one
@@ -2411,7 +2444,7 @@ mod pure_tests {
         );
         // Round-trips with what `with_db_name` emits, which is the property the
         // gate suite actually depends on.
-        let rewritten = with_db_name("host=h dbname=admin", "bench_1");
+        let rewritten = with_db_name("host=h dbname=admin", "bench_1").expect("valid");
         assert_eq!(db_name_from_url(&rewritten).as_deref(), Some("bench_1"));
         // libpq is last-wins on a repeated keyword.
         assert_eq!(
@@ -2476,15 +2509,18 @@ mod pure_tests {
         // decoded value is unchanged, and the quoting is what stops a pair from
         // absorbing the selector appended after it.
         assert_eq!(
-            with_db_name("host=h port=5432 dbname=admin", "b"),
+            with_db_name("host=h port=5432 dbname=admin", "b").expect("valid"),
             "host='h' port='5432' dbname=b",
         );
         // Absent entirely: append it rather than leaving the target implicit
         // (libpq would otherwise default the database to the username).
-        assert_eq!(with_db_name("host=h", "b"), "host='h' dbname=b");
+        assert_eq!(
+            with_db_name("host=h", "b").expect("valid"),
+            "host='h' dbname=b"
+        );
         // A quoted value elsewhere must survive the round trip intact.
         assert_eq!(
-            with_db_name("host=h password='hunter two' dbname=admin", "b"),
+            with_db_name("host=h password='hunter two' dbname=admin", "b").expect("valid"),
             "host='h' password='hunter two' dbname=b",
         );
     }
@@ -2501,7 +2537,8 @@ mod pure_tests {
     /// `TRUNCATE` against.
     #[test]
     fn with_db_name_requotes_a_value_ending_in_a_dangling_escape() {
-        let rewritten = with_db_name(r"host=h user=postgres application_name=bench\", "bench_1");
+        let rewritten = with_db_name(r"host=h user=postgres application_name=bench\", "bench_1")
+            .expect("valid");
         assert_eq!(
             rewritten,
             "host='h' user='postgres' application_name='bench' dbname=bench_1",
@@ -2514,8 +2551,8 @@ mod pure_tests {
     ///
     /// Every entry here parses cleanly, so the rewrite has to resolve to *our*
     /// database — an unparseable remainder is a different path, covered by
-    /// [`with_db_name_carries_an_unparseable_keyword_remainder`], and fails
-    /// loudly at connect rather than silently selecting the wrong database.
+    /// [`with_db_name_rejects_an_unparseable_keyword_remainder`], and is refused
+    /// outright rather than rewritten.
     #[test]
     fn with_db_name_keyword_pairs_cannot_absorb_the_appended_selector() {
         for admin in [
@@ -2527,7 +2564,7 @@ mod pure_tests {
             "host=h dbname=admin",
             "host=h",
         ] {
-            let rewritten = with_db_name(admin, "bench_1");
+            let rewritten = with_db_name(admin, "bench_1").expect("parses cleanly");
             assert_eq!(
                 db_name_from_url(&rewritten).as_deref(),
                 Some("bench_1"),
@@ -2536,37 +2573,92 @@ mod pure_tests {
         }
     }
 
-    /// An unparseable remainder must be carried, not silently dropped.
+    /// An incomplete trailing pair must be **rejected**, not carried.
     ///
-    /// Dropping it is the *same* failure the URL branch is built to avoid:
-    /// losing `?sslmode=require` makes a TLS-requiring server unreachable
-    /// through the advertised existing-server mode. The remainder is placed
-    /// before the replacement so libpq's last-wins assignment still resolves
-    /// `dbname` to ours even if the part we could not parse hides one.
+    /// `host=h user=alice dbname=admin application_name=` stops the tokenizer at
+    /// the empty assignment, and carrying that tail verbatim produced
+    /// `application_name= dbname=<bench db>`. The driver skips whitespace *after*
+    /// the `=`, so it reads `dbname=<bench db>` as the application-name value —
+    /// and because the real `dbname=admin` has already been filtered out, the
+    /// string then carries no database selector at all. libpq falls back to the
+    /// username database, which usually exists, and setup runs migrations and
+    /// `TRUNCATE` against it.
+    ///
+    /// Rejecting is the only safe option: the tail cannot be quoted (it is not a
+    /// value), and it cannot be reordered either — placed *after* the selector a
+    /// `dbname` hidden inside it would win on libpq's last-wins rule, which is
+    /// why it was placed before in the first place.
     #[test]
-    fn with_db_name_carries_an_unparseable_keyword_remainder() {
-        let rewritten = with_db_name("host=h sslmode=require dbname=admin oops", "b");
+    fn with_db_name_rejects_an_incomplete_trailing_pair() {
+        let err = with_db_name(
+            "host=h user=alice dbname=admin application_name=",
+            "bench_1",
+        )
+        .expect_err("an incomplete trailing pair must not produce a connection string");
         assert!(
-            rewritten.contains("sslmode='require'"),
-            "parameter dropped: {rewritten}"
+            err.contains("application_name="),
+            "the error must quote the tail it could not parse: {err}"
         );
-        assert!(rewritten.contains("oops"), "remainder dropped: {rewritten}");
+
+        // The other stop conditions are the same class and must also reject.
+        for malformed in [
+            "host=h user=alice dbname=admin application_name=",
+            "host=h oops",
+            "host=h = value",
+            "host=h password='unterminated",
+        ] {
+            assert!(
+                with_db_name(malformed, "bench_1").is_err(),
+                "carried an unparseable tail for {malformed}"
+            );
+        }
+
+        // A fully-parseable string is unaffected.
+        assert_eq!(
+            with_db_name("host=h dbname=admin", "bench_1").expect("valid"),
+            "host='h' dbname=bench_1",
+        );
+    }
+
+    /// An unparseable remainder is rejected — neither dropped nor carried.
+    ///
+    /// All three dispositions were considered and only rejection is safe.
+    /// *Dropping* it is the failure the URL branch is built to avoid: losing
+    /// `sslmode=require` makes a TLS-requiring server unreachable through the
+    /// advertised existing-server mode. *Carrying* it — which this test asserted
+    /// until round 33 — is worse: the tail is an incomplete pair, so the value
+    /// reader consumes whatever follows it, and what follows is the selector we
+    /// just appended.
+    ///
+    /// The error has to name the tail, because the operator's string is the only
+    /// place the problem can be fixed.
+    #[test]
+    fn with_db_name_rejects_an_unparseable_keyword_remainder() {
+        let err = with_db_name("host=h sslmode=require dbname=admin oops", "b")
+            .expect_err("an unparseable remainder must not produce a connection string");
         assert!(
-            rewritten.ends_with("dbname=b"),
-            "replacement must win last: {rewritten}"
+            err.contains("oops"),
+            "the error must quote the tail it could not parse: {err}"
         );
     }
 
     #[test]
     fn with_db_name_handles_urls_with_no_path_or_no_query() {
         assert_eq!(
-            with_db_name("postgres://postgres:postgres@localhost:5432/postgres", "b"),
+            with_db_name("postgres://postgres:postgres@localhost:5432/postgres", "b")
+                .expect("valid"),
             "postgres://postgres:postgres@localhost:5432/b",
         );
-        assert_eq!(with_db_name("postgres://host", "b"), "postgres://host/b");
-        assert_eq!(with_db_name("postgres://host/", "b"), "postgres://host/b");
         assert_eq!(
-            with_db_name("postgres://host?sslmode=require", "b"),
+            with_db_name("postgres://host", "b").expect("valid"),
+            "postgres://host/b"
+        );
+        assert_eq!(
+            with_db_name("postgres://host/", "b").expect("valid"),
+            "postgres://host/b"
+        );
+        assert_eq!(
+            with_db_name("postgres://host?sslmode=require", "b").expect("valid"),
             "postgres://host/b?sslmode=require",
         );
     }
@@ -2862,7 +2954,7 @@ pub mod db {
             // requirement the harness did not already have. Every statement
             // this session issues — the sweep's catalog query and `DROP`s, the
             // `CREATE DATABASE` — is cluster-scoped and works from anywhere.
-            let admin_conn_url = admin_connection_url(&admin_url);
+            let admin_conn_url = admin_connection_url(&admin_url)?;
             let mut admin = with_provision_deadline(
                 "connect to the admin database",
                 deadline,
@@ -2904,7 +2996,7 @@ pub mod db {
             )
             .await?
             .map_err(|e| SkipReason(format!("create database {db}: {e}")))?;
-            let url = super::with_db_name(&admin_url, &db);
+            let url = super::with_db_name(&admin_url, &db).map_err(SkipReason)?;
             let mut conn = with_provision_deadline(
                 "connect the ownership lease",
                 deadline,
@@ -3134,8 +3226,8 @@ pub mod db {
     ///
     /// Extracted so the choice is assertable rather than buried in a connect
     /// call — see `provisioning_connects_through_the_fixed_database`.
-    pub fn admin_connection_url(admin_url: &str) -> String {
-        super::with_db_name(admin_url, SWEEP_LOCK_DB)
+    pub fn admin_connection_url(admin_url: &str) -> Result<String, SkipReason> {
+        super::with_db_name(admin_url, SWEEP_LOCK_DB).map_err(SkipReason)
     }
 
     /// Take the sweep lock, blocking until a peer releases it.
@@ -3157,19 +3249,18 @@ pub mod db {
         // before its lease connects. A warning does not protect anybody's data,
         // so an unreachable `SWEEP_LOCK_DB` is terminal: better a run that does
         // not start than a run that silently cannot serialize.
-        let mut lock = AsyncPgConnection::establish(&super::with_db_name(admin_url, SWEEP_LOCK_DB))
-            .await
-            .map_err(|e| {
-                SkipReason(format!(
-                    "connect {SWEEP_LOCK_DB} for the sweep lock: {e}. The benchmark \
+        let lock_url = super::with_db_name(admin_url, SWEEP_LOCK_DB).map_err(SkipReason)?;
+        let mut lock = AsyncPgConnection::establish(&lock_url).await.map_err(|e| {
+            SkipReason(format!(
+                "connect {SWEEP_LOCK_DB} for the sweep lock: {e}. The benchmark \
                          serializes its stale-database sweep through `{SWEEP_LOCK_DB}` so \
                          that clients reaching this cluster through different admin \
                          databases still coordinate; without it a concurrent run could \
                          drop this one's database. Grant the role CONNECT on \
                          `{SWEEP_LOCK_DB}`, or point HARVEST_TEST_DATABASE_URL at a \
                          cluster where it is reachable."
-                ))
-            })?;
+            ))
+        })?;
         // `lock_timeout` covers advisory locks, so a peer that wedges while
         // holding the lock aborts our wait with an error instead of hanging.
         diesel::sql_query(format!("SET lock_timeout = '{SWEEP_LOCK_TIMEOUT}'"))

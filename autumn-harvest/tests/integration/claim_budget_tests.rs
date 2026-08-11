@@ -1131,7 +1131,8 @@ async fn setup_waits_for_a_peers_sweep_before_creating_its_database() {
         );
         return;
     };
-    let lock_url = with_db_name(&admin_url, db::SWEEP_LOCK_DB);
+    let lock_url = with_db_name(&admin_url, db::SWEEP_LOCK_DB)
+        .expect("HARVEST_TEST_DATABASE_URL must be a connection string the harness can rewrite");
     let Ok(mut holder) = AsyncPgConnection::establish(&lock_url).await else {
         eprintln!("SKIP setup_waits_for_a_peers_sweep_before_creating_its_database: no server");
         return;
@@ -1244,7 +1245,9 @@ async fn the_sweep_lock_is_taken_in_a_fixed_database_not_the_admin_url_s() {
     // concurrent sweep cannot delete it mid-probe, which also means nothing
     // would ever reclaim it. So the probe reports failures instead of
     // `expect`ing them, and the assertions run after cleanup.
-    let outcome = probe_sweep_lock_scope(&with_db_name(&admin_url, &scratch), &admin_url).await;
+    let scratch_url = with_db_name(&admin_url, &scratch)
+        .expect("HARVEST_TEST_DATABASE_URL must be a connection string the harness can rewrite");
+    let outcome = probe_sweep_lock_scope(&scratch_url, &admin_url).await;
 
     let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {scratch}"))
         .execute(&mut admin)
@@ -1273,7 +1276,8 @@ async fn probe_sweep_lock_scope(probe_admin_url: &str, admin_url: &str) -> Resul
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
     // The peer, holding the lock where the harness agrees it lives.
-    let mut holder = AsyncPgConnection::establish(&with_db_name(admin_url, db::SWEEP_LOCK_DB))
+    let holder_url = with_db_name(admin_url, db::SWEEP_LOCK_DB)?;
+    let mut holder = AsyncPgConnection::establish(&holder_url)
         .await
         .map_err(|e| format!("connect {}: {e}", db::SWEEP_LOCK_DB))?;
     diesel::sql_query("SELECT pg_advisory_lock($1)")
@@ -1364,12 +1368,13 @@ async fn a_dbname_query_parameter_cannot_redirect_the_connection() {
 
     // An operator's admin URL that selects its database by query parameter —
     // valid libpq, and the shape that triggers the bug.
-    let normalized = with_db_name(&admin_url, "postgres");
+    let normalized = with_db_name(&admin_url, "postgres")
+        .expect("HARVEST_TEST_DATABASE_URL must be a connection string the harness can rewrite");
     let joiner = if normalized.contains('?') { '&' } else { '?' };
     let contaminated = format!("{normalized}{joiner}dbname={decoy}");
 
     // Exactly what the harness does to reach the sweep-lock database.
-    let rewritten = with_db_name(&contaminated, "postgres");
+    let rewritten = with_db_name(&contaminated, "postgres").expect("valid");
 
     let landed = async {
         let mut conn = AsyncPgConnection::establish(&rewritten).await.ok()?;
@@ -1603,7 +1608,7 @@ async fn version_neutral_drop_evicts_a_live_backend() {
     // Hold a connection open across the drop. Kept in scope deliberately — this
     // is the condition under test, and dropping it early would make the
     // assertion pass without exercising the terminate step at all.
-    let victim_url = with_db_name(&bench.url, &victim);
+    let victim_url = with_db_name(&bench.url, &victim).expect("the harness url is rewritable");
     let occupant = AsyncPgConnection::establish(&victim_url)
         .await
         .expect("connect to the victim database");
@@ -1659,7 +1664,7 @@ fn provisioning_connects_through_the_fixed_database() {
         "postgres://u:p@h:5432/some_other_admin_db",
         "host=h user=u dbname=template1",
     ] {
-        let chosen = db::admin_connection_url(admin_url);
+        let chosen = db::admin_connection_url(admin_url).expect("valid");
         assert_eq!(
             db_name_from_url(&chosen).as_deref(),
             Some(db::SWEEP_LOCK_DB),
@@ -1697,8 +1702,9 @@ async fn a_template1_backend_blocks_create_database_but_ours_does_not() {
         );
         return;
     };
-    let Ok(mut creator) = AsyncPgConnection::establish(&with_db_name(&admin_url, "postgres")).await
-    else {
+    let creator_url = with_db_name(&admin_url, "postgres")
+        .expect("HARVEST_TEST_DATABASE_URL must be a connection string the harness can rewrite");
+    let Ok(mut creator) = AsyncPgConnection::establish(&creator_url).await else {
         eprintln!("SKIP a_template1_backend_blocks_create_database_but_ours_does_not: no server");
         return;
     };
@@ -1710,7 +1716,8 @@ async fn a_template1_backend_blocks_create_database_but_ours_does_not() {
     );
 
     // An admin URL an operator could plausibly hold, pointed at the template.
-    let operator_url = with_db_name(&admin_url, "template1");
+    let operator_url = with_db_name(&admin_url, "template1")
+        .expect("HARVEST_TEST_DATABASE_URL must be a connection string the harness can rewrite");
 
     // Half one: the hazard. Under the old behaviour this is where a waiting
     // client's provisioning session sat.
@@ -1734,8 +1741,9 @@ async fn a_template1_backend_blocks_create_database_but_ours_does_not() {
 
     // Half two: the regression guard. Same operator URL, but opened the way the
     // harness now opens it.
-    let Ok(_ours) = AsyncPgConnection::establish(&db::admin_connection_url(&operator_url)).await
-    else {
+    let ours_url = db::admin_connection_url(&operator_url)
+        .expect("HARVEST_TEST_DATABASE_URL must be a connection string the harness can rewrite");
+    let Ok(_ours) = AsyncPgConnection::establish(&ours_url).await else {
         eprintln!(
             "SKIP a_template1_backend_blocks_create_database_but_ours_does_not: \
              fixed database not connectable"
