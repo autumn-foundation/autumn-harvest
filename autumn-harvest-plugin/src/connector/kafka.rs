@@ -33,6 +33,22 @@ use std::sync::Arc;
 use super::message::{InboundMessage, MessageCoordinates, MessageHandle};
 use super::source::{ConnectorError, EventSource};
 
+/// Where a consumer group starts when it has **no committed offset** for a
+/// partition — librdkafka's `auto.offset.reset`.
+///
+/// Only meaningful for an uncommitted partition: once the group has committed,
+/// it resumes from the commit and this policy never applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetReset {
+    /// Start at the low watermark: an uncommitted partition owes its whole
+    /// retained log. Harvest's default, so a binding added to an existing topic
+    /// does not silently skip the backlog.
+    Earliest,
+    /// Start at the high watermark: an uncommitted partition owes nothing,
+    /// because a restart would resume at the tail rather than replay.
+    Latest,
+}
+
 /// Connection settings for a [`KafkaSource`].
 #[derive(Debug, Clone)]
 pub struct KafkaSourceConfig {
@@ -70,6 +86,34 @@ impl KafkaSourceConfig {
     pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra.push((key.into(), value.into()));
         self
+    }
+
+    /// The `auto.offset.reset` librdkafka will actually apply.
+    ///
+    /// Mirrors [`Self::to_client_config`]'s precedence exactly — the `earliest`
+    /// default, then `extra` overriding it, last write winning — so the lag
+    /// gauge cannot disagree with the running consumer about where an
+    /// uncommitted partition resumes.
+    ///
+    /// Deliberately NOT forced the way `enable.auto.commit` is: auto-commit
+    /// would break the ack-after-commit contract, whereas an offset-reset
+    /// policy breaks no invariant and is a legitimate caller choice (a new
+    /// binding on a huge existing topic may well want only new messages). An
+    /// unrecognised value maps to `Earliest`, matching the default — librdkafka
+    /// rejects a genuinely invalid value at client-create time, so such a
+    /// string never reaches a running consumer.
+    #[must_use]
+    pub fn effective_offset_reset(&self) -> OffsetReset {
+        self.extra
+            .iter()
+            .rev()
+            .find(|(k, _)| k.eq_ignore_ascii_case("auto.offset.reset"))
+            .map_or(OffsetReset::Earliest, |(_, v)| {
+                match v.trim().to_ascii_lowercase().as_str() {
+                    "latest" | "end" | "largest" => OffsetReset::Latest,
+                    _ => OffsetReset::Earliest,
+                }
+            })
     }
 
     /// Build the `librdkafka` client config this source will use.
@@ -343,6 +387,9 @@ impl EventSource for KafkaSource {
     async fn lag(&self) -> Option<i64> {
         let consumer = self.consumer();
         let topic = self.topic.clone();
+        // The policy the RUNNING consumer uses, so an uncommitted partition is
+        // baselined where that consumer would actually resume.
+        let reset = self.config.effective_offset_reset();
         // `fetch_watermarks` is a blocking librdkafka call.
         tokio::task::spawn_blocking(move || {
             let timeout = std::time::Duration::from_secs(2);
@@ -396,7 +443,7 @@ impl EventSource for KafkaSource {
             }
             let committed = consumer.committed_offsets(wanted, timeout).ok()?;
 
-            group_lag(&topic, &partitions, &committed, |partition| {
+            group_lag(&topic, &partitions, &committed, reset, |partition| {
                 consumer.fetch_watermarks(&topic, partition, timeout).ok()
             })
         })
@@ -480,8 +527,8 @@ fn canonical_broker_list(brokers: &str) -> String {
 /// `partitions` is the topic's full partition set from metadata, so the total
 /// is the GROUP's backlog rather than the calling replica's share of it. A
 /// partition with no entry in `committed` — one the group has never committed,
-/// which is the common shape for a partition owned by another replica — counts
-/// its whole retained backlog, per [`partition_lag`].
+/// which is the common shape for a partition owned by another replica — is
+/// baselined by `reset`, per [`partition_lag`].
 ///
 /// Returns `None` if any watermark is unavailable. A partial sum is
 /// indistinguishable from a real drop in backlog, and reporting one would turn
@@ -490,6 +537,7 @@ fn group_lag(
     topic: &str,
     partitions: &[i32],
     committed: &TopicPartitionList,
+    reset: OffsetReset,
     watermarks: impl Fn(i32) -> Option<(i64, i64)>,
 ) -> Option<i64> {
     let mut total: i64 = 0;
@@ -498,7 +546,7 @@ fn group_lag(
         let offset = committed
             .find_partition(topic, partition)
             .map_or(Offset::Invalid, |p| p.offset());
-        total = total.saturating_add(partition_lag(low, high, offset));
+        total = total.saturating_add(partition_lag(low, high, offset, reset));
     }
     Some(total)
 }
@@ -510,14 +558,19 @@ fn group_lag(
 /// consumer is pinned to `auto.offset.reset = earliest`, so a restart reads
 /// from the low watermark. Reporting zero for such a partition would hide a
 /// consumer that has processed nothing.
-fn partition_lag(low: i64, high: i64, committed: Offset) -> i64 {
+fn partition_lag(low: i64, high: i64, committed: Offset, reset: OffsetReset) -> i64 {
     let current = match committed {
         // Retention can advance `low` past an old commit. Those records are
         // gone from the log, so subtracting from the stale commit would report
         // a backlog the consumer can never read -- a permanent false alarm on
         // exactly the gauge operators page on.
         Offset::Offset(o) => o.max(low),
-        _ => low,
+        // Nothing committed: the group resumes wherever its reset policy says,
+        // so that is the honest baseline for what a restart would replay.
+        _ => match reset {
+            OffsetReset::Earliest => low,
+            OffsetReset::Latest => high,
+        },
     };
     (high - current).max(0)
 }
@@ -525,6 +578,71 @@ fn partition_lag(low: i64, high: i64, committed: Offset) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A group configured to start at the tail owes nothing for a partition it
+    /// has never committed.
+    ///
+    /// `to_client_config` applies `extra` AFTER its `earliest` default, so a
+    /// caller's `.property("auto.offset.reset", "latest")` is what librdkafka
+    /// actually uses — unlike `enable.auto.commit`, which is forced last
+    /// because auto-commit would break the ack-after-commit contract. An
+    /// offset-reset policy breaks no invariant, so it stays the caller's
+    /// choice, and the gauge has to honour it: baselining an uncommitted
+    /// partition at the LOW watermark would report the topic's whole retained
+    /// history as backlog for a brand-new latest-starting group, and on a quiet
+    /// topic nothing ever commits, so that false backlog would never drain.
+    #[test]
+    fn a_latest_group_owes_nothing_for_an_uncommitted_partition() {
+        assert_eq!(
+            partition_lag(0, 500, Offset::Invalid, OffsetReset::Latest),
+            0,
+            "a latest-starting group resumes at the high watermark, so nothing is owed"
+        );
+        assert_eq!(
+            partition_lag(0, 500, Offset::Invalid, OffsetReset::Earliest),
+            500,
+            "an earliest-starting group would replay the whole retained log"
+        );
+        // Once the group HAS committed, the reset policy is irrelevant: it only
+        // applies when there is no committed offset to resume from.
+        assert_eq!(
+            partition_lag(0, 500, Offset::Offset(450), OffsetReset::Latest),
+            50
+        );
+        assert_eq!(
+            partition_lag(0, 500, Offset::Offset(450), OffsetReset::Earliest),
+            50
+        );
+    }
+
+    #[test]
+    fn the_effective_offset_reset_honours_a_caller_override() {
+        let default = KafkaSourceConfig::new("b:9092", "g", "orders");
+        assert_eq!(default.effective_offset_reset(), OffsetReset::Earliest);
+
+        let latest =
+            KafkaSourceConfig::new("b:9092", "g", "orders").property("auto.offset.reset", "latest");
+        assert_eq!(latest.effective_offset_reset(), OffsetReset::Latest);
+
+        // librdkafka's aliases, and a last-write-wins override.
+        for alias in ["latest", "end", "largest", "LATEST"] {
+            let cfg = KafkaSourceConfig::new("b:9092", "g", "orders")
+                .property("auto.offset.reset", alias);
+            assert_eq!(
+                cfg.effective_offset_reset(),
+                OffsetReset::Latest,
+                "{alias} selects the tail"
+            );
+        }
+        let flipped = KafkaSourceConfig::new("b:9092", "g", "orders")
+            .property("auto.offset.reset", "latest")
+            .property("auto.offset.reset", "earliest");
+        assert_eq!(
+            flipped.effective_offset_reset(),
+            OffsetReset::Earliest,
+            "the LAST extra wins, matching to_client_config"
+        );
+    }
 
     /// A partition the local replica has never committed still contributes its
     /// full retained backlog.
@@ -545,12 +663,18 @@ mod tests {
             .add_partition_offset("orders", 0, Offset::Offset(40))
             .expect("valid offset");
 
-        let total = group_lag("orders", &[0, 1, 2], &committed, |p| match p {
-            0 => Some((0, 100)),
-            1 => Some((0, 7)),
-            2 => Some((10, 25)),
-            _ => None,
-        })
+        let total = group_lag(
+            "orders",
+            &[0, 1, 2],
+            &committed,
+            OffsetReset::Earliest,
+            |p| match p {
+                0 => Some((0, 100)),
+                1 => Some((0, 7)),
+                2 => Some((10, 25)),
+                _ => None,
+            },
+        )
         .expect("watermarks available for every partition");
 
         // 60 outstanding on p0, then the whole backlog of the two the group has
@@ -571,10 +695,22 @@ mod tests {
         }
         let watermarks = |_p: i32| Some((0, 30));
 
-        let one_replicas_share =
-            group_lag("orders", &[0, 1], &committed, watermarks).expect("watermarks available");
-        let whole_group = group_lag("orders", &[0, 1, 2, 3], &committed, watermarks)
-            .expect("watermarks available");
+        let one_replicas_share = group_lag(
+            "orders",
+            &[0, 1],
+            &committed,
+            OffsetReset::Earliest,
+            watermarks,
+        )
+        .expect("watermarks available");
+        let whole_group = group_lag(
+            "orders",
+            &[0, 1, 2, 3],
+            &committed,
+            OffsetReset::Earliest,
+            watermarks,
+        )
+        .expect("watermarks available");
 
         assert_eq!(
             one_replicas_share, 40,
@@ -594,7 +730,8 @@ mod tests {
     fn group_lag_is_none_when_a_watermark_is_unavailable() {
         let committed = TopicPartitionList::new();
         assert!(
-            group_lag("orders", &[0, 1], &committed, |p| (p == 0)
+            group_lag("orders", &[0, 1], &committed, OffsetReset::Earliest, |p| (p
+                == 0)
                 .then_some((0, 5)))
             .is_none()
         );
@@ -704,27 +841,45 @@ mod tests {
         // records are gone from the log, so counting them reports a backlog
         // the consumer can never read and cannot ever work off. Only the 100
         // records still between `low` and `high` are outstanding.
-        assert_eq!(partition_lag(1000, 1100, Offset::Offset(0)), 100);
+        assert_eq!(
+            partition_lag(1000, 1100, Offset::Offset(0), OffsetReset::Earliest),
+            100
+        );
     }
 
     #[test]
     fn an_uncommitted_partition_reports_the_whole_retained_backlog() {
         // `auto.offset.reset = earliest`, so a restart replays from `low`.
-        assert_eq!(partition_lag(1000, 1100, Offset::Invalid), 100);
-        assert_eq!(partition_lag(0, 50, Offset::Beginning), 50);
+        assert_eq!(
+            partition_lag(1000, 1100, Offset::Invalid, OffsetReset::Earliest),
+            100
+        );
+        assert_eq!(
+            partition_lag(0, 50, Offset::Beginning, OffsetReset::Earliest),
+            50
+        );
     }
 
     #[test]
     fn a_committed_offset_inside_the_window_subtracts_normally() {
-        assert_eq!(partition_lag(1000, 1100, Offset::Offset(1040)), 60);
+        assert_eq!(
+            partition_lag(1000, 1100, Offset::Offset(1040), OffsetReset::Earliest),
+            60
+        );
     }
 
     #[test]
     fn a_caught_up_partition_never_reports_negative_lag() {
-        assert_eq!(partition_lag(1000, 1100, Offset::Offset(1100)), 0);
+        assert_eq!(
+            partition_lag(1000, 1100, Offset::Offset(1100), OffsetReset::Earliest),
+            0
+        );
         // A commit past `high` is not expected, but must not underflow into a
         // huge unsigned-looking number through `saturating_add`.
-        assert_eq!(partition_lag(1000, 1100, Offset::Offset(1200)), 0);
+        assert_eq!(
+            partition_lag(1000, 1100, Offset::Offset(1200), OffsetReset::Earliest),
+            0
+        );
     }
 
     #[test]

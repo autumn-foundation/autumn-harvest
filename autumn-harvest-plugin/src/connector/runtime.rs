@@ -447,7 +447,7 @@ impl ConnectorRuntime {
         let batch = self
             .source
             .receive(
-                effective_max_batch(self.config.max_batch),
+                effective_max_batch(self.config.max_batch, self.binding.max_in_flight),
                 self.config.poll_timeout,
             )
             .await?;
@@ -1082,7 +1082,8 @@ pub const fn dead_letter_mode_of(binding: &SourceBinding) -> DeadLetterMode {
     binding.dead_letter_mode
 }
 
-/// The batch size actually handed to a source, floored at one.
+/// The batch size actually handed to a source: floored at one, and capped by
+/// the binding's dispatch capacity.
 ///
 /// A zero batch is a silent killer rather than a loud one: a source asked for
 /// zero messages returns an empty batch, the runtime reads that as an idle
@@ -1090,9 +1091,28 @@ pub const fn dead_letter_mode_of(binding: &SourceBinding) -> DeadLetterMode {
 /// Clamping here — at the runtime's single `receive` call site — covers every
 /// source including an embedder's own `EventSource`, not just the two adapters
 /// shipped in-tree.
+///
+/// The `max_in_flight` cap exists because prefetching past dispatch capacity
+/// buys nothing and costs something. The surplus cannot start until a permit
+/// frees up, so it just sits in memory — but on SQS the visibility timer starts
+/// at `ReceiveMessage`, not at dispatch. A message held behind the rest of the
+/// batch's dispatch latency can therefore have its visibility expire, be handed
+/// to another replica, and have its receive count incremented toward the
+/// queue's redrive policy — sending a perfectly processable message to the
+/// broker DLQ having never actually failed. The default config
+/// (`max_batch: 32`, `max_in_flight: 16`) already prefetched 16 past capacity,
+/// so this is the common path rather than an exotic one, and it is worst
+/// exactly where the docs send people: `.max_in_flight(1)`, the per-key
+/// ordering remedy, against SQS's ten-message batch.
 #[must_use]
-pub const fn effective_max_batch(configured: usize) -> usize {
-    if configured == 0 { 1 } else { configured }
+pub const fn effective_max_batch(configured: usize, max_in_flight: usize) -> usize {
+    let configured = if configured == 0 { 1 } else { configured };
+    let capacity = if max_in_flight == 0 { 1 } else { max_in_flight };
+    if configured < capacity {
+        configured
+    } else {
+        capacity
+    }
 }
 
 #[cfg(test)]
@@ -2185,8 +2205,17 @@ mod tests {
         let sink = Arc::new(RecordingDeadLetterSink::new());
         let rt = runtime(binding, Arc::clone(&source), sink);
 
-        let summary = rt.run_once().await.unwrap();
-        assert_eq!(summary.received, 12);
+        // A pass now pulls at most `max_in_flight` (see `effective_max_batch`),
+        // so draining twelve messages under `.max_in_flight(1)` takes twelve
+        // passes rather than one. Order across the whole drain is still what
+        // this asserts -- it is now guaranteed by two mechanisms rather than
+        // one: the permit, and the prefetch cap that stops the surplus being
+        // pulled at all.
+        let mut received = 0;
+        while received < 12 {
+            received += rt.run_once().await.unwrap().received;
+        }
+        assert_eq!(received, 12);
 
         let order = seen
             .lock()
@@ -2237,8 +2266,14 @@ mod tests {
         let sink = Arc::new(RecordingDeadLetterSink::new());
         let rt = runtime(binding, Arc::clone(&source), sink);
 
-        let summary = rt.run_once().await.unwrap();
-        assert_eq!(summary.received, 32, "the whole backlog is drained");
+        // `effective_max_batch` caps a pass at `LIMIT`, so the backlog drains
+        // over several passes. Each pass still dispatches its whole batch
+        // concurrently, so the peak-concurrency assertion below keeps its teeth.
+        let mut received = 0;
+        while received < 32 {
+            received += rt.run_once().await.unwrap().received;
+        }
+        assert_eq!(received, 32, "the whole backlog is drained");
 
         let observed = peak.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
@@ -2551,9 +2586,45 @@ mod tests {
     /// `EventSource` is covered too — not just the two shipped adapters.
     #[test]
     fn a_zero_batch_size_cannot_silently_stop_consumption() {
-        assert_eq!(effective_max_batch(0), 1, "zero must never reach a source");
-        assert_eq!(effective_max_batch(1), 1);
-        assert_eq!(effective_max_batch(32), 32);
+        assert_eq!(
+            effective_max_batch(0, 16),
+            1,
+            "zero must never reach a source"
+        );
+        assert_eq!(effective_max_batch(1, 16), 1);
+        assert_eq!(effective_max_batch(32, 64), 32);
+    }
+
+    /// Never pull more than the binding can dispatch concurrently.
+    ///
+    /// A prefetched surplus buys nothing: it cannot start until a permit frees
+    /// up, so it just sits. On SQS it is actively harmful -- the visibility
+    /// timer runs from `ReceiveMessage`, so a message waiting behind the whole
+    /// batch's dispatch latency can time out, be handed to another replica, and
+    /// have its receive count incremented toward the queue's redrive policy.
+    /// A perfectly good message reaches the broker DLQ having never failed.
+    #[test]
+    fn the_receive_size_never_exceeds_dispatch_capacity() {
+        assert_eq!(
+            effective_max_batch(32, 16),
+            16,
+            "the DEFAULT config prefetches 16 past capacity, so this is not an exotic case"
+        );
+        assert_eq!(
+            effective_max_batch(10, 1),
+            1,
+            "the documented per-key ordering remedy against a full SQS batch"
+        );
+        assert_eq!(
+            effective_max_batch(8, 32),
+            8,
+            "a batch smaller than capacity is still honoured"
+        );
+        assert_eq!(
+            effective_max_batch(32, 0),
+            1,
+            "a degenerate capacity still pulls one, never zero"
+        );
     }
 
     #[tokio::test]

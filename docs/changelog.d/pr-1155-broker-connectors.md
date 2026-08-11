@@ -837,6 +837,48 @@ coordinates, so a run traces back to the exact message.
   description (whose "`max by` avoids double-counting" note was itself an
   artifact of the bug) and the connector guide are corrected.
 
+- **Kafka lag honours the effective `auto.offset.reset`.** `to_client_config`
+  applies `extra` *after* its `earliest` default — deliberately, unlike
+  `enable.auto.commit`, which is forced last because auto-commit would break the
+  ack-after-commit contract — so a caller's
+  `.property("auto.offset.reset", "latest")` is what librdkafka actually uses.
+  `partition_lag` nonetheless baselined an uncommitted partition at the **low**
+  watermark, so a brand-new latest-starting group reported the topic's entire
+  retained history as outstanding, and on a quiet topic nothing ever commits, so
+  that false backlog never drained. New `OffsetReset` enum +
+  `KafkaSourceConfig::effective_offset_reset()` mirroring `to_client_config`'s
+  precedence exactly (default, then `extra`, last write wins, librdkafka's
+  `end`/`largest` aliases included), threaded into `partition_lag` so an
+  uncommitted partition is baselined where the consumer would actually resume.
+  The reset policy is **not** forced the way auto-commit is: it breaks no
+  invariant and a new binding on a huge existing topic may legitimately want
+  only new messages. Bounded residual, documented: for a `latest` group the
+  baseline is the *current* high watermark rather than the join-time one, so
+  between joining and the first commit the gauge can read low — but that is
+  exactly what a restart would replay (nothing), and it becomes exact the moment
+  the group commits.
+
+- **Prefetch is capped by dispatch capacity.** `run_once` pulled
+  `effective_max_batch(max_batch)` messages before acquiring any dispatch
+  permit, so a batch larger than `max_in_flight` left the surplus received but
+  un-started. On SQS the visibility timer runs from `ReceiveMessage`, not from
+  dispatch, so a message waiting behind the rest of the batch's dispatch latency
+  can have its visibility expire, be handed to another replica, and have its
+  receive count incremented toward the queue's redrive policy — a perfectly
+  processable message reaching the broker DLQ having never failed. Not exotic:
+  the **default** config (`max_batch: 32`, `max_in_flight: 16`) already
+  prefetched 16 past capacity, and it is worst exactly where the docs send
+  people — `.max_in_flight(1)`, the per-key ordering remedy, against SQS's
+  ten-message batch. `effective_max_batch` now takes `max_in_flight` and returns
+  the min (still floored at one, so a degenerate zero can never reach a source).
+  Kafka throughput is unaffected in practice — librdkafka prefetches into its
+  own local queue, so this bounds how many are handed to the runtime, not broker
+  round-trips; for SQS with `max_in_flight` below ten it trades a few more
+  `ReceiveMessage` calls for not losing messages to the redrive policy. Two
+  existing tests now drain across passes rather than in one, keeping their
+  intent (`in_flight_dispatch_is_bounded_by_max_in_flight` still observes real
+  concurrency, since a pass dispatches its whole capped batch concurrently).
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of
