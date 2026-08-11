@@ -192,6 +192,25 @@ pub struct ConnectorRuntime {
     last_lag_sample: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
+/// What a stall-recovery attempt achieved.
+///
+/// The distinction between the two failure arms is load-bearing: only
+/// [`Self::Unsupported`] justifies stopping an unsupervised binding for the
+/// life of the process, because it is a property of the *source type* rather
+/// than of the moment. A [`Self::Failed`] rebuild is retryable — and usually
+/// caused by the very outage that produced the stall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallRecovery {
+    /// The consumer was rebuilt; the blocked message will be redelivered.
+    Rebuilt,
+    /// This source cannot rebuild itself at all ([`EventSource::recover`]'s
+    /// default). There is no in-process recovery, so the binding stops.
+    Unsupported,
+    /// The rebuild was attempted and failed. Transient by assumption: back
+    /// off and try again rather than abandoning the stream.
+    Failed,
+}
+
 /// What one `run_once` pass did, for tests and diagnostics.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PassSummary {
@@ -348,7 +367,15 @@ impl ConnectorRuntime {
                     // recovery, so stop rather than spin forever pretending to
                     // retry.
                     Err(ConnectorError::Stalled { partition, .. }) => {
-                        if !self.recover_from_stall(partition).await {
+                        // Only `Unsupported` stops the binding: it is a
+                        // property of the source TYPE, so retrying can never
+                        // change the answer. A `Failed` rebuild is the
+                        // opposite -- typically the same downstream outage
+                        // that caused the stall -- so it falls through to the
+                        // shared backoff below and is retried on the next
+                        // pass, which is what lets consumption resume once the
+                        // broker comes back.
+                        if self.recover_from_stall(partition).await == StallRecovery::Unsupported {
                             tracing::error!(
                                 source = source_name,
                                 partition,
@@ -602,7 +629,7 @@ impl ConnectorRuntime {
     /// that has been rejected N times is still on strike N after the rebuild,
     /// so it still reaches its threshold and dead-letters rather than
     /// restarting its count on every recovery.
-    pub async fn recover_from_stall(&self, partition: i32) -> bool {
+    pub async fn recover_from_stall(&self, partition: i32) -> StallRecovery {
         match self.source.recover().await {
             Ok(true) => {
                 self.offsets.lock().await.forget_all();
@@ -612,17 +639,25 @@ impl ConnectorRuntime {
                     "connector consumer rebuilt after a commit stall; re-reading from the last \
                      commit so the blocked message is redelivered"
                 );
-                true
+                StallRecovery::Rebuilt
             }
-            Ok(false) => false,
+            Ok(false) => StallRecovery::Unsupported,
             Err(e) => {
-                tracing::error!(
+                // Deliberately distinct from `Ok(false)`. The usual cause of a
+                // stall is a downstream outage, and the same outage is what
+                // makes the rebuild fail — so this is the *expected* error at
+                // exactly the moment the binding must not give up. Treating it
+                // as "cannot rebuild" would stop an unsupervised binding on a
+                // blip and never resume it, turning a transient broker
+                // hiccup into a silent permanent outage for that stream.
+                tracing::warn!(
                     source = self.binding.name,
                     partition,
                     error = %e,
-                    "connector consumer rebuild failed after a commit stall"
+                    "connector consumer rebuild failed after a commit stall; retrying after \
+                     backoff"
                 );
-                false
+                StallRecovery::Failed
             }
         }
     }
@@ -2507,6 +2542,89 @@ mod tests {
         }
     }
 
+    /// A source whose rebuild fails transiently — the broker is unreachable
+    /// *right now*, not incapable of ever rebuilding.
+    #[derive(Debug)]
+    struct RebuildFailsSource {
+        inner: MockSource,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RebuildFailsSource {
+        fn new(stream: &str) -> Self {
+            Self {
+                inner: MockSource::new(stream),
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn attempts(&self) -> usize {
+            self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventSource for RebuildFailsSource {
+        fn stream(&self) -> &str {
+            self.inner.stream()
+        }
+        async fn receive(
+            &self,
+            max: usize,
+            timeout: std::time::Duration,
+        ) -> Result<Vec<InboundMessage>, ConnectorError> {
+            self.inner.receive(max, timeout).await
+        }
+        async fn ack(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            self.inner.ack(handle).await
+        }
+        async fn abandon(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            self.inner.abandon(handle).await
+        }
+        async fn recover(&self) -> Result<bool, ConnectorError> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ConnectorError::Broker("broker unreachable".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_rebuild_failure_is_retryable_not_terminal() {
+        // `Ok(false)` means "this source can NEVER rebuild itself" -- the only
+        // condition that justifies stopping an unsupervised binding for the
+        // life of the process. A rebuild that fails because the broker is
+        // momentarily unreachable is the opposite: retrying is exactly what
+        // recovers it. Collapsing both onto `false` stops the binding on a
+        // blip, and consumption never resumes even after the broker comes
+        // back.
+        let source = Arc::new(RebuildFailsSource::new("orders"));
+        let rt = ConnectorRuntime::new(
+            malformed_binding(),
+            Arc::clone(&source) as Arc<dyn EventSource>,
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
+        );
+
+        assert_eq!(
+            rt.recover_from_stall(0).await,
+            StallRecovery::Failed,
+            "a transient rebuild failure must be distinguishable from a source \
+             that cannot rebuild at all"
+        );
+        assert_eq!(source.attempts(), 1);
+
+        // ...and the default trait impl, which genuinely cannot rebuild, is
+        // the one that terminates the binding.
+        let rt2 = ConnectorRuntime::new(
+            malformed_binding(),
+            Arc::new(MockSource::new("orders")) as Arc<dyn EventSource>,
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
+        );
+        assert_eq!(rt2.recover_from_stall(0).await, StallRecovery::Unsupported);
+    }
+
     /// A positional source that wedges itself on every pass and can rebuild.
     ///
     /// Models the shape of a downstream outage on Kafka: each pass receives a
@@ -2666,7 +2784,7 @@ mod tests {
             "the lowest wedged partition is the one reported"
         );
 
-        assert!(rt.recover_from_stall(0).await);
+        assert_eq!(rt.recover_from_stall(0).await, StallRecovery::Rebuilt);
 
         assert_eq!(
             source.recover_count(),
@@ -2724,7 +2842,11 @@ mod tests {
         // `run`'s handling is what actually performs the retry.
         let recovered = rt.recover_from_stall(0).await;
 
-        assert!(recovered, "a recoverable source must be rebuilt");
+        assert_eq!(
+            recovered,
+            StallRecovery::Rebuilt,
+            "a recoverable source must be rebuilt"
+        );
         assert_eq!(source.recover_count(), 1, "the consumer was recreated once");
         assert_eq!(
             rt.offsets.lock().await.held(0),
@@ -2739,8 +2861,9 @@ mod tests {
     #[tokio::test]
     async fn a_source_that_cannot_rebuild_itself_reports_so() {
         let rt = stalled_runtime(Some(3), 4).await;
-        assert!(
-            !rt.recover_from_stall(0).await,
+        assert_eq!(
+            rt.recover_from_stall(0).await,
+            StallRecovery::Unsupported,
             "the default source cannot self-heal and must say so"
         );
     }

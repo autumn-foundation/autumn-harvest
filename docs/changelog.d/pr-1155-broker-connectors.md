@@ -768,6 +768,30 @@ coordinates, so a run traces back to the exact message.
   creates is what makes the next redrive lap report false. The entry is
   bounded exactly like a strike-bearing one (same expiry order, same retention
   deadline). `HarvestSink` mode was unaffected — it never reaches this arm.
+- **A transient consumer-rebuild failure no longer stops the binding.**
+  `recover_from_stall` collapsed `Err(_)` from `EventSource::recover` onto the
+  same `false` as `Ok(false)`, and the caller reads `false` as "this source can
+  never rebuild itself" and `break`s out of the run loop. But the usual cause
+  of a stall is a downstream outage, and that same outage is what makes the
+  rebuild fail — so a blip at exactly the wrong moment permanently stopped an
+  unsupervised binding, and consumption never resumed even after the broker
+  came back. It now returns a three-state `StallRecovery`: `Unsupported`
+  (a property of the source *type*, so retrying cannot change the answer)
+  still stops the binding; `Failed` falls through to the same `error_backoff`
+  the transient-error arm uses and is retried on the next pass.
+- **The Kafka subscription identity canonicalizes the broker seed list.**
+  `bootstrap.servers` is a *seed* list — librdkafka contacts one entry and
+  learns the real membership from its metadata — so `broker-a,broker-b` and
+  `broker-b,broker-a` address the same cluster. Comparing the raw string made
+  them look independent, so the duplicate-subscription guard admitted both;
+  Kafka, which only cares about the group id, then split the partitions
+  between them and two bindings targeting different workflows each silently
+  received a fraction of the records. The identity now sorts, trims,
+  lowercases and dedupes the seeds. **Residual, deliberately open:** two
+  *disjoint* seed lists naming one cluster still compare as different. Only
+  the broker's cluster id settles that, and fetching it means a live metadata
+  round-trip during plugin *build* — trading a rare config-typo detection for
+  a startup that fails whenever the broker is briefly unreachable.
 
 ### Success metric
 

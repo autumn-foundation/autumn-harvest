@@ -403,7 +403,44 @@ fn subscription_identity_for(config: &KafkaSourceConfig) -> String {
     // subscriptions, not one, and omitting them would reject that fan-in.
     // `\u{1}` cannot appear in a broker list, group id or topic, so no triple
     // can alias another.
-    format!("kafka:{brokers}\u{1}{group}\u{1}{}", config.topic)
+    format!(
+        "kafka:{}\u{1}{group}\u{1}{}",
+        canonical_broker_list(brokers),
+        config.topic
+    )
+}
+
+/// Reduce a `bootstrap.servers` value to a form that is stable across the ways
+/// one cluster can be written.
+///
+/// The value is a **seed** list, not an address: librdkafka contacts one entry
+/// and learns the real membership from its metadata. So order, whitespace,
+/// host case and repeats carry no meaning to Kafka — but they do change the
+/// raw string, which would make one cluster look like several and let the
+/// duplicate-subscription guard admit two runtimes into the same group. Kafka
+/// then splits the partitions between them and each target silently receives a
+/// fraction of the stream.
+///
+/// # Residual, deliberately not closed here
+///
+/// Two *disjoint* seed lists naming the same cluster (`a:9092` and `b:9092`,
+/// both members of it; a DNS alias against a resolved name) still compare as
+/// different. Only the broker can settle that — via its cluster id — and
+/// fetching it means a live metadata round-trip during plugin **build**, where
+/// this identity is computed and no consumer exists yet. That would make
+/// startup fail when the broker is briefly unreachable: trading a rare
+/// config-typo detection for a common availability failure. The narrower
+/// canonical form covers every spelling of one *written* seed list, which is
+/// the shape a copy-pasted duplicate binding actually takes.
+fn canonical_broker_list(brokers: &str) -> String {
+    let mut seeds: Vec<String> = brokers
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    seeds.sort_unstable();
+    seeds.dedup();
+    seeds.join(",")
 }
 
 /// Outstanding records for one partition, from its watermarks and the group's
@@ -487,6 +524,44 @@ mod tests {
         );
         // A `/` in a topic name must not let one triple alias another.
         assert_ne!(id("b:9092", "a", "b/c"), id("b:9092", "a/b", "c"));
+    }
+
+    #[test]
+    fn subscription_identity_canonicalizes_the_broker_seed_list() {
+        // `bootstrap.servers` is a SEED list, not an address: librdkafka
+        // contacts one entry and learns the real cluster membership from its
+        // metadata. So two configs listing the same seeds in a different
+        // order (or with stray whitespace, or differing in host case, or
+        // repeating an entry) address the SAME cluster. Comparing the raw
+        // string makes them look like independent clusters, so the
+        // duplicate-subscription guard waves both through -- and then Kafka,
+        // which is looking at the group id and does not care about our string,
+        // splits the partitions between them. Two bindings targeting different
+        // workflows each silently receive a fraction of the records: exactly
+        // the failure the guard exists to prevent, with no error anywhere.
+        let id =
+            |brokers| subscription_identity_for(&KafkaSourceConfig::new(brokers, "g", "orders"));
+        assert_eq!(
+            id("broker-a:9092,broker-b:9092"),
+            id("broker-b:9092,broker-a:9092"),
+            "seed order does not change which cluster is addressed"
+        );
+        assert_eq!(id("a:9092, b:9092"), id("b:9092,a:9092"));
+        assert_eq!(id("A:9092"), id("a:9092"), "hostnames are case-insensitive");
+        assert_eq!(
+            id("a:9092,a:9092,b:9092"),
+            id("a:9092,b:9092"),
+            "a repeated seed is still one cluster"
+        );
+        // ...and canonicalizing must not start conflating genuinely distinct
+        // clusters, which would REJECT a legitimate multi-cluster fan-in.
+        assert_ne!(id("east:9092"), id("west:9092"));
+        assert_ne!(id("a:9092,b:9092"), id("a:9092,c:9092"));
+        // The canonical form is what lands in the identity.
+        assert_eq!(
+            id("broker-b:9092,broker-a:9092"),
+            "kafka:broker-a:9092,broker-b:9092\u{1}g\u{1}orders"
+        );
     }
 
     #[test]
