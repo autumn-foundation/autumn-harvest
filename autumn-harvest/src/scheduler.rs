@@ -1591,12 +1591,15 @@ async fn upsert_schedule(
 /// held `D` — a `harvest_schedules_workflow_name_unique` violation re-issued
 /// once per second, forever.
 ///
-/// The classification rests on one invariant:
+/// The classification turns on *who owns the contested name by right*, not on
+/// whether a row's two names happen to differ.
 /// [`DagInfo::as_workflow_schedule`](crate::info::DagInfo::as_workflow_schedule)
-/// **always** sets `workflow_name == dag_name`, so a persisted row carrying a
-/// non-NULL `dag_name` that differs from the `workflow_name` it holds cannot
-/// have been produced by any registration path. It is corrupt, and whichever
-/// side of the comparison breaks the invariant is the side that is wrong.
+/// always sets `workflow_name == dag_name`, so a DAG registering under its own
+/// name has a first claim to it; a row squatting that name while answering to a
+/// different `dag_name` is the shape issue #1157 reported, and it yields.
+/// A row whose two names merely differ is **not** presumed corrupt — see
+/// [`Self::Conflict`] — because `WorkflowSchedule` has always exposed the two
+/// as independent public fields and earlier versions persisted them that way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkflowNameHolder {
     /// Nothing holds the name — the write is unobstructed.
@@ -1610,26 +1613,12 @@ enum WorkflowNameHolder {
     /// corrupt — release the name it squats (the row keeps its own identity,
     /// pause state and counters, and its rightful owner re-stamps it).
     Squatter,
-    /// A *well-formed* row owned by a different DAG holds the name. Two
-    /// schedules genuinely claiming one `workflow_name` is a configuration
-    /// collision: refuse to write rather than flap the name between them at
-    /// 1 Hz.
+    /// Another row holds the name and the registrant has no claim to it: either
+    /// a well-formed row genuinely answering to it, or *any* foreign holder when
+    /// the registrant does not own the name by right of its own `dag_name`.
+    /// Refuse to write rather than flap the name between them at 1 Hz — and
+    /// report both sides so an operator can rename one.
     Conflict,
-    /// This *registration* breaks the invariant: its `dag_name` differs from
-    /// its `workflow_name`.
-    ///
-    /// Refused unconditionally — including when the name is free. That is what
-    /// makes [`Self::Squatter`]'s premise true: if registration were allowed to
-    /// persist a decoupled row whenever the name happened to be vacant, it
-    /// would create *exactly* the shape a later registration of a DAG by that
-    /// name classifies as corrupt and strips. The victim row would stop firing
-    /// (the due list requires `workflow_name IS NOT NULL`) and its own
-    /// registration would then fail forever — a silent, permanent outage
-    /// manufactured by the repair path itself.
-    ///
-    /// Refusing up front converts that latent landmine into an immediate,
-    /// named error at the point the malformed schedule is registered.
-    SelfInconsistent,
 }
 
 /// The `dag_name` of the row currently holding a `workflow_name`, if any.
@@ -1648,30 +1637,38 @@ enum NameHolder<'a> {
 }
 
 /// Classify the row holding `registering_workflow`, if any.
+///
+/// The gate on [`WorkflowNameHolder::Squatter`] is the load-bearing part.
+/// `dag_name != workflow_name` is **not** by itself proof of corruption:
+/// `WorkflowSchedule` exposes the two as independent public fields,
+/// `validate_workflow_schedules` has never required them to agree, and earlier
+/// versions persisted such rows — so a deployment upgrading into this fix can
+/// legitimately hold them. The distinguisher is narrower: **does the registrant
+/// own this `workflow_name` by right of its own `dag_name`?** Only then is a
+/// foreign holder demonstrably squatting a name that is not its own, which is
+/// precisely issue #1157's reported repro. A registrant that does not own the
+/// name by right reconciles a free one and reports a foreign holder as a named
+/// [`WorkflowNameHolder::Conflict`], so the repair path can never manufacture a
+/// victim by stripping a row it has no claim against.
 const fn classify_workflow_name_holder(
     registering_dag: &str,
     registering_workflow: &str,
     holder: NameHolder<'_>,
 ) -> WorkflowNameHolder {
-    // Checked FIRST -- before the holder is even inspected, and in particular
-    // before the vacant-name fast path. See `SelfInconsistent`: allowing a
-    // decoupled registration through on a free name is what would persist the
-    // very shape `Squatter` strips, so the two branches must agree or the
-    // repair path manufactures its own victims.
-    if !const_str_eq(registering_dag, registering_workflow) {
-        return WorkflowNameHolder::SelfInconsistent;
-    }
+    let owns_name_by_right = const_str_eq(registering_dag, registering_workflow);
 
     match holder {
         NameHolder::Absent => WorkflowNameHolder::Vacant,
         NameHolder::Unowned => WorkflowNameHolder::WorkflowOnly,
-        // The holder's own `dag_name` disagrees with the `workflow_name` it
-        // holds (which is `registering_workflow`): corrupt, release it.
-        NameHolder::OwnedBy(dag) if !const_str_eq(dag, registering_workflow) => {
+        // We own this name by right of our own `dag_name`, and the holder's own
+        // `dag_name` disagrees with the name it holds: corrupt, release it.
+        NameHolder::OwnedBy(dag)
+            if owns_name_by_right && !const_str_eq(dag, registering_workflow) =>
+        {
             WorkflowNameHolder::Squatter
         }
-        // A well-formed row for another DAG that legitimately answers to this
-        // name. Genuine collision.
+        // Either a well-formed row that legitimately answers to this name, or a
+        // holder we have no claim against. Genuine collision either way.
         NameHolder::OwnedBy(_) => WorkflowNameHolder::Conflict,
     }
 }
@@ -1794,13 +1791,6 @@ async fn find_reusable_dag_workflow_schedule(
             // `dag_row` may be None; the caller then inserts, now unobstructed.
             Ok(dag_row)
         }
-        WorkflowNameHolder::SelfInconsistent => Err(HarvestError::Config(format!(
-            "schedule registration is inconsistent: dag '{dag_name}' registers \
-             workflow_name '{workflow_name}'. A DAG-backed schedule must use one name for \
-             both. Persisting a decoupled row would make it indistinguishable from a \
-             corrupt row and a later DAG named '{workflow_name}' would strip its \
-             workflow_name, silently stopping it. Rename so the two agree."
-        ))),
         WorkflowNameHolder::Conflict => {
             let holder = foreign_holder.expect("classified from a present holder");
             Err(HarvestError::Config(format!(
@@ -8107,39 +8097,64 @@ mod tests {
             H::Conflict
         );
 
-        // Our OWN registration violating the invariant (dag_name !=
-        // workflow_name) is checked first, so we never steal another row on
-        // the strength of a claim we should not be making.
+        // A registrant that does NOT own the name by right of its own dag_name
+        // still merges the legacy workflow-only shape (that path predates
+        // #1157 and is keyed on the holder, not on the registrant)...
         assert_eq!(
             classify_workflow_name_holder("my_dag", "other_name", NameHolder::Unowned),
-            H::SelfInconsistent
+            H::WorkflowOnly
         );
+        // ...but it never STRIPS a foreign holder on the strength of a claim it
+        // does not have. That is reported as a named collision instead.
         assert_eq!(
             classify_workflow_name_holder("my_dag", "other_name", NameHolder::OwnedBy("third_dag")),
-            H::SelfInconsistent
+            H::Conflict
         );
     }
 
-    /// A decoupled registration must be refused **even when the name is free**.
+    /// A decoupled registration reconciles its own row, and never steals.
     ///
-    /// This is the one that matters. Classifying a free name as `Vacant`
-    /// regardless of self-consistency looks harmless in isolation — nothing to
-    /// collide with — but it persists a row with
-    /// `dag_name = "X", workflow_name = "A"`, which is byte-for-byte the shape
-    /// `Squatter` treats as corrupt. Registering a DAG named `A` later would
-    /// strip that row's `workflow_name`; the due list requires it to be
-    /// non-NULL, so `X` would stop firing silently, and `X`'s own registration
-    /// would then fail forever. The repair path would have manufactured its own
-    /// victim.
+    /// `WorkflowSchedule` exposes `dag_name` and `workflow_name` as independent
+    /// public fields and `validate_workflow_schedules` has never required them
+    /// to agree, so a deployment upgrading into this fix can legitimately hold
+    /// rows where they differ. Refusing every such registration would strand
+    /// them: their cadence could never be reconciled again, and a row parked by
+    /// [`WorkflowNameHolder::Squatter`] could never re-stamp its own name.
     ///
-    /// `Squatter`'s premise ("unreachable through registration ⇒ corrupt") is
-    /// only true because this case is refused.
+    /// The distinguisher is not "do the two names differ" but **"does the
+    /// registrant own this `workflow_name` by right of its own DAG name?"**
+    /// Only a registrant whose `dag_name == workflow_name` may strip a foreign
+    /// holder — which is exactly issue #1157's repro, and nothing else. A
+    /// decoupled registrant reconciles a free name (in practice its own row,
+    /// excluded by id before classification) and reports a foreign holder as a
+    /// named [`WorkflowNameHolder::Conflict`] instead of stealing from it.
     #[test]
-    fn a_decoupled_registration_is_refused_even_when_the_name_is_free() {
+    fn a_decoupled_registration_reconciles_its_own_row_and_never_steals() {
+        // Free name (its own row was excluded by id): reconcile in place.
         assert_eq!(
             classify_workflow_name_holder("my_dag", "other_name", NameHolder::Absent),
-            WorkflowNameHolder::SelfInconsistent,
-            "a free name must not license persisting the very shape Squatter strips"
+            WorkflowNameHolder::Vacant,
+            "a legacy decoupled row must still be able to reconcile its own cadence"
+        );
+
+        // A foreign holder is a named collision to report, never a row to strip:
+        // the registrant has no claim on this name by right of its own DAG name.
+        assert_eq!(
+            classify_workflow_name_holder("my_dag", "other_name", NameHolder::OwnedBy("third_dag")),
+            WorkflowNameHolder::Conflict,
+            "a decoupled registrant must not strip another row's workflow_name"
+        );
+
+        // ...while the #1157 repair is untouched: a registrant that owns the
+        // name by right of its own dag_name still releases a squatter.
+        assert_eq!(
+            classify_workflow_name_holder(
+                "my_dag",
+                "my_dag",
+                NameHolder::OwnedBy("some_other_dag")
+            ),
+            WorkflowNameHolder::Squatter,
+            "issue #1157's reported repro must still repair"
         );
 
         // The consistent case is untouched: still the plain happy path.

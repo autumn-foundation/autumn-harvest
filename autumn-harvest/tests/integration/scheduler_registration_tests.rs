@@ -164,6 +164,16 @@ async fn row_for_workflow(
         .expect("query workflow row")
 }
 
+async fn schedule_expr_of(conn: &mut AsyncPgConnection, id: Uuid) -> Option<String> {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    dsl::harvest_schedules
+        .find(id)
+        .select(dsl::schedule_expr)
+        .first::<Option<String>>(conn)
+        .await
+        .expect("schedule_expr")
+}
+
 async fn updated_at_of(conn: &mut AsyncPgConnection, id: Uuid) -> DateTime<Utc> {
     use autumn_harvest::schema::harvest_schedules::dsl;
     dsl::harvest_schedules
@@ -310,33 +320,104 @@ async fn a_consistent_peer_row_is_a_conflict_not_a_steal() {
     );
 }
 
-// ── Defect 1 — the repair path must not manufacture its own victims ─────────
+// ── Defect 1 — a decoupled schedule keeps working, and never steals ─────────
 
+/// `WorkflowSchedule` exposes `dag_name`/`workflow_name` as independent public
+/// fields and `validate_workflow_schedules` has never required them to agree,
+/// so a deployment upgrading into this fix can legitimately hold rows where
+/// they differ. Such a row must keep reconciling its own cadence — otherwise
+/// the fix strands it, and a row parked by the squatter repair could never
+/// re-stamp its own name.
 #[tokio::test]
-async fn a_decoupled_registration_is_refused_rather_than_persisted() {
+async fn a_decoupled_registration_still_reconciles_its_own_row() {
     let (mut conn, _db) = setup_db().await;
 
-    // A registration whose dag_name and workflow_name disagree, with the name
-    // completely free. It is tempting to allow this — there is nothing to
-    // collide with. But persisting it creates a row shaped exactly like the
-    // corrupt one this fix strips, so registering a DAG named `wants_this`
-    // later would null THIS row's workflow_name and silently stop it firing.
+    // A pre-existing decoupled row, exactly as an older version would have
+    // persisted it: its dag_name and workflow_name disagree.
+    let legacy = insert_raw_row(
+        &mut conn,
+        Some("owning_dag"),
+        Some("wants_this"),
+        "cron:0 5 * * *",
+    )
+    .await;
+
+    // Its own registration must converge it, not refuse it: the cadence change
+    // below is exactly what an operator would expect to take effect.
+    let mut decoupled =
+        WorkflowSchedule::new("wants_this", Schedule::Cron("0 9 * * *".to_string()));
+    decoupled.dag_name = Some("owning_dag".to_string());
+
+    register_workflow_schedules(&mut conn, &[decoupled])
+        .await
+        .expect("a legacy decoupled row must still be reconcilable");
+
+    assert_eq!(
+        row_by_id(&mut conn, legacy).await,
+        (
+            Some("owning_dag".to_string()),
+            Some("wants_this".to_string())
+        ),
+        "reconciling must update the row in place, never strip or duplicate it"
+    );
+    assert_eq!(
+        schedule_expr_of(&mut conn, legacy).await.as_deref(),
+        Some("cron:0 9 * * *"),
+        "the cadence change must actually reach the row"
+    );
+    assert_eq!(
+        schedule_count(&mut conn).await,
+        1,
+        "no second row may be inserted alongside the one being reconciled"
+    );
+}
+
+/// The mirror image: a registrant whose `dag_name` differs from the
+/// `workflow_name` it wants has no claim on that name *by right of its own DAG
+/// name*, so it must report a foreign holder as a named collision rather than
+/// stripping it. Only a registrant that owns the name by right (issue #1157's
+/// repro) may release a squatter.
+#[tokio::test]
+async fn a_decoupled_registration_never_steals_a_foreign_name() {
+    let (mut conn, _db) = setup_db().await;
+
+    // Some other row already holds `wants_this`.
+    let holder = insert_raw_row(
+        &mut conn,
+        Some("incumbent_dag"),
+        Some("wants_this"),
+        "cron:0 2 * * *",
+    )
+    .await;
+
     let mut decoupled =
         WorkflowSchedule::new("wants_this", Schedule::Cron("0 5 * * *".to_string()));
     decoupled.dag_name = Some("owning_dag".to_string());
 
     let result = register_workflow_schedules(&mut conn, &[decoupled]).await;
-    assert!(
-        matches!(result, Err(autumn_harvest::HarvestError::Config(_))),
-        "a decoupled registration must be refused up front, not persisted as a \
-         landmine for the repair path to detonate later; got: {result:?}"
-    );
 
-    // Nothing was written: the refusal happens before any insert.
+    match result {
+        Err(autumn_harvest::HarvestError::Config(message)) => {
+            assert!(
+                message.contains("wants_this") && message.contains("owning_dag"),
+                "the refusal must name both sides so an operator can rename one; \
+                 got: {message}"
+            );
+        }
+        other => panic!(
+            "a registrant with no claim by right must report a named collision, \
+             never steal the name; got: {other:?}"
+        ),
+    }
+
+    // The incumbent is untouched — the repair path never manufactures a victim.
     assert_eq!(
-        schedule_count(&mut conn).await,
-        0,
-        "a refused registration must leave no row behind"
+        row_by_id(&mut conn, holder).await,
+        (
+            Some("incumbent_dag".to_string()),
+            Some("wants_this".to_string())
+        ),
+        "a holder we have no claim against must keep its workflow_name"
     );
 }
 
