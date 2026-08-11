@@ -114,6 +114,28 @@ jobs:
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
       - name: Clippy autumn-harvest-sqlite
         run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
+      # Issue #786: the `docs/performance.md` prose-vs-table guards must run on
+      # DOCS-ONLY pull requests — which is the change class most likely to break
+      # them, and the one the `test` matrix below skips entirely (every step
+      # there is gated on `changes.outputs.code == 'true'`). The Clippy step
+      # above only *compiles* these tests; it never executes them. So they run
+      # here, in the job that is deliberately ungated.
+      #
+      # Unconditional rather than `if: code == 'false'`: "the guards always run"
+      # is a stronger property than "the guards run when the other place did
+      # not", and does not silently break the day someone edits the matrix's
+      # gating. The duplicate run on code PRs is 7 tests against a
+      # `--no-default-features` build, which is cheap and cached.
+      #
+      # Guarded by `performance_docs::performance_guards_run_on_docs_only_changes`,
+      # which fails if this step is removed or becomes conditional.
+      # The filter is quoted because it ends in `::`, and a trailing colon in an
+      # unquoted YAML scalar is a mapping indicator — unquoted, this line makes
+      # the entire workflow file unparseable, so GitHub loads zero jobs and every
+      # run fails instantly. Guarded by
+      # `performance_docs::ci_yaml_plain_scalars_do_not_contain_a_mapping_colon`.
+      - name: Run docs/performance.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration performance_docs::"
 
   test:
     name: Test (${{ matrix.os }})
@@ -149,6 +171,21 @@ jobs:
       - name: Compile db-backed tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --all-features --tests --no-run
+      # Issue #786: the claim/enqueue benchmark shares its harness with the
+      # CI-gated budget assertion (`claim_budget_tests`, run Docker-backed via
+      # the manifest below). Compile-checking it here keeps the published
+      # `docs/performance.md` report from bit-rotting; `cargo bench` itself is
+      # deliberately NOT run per-PR, since the measurement is minutes-long and
+      # the *gate* is the test, not the report.
+      #
+      # Linux-only: bit-rot protection needs exactly one OS, and the benchmark is
+      # only ever *run* on Linux (see the manifest). The macOS and Windows legs
+      # already compile the same harness module through the `--all-features
+      # --tests --no-run` step above, so restricting this one costs no coverage
+      # and saves two legs' worth of minutes.
+      - name: Compile claim/enqueue benchmark (issue #786)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo bench -p autumn-harvest --features db --bench claim_bench --no-run
       - name: Run all-features lib tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --all-features --lib
