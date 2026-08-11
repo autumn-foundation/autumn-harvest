@@ -437,6 +437,54 @@ coordinates, so a run traces back to the exact message.
   says **affinity, not ordering**, states the same-device race, and points at
   `.max_in_flight(1)` as the explicit throughput trade.
 
+- **A panicked dispatch task left its Kafka offset unmarked.** The normal
+  `Retry` path marks a retried head so recovery fires on the head itself, but a
+  task lost to a `JoinError` never reaches `settle`, so that marking never ran —
+  and the message handle had already moved into the spawned task, so the join
+  arm could not reach it. On a source whose `abandon` cannot force a redelivery
+  the local position has already advanced past the record, so nothing hands it
+  back: the offset became a permanently blocked prefix head, and at the tail of
+  a quiet partition the backlog heuristic never fires because nothing settles
+  behind it. The positional pair is now captured alongside the join handle and
+  the arm marks the head, so the pass fails `Stalled` and the consumer is
+  rebuilt. The reproduction is a genuine engine-side panic through the real
+  `run_once`: the dead-letter sink is the one injectable seam that panics
+  *outside* the mapper's `catch_unwind`. Its assertion uses `threshold == 0`,
+  which disables the backlog heuristic, so `held: 0` proves the marked head is
+  the only signal that could have fired. A mirror test pins the other
+  direction — a redelivering source (SQS's visibility timeout) is not wedged
+  and must not recycle the consumer on every engine-side panic.
+
+- **Broker-native dead-lettering restarted its own strike countdown.**
+  `AbandonToBrokerDeadLetter` is terminal for harvest but not for the broker: it
+  resets visibility so the message returns and the broker counts the receive
+  toward its own `maxReceiveCount`. Whenever that ceiling sits above the
+  binding's `poison_threshold` — the normal configuration, since the binding
+  wants to nack well before the queue gives up — the message comes back one or
+  more times before the broker quarantines it, and clearing the strike history
+  on the way out sent each redelivery back through ordinary
+  visibility-timeout retries and emitted a fresh `dead_lettered` sample per lap.
+  The strikes are now kept for that disposition alone, so every later delivery
+  re-nacks on sight and the broker's own count is what ends it. The trade is
+  that such an entry outlives harvest's view of the message exactly as a
+  forever-retried one does; the redrive policy is what bounds it.
+
+- **Consumer lag was measured from the fetch position, not the committed
+  offset.** `lag()` subtracted `consumer.position()` from the high watermark,
+  but `position()` is the local next-fetch cursor: it advances the instant a
+  record is fetched, regardless of whether that record has been dispatched, is
+  being retried, or is stuck behind a blocked commit prefix. So a consumer
+  wedged with a large uncommitted backlog — precisely the condition
+  `harvest.connector.lag` exists to expose — reported its lag collapsing to
+  zero while a restart would replay everything from the last commit. It now
+  reads the durable committed group offset, falling back to the **low**
+  watermark for a partition with nothing committed yet (the consumer is pinned
+  to `auto.offset.reset = earliest`, so that is genuinely its outstanding
+  backlog; skipping the partition would report zero lag for a consumer that has
+  processed nothing). Covered by a broker-suite test that drives the source
+  directly so records are fetched but never acked — the honest reproduction of
+  a blocked prefix, which read zero under the old computation.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

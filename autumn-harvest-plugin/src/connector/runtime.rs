@@ -360,11 +360,16 @@ impl ConnectorRuntime {
         let mut handles = Vec::with_capacity(batch.len());
         for message in batch {
             self.metrics.record_connector_received(self.binding.name);
-            if let (Some(partition), Some(position)) =
-                (message.handle.partition, message.handle.position)
-            {
-                self.offsets.lock().await.observe(partition, position);
-            }
+            // Kept alongside the join handle: a panicked task never reaches
+            // `settle`, so the join arm below has to do the recovery marking
+            // itself — and `message` is moved into the spawned task.
+            let positional = match (message.handle.partition, message.handle.position) {
+                (Some(partition), Some(position)) => {
+                    self.offsets.lock().await.observe(partition, position);
+                    Some((partition, position))
+                }
+                _ => None,
+            };
 
             // Backpressure: block here until a slot frees, so the runtime
             // cannot outrun harvest's admission path.
@@ -374,14 +379,17 @@ impl ConnectorRuntime {
                 .map_err(|e| ConnectorError::Broker(format!("connector semaphore closed: {e}")))?;
 
             let this = self.clone_handles();
-            handles.push(tokio::spawn(async move {
-                let disposition = this.process(message).await;
-                drop(permit);
-                disposition
-            }));
+            handles.push((
+                positional,
+                tokio::spawn(async move {
+                    let disposition = this.process(message).await;
+                    drop(permit);
+                    disposition
+                }),
+            ));
         }
 
-        for handle in handles {
+        for (positional, handle) in handles {
             match handle.await {
                 Ok(MessageDisposition::Ack) => summary.acked += 1,
                 Ok(MessageDisposition::Retry) => summary.retried += 1,
@@ -405,6 +413,22 @@ impl ConnectorRuntime {
                         error = %e,
                         "connector dispatch task failed; message left for redelivery"
                     );
+                    // The task died before `settle`, so the normal `Retry`
+                    // path's recovery marking never ran. On a source whose
+                    // `abandon` cannot force a redelivery the local position
+                    // has already advanced past this record, so nothing hands
+                    // it back: mark the head so recovery fires on it directly
+                    // rather than waiting for later offsets to pile up behind
+                    // it — at the tail of a quiet partition, none ever will.
+                    //
+                    // A redelivering broker (SQS's visibility timeout) is not
+                    // wedged and must not trigger a rebuild, or every
+                    // engine-side panic would recycle the consumer.
+                    if let (false, Some((partition, position))) =
+                        (self.source.abandon_redelivers(), positional)
+                    {
+                        self.offsets.lock().await.retried(partition, position);
+                    }
                     summary.retried += 1;
                 }
             }
@@ -569,7 +593,25 @@ impl ConnectorRuntime {
         // Once a message reaches a terminal disposition its strike history is
         // no longer needed; dropping it keeps the tracker bounded. A message
         // left for redelivery keeps its strikes so the threshold still bites.
-        if matches!(effective, MessageDisposition::Retry) {
+        //
+        // `AbandonToBrokerDeadLetter` is terminal for *harvest* but not for
+        // the broker: it resets visibility so the message comes back and the
+        // broker counts the receive toward its own `maxReceiveCount`. Whenever
+        // that ceiling is above this binding's `poison_threshold` — the normal
+        // configuration, since the binding wants to nack well before the queue
+        // gives up — the message returns one or more times before the broker
+        // quarantines it. Clearing here would restart the strike countdown, so
+        // each redelivery would crawl back through ordinary visibility-timeout
+        // retries and emit a fresh `dead_lettered` sample per lap. Keeping the
+        // strikes makes every later delivery re-nack on sight and lets the
+        // broker's own count be what ends it.
+        //
+        // The cost is that such an entry outlives harvest's view of the
+        // message, exactly as a forever-retried one does; the broker's redrive
+        // policy is what bounds it.
+        if matches!(effective, MessageDisposition::AbandonToBrokerDeadLetter(_)) {
+            // Keep the strikes; nothing else to do.
+        } else if matches!(effective, MessageDisposition::Retry) {
             // On a source whose `abandon` cannot force a redelivery, this
             // offset is now a permanently blocked prefix head: the local
             // position has already moved past it, so nothing hands it back.
@@ -940,6 +982,27 @@ mod tests {
         )
     }
 
+    /// A sink whose `write` panics, so a dispatch task dies with a `JoinError`
+    /// rather than returning a disposition.
+    ///
+    /// This is the one *engine-side* panic seam reachable from a unit test:
+    /// the mapper's own panic is contained inside `map_and_dispatch`
+    /// (quarantined as `Malformed`) and never reaches the join arm, and the
+    /// dispatch path itself needs a live harvest runtime to fail. The sink is
+    /// injectable, so panicking there exercises the real `run_once` join arm.
+    #[derive(Debug, Default)]
+    struct PanickingDeadLetterSink;
+
+    #[async_trait::async_trait]
+    impl crate::connector::dead_letter::DeadLetterSink for PanickingDeadLetterSink {
+        async fn write(
+            &self,
+            _entry: &crate::connector::dead_letter::ConnectorDeadLetter,
+        ) -> Result<(), ConnectorError> {
+            panic!("engine-side dead-letter sink panic");
+        }
+    }
+
     fn runtime(
         binding: Arc<SourceBinding>,
         source: Arc<MockSource>,
@@ -953,6 +1016,127 @@ mod tests {
             IdempotencyMode::BrokerCoordinates,
         )
         .with_dead_letter_sink(sink)
+    }
+
+    #[tokio::test]
+    async fn a_panicked_dispatch_marks_its_offset_for_recovery() {
+        // A panicked task never reaches `settle`, so the normal `Retry` path's
+        // recovery marking does not run. On a positional broker whose
+        // `abandon` cannot force a redelivery (Kafka), the local position has
+        // already advanced past this record, so nothing hands it back: the
+        // offset is a permanently blocked prefix head. At the tail of a quiet
+        // partition nothing ever settles behind it, so the backlog heuristic
+        // alone would wait forever -- the head itself must be marked.
+        let source = Arc::new(MockSource::new("orders").without_redelivery());
+        source.push_kafka(0, 7, b"{{{");
+        let rt = ConnectorRuntime::new(
+            malformed_binding(),
+            Arc::clone(&source) as Arc<dyn EventSource>,
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
+        )
+        .with_dead_letter_sink(Arc::new(PanickingDeadLetterSink));
+
+        let outcome = rt.run_once().await;
+
+        // Marking the head makes the pass fail as `Stalled`, which is what
+        // drives the consumer rebuild. `held: 0` is the load-bearing detail:
+        // nothing settled behind this offset, so the backlog heuristic cannot
+        // be what fired — only the marked retried head can be. That is exactly
+        // the tail-of-a-quiet-partition case a volume bound would miss.
+        match outcome {
+            Err(ConnectorError::Stalled {
+                partition, held, ..
+            }) => {
+                assert_eq!(partition, 0);
+                assert_eq!(
+                    held, 0,
+                    "nothing piled up behind it; the retried head is the only possible signal"
+                );
+            }
+            other => panic!(
+                "a panicked dispatch on a non-redelivering source must stall its \
+                 partition so the consumer is rebuilt, got {other:?}"
+            ),
+        }
+
+        assert_eq!(
+            rt.offsets.lock().await.stalled(0).map(|(p, _)| p),
+            Some(0),
+            "the panicked offset must be marked for recovery, not merely observed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicked_dispatch_on_a_redelivering_source_is_not_a_stall() {
+        // The mirror image: a broker whose visibility timeout hands the
+        // message back (SQS) is not wedged, and must not trigger a consumer
+        // rebuild -- otherwise every engine-side panic would recycle it.
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_kafka(0, 7, b"{{{");
+        let rt = ConnectorRuntime::new(
+            malformed_binding(),
+            Arc::clone(&source) as Arc<dyn EventSource>,
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
+        )
+        .with_dead_letter_sink(Arc::new(PanickingDeadLetterSink));
+
+        let summary = rt.run_once().await.unwrap();
+
+        assert_eq!(summary.retried, 1);
+        assert_eq!(
+            rt.offsets.lock().await.stalled(0),
+            None,
+            "a redelivering source is not wedged by a panicked dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_native_dead_letter_keeps_its_strikes_across_redeliveries() {
+        // `AbandonToBrokerDeadLetter` is terminal for harvest but NOT for the
+        // broker: it resets visibility so the message comes back and the
+        // broker counts the receive toward its own `maxReceiveCount`. When
+        // that ceiling is above this binding's `poison_threshold` the message
+        // returns one or more times before the broker quarantines it. Clearing
+        // the strike history on the way out would restart the countdown, so
+        // each redelivery would crawl through ordinary visibility-timeout
+        // retries again and emit a fresh `dead_lettered` sample per lap.
+        let binding = Arc::new(
+            SourceBinding::starts("orders", "orders", "order_flow")
+                .map_raw(|_ctx| Err(MappingError::Rejected("no thanks".to_string())))
+                .poison_threshold(2)
+                .broker_native_dead_letter(),
+        );
+        let source = Arc::new(MockSource::new("orders"));
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let rt = runtime(binding, Arc::clone(&source), Arc::clone(&sink));
+
+        // Same coordinates every time: one message, three deliveries.
+        source.push_kafka(0, 1, b"{}");
+        let first = rt.run_once().await.unwrap();
+        source.push_kafka(0, 1, b"{}");
+        let second = rt.run_once().await.unwrap();
+        source.push_kafka(0, 1, b"{}");
+        let third = rt.run_once().await.unwrap();
+
+        assert_eq!(first.retried, 1, "strike 1 is below the threshold");
+        assert_eq!(second.dead_lettered, 1, "strike 2 reaches the threshold");
+        assert_eq!(
+            third.dead_lettered, 1,
+            "a redelivery of an already-nacked message must re-nack immediately, \
+             not restart the strike countdown"
+        );
+        assert_eq!(
+            third.retried, 0,
+            "restarting the countdown would send it back through ordinary retries"
+        );
+        assert!(
+            sink.entries().is_empty(),
+            "broker-native dead-lettering never writes to the harvest sink"
+        );
     }
 
     #[tokio::test]

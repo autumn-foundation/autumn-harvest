@@ -355,3 +355,61 @@ async fn a_committed_offset_is_not_re_read_and_a_redelivery_dedupes() {
         "and appends no second WorkflowStarted"
     );
 }
+
+/// Lag must be measured from the DURABLE committed group offset, not the local
+/// next-fetch position (Codex review of a872555).
+///
+/// `position()` advances the instant a record is fetched, regardless of
+/// whether it has been dispatched, is being retried, or is stuck behind a
+/// blocked commit prefix. A consumer wedged with a large uncommitted backlog —
+/// exactly the condition the `harvest.connector.lag` gauge exists to expose —
+/// would therefore report its lag collapsing to zero while a restart replayed
+/// everything from the last commit.
+///
+/// This drives the source directly rather than through `ConnectorRuntime`, so
+/// the records are *fetched but never acked*: the honest reproduction of a
+/// blocked prefix.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn lag_reflects_the_committed_offset_not_the_fetch_position() {
+    use autumn_harvest_plugin::connector::EventSource;
+
+    let kafka = Kafka::default()
+        .with_tag("3.9.1")
+        .start()
+        .await
+        .expect("kafka starts");
+    let brokers = format!(
+        "127.0.0.1:{}",
+        kafka.get_host_port_ipv4(KAFKA_PORT).await.expect("port")
+    );
+
+    let bodies: Vec<Value> = (0..5)
+        .map(|i| json!({"order_id": format!("lag-{i}")}))
+        .collect();
+    produce(&brokers, &bodies).await;
+
+    let source = KafkaSource::connect(&KafkaSourceConfig::new(&brokers, "harvest-lag", TOPIC))
+        .expect("kafka consumer connects");
+
+    // Fetch every record without acking any of them.
+    let mut fetched = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while fetched < bodies.len() && std::time::Instant::now() < deadline {
+        fetched += source
+            .receive(64, Duration::from_secs(15))
+            .await
+            .expect("receive")
+            .len();
+    }
+    assert_eq!(fetched, bodies.len(), "all records were fetched");
+
+    // Nothing was committed, so the whole backlog is still outstanding. Under
+    // the old `position()`-based computation this read as 0.
+    let lag = source.lag().await.expect("lag is available");
+    let produced = i64::try_from(bodies.len()).expect("fixture size fits an i64");
+    assert!(
+        lag >= produced,
+        "fetched-but-uncommitted records must still count as lag, got {lag}"
+    );
+}

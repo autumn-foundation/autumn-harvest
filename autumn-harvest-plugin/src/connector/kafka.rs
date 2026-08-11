@@ -342,19 +342,34 @@ impl EventSource for KafkaSource {
         // `fetch_watermarks` is a blocking librdkafka call.
         tokio::task::spawn_blocking(move || {
             let assignment = consumer.assignment().ok()?;
-            let positions = consumer.position().ok()?;
+            // The DURABLE group offset, not `position()`. `position()` is the
+            // local next-fetch cursor: it advances the moment a record is
+            // fetched, regardless of whether that record has been dispatched,
+            // is being retried, or is stuck behind a blocked commit prefix. So
+            // a consumer wedged with a large uncommitted backlog — precisely
+            // the condition this gauge exists to expose — would report its lag
+            // falling to zero, while a restart replayed everything from the
+            // last commit.
+            let committed = consumer.committed(std::time::Duration::from_secs(2)).ok()?;
             let mut total: i64 = 0;
             for elem in assignment.elements() {
                 let partition = elem.partition();
-                let (_, high) = consumer
+                let (low, high) = consumer
                     .fetch_watermarks(&topic, partition, std::time::Duration::from_secs(2))
                     .ok()?;
-                let position = positions
+                let offset = committed
                     .find_partition(&topic, partition)
                     .map_or(Offset::Invalid, |p| p.offset());
-                if let Offset::Offset(current) = position {
-                    total = total.saturating_add((high - current).max(0));
-                }
+                // Nothing committed yet means the whole retained backlog is
+                // outstanding: this consumer is pinned to
+                // `auto.offset.reset = earliest`, so a restart reads from the
+                // low watermark. Skipping the partition instead would report
+                // zero lag for a consumer that has processed nothing.
+                let current = match offset {
+                    Offset::Offset(o) => o,
+                    _ => low,
+                };
+                total = total.saturating_add((high - current).max(0));
             }
             Some(total)
         })
