@@ -625,12 +625,18 @@ fn decode_or_raw(s: &str) -> String {
 /// A connection URL split into the regions **the driver's own parser sees**.
 ///
 /// Deliberately not an RFC 3986 split. `tokio-postgres` hand-rolls its URL
-/// parsing (`UrlParser`), and its grammar is both simpler and different in one
-/// way that matters for redaction: **there is no fragment.** `parse_host` stops
-/// at `/` or `?`, `parse_path` runs to `?`, and `parse_params` terminates each
-/// value only at `&`. So in `?password=#hunter2` the `#hunter2` is part of the
-/// password, and code that treats it as a fragment and passes it through prints
-/// the secret.
+/// parsing (`UrlParser`), and its grammar diverges from the RFC's in two ways
+/// that each hide a credential from a naive splitter:
+///
+/// 1. **There is no fragment.** `parse_host` stops at `/` or `?`, `parse_path`
+///    runs to `?`, and `parse_params` terminates each value only at `&`. So in
+///    `?password=#hunter2` the `#hunter2` is part of the password, and code
+///    that treats it as a fragment and passes it through prints the secret.
+/// 2. **Credentials are parsed before the host, not inside an authority.**
+///    `parse_credentials` is `take_until(&['@'])` over the whole remaining
+///    string, with no `/` or `?` terminator, so `alice:sec/ret@db/postgres`
+///    authenticates as `alice` / `sec/ret`. An authority-first split stops at
+///    the `/`, finds no `@`, and prints the credential in full.
 ///
 /// Splitting once, here, is what keeps the three helpers below from each
 /// re-deriving a slightly different — and slightly wrong — view of the string.

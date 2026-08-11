@@ -606,11 +606,17 @@ ANALYZE` of the claim query.
   (or writer) checks out its pooled connection and then waits at a start
   barrier, so a row labelled "8 concurrent claimers" measures eight of them
   contending, not a ramp-up in which the first is already sampling while the
-  last is still connecting. The throughput denominator is the span from that
-  release to the slowest worker finishing, so pool construction is not counted
-  as measured work. This is a *different* clock from the per-scenario ceiling
-  below, which deliberately starts *before* checkout — `pool.get()` is an
-  unbounded await, so a ceiling that started after it would not bound it.
+  last is still connecting. The throughput denominator is **one** span shared by
+  every worker — earliest resume after the barrier through the last completion —
+  so pool construction is not counted as measured work and no worker's
+  release-to-resume delay escapes the denominator. Timing each worker from its
+  own resume and taking the widest of those would drop exactly that delay while
+  keeping all of its claims in the numerator, reporting a rate the run never
+  achieved; with more workers than runtime threads most of them are not polled
+  at release, so the effect is not marginal. This is a *different* clock from
+  the per-scenario ceiling below, which deliberately starts *before* checkout —
+  `pool.get()` is an unbounded await, so a ceiling that started after it would
+  not bound it.
 
 ### Profile does not matter
 
