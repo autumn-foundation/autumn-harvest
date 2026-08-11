@@ -594,41 +594,42 @@ pub enum SweepStep {
 /// Decide the fate of one candidate database, without touching a database.
 ///
 /// Split out so the whole decision is testable on every OS, with no server and
-/// no Docker. Only two things can stop the sweep here; everything else defers
-/// to the server-visible lease, which is the one authority that sees every
-/// client regardless of host or PID namespace:
+/// no Docker. Exactly **one** thing stops the sweep here — a name this harness
+/// did not mint, which is not ours to reclaim. Everything else defers to the
+/// server-visible lease, the one authority that sees every client regardless of
+/// host or PID namespace.
 ///
-/// 1. **It is ours.** Keyed on the run token, never the pid — two containerised
-///    runs on different hosts both report pid 1, so a pid would make one run
-///    exempt the other's databases and, worse, claim them as its own. This also
-///    covers the database we are about to create, whose lease does not exist
-///    between `CREATE DATABASE` and the connect that takes it.
-/// 2. **We did not mint the name.** Not ours to reclaim.
+/// Two exemptions that earlier revisions carried are deliberately gone, both
+/// retired by serialising the sweep, `CREATE DATABASE` and the lease under
+/// [`SWEEP_LOCK_KEY`]:
 ///
-/// Notably there is *no* liveness veto on the recorded pid. Serialising the
-/// sweep and the create-to-lease window under [`SWEEP_LOCK_KEY`] removed the
-/// only thing such a veto protected, and a pid veto is actively harmful in a
-/// container, where the recorded pid is usually 1 and therefore always "alive":
-/// every stale database from a previous container run would be skipped forever.
+/// * **No pid liveness veto.** It protected another local run inside its
+///   create-to-lease window, which the lock now makes unobservable. In a
+///   container it was actively harmful: the recorded pid is usually 1, pid 1 is
+///   always alive, so every stale database a previous container run left behind
+///   would be skipped forever.
+/// * **No run-token self-exemption.** It was meant to cover the database we are
+///   about to create — but the sweep runs *before* `CREATE DATABASE`, so that
+///   database does not exist yet and was never a candidate. What the exemption
+///   actually did was make a process unable to reclaim its **own** earlier
+///   databases: `run_token()` is constant for the life of a process, so a
+///   process calling [`db::setup_bench_db`] more than once (the benchmark, and
+///   the gate suite) left one migrated database behind per call until some
+///   other process happened to sweep. A prior database whose [`db::BenchDb`] is
+///   still alive holds its lease and is skipped by the server check anyway, so
+///   the lease already draws the line correctly — and draws it by *liveness*
+///   rather than by *ownership*, which is the question that actually matters.
+///
+/// The run token still earns its keep in the database **name**, where it makes
+/// two containerised runs on different hosts — both reporting pid 1 — collide
+/// neither at `CREATE DATABASE` nor in each other's sweep.
 #[must_use]
-pub fn sweep_step(owner_token: Option<&str>, my_token: &str, owner_pid: Option<u32>) -> SweepStep {
-    // Ours — including the database we are about to create, whose lease does
-    // not exist yet between `CREATE DATABASE` and the connect that takes it.
-    if owner_token == Some(my_token) {
+pub const fn sweep_step(owner_pid: Option<u32>, owner_token: Option<&str>) -> SweepStep {
+    // A name we did not mint: not ours to reclaim. Ours always carry both a
+    // numeric pid and a token, so a missing either way means someone else's.
+    if owner_pid.is_none() || owner_token.is_none() {
         return SweepStep::Skip;
     }
-    // A name we did not mint: not ours to reclaim.
-    if owner_pid.is_none() {
-        return SweepStep::Skip;
-    }
-    // Everything else is the server's call. Deliberately *no* liveness veto on
-    // the recorded pid: the only thing such a veto ever protected was another
-    // local run inside its own create-to-lease window, and the sweep now runs
-    // under the same advisory lock as that window (see `SWEEP_LOCK_KEY`), so it
-    // cannot observe one. Keeping it would be pure cost — a pid is only
-    // meaningful on the host that minted it, and in a container the recorded
-    // pid is usually 1, which is always alive, so every stale database from a
-    // previous container run would be skipped forever.
     SweepStep::AskServer
 }
 
@@ -906,27 +907,23 @@ mod pure_tests {
         );
     }
 
-    /// A run never reclaims its own database, whatever the host reports.
+    /// A process must be able to reclaim its **own** earlier databases.
+    ///
+    /// `run_token()` is constant for the life of a process, so a self-exemption
+    /// keyed on it made every process leak one migrated database per
+    /// `setup_bench_db` call — the benchmark alone calls it a dozen times. The
+    /// exemption bought nothing: the sweep runs *before* `CREATE DATABASE`, so
+    /// the database being created is not a candidate, and a prior database
+    /// still in use holds its lease and is skipped by the server check.
     #[test]
-    fn sweep_step_skips_our_own_run() {
+    fn sweep_step_lets_the_lease_decide_for_our_own_earlier_databases() {
         assert_eq!(
-            sweep_step(Some("mytoken"), "mytoken", Some(1)),
-            SweepStep::Skip
+            sweep_step(Some(1), Some("mytoken")),
+            SweepStep::AskServer,
+            "our own token must not exempt a database from the lease check",
         );
-        // Even mid create-to-lease, when the server would report no backends.
         assert_eq!(
-            sweep_step(Some("mytoken"), "mytoken", Some(99999)),
-            SweepStep::Skip
-        );
-    }
-
-    /// Two containerised runs on different hosts both report pid 1. Ownership
-    /// must key on the run token, or one would treat the other's live database
-    /// as its own.
-    #[test]
-    fn sweep_step_does_not_confuse_a_foreign_run_sharing_our_pid() {
-        assert_eq!(
-            sweep_step(Some("theirs"), "mine", Some(1)),
+            sweep_step(Some(std::process::id()), Some("mytoken")),
             SweepStep::AskServer,
         );
     }
@@ -937,10 +934,7 @@ mod pure_tests {
     /// can never answer "is this in use"; only the server sees every client.
     #[test]
     fn sweep_step_asks_the_server_for_a_foreign_run() {
-        assert_eq!(
-            sweep_step(Some("theirs"), "mine", Some(4242)),
-            SweepStep::AskServer,
-        );
+        assert_eq!(sweep_step(Some(4242), Some("theirs")), SweepStep::AskServer);
     }
 
     /// A live same-host pid must NOT veto the server's judgement.
@@ -950,21 +944,26 @@ mod pure_tests {
         // previous container run records exactly that pid. A liveness veto here
         // would skip it forever; the advisory lock already covers the only
         // window such a veto ever protected.
+        assert_eq!(sweep_step(Some(1), Some("theirs")), SweepStep::AskServer);
         assert_eq!(
-            sweep_step(Some("theirs"), "mine", Some(1)),
-            SweepStep::AskServer,
-        );
-        assert_eq!(
-            sweep_step(Some("theirs"), "mine", Some(std::process::id())),
+            sweep_step(Some(std::process::id()), Some("theirs")),
             SweepStep::AskServer,
         );
     }
 
     /// A name this harness did not mint is never reclaimed.
+    ///
+    /// Ours are `harvest_claim_bench_{pid}_{token}_{seq}`, so a missing pid *or*
+    /// a missing token means the name came from somewhere else. With the sweep
+    /// otherwise unconditional, this is the only thing standing between a
+    /// same-prefix database belonging to someone else and a `DROP`.
     #[test]
     fn sweep_step_leaves_unparseable_names_alone() {
-        assert_eq!(sweep_step(None, "mine", None), SweepStep::Skip);
-        assert_eq!(sweep_step(Some("notapid"), "mine", None), SweepStep::Skip);
+        assert_eq!(sweep_step(None, None), SweepStep::Skip);
+        // A numeric first component but no token: not our name shape.
+        assert_eq!(sweep_step(Some(123), None), SweepStep::Skip);
+        // A token but a non-numeric first component (parsed to `None`).
+        assert_eq!(sweep_step(None, Some("sometoken")), SweepStep::Skip);
     }
 
     /// The inverse of `with_db_name` must not reintroduce the last-slash bug.
@@ -1417,7 +1416,7 @@ pub mod db {
             let owner_pid = parts.next().and_then(|pid| pid.parse::<u32>().ok());
             let owner_token = parts.next();
 
-            if super::sweep_step(owner_token, run_token(), owner_pid) == super::SweepStep::Skip {
+            if super::sweep_step(owner_pid, owner_token) == super::SweepStep::Skip {
                 continue;
             }
 

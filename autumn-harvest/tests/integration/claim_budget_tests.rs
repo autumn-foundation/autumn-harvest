@@ -596,6 +596,92 @@ async fn an_idle_bench_database_still_holds_a_visible_lease() {
     panic!("lease survived BenchDb drop: the stale sweep can never reclaim {datname}");
 }
 
+/// A process reclaims its **own** finished databases, not just other runs'.
+///
+/// `run_token()` is constant for the life of a process, so an ownership-keyed
+/// self-exemption in the sweep meant a process could never clean up after
+/// itself: every [`db::setup_bench_db`] call left one migrated database — up to
+/// 100k rows — behind until some *other* process happened to sweep. This suite
+/// alone calls setup once per test, and the benchmark calls it a dozen times,
+/// so the leak was per-run and cumulative rather than exotic. Measured before
+/// the fix: one run of this suite left eight databases; after it, one.
+///
+/// The lease is what makes dropping the exemption safe, and this test pins both
+/// halves of that: the first database is reclaimed only *after* its `BenchDb` is
+/// dropped, so a still-live prior database is protected by its own backend
+/// rather than by its name.
+///
+/// Existing-server mode only, matching its siblings — the testcontainer path
+/// gets a private server per process and has nothing to sweep.
+#[tokio::test]
+async fn a_later_setup_reclaims_this_processes_finished_databases() {
+    use diesel::QueryableByName;
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+
+    #[derive(QueryableByName)]
+    struct ExistsRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    async fn exists(admin: &mut AsyncPgConnection, datname: &str) -> bool {
+        diesel::sql_query("SELECT count(*) AS n FROM pg_database WHERE datname = $1")
+            .bind::<diesel::sql_types::Text, _>(datname.to_string())
+            .get_result::<ExistsRow>(admin)
+            .await
+            .expect("pg_database is always readable")
+            .n
+            > 0
+    }
+
+    let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+        eprintln!(
+            "SKIP a_later_setup_reclaims_this_processes_finished_databases: \
+             existing-server mode only (HARVEST_TEST_DATABASE_URL unset)"
+        );
+        return;
+    };
+    let Ok(mut admin) = AsyncPgConnection::establish(&admin_url).await else {
+        eprintln!("SKIP a_later_setup_reclaims_this_processes_finished_databases: admin connect");
+        return;
+    };
+
+    let Ok(first) = db::setup_bench_db().await else {
+        eprintln!("SKIP a_later_setup_reclaims_this_processes_finished_databases: no database");
+        return;
+    };
+    let first_name = db_name_from_url(&first.url)
+        .expect("bench url always carries a database path")
+        .to_string();
+
+    // While the first is still held, a second setup must leave it alone: its
+    // lease says "in use", and that is the only thing that should matter.
+    let Ok(second) = db::setup_bench_db().await else {
+        eprintln!("SKIP a_later_setup_reclaims_this_processes_finished_databases: no database");
+        return;
+    };
+    assert!(
+        exists(&mut admin, &first_name).await,
+        "a live database was reclaimed by its own process: the lease must protect \
+         {first_name} while its BenchDb is held"
+    );
+    drop(second);
+
+    // Now release it and sweep again. Same process, same run token — so before
+    // the fix this is exactly the case that leaked.
+    drop(first);
+    let Ok(third) = db::setup_bench_db().await else {
+        eprintln!("SKIP a_later_setup_reclaims_this_processes_finished_databases: no database");
+        return;
+    };
+    assert!(
+        !exists(&mut admin, &first_name).await,
+        "{first_name} survived a later setup in the same process: a run cannot \
+         clean up after itself, so every setup call leaks a migrated database"
+    );
+    drop(third);
+}
+
 /// Setup serializes against a foreign sweep, so the create-to-lease window is
 /// not a hole.
 ///
