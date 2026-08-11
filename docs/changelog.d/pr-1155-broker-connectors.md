@@ -1019,6 +1019,19 @@ coordinates, so a run traces back to the exact message.
   under-report and show a false all-clear — the failure direction that hurts.
   Three RED-first tests, both guards mutation-verified in isolation.
 
+- **The SQS module doc described the wrong redelivery speed.** It claimed
+  `EventSource::abandon` "resets [the visibility timeout] to zero", which the
+  adapter deliberately stopped doing when `abandon` became a no-op — zeroing
+  visibility turns a transient failure into a tight redelivery loop against an
+  already-struggling system and burns `ApproximateReceiveCount` toward a redrive
+  policy's `maxReceiveCount` faster than the failure warrants. Only
+  `nack_for_dead_letter` zeroes it, where fast redelivery *is* the point. The
+  stale sentence hid the fact that **the visibility timeout is the retry
+  backoff**, so an operator diagnosing slow retries would have looked for a
+  bug rather than reaching for `visibility_timeout_secs`. Doc-only: the code,
+  the connector guide and `docs/telemetry.md` were all already correct, so this
+  was single-site drift rather than a misunderstanding of the design.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

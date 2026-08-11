@@ -9,9 +9,25 @@
 //! SQS acknowledgement is a per-message `DeleteMessage`, so there is no
 //! high-water mark to protect and no offset ordering to respect: the runtime's
 //! [`OffsetTracker`][ot] gate is bypassed entirely for opaque handles. A
-//! message is deleted only after its dispatch is durable; otherwise its
-//! visibility timeout lapses (or [`EventSource::abandon`] resets it to zero)
-//! and SQS redelivers, where it dedupes on the connector's derived key.
+//! message is deleted only after its dispatch is durable; otherwise SQS
+//! redelivers it, where it dedupes on the connector's derived key.
+//!
+//! *When* it is redelivered differs by path, and the two are deliberately not
+//! the same speed:
+//!
+//! * **Transient retry.** [`EventSource::abandon`] is a no-op — simply not
+//!   deleting the message is already sufficient, so it reappears once its
+//!   existing visibility timeout lapses. **The visibility timeout is the retry
+//!   backoff**; size it with [`SqsSourceConfig::visibility_timeout_secs`].
+//!   Zeroing visibility here would turn a transient failure — usually harvest
+//!   under pressure — into a tight redelivery loop against an already-struggling
+//!   system, and burn `ApproximateReceiveCount` toward a redrive policy's
+//!   `maxReceiveCount` faster than the failure warrants.
+//! * **Poison redrive.** [`EventSource::nack_for_dead_letter`] *does* reset
+//!   visibility to zero, because there fast redelivery is the point: each
+//!   receive drives the message toward `maxReceiveCount` and thus the queue's
+//!   DLQ. Only reachable under
+//!   [`SourceBinding::broker_native_dead_letter`][bn].
 //!
 //! [ot]: super::disposition::OffsetTracker
 //!
