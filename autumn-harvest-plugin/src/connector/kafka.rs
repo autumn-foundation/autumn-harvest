@@ -545,7 +545,14 @@ impl EventSource for KafkaSource {
         });
         // `fetch_watermarks` is a blocking librdkafka call.
         tokio::task::spawn_blocking(move || {
-            let timeout = std::time::Duration::from_secs(2);
+            // One overall deadline for the whole walk, so an abandoned sample
+            // stops rather than running on to completion on a blocking thread.
+            let deadline = std::time::Instant::now() + LAG_SAMPLE_BUDGET;
+            let budget = || {
+                remaining_lag_budget(deadline, std::time::Instant::now())
+                    .map(|left| left.min(LAG_CALL_TIMEOUT))
+            };
+            let timeout = budget()?;
 
             // Every partition of the topic, from metadata — deliberately NOT
             // `consumer.assignment()`. Consumer lag is a property of the GROUP,
@@ -594,7 +601,7 @@ impl EventSource for KafkaSource {
             for partition in &partitions {
                 wanted.add_partition(&topic, *partition);
             }
-            let committed = consumer.committed_offsets(wanted, timeout).ok()?;
+            let committed = consumer.committed_offsets(wanted, budget()?).ok()?;
 
             group_lag(
                 &topic,
@@ -602,7 +609,10 @@ impl EventSource for KafkaSource {
                 &committed,
                 reset,
                 &anchors,
-                |partition| consumer.fetch_watermarks(&topic, partition, timeout).ok(),
+                // Re-read the remaining budget per partition: this is the loop
+                // whose cost scales with the topic, so it is where the bound
+                // has to bite.
+                |partition| consumer.fetch_watermarks(&topic, partition, budget()?).ok(),
             )
         })
         .await
@@ -678,6 +688,37 @@ fn canonical_broker_list(brokers: &str) -> String {
     seeds.sort_unstable();
     seeds.dedup();
     seeds.join(",")
+}
+
+/// Overall wall-clock budget for one lag sample.
+///
+/// The sample walks **every partition of the topic** (deliberately — see
+/// [`EventSource::lag`]), so its cost scales with partition count, and each
+/// `fetch_watermarks` is a live broker round-trip that can itself be slow. Left
+/// unbounded, a large topic against a degraded broker keeps a blocking thread
+/// occupied for minutes and keeps hammering the very broker that is struggling.
+///
+/// The runtime independently budgets the call, which is what protects the
+/// message path; this bound is what makes an abandoned sample actually STOP.
+/// Without it the runtime's timeout only drops the `JoinHandle` — the blocking
+/// walk runs on to completion regardless, so abandoned walks pile up one per
+/// sample interval and the broker load grows rather than shrinks.
+const LAG_SAMPLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Per-call librdkafka timeout, further clamped by whatever budget is left.
+const LAG_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Time left in a sample's budget, or `None` once it is spent.
+///
+/// `None` aborts the walk, which surfaces as an unavailable watermark and so
+/// as no sample at all — the same honest failure mode [`group_lag`] already
+/// uses for a partial answer.
+fn remaining_lag_budget(
+    deadline: std::time::Instant,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    let left = deadline.checked_duration_since(now)?;
+    (!left.is_zero()).then_some(left)
 }
 
 /// The group's outstanding records across `partitions`.
@@ -888,6 +929,61 @@ mod tests {
         anchors.record_read(2, 7);
         anchors.record_read(1, 3);
         assert_eq!(anchors.pending_anchors(), vec![(0, 101), (1, 3), (2, 7)]);
+    }
+
+    /// The walk stops once its budget is spent, and each call is clamped to
+    /// what is left so a single one cannot overrun the whole sample.
+    #[test]
+    fn a_lag_sample_walk_stops_once_its_budget_is_spent() {
+        let start = std::time::Instant::now();
+        let deadline = start + LAG_SAMPLE_BUDGET;
+
+        // Plenty left: the caller clamps to the per-call timeout itself.
+        let left = remaining_lag_budget(deadline, start).expect("budget remains");
+        assert_eq!(left, LAG_SAMPLE_BUDGET);
+        assert_eq!(left.min(LAG_CALL_TIMEOUT), LAG_CALL_TIMEOUT);
+
+        // Nearly spent: the per-call timeout is clamped DOWN, so one slow call
+        // cannot run past the sample's own deadline.
+        let nearly = remaining_lag_budget(
+            deadline,
+            start + LAG_SAMPLE_BUDGET.saturating_sub(std::time::Duration::from_millis(500)),
+        )
+        .expect("budget remains");
+        assert_eq!(nearly, std::time::Duration::from_millis(500));
+        assert_eq!(
+            nearly.min(LAG_CALL_TIMEOUT),
+            std::time::Duration::from_millis(500)
+        );
+
+        // Spent, exactly and then past: both abort the walk.
+        assert!(remaining_lag_budget(deadline, deadline).is_none());
+        assert!(
+            remaining_lag_budget(deadline, deadline + std::time::Duration::from_secs(1)).is_none()
+        );
+    }
+
+    /// A walk that runs out of budget partway reports NO sample rather than a
+    /// partial total — a partial sum is indistinguishable from a genuine drop
+    /// in backlog, which is the wrong thing to page on.
+    #[test]
+    fn a_budget_exhausted_walk_reports_no_sample_not_a_partial_one() {
+        let committed = TopicPartitionList::new();
+        let seen = std::cell::Cell::new(0);
+        let total = group_lag(
+            "orders",
+            &[0, 1, 2, 3],
+            &committed,
+            OffsetReset::Earliest,
+            &PartitionAnchors::default(),
+            |_p| {
+                // Budget runs out after two partitions.
+                seen.set(seen.get() + 1);
+                (seen.get() <= 2).then_some((0, 100))
+            },
+        );
+        assert!(total.is_none(), "a truncated walk must not report a total");
+        assert_eq!(seen.get(), 3, "the walk stops at the first exhausted call");
     }
 
     #[test]

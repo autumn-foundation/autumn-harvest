@@ -965,6 +965,35 @@ coordinates, so a run traces back to the exact message.
   reset-policy baseline, and a process that restarts before its group ever
   commits genuinely has no anchor — which is what `latest` asks for. Neither
   applies to the `earliest` default.
+- **Bounded the lag sample so it cannot starve message consumption.** Two
+  earlier fixes on this PR composed into a starvation loop, which is worth
+  naming plainly: making the Kafka sample group-wide meant walking *every*
+  partition of the topic serially, and moving the sample *before* `receive` (so
+  no message is in custody across a billed round-trip) meant that walk now sits
+  directly in front of consumption. The throttle stamped the sample instant on
+  the way IN, so a walk that outlasted `lag_sample_interval` was due again the
+  moment it returned — every pass sampling, a sliver of each consuming. And
+  because the failure is driven by broker latency, it struck hardest exactly
+  when it mattered most: a degraded broker makes the walk slow *and* the backlog
+  grow, so the gauge reported a number the operator could not act on because the
+  connector was too busy measuring it to consume. Three bounds, all needed. The
+  sample is now budgeted at `lag_sample_interval` (a sample that cannot finish
+  within its own cadence is by definition too expensive for it, and the remedy is
+  the knob the operator already has); an over-budget sample is abandoned and
+  warned rather than blocking, so the gauge goes stale instead of the connector
+  going quiet — the same honest failure mode the adapters already use for a
+  partial answer. The interval is measured from **completion**, guaranteeing a
+  full interval of polling between samples however expensive one turns out to be
+  (worst case half the wall clock, bounded, versus previously unbounded). And the
+  Kafka walk carries its own overall deadline, clamping each `fetch_watermarks`
+  to the budget left — not redundant with the runtime timeout, because abandoning
+  the outer future only drops the join handle while the blocking walk runs on, so
+  abandoned walks would otherwise pile up one per interval and *increase* load on
+  the struggling broker. Concurrent watermark fetches were considered and not
+  taken: they shrink the walk but do not bound it, and parallelising a blocking
+  librdkafka call means N blocking threads per sample — trading one resource
+  problem for another when the guarantee needed is a bound, not a speedup. Three
+  RED-first tests, each mutation-verified against its own fix in isolation.
 
 ### Success metric
 

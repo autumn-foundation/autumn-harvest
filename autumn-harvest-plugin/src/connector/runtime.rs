@@ -455,10 +455,31 @@ impl ConnectorRuntime {
         // message reaches the broker DLQ having never once failed. The gauge is
         // throttled to a scrape cadence anyway, so which side of the receive it
         // lands on is immaterial to its accuracy.
-        if self.lag_sample_is_due()
-            && let Some(lag) = self.source.lag().await
-        {
-            self.metrics.record_connector_lag(self.binding.name, lag);
+        //
+        // The sample is BUDGETED, because being on this side of the receive is
+        // what makes an unbounded one lethal: it blocks the pass outright, so
+        // the connector stops consuming entirely while it waits. That is worst
+        // exactly when it matters most — a degraded broker makes the round-trip
+        // slow AND makes the backlog grow, so the gauge you are paying for
+        // reports a number you cannot act on because the connector is too busy
+        // measuring it to consume. An over-budget sample is abandoned; the
+        // gauge simply does not update, which is the same honest failure mode
+        // the adapters already use when a partial answer is unavailable.
+        if self.lag_sample_is_due() {
+            match tokio::time::timeout(self.lag_sample_budget(), self.source.lag()).await {
+                Ok(Some(lag)) => self.metrics.record_connector_lag(self.binding.name, lag),
+                // The adapter declined (a watermark was unavailable, say). Not
+                // an error — reporting a partial total would be worse.
+                Ok(None) => {}
+                Err(_) => tracing::warn!(
+                    source = self.binding.name,
+                    budget_ms = self.lag_sample_budget().as_millis(),
+                    "connector lag sample exceeded its budget and was abandoned;                      the gauge will be stale. Widen lag_sample_interval, or reduce                      what the sample costs (a Kafka sample scales with partition count)"
+                ),
+            }
+            // Re-stamp from COMPLETION so an expensive sample cannot re-arm
+            // itself on the very next pass; see `record_lag_sample_completed`.
+            self.record_lag_sample_completed();
         }
 
         let batch = self
@@ -684,9 +705,42 @@ impl ConnectorRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let due = last.is_none_or(|t| now.duration_since(t) >= self.config.lag_sample_interval);
         if due {
+            // Stamped on the way IN as well as out, so a concurrent pass cannot
+            // start a second sample while this one is outstanding.
             *last = Some(now);
         }
         due
+    }
+
+    /// Re-stamp the throttle once a sample has finished.
+    ///
+    /// The gap between samples is then measured from **completion**, not from
+    /// the start. Measuring from the start is what turns an expensive sample
+    /// into a starvation loop: a sample that takes longer than
+    /// `lag_sample_interval` is due again the instant it returns, so the very
+    /// next pass samples again, and the runtime spends nearly all of its time
+    /// walking the broker rather than consuming. Measuring from completion
+    /// guarantees a full interval of message polling between samples however
+    /// expensive one turns out to be.
+    fn record_lag_sample_completed(&self) {
+        *self
+            .last_lag_sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+    }
+
+    /// How long a single lag sample may block the message path.
+    ///
+    /// Derived from the cadence rather than configured separately: a sample
+    /// that cannot finish within the interval it is taken at is, by
+    /// definition, too expensive for that cadence, and the operator's remedy
+    /// is the knob they already have. Together with the completion re-stamp
+    /// this bounds the worst case at half the wall clock (budget, then a full
+    /// interval of polling) instead of leaving it unbounded — and in the
+    /// normal case a healthy sample is milliseconds and the bound never
+    /// engages.
+    const fn lag_sample_budget(&self) -> std::time::Duration {
+        self.config.lag_sample_interval
     }
 
     fn clone_handles(&self) -> Self {
@@ -2324,6 +2378,9 @@ mod tests {
     struct CallOrderSource {
         inner: MockSource,
         calls: std::sync::Mutex<Vec<&'static str>>,
+        /// When set, `lag()` never resolves — a broker round-trip that has
+        /// stopped responding rather than merely being slow.
+        lag_stalls: std::sync::atomic::AtomicBool,
     }
 
     impl CallOrderSource {
@@ -2331,7 +2388,12 @@ mod tests {
             Self {
                 inner: MockSource::new(stream),
                 calls: std::sync::Mutex::new(Vec::new()),
+                lag_stalls: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+        fn stall_lag(&self) {
+            self.lag_stalls
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         fn note(&self, what: &'static str) {
             self.calls
@@ -2370,8 +2432,96 @@ mod tests {
         }
         async fn lag(&self) -> Option<i64> {
             self.note("lag");
+            if self.lag_stalls.load(std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             self.inner.lag().await
         }
+    }
+
+    /// A sample that outlasts its own cadence must not re-arm immediately.
+    ///
+    /// The throttle stamps the sample instant, and stamping it on the way IN
+    /// means the gap is measured from when the sample STARTED. A sample that
+    /// takes longer than `lag_sample_interval` is therefore due again the
+    /// instant it finishes, on the very next pass — so the runtime spends
+    /// every pass sampling and only a sliver of each consuming. Measuring the
+    /// gap from COMPLETION guarantees a full interval of message polling
+    /// between samples no matter how expensive one turns out to be.
+    #[tokio::test]
+    async fn a_slow_lag_sample_does_not_immediately_re_arm_the_throttle() {
+        let config = ConnectorRuntimeConfig {
+            lag_sample_interval: std::time::Duration::from_millis(40),
+            ..ConnectorRuntimeConfig::default()
+        };
+        let rt = ConnectorRuntime::new(
+            malformed_binding(),
+            Arc::new(MockSource::new("orders")) as Arc<dyn EventSource>,
+            HarvestApiState::new(),
+            Arc::new(RecordingMetrics::default()) as Arc<dyn MetricsRecorder>,
+            IdempotencyMode::BrokerCoordinates,
+        )
+        .with_config(config);
+
+        assert!(rt.lag_sample_is_due(), "the first sample is always due");
+        // A sample that itself outlasts the interval.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        rt.record_lag_sample_completed();
+        assert!(
+            !rt.lag_sample_is_due(),
+            "the gap must be measured from completion, or an expensive sample              re-arms itself on every pass and starves message polling",
+        );
+    }
+
+    /// An unbounded lag sample must never block the message path.
+    ///
+    /// `lag()` is sampled before `receive` (so no message is ever in custody
+    /// across a billed broker round-trip), which means an unbounded sample
+    /// blocks the pass outright: the connector stops consuming entirely while
+    /// it waits. That is worst precisely when it matters most — a degraded
+    /// broker makes the sample slow AND makes the backlog grow. The sample is
+    /// therefore budgeted, and an over-budget one is abandoned so the pass
+    /// still polls.
+    #[tokio::test]
+    async fn an_over_budget_lag_sample_is_abandoned_so_the_pass_still_polls() {
+        let source = Arc::new(CallOrderSource::new("orders"));
+        source.inner.set_lag(Some(42));
+        source.stall_lag();
+        source.inner.push_kafka(0, 1, b"{{{");
+        let metrics = Arc::new(RecordingMetrics::default());
+        let rt = ConnectorRuntime::new(
+            malformed_binding(),
+            Arc::clone(&source) as Arc<dyn EventSource>,
+            HarvestApiState::new(),
+            Arc::clone(&metrics) as Arc<dyn MetricsRecorder>,
+            IdempotencyMode::BrokerCoordinates,
+        )
+        .with_dead_letter_sink(Arc::new(RecordingDeadLetterSink::new()))
+        .with_config(ConnectorRuntimeConfig {
+            // A small budget keeps the real wall-clock wait tiny; the point is
+            // that it is BOUNDED, not how large it is.
+            lag_sample_interval: std::time::Duration::from_millis(30),
+            ..ConnectorRuntimeConfig::default()
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), rt.run_once())
+            .await
+            .expect("an unbounded lag sample must not block the pass")
+            .expect("the pass itself must succeed");
+
+        let calls = source.calls();
+        assert!(
+            calls.contains(&"receive"),
+            "the pass must still poll for messages, got {calls:?}",
+        );
+        assert!(
+            metrics
+                .lag
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "an abandoned sample must record nothing rather than a stale value",
+        );
     }
 
     /// Telemetry must never sit between `receive` and dispatch.

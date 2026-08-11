@@ -631,6 +631,43 @@ other replica would be invisible. The cost is that each replica asks the broker
 about every partition, so calls per sample scale with replica count — bounded
 work on the `lag_sample_interval`, never on the message path.
 
+### The lag sample is budgeted so it cannot starve consumption
+
+The sample runs **before** `receive`, so no message is ever in custody across a
+billed broker round-trip. That placement is what makes an *unbounded* sample
+lethal: it blocks the pass outright, and the connector stops consuming entirely
+while it waits. Worse, the failure is self-reinforcing and strikes exactly when
+it matters most — a degraded broker makes the round-trip slow *and* makes the
+backlog grow, so the gauge you are paying for reports a number you cannot act on
+because the connector is too busy measuring it to consume.
+
+Two bounds close that, and both are needed:
+
+* **The sample is budgeted at `lag_sample_interval`.** A sample that cannot
+  finish within the cadence it is taken at is by definition too expensive for
+  that cadence, and the operator's remedy is the knob they already have. An
+  over-budget sample is abandoned and logged; the gauge simply does not update,
+  the same honest failure mode the adapters already use when a partial answer is
+  unavailable.
+* **The interval is measured from when a sample *finishes*, not when it starts.**
+  Measuring from the start is what turns an expensive sample into a starvation
+  loop: one that outlasts the interval is due again the instant it returns, so
+  the very next pass samples again. Measuring from completion guarantees a full
+  interval of message polling between samples however expensive one turns out to
+  be. In the worst case the connector spends half its wall clock sampling, which
+  is bounded; in the normal case a healthy sample is milliseconds and neither
+  bound ever engages.
+
+The Kafka adapter carries its own overall deadline for the walk as well, clamping
+each `fetch_watermarks` to whatever budget is left. That is not redundant with
+the runtime's timeout: abandoning the outer future only drops the join handle,
+and the blocking walk would otherwise run to completion regardless — so
+abandoned walks would pile up one per interval and *increase* load on the broker
+that is already struggling. If a sample is repeatedly abandoned you will see a
+`connector lag sample exceeded its budget` warning; widen
+`lag_sample_interval`, or reduce what the sample costs (its cost scales with
+partition count).
+
 ### A `latest` group is anchored, not forbidden
 
 `enable.auto.commit` is forced off no matter what a caller sets, because
