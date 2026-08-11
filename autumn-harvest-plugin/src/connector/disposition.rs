@@ -352,10 +352,19 @@ pub const MAX_POISON_ENTRIES: usize = 10_000;
 /// dead-letter sink never fires. The failure is silent — the tracker looks
 /// healthy and the message looks freshly rejected each time.
 ///
-/// The value is SQS's **maximum** visibility timeout, so no legal broker
-/// configuration can redeliver later than this. It is a floor, never a cap: an
-/// operator who sets a longer `poison_retention` still gets the longer window
-/// for both kinds.
+/// The value is **twice** [`MAX_BROKER_INVISIBILITY`], SQS's maximum
+/// visibility timeout. Equalling that maximum is not enough for two compounding
+/// reasons: `run_once` sweeps *before* it polls, so at exactly the maximum the
+/// strike is retired in the very pass that would then have received the
+/// redelivery; and the real redelivery is the visibility timeout plus the poll
+/// interval and whatever scheduling and queue delay the broker adds, so it
+/// always lands strictly after it. How much slack is decided by the asymmetry:
+/// expiring **late** costs bounded memory, expiring **early** silently disables
+/// strike-based quarantine altogether, so the margin is deliberately generous
+/// rather than tight.
+///
+/// It is a floor, never a cap: an operator who sets a longer
+/// `poison_retention` still gets the longer window for both kinds.
 ///
 /// Holding active entries longer is safe because time was never the hard bound
 /// — [`MAX_POISON_ENTRIES`] is, and its eviction stays kind-blind precisely so
@@ -363,7 +372,14 @@ pub const MAX_POISON_ENTRIES: usize = 10_000;
 /// active entry under load, and the cap already reports that as degradation via
 /// [`PoisonTracker::strike_progress_discarded`].
 pub const ACTIVE_STRIKE_RETENTION_FLOOR: std::time::Duration =
-    std::time::Duration::from_secs(12 * 60 * 60);
+    MAX_BROKER_INVISIBILITY.saturating_mul(2);
+
+/// The longest a broker in scope may legally hide a message before redelivering
+/// it: SQS's maximum `VisibilityTimeout`, a hard AWS limit.
+///
+/// Named rather than inlined so [`ACTIVE_STRIKE_RETENTION_FLOOR`] derives from
+/// it and the two cannot drift.
+const MAX_BROKER_INVISIBILITY: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 
 impl PoisonTracker {
     /// A tracker with no recorded strikes.
@@ -785,9 +801,42 @@ impl OffsetTracker {
             if entry.inflight.contains(&next) || entry.ceiling.is_none_or(|c| next >= c) {
                 break;
             }
-            advanced = Some(next);
-            entry.committed = Some(next);
-            next += 1;
+            // `next` is a hole — and so is every offset up to the next one this
+            // tracker knows about, by the identical test: not completed, not in
+            // flight, below the ceiling. Stepping through them one at a time is
+            // O(numeric gap), and the gap is not bounded by anything this
+            // process controls: nothing evicts a partition's mark when a
+            // rebalance moves it away (`forget` has no production caller), so a
+            // replica reacquiring a partition another replica advanced meanwhile
+            // faces a gap as large as that partition's traffic — billions of
+            // offsets. It runs under the offsets mutex, which `ack` holds across
+            // commit submission, so walking it would stall every other
+            // settlement on the runtime, not just this one.
+            //
+            // Jumping to the next tracked offset is the SAME advance, not an
+            // approximation: the prefix ends up on exactly the offset the walk
+            // would have left it on, and the next iteration re-tests that
+            // offset through the ordinary cases. `ceiling` is in the candidate
+            // set because the loop must never advance past it, and is `Some`
+            // here — the break above already ruled out `None`.
+            let after = next.saturating_add(1);
+            let resume = entry
+                .completed
+                .range(after..)
+                .next()
+                .copied()
+                .into_iter()
+                .chain(entry.inflight.range(after..).next().copied())
+                .chain(entry.ceiling)
+                .filter(|candidate| *candidate > next)
+                .min()
+                .unwrap_or(after);
+            // Everything below `resume` is a hole, so the prefix reaches the
+            // offset just before it.
+            let through = resume.saturating_sub(1);
+            advanced = Some(through);
+            entry.committed = Some(through);
+            next = resume;
         }
         advanced
     }
@@ -1707,6 +1756,43 @@ mod tests {
     }
 
     #[test]
+    fn an_active_strike_survives_the_maximum_visibility_timeout_with_slack() {
+        // A floor equal to the broker's maximum invisibility is not enough, for
+        // two compounding reasons. `run_once` sweeps BEFORE it polls, so at
+        // exactly the maximum the strike is retired in the very pass that would
+        // then have received the redelivery. And the real redelivery is the
+        // visibility timeout PLUS the poll interval and whatever scheduling and
+        // queue delay the broker adds, so it always lands strictly after it.
+        //
+        // The asymmetry decides how much slack: expiring LATE costs bounded
+        // memory (`MAX_POISON_ENTRIES`), expiring EARLY silently disables
+        // strike-based quarantine altogether.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        let retention = std::time::Duration::from_secs(60 * 60);
+        let max_invisibility = std::time::Duration::from_secs(12 * 60 * 60);
+
+        t.strike("k", t0);
+
+        t.expire_stale_as_of(t0 + max_invisibility, retention);
+        assert_eq!(
+            t.strikes("k"),
+            1,
+            "swept in the very pass that would then have received the redelivery"
+        );
+
+        t.expire_stale_as_of(
+            t0 + max_invisibility + std::time::Duration::from_secs(60 * 60),
+            retention,
+        );
+        assert_eq!(
+            t.strikes("k"),
+            1,
+            "a redelivery an hour past the maximum must still find its streak"
+        );
+    }
+
+    #[test]
     fn a_young_active_strike_holds_back_the_terminal_entries_behind_it() {
         // The cost of the active floor, pinned so it stays deliberate: expiry
         // is a FIFO queue swept from the front, so a not-yet-due active entry
@@ -1796,6 +1882,47 @@ mod tests {
     }
 
     // ---- OffsetTracker (Kafka contiguous-prefix commit) ----
+
+    #[test]
+    fn a_reassignment_gap_is_crossed_without_walking_it() {
+        // Nothing evicts a partition's mark when a rebalance moves it away --
+        // `forget` has no production caller, only the whole-client
+        // `forget_all` on a stall rebuild. So a replica that reacquires a
+        // partition another replica advanced meanwhile still holds the old
+        // `committed`, and the new offset is HIGHER, so `observe` does not
+        // treat it as a reposition.
+        //
+        // The prefix walk then has to cross the gap. Every offset in it is a
+        // legitimate hole by the walk's own test -- never delivered, below the
+        // ceiling -- so stepping one at a time is correct and unbounded: a busy
+        // partition can advance by billions. It runs under the offsets mutex,
+        // which `ack` holds across commit submission, so it does not merely
+        // burn a Tokio worker, it stalls every other settlement on the runtime.
+        let mut t = OffsetTracker::new();
+        t.observe(0, 100);
+        assert_eq!(t.complete(0, 100), Some(100));
+
+        // A billion offsets elapsed under another replica.
+        let far = 100 + 1_000_000_000;
+        t.observe(0, far);
+
+        let started = std::time::Instant::now();
+        let advanced = t.complete(0, far);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            advanced,
+            Some(far),
+            "the mark still lands on the offset that actually settled"
+        );
+        // Orders of magnitude of headroom: crossing the gap without walking it
+        // is microseconds, walking it is minutes. This separates a hang from a
+        // slow test, not two timings.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "crossing a reassignment gap must not scan it: took {elapsed:?}"
+        );
+    }
 
     #[test]
     fn offsets_completed_in_order_advance_one_by_one() {

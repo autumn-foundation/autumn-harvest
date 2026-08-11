@@ -1316,6 +1316,74 @@ coordinates, so a run traces back to the exact message.
   `recording_sink_is_idempotent_by_key_and_says_so` and, against a real
   Postgres, `a_second_dead_letter_for_one_key_is_reported_as_already_recorded`.
 
+- **Cross a partition-reassignment gap instead of walking it.** `OffsetTracker`'s
+  contiguous-prefix advance stepped one offset at a time over every hole below
+  the ceiling. `forget(partition)` has no production caller — only `forget_all()`
+  on a stall rebuild — so a Kafka partition that is revoked, advanced by another
+  replica, and handed back leaves a stale `committed` mark, and the numeric gap
+  between it and the resumed offsets satisfies the hole predicate for its whole
+  length. That walk runs under the offsets mutex, which `ack` now holds across
+  commit submission, so a reassignment across a busy partition could stall the
+  connector for the length of the gap. The advance now jumps straight to the
+  next *tracked* offset. This is semantics-preserving, not an approximation:
+  every offset in between satisfies the same hole predicate, so `committed`
+  lands exactly where the walk would have, and one jump suffices because the
+  loop can never advance past the first blocker. A blind "large forward jump →
+  reset" would instead be wrong — it would discard in-flight lower offsets and
+  commit past dispatched-but-not-durable messages, the exact loss the
+  contiguous prefix prevents. RED:
+  `a_reassignment_gap_is_crossed_without_walking_it` (a 1e9 gap, bounded at 5s).
+
+- **Give the active-strike retention floor slack beyond the visibility maximum.**
+  The floor that keeps a live poison strike alive across a broker's redelivery
+  delay was the maximum SQS visibility timeout exactly. `run_once` sweeps
+  strikes *before* it polls, so a floor equal to the broker's maximum
+  invisibility retires the strike in the very pass that then receives the
+  redelivery — the quarantine silently disables itself for exactly the slowest
+  redeliveries it exists for. Real redelivery is timeout + poll interval +
+  scheduling delay, and the two error directions are not symmetric: expiring
+  late costs bounded memory (`MAX_POISON_ENTRIES` still evicts), expiring early
+  costs the feature. The floor is now `2 × MAX_BROKER_INVISIBILITY`, derived
+  from a named constant so the two cannot drift. RED:
+  `an_active_strike_survives_the_maximum_visibility_timeout_with_slack`.
+
+- **Never pair one message's handle with another message's committed offset.**
+  A positional ack committed a contiguous-prefix high-water mark by cloning the
+  settling message's `MessageHandle` and overwriting its `position`. The mark's
+  message may already have settled and been released, so the token belonged to
+  a *different* message than the position — and `MessageHandle` documents the
+  token as opaque and handed straight back, which is exactly what a side-table
+  adapter keys on. A positional commit is a high-water *mark*, not a message
+  ack, so there is no honest handle to pass; passing the real token in the
+  in-order case and a mismatched one otherwise would be worse than either,
+  since an adapter cannot distinguish the cases. `EventSource` gains a
+  defaulted `commit_position(partition, position)` whose default delegates to
+  `ack` with an empty token — idiomatic for a trait that already defaults
+  `nack_for_dead_letter`/`recover`/`abandon_redelivers`, zero-churn for all ten
+  impls, and correct for Kafka, whose `ack` reads only the coordinates. RED:
+  `a_positional_commit_never_pairs_one_messages_token_with_anothers_position`
+  and `an_adapter_overriding_commit_position_receives_bare_coordinates`.
+
+- **Retry an owed Kafka anchor on every pass, not only when records arrive.**
+  `anchors_needing_durability` deliberately keeps a partition owed when its
+  synchronous anchor commit fails, so "the next receive retries" — and that
+  retry is the only thing bounding the crash window under an otherwise
+  uncommitted `latest` group. But the attempt was gated on `!batch.is_empty()`,
+  so a topic that went quiet right after the failure never drained again, the
+  owed anchor was never retried, and a window documented as one poll interval
+  stayed open for as long as the topic was idle. The guard is now the named
+  `retry_owed_anchors`, which is unconditionally true; nothing owed is a no-op,
+  so the quiet steady state costs one walk of the anchor map and no broker call.
+  Withholding the batch outright — the other reading of this hazard — is
+  rejected and now documented at the call site: discarding drained records
+  whose local consumer position has already advanced is the permanent-loss
+  hazard `defer_recv_error` exists to prevent, and it would fire on *every*
+  commit failure rather than only on a crash. The only correct form would
+  `seek()` back to each owed floor first, a blocking librdkafka call on a broker
+  already unhealthy enough to have failed a commit, whose own failure mode is
+  the loss it set out to prevent. RED:
+  `an_idle_pass_still_retries_an_anchor_commit_it_owes`.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

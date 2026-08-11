@@ -501,9 +501,19 @@ impl KafkaSource {
     /// "assigned" and not "committed" is the right line.
     ///
     /// **Best-effort.** A failed commit warns and leaves the partition owed, so
-    /// the next receive retries. Failing the receive instead would discard the
-    /// drained records, whose local consumer position has already advanced past
-    /// them — the permanent-loss hazard [`defer_recv_error`] exists to avoid.
+    /// the next receive retries — *every* next receive, drained or idle, which
+    /// is what bounds the crash window to a poll interval rather than to the
+    /// topic's next burst of traffic (see [`retry_owed_anchors`]).
+    ///
+    /// Failing the receive instead would discard the drained records, whose
+    /// local consumer position has already advanced past them — the
+    /// permanent-loss hazard [`defer_recv_error`] exists to avoid, and here it
+    /// would fire on *every* commit failure rather than only on a crash. The
+    /// only correct form of "withhold the batch" would first `seek()` the
+    /// consumer back to each owed floor so the records are genuinely un-read;
+    /// that is a blocking librdkafka call on a broker already unhealthy enough
+    /// to have failed a commit, and its own failure mode is the loss it set out
+    /// to prevent. Retrying promptly is the cheaper bound on the same window.
     async fn make_anchors_durable(&self, consumer: &Arc<StreamConsumer>) {
         let reset = self.config.effective_offset_reset();
         let owed = self.with_anchors(|a| anchors_needing_durability(reset, a));
@@ -727,6 +737,25 @@ const fn defer_recv_error(drained: usize) -> bool {
     drained > 0
 }
 
+/// Whether a receive pass should attempt the anchor commits it still owes.
+///
+/// **Always** — and the unused `drained` is the point. The obvious reading of
+/// "make the floor durable before these records are dispatched" gates the
+/// attempt on `drained > 0`, which is right for the *first* attempt and wrong
+/// for every retry after a failure. [`anchors_needing_durability`] keeps a
+/// failed partition owed precisely so the next receive retries it, but a topic
+/// that goes quiet right after the failure never drains again: the owed anchor
+/// is never retried, and the crash window
+/// [`KafkaSource::make_anchors_durable`] describes as "until the next attempt"
+/// becomes unbounded in wall-clock time rather than one poll interval.
+///
+/// Nothing owed is a no-op, so the quiet steady state costs one walk of the
+/// anchor map and no broker call at all — the `latest`-only cost of never
+/// leaving an owed floor stranded behind an idle topic.
+const fn retry_owed_anchors(_drained: usize) -> bool {
+    true
+}
+
 #[async_trait]
 impl EventSource for KafkaSource {
     fn stream(&self) -> &str {
@@ -754,8 +783,9 @@ impl EventSource for KafkaSource {
         let batch = self.drain_batch(&consumer, max, timeout).await?;
         // Before these records leave this function and become someone's
         // in-flight work, make the `latest` resume floor durable to the group.
-        // Best-effort: see `make_anchors_durable`.
-        if !batch.is_empty() {
+        // Best-effort, and NOT gated on this pass having drained anything --
+        // see `retry_owed_anchors` for why a quiet topic must still retry.
+        if retry_owed_anchors(batch.len()) {
             self.make_anchors_durable(&consumer).await;
         }
         Ok(batch)
@@ -2053,5 +2083,30 @@ mod tests {
         // With nothing drained there is nothing to lose, so the error is the
         // only useful thing to report.
         assert!(!defer_recv_error(0));
+    }
+
+    /// A quiet topic must not strand an anchor whose commit failed.
+    ///
+    /// `anchors_needing_durability` keeps a failed partition owed so "the next
+    /// receive retries", and the failure is only tolerable because that retry
+    /// bounds the crash window to roughly one poll interval. Gating the attempt
+    /// on `drained > 0` -- the obvious reading of "commit the floor for the
+    /// records we just read" -- silently voids that bound: a topic that goes
+    /// quiet immediately after the failed commit never drains again, so the
+    /// owed anchor is never retried and the window stays open for as long as
+    /// the topic is idle. Under an otherwise-uncommitted `latest` group a crash
+    /// anywhere in that window re-resolves at the tail and permanently skips
+    /// the in-flight records this floor exists to protect.
+    #[test]
+    fn an_idle_pass_still_retries_an_anchor_commit_it_owes() {
+        assert!(
+            retry_owed_anchors(0),
+            "a pass that drained nothing must still retry an owed anchor; \
+             gating on drained records leaves a failed commit stranded for as \
+             long as the topic stays quiet",
+        );
+        // The first attempt, for the records just drained, is unchanged.
+        assert!(retry_owed_anchors(1));
+        assert!(retry_owed_anchors(12));
     }
 }

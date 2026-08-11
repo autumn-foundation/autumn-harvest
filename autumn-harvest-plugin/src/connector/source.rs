@@ -136,6 +136,48 @@ pub trait EventSource: Send + Sync {
         self.abandon(handle).await
     }
 
+    /// Commit a **high-water mark** for `partition`, asserting that everything
+    /// at or below `position` is durably handled.
+    ///
+    /// Deliberately separate from [`Self::ack`], because it is not an
+    /// acknowledgement of a message. The runtime commits the *contiguous
+    /// completed prefix*, and the offset that prefix reaches is usually not the
+    /// one whose settlement triggered the advance: when 5 completes before 4,
+    /// it is 4's completion that carries the mark to 5. There may be no handle
+    /// for `position` in hand at all — its message settled earlier and was
+    /// released — so there is nothing honest to pass to `ack`.
+    ///
+    /// Only a positional broker ever reaches this. A handle with no
+    /// `partition`/`position` is acknowledged per-message through
+    /// [`Self::ack`] and never comes here.
+    ///
+    /// The default delegates to [`Self::ack`] with a **token-less** handle
+    /// carrying only the coordinates, which is right for any adapter whose
+    /// commit is addressed by `(partition, position)` — the in-tree Kafka
+    /// adapter is one. The token is empty rather than borrowed from some other
+    /// message precisely so an adapter that *does* key off it cannot silently
+    /// acknowledge the wrong record: it sees an obviously-absent token instead
+    /// of a plausible, wrong one. Such an adapter should override this.
+    ///
+    /// An adapter that cannot commit by position at all is not positional, and
+    /// should leave `partition`/`position` unset on its handles
+    /// ([`MessageHandle::opaque`]) so its messages are acknowledged
+    /// individually.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorError::Broker`] when the commit fails. Like a failed
+    /// ack this is safe: the messages below the mark are redelivered and dedupe
+    /// as idempotent replays.
+    async fn commit_position(&self, partition: i32, position: i64) -> Result<(), ConnectorError> {
+        self.ack(&MessageHandle {
+            token: String::new(),
+            partition: Some(partition),
+            position: Some(position),
+        })
+        .await
+    }
+
     /// Current consumer lag, for adapters whose client exposes it.
     ///
     /// The default returns `None`, so an adapter that cannot report lag simply

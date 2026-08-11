@@ -1375,9 +1375,15 @@ impl ConnectorRuntime {
         // this handle's own position: when offsets 2 then 1 settle in that
         // order, offset 2 is held, and it is 1's completion that advances the
         // prefix to 2. Committing 1's handle there would leave 2 uncommitted
-        // and re-read on a crash. Kafka's `ack` addresses the commit purely by
-        // `(partition, position)` (the token is unused), so a synthesized
-        // handle at the mark is the correct thing to hand it.
+        // and re-read on a crash.
+        //
+        // So the mark goes through `commit_position`, not `ack`. Cloning this
+        // handle and overwriting its position would hand the adapter one
+        // message's token paired with another's offset, and `MessageHandle`
+        // documents the token as opaque, handed straight back, and the key
+        // adapters build their side tables on — so a token-keyed adapter would
+        // acknowledge the wrong record. There is often no handle for the mark
+        // to borrow anyway: its message settled earlier and was released.
         //
         // The lock is held across the *submission*, not merely across the
         // computation of the mark. Concurrent settlements race otherwise: two
@@ -1397,13 +1403,7 @@ impl ConnectorRuntime {
                 // committed as part of a later contiguous advance.
                 return;
             };
-            // The token is unused by a positional adapter's commit, which
-            // addresses it purely by `(partition, position)` — so synthesizing
-            // at the mark is correct even when it is not this handle's own
-            // offset.
-            let mut at_mark = handle.clone();
-            at_mark.position = Some(advanced);
-            self.source.ack(&at_mark).await
+            self.source.commit_position(partition, advanced).await
         } else {
             self.source.ack(handle).await
         };
@@ -2873,6 +2873,115 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_positional_commit_never_pairs_one_messages_token_with_anothers_position() {
+        // `MessageHandle` documents the token as opaque and handed *straight
+        // back*, and tells adapters to key their own side table off it. But the
+        // contiguous prefix commits a MARK, not a message: when 5 settles
+        // before 4, it is 4's completion that advances the prefix to 5, and
+        // 4's handle is the only one in hand. Cloning it and overwriting the
+        // position hands the adapter token-of-4 paired with position-5 -- a
+        // token-keyed adapter then acknowledges the wrong record, or rejects
+        // every commit.
+        //
+        // A positional commit is not an ack, so it must not arrive dressed as
+        // one. The empty token is the signal: no message is being acknowledged.
+        let source = Arc::new(MockSource::new("orders"));
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let rt = runtime(malformed_binding(), Arc::clone(&source), Arc::clone(&sink));
+
+        rt.offsets.lock().await.observe(0, 4);
+        rt.offsets.lock().await.observe(0, 5);
+        rt.ack(&MessageHandle::positioned("orders:0:5", 0, 5)).await;
+        rt.ack(&MessageHandle::positioned("orders:0:4", 0, 4)).await;
+
+        for handle in source.acked() {
+            assert!(
+                handle.token.is_empty(),
+                "a positional commit must not carry a message's token: {handle:?}"
+            );
+        }
+    }
+
+    /// A token-keyed positional adapter: it overrides `commit_position` and
+    /// refuses to acknowledge a positional handle, because for it a commit is
+    /// never a message ack.
+    #[derive(Debug)]
+    struct PositionalCommitSource {
+        inner: MockSource,
+        commits: std::sync::Mutex<Vec<(i32, i64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EventSource for PositionalCommitSource {
+        fn stream(&self) -> &str {
+            self.inner.stream()
+        }
+        async fn receive(
+            &self,
+            max: usize,
+            timeout: std::time::Duration,
+        ) -> Result<Vec<InboundMessage>, ConnectorError> {
+            self.inner.receive(max, timeout).await
+        }
+        async fn ack(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            assert!(
+                handle.partition.is_none(),
+                "a positional commit must not arrive as a message ack: {handle:?}"
+            );
+            self.inner.ack(handle).await
+        }
+        async fn abandon(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            self.inner.abandon(handle).await
+        }
+        async fn commit_position(
+            &self,
+            partition: i32,
+            position: i64,
+        ) -> Result<(), ConnectorError> {
+            self.commits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((partition, position));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_adapter_overriding_commit_position_receives_bare_coordinates() {
+        // The affirmative half: an adapter whose commit genuinely cannot be
+        // expressed as an ack overrides the default and gets the mark as plain
+        // coordinates — never a handle borrowed from whichever message happened
+        // to trigger the advance.
+        let source = Arc::new(PositionalCommitSource {
+            inner: MockSource::new("orders"),
+            commits: std::sync::Mutex::new(Vec::new()),
+        });
+        let rt = ConnectorRuntime::new(
+            malformed_binding(),
+            Arc::clone(&source) as Arc<dyn EventSource>,
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
+        );
+
+        rt.offsets.lock().await.observe(0, 4);
+        rt.offsets.lock().await.observe(0, 5);
+        rt.ack(&MessageHandle::positioned("orders:0:5", 0, 5)).await;
+        rt.ack(&MessageHandle::positioned("orders:0:4", 0, 4)).await;
+
+        let commits = source
+            .commits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            commits,
+            vec![(0, 5)],
+            "one commit, at the offset the contiguous prefix reached"
+        );
+    }
+
     /// A source whose commit submission is slow for one chosen offset.
     ///
     /// Stands in for the real asymmetry between two concurrent commits: they
@@ -2960,9 +3069,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_in_order_ack_commits_its_own_offset_unchanged() {
-        // The common case: offsets settle in order, so the advanced mark IS
-        // the handle's own position and no synthesis happens.
+    async fn a_positional_commit_is_uniform_whether_or_not_the_mark_moved() {
+        // The common case: offsets settle in order, so the advanced mark IS the
+        // handle's own position. It is still a high-water mark rather than an
+        // acknowledgement of that message, and it must arrive looking like one.
+        //
+        // Passing the real token through *here* while withholding it whenever
+        // the mark ran ahead would be worse than either alternative: the
+        // adapter cannot tell the two cases apart, so it would have to treat a
+        // present token as untrustworthy anyway — and the one time it forgot,
+        // it would acknowledge the wrong record.
         let source = Arc::new(MockSource::new("orders"));
         let sink = Arc::new(RecordingDeadLetterSink::new());
         let rt = runtime(malformed_binding(), Arc::clone(&source), sink);
@@ -2971,11 +3087,16 @@ mod tests {
         rt.ack(&MessageHandle::positioned("orders:0:7", 0, 7)).await;
 
         assert_eq!(source.acked().len(), 1);
-        assert_eq!(source.acked()[0].position, Some(7));
         assert_eq!(
-            source.acked()[0].token,
-            "orders:0:7",
-            "an unsynthesized ack keeps the adapter's own token"
+            source.acked()[0].position,
+            Some(7),
+            "the mark is the offset the prefix reached"
+        );
+        assert!(
+            source.acked()[0].token.is_empty(),
+            "a positional commit is a mark, not a message ack — even when the \
+             two coincide: {:?}",
+            source.acked()[0]
         );
     }
 
