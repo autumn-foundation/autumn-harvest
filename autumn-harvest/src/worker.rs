@@ -10473,6 +10473,23 @@ async fn check_continue_as_new_type<'a>(
                 execution.shard_id,
             ) {
                 error
+            } else if let Err(error) = classify_successor_deadline_representable(
+                info.name,
+                // Judge the EFFECTIVE timeout (post-ceiling), matching what
+                // `resolve_continue_as_new_successor_defaults` will actually
+                // store — otherwise a configured ceiling that makes the
+                // declaration perfectly valid would still be rejected.
+                info.execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok())
+                    .map(|t| {
+                        registry
+                            .max_workflow_execution_timeout
+                            .and_then(|d| chrono::Duration::from_std(d).ok())
+                            .map_or(t, |ceiling| t.min(ceiling))
+                    }),
+                chrono::Utc::now(),
+            ) {
+                error
             } else {
                 // The successor takes a DIFFERENT uniqueness slot —
                 // `(target, workflow_id)` — and sealing the predecessor does not
@@ -10607,6 +10624,57 @@ fn classify_cross_shard_continue_as_new(
          on the routed shard. Keep this entity on one type and branch internally, or run a \
          single-shard deployment",
         target_shard.as_i32()
+    ))
+}
+
+/// Reject a cross-type continuation whose target declares an
+/// `execution_timeout` that cannot be represented as an absolute deadline
+/// (issue #803, Codex P2 on PR #1159).
+///
+/// The scanner is authoritative on `deadline_at`, not on `execution_timeout`:
+/// `enforce_workflow_execution_timeouts` selects
+/// `deadline_at IS NOT NULL AND deadline_at < now`, so a NULL deadline is never
+/// enforced. Persisting `execution_timeout = Some(..)` with `deadline_at =
+/// NULL` would therefore leave a row that *claims* a hard runaway cap it does
+/// not actually have — the exact failure a hard timeout exists to prevent.
+///
+/// This is the FIRST path that resolves the target type's own declaration: the
+/// normal start path computes `target_start_time + d` with a plain `+`
+/// (`execution.rs`), which panics on overflow rather than persisting such a
+/// run, so a type whose declaration overflows could never have been started
+/// directly anyway. Refusing here reaches the same "no run is created with a
+/// lying field" outcome as a diagnosable terminal failure instead of a panic.
+///
+/// Takes the **effective** timeout (already clamped by the operator's
+/// fleet-wide ceiling), so a configured ceiling rescues an otherwise
+/// unrepresentable declaration rather than failing the transition.
+///
+/// The SLA (#487) is deliberately NOT handled here: an overflowing soft budget
+/// maps to "no SLA" in [`resolve_continue_as_new_successor_defaults`], matching
+/// the documented start-path behaviour. Dropping an observational counter is
+/// benign; silently dropping a runaway cap is not.
+fn classify_successor_deadline_representable(
+    target: &str,
+    effective_timeout: Option<chrono::Duration>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    let Some(timeout) = effective_timeout else {
+        // No declared timeout: `deadline_at = NULL` is then correct and agrees
+        // with `execution_timeout = NULL`.
+        return Ok(());
+    };
+    if now.checked_add_signed(timeout).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "continue_as_new into '{target}' cannot resolve its declared \
+         execution_timeout ({} seconds) to an absolute deadline: the resulting instant is outside \
+         the representable timestamp range. Persisting it would store a hard timeout the timeout \
+         scanner can never enforce (it requires a non-NULL deadline_at), so the successor would \
+         claim a runaway cap it does not have. Declare a smaller execution_timeout on '{target}', \
+         omit it to mean 'no timeout', or configure a fleet-wide \
+         max_workflow_execution_timeout ceiling",
+        timeout.num_seconds()
     ))
 }
 
@@ -10851,7 +10919,20 @@ fn resolve_continue_as_new_successor_defaults<'a>(
         .sla
         .and_then(|d| chrono::Duration::from_std(d).ok())
         .filter(|sla| *sla > chrono::Duration::zero())
-        .map(|sla| execution_timeout.map_or(sla, |hard| sla.min(hard)));
+        .map(|sla| execution_timeout.map_or(sla, |hard| sla.min(hard)))
+        // An SLA whose absolute deadline is unrepresentable maps to "no SLA" —
+        // BOTH fields NULL — rather than storing a budget with a NULL
+        // `sla_deadline_at` the breach scanner can never observe (Codex P2 on
+        // PR #1159). This mirrors the documented #487 start-path rule that an
+        // out-of-range duration maps to "no SLA", and keeps the row honest.
+        //
+        // Deliberately softer than the hard-timeout treatment, which REJECTS
+        // the transition (`classify_successor_deadline_representable`): the SLA
+        // is observational, so degrading it is benign, whereas silently
+        // dropping a runaway cap is not. Narrow in practice — the clamp above
+        // already bounds the SLA by a representable `execution_timeout`, so
+        // this can only fire when the target declares no hard timeout at all.
+        .filter(|sla| now.checked_add_signed(*sla).is_some());
     ContinueAsNewSuccessorDefaults {
         execution_timeout,
         // `checked_add_signed` here (unlike the verbatim arm above): these are
@@ -22152,6 +22233,13 @@ mod tests {
 
     /// A pathological declared duration must yield `None` rather than panic on
     /// the `DateTime + Duration` overflow.
+    ///
+    /// Note this pins the *resolver's* no-panic behaviour only. Such a
+    /// declaration never reaches persistence: the transition is rejected
+    /// upstream by `classify_successor_deadline_representable`, so a row with
+    /// `execution_timeout = Some(..)` and `deadline_at = NULL` is unreachable
+    /// (see `can803_unrepresentable_execution_timeout_is_rejected`). The
+    /// no-panic guarantee is kept as defense in depth for any future caller.
     #[test]
     fn can803_cross_type_overflowing_timeout_does_not_panic() {
         let execution = can803_predecessor();
@@ -22436,6 +22524,120 @@ mod tests {
             Some(serde_json::json!({"max_attempts": 50})),
             "the same-type arm must carry the stored policy verbatim"
         );
+    }
+
+    /// A target whose declared `execution_timeout` cannot be represented as an
+    /// absolute deadline must FAIL the transition, not silently produce a run
+    /// with `execution_timeout = Some(..)` and `deadline_at = NULL`
+    /// (Codex P2 on PR #1159).
+    ///
+    /// Load-bearing because the scanner is authoritative on `deadline_at`:
+    /// `enforce_workflow_execution_timeouts` selects
+    /// `deadline_at IS NOT NULL AND deadline_at < now` (`timeout.rs:1838-1847`),
+    /// so a NULL deadline is NEVER enforced. Storing the duration anyway would
+    /// leave a row that CLAIMS a hard runaway cap it does not have.
+    ///
+    /// This is the first path that resolves the TARGET type's declaration: the
+    /// normal start path computes `target_start_time + d` with a plain `+`
+    /// (`execution.rs:592`), which panics rather than persisting such a run, so
+    /// a type whose declaration overflows could never have been started
+    /// directly. Refusing here matches that "no run is created with a lying
+    /// field" outcome, as a diagnosable terminal failure instead of a panic.
+    #[test]
+    fn can803_unrepresentable_execution_timeout_is_rejected() {
+        let now = chrono::Utc::now();
+
+        // Representable: allowed, and no ceiling needed.
+        assert!(
+            classify_successor_deadline_representable(
+                "paid_subscription",
+                Some(chrono::Duration::hours(24)),
+                now,
+            )
+            .is_ok(),
+            "an ordinary declared timeout must not be rejected"
+        );
+
+        // Absent: allowed -- "no timeout" is a legitimate declaration, and
+        // `deadline_at = NULL` then agrees with `execution_timeout = NULL`.
+        assert!(
+            classify_successor_deadline_representable("paid_subscription", None, now).is_ok(),
+            "a target declaring no timeout must not be rejected"
+        );
+
+        // Unrepresentable: rejected, naming the target so an operator can find
+        // the offending declaration without reading the source.
+        let unrepresentable = chrono::Duration::seconds(8_640_000_000_000);
+        assert!(
+            now.checked_add_signed(unrepresentable).is_none(),
+            "fixture premise: this duration must overflow DateTime<Utc>"
+        );
+        let error = classify_successor_deadline_representable(
+            "paid_subscription",
+            Some(unrepresentable),
+            now,
+        )
+        .expect_err("an unrepresentable deadline must be rejected");
+        assert!(
+            error.contains("paid_subscription"),
+            "the rejection must name the target type: {error}"
+        );
+        assert!(
+            error.contains("execution_timeout"),
+            "the rejection must name the offending field: {error}"
+        );
+    }
+
+    /// The fleet-wide ceiling (#243) is applied BEFORE representability is
+    /// judged, so a configured ceiling rescues an otherwise-unrepresentable
+    /// declaration instead of failing the transition. Pins the ordering the
+    /// guard depends on -- judging the raw declaration would reject a run the
+    /// operator's own cap makes perfectly valid.
+    #[test]
+    fn can803_ceiling_rescues_an_unrepresentable_declaration() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.execution_timeout = Some(Duration::from_secs(8_640_000_000_000));
+        let now = chrono::Utc::now();
+
+        let defaults = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            Some(chrono::Duration::hours(24)),
+            None,
+            now,
+        );
+        assert_eq!(
+            defaults.execution_timeout,
+            Some(chrono::Duration::hours(24)),
+            "the ceiling must clamp the declaration down"
+        );
+        assert!(
+            defaults.deadline_at.is_some(),
+            "a clamped timeout must produce a real deadline, never NULL"
+        );
+    }
+
+    /// An overflowing SLA (#487) maps to "no SLA" -- BOTH fields NULL -- rather
+    /// than failing the transition or storing a lying `sla` with a NULL
+    /// deadline. Deliberately different from the hard-timeout treatment above:
+    /// the SLA is observational (a counter), so degrading it is benign, and
+    /// this matches the documented #487 start-path behaviour ("an
+    /// out-of-range/overflowing duration maps to 'no SLA'").
+    #[test]
+    fn can803_unrepresentable_sla_maps_to_no_sla_not_a_lying_field() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.sla = Some(Duration::from_secs(8_640_000_000_000));
+        let now = chrono::Utc::now();
+
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
+        assert_eq!(
+            defaults.sla, None,
+            "an unrepresentable SLA must be dropped, not stored with a NULL deadline"
+        );
+        assert_eq!(defaults.sla_deadline_at, None);
     }
 
     /// Establishes the PREMISE of the cross-shard guard: rendezvous routing

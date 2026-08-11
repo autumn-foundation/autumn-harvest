@@ -63,3 +63,23 @@ Tests: `can803_cross_type_applies_the_workflow_attempts_ceiling`,
 `can803_cross_type_key_routes_to_a_different_shard_for_most_ids` (pins the
 pair-hash premise so the guard cannot silently become dead code). Both fixes
 are mutation-verified.
+
+**Codex P2 (PR #1159) — reject unrepresentable successor deadlines.** The cross-type
+arm resolved the target's declared `execution_timeout` with `checked_add_signed`, so an
+out-of-range duration stored `execution_timeout = Some(..)` alongside `deadline_at =
+NULL`. `enforce_workflow_execution_timeouts` selects `deadline_at IS NOT NULL AND
+deadline_at < now`, so that successor would have **claimed a hard runaway cap it did not
+have**. Reachable: `task_duration` accepts e.g. `"1000000000d"`, which converts via
+`chrono::Duration::from_std` but overflows `DateTime<Utc>`. This path is the first to
+resolve the *target* type's declaration — the normal start path uses a plain `+`
+(`execution.rs:592`), which panics rather than persisting such a run, so the type could
+never have been started directly. New pure `classify_successor_deadline_representable`
+now **rejects the transition** (terminal predecessor failure naming the type, the field,
+and the three remedies), judging the *effective* (post-ceiling) timeout so a configured
+`max_workflow_execution_timeout` rescues an otherwise-unrepresentable declaration. An
+out-of-range **`sla`** is treated differently — it maps to "no SLA" (both fields
+cleared), matching the documented #487 start-path rule: an observational counter may
+degrade, a runaway cap may not. Mutation-verified. Tests:
+`can803_unrepresentable_execution_timeout_is_rejected`,
+`can803_ceiling_rescues_an_unrepresentable_declaration`,
+`can803_unrepresentable_sla_maps_to_no_sla_not_a_lying_field`.
