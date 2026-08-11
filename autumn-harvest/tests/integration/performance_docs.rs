@@ -570,6 +570,128 @@ fn performance_guards_run_on_docs_only_changes() {
     );
 }
 
+/// The changelog fragment must not publish superseded figures.
+///
+/// The fragment is collated into the public `CHANGELOG.md`, so its opening
+/// entry *is* the release note. Rounds of review appended corrections to the
+/// end of it as a development diary — which left the headline still quoting an
+/// earlier run's numbers and the attribution that was later retracted, roughly
+/// ninety thousand characters before the retraction. A reader of the collated
+/// changelog meets the superseded claim first and may never reach the fix.
+///
+/// So this pins the fragment against the same tables `docs/performance.md`
+/// publishes: the figures it quotes must be the current ones, and the rejected
+/// isolated-cost reading must not appear as an assertion anywhere in it.
+///
+/// This guard lives here rather than beside the changelog because
+/// `docs/changelog.d/**` is also classified `code=false` — a changelog-only
+/// edit is exactly the kind of change that skips the gated test matrix, and the
+/// ungated lint step runs *this* module.
+#[test]
+fn changelog_fragment_quotes_the_published_figures() {
+    let doc = read_performance_doc();
+    let rows = parse_gate_table(&doc);
+    let by_name: std::collections::BTreeMap<&str, &GateRow> =
+        rows.iter().map(|r| (r.gate.as_str(), r)).collect();
+    let control = by_name
+        .get("double_backlog")
+        .expect("the control row must exist");
+
+    let fragment = read_normalized(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate directory must have a parent")
+            .join("docs/changelog.d/pr-786-claim-throughput-benchmark.md"),
+    );
+
+    // The control's multiplier is the one the retracted attribution was built
+    // on, so it is the one most likely to be left stale. Read the current value
+    // off the table rather than hardcoding it.
+    //
+    // Scoped to the sentence that introduces the control, NOT to the whole
+    // fragment: the figure also appears in the appended round-by-round diary,
+    // so a bare `fragment.contains(..)` is satisfied by a *correct* mention in
+    // the diary while the *leading* entry — the part that becomes the release
+    // note — still quotes a superseded run. That is exactly the drift this
+    // guards, so an unscoped check would pass through it. (Verified: it did.)
+    let published = format!("+{}%", control.delta_pct);
+    let intro = fragment
+        .find("ClaimGate::DoubleBacklog")
+        .expect("the changelog fragment must introduce the `ClaimGate::DoubleBacklog` control");
+    let window_end = (intro + 400).min(fragment.len());
+    let window = &fragment[intro..window_end];
+    assert!(
+        window.contains(&published),
+        "the changelog fragment introduces the `double_backlog` control without \
+         quoting its published cost ({published}). The fragment is collated into \
+         the public CHANGELOG, so a superseded figure here IS the release note \
+         while the correction sits thousands of characters below it. Window:\n{window}"
+    );
+
+    // Assertions of the reading the control cannot support.
+    //
+    // A *quoted* occurrence is fine and in fact necessary: the diary retracts
+    // these claims by name, so it has to reproduce them. Only an occurrence the
+    // fragment states in its own voice is the regression. Distinguished by the
+    // character immediately before it — a retraction reads `... the attribution
+    // retracted in round 24 ("deleting the predicate would buy nothing") ...`.
+    //
+    // Without this the guard fails on the very text that fixes the bug, which
+    // is how it first behaved: writing the round-26 retraction tripped it.
+    for banned in [
+        "deleting the predicate would buy nothing",
+        "Deleting the predicate would buy nothing",
+        "the anti-join costs **−2%**",
+        "the anti-join costs **+1%**",
+    ] {
+        let asserted = fragment.match_indices(banned).any(|(idx, _)| {
+            let before = fragment[..idx].chars().next_back();
+            !matches!(before, Some('"' | '\u{201c}' | '\u{2018}' | '\''))
+        });
+        assert!(
+            !asserted,
+            "the changelog fragment states \"{banned}\" in its own voice, which \
+             attributes the `paused_rows` delta to the anti-join predicate in \
+             isolation. The `double_backlog` control sorts a different number of \
+             rows, so it cannot support that; publish the depth-controlled \
+             finding instead. (Quoting the phrase while retracting it is fine — \
+             put it in quotation marks.)"
+        );
+    }
+}
+
+/// The harness docs must name the statistic the gate actually asserts.
+///
+/// The gate switched from p99 to p50 — deliberately, because the headline
+/// scenario oversubscribes the box and the tail measures the run queue rather
+/// than the claim path. The shared harness's module docs kept describing a p99
+/// gate, so a maintainer reading the harness first would calibrate or relax the
+/// budget against a statistic nothing asserts.
+#[test]
+fn harness_docs_name_the_asserted_statistic() {
+    let harness = read_normalized(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/claim_bench_support.rs"),
+    );
+    let module_doc: String = harness
+        .lines()
+        .take_while(|line| line.starts_with("//!") || line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        module_doc.contains("fails the build if **p50** exceeds"),
+        "the harness module docs must state that the CI gate asserts p50; the \
+         gate compares `report.stats.p50_ms` against `HEADLINE_P50_BUDGET_MS`"
+    );
+    assert!(
+        !module_doc.contains("fails the build if p99 exceeds"),
+        "the harness module docs claim the gate asserts p99. It asserts p50 — \
+         p99 is measured and printed but deliberately not gated, because the \
+         headline scenario's tail measures the run queue. A maintainer reading \
+         this would tune the budget against the wrong statistic."
+    );
+}
+
 /// The truncated rows must describe the sample count they actually published.
 #[test]
 fn truncated_sample_counts_in_prose_match_the_table() {

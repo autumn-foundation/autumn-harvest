@@ -8,7 +8,13 @@
 //!   every backlog depth and prints the per-gate cost table plus an
 //!   `EXPLAIN (ANALYZE, BUFFERS)` of the headline claim.
 //! * `tests/integration/claim_budget_tests.rs` — the CI gate. Runs the single
-//!   headline scenario and fails the build if p99 exceeds the published budget.
+//!   headline scenario and fails the build if **p50** exceeds the published
+//!   budget ([`HEADLINE_P50_BUDGET_MS`]). p99 is measured, published and
+//!   printed on failure, but it is deliberately *not* the assertion: the
+//!   headline scenario oversubscribes the box on purpose, which makes the tail
+//!   a measurement of the run queue rather than of the claim path. See the
+//!   "Why p50 and not p99" section of `claim_budget_tests.rs` for the
+//!   derivation — and do not calibrate the budget against the tail.
 //!
 //! # Why a hand-rolled harness rather than criterion
 //!
