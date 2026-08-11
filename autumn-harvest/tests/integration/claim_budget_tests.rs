@@ -1306,9 +1306,14 @@ async fn a_dbname_query_parameter_cannot_redirect_the_connection() {
     .await;
 
     // Clean up before asserting, so a failure does not also leak a database.
-    let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {decoy} WITH (FORCE)"))
-        .execute(&mut admin)
-        .await;
+    //
+    // Version-neutral rather than `WITH (FORCE)`: that clause is PostgreSQL 13+
+    // and this cleanup ignores its result, so on 12 the decoy would survive
+    // silently — and unlike a stale bench database it carries no
+    // `BENCH_DB_PREFIX`, so the harness sweep can never reclaim it either. The
+    // name is minted a few lines above, which is what makes it safe to
+    // interpolate.
+    db::drop_database_version_neutral(&mut admin, &decoy).await;
 
     let landed = landed.expect("the rewritten URL must be connectable");
     assert_eq!(
@@ -1364,4 +1369,145 @@ async fn setup_deadline_in_the_past_trips_immediately() {
         .checked_sub(std::time::Duration::from_secs(1))
         .expect("the process has been up for at least a second");
     let () = with_setup_deadline("connect", deadline, std::future::pending::<()>()).await;
+}
+
+/// Provisioning must skip rather than hang when the server stops answering.
+///
+/// `setup_bench_db` runs before any scenario, so its awaits sit outside both the
+/// measured deadline and the setup deadline `connect_and_seed` applies. Without
+/// a ceiling here a stalled server parks the bench and this gate until the outer
+/// workflow timeout.
+#[tokio::test(start_paused = true)]
+async fn provision_deadline_skips_rather_than_hanging_on_a_stalled_server() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    let outcome: Result<(), _> =
+        db::with_provision_deadline("connect", deadline, std::future::pending::<()>()).await;
+
+    // A `SkipReason`, deliberately not a panic: failing to provision means the
+    // benchmark cannot run in this environment, which is what skipping is for.
+    // `connect_and_seed` panics instead, because by then provisioning succeeded
+    // and a stall there is a real fault.
+    let reason = outcome.expect_err("a stalled step must not resolve");
+    assert!(
+        reason
+            .0
+            .contains("provisioning the benchmark database stalled"),
+        "the skip must name the phase that stalled, got: {}",
+        reason.0
+    );
+    assert!(
+        reason.0.contains("connect"),
+        "the skip must name the step that stalled, got: {}",
+        reason.0
+    );
+}
+
+/// The ceiling is a bound, not a delay: a step that finishes passes through,
+/// and its own `Result` survives the nesting.
+#[tokio::test(start_paused = true)]
+async fn provision_deadline_preserves_a_step_that_finishes_in_time() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    let inner: Result<u32, String> = Ok(7);
+    let outcome =
+        db::with_provision_deadline("create the benchmark database", deadline, async { inner })
+            .await;
+    assert_eq!(
+        outcome.map_err(|r| r.0),
+        Ok(Ok(7)),
+        "a completed step must return its own Result untouched"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Version-neutral database drop (issue #786, round 20).
+// ---------------------------------------------------------------------------
+
+/// Terminate-then-drop must evict a live backend, exactly as `WITH (FORCE)` did.
+///
+/// The clause was doing real work: the sweep drops databases a crashed run left
+/// behind, and a plain `DROP DATABASE` against one that still has a backend
+/// attached fails with *"is being accessed by other users"*. Every cleanup site
+/// discards its result, so that failure is silent and the database leaks.
+///
+/// Replacing the clause is therefore only safe if the replacement handles the
+/// same case — which is what this asserts, by holding a connection open across
+/// the drop. Its partner
+/// `no_cleanup_emits_the_postgres_13_only_force_clause` covers the half CI
+/// cannot reach: that the clause stays gone on a server old enough to reject it.
+#[tokio::test]
+async fn version_neutral_drop_evicts_a_live_backend() {
+    use diesel::QueryableByName;
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+
+    #[derive(QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+        eprintln!(
+            "SKIP version_neutral_drop_evicts_a_live_backend: \
+             existing-server mode only (HARVEST_TEST_DATABASE_URL unset)"
+        );
+        return;
+    };
+    let Ok(mut admin) = AsyncPgConnection::establish(&admin_url).await else {
+        eprintln!("SKIP version_neutral_drop_evicts_a_live_backend: admin connect failed");
+        return;
+    };
+
+    // Run-unique for the same reason every other probe here is: a shared admin
+    // server may be hosting a concurrent run with our pid.
+    let victim = format!(
+        "harvest_drop_probe_{}_{}",
+        std::process::id(),
+        db::run_token(),
+    );
+    diesel::sql_query(format!("CREATE DATABASE {victim}"))
+        .execute(&mut admin)
+        .await
+        .expect("create the victim database");
+
+    // Hold a connection open across the drop. Kept in scope deliberately — this
+    // is the condition under test, and dropping it early would make the
+    // assertion pass without exercising the terminate step at all.
+    let occupant_url = with_db_name(&admin_url, &victim);
+    let occupant = AsyncPgConnection::establish(&occupant_url)
+        .await
+        .expect("connect to the victim database");
+
+    // Confirm the server can see the backend, so a silently-closed connection
+    // cannot make this test vacuous.
+    let attached =
+        diesel::sql_query("SELECT count(*) AS n FROM pg_stat_activity WHERE datname = $1")
+            .bind::<diesel::sql_types::Text, _>(&victim)
+            .get_result::<CountRow>(&mut admin)
+            .await
+            .expect("count backends attached to the victim")
+            .n;
+    assert!(
+        attached >= 1,
+        "the probe connection is not attached to {victim}, so this test would \
+         pass without ever exercising the terminate step",
+    );
+
+    db::drop_database_version_neutral(&mut admin, &victim).await;
+
+    let survivors = diesel::sql_query("SELECT count(*) AS n FROM pg_database WHERE datname = $1")
+        .bind::<diesel::sql_types::Text, _>(&victim)
+        .get_result::<CountRow>(&mut admin)
+        .await
+        .expect("look the victim up in pg_database")
+        .n;
+
+    // Only now may the occupant go, so the drop above ran against a live backend.
+    drop(occupant);
+
+    assert_eq!(
+        survivors, 0,
+        "{victim} survived the drop while a backend was attached: a plain \
+         DROP DATABASE fails there, and cleanup sites discard the error, so the \
+         database would leak on every crashed run",
+    );
 }

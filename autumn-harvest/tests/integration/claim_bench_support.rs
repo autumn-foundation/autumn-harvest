@@ -2453,6 +2453,50 @@ mod pure_tests {
         names.dedup();
         assert_eq!(names.len(), before, "gate identifiers must be unique");
     }
+
+    /// No cleanup here may reach for `DROP DATABASE ... WITH (FORCE)`.
+    ///
+    /// That clause is `PostgreSQL` 13+ and the engine supports 12+ (README).
+    /// Every cleanup site discards its result — a failed cleanup must not fail
+    /// the run — so on 12 the statement is a syntax error that vanishes and the
+    /// database leaks instead. [`db::drop_database_version_neutral`] is the
+    /// version-neutral replacement.
+    ///
+    /// A source scan rather than a behavioural test because the claim is about
+    /// a server version CI does not run: the behavioural half (evicting a live
+    /// backend) is covered by `version_neutral_drop_evicts_a_live_backend` in
+    /// `claim_budget_tests.rs`, but nothing there can catch the clause coming
+    /// back on `PostgreSQL` 16. Comment lines are exempt — four of them explain
+    /// precisely why the clause is absent.
+    #[test]
+    fn no_cleanup_emits_the_postgres_13_only_force_clause() {
+        // Assembled rather than written out: this guard lives inside one of the
+        // files it scans, so spelling the needle here would match itself and the
+        // test could never pass. Do not "tidy" it back into one literal.
+        let needle = concat!("FOR", "CE");
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration");
+        for file in ["claim_bench_support.rs", "claim_budget_tests.rs"] {
+            let path = dir.join(file);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            for (index, line) in source.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                assert!(
+                    !trimmed.contains(needle),
+                    "{}:{} emits the PostgreSQL 13+ clause: {trimmed}\n\
+                     The engine supports Postgres 12+ and cleanup results are \
+                     discarded, so on 12 this is a syntax error that leaks the \
+                     database silently. Use db::drop_database_version_neutral.",
+                    file,
+                    index + 1,
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2585,20 +2629,70 @@ pub mod db {
     /// Returns `Err(SkipReason)` when no Docker daemon and no env URL are
     /// available, so `cargo bench` on a laptop without Docker prints a notice
     /// and exits cleanly instead of failing.
+    /// Run one provisioning step under a wall-clock ceiling.
+    ///
+    /// `setup_bench_db` runs *before* any scenario, so its awaits are outside
+    /// both the measured phase's deadline and the setup deadline `connect_and_seed`
+    /// applies — the same hole one level up. A server that completes the TCP
+    /// handshake and then stops answering during authentication, `CREATE
+    /// DATABASE`, the lease connection or the migrations would park the bench
+    /// and the CI gate until the outer workflow timeout.
+    ///
+    /// A timeout is reported as a [`SkipReason`], **not** a panic, because that
+    /// is this function's existing contract: every failure to provision skips
+    /// the benchmark rather than failing the build. A database that will not
+    /// answer is an environment the gate cannot run in, which is exactly what
+    /// `SkipReason` means. (`connect_and_seed` panics instead, because by then
+    /// provisioning has succeeded and a stall is a real fault.)
+    ///
+    /// The returned `Result` nests: the outer is the deadline, the inner is
+    /// whatever the step itself returns.
+    pub async fn with_provision_deadline<T>(
+        what: &str,
+        deadline: Instant,
+        fut: impl std::future::Future<Output = T> + Send,
+    ) -> Result<T, SkipReason> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::time::timeout(remaining, fut).await.map_err(|_| {
+            SkipReason(format!(
+                "provisioning the benchmark database stalled: {what} did not finish \
+                 within {remaining:?}. The server accepted a connection but stopped \
+                 answering, so the benchmark cannot run here."
+            ))
+        })
+    }
+
     pub async fn setup_bench_db() -> Result<BenchDb, SkipReason> {
         if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
             // Redacted: this message is printed by both the bench and the CI
             // gate, and an admin URL normally carries a password.
             let safe_url = super::redact_url(&admin_url);
-            let mut admin = AsyncPgConnection::establish(&admin_url)
-                .await
-                .map_err(|e| SkipReason(format!("connect {safe_url}: {e}")))?;
+            // One ceiling for the whole provisioning phase, fixed before the
+            // first await. See `with_provision_deadline`.
+            let deadline = Instant::now() + super::scenario_time_budget();
+            let mut admin = with_provision_deadline(
+                "connect to the admin database",
+                deadline,
+                AsyncPgConnection::establish(&admin_url),
+            )
+            .await?
+            .map_err(|e| SkipReason(format!("connect {safe_url}: {e}")))?;
             // Everything from here to the lease runs under an advisory lock, so
             // no other client can sweep while we are between `CREATE DATABASE`
             // and holding a backend on it. The lock lives on its own connection
             // to a fixed database — see `SWEEP_LOCK_KEY` for why that matters.
-            let lock = take_sweep_lock(&admin_url).await?;
-            drop_stale_bench_databases(&mut admin).await;
+            let lock = with_provision_deadline(
+                "take the sweep lock",
+                deadline,
+                take_sweep_lock(&admin_url),
+            )
+            .await??;
+            with_provision_deadline(
+                "sweep stale benchmark databases",
+                deadline,
+                drop_stale_bench_databases(&mut admin),
+            )
+            .await?;
             let n = DB_SEQ.fetch_add(1, Ordering::SeqCst);
             // Shape: harvest_claim_bench_{pid}_{run_token}_{seq}. The pid is a
             // cheap same-host liveness handle for the sweep; the run token is
@@ -2610,29 +2704,46 @@ pub mod db {
                 run_token(),
                 n
             );
-            diesel::sql_query(format!("CREATE DATABASE {db}"))
-                .execute(&mut admin)
-                .await
-                .map_err(|e| SkipReason(format!("create database {db}: {e}")))?;
+            with_provision_deadline(
+                "create the benchmark database",
+                deadline,
+                diesel::sql_query(format!("CREATE DATABASE {db}")).execute(&mut admin),
+            )
+            .await?
+            .map_err(|e| SkipReason(format!("create database {db}: {e}")))?;
             let url = super::with_db_name(&admin_url, &db);
-            let mut conn = AsyncPgConnection::establish(&url)
-                .await
-                .map_err(|e| SkipReason(format!("connect {db}: {e}")))?;
+            let mut conn = with_provision_deadline(
+                "connect the ownership lease",
+                deadline,
+                AsyncPgConnection::establish(&url),
+            )
+            .await?
+            .map_err(|e| SkipReason(format!("connect {db}: {e}")))?;
             // Arm the lease before anything can observe it: a lease the server
             // is free to reap is not a lease. Done under the lock so the
             // database is never visible to a foreign sweep in a state where its
             // only defence has an expiry date.
-            arm_lease_session(&mut conn).await;
+            with_provision_deadline(
+                "arm the ownership lease",
+                deadline,
+                arm_lease_session(&mut conn),
+            )
+            .await?;
             // The lease now exists, so the database is visible in
             // `pg_stat_activity` and defends itself. Release before the
             // migration — that is the slow part, and holding the lock across it
             // would serialize concurrent runs for no benefit. Every `?` above
             // drops `lock`, which ends that session and releases the lock too,
             // so an early return cannot strand it.
-            release_sweep_lock(lock).await;
-            conn.batch_execute(autumn_harvest::full_migrations_sql())
-                .await
-                .map_err(|e| SkipReason(format!("migrate {db}: {e}")))?;
+            with_provision_deadline("release the sweep lock", deadline, release_sweep_lock(lock))
+                .await?;
+            with_provision_deadline(
+                "run migrations",
+                deadline,
+                conn.batch_execute(autumn_harvest::full_migrations_sql()),
+            )
+            .await?
+            .map_err(|e| SkipReason(format!("migrate {db}: {e}")))?;
             return Ok(BenchDb {
                 url,
                 _container: None,
@@ -2906,25 +3017,47 @@ pub mod db {
             if database_has_connections(admin, &row.datname).await {
                 continue;
             }
-            // `DROP DATABASE ... WITH (FORCE)` would be tidier but is
-            // PostgreSQL 13+, and the engine supports 12+ (see the README); on
-            // 12 it is a syntax error, and the error is ignored here, so bench
-            // databases would accumulate forever. Terminate-then-drop is
-            // version-neutral and equivalent in effect: we only reach this line
-            // for a database just observed to have zero connections, so the
-            // terminate is belt-and-braces against a backend arriving in the
-            // gap between that check and the drop.
-            let _ = diesel::sql_query(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-                 WHERE datname = $1 AND pid <> pg_backend_pid()",
-            )
-            .bind::<diesel::sql_types::Text, _>(&row.datname)
-            .execute(admin)
-            .await;
-            let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {}", row.datname))
-                .execute(admin)
-                .await;
+            // We reach this line only for a database just observed to have zero
+            // connections, so the terminate inside the helper is belt-and-braces
+            // against a backend arriving in the gap between that check and the
+            // drop.
+            drop_database_version_neutral(admin, &row.datname).await;
         }
+    }
+
+    /// `DROP DATABASE`, on every `PostgreSQL` the engine supports.
+    ///
+    /// `DROP DATABASE ... WITH (FORCE)` is tidier but is `PostgreSQL` 13+, and the
+    /// engine supports 12+ (see the README). On 12 it is a *syntax error* — and
+    /// every caller here ignores the result, because a cleanup that fails must
+    /// not fail the run — so the database silently accumulates forever instead.
+    /// Terminate-then-drop is version-neutral and equivalent in effect.
+    ///
+    /// Shared rather than written out at each site: the two callers leak in
+    /// different ways when they disagree. A stale bench database at least
+    /// carries the harness prefix and is reclaimed by the next run's sweep; a
+    /// probe database does not, so nothing ever collects it.
+    ///
+    /// Best-effort by design — both statements' results are discarded.
+    ///
+    /// # Safety
+    ///
+    /// `name` is interpolated, not bound (`PostgreSQL` does not accept a parameter
+    /// there). The caller must have **minted** it, or — for a name read back
+    /// from the server — cleared it through [`super::sweep_step`] first, which
+    /// is the check that keeps a database this harness did not create out of a
+    /// `DROP`.
+    pub async fn drop_database_version_neutral(conn: &mut AsyncPgConnection, name: &str) {
+        let _ = diesel::sql_query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = $1 AND pid <> pg_backend_pid()",
+        )
+        .bind::<diesel::sql_types::Text, _>(name)
+        .execute(conn)
+        .await;
+        let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {name}"))
+            .execute(conn)
+            .await;
     }
 
     /// Does any backend currently hold a connection to `datname`?
