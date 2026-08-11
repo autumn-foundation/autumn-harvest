@@ -25,3 +25,41 @@
 **Docs / example.** CLAUDE.md gains a "Cross-type continue-as-new — multi-phase entities" usage subsection (carry/re-resolve matrix, the presence-decides rule, the addressing consequence, rollout ordering). `autumn-harvest/examples/entity_phase_transition.rs` is a three-phase subscription entity under one `workflow_id` demonstrating the typed form, the untyped form, and a same-type monthly-billing loop side by side.
 
 **Tests (TDD red→green→refactor; every RED confirmed as a real compile error or failing assertion before implementation).** `event.rs`: 3 serde tests (same-type omits the field, cross-type round-trips, pre-#803 JSON deserializes to `None`). `replay.rs`: 5 matcher tests incl. both divergence directions. `context.rs`: 6 tests over the new methods and the shared impl (the divergence test is `tokio::time::timeout`-bounded on purpose — if the type guard regresses the call resolves `Matched` and parks forever, so an unbounded assertion would turn a regression into a CI wall-clock timeout instead of a red test). `worker.rs`: 11 pure tests (`can803_*`) covering same-type-verbatim, cross-type-from-target, target-without-defaults-clears, the SLA clamp, the #243 ceiling, non-positive-SLA-dropped, overflow-does-not-panic, the #617 chain cap carried verbatim even when the target declares its own, the target-classification matrix, the DAG rejection, and the successor-slot matrix (free / self / terminal-occupant / live-occupant). `tests/integration/replayer_tests.rs`: a "Cross-type continue-as-new" section whose success-metric sweep runs 100 iterations that **vary** the recorded target across three types and pair each positive with its two negatives — "identical successor type" is asserted by *exclusion* (exactly one of the three handlers replays clean; both others are rejected as non-determinism), because the resolved type is not readable off the report. Plus redirect-is-non-determinism, revert-to-same-type-is-non-determinism, JSON round-trip and a pre-#803 back-compat replay. `tests/integration/cross_type_continue_as_new_tests.rs`: 14 worker-driven DB tests (identity/shard/queue/**input** preservation, defaults-from-the-new-type with the #617 chain cap pinned verbatim, defaults-cleared, unregistered→terminal-with-no-successor, a terminal occupant sealed so the successor takes its slot, a live occupant blocking terminally with the bystander untouched, naming-your-own-type continuing normally, full AC7 carryover (`last_completion_result`, schedule lineage, memo, search attributes, context headers, completion callbacks, `assigned_build_id`, run-chain back-links), a mid-transition signal reassigning via the row-lock choreography, `signal_with_start` attaching to the live successor, the old-type-starts-a-separate-run consequence, concurrency re-resolution, the child guard, and same-type-unchanged). `examples/entity_phase_transition.rs`: 4 embedded `WorkflowTestEnv` tests, wired into CI with their own step (a `[[example]]` defaults to `test = false`, so without it they would never execute). Mutation-tested: dropping the SLA clamp, sourcing cross-type `owner` from the predecessor, accepting a blank target, disabling the matcher's type comparison, and forcing the successor slot always-`Free` were each applied and each caught — the last two were re-confirmed after the tests were strengthened, since the original success-metric loop survived the matcher mutant.
+
+**Post-review hardening (Codex, PR #1159).** Two fixes.
+
+**P1 — retry-ceiling bypass.** The cross-type arm resolved the target's
+`retry_policy` from its `WorkflowInfo` and serialized it into the successor row
+unchanged, bypassing the operator's fleet-wide `max_workflow_attempts_ceiling`
+(#523). Authoritative rather than cosmetic: the retry consumer gates on
+`attempt >= policy.max_attempts` read straight off the stored row and never
+re-clamps. Now clamped at the write site, mirroring the two existing sites that
+resolve a policy from a `WorkflowInfo` and so bypass `StartWorkflowParams` (the
+normal start path in `execution.rs`, and the detached-child spawn). The
+**same-type** arm is deliberately NOT clamped — it carries the predecessor's
+already-clamped stored value, and re-clamping would silently shrink an
+in-flight chain's budget if an operator lowered the ceiling mid-flight.
+
+**P1 — cross-shard misrouting.** Rendezvous routing hashes the
+`(workflow_name, workflow_id)` **pair**, so a type change re-routes the key —
+measured at 143/200 ids (~75%) on a 4-shard router. The successor is
+nonetheless inserted on the predecessor's shard (the seal and the insert are
+one transaction; there is no cross-shard transaction to relocate it). Left
+unguarded that silently (a) made the successor unreachable by
+`workflow_id`-addressed signal/cancel/await (#751), which resolves its target by
+hashing the new pair — precisely the addressing this feature exists to preserve —
+and (b) hid a live run of the target type on the routed shard from
+`resolve_successor_slot`, admitting two live runs under one key. Such a
+transition is now **rejected terminally**, naming both shards, matching the
+fail-closed posture already taken for blank / unregistered / DAG /
+occupied-slot targets. Single-shard deployments are unaffected; `HarvestPlugin`
+rejects multi-shard upstream, so the restriction binds only standalone-runner
+embedders. Cross-type continue-as-new is therefore single-shard-only for now;
+relocation or a routing directory would lift it.
+
+Tests: `can803_cross_type_applies_the_workflow_attempts_ceiling`,
+`can803_same_type_retry_policy_is_not_reclamped_by_the_ceiling`,
+`can803_cross_shard_guard_matrix`, and
+`can803_cross_type_key_routes_to_a_different_shard_for_most_ids` (pins the
+pair-hash premise so the guard cannot silently become dead code). Both fixes
+are mutation-verified.
