@@ -449,6 +449,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_writes_of_one_key_report_exactly_one_recorded() {
+        // The multi-replica shape: two consumers hold the same SQS message
+        // because its visibility expired mid-write, and both dead-letter it.
+        // Exactly one may be told it created the record, or both process-local
+        // poison trackers call their handoff the first and `poisoned` counts a
+        // message that produced one row. The check and the push therefore share
+        // one guard, as `ON CONFLICT DO NOTHING` is one statement.
+        let sink = RecordingDeadLetterSink::new();
+        let (first, second) = (entry(), entry());
+        let (a, b) = tokio::join!(sink.write(&first), sink.write(&second));
+
+        let outcomes = [a.unwrap(), b.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| **o == DeadLetterOutcome::Recorded)
+                .count(),
+            1,
+            "exactly one writer may claim the record: {outcomes:?}"
+        );
+        assert_eq!(sink.entries().len(), 1);
+    }
+
+    #[tokio::test]
     async fn recording_sink_can_be_made_to_fail() {
         let sink = RecordingDeadLetterSink::new();
         sink.fail_writes(true);
