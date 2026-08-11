@@ -77,28 +77,57 @@ pub struct ConnectorRuntimeConfig {
     /// needs to move on a scrape cadence.
     pub lag_sample_interval: std::time::Duration,
     /// Fail the pass when a partition is holding this many completed offsets
-    /// behind a prefix head that has not settled. `0` (the default) disables
-    /// the check.
+    /// behind a prefix head that has not settled.
     ///
-    /// This is the escape hatch for a **permanently blocked prefix**. On a
-    /// positionally-ordered broker the commit mark can only advance over a
-    /// contiguous completed prefix, so a message that is retried rather than
-    /// settled blocks its partition. On Kafka that block is permanent by
-    /// construction: `abandon` is a no-op (not committing is not a nack), so
-    /// nothing hands the message back until the consumer is recreated and
-    /// re-reads from the last commit. Every later message keeps settling, so
-    /// without this the stall is silent — the partition simply stops
-    /// committing.
+    /// `None` (the default) derives the bound from the binding's
+    /// `max_in_flight`; `Some(0)` disables the check; `Some(n)` sets it
+    /// explicitly. See [`effective_stall_threshold`].
+    ///
+    /// This detects a **permanently blocked prefix**. On a positionally-ordered
+    /// broker the commit mark can only advance over a contiguous completed
+    /// prefix, so a message that is retried rather than settled blocks its
+    /// partition. On Kafka that block is permanent by construction: `abandon`
+    /// is a no-op (not committing is not a nack), so nothing hands the message
+    /// back until the consumer is recreated and re-reads from the last commit.
+    /// Every later message keeps settling, so without this the stall is
+    /// **silent** — the partition simply stops committing while the connector
+    /// otherwise looks healthy.
     ///
     /// Failing the pass is the fix precisely because it is loud and because
     /// the supervisor's response *is* the retry: `run` backs off and polls
     /// again, and a supervisor that recreates the consumer re-reads from the
     /// last commit, which redelivers the blocked message.
     ///
-    /// Size it above the concurrency you expect to settle out of order —
-    /// `max_in_flight` bounds that, so anything comfortably above it means
-    /// "not settling", not "settling out of order".
-    pub stall_threshold: usize,
+    /// It is on by default because a stall that nobody configured a detector
+    /// for is exactly the one that goes unnoticed. Set `Some(0)` to opt out.
+    pub stall_threshold: Option<usize>,
+}
+
+/// Never derive a bound below this, so a binding with tiny `max_in_flight`
+/// does not fail its pass the moment a couple of messages settle out of order.
+pub const MIN_DERIVED_STALL_THRESHOLD: usize = 32;
+
+/// How many held offsets count as a stall, given the configured knob and the
+/// binding's concurrency.
+///
+/// The derived bound is a multiple of `max_in_flight` because that is exactly
+/// what bounds *healthy* out-of-order settlement: only that many messages are
+/// ever outstanding, so a held depth well past it means the head is not
+/// settling at all rather than settling late. Explicit configuration always
+/// wins, and `Some(0)` disables the check.
+#[must_use]
+pub const fn effective_stall_threshold(configured: Option<usize>, max_in_flight: usize) -> usize {
+    if let Some(explicit) = configured {
+        return explicit;
+    }
+    // Saturating: a pathological `max_in_flight` must not wrap to a tiny bound
+    // and start failing healthy passes.
+    let derived = max_in_flight.saturating_mul(4);
+    if derived > MIN_DERIVED_STALL_THRESHOLD {
+        derived
+    } else {
+        MIN_DERIVED_STALL_THRESHOLD
+    }
 }
 
 impl Default for ConnectorRuntimeConfig {
@@ -111,9 +140,9 @@ impl Default for ConnectorRuntimeConfig {
             error_backoff: std::time::Duration::from_secs(1),
             idle_backoff: std::time::Duration::from_millis(200),
             lag_sample_interval: std::time::Duration::from_secs(15),
-            // Opt-in: a deployment that tolerates a deep out-of-order backlog
-            // should not start failing passes because it upgraded.
-            stall_threshold: 0,
+            // Derived from the binding's `max_in_flight` (see
+            // `effective_stall_threshold`), so the detector is on by default.
+            stall_threshold: None,
         }
     }
 }
@@ -367,12 +396,9 @@ impl ConnectorRuntime {
     ///
     /// Opt-in via [`ConnectorRuntimeConfig::stall_threshold`]; `0` disables.
     async fn check_commit_stall(&self) -> Result<(), ConnectorError> {
-        let Some((partition, held)) = self
-            .offsets
-            .lock()
-            .await
-            .stalled(self.config.stall_threshold)
-        else {
+        let threshold =
+            effective_stall_threshold(self.config.stall_threshold, self.binding.max_in_flight);
+        let Some((partition, held)) = self.offsets.lock().await.stalled(threshold) else {
             return Ok(());
         };
         tracing::error!(
@@ -380,15 +406,15 @@ impl ConnectorRuntime {
             stream = %self.binding.stream,
             partition,
             held,
-            threshold = self.config.stall_threshold,
+            threshold,
             "connector commit prefix is stalled; the head offset has not settled while later \
              offsets pile up behind it. Recreate the consumer to re-read from the last commit"
         );
         Err(ConnectorError::Broker(format!(
             "connector '{}' commit prefix stalled on partition {partition}: {held} completed \
-             offsets are held behind an unsettled head (threshold {}). The blocked message is \
-             only redelivered by re-reading from the last commit",
-            self.binding.name, self.config.stall_threshold,
+             offsets are held behind an unsettled head (threshold {threshold}). The blocked \
+             message is only redelivered by re-reading from the last commit",
+            self.binding.name,
         )))
     }
 
@@ -1339,7 +1365,7 @@ mod tests {
     /// Seeded through the tracker (as `ack_waits_for_the_contiguous_offset_prefix`
     /// does) rather than through a mapper, because the point under test is the
     /// commit prefix, not how a particular message came to be retried.
-    async fn stalled_runtime(threshold: usize, settled: i64) -> ConnectorRuntime {
+    async fn stalled_runtime(threshold: Option<usize>, settled: i64) -> ConnectorRuntime {
         let rt = runtime_with_metrics(
             malformed_binding(),
             Arc::new(MockSource::new("orders")),
@@ -1373,7 +1399,7 @@ mod tests {
         // recreated and re-reads from the last commit. Left unreported the
         // partition's prefix stays blocked forever and its commit never
         // advances -- silently, because every later message settles fine.
-        let rt = stalled_runtime(3, 4).await;
+        let rt = stalled_runtime(Some(3), 4).await;
         assert_eq!(rt.offsets.lock().await.held(0), 4);
 
         // Reported even on an IDLE pass: a stalled partition usually goes
@@ -1394,13 +1420,34 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn stall_detection_is_off_by_default_and_below_its_bound() {
-        // Off by default: an existing deployment that tolerates a deep
-        // out-of-order backlog must not start failing passes on upgrade.
-        assert_eq!(ConnectorRuntimeConfig::default().stall_threshold, 0);
+    #[test]
+    fn the_default_stall_bound_is_derived_from_the_concurrency_it_must_clear() {
+        // On by default: an unconfigured deployment must still surface a
+        // permanently blocked prefix, or the retry never happens for anyone
+        // who did not know to opt in.
+        assert_eq!(ConnectorRuntimeConfig::default().stall_threshold, None);
 
-        let disabled = stalled_runtime(0, 4).await;
+        // Healthy out-of-order settlement is bounded by `max_in_flight` (only
+        // that many messages are ever outstanding), so the derived bound sits
+        // well clear of it.
+        assert!(effective_stall_threshold(None, 64) > 64);
+        assert!(effective_stall_threshold(None, 8) >= MIN_DERIVED_STALL_THRESHOLD);
+        // A tiny binding still gets a floor, so a 1-in-flight connector does
+        // not fail its pass the moment two messages settle out of order.
+        assert_eq!(
+            effective_stall_threshold(None, 1),
+            MIN_DERIVED_STALL_THRESHOLD
+        );
+        // Explicit wins, and 0 is the documented off switch.
+        assert_eq!(effective_stall_threshold(Some(10), 64), 10);
+        assert_eq!(effective_stall_threshold(Some(0), 64), 0);
+        // Never overflows for a pathological binding.
+        assert!(effective_stall_threshold(None, usize::MAX) > 0);
+    }
+
+    #[tokio::test]
+    async fn stall_detection_can_be_disabled_and_ignores_depths_below_its_bound() {
+        let disabled = stalled_runtime(Some(0), 4).await;
         assert!(
             disabled.run_once().await.is_ok(),
             "threshold 0 disables the check"
@@ -1408,8 +1455,13 @@ mod tests {
 
         // Configured, but the held depth is below the bound: ordinary
         // out-of-order settlement must never fail a pass.
-        let under = stalled_runtime(10, 4).await;
+        let under = stalled_runtime(Some(10), 4).await;
         assert!(under.run_once().await.is_ok());
+
+        // And the default bound is generous enough that a shallow backlog on
+        // a default binding is not mistaken for a stall.
+        let defaulted = stalled_runtime(None, 4).await;
+        assert!(defaulted.run_once().await.is_ok());
     }
 
     #[tokio::test]
@@ -1417,7 +1469,7 @@ mod tests {
         // The check must not latch: once the blocked head settles (the
         // recreated consumer redelivered it and it dispatched), the prefix
         // drains and passes succeed again.
-        let rt = stalled_runtime(3, 4).await;
+        let rt = stalled_runtime(Some(3), 4).await;
         assert!(rt.run_once().await.is_err());
 
         rt.ack(&MessageHandle::positioned("orders:0:0", 0, 0)).await;

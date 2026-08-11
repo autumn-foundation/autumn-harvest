@@ -88,6 +88,93 @@ fn real_migrations_have_unique_version_prefixes() {
     );
 }
 
+/// Migration directory names in the **plugin's** harvest-database tree.
+///
+/// Read from disk rather than an env var because `build.rs` belongs to the
+/// core crate. A missing directory yields an empty list: the guard's job is to
+/// detect collisions, not to require the plugin to own any migrations.
+fn plugin_harvest_migration_names() -> Vec<String> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../autumn-harvest-plugin/migrations/harvest");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Plugin migration names whose version is already taken by a core migration.
+///
+/// Pure, so the guard below and its RED demonstration exercise the *same*
+/// predicate rather than two copies that can drift apart.
+fn versions_colliding_with_core<'a>(plugin: &'a [String], core_list: &str) -> Vec<&'a str> {
+    let core: BTreeSet<&str> = core_list
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .filter_map(|n| n.split('_').next())
+        .collect();
+    plugin
+        .iter()
+        .filter(|name| {
+            name.split('_')
+                .next()
+                .is_some_and(|version| core.contains(version))
+        })
+        .map(String::as_str)
+        .collect()
+}
+
+#[test]
+fn plugin_and_core_migrations_never_share_a_version() {
+    // Diesel identifies an applied migration by its **version alone** and
+    // records it in one `__diesel_schema_migrations` table. The plugin's
+    // migrations run against the SAME harvest database as the core ones, and
+    // `ensure_runtime_migrations` runs core first — so a plugin migration
+    // sharing a core version is silently considered already applied and its
+    // SQL NEVER EXECUTES. The table it was meant to create simply does not
+    // exist, and the failure surfaces far away at runtime.
+    //
+    // The sibling `real_migrations_have_unique_version_prefixes` cannot catch
+    // this: it only sees the core tree.
+    let plugin = plugin_harvest_migration_names();
+    if plugin.is_empty() {
+        return;
+    }
+    let collisions = versions_colliding_with_core(&plugin, MIGRATIONS_LIST);
+
+    assert!(
+        collisions.is_empty(),
+        "plugin migration(s) {collisions:?} reuse a version already taken by a core \
+         migration. Diesel keys on version alone and core runs first, so the plugin \
+         migration would be skipped entirely and its table never created. Rename it to a \
+         version unused anywhere in the repository."
+    );
+}
+
+#[test]
+fn version_collision_detection_covers_both_trees() {
+    // RED demonstration for the guard above, on the SAME predicate: a shared
+    // version must be reported even though the two directory names differ.
+    let core = "20260716000000_core_thing,20260101000000_other";
+    let plugin = ["20260716000000_plugin_thing".to_string()];
+    assert_eq!(
+        versions_colliding_with_core(&plugin, core),
+        vec!["20260716000000_plugin_thing"],
+        "a version shared with a core migration must be detected"
+    );
+
+    // A distinct version is not a collision, so the guard cannot be vacuously
+    // green by flagging everything.
+    let distinct = ["20260719000000_plugin_thing".to_string()];
+    assert!(versions_colliding_with_core(&distinct, core).is_empty());
+}
+
 #[test]
 fn full_migrations_sql_bundle_is_complete() {
     let bundle = autumn_harvest::full_migrations_sql();

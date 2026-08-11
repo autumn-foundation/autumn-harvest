@@ -244,15 +244,21 @@ is recreated and re-reads from the last commit. The stall is silent, because
 the connector otherwise looks healthy: messages keep flowing, they all dispatch,
 only the commit stops moving.
 
-Set `ConnectorRuntimeConfig::stall_threshold` to bound it. When a partition
-holds that many completed offsets behind an unsettled head, the pass **fails
-loudly** — naming the partition, the depth, and the remedy — instead of
-continuing to look healthy. `run` then backs off and re-polls, and a supervisor
-that recreates the consumer performs the retry by re-reading from the last
-commit. It is `0` (off) by default so an upgrade cannot start failing passes on
-a deployment that tolerates a deep out-of-order backlog; size it comfortably
-above `max_in_flight`, which bounds how many messages can legitimately be
-settling out of order at once.
+The connector detects this. When a partition holds more than
+`ConnectorRuntimeConfig::stall_threshold` completed offsets behind an unsettled
+head, the pass **fails loudly** — naming the partition, the depth, and the
+remedy — instead of continuing to look healthy. `run` then backs off and
+re-polls, and a supervisor that recreates the consumer performs the retry by
+re-reading from the last commit. It is checked on idle passes too, because a
+stalled partition usually goes quiet.
+
+The check is **on by default**, since a stall nobody configured a detector for
+is precisely the one that goes unnoticed. The default bound is derived from the
+binding's `max_in_flight` (×4, floored at 32) because that is what bounds
+*healthy* out-of-order settlement: only `max_in_flight` messages are ever
+outstanding, so a held depth well past it means the head is not settling at all
+rather than settling late. Set it explicitly to tune it, or to `Some(0)` to opt
+out entirely.
 
 ## Idempotency
 

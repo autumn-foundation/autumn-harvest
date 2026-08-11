@@ -47,7 +47,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const CONNECTOR_DLQ_SQL: &str =
-    include_str!("../migrations/harvest/20260716000000_harvest_connector_dead_letters/up.sql");
+    include_str!("../migrations/harvest/20260719000000_harvest_connector_dead_letters/up.sql");
 
 const QUEUE: &str = "orders";
 

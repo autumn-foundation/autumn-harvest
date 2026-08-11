@@ -28,7 +28,7 @@ the engine already uses for `PayloadStore` (#524),
 is an ordinary start landing the same `WorkflowStarted` event an HTTP caller
 produces. The only durable state the connector owns is
 `harvest_connector_dead_letters`, a **plugin**-owned table (alongside
-`harvest_workflow_outbox`, migration `20260716000000`) for poison messages that
+`harvest_workflow_outbox`, migration `20260719000000`) for poison messages that
 never became executions — the engine's `harvest_dead_letters` is task-keyed
 (`original_task_id NOT NULL` + a `task_type` CHECK), so holding one would have
 required relaxing a *core* schema constraint, which the issue forbids for the
@@ -250,19 +250,41 @@ coordinates, so a run traces back to the exact message.
   reset and the prefix rebuilt from the new position. A redelivery of an offset
   still in flight (or completed and held) is not a reposition and leaves the
   live prefix alone.
+* **The dead-letter migration would never have run.** Its directory used
+  version `20260716000000`, already taken by the core
+  `20260716000000_harvest_workflow_history_bloat_warn`. Diesel identifies an
+  applied migration by **version alone**, in one `__diesel_schema_migrations`
+  table, and `ensure_runtime_migrations` applies the core migrations to the
+  harvest database *before* the plugin's — so the core one records the version
+  and the plugin's `CREATE TABLE` is treated as already applied and skipped.
+  `harvest_connector_dead_letters` would simply not exist, every poison
+  message's dead-letter write would fail, and each would be downgraded to a
+  retry and redelivered forever: exactly the failure the poison path exists to
+  prevent, surfacing far from its cause. Renamed to `20260719000000`.
+
+  Every test passed anyway, because each DB suite creates the table itself
+  (`reset()` runs the migration's SQL directly) — so the harness could never
+  observe the migration being skipped. The durable fix is therefore a guard,
+  not a test of this one table: `migration_hygiene` gained
+  `plugin_and_core_migrations_never_share_a_version`, which cross-checks the
+  plugin's harvest tree against the core tree. The pre-existing
+  `real_migrations_have_unique_version_prefixes` could not catch this — it only
+  ever saw the core tree. Verified red against the colliding name.
 * **A permanently blocked commit prefix was silent.** The contiguous-prefix
   rule means a message that is retried rather than settled blocks its
   partition's commit. On SQS the visibility timeout resolves that; on Kafka it
   cannot, because `abandon` is a no-op there (not committing is not a nack), so
   nothing hands the message back until the consumer is recreated. The connector
   meanwhile looked healthy — messages flowing, all dispatching, only the commit
-  frozen. New opt-in `ConnectorRuntimeConfig::stall_threshold`: when a
+  frozen. New `ConnectorRuntimeConfig::stall_threshold`: when a
   partition holds that many completed offsets behind an unsettled head, the
   pass **fails loudly**, naming the partition, the depth and the remedy, so the
   supervisor recreates the consumer and the re-read performs the retry. Checked
-  on idle passes too, since a stalled partition usually goes quiet. `0` (off)
-  by default so an upgrade cannot start failing passes on a deployment that
-  tolerates a deep out-of-order backlog.
+  on idle passes too, since a stalled partition usually goes quiet. **On by
+  default** — a stall nobody configured a detector for is exactly the one that
+  goes unnoticed — with the bound derived from the binding's `max_in_flight`
+  (×4, floored at 32), which is what bounds *healthy* out-of-order settlement.
+  `Some(0)` opts out.
 
 ### Success metric
 
