@@ -345,7 +345,40 @@ impl EventSource for KafkaSource {
         let topic = self.topic.clone();
         // `fetch_watermarks` is a blocking librdkafka call.
         tokio::task::spawn_blocking(move || {
-            let assignment = consumer.assignment().ok()?;
+            let timeout = std::time::Duration::from_secs(2);
+
+            // Every partition of the topic, from metadata — deliberately NOT
+            // `consumer.assignment()`. Consumer lag is a property of the GROUP,
+            // but an assignment-scoped sum is a property of one replica: scale
+            // the connector to four replicas and each reports roughly a quarter
+            // of the backlog. The dashboard aggregates with `max by (source)`
+            // (correct for SQS, where every replica reads the same whole-queue
+            // depth), so an assignment-scoped Kafka sample would show the
+            // largest replica's subtotal and hide a partition stalled on any of
+            // the others — the exact failure the gauge exists to catch. Making
+            // the sample group-wide means one aggregation is right for both
+            // adapters and the gauge means the same thing regardless of which
+            // broker is behind it.
+            //
+            // The cost is that each replica asks about every partition rather
+            // than its own share, so broker calls per sample scale with replica
+            // count. That is bounded work on the lag interval, not the message
+            // path, and it is how consumer-group lag exporters compute this.
+            let metadata = consumer.fetch_metadata(Some(&topic), timeout).ok()?;
+            let partitions: Vec<i32> = metadata
+                .topics()
+                .iter()
+                .filter(|t| t.name() == topic)
+                .flat_map(|t| {
+                    t.partitions()
+                        .iter()
+                        .map(rdkafka::metadata::MetadataPartition::id)
+                })
+                .collect();
+            if partitions.is_empty() {
+                return None;
+            }
+
             // The DURABLE group offset, not `position()`. `position()` is the
             // local next-fetch cursor: it advances the moment a record is
             // fetched, regardless of whether that record has been dispatched,
@@ -354,19 +387,18 @@ impl EventSource for KafkaSource {
             // the condition this gauge exists to expose — would report its lag
             // falling to zero, while a restart replayed everything from the
             // last commit.
-            let committed = consumer.committed(std::time::Duration::from_secs(2)).ok()?;
-            let mut total: i64 = 0;
-            for elem in assignment.elements() {
-                let partition = elem.partition();
-                let (low, high) = consumer
-                    .fetch_watermarks(&topic, partition, std::time::Duration::from_secs(2))
-                    .ok()?;
-                let offset = committed
-                    .find_partition(&topic, partition)
-                    .map_or(Offset::Invalid, |p| p.offset());
-                total = total.saturating_add(partition_lag(low, high, offset));
+            //
+            // `committed_offsets` takes an explicit partition list, unlike
+            // `committed`, which is scoped to the local assignment.
+            let mut wanted = TopicPartitionList::new();
+            for partition in &partitions {
+                wanted.add_partition(&topic, *partition);
             }
-            Some(total)
+            let committed = consumer.committed_offsets(wanted, timeout).ok()?;
+
+            group_lag(&topic, &partitions, &committed, |partition| {
+                consumer.fetch_watermarks(&topic, partition, timeout).ok()
+            })
         })
         .await
         .ok()
@@ -443,6 +475,34 @@ fn canonical_broker_list(brokers: &str) -> String {
     seeds.join(",")
 }
 
+/// The group's outstanding records across `partitions`.
+///
+/// `partitions` is the topic's full partition set from metadata, so the total
+/// is the GROUP's backlog rather than the calling replica's share of it. A
+/// partition with no entry in `committed` — one the group has never committed,
+/// which is the common shape for a partition owned by another replica — counts
+/// its whole retained backlog, per [`partition_lag`].
+///
+/// Returns `None` if any watermark is unavailable. A partial sum is
+/// indistinguishable from a real drop in backlog, and reporting one would turn
+/// a broker hiccup into a false all-clear on the gauge operators page on.
+fn group_lag(
+    topic: &str,
+    partitions: &[i32],
+    committed: &TopicPartitionList,
+    watermarks: impl Fn(i32) -> Option<(i64, i64)>,
+) -> Option<i64> {
+    let mut total: i64 = 0;
+    for &partition in partitions {
+        let (low, high) = watermarks(partition)?;
+        let offset = committed
+            .find_partition(topic, partition)
+            .map_or(Offset::Invalid, |p| p.offset());
+        total = total.saturating_add(partition_lag(low, high, offset));
+    }
+    Some(total)
+}
+
 /// Outstanding records for one partition, from its watermarks and the group's
 /// committed offset.
 ///
@@ -465,6 +525,80 @@ fn partition_lag(low: i64, high: i64, committed: Offset) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A partition the local replica has never committed still contributes its
+    /// full retained backlog.
+    ///
+    /// This is the case that only appears once the gauge goes group-wide: with
+    /// several replicas in one group, most partitions in the metadata list are
+    /// owned by *some other* replica, and `committed_offsets` returns
+    /// `Offset::Invalid` for a partition the group has not committed at all.
+    /// Scoring those as zero would silently re-create the very under-report the
+    /// group-wide change exists to fix -- the partitions we just started
+    /// counting would all count as nothing.
+    #[test]
+    fn group_lag_counts_an_uncommitted_partition_as_its_whole_backlog() {
+        let mut committed = TopicPartitionList::new();
+        // Only partition 0 has a committed offset; 1 and 2 are untouched, as
+        // they would be for a partition assigned to a different replica.
+        committed
+            .add_partition_offset("orders", 0, Offset::Offset(40))
+            .expect("valid offset");
+
+        let total = group_lag("orders", &[0, 1, 2], &committed, |p| match p {
+            0 => Some((0, 100)),
+            1 => Some((0, 7)),
+            2 => Some((10, 25)),
+            _ => None,
+        })
+        .expect("watermarks available for every partition");
+
+        // 60 outstanding on p0, then the whole backlog of the two the group has
+        // never committed: 7 and 15.
+        assert_eq!(total, 60 + 7 + 15);
+    }
+
+    /// The sum spans every partition it is handed, so a caller passing the
+    /// topic's full metadata partition set gets the GROUP's backlog rather than
+    /// one replica's subtotal.
+    #[test]
+    fn group_lag_spans_every_partition_it_is_given() {
+        let mut committed = TopicPartitionList::new();
+        for p in 0..4 {
+            committed
+                .add_partition_offset("orders", p, Offset::Offset(10))
+                .expect("valid offset");
+        }
+        let watermarks = |_p: i32| Some((0, 30));
+
+        let one_replicas_share =
+            group_lag("orders", &[0, 1], &committed, watermarks).expect("watermarks available");
+        let whole_group = group_lag("orders", &[0, 1, 2, 3], &committed, watermarks)
+            .expect("watermarks available");
+
+        assert_eq!(
+            one_replicas_share, 40,
+            "two partitions, 20 outstanding each"
+        );
+        assert_eq!(whole_group, 80, "all four partitions");
+        assert!(
+            whole_group > one_replicas_share,
+            "an assignment-scoped sum under-reports the group; that is the bug"
+        );
+    }
+
+    /// An unavailable watermark fails the whole sample rather than silently
+    /// reporting a smaller number: a partial total is indistinguishable from a
+    /// genuine drop in backlog, which is the wrong thing to page on.
+    #[test]
+    fn group_lag_is_none_when_a_watermark_is_unavailable() {
+        let committed = TopicPartitionList::new();
+        assert!(
+            group_lag("orders", &[0, 1], &committed, |p| (p == 0)
+                .then_some((0, 5)))
+            .is_none()
+        );
+    }
 
     #[test]
     fn subscription_identity_uses_the_effective_group_and_brokers() {

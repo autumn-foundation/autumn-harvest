@@ -813,6 +813,30 @@ coordinates, so a run traces back to the exact message.
   now names the physical-subscription rule, with the warning and the
   deliberate independent-broker exception described alongside it.
 
+- **Kafka lag is group-wide, not per-replica.** `KafkaSource::lag` summed only
+  `consumer.assignment()`, so consumer lag — a property of the *group* — was
+  reported as a property of one replica. With N replicas each sample was roughly
+  `1/N` of the backlog, and because the starter dashboard aggregates with
+  `max by (source)` (correct for SQS, where every replica reads the same
+  whole-queue depth via `GetQueueAttributes`), the panel showed the largest
+  replica's subtotal and hid a partition stalled on any of the others — the exact
+  condition the gauge exists to expose. The sample now enumerates the topic's
+  partitions from `fetch_metadata` and reads the group's offsets with
+  `committed_offsets` (which takes an explicit partition list, unlike
+  `committed`, which is assignment-scoped), so every replica reports the same
+  group-wide number and one aggregation is correct for **both** adapters. Chosen
+  over adding an adapter-kind label and branching the PromQL: that would leave
+  the gauge meaning different things depending on which broker is behind it, a
+  trap for every future alert, and would need a new metric label. Cost: broker
+  calls per sample scale with replica count — bounded work on the
+  `lag_sample_interval`, never on the message path, and how consumer-group lag
+  exporters compute this. The summation is extracted as the pure `group_lag`,
+  which fails the whole sample (`None`) if any watermark is unavailable rather
+  than reporting a partial total, since a partial total is indistinguishable
+  from a genuine drop in backlog. `docs/telemetry.md`, the dashboard panel
+  description (whose "`max by` avoids double-counting" note was itself an
+  artifact of the bug) and the connector guide are corrected.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

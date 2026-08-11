@@ -5210,7 +5210,7 @@
               }
             }
           ],
-          "description": "Unconsumed backlog per binding where the broker client exposes it (issue #944), measured as work still owed to the consumer rather than immediately fetchable: Kafka high watermark minus the committed offset (clamped up to the low watermark, so retention-deleted records are excluded); SQS ApproximateNumberOfMessages plus ApproximateNumberOfMessagesNotVisible (a message abandoned for retry is not visible, so the visible count alone drains toward zero during an outage). `max by` avoids double-counting connector replicas."
+          "description": "Unconsumed backlog per binding where the broker client exposes it (issue #944), measured as work still owed to the consumer rather than immediately fetchable: Kafka high watermark minus the committed offset (clamped up to the low watermark, so retention-deleted records are excluded); SQS ApproximateNumberOfMessages plus ApproximateNumberOfMessagesNotVisible (a message abandoned for retry is not visible, so the visible count alone drains toward zero during an outage). Every replica reports the same number -- SQS reads whole-queue depth, and the Kafka sample is group-wide across the topic's partitions rather than the replica's own assignment -- so `max by` deduplicates replicas without under-reporting either adapter."
         }
       ]
     }

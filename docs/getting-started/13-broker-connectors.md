@@ -583,13 +583,25 @@ a restart would have to redo — not the cheaper number each broker offers first
 
 | Adapter | Reports | Why not the obvious one |
 |---|---|---|
-| Kafka | high-watermark minus the durable **committed group offset**, per assigned partition | The consumer's *read position* advances the moment a record is fetched, regardless of whether it was dispatched, is being retried, or is stuck behind a blocked commit prefix. Reading against it makes a wedged consumer report its lag falling to **zero** while a restart would replay the whole uncommitted span — inverting the gauge in exactly the case it exists to expose. A partition with nothing committed yet falls back to the low watermark, which is honest because the consumer is pinned to `auto.offset.reset = earliest`. A committed offset that retention has since advanced *past* is clamped up to the low watermark for the same reason: those records are gone from the log, so subtracting from the stale commit would report a backlog the consumer can never read. |
+| Kafka | high-watermark minus the durable **committed group offset**, summed across **every partition of the topic** | The consumer's *read position* advances the moment a record is fetched, regardless of whether it was dispatched, is being retried, or is stuck behind a blocked commit prefix. Reading against it makes a wedged consumer report its lag falling to **zero** while a restart would replay the whole uncommitted span — inverting the gauge in exactly the case it exists to expose. A partition with nothing committed yet falls back to the low watermark, which is honest because the consumer is pinned to `auto.offset.reset = earliest`. A committed offset that retention has since advanced *past* is clamped up to the low watermark for the same reason: those records are gone from the log, so subtracting from the stale commit would report a backlog the consumer can never read. |
 | SQS | `ApproximateNumberOfMessages` **plus** `ApproximateNumberOfMessagesNotVisible` | A message abandoned for visibility-timeout retry becomes *not visible*, so the visible count alone drains toward zero during a downstream outage while the outstanding population is unchanged. Both attributes ride the single `GetQueueAttributes` call, so this costs no extra round-trip. `ApproximateNumberOfMessagesDelayed` is excluded: a `DelaySeconds` message has not been delivered to anyone and is not work this connector currently owes. |
 
 > Because the gauge counts uncommitted and in-flight work, it stays **high**
 > while a partition is wedged or a backlog is being retried. That is the point:
 > pair it with an alert on a lag that is not falling, rather than one that only
 > fires on a large visible queue.
+
+Both adapters report a **group-wide** number, so every replica of a binding
+emits the same value and the starter dashboard's `max by (source)` deduplicates
+replicas without under-reporting. That is free for SQS — `GetQueueAttributes`
+returns the whole queue's depth to whoever asks — but for Kafka it is a
+deliberate choice: the sample enumerates the topic's partitions from metadata
+rather than reading `assignment()`. An assignment-scoped sum would be a property
+of one *replica*, so four replicas would each report about a quarter of the
+backlog, `max` would surface the largest quarter, and a partition stalled on any
+other replica would be invisible. The cost is that each replica asks the broker
+about every partition, so calls per sample scale with replica count — bounded
+work on the `lag_sample_interval`, never on the message path.
 
 A broker-triggered execution also records `start_source = 'broker'` with
 `start_source_ref` set to the rendered coordinates, so a run traces back to the

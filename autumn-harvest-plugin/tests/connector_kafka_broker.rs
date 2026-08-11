@@ -413,3 +413,112 @@ async fn lag_reflects_the_committed_offset_not_the_fetch_position() {
         "fetched-but-uncommitted records must still count as lag, got {lag}"
     );
 }
+
+/// Both replicas of a consumer group report the SAME lag, and it is the whole
+/// group's backlog rather than the share of partitions each one happens to own.
+///
+/// This is the property the dashboard depends on. It aggregates the gauge with
+/// `max by (source)` — correct for SQS, where every replica reads the same
+/// whole-queue depth — so an assignment-scoped Kafka sample would surface the
+/// largest replica's subtotal (roughly `1/replicas` of the truth) and hide a
+/// partition stalled on any of the others.
+///
+/// It needs a real broker because the bug is in *which* partitions the sample
+/// asks about: the unit tests take the partition list as a parameter, so they
+/// cannot distinguish `fetch_metadata` from `assignment()`. Only a genuine
+/// group with a genuine split assignment can.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn every_replica_in_a_group_reports_the_whole_group_lag() {
+    use autumn_harvest_plugin::connector::EventSource;
+    use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+    use rdkafka::client::DefaultClientContext;
+
+    const PARTITIONS: i32 = 4;
+    const GROUP: &str = "harvest-group-lag";
+    const MULTI_TOPIC: &str = "orders.multipartition";
+
+    let kafka = Kafka::default()
+        .with_tag("3.9.1")
+        .start()
+        .await
+        .expect("kafka starts");
+    let brokers = format!(
+        "127.0.0.1:{}",
+        kafka.get_host_port_ipv4(KAFKA_PORT).await.expect("port")
+    );
+
+    // Explicit multi-partition topic: an auto-created one would have a single
+    // partition, which cannot split across replicas and so cannot exhibit the
+    // bug at all.
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .create()
+        .expect("admin client");
+    admin
+        .create_topics(
+            &[NewTopic::new(
+                MULTI_TOPIC,
+                PARTITIONS,
+                TopicReplication::Fixed(1),
+            )],
+            &AdminOptions::new(),
+        )
+        .await
+        .expect("create topic");
+
+    // One record per partition, addressed explicitly so the backlog is spread
+    // rather than hashed onto one partition.
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .set("message.timeout.ms", "10000")
+        .create()
+        .expect("producer");
+    let per_partition = 3;
+    for partition in 0..PARTITIONS {
+        for i in 0..per_partition {
+            let payload = serde_json::to_vec(&json!({"order_id": format!("p{partition}-{i}")}))
+                .expect("serializable");
+            producer
+                .send(
+                    FutureRecord::to(MULTI_TOPIC)
+                        .payload(&payload)
+                        .partition(partition)
+                        .key("k"),
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect("produce");
+        }
+    }
+    let total_backlog = i64::from(PARTITIONS) * i64::from(per_partition);
+
+    // Two replicas in ONE group: Kafka splits the four partitions between them.
+    let replica_a = KafkaSource::connect(&KafkaSourceConfig::new(&brokers, GROUP, MULTI_TOPIC))
+        .expect("replica A connects");
+    let replica_b = KafkaSource::connect(&KafkaSourceConfig::new(&brokers, GROUP, MULTI_TOPIC))
+        .expect("replica B connects");
+
+    // Drive both until each holds a non-empty assignment, so the split is real
+    // and neither is reporting from an empty one.
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while std::time::Instant::now() < deadline {
+        let _ = replica_a.receive(16, Duration::from_secs(5)).await;
+        let _ = replica_b.receive(16, Duration::from_secs(5)).await;
+        if replica_a.lag().await.is_some() && replica_b.lag().await.is_some() {
+            break;
+        }
+    }
+
+    let lag_a = replica_a.lag().await.expect("replica A reports lag");
+    let lag_b = replica_b.lag().await.expect("replica B reports lag");
+
+    assert_eq!(
+        lag_a, lag_b,
+        "both replicas must report the same group-wide lag, got A={lag_a} B={lag_b}"
+    );
+    assert_eq!(
+        lag_a, total_backlog,
+        "the sample must be the whole group backlog ({total_backlog}), not one replica's share"
+    );
+}
