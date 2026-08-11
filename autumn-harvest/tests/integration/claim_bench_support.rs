@@ -533,9 +533,113 @@ const PRINTABLE_CONN_PARAMS: &[&str] = &[
     "target_session_attrs",
 ];
 
-/// The key of a `key=value` token, or the whole token when it has no `=`.
-fn token_key(token: &str) -> &str {
-    token.split_once('=').map_or(token, |(k, _)| k).trim()
+const fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Percent-decode, matching `tokio-postgres`' `UrlParser::decode`.
+///
+/// That is a plain `percent_decode(..).decode_utf8()`: a `%` not followed by two
+/// hex digits is literal, and `+` is **not** a space (this is a URI, not an HTML
+/// form). `None` when the result is not valid UTF-8 — precisely when the
+/// driver's own `decode` returns `Err` and the connection string is unusable, so
+/// a caller can treat that as "the driver will never connect with this anyway".
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(hi), Some(lo)) = (hex_val(b[i + 1]), hex_val(b[i + 2]))
+        {
+            out.push(hi * 16 + lo);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The key of a URL **query** pair, decoded the way the driver decodes it.
+///
+/// `UrlParser::parse_params` runs `self.decode(key)?` before dispatching to
+/// `Config::param`, so `db%6Eame=admin` is a `dbname` override. Comparing the
+/// raw key therefore misses it — and for a filter that exists to *strip* an
+/// overriding parameter, missing it is the failure that matters.
+///
+/// An undecodable key falls back to its raw form. The driver errors out on such
+/// a string, so it can never connect; matching the raw text is the conservative
+/// reading for a filter whose job is to remove things.
+fn decoded_query_key(pair: &str) -> String {
+    decode_or_raw(pair.split_once('=').map_or(pair, |(k, _)| k))
+}
+
+/// [`percent_decode`], falling back to the raw span when the bytes are not UTF-8.
+///
+/// The driver *rejects* that input rather than falling back, so such a string
+/// can never open a connection. Returning the raw span keeps the caller
+/// comparing text instead of losing the span entirely.
+fn decode_or_raw(s: &str) -> String {
+    percent_decode(s).unwrap_or_else(|| s.to_string())
+}
+
+/// A connection URL split into the regions **the driver's own parser sees**.
+///
+/// Deliberately not an RFC 3986 split. `tokio-postgres` hand-rolls its URL
+/// parsing (`UrlParser`), and its grammar is both simpler and different in one
+/// way that matters for redaction: **there is no fragment.** `parse_host` stops
+/// at `/` or `?`, `parse_path` runs to `?`, and `parse_params` terminates each
+/// value only at `&`. So in `?password=#hunter2` the `#hunter2` is part of the
+/// password, and code that treats it as a fragment and passes it through prints
+/// the secret.
+///
+/// Splitting once, here, is what keeps the three helpers below from each
+/// re-deriving a slightly different — and slightly wrong — view of the string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DriverUrl<'a> {
+    /// Scheme through `://`.
+    prefix: &'a str,
+    /// Everything the driver hands to `parse_credentials` + `parse_host`.
+    authority: &'a str,
+    /// Path without its leading `/`; `None` when the URL carries no path.
+    path: Option<&'a str>,
+    /// Everything after the first `?`, verbatim. `None` when there is no `?`.
+    query: Option<&'a str>,
+}
+
+/// Split a URL-form connection string, or `None` for the keyword/value form.
+fn split_driver_url(url: &str) -> Option<DriverUrl<'_>> {
+    let scheme_end = url.find("://")?;
+    let (prefix, rest) = url.split_at(scheme_end + 3);
+    // `#` is deliberately absent: the driver has no fragment concept.
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+
+    let (path, query) = tail.strip_prefix('/').map_or_else(
+        // No leading `/`, so `parse_path` declines: there is no path at all,
+        // and whatever follows can only be a query.
+        || (None, tail.strip_prefix('?')),
+        |after_slash| {
+            after_slash
+                .split_once('?')
+                .map_or((Some(after_slash), None), |(p, q)| (Some(p), Some(q)))
+        },
+    );
+
+    Some(DriverUrl {
+        prefix,
+        authority,
+        path,
+        query,
+    })
 }
 
 /// One `keyword = value` pair from a libpq keyword/value connection string.
@@ -662,6 +766,12 @@ fn keyword_value_pairs(s: &str) -> (Vec<KeywordPair<'_>>, usize) {
 /// Keys stay visible: knowing *which* options were set is diagnostic, and a key
 /// is not a secret. A token with no `=` at all is passed through — it carries no
 /// value, and under a *correct* tokenizer it cannot be the tail of one.
+///
+/// Splits on `&` **only**, because that is the driver's own value terminator
+/// (see [`DriverUrl`]); a value containing `#` is one value, not a value plus a
+/// fragment. The allowlist is matched against the *decoded* key, so
+/// `ho%73t=…` is recognised as `host` rather than hidden under a different
+/// spelling.
 fn redact_query_values(query: &str) -> String {
     query
         .split('&')
@@ -705,7 +815,8 @@ fn redact_keyword_values(params: &str) -> String {
 fn redact_one_token(token: &str) -> String {
     match token.split_once('=') {
         Some((key, _))
-            if !PRINTABLE_CONN_PARAMS.contains(&key.trim().to_ascii_lowercase().as_str()) =>
+            if !PRINTABLE_CONN_PARAMS
+                .contains(&decoded_query_key(token).to_ascii_lowercase().as_str()) =>
         {
             format!("{key}=***")
         }
@@ -745,35 +856,28 @@ fn redact_one_token(token: &str) -> String {
 /// that starts echoing its input cannot silently reopen it.
 #[must_use]
 pub fn redact_url(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
+    let Some(parts) = split_driver_url(url) else {
         // No scheme: the libpq keyword/value form, space-separated.
         return redact_keyword_values(url);
     };
-    let (prefix, rest) = url.split_at(scheme_end + 3);
-    // Userinfo, if present, runs to the last '@' before the authority ends.
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
 
-    // Path, then query, then fragment — the same ordering `with_db_name` relies
-    // on, so a slash inside a parameter value cannot be mistaken for the path.
-    let tail = match rest[authority_end..].split_once('?') {
-        Some((path, after)) => {
-            let (query, fragment) = after
-                .split_once('#')
-                .map_or((after, None), |(q, f)| (q, Some(f)));
-            let mut out = format!("{path}?{}", redact_query_values(query));
-            if let Some(f) = fragment {
-                out.push('#');
-                out.push_str(f);
-            }
-            out
-        }
-        None => rest[authority_end..].to_string(),
-    };
+    let mut tail = String::new();
+    if let Some(path) = parts.path {
+        tail.push('/');
+        tail.push_str(path);
+    }
+    if let Some(query) = parts.query {
+        tail.push('?');
+        tail.push_str(&redact_query_values(query));
+    }
 
-    authority.rfind('@').map_or_else(
-        || format!("{prefix}{authority}{tail}"),
-        |at| format!("{prefix}***@{}{tail}", &authority[at + 1..]),
+    // Userinfo, if present, runs to the last `@` in the authority. The driver
+    // instead cuts at the *first* `@` anywhere in the string, which for a
+    // well-formed URL is the same `@`; where they differ this redacts a
+    // superset, which is the safe direction for a log line.
+    parts.authority.rfind('@').map_or_else(
+        || format!("{}{}{tail}", parts.prefix, parts.authority),
+        |at| format!("{}***@{}{tail}", parts.prefix, &parts.authority[at + 1..]),
     )
 }
 
@@ -786,8 +890,9 @@ pub fn redact_url(url: &str) -> String {
 /// contains a slash — `?sslrootcert=/etc/ssl/root.crt` — it splices *inside the
 /// query* and produces a malformed URL.
 ///
-/// Userinfo may not contain an unencoded `/`, `?` or `#` in a valid URI, so
-/// locating the authority by the first such character is sound.
+/// The authority is located by the driver's own rule — the first `/` or `?`,
+/// with `#` deliberately *not* a terminator, because `UrlParser` has no
+/// fragment concept (see [`DriverUrl`]).
 ///
 /// # Why the query cannot simply be carried over
 ///
@@ -800,53 +905,55 @@ pub fn redact_url(url: &str) -> String {
 /// exactly these rewritten strings. Any `dbname` parameter is dropped, so the
 /// path is the single selector.
 ///
+/// The match is against the **decoded** key: `parse_params` decodes before
+/// dispatching to `Config::param`, so `?db%6Eame=admin` is a `dbname` override
+/// that a raw comparison would carry straight through the rewrite.
+///
 /// The libpq keyword/value form has no path at all, so there the database is
-/// selected by replacing `dbname` rather than by appending a path component.
+/// selected by replacing `dbname` rather than by appending a path component —
+/// and that grammar is *not* percent-encoded, so its keys are compared raw.
+///
+/// `db` is written verbatim, so it must already be in the form the driver will
+/// read back — no percent escapes, since [`db_name_from_url`] (and the driver's
+/// own `parse_path`) decodes them. Every name this harness generates is
+/// `[a-z0-9_]` by construction — [`BENCH_DB_PREFIX`] plus a pid, a hex run
+/// token and a counter — so the constraint is satisfied without an encoder that
+/// would never run.
 #[must_use]
 pub fn with_db_name(url: &str, db: &str) -> String {
     // Keyword/value form (`host=h dbname=admin`): no `://`, no path.
-    if !url.contains("://") {
-        let (pairs, _) = keyword_value_pairs(url);
-        let mut parts: Vec<String> = pairs
+    let Some(parts) = split_driver_url(url) else {
+        let (pairs, stopped) = keyword_value_pairs(url);
+        let mut out: Vec<String> = pairs
             .iter()
             .filter(|p| !p.key.eq_ignore_ascii_case("dbname"))
             .map(|p| format!("{}={}", p.key, p.raw_value))
             .collect();
-        parts.push(format!("dbname={db}"));
-        return parts.join(" ");
-    }
+        // Anything the parser could not consume is carried verbatim rather
+        // than dropped: silently losing `sslmode=require` is the exact
+        // unreachable-server failure this function exists to avoid. It is
+        // carried *before* the replacement, so libpq's last-wins assignment
+        // still resolves to our database even if the remainder hides a
+        // `dbname` we could not parse out.
+        let rest = url[stopped..].trim();
+        if !rest.is_empty() {
+            out.push(rest.to_string());
+        }
+        out.push(format!("dbname={db}"));
+        return out.join(" ");
+    };
 
-    let (prefix, rest) = url.split_at(url.find("://").map_or(0, |i| i + 3));
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(authority_end);
-    let suffix_start = tail.find(['?', '#']).unwrap_or(tail.len());
-    let suffix = &tail[suffix_start..];
-
-    // Separate query from fragment so `dbname` can be dropped from the query
-    // without disturbing a fragment that follows it.
-    let (query, fragment) = suffix.strip_prefix('?').map_or_else(
-        || (None, suffix.strip_prefix('#')),
-        |after| {
-            after
-                .split_once('#')
-                .map_or((Some(after), None), |(q, f)| (Some(q), Some(f)))
-        },
-    );
-
-    let kept: Vec<&str> = query
+    let kept: Vec<&str> = parts
+        .query
         .into_iter()
         .flat_map(|q| q.split('&'))
-        .filter(|pair| !pair.is_empty() && !token_key(pair).eq_ignore_ascii_case("dbname"))
+        .filter(|pair| !pair.is_empty() && !decoded_query_key(pair).eq_ignore_ascii_case("dbname"))
         .collect();
 
-    let mut out = format!("{prefix}{authority}/{db}");
+    let mut out = format!("{}{}/{db}", parts.prefix, parts.authority);
     if !kept.is_empty() {
         out.push('?');
         out.push_str(&kept.join("&"));
-    }
-    if let Some(f) = fragment {
-        out.push('#');
-        out.push_str(f);
     }
     out
 }
@@ -864,52 +971,50 @@ pub fn with_db_name(url: &str, db: &str) -> String {
 /// operator supplied in `HARVEST_TEST_DATABASE_URL` and the gate suite unwraps
 /// this result — a `None` there is a panic, not a skip:
 ///
-/// * **URL** (`postgres://host/db`): a `dbname` *query* parameter wins over the
-///   path, matching `tokio-postgres`' `UrlParser::parse`, which runs
-///   `parse_path` before `parse_params`, so the later assignment survives. This
-///   is the same precedence [`with_db_name`] honours by stripping the query
-///   parameter; the two must agree or one could strip a `dbname` the other
-///   would not have found.
+/// * **URL** (`postgres://host/db`): the regions come from
+///   [`split_driver_url`], so this reads the *driver's* grammar rather than the
+///   RFC's — there is no fragment, and keys and values are percent-decoded (see
+///   [`decoded_query_key`]). A `dbname` *query* parameter wins over the path,
+///   matching `tokio-postgres`' `UrlParser::parse`, which runs `parse_path`
+///   before `parse_params`, so the later assignment survives. This is the same
+///   precedence [`with_db_name`] honours by stripping the query parameter; the
+///   two must agree or one could strip a `dbname` the other would not have
+///   found.
 /// * **keyword/value** (`host=h dbname=db`): the *last* `dbname` wins, matching
-///   `Config::param`, which simply assigns on each occurrence.
+///   `Config::param`, which simply assigns on each occurrence. That grammar is
+///   not percent-encoded, so the unquoted span is already the real name.
+///
+/// Returns an owned name because decoding (`%2F` and friends) produces bytes
+/// that are not a slice of the input.
 ///
 /// `None` only when the string names no database at all (`postgres://host`,
 /// `host=h port=5432`).
 #[must_use]
-pub fn db_name_from_url(url: &str) -> Option<&str> {
+pub fn db_name_from_url(url: &str) -> Option<String> {
     // Keyword/value form: no `://`, so there is no path to read — the name can
     // only come from a `dbname` keyword.
-    if !url.contains("://") {
+    let Some(parts) = split_driver_url(url) else {
         let (pairs, _) = keyword_value_pairs(url);
         return pairs
             .iter()
             .rev()
             .find(|p| p.key.eq_ignore_ascii_case("dbname"))
-            .map(|p| unquote_span(p.raw_value));
-    }
-
-    let rest = url.find("://").map_or(url, |i| &url[i + 3..]);
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let tail = &rest[authority_end..];
+            .map(|p| unquote_span(p.raw_value).to_string());
+    };
 
     // A `dbname` query parameter overrides the path (see the doc comment). A
-    // bare `dbname` with no `=` reads as empty, matching how the `url` crate's
-    // `query_pairs` feeds `tokio-postgres`.
-    if let Some(name) = tail
-        .split_once('?')
-        .map(|(_, after)| after.split_once('#').map_or(after, |(q, _)| q))
+    // bare `dbname` with no `=` reads as empty, matching `parse_params`, which
+    // stores whatever `take_until(&['&'])` yields.
+    if let Some(pair) = parts
+        .query
         .into_iter()
         .flat_map(|q| q.split('&'))
-        .rfind(|pair| token_key(pair).eq_ignore_ascii_case("dbname"))
-        .map(|pair| pair.split_once('=').map_or("", |(_, v)| v))
+        .rfind(|pair| decoded_query_key(pair).eq_ignore_ascii_case("dbname"))
     {
-        return Some(name);
+        return Some(decode_or_raw(pair.split_once('=').map_or("", |(_, v)| v)));
     }
 
-    // Only a leading `/` introduces a path; `?`/`#` mean there is none.
-    let path = tail.strip_prefix('/')?;
-    let path_end = path.find(['?', '#']).unwrap_or(path.len());
-    Some(&path[..path_end])
+    parts.path.map(decode_or_raw)
 }
 
 /// Prefix of every database this harness creates against an admin URL.
@@ -1358,6 +1463,49 @@ mod pure_tests {
         );
     }
 
+    /// A `#` inside a query value is part of that value, not a fragment.
+    ///
+    /// `UrlParser::parse_params` terminates a value with `take_until(&['&'])`
+    /// and the driver has no fragment concept anywhere, so `password=#hunter2`
+    /// authenticates with the literal `#hunter2`. Splitting the URL at `#` and
+    /// appending the tail unredacted therefore prints most of a live password
+    /// on the one line — a connection failure — that operators paste around.
+    #[test]
+    fn redact_url_removes_a_password_containing_a_hash() {
+        let redacted = redact_url("postgres://db.internal:5432/harvest?password=#hunter2");
+        assert!(
+            !redacted.contains("hunter2"),
+            "password survived: {redacted}"
+        );
+        assert!(
+            redacted.contains("db.internal:5432/harvest"),
+            "endpoint lost: {redacted}"
+        );
+    }
+
+    /// A percent-encoded key names the same parameter to the driver.
+    ///
+    /// `parse_params` runs `self.decode(key)?` before `Config::param`, so
+    /// `pass%77ord` *is* `password`. Comparing the raw key against the
+    /// printable allowlist would still redact it (anything unrecognised is
+    /// redacted), but the allowlist has to be consulted on the decoded key or
+    /// the reverse mistake — treating an encoded `sslmode` as unknown — becomes
+    /// the same class of bug in the other direction.
+    #[test]
+    fn redact_url_removes_a_percent_encoded_password_parameter() {
+        let redacted = redact_url("postgres://db.internal:5432/harvest?pass%77ord=hunter2");
+        assert!(
+            !redacted.contains("hunter2"),
+            "password survived: {redacted}"
+        );
+        // An encoded *shape* parameter is recognised, so it stays readable.
+        let shown = redact_url("postgres://db.internal:5432/harvest?sslmo%64e=require");
+        assert!(
+            shown.contains("require"),
+            "recognised parameter was hidden: {shown}"
+        );
+    }
+
     /// libpq lets a keyword value be quoted, so it may contain spaces.
     ///
     /// Splitting the form on whitespace therefore cuts `password='hunter two'`
@@ -1649,20 +1797,31 @@ mod pure_tests {
     #[test]
     fn db_name_from_url_reads_the_path_not_the_last_slash() {
         assert_eq!(
-            db_name_from_url("postgres://u:p@h:5432/bench_1"),
+            db_name_from_url("postgres://u:p@h:5432/bench_1").as_deref(),
             Some("bench_1")
         );
         assert_eq!(
-            db_name_from_url("postgres://u:p@h:5432/bench_1?sslmode=require"),
+            db_name_from_url("postgres://u:p@h:5432/bench_1?sslmode=require").as_deref(),
             Some("bench_1")
         );
         assert_eq!(
-            db_name_from_url("postgres://u:p@h:5432/bench_1?sslrootcert=/etc/ssl/root.crt"),
+            db_name_from_url("postgres://u:p@h:5432/bench_1?sslrootcert=/etc/ssl/root.crt")
+                .as_deref(),
             Some("bench_1"),
         );
+    }
+
+    /// `#` is an ordinary character to the driver: `parse_path` runs
+    /// `take_until(&['?'])`, so with no query it takes the rest of the string.
+    ///
+    /// The RFC would call `#frag` a fragment and stop before it. Reading it that
+    /// way would have this harness look for a database the driver never asked
+    /// for, so the *driver's* grammar is the one that matters.
+    #[test]
+    fn db_name_from_url_keeps_a_hash_in_the_path() {
         assert_eq!(
-            db_name_from_url("postgres://u:p@h:5432/bench_1#frag"),
-            Some("bench_1")
+            db_name_from_url("postgres://u:p@h:5432/bench_1#frag").as_deref(),
+            Some("bench_1#frag")
         );
     }
 
@@ -1685,7 +1844,7 @@ mod pure_tests {
         ] {
             let rewritten = with_db_name(base, "harvest_claim_bench_1_deadbeefdeadbeef_0");
             assert_eq!(
-                db_name_from_url(&rewritten),
+                db_name_from_url(&rewritten).as_deref(),
                 Some("harvest_claim_bench_1_deadbeefdeadbeef_0"),
                 "round trip failed for {base}",
             );
@@ -1734,10 +1893,61 @@ mod pure_tests {
             with_db_name("postgres://h:5432/admin?DBName=admin", "b"),
             "postgres://h:5432/b",
         );
-        // A fragment is still carried, and `dbname` is dropped from before it.
+        // No fragment concept: the driver's `parse_params` terminates a value
+        // only at `&`, so `admin#frag` is the whole `dbname` value and the
+        // whole thing is what gets dropped.
         assert_eq!(
             with_db_name("postgres://h/admin?dbname=admin#frag", "b"),
-            "postgres://h/b#frag",
+            "postgres://h/b",
+        );
+    }
+
+    /// The overriding parameter can arrive percent-encoded, and still overrides.
+    ///
+    /// `parse_params` decodes the key (`self.decode(key)?`) before dispatching,
+    /// so `db%6Eame=admin` reaches `Config::dbname` exactly like `dbname=admin`
+    /// would. A raw-text filter leaves it in place, and then every connection
+    /// this harness opens — sweep lock, lease, migrations, and the benchmark's
+    /// own `TRUNCATE` — lands on the operator's admin database instead of the
+    /// isolated one. That is the same P1 as the plain-text case above, reached
+    /// through a spelling the previous filter could not see.
+    #[test]
+    fn with_db_name_removes_a_percent_encoded_dbname_query_parameter() {
+        assert_eq!(
+            with_db_name(
+                "postgres://h:5432/admin?db%6Eame=admin&sslmode=require",
+                "b"
+            ),
+            "postgres://h:5432/b?sslmode=require",
+        );
+        // The reader must agree with the writer about which key counts, or one
+        // would strip a `dbname` the other would not have found.
+        assert_eq!(
+            db_name_from_url("postgres://h:5432/admin?db%6Eame=real").as_deref(),
+            Some("real"),
+        );
+    }
+
+    /// A percent-encoded database name decodes to the name the driver opens.
+    ///
+    /// `parse_path` ends in `self.config.dbname(self.decode(dbname)?)`, so
+    /// `%2F` is a slash *in the name*, not a path separator. Reporting the raw
+    /// span would have the lease query look up a database that does not exist.
+    #[test]
+    fn db_name_from_url_decodes_percent_escapes() {
+        assert_eq!(
+            db_name_from_url("postgres://h/bench%5Fone").as_deref(),
+            Some("bench_one"),
+        );
+        assert_eq!(
+            db_name_from_url("postgres://h/admin?dbname=bench%5Ftwo").as_deref(),
+            Some("bench_two"),
+        );
+        // Undecodable bytes fall back to the raw span: the driver rejects such
+        // a string outright, so there is no connection to disagree with.
+        assert_eq!(
+            db_name_from_url("postgres://h/bench%FF").as_deref(),
+            Some("bench%FF"),
         );
     }
 
@@ -1752,20 +1962,29 @@ mod pure_tests {
     #[test]
     fn db_name_from_url_reads_the_keyword_value_form() {
         assert_eq!(
-            db_name_from_url("host=h port=5432 dbname=harvest_claim_bench_1_abc_0"),
+            db_name_from_url("host=h port=5432 dbname=harvest_claim_bench_1_abc_0").as_deref(),
             Some("harvest_claim_bench_1_abc_0"),
         );
         // Round-trips with what `with_db_name` emits, which is the property the
         // gate suite actually depends on.
         let rewritten = with_db_name("host=h dbname=admin", "bench_1");
-        assert_eq!(db_name_from_url(&rewritten), Some("bench_1"));
+        assert_eq!(db_name_from_url(&rewritten).as_deref(), Some("bench_1"));
         // libpq is last-wins on a repeated keyword.
         assert_eq!(
-            db_name_from_url("dbname=first dbname=second"),
+            db_name_from_url("dbname=first dbname=second").as_deref(),
             Some("second")
         );
-        // A quoted value is returned without its quotes.
-        assert_eq!(db_name_from_url("host=h dbname='b 1'"), Some("b 1"));
+        // A quoted value is returned without its quotes. Percent escapes are
+        // *not* decoded here: that grammar has no percent-encoding, so `%41`
+        // names a database literally called `%41`.
+        assert_eq!(
+            db_name_from_url("host=h dbname='b 1'").as_deref(),
+            Some("b 1")
+        );
+        assert_eq!(
+            db_name_from_url("host=h dbname=%41").as_deref(),
+            Some("%41")
+        );
         // Genuinely absent stays `None`.
         assert_eq!(db_name_from_url("host=h port=5432"), None);
     }
@@ -1782,22 +2001,22 @@ mod pure_tests {
     #[test]
     fn db_name_from_url_lets_a_dbname_query_override_the_path() {
         assert_eq!(
-            db_name_from_url("postgres://h/admin?dbname=real"),
+            db_name_from_url("postgres://h/admin?dbname=real").as_deref(),
             Some("real"),
         );
-        // Case-insensitive, and unaffected by a trailing fragment.
+        // Case-insensitive. `#frag` is part of the value, not a fragment.
         assert_eq!(
-            db_name_from_url("postgres://h/admin?sslmode=require&DBName=real#frag"),
-            Some("real"),
+            db_name_from_url("postgres://h/admin?sslmode=require&DBName=real#frag").as_deref(),
+            Some("real#frag"),
         );
-        // Last-wins, matching `query_pairs` feeding `Config::param`.
+        // Last-wins, matching repeated `parse_params` assignment.
         assert_eq!(
-            db_name_from_url("postgres://h/admin?dbname=first&dbname=second"),
+            db_name_from_url("postgres://h/admin?dbname=first&dbname=second").as_deref(),
             Some("second"),
         );
         // No query `dbname`: the path still answers.
         assert_eq!(
-            db_name_from_url("postgres://h/admin?sslmode=require"),
+            db_name_from_url("postgres://h/admin?sslmode=require").as_deref(),
             Some("admin"),
         );
     }
@@ -1820,6 +2039,27 @@ mod pure_tests {
         assert_eq!(
             with_db_name("host=h password='hunter two' dbname=admin", "b"),
             "host=h password='hunter two' dbname=b",
+        );
+    }
+
+    /// An unparseable remainder must be carried, not silently dropped.
+    ///
+    /// Dropping it is the *same* failure the URL branch is built to avoid:
+    /// losing `?sslmode=require` makes a TLS-requiring server unreachable
+    /// through the advertised existing-server mode. The remainder is placed
+    /// before the replacement so libpq's last-wins assignment still resolves
+    /// `dbname` to ours even if the part we could not parse hides one.
+    #[test]
+    fn with_db_name_carries_an_unparseable_keyword_remainder() {
+        let rewritten = with_db_name("host=h sslmode=require dbname=admin oops", "b");
+        assert!(
+            rewritten.contains("sslmode=require"),
+            "parameter dropped: {rewritten}"
+        );
+        assert!(rewritten.contains("oops"), "remainder dropped: {rewritten}");
+        assert!(
+            rewritten.ends_with("dbname=b"),
+            "replacement must win last: {rewritten}"
         );
     }
 

@@ -667,9 +667,7 @@ async fn an_idle_bench_database_still_holds_a_visible_lease() {
     // `?sslrootcert=/etc/ssl/root.crt` the last slash sits inside the query, so
     // the name would come back as `root.crt` and this test would fail against a
     // perfectly healthy lease.
-    let datname = db_name_from_url(&bench.url)
-        .expect("bench url always carries a database path")
-        .to_string();
+    let datname = db_name_from_url(&bench.url).expect("bench url always carries a database path");
 
     let Ok(mut admin) = AsyncPgConnection::establish(&admin_url).await else {
         eprintln!("SKIP an_idle_bench_database_still_holds_a_visible_lease: admin connect failed");
@@ -888,9 +886,8 @@ async fn a_later_setup_reclaims_this_processes_finished_databases() {
         eprintln!("SKIP a_later_setup_reclaims_this_processes_finished_databases: no database");
         return;
     };
-    let first_name = db_name_from_url(&first.url)
-        .expect("bench url always carries a database path")
-        .to_string();
+    let first_name =
+        db_name_from_url(&first.url).expect("bench url always carries a database path");
 
     // While the first is still held, a second setup must leave it alone: its
     // lease says "in use", and that is the only thing that should matter.
