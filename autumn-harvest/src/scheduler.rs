@@ -675,8 +675,7 @@ pub fn registration_backoff_key(kind: &str, name: &str, shard: ShardId) -> Strin
 /// this fix suppresses would persist at roughly full rate, merely spread across
 /// processes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[doc(hidden)]
-pub enum RegistrationOutcome {
+enum RegistrationOutcome {
     /// The row was reconciled, or was already converged. Clears any penalty.
     Settled,
     /// A peer held the registration lock. Leaves any penalty untouched.
@@ -893,7 +892,9 @@ async fn register_workflow_schedules_for_shard(
         let outcome = if schedule_targets_shard(ws, router, shard) {
             register_one_workflow_schedule_locked(conn, ws).await
         } else if ws.dag_name.is_some() {
-            delete_stale_dag_workflow_schedule_locked(conn, ws).await
+            collect_stale_dag_workflow_schedule(conn, ws)
+                .await
+                .map(|_| RegistrationOutcome::Settled)
         } else {
             Ok(RegistrationOutcome::Settled)
         };
@@ -949,8 +950,7 @@ fn stale_dag_row_filter<'a>(workflow_name: &'a str, dag_name: &'a str) -> StaleD
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] if the probe cannot be executed.
-#[doc(hidden)]
-pub async fn stale_dag_rows_exist(
+async fn stale_dag_rows_exist(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
 ) -> HarvestResult<bool> {
@@ -969,35 +969,43 @@ pub async fn stale_dag_rows_exist(
     Ok(stale > 0)
 }
 
-/// Drop this shard's stale rows for `ws`, skipping when a peer is reconciling.
+/// Drop this shard's stale rows for `ws`. Returns whether a `DELETE` was issued.
 ///
-/// Mirrors [`register_one_workflow_schedule_locked`]: probe outside the
-/// transaction, and take the fleet-wide registration lock around the write so a
-/// converged fleet performs 1× the deletes rather than N× (issue #1157,
-/// defects 3 and 4). A lock skip returns [`RegistrationOutcome::Skipped`] so it
-/// is not mistaken for a settled pass and does not clear accumulated backoff.
+/// The probe is the write-volume fix (issue #1157, defect 3): a converged shard
+/// performs one cheap `SELECT` instead of a `DELETE` statement — and its table
+/// lock — once per second per DAG, forever.
+///
+/// **Deliberately *not* behind the fleet-wide registration lock**, unlike its
+/// upsert sibling, and the asymmetry is load-bearing rather than an oversight.
+/// The lock exists to stop N replicas issuing N copies of the *same converging
+/// write*; skipping is safe there because the peer holding the lock is writing
+/// that very row. Here it is not: a peer holds the lock while reconciling its
+/// *own* schedules, so a skip means the row is collected by **nobody** this
+/// tick. `tick_once_sharded` then runs `tick_workflow_schedules` against the
+/// same shard in the same pass, and that due query has no target-shard filter —
+/// so a surviving stale row claims and fires on the shard that no longer owns
+/// the schedule, duplicating the execution the owning shard creates. Deferring
+/// a delete is therefore a correctness bug in a way deferring an upsert is not.
+///
+/// Nothing is lost by dropping the lock: a duplicate `DELETE` is idempotent and
+/// the probe means a converged shard issues none at all, so the steady-state
+/// write volume is zero either way. The only cost is that the first tick after
+/// a routing change may issue the delete once per replica assigned to the
+/// shard — once, not once per second.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] if the probe or the delete fails.
 #[doc(hidden)]
-pub async fn delete_stale_dag_workflow_schedule_locked(
+pub async fn collect_stale_dag_workflow_schedule(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
-) -> HarvestResult<RegistrationOutcome> {
+) -> HarvestResult<bool> {
     if !stale_dag_rows_exist(conn, ws).await? {
-        return Ok(RegistrationOutcome::Settled);
+        return Ok(false);
     }
-    // See `register_one_dag_schedule` for why the isolation level is pinned.
-    let mut tx = conn.build_transaction().read_committed();
-    Box::pin(tx.run(async |c| {
-        if !try_take_registration_lock(c).await? {
-            return Ok(RegistrationOutcome::Skipped);
-        }
-        delete_stale_dag_workflow_schedule(c, ws).await?;
-        Ok(RegistrationOutcome::Settled)
-    }))
-    .await
+    delete_stale_dag_workflow_schedule(conn, ws).await?;
+    Ok(true)
 }
 
 async fn delete_stale_dag_workflow_schedule(

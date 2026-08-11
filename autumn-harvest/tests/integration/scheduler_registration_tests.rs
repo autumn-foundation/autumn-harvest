@@ -184,6 +184,24 @@ async fn updated_at_of(conn: &mut AsyncPgConnection, id: Uuid) -> DateTime<Utc> 
         .expect("updated_at")
 }
 
+/// Rows the firing pass (`tick_workflow_schedules`) would consider due.
+/// Deliberately mirrors that query's filters, including its absence of any
+/// target-shard predicate.
+async fn due_rows(conn: &mut AsyncPgConnection) -> i64 {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    dsl::harvest_schedules
+        .filter(dsl::workflow_name.is_not_null())
+        .filter(dsl::is_paused.eq(false))
+        .filter(dsl::auto_paused_at.is_null())
+        .filter(dsl::exhausted_at.is_null())
+        .filter(dsl::next_run_at.is_not_null())
+        .filter(dsl::next_run_at.le(Utc::now()))
+        .count()
+        .get_result(conn)
+        .await
+        .expect("due count")
+}
+
 async fn schedule_count(conn: &mut AsyncPgConnection) -> i64 {
     use autumn_harvest::schema::harvest_schedules::dsl;
     dsl::harvest_schedules
@@ -783,10 +801,12 @@ async fn a_failing_schedule_is_suppressed_on_the_very_next_tick() {
 // through `tick_once`, which would never take that branch.
 
 #[tokio::test]
-async fn a_converged_shard_takes_no_lock_to_delete_nothing() {
+async fn a_converged_shard_issues_no_delete_at_all() {
     let (mut conn, db) = setup_db().await;
 
-    // A peer holds the registration lock for the whole test.
+    // A peer holds the registration lock for the whole test. The collection
+    // must not contend for it either way, so this also pins that the probe
+    // runs before any lock acquisition.
     let mut holder = AsyncPgConnection::establish(&db.url)
         .await
         .expect("holder connect");
@@ -800,33 +820,28 @@ async fn a_converged_shard_takes_no_lock_to_delete_nothing() {
         .await
         .expect("holder takes the lock");
 
-    // This shard holds no row for the schedule, so there is nothing to delete.
-    let outcome = autumn_harvest::scheduler::delete_stale_dag_workflow_schedule_locked(
+    // This shard holds no row for the schedule, so there is nothing to collect.
+    let deleted = autumn_harvest::scheduler::collect_stale_dag_workflow_schedule(
         &mut conn,
         &dag_schedule("nightly"),
     )
     .await
     .expect("a converged shard must not error");
 
-    // The convergence probe must short-circuit BEFORE contending for the lock.
-    // Without it this returns `Skipped`, which would also *hold the schedule's
-    // backoff penalty forever* on an already-healthy fleet.
-    assert_eq!(
-        outcome,
-        autumn_harvest::scheduler::RegistrationOutcome::Settled,
-        "an already-converged shard must settle without taking the fleet lock -- \
-         issuing a DELETE that removes nothing, once per second per replica, is \
-         the storm this fix eliminates"
+    assert!(
+        !deleted,
+        "issuing a DELETE that removes nothing, once per second per replica, \
+         is the storm this fix eliminates -- the probe must short-circuit"
     );
 
     holder.batch_execute("ROLLBACK").await.expect("rollback");
 }
 
 #[tokio::test]
-async fn a_stale_row_delete_is_guarded_by_the_registration_lock() {
+async fn a_stale_row_is_collected_even_while_a_peer_holds_the_lock() {
     let (mut conn, db) = setup_db().await;
 
-    // This shard still holds a row for a schedule that has moved elsewhere.
+    // A stale row this shard no longer owns, already due to fire.
     let stale = insert_raw_row(
         &mut conn,
         Some("nightly"),
@@ -834,7 +849,16 @@ async fn a_stale_row_delete_is_guarded_by_the_registration_lock() {
         "cron:0 1 * * *",
     )
     .await;
+    {
+        use autumn_harvest::schema::harvest_schedules::dsl;
+        diesel::update(dsl::harvest_schedules.find(stale))
+            .set(dsl::next_run_at.eq(Some(Utc::now() - chrono::Duration::minutes(5))))
+            .execute(&mut conn)
+            .await
+            .expect("make the stale row due");
+    }
 
+    // A peer is mid-registration on this shard and holds the fleet lock.
     let mut holder = AsyncPgConnection::establish(&db.url)
         .await
         .expect("holder connect");
@@ -848,45 +872,29 @@ async fn a_stale_row_delete_is_guarded_by_the_registration_lock() {
         .await
         .expect("holder takes the lock");
 
-    let outcome = autumn_harvest::scheduler::delete_stale_dag_workflow_schedule_locked(
+    let deleted = autumn_harvest::scheduler::collect_stale_dag_workflow_schedule(
         &mut conn,
         &dag_schedule("nightly"),
     )
     .await
-    .expect("losing the lock must skip, not fail");
+    .expect("collection must not depend on winning the lock");
 
-    assert_eq!(
-        outcome,
-        autumn_harvest::scheduler::RegistrationOutcome::Skipped,
-        "a peer already reconciling must suppress this process's DELETE"
-    );
-    assert_eq!(
-        row_by_id(&mut conn, stale).await,
-        (Some("nightly".to_string()), Some("nightly".to_string())),
-        "the row must survive while a peer holds the lock -- the DELETE is a \
-         fleet-wide write and must not race the peer's reconciliation"
-    );
-
-    // Release the peer; the collection converges on the next pass.
-    holder.batch_execute("ROLLBACK").await.expect("rollback");
-    drop(holder);
-
-    let outcome = autumn_harvest::scheduler::delete_stale_dag_workflow_schedule_locked(
-        &mut conn,
-        &dag_schedule("nightly"),
-    )
-    .await
-    .expect("delete after the peer released the lock");
-
-    assert_eq!(
-        outcome,
-        autumn_harvest::scheduler::RegistrationOutcome::Settled
-    );
+    assert!(deleted, "the stale row must be collected");
     assert_eq!(
         schedule_count(&mut conn).await,
         0,
-        "collection must resume once the peer releases the lock"
+        "deferring collection because a peer holds the lock leaves the row \
+         alive through the SAME tick's firing pass"
     );
+    assert_eq!(
+        due_rows(&mut conn).await,
+        0,
+        "the due query has no target-shard filter, so a surviving stale row on \
+         a non-owning shard claims and fires -- duplicating the execution the \
+         owning shard creates"
+    );
+
+    holder.batch_execute("ROLLBACK").await.expect("rollback");
 }
 
 // ── Defect 1, concurrency — the squatter release must be a compare-and-swap ──
