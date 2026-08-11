@@ -10469,6 +10469,7 @@ async fn check_continue_as_new_type<'a>(
             // key routes to that same shard (Codex P1 on PR #1159).
             if let Err(error) = reject_cross_shard_continue_as_new(
                 info.name,
+                &execution.workflow_name,
                 &execution.workflow_id,
                 execution.shard_id,
             ) {
@@ -10582,15 +10583,27 @@ enum SuccessorSlot {
 /// guessing would be worse than the status quo.
 fn reject_cross_shard_continue_as_new(
     target: &str,
+    predecessor_type: &str,
     workflow_id: &str,
     predecessor_shard: i32,
 ) -> Result<(), String> {
+    // Cheap exemption first: naming the run's own type changes no key, so it
+    // needs no routing lookup at all (Codex P2 on PR #1159).
+    if target == predecessor_type {
+        return Ok(());
+    }
     let target_shard =
         crate::shard::external_target_owning_shard(&crate::types::ExternalTarget::WorkflowId {
             workflow_name: target.to_string(),
             workflow_id: workflow_id.to_string(),
         });
-    classify_cross_shard_continue_as_new(target, workflow_id, predecessor_shard, target_shard)
+    classify_cross_shard_continue_as_new(
+        target,
+        predecessor_type,
+        workflow_id,
+        predecessor_shard,
+        target_shard,
+    )
 }
 
 /// Pure decision behind [`reject_cross_shard_continue_as_new`].
@@ -10603,10 +10616,24 @@ fn reject_cross_shard_continue_as_new(
 /// `target_shard == None` means no global router is installed.
 fn classify_cross_shard_continue_as_new(
     target: &str,
+    predecessor_type: &str,
     workflow_id: &str,
     predecessor_shard: i32,
     target_shard: Option<crate::types::ShardId>,
 ) -> Result<(), String> {
+    if target == predecessor_type {
+        // Naming the run's OWN type is a supported request (it re-resolves that
+        // type's declared defaults) and leaves `(workflow_name, workflow_id)`
+        // untouched, so the misrouting rationale below does not apply and the
+        // successor stays on the predecessor's shard exactly as a legacy
+        // same-type continuation does.
+        //
+        // Load-bearing, not theoretical: with explicit shard placement (issue
+        // #697) a run is deliberately pinned OFF its hash-derived shard, so
+        // without this arm every such entity would be failed terminally the
+        // moment it named its own type.
+        return Ok(());
+    }
     let Some(target_shard) = target_shard else {
         // No global router installed: the target shard is unknowable here, and
         // a deployment without a router is single-shard by construction.
@@ -22526,6 +22553,52 @@ mod tests {
         );
     }
 
+    /// Naming the run's OWN type must never trip the cross-shard guard, even on
+    /// an execution whose pinned shard differs from its rendezvous hash
+    /// (Codex P2 on PR #1159).
+    ///
+    /// `continue_as_new_as(&own_info(), ..)` is a supported request (it
+    /// re-resolves that type's declared defaults, which the legacy
+    /// `continue_as_new` deliberately does not) and it does not change
+    /// `(workflow_name, workflow_id)` at all — so the misrouting rationale the
+    /// guard exists for simply does not apply. Explicit shard placement
+    /// (issue #697) makes this REACHABLE rather than theoretical: a pinned run
+    /// lives on an operator-chosen shard precisely so that it does NOT sit on
+    /// its hash-derived one, so without this arm every such entity would be
+    /// failed terminally the moment it named its own type.
+    #[test]
+    fn can803_naming_own_type_is_exempt_from_the_cross_shard_guard() {
+        use crate::types::ShardId;
+
+        // The reachable shape: pinned to shard 0 (issue #697), hashes to 2.
+        assert!(
+            classify_cross_shard_continue_as_new(
+                "trial_subscription",
+                "trial_subscription",
+                "sub-42",
+                0,
+                Some(ShardId::new(2)),
+            )
+            .is_ok(),
+            "naming the run's own type must be exempt: the key is unchanged, so a pinned \
+             execution whose hash points elsewhere must still be allowed to continue"
+        );
+
+        // ...and a GENUINE type change on that same divergent routing is still
+        // rejected, so the exemption above cannot be masking a dead guard.
+        assert!(
+            classify_cross_shard_continue_as_new(
+                "paid_subscription",
+                "trial_subscription",
+                "sub-42",
+                0,
+                Some(ShardId::new(2)),
+            )
+            .is_err(),
+            "a real type change on divergent routing must still be rejected"
+        );
+    }
+
     /// A target whose declared `execution_timeout` cannot be represented as an
     /// absolute deadline must FAIL the transition, not silently produce a run
     /// with `execution_timeout = Some(..)` and `deadline_at = NULL`
@@ -22678,7 +22751,14 @@ mod tests {
         // No router installed => inert. A deployment without one is
         // single-shard by construction, and guessing would be worse.
         assert!(
-            classify_cross_shard_continue_as_new("paid_subscription", "sub-1", 0, None).is_ok(),
+            classify_cross_shard_continue_as_new(
+                "paid_subscription",
+                "trial_subscription",
+                "sub-1",
+                0,
+                None
+            )
+            .is_ok(),
             "with no router installed the guard must not reject"
         );
 
@@ -22688,6 +22768,7 @@ mod tests {
         assert!(
             classify_cross_shard_continue_as_new(
                 "paid_subscription",
+                "trial_subscription",
                 "sub-1",
                 0,
                 Some(ShardId::new(0))
@@ -22698,6 +22779,7 @@ mod tests {
         assert!(
             classify_cross_shard_continue_as_new(
                 "paid_subscription",
+                "trial_subscription",
                 "sub-1",
                 3,
                 Some(ShardId::new(3))
@@ -22710,6 +22792,7 @@ mod tests {
         // operator can tell which way it diverged without reading the source.
         let error = classify_cross_shard_continue_as_new(
             "paid_subscription",
+            "trial_subscription",
             "sub-42",
             0,
             Some(ShardId::new(2)),

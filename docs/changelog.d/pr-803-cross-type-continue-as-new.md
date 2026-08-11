@@ -83,3 +83,17 @@ degrade, a runaway cap may not. Mutation-verified. Tests:
 `can803_unrepresentable_execution_timeout_is_rejected`,
 `can803_ceiling_rescues_an_unrepresentable_declaration`,
 `can803_unrepresentable_sla_maps_to_no_sla_not_a_lying_field`.
+
+**Codex P2 (PR #1159) — exempt a self-named continuation from the cross-shard guard.**
+`continue_as_new_as(&own_info(), ..)` is a supported request (it re-resolves that type's
+declared defaults, which the legacy `continue_as_new` deliberately does not) and it does
+not change `(workflow_name, workflow_id)` at all — so the misrouting rationale the
+cross-shard guard exists for does not apply to it. Reachable rather than theoretical: with
+explicit shard placement (#697) a run is deliberately pinned OFF its hash-derived shard, so
+every such entity was failed terminally the moment it named its own type.
+`reject_cross_shard_continue_as_new` / `classify_cross_shard_continue_as_new` now take the
+predecessor's type and return `Ok(())` when the target matches it, before any routing lookup.
+A genuine type change on the same divergent routing is still rejected, pinned in the same
+test so the exemption cannot mask a dead guard. Mutation-verified. Test:
+`can803_naming_own_type_is_exempt_from_the_cross_shard_guard`.
+
