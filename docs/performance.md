@@ -324,10 +324,23 @@ with a large paused population still pays roughly the same 15x that an equal
 number of *live* rows would cost. That is the depth-controlled result, and it is
 the actionable one: **drain the rows.** Whether the `NOT EXISTS (… state =
 'PAUSED')` predicate is *additionally* expensive to evaluate is not settled by
-these two scenarios. What bounds it is the `all_gates` row below: at this depth
-every predicate in the engine *combined* costs +28% against an equal-depth
-comparand, against the ~15x that depth alone costs. Predicate cost is not where
-the problem is, at any depth this page measures.
+these two scenarios, and it is not settled by the `all_gates` row either — that
+row carries the same confound, in the same direction. `all_gates` also seeds
+PAUSED ballast, so it too sorts 10 000 rows where `double_backlog` sorts 20 000;
+comparing the two charges the predicates while *crediting* them with a sort half
+the size. The +28% that comparison yields is therefore a floor, not a bound: the
+population-matched cost is higher by whatever the 10 000-row sort saving is
+worth, and nothing here measures that.
+
+What *is* population-matched is the top of the table. `rate_limited`,
+`circuit_breaker_set`, `build_policy` and `concurrency_key` all seed exactly the
+10 000 claimable rows `baseline` does, so their deltas are clean — and they do
+not support a "predicates are a rounding error" reading either:
+`concurrency_key` costs **+644%** on an identical population. The defensible
+statement is narrower than the one this page used to make: *depth* is the
+dominant cost (~15x from 10k to 20k rows), *one* predicate is separately
+expensive at this depth (`concurrency_key`, ~7.4x), and the combined cost of all
+of them is not something these scenarios can bound in either direction.
 
 What each row exercises, and what it means:
 
@@ -364,11 +377,15 @@ What each row exercises, and what it means:
   all of these features", **not** as a strict upper bound on the claim path: the
   circuit-breaker tracked set short-circuits the rate-limit `EXISTS` and the
   debit CTE (`= ANY($5)` wins, #369), so a deployment with rate limiting and
-  *no* breaker executes strictly more work per claim than this row does. Note
-  what happens when depth is controlled for: `all_gates` runs at the same 20 000
-  rows as `double_backlog`, and against *that* comparand every predicate in the
-  engine combined costs **+28%**. At this depth the scan and sort dominate so
-  completely that the predicates are a rounding error on top of them.
+  *no* breaker executes strictly more work per claim than this row does. It is
+  reported against `baseline` because there is no comparand that would make a
+  depth-controlled reading sound: `all_gates` seeds the same PAUSED ballast
+  `paused_rows` does, so it *scans* 20 000 rows like `double_backlog` but
+  *sorts* only 10 000. Comparing the two (which yields +28%) charges this row
+  for every predicate while crediting it with half the sort, so that figure
+  understates the combined cost by an unmeasured amount and is not quoted as a
+  bound. See [what that control does not
+  establish](#what-that-control-does-not-establish).
 
 ## The plan
 

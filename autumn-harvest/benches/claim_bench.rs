@@ -50,6 +50,7 @@ use std::collections::HashMap;
 use support::db::{self, BenchDb, ClaimReport, EnqueueReport};
 use support::{
     BACKLOG_SWEEP, ClaimGate, LatencyStats, MIN_MEANINGFUL_SAMPLES, Scenario, headline_scenario,
+    scenario_time_budget, with_setup_deadline,
 };
 
 /// Writers used for the enqueue measurement.
@@ -100,9 +101,24 @@ async fn run() {
     explain_section(&db).await;
 }
 
+/// Read the server version for the report header.
+///
+/// Report-only, and still bounded. A remote server that accepted provisioning
+/// and then stopped answering would otherwise hang here — *before* any scenario
+/// exists to carry a deadline — so `HARVEST_BENCH_SCENARIO_SECS` would be
+/// bypassed by a path that takes no measurement at all. Every await the
+/// benchmark performs is under some ceiling, including the ones that only
+/// produce prose.
 async fn server_version(db: &BenchDb) -> String {
-    let mut conn = db::connect(&db.url).await;
-    db::server_version(&mut conn).await
+    let deadline = std::time::Instant::now() + scenario_time_budget();
+    let mut conn =
+        with_setup_deadline("report-header connect", deadline, db::connect(&db.url)).await;
+    with_setup_deadline(
+        "report-header server-version query",
+        deadline,
+        db::server_version(&mut conn),
+    )
+    .await
 }
 
 /// Render the p50/p99/max cells of a table row.
@@ -363,9 +379,26 @@ async fn explain_section(db: &BenchDb) {
     let headline = headline_scenario();
     println!("## `EXPLAIN (ANALYZE, BUFFERS)` — headline claim");
     println!();
-    let mut conn = db::connect(&db.url).await;
-    db::seed(&mut conn, headline).await;
-    let plan = db::explain_claim(&mut conn, headline).await;
+    // Bounded for the same reason as the report header: this section runs after
+    // every measurement, so a stall here would hang the process with all the
+    // numbers already printed and nothing left to wait for. Failing loudly is
+    // better than a silently missing plan — the report gets pasted into
+    // `docs/performance.md`, where an absent plan is easy not to notice.
+    let deadline = std::time::Instant::now() + scenario_time_budget();
+    let mut conn =
+        with_setup_deadline("explain-section connect", deadline, db::connect(&db.url)).await;
+    with_setup_deadline(
+        "explain-section seed",
+        deadline,
+        db::seed(&mut conn, headline),
+    )
+    .await;
+    let plan = with_setup_deadline(
+        "explain-section EXPLAIN",
+        deadline,
+        db::explain_claim(&mut conn, headline),
+    )
+    .await;
     println!("```text");
     println!("{plan}");
     println!("```");

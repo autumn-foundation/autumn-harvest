@@ -65,8 +65,10 @@ Start with [Chapter 1 →](01-project-skeleton.md)
 - **Telemetry.** [`telemetry.md`](../telemetry.md) covers the OpenTelemetry
   surface and the `metrics-rs` adapter recipe.
 - **Performance.** [`performance.md`](../performance.md) publishes measured
-  task-claim and enqueue baselines, attributes cost to each accreted claim-path
-  predicate, and explains the CI-gated budget — read it before deciding whether a
+  task-claim and enqueue baselines, attributes cost to five representative
+  claim-path predicates (five others are evaluated on every claim but left on
+  their cheapest null/empty path, so they are not measured — the page names
+  them), and explains the CI-gated budget — read it before deciding whether a
   deep backlog means you need another shard.
 - **Search attributes.** [`search-attributes.md`](../search-attributes.md)
   explains how to index workflows for filtered queries.

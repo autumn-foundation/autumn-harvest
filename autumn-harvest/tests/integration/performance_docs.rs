@@ -47,6 +47,27 @@ fn read_performance_doc() -> String {
     read_normalized(&performance_doc_path())
 }
 
+/// Does `haystack` state `phrase` in its own voice, rather than quoting it?
+///
+/// Several guards in this module ban a specific superseded phrasing. Every one
+/// of them, written naively as `haystack.contains(phrase)`, failed on the very
+/// text that *fixed* the thing it guards — because a retraction has to
+/// reproduce the claim it retracts in order to name it. That has now happened
+/// three times (the round-23 keyword ban, the round-26 changelog guard, and the
+/// round-28 `all_gates` guard), so the distinction lives here rather than being
+/// re-derived inline a fourth time.
+///
+/// The signal is the character immediately preceding the phrase: a retraction
+/// reads `... does not support a "predicates are a rounding error" reading`,
+/// while an assertion runs straight on from prose. Straight and curly quotes
+/// both count, since Markdown prose mixes them.
+fn asserted_in_own_voice(haystack: &str, phrase: &str) -> bool {
+    haystack.match_indices(phrase).any(|(idx, _)| {
+        let before = haystack[..idx].chars().next_back();
+        !matches!(before, Some('"' | '\u{201c}' | '\u{2018}' | '\''))
+    })
+}
+
 /// One row of the per-gate attribution table.
 #[derive(Debug, Clone)]
 struct GateRow {
@@ -628,28 +649,17 @@ fn changelog_fragment_quotes_the_published_figures() {
          while the correction sits thousands of characters below it. Window:\n{window}"
     );
 
-    // Assertions of the reading the control cannot support.
-    //
-    // A *quoted* occurrence is fine and in fact necessary: the diary retracts
-    // these claims by name, so it has to reproduce them. Only an occurrence the
-    // fragment states in its own voice is the regression. Distinguished by the
-    // character immediately before it — a retraction reads `... the attribution
-    // retracted in round 24 ("deleting the predicate would buy nothing") ...`.
-    //
-    // Without this the guard fails on the very text that fixes the bug, which
-    // is how it first behaved: writing the round-26 retraction tripped it.
+    // Assertions of the reading the control cannot support. Quoted occurrences
+    // are exempt — see [`asserted_in_own_voice`] for why that exemption is
+    // load-bearing rather than a convenience.
     for banned in [
         "deleting the predicate would buy nothing",
         "Deleting the predicate would buy nothing",
         "the anti-join costs **−2%**",
         "the anti-join costs **+1%**",
     ] {
-        let asserted = fragment.match_indices(banned).any(|(idx, _)| {
-            let before = fragment[..idx].chars().next_back();
-            !matches!(before, Some('"' | '\u{201c}' | '\u{2018}' | '\''))
-        });
         assert!(
-            !asserted,
+            !asserted_in_own_voice(&fragment, banned),
             "the changelog fragment states \"{banned}\" in its own voice, which \
              attributes the `paused_rows` delta to the anti-join predicate in \
              isolation. The `double_backlog` control sorts a different number of \
@@ -850,5 +860,105 @@ fn the_bench_report_does_not_republish_the_retracted_attribution() {
          `paused_rows` delta is not the anti-join's cost in isolation. Dropping \
          the note entirely leaves the per-gate table's `vs` column unqualified, \
          which is how the misreading started."
+    );
+}
+
+/// Every database await in the benchmark must sit under a wall-clock ceiling.
+///
+/// The benchmark advertises `HARVEST_BENCH_SCENARIO_SECS` as the bound on how
+/// long any one phase may take, and the scenario runners honour it — but the
+/// *report-only* paths (the version line in the header, the `EXPLAIN` section)
+/// originally connected and queried with no deadline at all. A server that
+/// accepted provisioning and then stopped answering would hang the process
+/// there, outside every scenario, with the advertised ceiling never consulted.
+/// Same class as the scenario-path bounds added in earlier rounds; this is the
+/// corner that takes no measurement and so was easy to overlook.
+///
+/// Checked textually rather than by types: the fix is "the call is wrapped",
+/// which is a syntactic property, and a type-level version would mean wrapping
+/// the whole `db` module in a deadline-carrying newtype for one benchmark.
+#[test]
+fn every_bench_database_await_is_bounded() {
+    let bench =
+        read_normalized(&Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/claim_bench.rs"));
+
+    // Calls that open or use a connection directly. The scenario runners
+    // (`run_claim_scenario`, `run_enqueue_scenario`) carry their own deadlines
+    // internally and are deliberately not listed.
+    for call in [
+        "db::connect(",
+        "db::seed(",
+        "db::explain_claim(",
+        "db::server_version(",
+    ] {
+        for (idx, _) in bench.match_indices(call) {
+            let line_start = bench[..idx].rfind('\n').map_or(0, |p| p + 1);
+            let line = bench[line_start..].lines().next().unwrap_or_default();
+            if line.trim_start().starts_with("//") || line.trim_start().starts_with("///") {
+                continue;
+            }
+            // The wrapper may sit on this line or, once rustfmt has split the
+            // call across lines, a little above it. Search back a few lines for
+            // the enclosing `with_setup_deadline(`.
+            let window_start = bench[..idx]
+                .rmatch_indices('\n')
+                .nth(3)
+                .map_or(0, |(p, _)| p);
+            let window = &bench[window_start..idx];
+            assert!(
+                window.contains("with_setup_deadline("),
+                "benches/claim_bench.rs calls `{call}` without a wall-clock \
+                 ceiling. A server that stops answering after provisioning \
+                 would hang the benchmark here, bypassing \
+                 `HARVEST_BENCH_SCENARIO_SECS` on a path that takes no \
+                 measurement. Wrap it in `with_setup_deadline`. Line:\n{line}"
+            );
+        }
+    }
+}
+
+/// The `all_gates` delta must not be published as a bound on predicate cost.
+///
+/// `all_gates` seeds the same PAUSED ballast `paused_rows` does, so it scans
+/// 20 000 rows but sorts only 10 000, while its would-be `double_backlog`
+/// comparand sorts 20 000. Comparing them charges the row for every predicate
+/// while crediting it with half the sort — the same confound round 24 retracted
+/// for `paused_rows`, in the same direction, and therefore a *floor* rather
+/// than a bound.
+///
+/// This is a separate guard from
+/// [`the_paused_rows_delta_is_not_attributed_to_the_predicate`] because the two
+/// claims failed independently: the `paused_rows` attribution was retracted a
+/// full round before anyone noticed `all_gates` rested on the identical
+/// comparison.
+#[test]
+fn the_all_gates_delta_is_not_published_as_a_predicate_bound() {
+    let doc = read_performance_doc();
+
+    // Quoted occurrences are exempt: the retraction below names the reading it
+    // withdraws, so it has to reproduce it. See [`asserted_in_own_voice`].
+    for banned in [
+        "What bounds it is the `all_gates` row",
+        "predicates are a rounding error",
+        "every predicate in the engine combined costs **+28%**",
+    ] {
+        assert!(
+            !asserted_in_own_voice(&doc, banned),
+            "docs/performance.md states \"{banned}\", which treats the \
+             `all_gates` delta as a bound on combined predicate cost. \
+             `all_gates` sorts 10 000 rows where `double_backlog` sorts 20 000, \
+             so that comparison understates the cost by the sort saving and \
+             bounds nothing."
+        );
+    }
+
+    // And the correction must be present, so the claim cannot simply be deleted
+    // and leave the reader to draw the retracted conclusion from the table.
+    assert!(
+        doc.contains("floor, not a bound"),
+        "docs/performance.md must say explicitly that the `all_gates` \
+         comparison yields a floor rather than a bound on combined predicate \
+         cost. Deleting the claim without stating the direction of the bias \
+         leaves the +28% in the table for a reader to misread the same way."
     );
 }

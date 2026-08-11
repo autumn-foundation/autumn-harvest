@@ -370,8 +370,11 @@ in [`docs/alerts/README.md`](docs/alerts/README.md).
 
 [`docs/performance.md`](docs/performance.md) publishes measured task-claim and
 enqueue baselines: how claim latency scales with pending-backlog depth (the
-number that answers *"when do I add a shard?"*), what each accreted claim-path
-predicate costs, and the `EXPLAIN (ANALYZE, BUFFERS)` plan behind both. Like the
+number that answers *"when do I add a shard?"*), what five representative
+claim-path predicates cost (five more are in the query on every claim but are
+left on their cheapest null/empty path, so they are evaluated rather than
+measured — the page names them), and the `EXPLAIN (ANALYZE, BUFFERS)` plan
+behind both. Like the
 alert pack, these are starter reference numbers from one machine — reproduce
 them on your own hardware before designing against them. A CI gate defends the
 headline scenario so a change that collapses the claim path fails the build.
