@@ -91,17 +91,28 @@ pub enum ClaimGate {
     CircuitBreakerSet,
     /// **Control for [`Self::PausedRows`], not a gate.**
     ///
-    /// Seeds `2 * backlog` rows, all of them plain and claimable. This is the
-    /// same total table depth `PausedRows` produces, with no PAUSED subplan —
-    /// so `DoubleBacklog - Baseline` is the cost of *depth alone* and
-    /// `PausedRows - DoubleBacklog` is the cost of the anti-join. Without it,
-    /// the `PausedRows` delta conflates the two and overstates the predicate.
+    /// Seeds `2 * backlog` rows, all of them plain and claimable — the same
+    /// *total* table depth `PausedRows` produces, with no PAUSED subplan. So
+    /// `DoubleBacklog - Baseline` is the cost of depth alone, and without this
+    /// control the `PausedRows` delta is charged for that depth too.
+    ///
+    /// `PausedRows - DoubleBacklog` is an **equal-total-depth comparison, not
+    /// predicate isolation**. The anti-join is a `WHERE` predicate, so it runs
+    /// *before* the `ORDER BY`: `PausedRows` feeds 10 000 rows to the sort
+    /// where this control feeds 20 000. The delta is therefore the anti-join's
+    /// probe cost *minus* that sort saving — two effects with opposite signs
+    /// that this measurement cannot separate, and whose net sign flips between
+    /// runs. See "What that control does not establish" in
+    /// `docs/performance.md`.
     DoubleBacklog,
     /// An *additional* `backlog` rows belong to `PAUSED` executions, on top of
     /// the claimable backlog, so the scan walks past unclaimable rows via the
     /// `NOT EXISTS` anti-join (issue #383). Total seeded depth is
     /// `2 * backlog`; compare against [`Self::DoubleBacklog`], not
-    /// [`Self::Baseline`], to isolate the predicate from the depth.
+    /// [`Self::Baseline`], so the delta is not charged for the extra depth.
+    /// That pairing is equal-total-depth only — **not predicate isolation**;
+    /// see [`Self::DoubleBacklog`] for why the two scenarios sort different
+    /// populations.
     PausedRows,
     /// Every gate above at once.
     ///
@@ -148,7 +159,12 @@ impl ClaimGate {
     /// Which gate a row's `vs` column should be measured against.
     ///
     /// Every gate compares to `Baseline` except `PausedRows`, whose honest
-    /// comparand is the equal-depth [`Self::DoubleBacklog`] control.
+    /// comparand is the equal-total-depth [`Self::DoubleBacklog`] control.
+    ///
+    /// That pairing controls for table depth. It does **not** isolate the
+    /// `NOT EXISTS` anti-join — see [`Self::DoubleBacklog`] — so a report
+    /// republished from these pairings must not label the `vs` column as a
+    /// predicate cost.
     #[must_use]
     pub const fn comparand(self) -> Self {
         match self {

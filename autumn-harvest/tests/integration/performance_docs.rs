@@ -1409,3 +1409,61 @@ fn changelog_headline_millisecond_figures_still_appear_on_the_page() {
         );
     }
 }
+
+/// The `ClaimGate` variant docs must not resurrect the anti-join attribution.
+///
+/// `docs/performance.md` retracted the reading that `PausedRows -
+/// DoubleBacklog` isolates the `NOT EXISTS` predicate: the anti-join is a
+/// `WHERE` predicate, so it runs before the `ORDER BY` and `PausedRows` feeds
+/// half as many rows to the sort as its control does. The delta is the probe
+/// cost *minus* that sort saving — two effects with opposite signs, whose net
+/// sign flips between runs.
+///
+/// The enum docs are a second surface for that claim, and a worse one:
+/// `comparand()` is what the report generator pairs rows by, so a maintainer
+/// republishing a run reads the attribution from here, not from the page.
+/// Round 35 was this same shape — a retraction that landed in the docs and
+/// left a stale assertion somewhere else.
+#[test]
+fn claim_gate_docs_do_not_claim_the_delta_isolates_the_anti_join() {
+    let harness = read_normalized(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/claim_bench_support.rs"),
+    );
+
+    // Scope to the enum and the `comparand` contract that pairs its rows.
+    // Unscoped, this would also read `docs/performance.md`'s own quoted
+    // retraction of the phrase, which is a correct use of it.
+    let start = harness
+        .find("pub enum ClaimGate {")
+        .expect("the harness must declare `pub enum ClaimGate`");
+    let end = harness
+        .find("pub const fn comparand")
+        .expect("the harness must declare `comparand`");
+    let region = collapse_ws(&harness[start..end]);
+
+    for banned in [
+        "is the cost of the anti-join",
+        "isolate the predicate",
+        "overstates the predicate",
+    ] {
+        assert!(
+            !asserted_in_own_voice(&region, banned),
+            "the `ClaimGate` docs state \"{banned}\", which reads the \
+             `PausedRows` - `DoubleBacklog` delta as the anti-join predicate's \
+             cost in isolation. `docs/performance.md` retracted that: the two \
+             scenarios sort different populations (10 000 vs 20 000), so the \
+             delta is the probe cost minus the sort saving and cannot identify \
+             either. Describe it as an equal-total-depth comparison instead. \
+             (Quoting the phrase to retract it is fine.)"
+        );
+    }
+
+    assert!(
+        region.contains("not predicate isolation"),
+        "the `ClaimGate` docs pair `PausedRows` against `DoubleBacklog` without \
+         saying what that pairing does *not* establish. `comparand()` is what \
+         the report generator uses, so a maintainer reading only this enum will \
+         republish the delta as a predicate cost. State that it is an \
+         equal-total-depth comparison, not predicate isolation."
+    );
+}
