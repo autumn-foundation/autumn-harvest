@@ -69,9 +69,19 @@ HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 HARVEST_BENCH_SCENARIO_SECS=180 \
   cargo bench -p autumn-harvest --features db --bench claim_bench
 
-# The CI gate (the headline scenario only), ~2 minutes:
+# The CI gate, byte-for-byte as `.github/ci/integration-suites.txt` runs it.
+# `claim_budget_tests` is a substring filter, so this runs the whole gate
+# module, not just the budget check: the headline scenario, the eight-scenario
+# coverage sweep, the 250k-row enqueue cutoff, and the sweep/lease probes.
+# ~80s here against a local server; longer in CI, which starts a container.
 cargo test -p autumn-harvest --features db --test integration -- \
   claim_budget_tests --test-threads=1
+
+# Just the headline p50-vs-budget check — the one assertion that fails when a
+# regression lands. ~50s here.
+cargo test -p autumn-harvest --features db --test integration -- \
+  claim_budget_tests::claim_p50_at_headline_scenario_is_within_budget \
+  --test-threads=1
 ```
 
 Every table on this page is from **one** run of the first command, on an

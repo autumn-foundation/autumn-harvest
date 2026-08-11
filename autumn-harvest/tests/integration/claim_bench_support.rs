@@ -699,6 +699,30 @@ fn is_canonical_decimal<T: std::str::FromStr + std::fmt::Display>(s: &str) -> bo
     s.parse::<T>().is_ok_and(|v| v.to_string() == s)
 }
 
+/// The decoy database name used to prove the sweep spares a foreign database.
+///
+/// Two properties, and they pull in opposite directions, which is why this is
+/// one function rather than a `format!` at the call site:
+///
+/// 1. It must be a **candidate** — inside `BENCH_DB_PREFIX`, and shaped so the
+///    two-field check of an earlier round would have accepted it. A decoy the
+///    sweep never looks at proves nothing.
+/// 2. It must **never** be a name this harness could mint, or the test would
+///    assert that a real bench database survives the sweep — the exact opposite
+///    of the contract, and a silent way to reintroduce the leak.
+///
+/// Rejection here is over-determined on purpose: `sweepprobe` can never be
+/// 16 hex digits (it contains `s`, `w`, `p`, `r`, `o`), *and* the extra
+/// components put the name past the exactly-three split. Either alone suffices.
+///
+/// `token` makes the name run-unique. The probe drops its decoy by name before
+/// creating it, so without one, two runs sharing a cluster from different PID
+/// namespaces — both pid 1 under containers — would delete each other's live
+/// decoy and fail each other's survival assertion.
+pub fn sweep_probe_decoy_name(pid: u32, token: &str) -> String {
+    format!("{BENCH_DB_PREFIX}123_sweepprobe_{pid}_{token}")
+}
+
 /// Exactly 16 lowercase hex digits, the only shape [`db::run_token`] emits.
 ///
 /// Uppercase is rejected for the same reason a fourth component is: we never
@@ -727,7 +751,8 @@ mod pure_tests {
         BACKLOG_SWEEP, BudgetVerdict, ClaimGate, ClaimerOutcome, DEFAULT_SCENARIO_BUDGET_SECS,
         HEADLINE_P50_BUDGET_MS, LatencyStats, SweepStep, budget_from_str, budget_verdict,
         claims_for_claimer, db_name_from_url, headline_scenario, measured_claims_for,
-        percentile_ms, redact_url, sweep_step, warmup_claims_for, with_db_name,
+        percentile_ms, redact_url, sweep_probe_decoy_name, sweep_step, warmup_claims_for,
+        with_db_name,
     };
 
     #[test]
@@ -1116,6 +1141,34 @@ mod pure_tests {
         assert_eq!(sweep_step(&minted), SweepStep::AskServer, "{minted}");
     }
 
+    /// The decoy is a sweep *candidate* that is never a *mintable* name.
+    ///
+    /// Both halves are load-bearing and neither is obvious from the format
+    /// string, so they are pinned here rather than only inside the DB test that
+    /// uses them — this runs on every OS, including the `--no-default-features`
+    /// leg where no database exists. If the decoy stopped being a candidate the
+    /// DB test would pass vacuously; if it started being mintable, the test
+    /// would assert that a *real* bench database survives the sweep.
+    #[test]
+    fn the_sweep_probe_decoy_is_a_candidate_but_never_mintable() {
+        let decoy = sweep_probe_decoy_name(1, "0123456789abcdef");
+        assert!(
+            decoy.starts_with(super::BENCH_DB_PREFIX),
+            "the decoy must be inside the swept prefix or the sweep never \
+             considers it and the test proves nothing: {decoy}",
+        );
+        assert_eq!(
+            sweep_step(&decoy),
+            SweepStep::Skip,
+            "the decoy must never parse as a name this harness mints: {decoy}",
+        );
+        // Distinct runs get distinct decoys — the whole point of the token.
+        assert_ne!(
+            sweep_probe_decoy_name(1, "0123456789abcdef"),
+            sweep_probe_decoy_name(1, "fedcba9876543210"),
+        );
+    }
+
     /// The inverse of `with_db_name` must not reintroduce the last-slash bug.
     ///
     /// A slash inside a query value is the exact case that makes `rsplit('/')`
@@ -1328,7 +1381,13 @@ pub mod db {
     /// current time and pid through it yields a value that differs across hosts
     /// and across runs on one host. Std-only: the harness deliberately pulls in
     /// no RNG crate for a name suffix.
-    fn run_token() -> &'static str {
+    ///
+    /// Public because the gate suite's probes create databases of their own on
+    /// the same shared server and need the *same* uniqueness guarantee. Reusing
+    /// this rather than rolling a second uniquifier means there is one
+    /// definition of "which run minted this" for a human to reason about, and
+    /// nothing that can drift.
+    pub fn run_token() -> &'static str {
         static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         TOKEN.get_or_init(|| {
             use std::hash::{BuildHasher, Hasher};

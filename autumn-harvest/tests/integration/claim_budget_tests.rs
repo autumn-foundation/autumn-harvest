@@ -51,7 +51,8 @@ use super::claim_bench_support::db::{self, BenchDb};
 use super::claim_bench_support::{
     BUDGET_ENV_VAR, BudgetVerdict, ClaimGate, HEADLINE_P50_BUDGET_MS, LatencyStats,
     MIN_MEANINGFUL_SAMPLES, SCENARIO_BUDGET_ENV_VAR, Scenario, budget_from_env, budget_verdict,
-    db_name_from_url, headline_scenario, measured_claims_for, scenario_time_budget, with_db_name,
+    db_name_from_url, headline_scenario, measured_claims_for, scenario_time_budget,
+    sweep_probe_decoy_name, with_db_name,
 };
 
 // The published budget lives in the shared harness as
@@ -977,10 +978,12 @@ async fn a_foreign_database_sharing_our_prefix_is_never_dropped() {
     };
 
     // Prefixed and numeric-then-arbitrary, so the old two-field check accepted
-    // it. Suffixed with our pid so two concurrent runs cannot fight over one
-    // decoy, and named unmistakably after this probe so it can never collide
-    // with a database an operator actually cares about.
-    let decoy = format!("harvest_claim_bench_123_sweepprobe{}", std::process::id());
+    // it, yet never a name this harness could mint. Named unmistakably after
+    // this probe so it cannot collide with a database an operator cares about,
+    // and carrying the run token because a pid alone is not unique across hosts
+    // — the drop below is unconditional, so two pid-1 runs would delete each
+    // other's live decoy. See `sweep_probe_decoy_name` for both properties.
+    let decoy = sweep_probe_decoy_name(std::process::id(), db::run_token());
 
     // A previous crashed run of this test could have stranded one.
     let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {decoy}"))
@@ -1134,8 +1137,21 @@ async fn the_sweep_lock_is_taken_in_a_fixed_database_not_the_admin_url_s() {
 
     // A scratch database standing in for an operator whose admin URL points
     // somewhere other than `SWEEP_LOCK_DB`. Named outside the bench prefix so
-    // the sweep never touches it.
-    let scratch = format!("harvest_sweep_scope_probe_{}", std::process::id());
+    // the sweep never touches it, and carrying the run token: the drop below is
+    // unconditional, so a pid-only name lets two runs sharing a cluster from
+    // different PID namespaces — both pid 1 under containers — delete each
+    // other's live scratch mid-probe.
+    //
+    // The token means a strand is never reclaimed by a later same-pid run, but
+    // that was never a reliable cleanup: what actually prevents strands is that
+    // nothing between the create and the drop may panic (see below). Trading a
+    // coincidental cleanup for the removal of a destructive collision is the
+    // right way round, and both probe names are unmistakable to an operator.
+    let scratch = format!(
+        "harvest_sweep_scope_probe_{}_{}",
+        std::process::id(),
+        db::run_token(),
+    );
     let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {scratch}"))
         .execute(&mut admin)
         .await;
