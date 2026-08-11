@@ -113,9 +113,18 @@ Two more things worth knowing before pointing this at a server you care about:
   lives on its own connection to the `postgres` database rather than on the
   admin connection, because Postgres advisory locks are scoped to the session's
   database, not the cluster: taken on the admin connection, two runs reaching
-  one server through different admin databases would not serialize at all.
+  one server through different admin databases would not serialize at all. For
+  the same reason there is no fallback — **a role that cannot connect to
+  `postgres` makes the run refuse to start**, naming the missing grant, rather
+  than proceeding with a lock that only coordinates a subset of clients.
   Credentials never reach a log line: the URL is redacted to
   `scheme://***@host:port/db` before it is printed.
+* **Each scenario is bounded by a wall clock**, on the write path as well as
+  the read path: every pool checkout, claim and enqueue is bounded by the
+  scenario deadline, so a stalled server ends the scenario at the ceiling
+  instead of hanging the run. A scenario that stops early is marked `⚠` in the
+  report and fails the CI gate as unsound rather than publishing a percentile
+  over a partial window.
 * **`HARVEST_BENCH_SCENARIO_SECS`** caps each scenario's measured phase
   (default 240 s). It is the knob to raise when a row comes back marked `⚠` or
   `‡` — see [measurement hygiene](#measurement-hygiene).

@@ -1373,28 +1373,27 @@ pub mod db {
     /// Public so the regression test can prove the lock is taken in the fixed
     /// database rather than in whichever one the admin URL names.
     pub async fn take_sweep_lock(admin_url: &str) -> Result<AsyncPgConnection, SkipReason> {
-        // Falling back to the admin URL's own database keeps a run working on a
-        // server whose `postgres` database has been dropped or revoked. It
-        // narrows coordination to clients sharing that database, which is worse
-        // than nothing only if it is silent — hence the warning.
-        let mut lock = match AsyncPgConnection::establish(&super::with_db_name(
-            admin_url,
-            SWEEP_LOCK_DB,
-        ))
-        .await
-        {
-            Ok(conn) => conn,
-            Err(e) => {
-                eprintln!(
-                    "warning: sweep lock falling back to the admin URL's own database \
-                         (connect {SWEEP_LOCK_DB}: {e}); concurrent runs reaching this \
-                         cluster through a different admin database will not serialize"
-                );
-                AsyncPgConnection::establish(admin_url)
-                    .await
-                    .map_err(|e| SkipReason(format!("connect for sweep lock: {e}")))?
-            }
-        };
+        // No fallback to the admin URL's own database. That would take a lock
+        // scoped to whichever database the operator named, which is exactly the
+        // per-database scoping this fixed database exists to escape — two
+        // clients arriving through different admin databases would both enter
+        // the sweep/create section and one could drop the other's new database
+        // before its lease connects. A warning does not protect anybody's data,
+        // so an unreachable `SWEEP_LOCK_DB` is terminal: better a run that does
+        // not start than a run that silently cannot serialize.
+        let mut lock = AsyncPgConnection::establish(&super::with_db_name(admin_url, SWEEP_LOCK_DB))
+            .await
+            .map_err(|e| {
+                SkipReason(format!(
+                    "connect {SWEEP_LOCK_DB} for the sweep lock: {e}. The benchmark \
+                         serializes its stale-database sweep through `{SWEEP_LOCK_DB}` so \
+                         that clients reaching this cluster through different admin \
+                         databases still coordinate; without it a concurrent run could \
+                         drop this one's database. Grant the role CONNECT on \
+                         `{SWEEP_LOCK_DB}`, or point HARVEST_TEST_DATABASE_URL at a \
+                         cluster where it is reachable."
+                ))
+            })?;
         // `lock_timeout` covers advisory locks, so a peer that wedges while
         // holding the lock aborts our wait with an error instead of hanging.
         diesel::sql_query(format!("SET lock_timeout = '{SWEEP_LOCK_TIMEOUT}'"))
@@ -2038,6 +2037,12 @@ pub mod db {
         /// Latency over the post-warmup rows only.
         pub stats: LatencyStats,
         pub wall_secs: f64,
+        /// At least one writer stopped early on the scenario deadline.
+        ///
+        /// Same contract as [`ClaimReport::truncated`]: the percentiles above
+        /// then describe a partial run, so a caller must treat them as unsound
+        /// rather than publishing them.
+        pub truncated: bool,
     }
 
     impl EnqueueReport {
@@ -2119,31 +2124,67 @@ pub mod db {
         let queues = Arc::new(queue_names(scenario));
 
         let started = Instant::now();
+        // One ceiling for the whole scenario, fixed before any writer runs —
+        // the same contract as the claim path, and for the same reason: both
+        // `pool.get()` and `queue::enqueue` are unbounded awaits, so a stalled
+        // server would otherwise hang the bench (and the CI gate that calls
+        // this) until the outer workflow timeout, while the page advertises a
+        // per-scenario cap.
+        let deadline = started + super::scenario_time_budget();
         let mut handles = Vec::with_capacity(writers);
         for w in 0..writers.max(1) {
             let pool = pool.clone();
             let queues = Arc::clone(&queues);
             handles.push(tokio::spawn(async move {
                 let mut samples = Vec::with_capacity(rows_per_writer);
-                let mut conn = pool.get().await.expect("pool checkout");
+                // Failing to check out is terminal for this writer: it takes no
+                // samples and reports truncated, so the caller calls the
+                // measurement unsound rather than publishing a rate computed
+                // only from the writers that did start.
+                let Ok(Ok(mut conn)) = tokio::time::timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    pool.get(),
+                )
+                .await
+                else {
+                    return (Vec::new(), true);
+                };
+                let mut truncated = false;
                 for i in 0..rows_per_writer {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        truncated = true;
+                        break;
+                    }
                     let q = queues[(w + i) % queues.len()].clone();
                     let params = bench_enqueue_params(q);
-                    let t0 = Instant::now();
-                    queue::enqueue(&mut conn, &params)
-                        .await
-                        .expect("enqueue failed");
+                    let t0 = now;
+                    // Bound the call, not just the loop head: a single stalled
+                    // write would otherwise sit here past the ceiling while the
+                    // loop-top check never runs again. A timeout abandons the
+                    // connection mid-query, which is fine and terminal — we
+                    // break, the pool recycles it, and `truncated` propagates.
+                    let wrote =
+                        tokio::time::timeout(deadline - now, queue::enqueue(&mut conn, &params))
+                            .await;
+                    let Ok(wrote) = wrote else {
+                        truncated = true;
+                        break;
+                    };
+                    wrote.expect("enqueue failed");
                     samples.push(t0.elapsed().as_secs_f64() * 1000.0);
                 }
-                samples
+                (samples, truncated)
             }));
         }
 
         let mut rows = 0usize;
         let mut warmup_rows = 0usize;
+        let mut truncated = false;
         let mut all_samples = Vec::with_capacity(writers * rows_per_writer);
         for h in handles {
-            let samples = h.await.expect("writer task panicked");
+            let (samples, writer_truncated) = h.await.expect("writer task panicked");
+            truncated |= writer_truncated;
             rows += samples.len();
             // Same post-hoc warmup trim as the claim path: the first writes on
             // a fresh connection pay plan-cache and connection setup costs that
@@ -2161,6 +2202,7 @@ pub mod db {
             warmup_rows,
             stats: LatencyStats::from_samples(&all_samples),
             wall_secs,
+            truncated,
         }
     }
 

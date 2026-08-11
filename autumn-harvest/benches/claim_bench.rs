@@ -318,11 +318,15 @@ async fn enqueue_section(db: &BenchDb) {
         let report: EnqueueReport =
             db::run_enqueue_scenario(db, backlog, ENQUEUE_WRITERS, ENQUEUE_ROWS_PER_WRITER).await;
         println!(
-            "| {}{} | {} | {} | {} | {} | {:.0} |",
+            "| {}{}{} | {} | {} | {} | {} | {:.0} |",
             // Read the report, not the loop variable: a transcription bug here
             // would silently mislabel which backlog a row describes.
             report.backlog,
             thin_sample_note(report.stats),
+            // Same mark the claim rows carry: a row that stopped on the
+            // wall-clock ceiling covers a partial window, and must not be
+            // transcribed into docs/performance.md as a steady-state number.
+            truncation_note(report.truncated),
             report.writers,
             report.rows,
             report.stats.count,

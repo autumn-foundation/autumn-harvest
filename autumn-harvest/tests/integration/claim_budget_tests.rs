@@ -72,6 +72,14 @@ use super::claim_bench_support::{
 /// touched.
 const MIN_CLAIM_RATIO: f64 = 0.90;
 
+/// Slack allowed above [`scenario_time_budget`] before a gate calls the
+/// wall-clock ceiling violated.
+///
+/// Absorbs task join and report assembly under an oversubscribed runner. It is
+/// far smaller than the overruns these assertions exist to catch — an unbounded
+/// await runs for minutes or forever, not for seconds.
+const WALL_CLOCK_SLACK: Duration = Duration::from_secs(30);
+
 /// Acquire a benchmark database, or decide how to proceed without one.
 ///
 /// Locally (no Docker, no `HARVEST_TEST_DATABASE_URL`) the gate skips loudly.
@@ -165,10 +173,9 @@ async fn claim_p50_at_headline_scenario_is_within_budget() {
     // returns to a check — a stalled pool checkout, say. Assert the ceiling
     // the harness advertises directly, against the clock, so an unbounded
     // wait anywhere in the scenario surfaces as a failure rather than as a
-    // job that quietly runs for minutes past its cap. The slack absorbs task
-    // join and report assembly under an oversubscribed runner; it is far
-    // smaller than the overruns this is meant to catch.
-    let ceiling = scenario_time_budget() + Duration::from_secs(30);
+    // job that quietly runs for minutes past its cap. See `WALL_CLOCK_SLACK`
+    // for why the slack is safe.
+    let ceiling = scenario_time_budget() + WALL_CLOCK_SLACK;
     assert!(
         report.wall_secs <= ceiling.as_secs_f64(),
         "measurement unsound: the scenario ran {:.1}s, past its {}s wall-clock \
@@ -283,6 +290,33 @@ async fn enqueue_throughput_is_measured_against_a_non_empty_queue() {
         report.rows_per_sec(),
     );
 
+    // Same soundness contract as the claim gate: a run that stopped on the
+    // wall-clock ceiling has percentiles over a partial window, so say so
+    // rather than publishing them.
+    assert!(
+        !report.truncated,
+        "measurement unsound: the enqueue scenario hit its {}s wall-clock budget \
+         and stopped early after {} rows. Raise {} for a one-off, but a write \
+         path that cannot finish in the default budget is itself the signal.",
+        scenario_time_budget().as_secs(),
+        report.rows,
+        SCENARIO_BUDGET_ENV_VAR,
+    );
+
+    // And the backstop the claim gate learned the hard way: `truncated` is only
+    // set where the harness *checks* the deadline, so it can never catch an
+    // await that never returns to a check. Assert the ceiling directly, so a
+    // future unbounded await fails here instead of hanging CI.
+    let ceiling = scenario_time_budget() + WALL_CLOCK_SLACK;
+    assert!(
+        report.wall_secs <= ceiling.as_secs_f64(),
+        "enqueue scenario ran {:.1}s, past its {}s wall-clock budget (+{}s slack): \
+         some await on the write path is not bounded by the scenario deadline.",
+        report.wall_secs,
+        scenario_time_budget().as_secs(),
+        WALL_CLOCK_SLACK.as_secs(),
+    );
+
     assert_eq!(
         report.rows,
         writers * rows_per_writer,
@@ -309,6 +343,67 @@ async fn enqueue_throughput_is_measured_against_a_non_empty_queue() {
         "enqueue must have written into a non-empty queue: expected the seeded \
          {backlog}-row backlog plus {} enqueued rows, found {pending} PENDING",
         report.rows,
+    );
+}
+
+/// The enqueue path honours the scenario wall-clock ceiling.
+///
+/// Both awaits on that path — the pool checkout and `queue::enqueue` itself —
+/// are unbounded, so without a deadline a stalled server hangs the benchmark
+/// (and the gate above) until the outer CI workflow timeout, while
+/// `docs/performance.md` advertises a per-scenario cap. The claim path learned
+/// this two rounds earlier; this pins the same contract for writes.
+///
+/// Deterministic rather than timing-dependent: it asks for far more rows than
+/// the budget can absorb, so the ceiling *must* bite. Without the deadline the
+/// run writes all of them — minutes of work — which is the bug.
+///
+/// Existing-server mode only, and it sets its own budget, so it does not
+/// inherit `HARVEST_BENCH_SCENARIO_SECS` from the environment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enqueue_stops_at_the_scenario_wall_clock_ceiling() {
+    let Some(db) = bench_db_or_skip().await else {
+        return;
+    };
+
+    // The floor `scenario_time_budget` allows. The measured phase starts after
+    // seeding, so this bounds only the writes.
+    // SAFETY: single-threaded test setup before any spawn reads the env.
+    unsafe { std::env::set_var(SCENARIO_BUDGET_ENV_VAR, "1") };
+    let budget = scenario_time_budget();
+
+    // Far more rows than 1s of writing can absorb at the measured ~1-3 ms each.
+    let started = std::time::Instant::now();
+    let report = db::run_enqueue_scenario(&db, 100, 4, 250_000).await;
+    let elapsed = started.elapsed();
+    unsafe { std::env::remove_var(SCENARIO_BUDGET_ENV_VAR) };
+
+    assert!(
+        report.truncated,
+        "the enqueue scenario wrote all {} requested rows inside a {}s budget, \
+         so either the deadline is not being enforced or the row count is no \
+         longer large enough to bite",
+        report.rows,
+        budget.as_secs(),
+    );
+
+    // The ceiling is only meaningful if the run actually *stopped*. `truncated`
+    // alone would be satisfied by a run that set the flag and kept writing.
+    let ceiling = budget + WALL_CLOCK_SLACK;
+    assert!(
+        elapsed <= ceiling,
+        "enqueue ran {:.1}s past a {}s budget (+{}s slack): the deadline is set \
+         but some await is not bounded by it",
+        elapsed.as_secs_f64(),
+        budget.as_secs(),
+        WALL_CLOCK_SLACK.as_secs(),
+    );
+
+    // A truncated run still reports what it managed, so the caller can say how
+    // far it got rather than only that it stopped.
+    assert!(
+        report.rows > 0,
+        "a truncated run must still report the rows it wrote",
     );
 }
 
