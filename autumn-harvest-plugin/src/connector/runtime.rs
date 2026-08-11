@@ -1505,6 +1505,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_deterministic_poison_is_counted_on_its_first_broker_native_handoff() {
+        // The other side of the dedupe. `Malformed` and `TargetRejected` are
+        // dead-lettered on sight and are never strike-counted, so the tracker
+        // holds nothing for the key when the handoff happens. If a missing
+        // entry read as "already counted", `harvest.connector.poisoned` would
+        // sit at zero for a malformed-payload flood -- the exact alert this
+        // metric exists to raise.
+        let binding = Arc::new(
+            SourceBinding::starts("orders", "orders", "order_flow")
+                .map_raw(|_ctx| Err(MappingError::Deserialize("not json".to_string())))
+                .poison_threshold(2)
+                .broker_native_dead_letter(),
+        );
+        let source = Arc::new(MockSource::new("orders"));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let rt = runtime_with_metrics(
+            binding,
+            Arc::clone(&source),
+            Arc::new(RecordingDeadLetterSink::new()),
+            Arc::clone(&metrics),
+        );
+
+        // Quarantined on the FIRST delivery -- no strike countdown at all.
+        source.push_kafka(0, 1, b"not json");
+        rt.run_once().await.unwrap();
+        assert_eq!(
+            metrics.poisoned(),
+            vec![("orders".to_string(), PoisonReason::Malformed)],
+            "a deterministic poison must be counted on its first handoff"
+        );
+
+        // ...and the redrive lap that follows is still the same message.
+        source.push_kafka(0, 1, b"not json");
+        rt.run_once().await.unwrap();
+        assert_eq!(
+            metrics.poisoned().len(),
+            1,
+            "a redrive lap must not report a second poison message"
+        );
+
+        // A DIFFERENT malformed message is a different poison message.
+        source.push_kafka(0, 2, b"also not json");
+        rt.run_once().await.unwrap();
+        assert_eq!(metrics.poisoned().len(), 2);
+
+        // The settlement invariant is untouched by either gate.
+        assert_eq!(metrics.dispatched().len(), metrics.received().len());
+    }
+
+    #[tokio::test]
     async fn broker_native_strikes_do_not_accumulate_without_bound() {
         // The other half of the contract above. Keeping the strikes is right
         // for the redrive lifetime, but SQS moves the message to its DLQ

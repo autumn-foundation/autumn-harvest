@@ -756,6 +756,18 @@ coordinates, so a run traces back to the exact message.
   redelivery is a received message, and that family's documented invariant is
   that it sums to `received` — asserted alongside the fix so the two rules
   cannot be conflated later.
+- **Deterministic poison is counted on its first broker-native handoff.**
+  Completes the fix above, which gated the counter on `mark_terminal_as_of`
+  returning "first" but treated an *absent* key as "not first". `Malformed`
+  and `TargetRejected` are dead-lettered on sight and never strike-counted, so
+  no entry exists when they reach the handoff — `harvest.connector.poisoned`
+  was therefore never incremented at all for the two most obvious poison
+  classes in `BrokerNative` mode, a silent blind spot worse than the per-lap
+  inflation it replaced. `mark_terminal_as_of` now upserts a terminal entry
+  instead of returning early, so the first handoff counts and the entry it
+  creates is what makes the next redrive lap report false. The entry is
+  bounded exactly like a strike-bearing one (same expiry order, same retention
+  deadline). `HarvestSink` mode was unaffected — it never reaches this arm.
 
 ### Success metric
 

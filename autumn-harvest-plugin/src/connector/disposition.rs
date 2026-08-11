@@ -255,6 +255,21 @@ struct StrikeState {
     last_seen: std::time::Instant,
 }
 
+impl StrikeState {
+    /// A brand-new entry: no strikes, not yet handed to the broker's redrive.
+    ///
+    /// Both entry points create one — `strike` for a rejection that may yet
+    /// recover, `mark_terminal_as_of` for a deterministic poison that was
+    /// never strike-counted at all — so naming it keeps the two aligned.
+    const fn fresh(now: std::time::Instant) -> Self {
+        Self {
+            count: 0,
+            terminal_at: None,
+            last_seen: now,
+        }
+    }
+}
+
 /// Hard ceiling on retained poison strikes, terminal or not — applied
 /// independently to the live map *and* to the expiry queue.
 ///
@@ -288,11 +303,7 @@ impl PoisonTracker {
         let entry = self
             .strikes
             .entry(key.to_string())
-            .or_insert_with(|| StrikeState {
-                count: 0,
-                terminal_at: None,
-                last_seen: now,
-            });
+            .or_insert_with(|| StrikeState::fresh(now));
         entry.count = entry.count.saturating_add(1);
         entry.last_seen = now;
         let count = entry.count;
@@ -322,17 +333,25 @@ impl PoisonTracker {
     /// `dispatched` counter is deliberately *not* gated this way — every
     /// redelivery is a received message, and that family's documented
     /// invariant is that it sums to `received`.)
+    ///
+    /// An **absent** key is the deterministic-poison case, not a no-op:
+    /// [`DispatchOutcome::Malformed`] and [`DispatchOutcome::TargetRejected`]
+    /// are dead-lettered on sight and never strike-counted, so nothing has
+    /// recorded the key by the time they land here. That first handoff is a
+    /// genuine poison message and must count — reading a missing entry as
+    /// "already counted" would zero `harvest.connector.poisoned` for the two
+    /// most obvious poison classes. The entry this creates is also what makes
+    /// the *next* redrive lap of that same message report false, and it is
+    /// bounded exactly like a strike-bearing one: it joins the same expiry
+    /// order and retires on the same retention deadline.
     pub fn mark_terminal_as_of(&mut self, key: &str, now: std::time::Instant) -> bool {
-        let first;
-        if let Some(state) = self.strikes.get_mut(key) {
-            first = state.terminal_at.is_none();
-            state.terminal_at = Some(now);
-            state.last_seen = now;
-        } else {
-            // Marking a key with no strike recorded would otherwise queue an
-            // expiry entry for nothing.
-            return false;
-        }
+        let state = self
+            .strikes
+            .entry(key.to_string())
+            .or_insert_with(|| StrikeState::fresh(now));
+        let first = state.terminal_at.is_none();
+        state.terminal_at = Some(now);
+        state.last_seen = now;
         self.expiry.push_back((now, key.to_string()));
         self.enforce_cap();
         first
@@ -1202,9 +1221,42 @@ mod tests {
         // A DIFFERENT message is a different poison message and does count.
         t.strike("m-2", t0);
         assert!(t.mark_terminal_as_of("m-2", t0));
-        // Marking a key with no strikes recorded is a no-op, so it cannot
-        // manufacture a sample either.
-        assert!(!t.mark_terminal_as_of("never-struck", t0));
+        // A key with no strikes recorded is the DETERMINISTIC poison case and
+        // has its own contract -- see
+        // `a_deterministic_poison_counts_on_its_first_handoff_and_not_after`.
+    }
+
+    #[test]
+    fn a_deterministic_poison_counts_on_its_first_handoff_and_not_after() {
+        // `Malformed` and `TargetRejected` are "never retryable, never
+        // strike-counted": they are dead-lettered on sight, so the tracker has
+        // no entry for the key when the handoff happens. Treating a missing
+        // entry as "not the first" would zero `harvest.connector.poisoned` for
+        // the two most obvious poison classes -- a silent blind spot, worse
+        // than the per-lap inflation the first-handoff gate exists to stop.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        let retention = std::time::Duration::from_secs(60);
+
+        assert!(
+            t.mark_terminal_as_of("never-struck", t0),
+            "a deterministic poison's first handoff IS a poison message"
+        );
+        // The entry that first mark creates is what stops the next redrive lap
+        // from reporting the same physical message a second time.
+        assert!(
+            !t.mark_terminal_as_of("never-struck", t0 + std::time::Duration::from_secs(5)),
+            "a redrive lap of the same message must not count twice"
+        );
+
+        // And it is bounded like any other terminal entry: nothing downstream
+        // can ever clear it, so the retention window has to.
+        t.expire_stale_as_of(t0 + std::time::Duration::from_secs(70), retention);
+        assert_eq!(
+            t.tracked(),
+            0,
+            "a strike-less terminal entry must retire like any other"
+        );
     }
 
     #[test]
