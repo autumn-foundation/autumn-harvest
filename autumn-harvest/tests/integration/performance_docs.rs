@@ -1026,6 +1026,71 @@ fn overview_docs_do_not_claim_complete_predicate_coverage() {
     }
 }
 
+/// The released entry's *current-behavior* description must not promise a
+/// pid-liveness guarantee the sweep no longer offers.
+///
+/// Round 5 removed the pid veto from `sweep_step` outright, making the
+/// server-visible lease the sole liveness authority — precisely because a
+/// containerised run records pid 1, pid 1 is alive everywhere, and the veto
+/// therefore skipped every stale database a previous container run had left
+/// behind. The opening description still told operators the sweep skips a
+/// database "whose owning pid is still alive", which is both untrue and
+/// reassuring in the wrong direction: an operator reading it would expect a
+/// live-but-leaseless run to be protected from reclamation.
+///
+/// Scoped to the text *before* the first `Post-review hardening` section, and
+/// that scoping is the substance of the test. The released entry embeds a
+/// round-by-round narrative in which "the local pid check is kept" is a true
+/// statement about round 2, later superseded; banning the phrase everywhere
+/// would forbid the entry from recording its own history. The prefix is the
+/// part that speaks in the present tense about shipped behaviour.
+///
+/// The sibling guard below catches a *retracted conclusion*; this one catches a
+/// *retracted mechanism*. Neither the figure checks nor the own-voice check can
+/// see either, because in both cases the prose is internally consistent and
+/// only disagrees with the code.
+#[test]
+fn the_released_entry_does_not_promise_pid_liveness_protection() {
+    let fragment = read_normalized(&changelog_fragment_path());
+    let leading = fragment
+        .lines()
+        .next()
+        .expect("the fragment must have a leading entry");
+
+    // Everything up to the first round narrative is the shipped-behaviour
+    // description; the narratives after it are history and may say otherwise.
+    let current_behavior = leading
+        .split_once("Post-review hardening")
+        .map_or(leading, |(before, _)| before);
+
+    for banned in [
+        "owning pid is still alive",
+        "liveness check is Linux-only",
+        "whose owning pid",
+    ] {
+        assert!(
+            !current_behavior.contains(banned),
+            "the released changelog entry's opening description states \
+             \"{banned}\", promising that a live local pid protects a database \
+             from the stale sweep. Round 5 removed that veto: the server-visible \
+             lease is the sole liveness authority, so a database with no backend \
+             attached is reclaimed regardless of pid — deliberately, because a \
+             containerised run records pid 1 and pid 1 is always alive. The \
+             round narratives below may record the superseded rule; the opening \
+             description may not."
+        );
+    }
+
+    assert!(
+        current_behavior.contains("pg_stat_activity"),
+        "the released changelog entry's opening description must name the \
+         mechanism that actually decides reclamation (`pg_stat_activity`). \
+         Deleting the pid claim without replacing it leaves the sweep's safety \
+         property unstated, which is how the stale claim survived six rounds of \
+         review in the first place."
+    );
+}
+
 /// The changelog fragment's *leading* entry must not publish the retracted
 /// `all_gates` bound.
 ///
