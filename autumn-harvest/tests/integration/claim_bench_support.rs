@@ -593,24 +593,25 @@ pub enum SweepStep {
 
 /// Decide the fate of one candidate database, without touching a database.
 ///
-/// Split out so the *platform-conditional* half is testable on every OS. The
-/// rule that matters: only a definite `Some(true)` from the host may veto the
-/// server. Where liveness cannot be answered — every non-Linux host — the
-/// answer is `None`, and the sweep must fall through to the lease rather than
-/// treat "I cannot tell" as "in use". Reading an unanswerable check as a veto
-/// is what previously made every completed benchmark leak its database forever
-/// on macOS and Windows, because the server check was then never reached.
+/// Split out so the whole decision is testable on every OS, with no server and
+/// no Docker. Only two things can stop the sweep here; everything else defers
+/// to the server-visible lease, which is the one authority that sees every
+/// client regardless of host or PID namespace:
 ///
-/// Ownership is keyed on the run token, not the pid: two containerised runs on
-/// different hosts both report pid 1, so a pid would make one run exempt the
-/// other's databases from reclamation and, worse, claim them as its own.
+/// 1. **It is ours.** Keyed on the run token, never the pid — two containerised
+///    runs on different hosts both report pid 1, so a pid would make one run
+///    exempt the other's databases and, worse, claim them as its own. This also
+///    covers the database we are about to create, whose lease does not exist
+///    between `CREATE DATABASE` and the connect that takes it.
+/// 2. **We did not mint the name.** Not ours to reclaim.
+///
+/// Notably there is *no* liveness veto on the recorded pid. Serialising the
+/// sweep and the create-to-lease window under [`SWEEP_LOCK_KEY`] removed the
+/// only thing such a veto protected, and a pid veto is actively harmful in a
+/// container, where the recorded pid is usually 1 and therefore always "alive":
+/// every stale database from a previous container run would be skipped forever.
 #[must_use]
-pub fn sweep_step(
-    owner_token: Option<&str>,
-    my_token: &str,
-    owner_pid: Option<u32>,
-    same_host_pid_alive: Option<bool>,
-) -> SweepStep {
+pub fn sweep_step(owner_token: Option<&str>, my_token: &str, owner_pid: Option<u32>) -> SweepStep {
     // Ours — including the database we are about to create, whose lease does
     // not exist yet between `CREATE DATABASE` and the connect that takes it.
     if owner_token == Some(my_token) {
@@ -620,11 +621,14 @@ pub fn sweep_step(
     if owner_pid.is_none() {
         return SweepStep::Skip;
     }
-    // Another *local* run inside its own create-to-lease window, which the
-    // server cannot see yet.
-    if same_host_pid_alive == Some(true) {
-        return SweepStep::Skip;
-    }
+    // Everything else is the server's call. Deliberately *no* liveness veto on
+    // the recorded pid: the only thing such a veto ever protected was another
+    // local run inside its own create-to-lease window, and the sweep now runs
+    // under the same advisory lock as that window (see `SWEEP_LOCK_KEY`), so it
+    // cannot observe one. Keeping it would be pure cost — a pid is only
+    // meaningful on the host that minted it, and in a container the recorded
+    // pid is usually 1, which is always alive, so every stale database from a
+    // previous container run would be skipped forever.
     SweepStep::AskServer
 }
 
@@ -906,12 +910,12 @@ mod pure_tests {
     #[test]
     fn sweep_step_skips_our_own_run() {
         assert_eq!(
-            sweep_step(Some("mytoken"), "mytoken", Some(1), Some(false)),
+            sweep_step(Some("mytoken"), "mytoken", Some(1)),
             SweepStep::Skip
         );
         // Even mid create-to-lease, when the server would report no backends.
         assert_eq!(
-            sweep_step(Some("mytoken"), "mytoken", Some(1), None),
+            sweep_step(Some("mytoken"), "mytoken", Some(99999)),
             SweepStep::Skip
         );
     }
@@ -922,32 +926,36 @@ mod pure_tests {
     #[test]
     fn sweep_step_does_not_confuse_a_foreign_run_sharing_our_pid() {
         assert_eq!(
-            sweep_step(Some("theirs"), "mine", Some(1), None),
+            sweep_step(Some("theirs"), "mine", Some(1)),
             SweepStep::AskServer,
         );
     }
 
-    /// The headline of this fix: where liveness cannot be answered, the sweep
-    /// must consult the server rather than read "I cannot tell" as "in use".
-    /// Reading it as a veto leaked every completed benchmark's database.
+    /// A foreign run's database is always the server's call.
+    ///
+    /// The pid in the name is only meaningful on the host that minted it, so it
+    /// can never answer "is this in use"; only the server sees every client.
     #[test]
-    fn sweep_step_asks_the_server_when_liveness_is_unanswerable() {
+    fn sweep_step_asks_the_server_for_a_foreign_run() {
         assert_eq!(
-            sweep_step(Some("theirs"), "mine", Some(4242), None),
+            sweep_step(Some("theirs"), "mine", Some(4242)),
             SweepStep::AskServer,
         );
     }
 
-    /// A definite live same-host pid still protects another local run inside
-    /// its create-to-lease window.
+    /// A live same-host pid must NOT veto the server's judgement.
     #[test]
-    fn sweep_step_defers_to_a_definite_live_local_pid() {
+    fn sweep_step_never_vetoes_on_a_live_local_pid() {
+        // `1` is alive on every containerised host, and a stale database from a
+        // previous container run records exactly that pid. A liveness veto here
+        // would skip it forever; the advisory lock already covers the only
+        // window such a veto ever protected.
         assert_eq!(
-            sweep_step(Some("theirs"), "mine", Some(4242), Some(true)),
-            SweepStep::Skip,
+            sweep_step(Some("theirs"), "mine", Some(1)),
+            SweepStep::AskServer,
         );
         assert_eq!(
-            sweep_step(Some("theirs"), "mine", Some(4242), Some(false)),
+            sweep_step(Some("theirs"), "mine", Some(std::process::id())),
             SweepStep::AskServer,
         );
     }
@@ -955,11 +963,8 @@ mod pure_tests {
     /// A name this harness did not mint is never reclaimed.
     #[test]
     fn sweep_step_leaves_unparseable_names_alone() {
-        assert_eq!(sweep_step(None, "mine", None, Some(false)), SweepStep::Skip);
-        assert_eq!(
-            sweep_step(Some("notapid"), "mine", None, None),
-            SweepStep::Skip
-        );
+        assert_eq!(sweep_step(None, "mine", None), SweepStep::Skip);
+        assert_eq!(sweep_step(Some("notapid"), "mine", None), SweepStep::Skip);
     }
 
     /// The inverse of `with_db_name` must not reintroduce the last-slash bug.
@@ -1412,15 +1417,7 @@ pub mod db {
             let owner_pid = parts.next().and_then(|pid| pid.parse::<u32>().ok());
             let owner_token = parts.next();
 
-            // `None` on a platform that cannot answer, so it never vetoes.
-            #[cfg(target_os = "linux")]
-            let same_host_pid_alive = owner_pid.map(process_is_alive);
-            #[cfg(not(target_os = "linux"))]
-            let same_host_pid_alive: Option<bool> = None;
-
-            if super::sweep_step(owner_token, run_token(), owner_pid, same_host_pid_alive)
-                == super::SweepStep::Skip
-            {
+            if super::sweep_step(owner_token, run_token(), owner_pid) == super::SweepStep::Skip {
                 continue;
             }
 
@@ -1447,9 +1444,9 @@ pub mod db {
     /// Host-agnostic, unlike a local pid probe: the server sees every client
     /// regardless of which machine or PID namespace it runs in.
     ///
-    /// Conservative in the same direction as [`process_is_alive`] — a failed
-    /// check reports "in use", so the worst outcome is a leaked database, never
-    /// a live run dropped out from under itself.
+    /// Conservative by design — a failed check reports "in use", so the worst
+    /// outcome is a leaked database, never a live run dropped out from under
+    /// itself.
     async fn database_has_connections(admin: &mut AsyncPgConnection, datname: &str) -> bool {
         #[derive(QueryableByName)]
         struct CountRow {
@@ -1462,23 +1459,6 @@ pub mod db {
             .get_result::<CountRow>(admin)
             .await
             .map_or(true, |row| row.n > 0)
-    }
-
-    /// Best-effort liveness check for a pid that may own a bench database.
-    ///
-    /// Conservative by design: anything other than a confident "that process is
-    /// gone" is reported as alive, so a database in use is never dropped out
-    /// from under a concurrent run.
-    fn process_is_alive(pid: u32) -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            std::path::Path::new(&format!("/proc/{pid}")).exists()
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = pid;
-            true
-        }
     }
 
     /// Build a pool sized to the claimer count, so a measured claim never

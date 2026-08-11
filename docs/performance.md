@@ -52,7 +52,7 @@ are present in the query and held constant; see
   [the control that changed the conclusion](#the-control-that-changed-the-conclusion).
 * **Enqueue is not the problem.** ~3 500 rows/s sustained at p50 ~1.8 ms, flat
   from 1k to 100k backlog (7% spread, inside run-to-run noise). At 100k the write
-  side sustains ~3 650 rows/s while the read side manages ~2 claims/s — **a queue
+  side sustains ~3 650 rows/s while the read side manages ~3 claims/s — **a queue
   that deep does not drain.**
 * Issue #786 deliberately **measures without tuning**: the claim query is
   byte-for-byte unchanged by this work.
@@ -126,13 +126,13 @@ Baseline gate (no build policy, no concurrency key, no rate limit, no pauses),
 
 | backlog | n | p50 ms | p99 ms | max ms | claims/s |
 |--:|--:|--:|--:|--:|--:|
-| 1 000 | 184 | 9.92 | 19.48 | 19.83 | 549 |
-| 10 000 | 720 | 234.22 | 304.21 | 348.03 | 22 |
-| 100 000 ⚠ | 345 | 3 531.95 | 10 020.10 | 11 827.86 | 2 |
+| 1 000 | 184 | 10.15 | 19.29 | 22.63 | 681 |
+| 10 000 | 720 | 208.06 | 267.98 | 308.08 | 25 |
+| 100 000 ⚠ | 432 | 2 988.02 | 3 857.67 | 4 192.23 | 3 |
 
 ⚠ Cut short by the per-scenario wall-clock budget (180 s for this run; the
 default is 240 s, override with `HARVEST_BENCH_SCENARIO_SECS`). The percentiles
-describe the 345 claims it did observe. That the scenario *cannot* finish its
+describe the 432 claims it did observe. That the scenario *cannot* finish its
 planned 800 claims in three minutes is itself the finding.
 
 These rows run at 8 concurrent claimers against a 4-core box, so they measure
@@ -146,7 +146,7 @@ the same reason.
 pending rows claims in single-digit milliseconds. A queue that sits at ten
 thousand claims in roughly a quarter of a second — still workable, but each worker
 poll is now a real cost. A queue parked at a hundred thousand pending rows spends
-several seconds per claim, and the fleet's throughput collapses to a couple of
+several seconds per claim, and the fleet's throughput collapses to a handful of
 claims per second regardless of how many workers you add. If your steady-state
 backlog is trending toward the 100k row, the answer is to shard
 (`docs/sharding.md`) or to shed the backlog — adding workers will not help,
@@ -184,17 +184,24 @@ itself a finding.
 
 `double_backlog` is a **control, not a gate** — it seeds no predicate at all.
 
-**How much of this reproduces.** Across three independent runs on the reference
+**How much of this reproduces.** Across four independent runs on the reference
 machine, `build_policy` is the only row that repeats to the point: +15%, +13%,
-+15%. `rate_limited` and `circuit_breaker_set` each land within a few points of
-zero and have **swapped rank with each other** between runs (one run put
-`rate_limited` at −3%), so read them as "free", not as an ordering — the gap
-between them is smaller than the noise. `concurrency_key` was +306%, +283% and
-+590%; `paused_rows` vs `baseline` was +1319%, +1346% and +1321%. So: the
++15%, +13%. `rate_limited` and `circuit_breaker_set` each land within a few
+points of zero and have **swapped rank with each other** between runs (one run
+put `rate_limited` at −3%, another put `circuit_breaker_set` at −1% — i.e. below
+`baseline`), so read them as "free", not as an ordering: the gap between them is
+smaller than the noise, and either can measure faster than a claim path that
+does strictly less work. `concurrency_key` was +306%, +283%, +590% and +518%;
+`paused_rows` vs `baseline` was +1319%, +1346%, +1321% and +1343%. So: the
 *classification* into free / modest / expensive is stable, and the expensive
 rows are reproducibly expensive, but only `build_policy` and the paused-vs-
 baseline figure are reproducible to better than a factor of two. Treat every
 percentage here as one significant figure.
+
+The table above is one representative run, not an average — averaging truncated
+scenarios with different `n` would be worse than quoting one honestly. The
+fourth run's every row fell inside the ranges quoted here, which is the property
+that matters: the table is representative, not lucky.
 
 ### The control that changed the conclusion
 
@@ -358,9 +365,9 @@ start-storm is bounded by your connection pool and by Postgres write throughput,
 not by anything Harvest does.
 
 Put the two sides together and the operational picture is stark: at a 100 000-row
-backlog this machine sustains ~3 650 enqueues/s against ~2 claims/s. **A queue
-that deep does not drain.** Nothing in the write path warns you about it; the
-backlog table above is the warning.
+backlog this machine sustains ~3 650 enqueues/s against ~3 claims/s — three
+orders of magnitude apart. **A queue that deep does not drain.** Nothing in the
+write path warns you about it; the backlog table above is the warning.
 
 Two caveats on this table. `queue::enqueue` is not a bare `INSERT`: it resolves
 defaults and writes one row inside its own transaction, so the per-row latency
@@ -381,8 +388,8 @@ exceeds its budget.
 | | |
 |:--|:--|
 | Statistic | **p50** (see below — deliberately not p99) |
-| Reference p50 | 234 ms on a quiet reference box; ~516 ms observed on a loaded one |
-| Budget | **1 500 ms** (~2.9x the worst observation, ~6.4x the quiet one) |
+| Reference p50 | 200–234 ms across runs on a quiet reference box; ~516 ms observed on a loaded one |
+| Budget | **1 500 ms** (~2.9x the worst observation, ~6.4–7.5x the quiet ones) |
 | Override | `HARVEST_CLAIM_BUDGET_MS` |
 
 ### Why the gate asserts p50, not p99
@@ -394,7 +401,7 @@ the claim path. Measured across repeated runs on the reference machine:
 
 | statistic | quiet box | loaded box | spread |
 |:--|--:|--:|--:|
-| p50 | ~220–234 ms | ~516 ms | **~2.3x** |
+| p50 | ~200–234 ms | ~516 ms | **~2.3x** |
 | p99 | ~300 ms | ~4 665 ms | **~15x** |
 
 A p99 gate at this budget failed **2 runs out of 6** during review, on the same
@@ -412,10 +419,23 @@ simply not the assertion.
 predicate that makes claims 50% slower — the reference p50 itself moves 2.3x
 with machine load, so no threshold on this hardware could. It catches the kind
 of change that adds another per-row subplan to a scan already walking the whole
-pending backlog; the measured predicates that do that land at 6.9x and 14.6x, so
-6.4x headroom sits below them and above the noise. For drift, run the benchmark
-and compare against the per-gate table above, which runs below saturation
-precisely so it can resolve smaller differences.
+pending backlog. Being precise about how big that cliff has to be, since the
+quiet-box reference spans 200–234 ms and the budget is therefore 6.4–7.5x it:
+
+| regression scale | example | quiet box (200 ms) | quiet box (234 ms) | loaded box (516 ms) |
+|:--|:--|:--|:--|:--|
+| ~6.9x | a second `concurrency_key`-class subplan | 1 380 ms — **misses** | 1 615 ms — trips | 3 560 ms — trips |
+| ~14.6x | doubling the rows every claim walks | 2 914 ms — trips | 3 409 ms — trips | 7 519 ms — trips |
+
+So a depth-class regression trips everywhere, while a single-subplan-class one
+trips on a loaded box and at the slow end of the quiet range but can slip
+through on the fastest quiet runs. That is inherent rather than a tuning miss:
+the reference moves 2.3x with load, so no single threshold separates 6.9x from
+noise on this hardware. It also matters less than it looks, because the gate
+runs in CI, and CI is the loaded case — 2.9x headroom, where even the smaller
+cliff clears the budget by more than 2x. For drift below either cliff, run the
+benchmark and compare against the per-gate table above, which runs below
+saturation precisely so it can resolve smaller differences.
 
 **The budget was derived on the reference machine, not on a CI runner.** CI
 hardware is slower and shared, so the Linux CI runs are the real calibration.
