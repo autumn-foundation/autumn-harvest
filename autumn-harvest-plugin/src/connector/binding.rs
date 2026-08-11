@@ -59,9 +59,17 @@ impl std::error::Error for MappingError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappedMessage {
     /// The business workflow id this message belongs to. For a
-    /// `SignalsWithStart` binding this is the entity key, and messages sharing
-    /// it are delivered to the same execution in order (see the ordering
-    /// caveat in `docs/getting-started/13-broker-connectors.md`).
+    /// `SignalsWithStart` binding this is the entity key: every message sharing
+    /// it is delivered to the **same execution** — affinity, *not* ordering.
+    ///
+    /// The connector spawns up to `max_in_flight` dispatches concurrently,
+    /// including two messages for the same key in one batch, so a later broker
+    /// record can persist its signal first and the workflow then observes them
+    /// in database-recorded order rather than broker order. Every message still
+    /// lands in exactly one run; only the sequence is unguaranteed. Set
+    /// `.max_in_flight(1)` on the binding to make dispatch strictly sequential
+    /// — the one knob that does buy you order, at the cost of throughput. See
+    /// the ordering caveat in `docs/getting-started/13-broker-connectors.md`.
     pub workflow_id: WorkflowId,
     /// The JSON payload handed to the workflow as its start input (and, for a
     /// `SignalsWithStart` binding, as the signal payload).
@@ -104,7 +112,12 @@ pub enum ConnectorTarget {
         workflow: &'static str,
     },
     /// Atomically start-or-attach and deliver a signal — the entity-workflow
-    /// pattern, and the *ordered* path for per-key message streams.
+    /// pattern, and the per-key *affinity* path for keyed message streams.
+    ///
+    /// Affinity, not ordering: every message for a key lands in one execution,
+    /// but concurrent dispatch means the run may observe them out of broker
+    /// order unless the binding sets `.max_in_flight(1)`. See
+    /// [`MappedMessage::workflow_id`].
     SignalsWithStart {
         /// The registered workflow type name.
         workflow: &'static str,

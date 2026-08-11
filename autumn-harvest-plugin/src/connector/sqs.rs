@@ -276,10 +276,25 @@ pub fn coordinate_id(dedup_id: Option<&str>, message_id: Option<&str>) -> Option
         .map(str::to_string)
 }
 
+/// The physical-subscription identity for a queue URL.
+///
+/// The URL rather than the stream name: two queues can share a name across
+/// accounts or regions, and the stream name is caller-overridable via
+/// [`SqsSourceConfig::stream`], so neither is a reliable identity. SQS has no
+/// consumer-group concept, so every receiver on one queue competes.
+#[must_use]
+fn subscription_identity_for(queue_url: &str) -> String {
+    format!("sqs:{queue_url}")
+}
+
 #[async_trait]
 impl EventSource for SqsSource {
     fn stream(&self) -> &str {
         &self.stream
+    }
+
+    fn subscription_identity(&self) -> Option<String> {
+        Some(subscription_identity_for(&self.queue_url))
     }
 
     async fn receive(
@@ -456,6 +471,23 @@ impl EventSource for SqsSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_identity_is_the_queue_url_not_the_stream_name() {
+        // SQS has no consumer-group concept: every receiver on a queue
+        // competes for the same messages, so the queue URL alone identifies
+        // the physical subscription. The stream *name* would be wrong twice
+        // over -- two queues can share a name across regions or accounts, and
+        // it is caller-overridable via `SqsSourceConfig::stream`.
+        let url = "https://sqs.us-east-1.amazonaws.com/123456789012/orders";
+        assert_eq!(subscription_identity_for(url), format!("sqs:{url}"));
+        // Same queue name, different account: distinct subscriptions.
+        let other = "https://sqs.us-east-1.amazonaws.com/999999999999/orders";
+        assert_ne!(
+            subscription_identity_for(url),
+            subscription_identity_for(other)
+        );
+    }
 
     #[test]
     fn stream_name_defaults_to_the_queue_name() {

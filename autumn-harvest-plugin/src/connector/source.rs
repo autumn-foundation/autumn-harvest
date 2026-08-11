@@ -210,4 +210,31 @@ pub trait EventSource: Send + Sync {
     fn has_native_dead_letter(&self) -> bool {
         false
     }
+
+    /// A stable name for the **physical subscription** this source consumes,
+    /// if the adapter can state one.
+    ///
+    /// Two sources sharing an identity compete for the same messages, so each
+    /// binding sees an arbitrary subset rather than the whole stream. The
+    /// plugin rejects such a pair at build time. Object identity cannot catch
+    /// it: separately constructed sources over one queue or one consumer group
+    /// have distinct pointers.
+    ///
+    /// It is a *subscription* identity, not a *stream* identity — the two
+    /// differ wherever the broker has a consumer-group concept. Two Kafka
+    /// consumers on one topic under **distinct group ids** each receive the
+    /// whole stream, which is the sanctioned way to fan one topic out to two
+    /// targets, so Kafka's identity pairs the group with the topic. SQS has no
+    /// such concept — every receiver on a queue competes — so its identity is
+    /// the queue URL.
+    ///
+    /// The default is `None`: an adapter that cannot name its subscription is
+    /// not evidence of a clash, and a `None` never matches another `None`.
+    /// Such a source keeps the object-identity check only. Override this when
+    /// the adapter knows what it is subscribed to; returning an identity that
+    /// is *coarser* than the real subscription would reject legitimate
+    /// fan-out, so include everything that makes two consumers independent.
+    fn subscription_identity(&self) -> Option<String> {
+        None
+    }
 }

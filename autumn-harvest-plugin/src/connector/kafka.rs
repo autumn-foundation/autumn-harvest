@@ -210,6 +210,13 @@ impl EventSource for KafkaSource {
         &self.topic
     }
 
+    fn subscription_identity(&self) -> Option<String> {
+        Some(subscription_identity_for(
+            &self.config.group_id,
+            &self.topic,
+        ))
+    }
+
     async fn receive(
         &self,
         max: usize,
@@ -370,6 +377,22 @@ impl EventSource for KafkaSource {
     }
 }
 
+/// The physical-subscription identity for a consumer group on a topic.
+///
+/// The group is load-bearing and cannot be dropped: two consumers on one topic
+/// under **distinct** group ids each receive the whole stream, which is the
+/// sanctioned way to fan one topic out to two targets. Identifying a
+/// subscription by topic alone would reject exactly that. Two consumers in the
+/// *same* group split the partitions between them, so each binding would see
+/// only a subset — the clash this identity exists to catch.
+///
+/// The separator is `\u{1}`, a byte no Kafka group id or topic name may
+/// contain, so `("a", "b/c")` and `("a/b", "c")` cannot alias each other.
+#[must_use]
+fn subscription_identity_for(group_id: &str, topic: &str) -> String {
+    format!("kafka:{group_id}\u{1}{topic}")
+}
+
 /// Outstanding records for one partition, from its watermarks and the group's
 /// committed offset.
 ///
@@ -392,6 +415,32 @@ fn partition_lag(low: i64, high: i64, committed: Offset) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_identity_pairs_the_group_with_the_topic() {
+        // The group is load-bearing: two consumers on one topic under
+        // DISTINCT group ids each get the full stream, which is the fan-out
+        // the duplicate-source panic message itself recommends. Identifying a
+        // subscription by topic alone would reject it.
+        assert_eq!(
+            subscription_identity_for("g1", "orders"),
+            "kafka:g1\u{1}orders"
+        );
+        assert_ne!(
+            subscription_identity_for("g1", "orders"),
+            subscription_identity_for("g2", "orders"),
+        );
+        // Same group, different topics are also distinct subscriptions.
+        assert_ne!(
+            subscription_identity_for("g1", "orders"),
+            subscription_identity_for("g1", "shipments"),
+        );
+        // A `/` in a topic name must not let one pair alias another.
+        assert_ne!(
+            subscription_identity_for("a", "b/c"),
+            subscription_identity_for("a/b", "c"),
+        );
+    }
 
     #[test]
     fn a_committed_offset_below_the_low_watermark_is_clamped() {

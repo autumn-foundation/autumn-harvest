@@ -2,6 +2,8 @@
 //! the Harvest workflow engine into an Autumn [`AppBuilder`].
 
 use std::any::Any;
+#[cfg(feature = "connectors")]
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -747,6 +749,52 @@ fn first_shared_source(identities: &[usize]) -> Option<(usize, usize)> {
     None
 }
 
+/// Index pair of the first two entries that declare the same identity.
+///
+/// The sibling of [`first_shared_source`] for a *declared* identity rather
+/// than an object pointer: two separately constructed sources over one
+/// physical subscription have distinct pointers, so the pointer check cannot
+/// see them, but they still compete for the same messages.
+///
+/// A `None` entry declares no identity and never matches — not even another
+/// `None`. An adapter that cannot name its subscription is not evidence of a
+/// clash, and treating absence as a match would reject every pair of custom
+/// adapters on sight.
+#[cfg(feature = "connectors")]
+fn first_shared_identity<T: PartialEq>(identities: &[Option<T>]) -> Option<(usize, usize)> {
+    for (i, id) in identities.iter().enumerate() {
+        let Some(id) = id else { continue };
+        if let Some(j) = identities[i + 1..]
+            .iter()
+            .position(|other| other.as_ref().is_some_and(|o| o == id))
+        {
+            return Some((i, i + 1 + j));
+        }
+    }
+    None
+}
+
+/// Index registered workflows by name the way the engine itself resolves them:
+/// **last-wins** (issue #944).
+///
+/// `HandlerRegistry` collapses the builder's `Vec<WorkflowInfo>` into a
+/// `HashMap`, so a name registered twice executes under the *last* definition.
+/// A `.find()` would be first-wins, which is not a cosmetic difference here:
+/// the target's info decides the effective [`IdempotencyMode`][im], so a first
+/// throttled definition followed by a plain one makes the runtime dedupe on
+/// broker coordinates while a first-wins lookup describes a definition that
+/// will never run — suppressing the 24-hour claim-lifetime warning and leaving
+/// the operator unaware that a late replay can start a second execution.
+///
+/// One helper so every connector path that reads a target's info agrees by
+/// construction rather than by comment.
+///
+/// [im]: crate::connector::IdempotencyMode
+#[cfg(feature = "connectors")]
+fn workflow_infos_by_name(workflows: &[WorkflowInfo]) -> HashMap<&str, &WorkflowInfo> {
+    workflows.iter().map(|w| (w.name, w)).collect()
+}
+
 /// Whether a binding's declared stream matches the stream its adapter
 /// actually consumes (issue #944).
 ///
@@ -783,15 +831,9 @@ fn spawn_connectors(
         crate::connector::PostgresDeadLetterSink::new(dead_letter_pool.clone()),
     );
 
-    // Resolve the target's `WorkflowInfo` **last-wins**, matching what
-    // `HandlerRegistry` itself does when it collapses the builder's `Vec` into
-    // a `HashMap` — a `.find()` here would be first-wins, so a workflow
-    // registered twice could hand the connector a different (e.g. differently
-    // throttled) info than the one the engine will actually execute, silently
-    // resolving the wrong `IdempotencyMode`. Also matches the validation pass,
-    // which builds its own last-wins map.
-    let by_name: std::collections::HashMap<&str, &WorkflowInfo> =
-        workflows.iter().map(|w| (w.name, w)).collect();
+    // Last-wins, matching `HandlerRegistry` and the validation pass -- see
+    // `workflow_infos_by_name` for why first-wins is a correctness bug here.
+    let by_name = workflow_infos_by_name(workflows);
 
     for registration in registrations {
         let binding = std::sync::Arc::clone(&registration.binding);
@@ -944,6 +986,32 @@ impl Plugin for HarvestPlugin {
                     connectors[i].binding.name, connectors[j].binding.name,
                 );
             }
+            // The same clash reached a different way: two *separately
+            // constructed* sources over one physical subscription have
+            // distinct pointers, so the identity check above cannot see them,
+            // but they still compete for the same messages. An adapter that
+            // declares no identity keeps the pointer check only.
+            let subscriptions: Vec<Option<String>> = connectors
+                .iter()
+                .map(|r| r.source.subscription_identity())
+                .collect();
+            if let Some((i, j)) = first_shared_identity(&subscriptions) {
+                panic!(
+                    "harvest connector bindings '{}' and '{}' consume the same physical \
+                     subscription ('{}'): both receive loops compete for the same messages, \
+                     so each binding sees an arbitrary SUBSET rather than the whole stream -- \
+                     on SQS every receiver on a queue competes, and on Kafka two consumers in \
+                     one group split the partitions between them. To fan one stream out to \
+                     two targets, use two Kafka consumers with DISTINCT group ids, or two SQS \
+                     queues behind an SNS topic",
+                    connectors[i].binding.name,
+                    connectors[j].binding.name,
+                    subscriptions[i].as_deref().unwrap_or("<unknown>"),
+                );
+            }
+            // Last-wins, so this warning describes the definition the engine
+            // will actually execute -- see `workflow_infos_by_name`.
+            let target_infos = workflow_infos_by_name(builder.workflow_infos());
             for registration in &connectors {
                 assert!(
                     binding_stream_matches_adapter(
@@ -966,10 +1034,9 @@ impl Plugin for HarvestPlugin {
                     crate::connector::resolve_idempotency_mode(
                         registration.binding.target,
                         registration.binding.idempotency_mode,
-                        builder
-                            .workflow_infos()
-                            .iter()
-                            .find(|w| w.name == registration.binding.target.workflow()),
+                        target_infos
+                            .get(registration.binding.target.workflow())
+                            .copied(),
                     ),
                     registration.binding.target,
                     builder.start_idempotency_window_config(),
@@ -3039,6 +3106,86 @@ mod tests {
         assert_eq!(first_shared_source(&[4, 4, 5, 5]), Some((0, 1)));
         assert_eq!(first_shared_source(&[]), None);
         assert_eq!(first_shared_source(&[9]), None);
+    }
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn two_sources_on_one_physical_subscription_are_rejected() {
+        // Pointer identity only catches a *shared* `Arc`. Two separately
+        // constructed sources over the same physical subscription have
+        // distinct pointers and compete for the same messages, so each target
+        // sees an arbitrary subset -- the same split the shared-`Arc` case
+        // produces, reached a different way.
+        let q = |s: &str| Some(s.to_string());
+        assert_eq!(
+            first_shared_identity(&[q("sqs:a"), q("sqs:b")]),
+            None,
+            "distinct subscriptions are the normal case"
+        );
+        assert_eq!(
+            first_shared_identity(&[q("sqs:a"), q("sqs:a")]),
+            Some((0, 1)),
+            "two sources on one queue url must be rejected"
+        );
+        // Two Kafka consumers on ONE topic under DISTINCT group ids is the
+        // sanctioned fan-out -- the existing panic message recommends it -- so
+        // the identity must include the group, not just the topic.
+        assert_eq!(
+            first_shared_identity(&[q("kafka:g1/orders"), q("kafka:g2/orders")]),
+            None,
+            "distinct consumer groups on one topic are a legitimate fan-out"
+        );
+        assert_eq!(
+            first_shared_identity(&[q("kafka:g1/orders"), q("kafka:g1/orders")]),
+            Some((0, 1)),
+            "two consumers in one group compete for the same partitions"
+        );
+        // An adapter that declares no identity is not evidence of a clash:
+        // two `None`s must never match each other, or every pair of custom
+        // adapters would be rejected on sight.
+        assert_eq!(first_shared_identity::<String>(&[None, None]), None);
+        assert_eq!(first_shared_identity(&[None, q("sqs:a")]), None);
+        // Reports the FIRST offending pair, matching `first_shared_source`.
+        assert_eq!(
+            first_shared_identity(&[q("a"), q("a"), q("b"), q("b")]),
+            Some((0, 1))
+        );
+        assert_eq!(first_shared_identity::<String>(&[]), None);
+    }
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn a_duplicate_workflow_name_resolves_last_wins_everywhere() {
+        // `HandlerRegistry` collapses the builder's `Vec<WorkflowInfo>` into a
+        // `HashMap`, so a name registered twice resolves LAST-wins -- that is
+        // the info the engine actually executes. Every connector path that
+        // reads a target's info must agree, or the startup warning describes a
+        // definition the runtime will never run: a first *throttled* definition
+        // followed by a plain one makes the runtime dedupe on broker
+        // coordinates while a first-wins lookup suppresses the 24h
+        // claim-lifetime warning, leaving the operator unaware that a late
+        // replay can start a second execution.
+        let named = |name| WorkflowInfo {
+            name,
+            ..fake_workflow_info()
+        };
+        let throttled = named("order_flow").with_throttle(
+            autumn_harvest::throttle::ThrottlePolicy::from_rate_str("100/m", None, None, None)
+                .unwrap(),
+        );
+        let plain = named("order_flow");
+        let other = named("cart");
+
+        let registered = [throttled, plain, other];
+        let map = workflow_infos_by_name(&registered);
+        assert!(
+            map["order_flow"].throttle.is_none(),
+            "the LAST definition of a duplicated name must win, matching \
+             HandlerRegistry -- a first-wins lookup would return the throttled one"
+        );
+        assert_eq!(map["cart"].name, "cart");
+        assert_eq!(map.len(), 2, "a duplicated name occupies one entry");
+        assert!(workflow_infos_by_name(&[]).is_empty());
     }
 
     #[cfg(feature = "connectors")]

@@ -688,6 +688,39 @@ coordinates, so a run traces back to the exact message.
   same row was stale for the same reason (the retention clamp above is not
   mentioned anywhere an operator reads), so it was corrected in the same pass,
   including the one remaining incomplete sentence in the connector guide.
+- **Two separately-constructed sources over one physical subscription were
+  accepted.** The build-time clash check compared `Arc::as_ptr`, which catches
+  a *shared* source object but not two sources built independently over one SQS
+  queue or one Kafka consumer group — they have distinct pointers and still
+  compete for the same messages, so each binding sees an arbitrary **subset**
+  rather than the whole stream. Object identity cannot express this; the
+  adapter has to state it. `EventSource::subscription_identity` is the new seam
+  (defaulting to `None`, which never matches another `None`, so a custom
+  adapter keeps today's pointer-only check rather than being rejected on
+  sight). It is deliberately a *subscription* identity, not a *stream* one: two
+  Kafka consumers on one topic under **distinct group ids** each receive the
+  whole stream — the fan-out the existing panic message recommends — so Kafka
+  pairs the group with the topic while SQS, which has no group concept, uses
+  the queue URL alone.
+- **The startup dedupe warning read a workflow definition the engine will never
+  run.** `HandlerRegistry` collapses the builder's `Vec<WorkflowInfo>` into a
+  `HashMap`, so a name registered twice executes **last-wins**, and
+  `spawn_connectors` matched that — but the validation pass used a first-wins
+  `.find()`. A first *throttled* definition followed by a plain one therefore
+  made the runtime dedupe on broker coordinates while the validation pass
+  suppressed the 24-hour claim-lifetime warning, leaving the operator unaware
+  that a late replay can start a second execution. Both now go through one
+  `workflow_infos_by_name` helper, so they agree by construction rather than by
+  a comment — a comment that, until this fix, asserted an agreement that did
+  not exist.
+- **The exported `MappedMessage` rustdoc still promised in-order delivery.** The
+  guide and quickstart were corrected when the affinity-is-not-ordering caveat
+  landed, but the API doc a library author actually reads still said same-key
+  messages arrive "in order" — which is false whenever `max_in_flight > 1`,
+  precisely the default. Both it and the `ConnectorTarget::SignalsWithStart`
+  variant doc (which called itself "the *ordered* path") now promise affinity,
+  name concurrent dispatch as the reason, and point at `.max_in_flight(1)` as
+  the one knob that does buy order.
 
 ### Success metric
 
