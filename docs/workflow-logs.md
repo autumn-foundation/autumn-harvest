@@ -192,6 +192,14 @@ Drop-newest is deliberate: the first lines of a run are the ones that explain ho
 it got where it is. A run that logs 10,000 lines has a logging problem, and the
 early lines are what diagnose it.
 
+`max_lines` bounds **memory as well as storage**: a decision cycle stops queuing
+`ctx.log_*` calls once it holds `max_lines + 1` of them, so a workflow logging in
+a tight loop without suspending cannot retain an unbounded number of messages
+before the write. (The one extra is what guarantees the truncation marker still
+fires — a batch of exactly `max_lines` would be admitted whole and look like a
+run that dropped nothing.) The stored outcome is identical either way; the bound
+just moves the drop from the database to the point of the call.
+
 **The marker is terminal.** Once an execution has truncated, later lines stay
 rejected even if `max_lines` is subsequently **raised**. `max_lines` is
 per-worker-process config, so on a rolling deployment a run can truncate under an

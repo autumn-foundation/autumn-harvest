@@ -201,6 +201,67 @@ async fn re_driven_cycle_does_not_duplicate_or_reorder_lines() {
     );
 }
 
+#[tokio::test]
+async fn the_return_value_is_the_rows_actually_inserted_not_the_rows_admitted() {
+    // Regression (issue #790 review round 2, P2). The function documents its
+    // return as "the number of real (non-marker) rows actually inserted", but
+    // returned the *admitted* count — so a re-drive, whose rows are all
+    // collapsed by `ON CONFLICT DO NOTHING`, reported writes that never
+    // happened. Callers that log or meter on it were being told a lie.
+    let (url, _c) = setup_database().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut conn, exec_id, "redrive_count_flow").await;
+
+    let cycle = vec![
+        line(0, "info", "step one"),
+        line(1, "info", "step two"),
+        line(2, "warn", "step three"),
+    ];
+
+    let first = store::append_workflow_logs(&mut conn, exec_id, &cycle, 1_000)
+        .await
+        .expect("first append");
+    assert_eq!(first, 3, "a fresh batch genuinely inserts all three rows");
+
+    // Same position, same seqs — every row is collapsed by the conflict clause.
+    let second = store::append_workflow_logs(&mut conn, exec_id, &cycle, 1_000)
+        .await
+        .expect("re-drive append");
+    assert_eq!(
+        second, 0,
+        "a re-drive inserts NOTHING, so the reported count must be 0"
+    );
+
+    // Partial overlap: two already-stored seqs plus one genuinely new line.
+    let overlapping = vec![
+        line(1, "info", "step two"),
+        line(2, "warn", "step three"),
+        line(3, "info", "step four"),
+    ];
+    let third = store::append_workflow_logs(&mut conn, exec_id, &overlapping, 1_000)
+        .await
+        .expect("partial-overlap append");
+    assert_eq!(third, 1, "only the genuinely new line is inserted");
+
+    // The critical guard on the fix: the truncation marker keys off ADMISSION,
+    // not the inserted count. Using `inserted` for that decision would fire a
+    // false marker on every re-drive (0 inserted < 3 lines), telling an operator
+    // a healthy run had dropped lines.
+    let rows = read_all(&mut conn, exec_id).await;
+    assert_eq!(
+        rows.len(),
+        4,
+        "four distinct lines stored, and NO truncation marker: {rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|(_, _, message)| message.contains("cap reached")),
+        "a re-drive must never fabricate a truncation marker: {rows:?}"
+    );
+}
+
 // ── AC3: level filter + cursor pagination ───────────────────────────────────
 
 #[tokio::test]

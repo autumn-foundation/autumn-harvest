@@ -66,6 +66,13 @@ never a correctness one. Relatedly, `seq` keys *position*, not *content*: if a
 deploy changes the message text of the Nth call and an in-flight execution is
 re-driven at that position, the originally stored text wins.
 
+`append_workflow_logs` returns the INSERT's **affected-row count**, not the
+number of lines it offered (Codex review round 2, P2): a re-driven cycle whose
+rows are all collapsed by the conflict clause honestly reports `0` written. The
+truncation-marker decision deliberately stays keyed on the *admitted* count —
+gating it on the inserted count would stamp a marker on every re-drive and tell
+an operator a healthy run had lost lines.
+
 **A log write can never wedge a workflow.** The INSERT runs in a nested
 `conn.transaction()` (a SAVEPOINT) inside the persist transaction and is
 warn-and-swallow on failure — an observability table erroring must not become a
@@ -82,6 +89,17 @@ response-level `truncated` flag that is probed directly and is therefore
 **filter-independent**. `with_max_lines(0)` clamps up to `1` — a policy that
 admits nothing would be a silent-loss trap, and disabling persistence is what
 *omitting* the builder call already means.
+
+`max_lines` bounds **memory as well as storage** (Codex review round 2, P2): a
+decision cycle stops queuing `RecordLog` commands once it holds `max_lines + 1`,
+checked *before* the message is cloned, so a workflow logging in a tight loop
+without suspending cannot retain hundreds of thousands of capped strings while
+advertising a 1,000-line cap. The `+ 1` is load-bearing — the store admits at
+most `max_lines` from any batch, so queuing exactly `max_lines` would satisfy
+`admit == lines.len()` and the truncation marker would never fire, converting
+AC4's *visible* overflow into silent loss. A dropped call still consumes its
+ordinal, so the `seq` identity AC2 depends on is undisturbed. The stored outcome
+is unchanged; only the point at which the excess is discarded moves.
 
 The marker is **terminal** (Codex review, P2): once it exists the gate stays
 shut, even if `max_lines` is later RAISED. `max_lines` is per-worker-process

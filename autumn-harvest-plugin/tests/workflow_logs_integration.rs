@@ -159,12 +159,17 @@ async fn get_json_with_admin(app: &HarvestApiApp, uri: &str, admin: bool) -> (St
 
 /// Start a real execution row so the route's existence check passes.
 ///
-/// Returns the execution id the start actually RESOLVED to, not the minted one:
-/// under the default `AllowDuplicate` reuse policy a re-run against an already
-/// migrated database (`HARVEST_TEST_DATABASE_URL`) attaches to the prior row,
-/// and a test that assumed its own minted id would then insert log rows against
-/// an execution that does not exist.
+/// The caller's `workflow_id` is suffixed with a fresh UUID so every call
+/// yields a genuinely NEW execution. Without that, the default `AllowDuplicate`
+/// reuse policy attaches to the prior run's row when the suite is re-run
+/// against a persistent database (`HARVEST_TEST_DATABASE_URL`) — the execution
+/// then already holds that test's log rows, so an assertion on how many rows a
+/// write actually inserted reads 0 rather than the fresh count. CI's
+/// per-test container hides this; a local re-run does not.
+///
+/// Returns the execution id the start RESOLVED to, not the minted one.
 async fn seed_execution(conn: &mut AsyncPgConnection, workflow_id: &str) -> ExecutionId {
+    let workflow_id = &format!("{workflow_id}-{}", uuid::Uuid::new_v4());
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     let started = start_or_load_workflow_execution(
         conn,

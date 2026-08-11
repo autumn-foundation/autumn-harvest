@@ -1637,12 +1637,13 @@ pub async fn update_current_details(
 
 /// `seq` reserved for the per-execution truncation marker (issue #790).
 ///
-/// `i64::MAX` sorts strictly after every real line — a real `seq` is
-/// `epoch << 24 | local_index`, and `epoch` (the loaded-history length) would
-/// have to exceed 2^39 to reach it, which the history hard cap makes
-/// unreachable by many orders of magnitude. Using the ordering key itself to
-/// pin the marker last means no extra column and no special-casing in the read
-/// path: the marker is just the final line.
+/// `i64::MAX` sorts strictly after every real line — a real `seq` is a
+/// **call ordinal** (the Nth `ctx.log_*` call of this run), so a workflow would
+/// have to make ~2^63 log calls in one execution to reach it, and the
+/// per-execution line cap plus the in-memory enqueue bound stop storing long
+/// before that. Using the ordering key itself to pin the marker last means no
+/// extra column and no special-casing in the read path: the marker is just the
+/// final line.
 pub const WORKFLOW_LOG_TRUNCATION_SEQ: i64 = i64::MAX;
 
 /// Message stored on the truncation marker row.
@@ -1693,7 +1694,10 @@ pub struct WorkflowLogLine {
 /// batch is either already stored (so `ON CONFLICT DO NOTHING` would have
 /// collapsed it) or was deliberately dropped.
 ///
-/// Returns the number of real (non-marker) rows actually inserted.
+/// Returns the number of real (non-marker) rows **actually inserted** — the
+/// affected-row count from the INSERT, not the number offered. A re-driven
+/// cycle whose rows are all collapsed by the conflict clause therefore returns
+/// `0`, which is the honest answer: nothing was written.
 pub async fn append_workflow_logs(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -1748,7 +1752,10 @@ pub async fn append_workflow_logs(
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let admit = (remaining as usize).min(lines.len());
 
-    if admit > 0 {
+    // Keep the affected-row count (issue #790 review round 2): on the re-drive
+    // path the conflict clause collapses rows that are already stored, so
+    // `admit` counts what we OFFERED, not what landed.
+    let inserted = if admit > 0 {
         let rows: Vec<crate::models::NewHarvestWorkflowLog> = lines[..admit]
             .iter()
             .map(|line| crate::models::NewHarvestWorkflowLog {
@@ -1764,10 +1771,17 @@ pub async fn append_workflow_logs(
             .do_nothing()
             .execute(conn)
             .await
-            .map_err(crate::error::database_error)?;
-    }
+            .map_err(crate::error::database_error)?
+    } else {
+        0
+    };
 
     // Anything we could not admit is dropped -- record the marker exactly once.
+    //
+    // This condition MUST stay on `admit`, never on `inserted`. A re-drive
+    // offers rows that are already stored, so `inserted` is 0 while nothing was
+    // dropped at all -- gating on it would stamp a truncation marker on every
+    // re-driven cycle and tell an operator a healthy run had lost lines.
     if admit < lines.len() {
         diesel::insert_into(dsl::harvest_workflow_logs)
             .values(crate::models::NewHarvestWorkflowLog {
@@ -1783,7 +1797,7 @@ pub async fn append_workflow_logs(
             .map_err(crate::error::database_error)?;
     }
 
-    Ok(admit)
+    Ok(inserted)
 }
 
 /// Read filters for one page of an execution's durable log lines (issue #790).

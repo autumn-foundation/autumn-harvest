@@ -1946,6 +1946,27 @@ impl WorkflowLogger<'_> {
         let Some(policy) = self.ctx.log_policy else {
             return;
         };
+
+        // Bound the in-memory queue at `max_lines + 1` (issue #790 review
+        // round 2). `max_lines` is otherwise enforced only at the database
+        // write, so a workflow logging in a large loop without suspending would
+        // retain one capped `String` per call for the whole decision cycle —
+        // hundreds of thousands of them — despite advertising a 1,000-line cap.
+        // Checked BEFORE the truncate below so the allocation is genuinely
+        // avoided, not merely dropped later.
+        //
+        // The `+ 1` is load-bearing: see `log_commands_queued`. Queuing exactly
+        // `max_lines` would make the store's `admit == lines.len()` and the
+        // truncation marker would never fire, turning AC4's visible overflow
+        // into silent loss.
+        let queued = self
+            .ctx
+            .log_commands_queued
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if queued > u64::from(policy.max_lines()) {
+            return;
+        }
+
         let capped = truncate_on_char_boundary(message, policy.max_message_bytes);
         // `seq` IS the call ordinal: a deterministic identity for this logical
         // line. A re-drive (spurious wake, rolled-back cycle, pause/resume)
@@ -2405,6 +2426,22 @@ pub struct WorkflowContext {
     /// to 0 each cycle — which is exactly right, because replay re-executes the
     /// body from the top.
     log_call_ordinal: std::sync::atomic::AtomicU64,
+    /// Count of [`WorkflowCommand::RecordLog`] commands **queued** so far this
+    /// decision cycle (issue #790 review round 2).
+    ///
+    /// Deliberately a *second* counter rather than a reuse of
+    /// [`log_call_ordinal`](WorkflowContext::log_call_ordinal): the ordinal
+    /// counts every `ctx.log_*` call including replay-suppressed ones (that is
+    /// what makes it a stable identity), whereas this counts only the commands
+    /// actually retained in memory. Bounding on the ordinal would shrink the
+    /// queue by however many lines the cycle happened to replay.
+    ///
+    /// The bound is `max_lines + 1`, not `max_lines`: the store admits at most
+    /// `max_lines` rows from any one batch, so a batch of exactly `max_lines`
+    /// would satisfy `admit == lines.len()` and never trip the truncation
+    /// marker — converting AC4's *visible* overflow into silent loss. One extra
+    /// queued command guarantees `admit < lines.len()` so the marker fires.
+    log_commands_queued: std::sync::atomic::AtomicU64,
     /// Opt-in durable-log-sink policy (issue #790). `None` (the default) means
     /// the sink is disabled: [`WorkflowLogger`] stays tracing-only and pushes
     /// no [`WorkflowCommand::RecordLog`] at all.
@@ -2901,6 +2938,7 @@ impl WorkflowContext {
             session_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
+            log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
@@ -3050,6 +3088,7 @@ impl WorkflowContext {
             session_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
+            log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
@@ -3114,6 +3153,7 @@ impl WorkflowContext {
             session_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
+            log_commands_queued: std::sync::atomic::AtomicU64::new(0),
             log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
@@ -22298,6 +22338,90 @@ mod tests {
         assert_eq!(
             logs[0].2, "😀😀",
             "truncation must land on a UTF-8 character boundary"
+        );
+    }
+
+    #[test]
+    fn queued_log_commands_are_bounded_by_the_line_cap() {
+        // Regression (issue #790 review round 2, P2). `max_lines` was enforced
+        // ONLY at the database write, so a workflow that logs in a large loop
+        // without suspending retained one capped `String` per call — hundreds of
+        // thousands of them — in the in-memory command queue for the whole
+        // decision cycle, despite advertising a 1,000-line cap. The bound must
+        // bite at ENQUEUE, before the message is even cloned.
+        //
+        // The bound is `max_lines + 1`, not `max_lines`: the store admits at
+        // most `max_lines` rows from any batch, so queuing exactly `max_lines`
+        // would make `admit == lines.len()` and the truncation marker would
+        // never fire — turning AC4's *visible* overflow into silent loss. One
+        // extra command guarantees `admit < lines.len()` and a visible marker.
+        let policy = WorkflowLogPolicy::default().with_max_lines(3);
+        let ctx = WorkflowContext::new_test().with_log_policy(Some(policy));
+        for i in 0..8 {
+            ctx.log_info(&format!("line {i}"));
+        }
+        let logs = recorded_logs(&ctx.drain_commands());
+        assert_eq!(
+            logs.len(),
+            4,
+            "a cycle must queue at most max_lines + 1 RecordLog commands, got {}",
+            logs.len()
+        );
+        // The queued lines are the OLDEST ones (drop-newest, matching the
+        // store's own admission rule) and their seqs are a contiguous prefix.
+        assert_eq!(
+            logs.iter().map(|l| l.2.as_str()).collect::<Vec<_>>(),
+            vec!["line 0", "line 1", "line 2", "line 3"],
+            "drop-newest: the first lines of a run are the ones that explain it"
+        );
+        assert_eq!(
+            logs.iter().map(|l| l.0).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn a_dropped_log_call_still_consumes_its_seq_ordinal() {
+        // The enqueue bound must NOT disturb the call-ordinal identity that AC2
+        // depends on. A call dropped by the bound still claims its slot, so if a
+        // later re-drive takes a shorter path (fewer early lines) the surviving
+        // lines keep the seqs they would have had — the ordinal counts CALLS,
+        // never queued commands.
+        let policy = WorkflowLogPolicy::default().with_max_lines(2);
+        let ctx = WorkflowContext::new_test().with_log_policy(Some(policy));
+        for i in 0..5 {
+            ctx.log_info(&format!("line {i}"));
+        }
+        // Non-vacuity: the bound must actually have dropped calls here, or the
+        // assertion below would hold trivially.
+        assert_eq!(
+            recorded_logs(&ctx.drain_commands()).len(),
+            3,
+            "max_lines(2) bounds the queue at 3, so 2 of the 5 calls were dropped"
+        );
+        // 5 calls were made, so the ordinal advanced 5 times even though only
+        // 3 commands were queued. Assert on the counter itself, since the
+        // dropped calls leave no command to inspect.
+        assert_eq!(
+            ctx.log_call_ordinal
+                .load(std::sync::atomic::Ordering::Relaxed),
+            5,
+            "every ctx.log_* call must consume an ordinal, queued or not"
+        );
+    }
+
+    #[test]
+    fn queued_log_commands_are_unbounded_when_persistence_is_disabled() {
+        // AC6 guard: the bound is a property of the durable sink. With the sink
+        // off there is nothing to bound and nothing is queued at all, so the
+        // new counter must never change the disabled path.
+        let ctx = WorkflowContext::new_test();
+        for i in 0..5_000 {
+            ctx.log_info(&format!("line {i}"));
+        }
+        assert!(
+            recorded_logs(&ctx.drain_commands()).is_empty(),
+            "the disabled sink queues nothing, bound or no bound"
         );
     }
 

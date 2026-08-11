@@ -4300,8 +4300,6 @@ mod tests {
         assert!(worker_config.queues.contains(&"default".to_string()));
     }
 
-    /// The core worker build path (`into_worker_parts`) — which the standalone
-    /// `HarvestRunner` worker funnels through via
     /// Both worker-parts hops must thread the configured durable-log policy
     /// into the `HandlerRegistry` (issue #790).
     ///
@@ -4314,6 +4312,7 @@ mod tests {
     ///
     /// `into_worker_parts_with_extra_state` is covered too because it is the hop
     /// the plugin (and any app registering extra shared state) actually takes.
+    #[cfg(feature = "db")]
     #[test]
     fn both_worker_parts_hops_thread_the_workflow_log_policy() {
         // Distinct from the defaults (1_000 / 4_096) so a hop that silently
@@ -4347,6 +4346,7 @@ mod tests {
     /// AC6: with no policy configured the registry carries `None`, so the
     /// executor never even constructs the durable sink and `ctx.logger()` is
     /// byte-for-byte pre-#790.
+    #[cfg(feature = "db")]
     #[test]
     fn worker_parts_carry_no_log_policy_unless_it_is_configured() {
         let (registry, _dags, _ws, _wc) = HarvestBuilder::new().build().into_worker_parts();
@@ -4356,6 +4356,8 @@ mod tests {
         );
     }
 
+    /// The core worker build path (`into_worker_parts`) — which the standalone
+    /// `HarvestRunner` worker funnels through via
     /// `into_worker_parts_with_extra_state` — must install the configured
     /// start-idempotency retention window into the process-global sweep static
     /// (issue #808, Codex P2). Without this, a split web/worker deployment
