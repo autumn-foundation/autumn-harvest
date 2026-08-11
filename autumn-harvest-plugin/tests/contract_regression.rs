@@ -531,6 +531,117 @@ fn awaitables_route_is_classified() {
     );
 }
 
+/// `GET /workflows/{id}/logs` (issue #790) must be registered in the management
+/// route list AND classified `ReadOnly` in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`, appearing in the route manifest
+/// with no audit operation (`None`) and listed in `EXCLUDED_ROUTES` — the exact
+/// read-only precedent set by `GET /workflows/{id}/awaitables`.
+///
+/// Mirrors `timeline_route_is_classified`: the audit-side mutual cross-check
+/// (`CLASSIFIED_ROUTES` vs `ALL_MUTATION_ROUTES`) stays green if a route is
+/// dropped from BOTH lists, so this test pins the route against the live
+/// router registry.
+#[test]
+fn workflow_logs_route_is_classified() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, EXCLUDED_ROUTES, RouteClass,
+    };
+
+    let route = "GET /workflows/{id}/logs";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && matches!(class, RouteClass::ReadOnly)),
+        "{route} must be classified ReadOnly in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+    assert!(
+        ALL_MUTATION_ROUTES
+            .iter()
+            .any(|(r, op)| *r == route && op.is_none()),
+        "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (None)"
+    );
+    assert!(
+        EXCLUDED_ROUTES.contains(&route),
+        "{route} is read-only and must be listed in EXCLUDED_ROUTES"
+    );
+}
+
+/// Every field an `EraseOutcome` can actually serialize must be declared in
+/// the response-field registry for `POST /workflows/{id}/erase-payloads`.
+///
+/// The generic `contract_response_fields_match_code_registry` check compares
+/// the code registry against `docs/api-contract.json` — never against the
+/// struct that is actually returned — so both can go stale together and stay
+/// green while the wire response grows a field. That is exactly what happened:
+/// `completion_deliveries_scrubbed` / `dead_letters_scrubbed` (#605) and then
+/// `logs_deleted` (#790) were all emitted but undeclared. `logs_deleted` is the
+/// only machine-readable receipt that a right-to-erasure request also removed
+/// the run's author log lines, so a contract-following client needs it
+/// documented.
+#[test]
+fn erase_outcome_serialized_fields_are_all_declared() {
+    let outcome = autumn_harvest::erase::EraseOutcome {
+        execution_id: "e".to_string(),
+        events_scrubbed: 1,
+        fields_tombstoned: 1,
+        execution_row_scrubbed: true,
+        // The three `skip_serializing_if` fields are populated deliberately, so
+        // this asserts over the *widest* response the endpoint can produce.
+        summary_scrubbed: true,
+        signals_scrubbed: 1,
+        logs_deleted: 1,
+        completion_deliveries_scrubbed: 1,
+        dead_letters_scrubbed: 1,
+        children: vec![],
+        skipped_children: vec![autumn_harvest::erase::SkippedChild {
+            execution_id: "c".to_string(),
+            state: "RUNNING".to_string(),
+            // `reason` is `skip_serializing_if = "Option::is_none"`, so populate
+            // it -- the point of this test is the WIDEST response shape.
+            reason: Some("legal hold".to_string()),
+        }],
+        failures: vec![autumn_harvest::erase::EraseFailure {
+            execution_id: "c".to_string(),
+            reason: "boom".to_string(),
+        }],
+    };
+    // `children` is skipped when empty; give it one entry so it serializes.
+    let outcome = autumn_harvest::erase::EraseOutcome {
+        children: vec![outcome.clone()],
+        ..outcome
+    };
+
+    let declared: Vec<&str> = management_api_response_fields()
+        .iter()
+        .find(|(m, p, _)| *m == "POST" && *p == "/workflows/{id}/erase-payloads")
+        .and_then(|(_, _, fields)| *fields)
+        .expect("erase-payloads must declare a response-field list")
+        .to_vec();
+
+    let serialized = serde_json::to_value(&outcome).expect("EraseOutcome must serialize");
+    let emitted: Vec<String> = serialized
+        .as_object()
+        .expect("EraseOutcome serializes as an object")
+        .keys()
+        .cloned()
+        .collect();
+
+    for key in &emitted {
+        assert!(
+            declared.contains(&key.as_str()),
+            "EraseOutcome emits `{key}` but it is not declared in \
+             management_api_response_fields() for POST /workflows/{{id}}/erase-payloads \
+             (declared: {declared:?})"
+        );
+    }
+}
+
 /// `GET /workflows/{id}/timeline` (issue #739) must be registered in the
 /// management route list AND classified `ReadOnly` in
 /// `autumn_harvest::audit::CLASSIFIED_ROUTES`, appearing in the route manifest

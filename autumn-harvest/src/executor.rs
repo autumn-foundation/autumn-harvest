@@ -252,6 +252,10 @@ pub enum QueryReplayOutcome {
 ///   best-effort live-output side channel (issue #791) that appends nothing to
 ///   `harvest_events` and is suppressed during replay — replay-neutral by
 ///   construction.
+/// - [`RecordLog`](WorkflowCommand::RecordLog): a durable but purely
+///   observational per-execution log line (issue #790). Written to a separate
+///   table, never to `harvest_events`, and suppressed during replay by the same
+///   gate as the `tracing` sink — replay-neutral by construction.
 /// - [`CancelRaceLosers`](WorkflowCommand::CancelRaceLosers): for the
 ///   timer+signal race shape (issue #600) this is a pure, deterministic function
 ///   of already-resolved history (the winner is fixed by recorded order), so it
@@ -284,6 +288,7 @@ pub(crate) const fn is_replay_significant_command(cmd: &WorkflowCommand) -> bool
         WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ReleaseMutex { .. }
     )
@@ -1301,7 +1306,13 @@ pub async fn run_workflow_with_state(
 /// Issue #526, test harness only. The context is built with
 /// [`WorkflowContext::with_advancing_timer_clock`] so that each durable timer
 /// resolved from history increments `ctx.now()` by its duration.
+// Mirrors its non-advancing-clock siblings, which are likewise a flat list of
+// independently-threaded context knobs (exec/history/handler/input/state/
+// span-meta/metrics/log-policy) rather than a struct — bundling them here alone
+// would diverge this harness entry point from the ones it must stay in step
+// with.
 #[cfg(any(test, feature = "testing"))]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_workflow_with_state_advancing_clock(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
@@ -1310,6 +1321,10 @@ pub async fn run_workflow_with_state_advancing_clock(
     state: SharedState,
     span_meta: Option<&WorkflowExecuteSpanMeta>,
     metrics: std::sync::Arc<dyn MetricsRecorder>,
+    // Issue #790: the durable-log policy, so a `WorkflowTestEnv` run can
+    // exercise `ctx.log_*`'s durable sink without a database. `None` (the
+    // default) reproduces a deployment with the sink disabled.
+    workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     use crate::context::WorkflowContext;
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
@@ -1339,7 +1354,9 @@ pub async fn run_workflow_with_state_advancing_clock(
     // Issue #698: thread the spawning parent's execution id so a child workflow
     // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
     .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
-    .with_metrics(metrics);
+    .with_metrics(metrics)
+    // Issue #790.
+    .with_log_policy(workflow_log_policy);
     drive_workflow(ctx, handler, input, span_meta).await
 }
 
@@ -1373,6 +1390,8 @@ pub async fn run_workflow_with_state_and_history_policy(
         crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
         crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
         crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+        // Durable log sink disabled on this convenience path (issue #790).
+        None,
         std::collections::HashMap::new(),
         None,
         metrics,
@@ -1400,6 +1419,9 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     max_signal_payload_bytes: u64,
     max_workflow_input_bytes: u64,
     max_current_details_bytes: usize,
+    // Opt-in durable workflow-log sink policy (issue #790). `None` = disabled,
+    // which keeps `ctx.logger()` tracing-only and byte-for-byte pre-#790.
+    workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
     context_headers: std::collections::HashMap<String, String>,
     payload_offload_threshold: Option<u64>,
     metrics: std::sync::Arc<dyn MetricsRecorder>,
@@ -1431,6 +1453,7 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
         max_workflow_input_bytes,
     )
     .with_current_details_cap(max_current_details_bytes)
+    .with_log_policy(workflow_log_policy)
     .with_payload_offload_threshold(payload_offload_threshold)
     .with_context_headers(context_headers)
     .with_metrics(metrics)
@@ -2309,6 +2332,7 @@ mod tests {
             empty_shared_state(),
             Some(&meta),
             recorder.clone(),
+            None,
         )
         .await;
         match outcome {
@@ -2341,6 +2365,7 @@ mod tests {
             empty_shared_state(),
             Some(&meta),
             recorder.clone(),
+            None,
         )
         .await;
         match outcome {
@@ -2366,6 +2391,7 @@ mod tests {
             empty_shared_state(),
             Some(&meta),
             recorder.clone(),
+            None,
         )
         .await;
         assert!(matches!(outcome, WorkflowOutcome::Suspended { .. }));

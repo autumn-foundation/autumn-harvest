@@ -292,6 +292,69 @@ fn workflow_list_and_query_use_get_requests() {
     );
     assert_eq!(timeline_request.body, None);
 
+    // Durable per-execution author logs (issue #790).
+    let logs = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "logs",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow logs args should parse");
+    let logs_request = logs.api_request().expect("logs request should build");
+    assert_eq!(logs_request.method, ApiMethod::Get);
+    assert_eq!(
+        logs_request.path, "/workflows/00000000-0000-0000-0000-000000000001/logs",
+        "no flags must send no query string at all"
+    );
+    assert_eq!(logs_request.body, None);
+
+    // Every flag, including a comma-separated --level that must expand into
+    // one `level=` param per value.
+    let logs_filtered = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "logs",
+        "00000000-0000-0000-0000-000000000001",
+        "--level",
+        "warn,error",
+        "--limit",
+        "50",
+        "--cursor",
+        "17",
+        "--since",
+        "2026-05-06T00:00:00Z",
+    ])
+    .expect("workflow logs filter args should parse");
+    let logs_filtered_request = logs_filtered
+        .api_request()
+        .expect("filtered logs request should build");
+    assert_eq!(
+        logs_filtered_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/logs\
+         ?level=warn&level=error&limit=50&cursor=17&since=2026-05-06T00:00:00Z"
+    );
+    assert_eq!(logs_filtered_request.body, None);
+
+    // A repeated --level flag is equivalent to the comma-separated form.
+    let logs_repeated = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "logs",
+        "00000000-0000-0000-0000-000000000001",
+        "--level",
+        "warn",
+        "--level",
+        "error",
+    ])
+    .expect("repeated --level should parse");
+    assert_eq!(
+        logs_repeated
+            .api_request()
+            .expect("repeated-level request should build")
+            .path,
+        "/workflows/00000000-0000-0000-0000-000000000001/logs?level=warn&level=error"
+    );
+
     let awaitables = Cli::try_parse_from([
         "harvest",
         "workflow",

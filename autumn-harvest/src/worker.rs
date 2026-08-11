@@ -447,6 +447,10 @@ pub struct HandlerRegistry {
     /// Maximum byte length for `current_details` strings passed to the
     /// workflow context (issue #473). Default: 1 KiB.
     pub max_current_details_bytes: usize,
+    /// Opt-in durable workflow-log sink policy (issue #790). `None` (the
+    /// default) disables the sink: `ctx.logger()` stays tracing-only, no
+    /// `RecordLog` command is ever pushed, and the worker performs no log write.
+    pub workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
     /// Server-side ceiling on `workflow_attempt` (issue #523). `None` = no
     /// ceiling. Applied to scheduler-fired starts so automated fires respect
     /// the same operator-configured cap as API/manual starts.
@@ -644,6 +648,7 @@ impl HandlerRegistry {
             max_activity_result_bytes: crate::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
             max_signal_payload_bytes: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             max_current_details_bytes: crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+            workflow_log_policy: None,
             circuit_breakers: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
                 circuit_policies,
             )),
@@ -722,6 +727,19 @@ impl HandlerRegistry {
     #[must_use]
     pub const fn with_current_details_cap(mut self, cap_bytes: usize) -> Self {
         self.max_current_details_bytes = cap_bytes;
+        self
+    }
+
+    /// Install the opt-in durable workflow-log sink policy (issue #790).
+    ///
+    /// `None` (the default) disables the sink entirely: no `RecordLog` command
+    /// is pushed by the context and the worker performs no log write.
+    #[must_use]
+    pub const fn with_workflow_log_policy(
+        mut self,
+        policy: Option<crate::context::WorkflowLogPolicy>,
+    ) -> Self {
+        self.workflow_log_policy = policy;
         self
     }
 
@@ -978,6 +996,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("max_activity_result_bytes", &self.max_activity_result_bytes)
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("max_current_details_bytes", &self.max_current_details_bytes)
+            .field("workflow_log_policy", &self.workflow_log_policy)
             .field("circuit_breakers", &self.circuit_breakers)
             .field(
                 "max_workflow_attempts_ceiling",
@@ -1058,6 +1077,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
         WorkflowCommand::PublishProgress { .. } => "PublishProgress",
+        WorkflowCommand::RecordLog { .. } => "RecordLog",
         WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
         WorkflowCommand::RequestCancelExternalWorkflow { .. } => "RequestCancelExternalWorkflow",
         WorkflowCommand::AwaitExternalWorkflow { .. } => "AwaitExternalWorkflow",
@@ -1125,6 +1145,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
                 | WorkflowCommand::ArmTimer { .. }
@@ -1147,6 +1168,7 @@ fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::PublishProgress { .. }
+                    | WorkflowCommand::RecordLog { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
                     | WorkflowCommand::ArmTimer { .. }
@@ -1178,6 +1200,7 @@ fn should_handle_mutex_acquire(commands: &[WorkflowCommand]) -> bool {
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ArmTimer { .. }
@@ -1431,6 +1454,7 @@ fn extract_single_command<T>(
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
                 | WorkflowCommand::ArmTimer { .. }
@@ -1463,6 +1487,7 @@ fn extract_all_scheduled_activities(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ArmTimer { .. }
@@ -1514,6 +1539,7 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ArmTimer { .. }
@@ -1573,6 +1599,7 @@ fn extract_started_timer_for_suspension(
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::PublishProgress { .. }
+                | WorkflowCommand::RecordLog { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
                 | WorkflowCommand::ArmTimer { .. }
@@ -1602,6 +1629,7 @@ fn extract_all_started_child_workflows(
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::PublishProgress { .. }
+                    | WorkflowCommand::RecordLog { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
                     | WorkflowCommand::ArmTimer { .. }
@@ -1721,6 +1749,7 @@ fn extract_child_timeout_race(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ReleaseMutex { .. } => {}
             // Anything else (activity, activity wait, signal wait, external
@@ -2173,7 +2202,8 @@ fn split_mixed_signal_batch(
             WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
-            | WorkflowCommand::PublishProgress { .. } => {}
+            | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. } => {}
             other => remaining.push(other),
         }
     }
@@ -4995,6 +5025,83 @@ async fn persist_current_details_from_commands(
         }
     }
     Ok(())
+}
+
+/// Collect this cycle's [`WorkflowCommand::RecordLog`] commands into the
+/// store-layer line shape, in emission order (issue #790).
+///
+/// Pure and total: no DB, no I/O. `seq` is a `u64` in the command (the shared
+/// `encode_progress_seq` encoding) and an `i64` in the column; the saturating
+/// cast is unreachable for a real execution (`epoch` would have to exceed 2^39)
+/// and pins to `i64::MAX - 1` rather than wrapping into the reserved truncation
+/// slot, so a pathological value can never masquerade as the marker.
+fn collect_log_lines(commands: &[WorkflowCommand]) -> Vec<store::WorkflowLogLine> {
+    commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::RecordLog {
+                seq,
+                level,
+                message,
+            } => Some(store::WorkflowLogLine {
+                // Clamp strictly BELOW the reserved truncation slot. `try_from`
+                // alone would let a `seq` of exactly `i64::MAX` convert
+                // successfully and land ON the sentinel, letting a real line
+                // masquerade as the marker. Unreachable for a real execution
+                // (it needs 2^63 log calls in one cycle), but the guarantee is
+                // "can never be forged", so make it total.
+                seq: i64::try_from(*seq)
+                    .unwrap_or(i64::MAX)
+                    .min(store::WORKFLOW_LOG_TRUNCATION_SEQ - 1),
+                level: level.as_str(),
+                message: message.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Persist this cycle's durable workflow log lines (issue #790).
+///
+/// **Best-effort by design — a log write must never fail a workflow.** Logs are
+/// observational; wedging a run because an observability table is missing or
+/// erroring would be a self-inflicted outage. Two things make "best-effort"
+/// actually hold here:
+///
+/// 1. The write is wrapped in its own nested `transaction`, which Postgres
+///    implements as a SAVEPOINT. Without it, a failed statement would poison
+///    the *enclosing* persist transaction (every later statement erroring with
+///    "current transaction is aborted"), so swallowing the error would not save
+///    the cycle — it would corrupt it. The savepoint rolls back just this write.
+/// 2. The error is then logged and dropped.
+///
+/// A no-op (`lines.is_empty()`, i.e. the sink is disabled or the workflow logged
+/// nothing) opens no savepoint at all, so the disabled path costs one slice
+/// scan and nothing else.
+async fn persist_workflow_logs_from_commands(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+    max_lines: u32,
+) {
+    let lines = collect_log_lines(commands);
+    if lines.is_empty() {
+        return;
+    }
+    let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |c| {
+        store::append_workflow_logs(c, exec_id, &lines, max_lines).await?;
+        Ok(())
+    }))
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(
+            execution_id = %exec_id,
+            error = %e,
+            lines = lines.len(),
+            "harvest: failed to persist durable workflow logs (issue #790); \
+             logs are observational and best-effort, so the workflow continues"
+        );
+    }
 }
 
 /// Fire a best-effort `pg_notify` for each [`WorkflowCommand::PublishProgress`]
@@ -9927,6 +10034,17 @@ async fn handle_suspended_workflow(
         )
         .await;
     }
+    // Persist durable workflow logs (issue #790) — best-effort, never fails
+    // the cycle. No-op when the sink is disabled (the default).
+    if let Some(policy) = registry.workflow_log_policy {
+        persist_workflow_logs_from_commands(
+            conn,
+            context.persistence.exec_id,
+            commands,
+            policy.max_lines(),
+        )
+        .await;
+    }
     // Fire ephemeral progress chunks (issue #791) — best-effort, never fails the cycle.
     notify_progress_from_commands(conn, context.persistence.exec_id, commands).await;
 
@@ -10910,6 +11028,16 @@ async fn persist_terminal_outcome_commands(
         .await?;
     persist_search_attrs_from_commands(conn, persistence.exec_id, pending_cmds).await?;
     persist_current_details_from_commands(conn, persistence.exec_id, pending_cmds).await?;
+    // Persist durable workflow logs (issue #790) — best-effort, never fails the cycle.
+    if let Some(policy) = registry.workflow_log_policy {
+        persist_workflow_logs_from_commands(
+            conn,
+            persistence.exec_id,
+            pending_cmds,
+            policy.max_lines(),
+        )
+        .await;
+    }
     // Fire ephemeral progress chunks (issue #791) — best-effort, never fails the cycle.
     notify_progress_from_commands(conn, persistence.exec_id, pending_cmds).await;
 
@@ -11915,6 +12043,7 @@ async fn process_workflow_task(
                         per.max(registry.max_workflow_input_bytes)
                     }),
                 registry.max_current_details_bytes,
+                registry.workflow_log_policy,
                 exec_context_headers.clone(),
                 registry
                     .payload_offloader()
@@ -11945,6 +12074,16 @@ async fn process_workflow_task(
                 persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await?;
                 // Persist the current_details breadcrumb before inline execution (issue #473).
                 persist_current_details_from_commands(conn, prepared.exec_id, &commands).await?;
+                // Persist durable workflow logs (issue #790) — best-effort, before inline run.
+                if let Some(policy) = registry.workflow_log_policy {
+                    persist_workflow_logs_from_commands(
+                        conn,
+                        prepared.exec_id,
+                        &commands,
+                        policy.max_lines(),
+                    )
+                    .await;
+                }
                 // Fire ephemeral progress chunks (issue #791) — best-effort, before inline run.
                 notify_progress_from_commands(conn, prepared.exec_id, &commands).await;
                 // Issue #691 (FIX-B): resolve any ReleaseMutex bookkeeping (an
@@ -12151,6 +12290,7 @@ async fn process_workflow_task(
                             | WorkflowCommand::UpsertSearchAttributes { .. }
                             | WorkflowCommand::SetCurrentDetails { .. }
                             | WorkflowCommand::PublishProgress { .. }
+                            | WorkflowCommand::RecordLog { .. }
                             | WorkflowCommand::ReleaseMutex { .. }
                     )
                 }) && !commands
@@ -12215,6 +12355,16 @@ async fn process_workflow_task(
                         Err::<(), _>(e),
                         workflow_panic_strikes,
                         prepared.exec_id.as_uuid(),
+                    )
+                    .await;
+                }
+                // Persist durable workflow logs (issue #790) — best-effort, never fails the cycle.
+                if let Some(policy) = registry.workflow_log_policy {
+                    persist_workflow_logs_from_commands(
+                        conn,
+                        prepared.exec_id,
+                        &commands,
+                        policy.max_lines(),
                     )
                     .await;
                 }
@@ -12453,6 +12603,16 @@ async fn process_workflow_task(
                         Err::<(), _>(e),
                         workflow_panic_strikes,
                         prepared.exec_id.as_uuid(),
+                    )
+                    .await;
+                }
+                // Persist durable workflow logs (issue #790) — best-effort, never fails the cycle.
+                if let Some(policy) = registry.workflow_log_policy {
+                    persist_workflow_logs_from_commands(
+                        conn,
+                        prepared.exec_id,
+                        &commands,
+                        policy.max_lines(),
                     )
                     .await;
                 }
@@ -18129,6 +18289,92 @@ mod tests {
             "a value truncated down to empty without explicit_clear must not \
              clear the column -- it must be a no-op that preserves the \
              existing breadcrumb"
+        );
+    }
+
+    // ── Durable workflow logs (issue #790) ────────────────────────────
+
+    #[test]
+    fn collect_log_lines_preserves_emission_order_and_levels() {
+        let cmds = vec![
+            WorkflowCommand::RecordLog {
+                seq: 10,
+                level: crate::context::WorkflowLogLevel::Info,
+                message: "first".to_string(),
+            },
+            WorkflowCommand::SetCurrentDetails {
+                value: "noise".to_string(),
+                explicit_clear: false,
+            },
+            WorkflowCommand::RecordLog {
+                seq: 11,
+                level: crate::context::WorkflowLogLevel::Error,
+                message: "second".to_string(),
+            },
+        ];
+        let lines = collect_log_lines(&cmds);
+        assert_eq!(lines.len(), 2, "unrelated commands must be ignored");
+        assert_eq!((lines[0].seq, lines[0].level), (10, "info"));
+        assert_eq!((lines[1].seq, lines[1].level), (11, "error"));
+        assert_eq!(lines[1].message, "second");
+    }
+
+    #[test]
+    fn collect_log_lines_is_empty_without_record_log_commands() {
+        // The sink-disabled path: the context pushes no RecordLog at all, so
+        // the worker must resolve to "nothing to write" and open no savepoint.
+        let cmds = vec![WorkflowCommand::SetCurrentDetails {
+            value: "x".to_string(),
+            explicit_clear: false,
+        }];
+        assert!(collect_log_lines(&cmds).is_empty());
+    }
+
+    #[test]
+    fn collect_log_lines_saturates_rather_than_colliding_with_the_truncation_marker() {
+        // `seq` is u64 on the command and i64 in the column. An unrepresentable
+        // value must pin BELOW the reserved truncation slot, never wrap into it
+        // (which would let a real line masquerade as the marker).
+        let cmds = vec![WorkflowCommand::RecordLog {
+            seq: u64::MAX,
+            level: crate::context::WorkflowLogLevel::Warn,
+            message: "extreme".to_string(),
+        }];
+        let lines = collect_log_lines(&cmds);
+        assert_eq!(lines[0].seq, i64::MAX - 1);
+        assert_ne!(
+            lines[0].seq,
+            store::WORKFLOW_LOG_TRUNCATION_SEQ,
+            "a real line must never collide with the truncation marker slot"
+        );
+    }
+
+    #[test]
+    fn record_log_is_pure_bookkeeping_for_every_worker_classifier() {
+        // The 11 non-compile-enforced classifiers in this file fail SILENTLY at
+        // runtime if a new bookkeeping command is missed (a stalled workflow,
+        // not a build break). These are the highest-blast-radius ones: assert
+        // RecordLog is treated exactly like the SetCurrentDetails precedent.
+        let log = || WorkflowCommand::RecordLog {
+            seq: 1,
+            level: crate::context::WorkflowLogLevel::Info,
+            message: "m".to_string(),
+        };
+        assert_eq!(workflow_command_name(&log()), "RecordLog");
+        assert!(
+            only_bookkeeping_commands(&[log()]),
+            "a log-only cycle must be classified as bookkeeping-only, or the \
+             worker would misread it as an unsupported suspension"
+        );
+        assert!(
+            should_requeue_signal_wait(&[
+                WorkflowCommand::WaitForSignal {
+                    signal_name: "go".to_string(),
+                    result_tx: tokio::sync::oneshot::channel().0,
+                },
+                log(),
+            ]),
+            "a signal-wait park carrying a log line must still be requeued"
         );
     }
 

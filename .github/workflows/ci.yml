@@ -248,6 +248,9 @@ jobs:
       - name: Run mutex_ledger example tests (issue #691)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example mutex_ledger
+      - name: Run workflow_logs example tests (issue #790)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example workflow_logs
       - name: Run fanout_batch example tests (issue #750)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example fanout_batch

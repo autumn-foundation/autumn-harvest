@@ -239,6 +239,38 @@ impl HarvestPlugin {
         self
     }
 
+    /// Enable the **opt-in durable per-execution workflow log sink** (issue
+    /// #790).
+    ///
+    /// With it, lines emitted through the existing
+    /// `ctx.logger()` / `ctx.log_info` / `ctx.log_warn` / `ctx.log_error`
+    /// entry points (issue #379) are additionally persisted per execution and
+    /// readable in one call via `GET /api/harvest/workflows/{id}/logs`, the
+    /// `harvest workflow logs` CLI command, or the Vantage execution-detail
+    /// **Logs** panel — no external log-aggregation correlation.
+    ///
+    /// **Off by default, and additive.** Without this call `ctx.logger()`
+    /// behaves exactly as before (`tracing`-only), and the workflow body does
+    /// not change either way.
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest_plugin::HarvestPlugin;
+    /// # use autumn_harvest::WorkflowLogPolicy;
+    /// // Defaults: 1,000 lines per execution, 4 KiB per line.
+    /// let plugin = HarvestPlugin::new().workflow_log_persistence(WorkflowLogPolicy::new());
+    /// ```
+    ///
+    /// See [`docs/workflow-logs.md`](https://github.com/autumn-foundation/autumn-harvest/blob/main/docs/workflow-logs.md)
+    /// for the full contract.
+    #[must_use]
+    pub fn workflow_log_persistence(
+        mut self,
+        policy: autumn_harvest::context::WorkflowLogPolicy,
+    ) -> Self {
+        self.builder = self.builder.workflow_log_persistence(policy);
+        self
+    }
+
     /// Mount the Harvest management API under `path`.
     #[must_use]
     pub fn api(mut self, path: impl Into<String>) -> Self {
@@ -2128,6 +2160,42 @@ mod tests {
             handler: dispatch,
             queue: None,
         }
+    }
+
+    #[test]
+    fn workflow_log_persistence_threads_the_policy_into_the_built_harvest() {
+        // Issue #790 (review P1): the durable log sink lives on
+        // `HarvestBuilder`, and `HarvestPlugin` holds its builder privately
+        // behind a hand-picked forwarder set. Without this forwarder the
+        // feature has NO enabling path for a plugin-wired app -- which is the
+        // primary documented deployment shape, and exactly what every doc
+        // snippet shows.
+        let built = HarvestPlugin::new()
+            .workflow_log_persistence(
+                autumn_harvest::WorkflowLogPolicy::new()
+                    .with_max_lines(7)
+                    .with_max_message_bytes(64),
+            )
+            .builder
+            .try_build()
+            .expect("builder must build");
+
+        let policy = built
+            .workflow_log_policy
+            .expect("the forwarded policy must reach BuiltHarvest");
+        assert_eq!(policy.max_lines(), 7);
+        assert_eq!(policy.max_message_bytes(), 64);
+    }
+
+    #[test]
+    fn workflow_log_persistence_is_off_unless_the_forwarder_is_called() {
+        // The AC6 opt-in boundary: absent the call the sink is disabled and
+        // `ctx.logger()` is byte-for-byte today's tracing-only behaviour.
+        let built = HarvestPlugin::new()
+            .builder
+            .try_build()
+            .expect("builder must build");
+        assert!(built.workflow_log_policy.is_none());
     }
 
     #[cfg(feature = "webhooks")]

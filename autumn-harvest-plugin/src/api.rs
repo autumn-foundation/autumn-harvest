@@ -4437,6 +4437,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}/tree", get(get_workflow_tree))
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{id}/timeline", get(get_workflow_timeline))
+        // Durable per-execution author log lines (issue #790): admin-gated
+        // (log messages are free-form author text), read-only.
+        .route(
+            "/workflows/{id}/logs",
+            get(get_workflow_logs).route_layer(require_admin.clone()),
+        )
         // Open-awaitables diagnostic (issue #615): admin-gated (the eligibility
         // endpoints' posture), read-only replay projection of what the
         // execution is currently parked on.
@@ -5613,6 +5619,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/tree"),
         ("GET", "/workflows/{id}/stack"),
         ("GET", "/workflows/{id}/timeline"),
+        // Durable per-execution author log lines (issue #790). Admin-gated,
+        // read-only. See docs/api-contract.json.
+        ("GET", "/workflows/{id}/logs"),
         ("GET", "/workflows/{id}/awaitables"),
         ("GET", "/workflows/{id}/run-chain"),
         // Single-execution replay diagnosis (issue #614): admin-gated, read-only
@@ -6369,6 +6378,20 @@ pub const fn management_api_response_fields()
         ),
         (
             "GET",
+            "/workflows/{id}/logs",
+            // Issue #790. Nested `lines[]` fields (`seq`, `level`, `message`,
+            // `occurred_at`, `truncation_marker`) are documented in the route's
+            // contract description, following the `/stack` precedent.
+            Some(&[
+                "execution_id",
+                "lines",
+                "next_cursor",
+                "total_lines",
+                "truncated",
+            ]),
+        ),
+        (
+            "GET",
             "/workflows/{id}/awaitables",
             // Issue #615. `wait_set_reason` is omitted when absent
             // (skip_serializing_if) but declared here so the registry ↔
@@ -6546,7 +6569,11 @@ pub const fn management_api_response_fields()
                 "events_scrubbed",
                 "fields_tombstoned",
                 "execution_row_scrubbed",
+                "summary_scrubbed",
                 "signals_scrubbed",
+                "logs_deleted",
+                "completion_deliveries_scrubbed",
+                "dead_letters_scrubbed",
                 "children",
                 "skipped_children",
                 "failures",
@@ -11173,6 +11200,239 @@ async fn get_workflow_timeline(
     );
 
     Ok(Json(timeline))
+}
+
+// ── Durable per-execution workflow logs (issue #790) ──────────────────────
+
+const DEFAULT_WORKFLOW_LOG_PAGE: i64 = 200;
+const MAX_WORKFLOW_LOG_PAGE: i64 = 1000;
+
+/// One durable log line as served by `GET /workflows/{id}/logs`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct WorkflowLogLineResponse {
+    /// Deterministic emission-order key; also the pagination cursor.
+    pub seq: i64,
+    /// `info` | `warn` | `error`.
+    pub level: String,
+    /// The author-emitted message (capped at write time).
+    pub message: String,
+    /// Wall-clock instant the line was persisted.
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    /// `true` for the synthetic per-execution cap marker (issue #790, AC4).
+    /// Omitted for ordinary lines.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncation_marker: bool,
+}
+
+/// Response of `GET /workflows/{id}/logs`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct WorkflowLogsResponse {
+    /// The execution's id (echoed).
+    pub execution_id: String,
+    /// The log lines for this page, in emission order.
+    pub lines: Vec<WorkflowLogLineResponse>,
+    /// Opaque cursor; pass as `?cursor=` for the next page. `null` = last page.
+    pub next_cursor: Option<i64>,
+    /// Total persisted line count for this execution, unaffected by filters.
+    pub total_lines: i64,
+    /// `true` when this execution hit its per-execution cap and later lines
+    /// were dropped (issue #790, AC4). Independent of the current page's
+    /// filters, so a `?level=error` page still reports it.
+    pub truncated: bool,
+}
+
+/// Parsed `GET /workflows/{id}/logs` query: `(limit, cursor, levels, since)`.
+type WorkflowLogsQueryParams = (
+    i64,
+    Option<i64>,
+    Vec<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+/// Parse query parameters for `GET /workflows/{id}/logs`.
+///
+/// An unknown `level=` value is rejected rather than silently ignored: a typo
+/// would otherwise answer "no lines" for a run that has plenty, which is the
+/// worst possible outcome for a triage endpoint.
+fn parse_workflow_logs_query(
+    pairs: &[(String, String)],
+) -> Result<WorkflowLogsQueryParams, AutumnError> {
+    let mut limit = DEFAULT_WORKFLOW_LOG_PAGE;
+    let mut cursor: Option<i64> = None;
+    let mut levels: Vec<String> = Vec::new();
+    let mut since: Option<chrono::DateTime<chrono::Utc>> = None;
+
+    for (k, v) in pairs {
+        match k.as_str() {
+            "limit" => {
+                let parsed = v.parse::<i64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid limit {v:?}: must be a positive integer"
+                    ))
+                })?;
+                if parsed <= 0 {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "invalid limit {parsed}: must be a positive integer"
+                    )));
+                }
+                limit = parsed.clamp(1, MAX_WORKFLOW_LOG_PAGE);
+            }
+            // `after` is accepted as an alias for parity with
+            // `GET /workflows/{id}/history`.
+            "cursor" | "after" => {
+                let parsed = v.parse::<i64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid cursor {v:?}: must be a non-negative integer"
+                    ))
+                })?;
+                if parsed < 0 {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "invalid cursor {parsed}: must be non-negative"
+                    )));
+                }
+                cursor = Some(parsed);
+            }
+            "level" => {
+                for part in v.split(',') {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    let level =
+                        autumn_harvest::WorkflowLogLevel::from_wire(part).ok_or_else(|| {
+                            AutumnError::bad_request_msg(format!(
+                                "invalid level {part:?}: expected one of info, warn, error"
+                            ))
+                        })?;
+                    let wire = level.as_str().to_string();
+                    if !levels.contains(&wire) {
+                        levels.push(wire);
+                    }
+                }
+            }
+            "since" => {
+                since = Some(parse_audit_datetime(v.trim())?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok((limit, cursor, levels, since))
+}
+
+/// `GET /workflows/{id}/logs` — durable per-execution author log lines.
+///
+/// Read-only projection of `harvest_workflow_logs` (issue #790). Lines are
+/// returned in **emission order** (`seq`, the deterministic logical-position
+/// key), never `occurred_at` — which is wall clock and can be non-monotonic
+/// across workers.
+///
+/// Admin-gated, matching the sibling per-execution diagnostic reads
+/// (`/awaitables`, the eligibility endpoints): a log message is free-form
+/// author text that routinely carries business detail, so it gets the stricter
+/// posture rather than the plain-execution-row one.
+///
+/// Shard routing uses the **exact** (no default-shard fallback) resolver: an
+/// empty log list is a legitimate answer for a run that simply never logged, so
+/// a mis-routed read would be indistinguishable from "this run has no logs".
+/// Failing closed with a 503 keeps the answer honest.
+///
+/// Logs are observational only (AC7): they are not part of the event history,
+/// carry no determinism guarantee, and are never read back into workflow logic.
+async fn get_workflow_logs(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<WorkflowLogsResponse>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let (limit, cursor, levels, since) = parse_workflow_logs_query(&pairs)?;
+
+    let Some(mut conn) = db_conn_for_execution_exact(&api_state, exec_id).await? else {
+        return Err(AutumnError::not_found_msg(format!(
+            "workflow execution {exec_id} not found"
+        )));
+    };
+
+    // Existence check first, so an unknown id is a 404 rather than an empty page.
+    match load_execution(&mut conn, exec_id).await {
+        Ok(_) => {}
+        Err(HarvestError::NotFound(_)) => {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found"
+            )));
+        }
+        Err(err) => return Err(map_error(err)),
+    }
+
+    let level_refs: Vec<&str> = levels.iter().map(String::as_str).collect();
+    // Fetch `limit + 1` and compare, the repo's pagination idiom (see the
+    // schedule-runs / audit / dead-letter loaders). Emitting a cursor purely
+    // because the page came back full would hand the caller a non-null
+    // `next_cursor` whose follow-up page is empty whenever the remaining line
+    // count is an exact multiple of `limit` -- and, on a capped run, that
+    // spurious cursor is the `i64::MAX` marker slot.
+    let mut rows = autumn_harvest::store::load_workflow_logs(
+        &mut conn,
+        exec_id,
+        &autumn_harvest::store::WorkflowLogQuery {
+            after_seq: cursor,
+            since,
+            levels: &level_refs,
+            limit: limit.saturating_add(1),
+        },
+    )
+    .await
+    .map_err(map_error)?;
+    let has_more = i64::try_from(rows.len()).unwrap_or(i64::MAX) > limit;
+    if has_more {
+        rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    }
+
+    let total_lines = autumn_harvest::store::count_workflow_logs(&mut conn, exec_id)
+        .await
+        .map_err(map_error)?;
+
+    // The cap marker is a single sentinel row at `seq = i64::MAX`; probe for it
+    // directly so `truncated` is filter-independent.
+    let truncated = !autumn_harvest::store::load_workflow_logs(
+        &mut conn,
+        exec_id,
+        &autumn_harvest::store::WorkflowLogQuery {
+            after_seq: Some(autumn_harvest::store::WORKFLOW_LOG_TRUNCATION_SEQ - 1),
+            limit: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(map_error)?
+    .is_empty();
+
+    drop(conn);
+
+    let next_cursor = if has_more {
+        rows.last().map(|r| r.seq)
+    } else {
+        None
+    };
+
+    let lines = rows
+        .into_iter()
+        .map(|r| WorkflowLogLineResponse {
+            truncation_marker: r.seq == autumn_harvest::store::WORKFLOW_LOG_TRUNCATION_SEQ,
+            seq: r.seq,
+            level: r.level,
+            message: r.message,
+            occurred_at: r.occurred_at,
+        })
+        .collect();
+
+    Ok(Json(WorkflowLogsResponse {
+        execution_id: exec_id.to_string(),
+        lines,
+        next_cursor,
+        total_lines,
+        truncated,
+    }))
 }
 
 // ── Open-awaitables diagnostic (issue #615) ───────────────────────────────

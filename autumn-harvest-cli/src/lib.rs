@@ -1048,6 +1048,30 @@ enum WorkflowCommand {
         /// Workflow execution ID.
         execution_id: String,
     },
+    /// Read the durable per-execution author log lines a workflow emitted via
+    /// `ctx.logger()` / `ctx.log_info` / `log_warn` / `log_error`.
+    ///
+    /// Requires the opt-in durable sink
+    /// (`HarvestBuilder::workflow_log_persistence`); with it disabled every
+    /// execution returns an empty list. Lines are observational only: they are
+    /// not part of the event history and are never replayed.
+    Logs {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Only show lines at this level. Repeat, or comma-separate, to allow
+        /// several. One of: info, warn, error.
+        #[arg(long = "level")]
+        level: Vec<String>,
+        /// Page size (default 200, max 1000).
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Exclusive keyset cursor: the previous page's last `seq`.
+        #[arg(long)]
+        cursor: Option<i64>,
+        /// RFC 3339 exclusive lower bound on `occurred_at`.
+        #[arg(long)]
+        since: Option<String>,
+    },
     /// Show the open awaitables an execution is parked on (pending activities,
     /// unfired timers, awaited-but-unsent signals, pending children,
     /// `await_condition` parks, pending updates), replay-derived.
@@ -5401,6 +5425,50 @@ fn canary_request(
     )
 }
 
+/// Build `GET /workflows/{id}/logs` (issue #790).
+///
+/// `--level` is repeatable AND comma-separable; each value is sent as its own
+/// `level=` param (the server accepts both forms). Values are passed through
+/// verbatim so an invalid level is rejected by the server with a clear 400
+/// rather than being silently dropped here — a typo must never look like
+/// "this run logged nothing".
+fn workflow_logs_request(
+    execution_id: &str,
+    levels: &[String],
+    limit: Option<i64>,
+    cursor: Option<i64>,
+    since: Option<&str>,
+) -> ApiRequest {
+    let mut params: Vec<(&'static str, String)> = Vec::new();
+    for raw in levels {
+        for part in raw.split(',') {
+            let part = part.trim();
+            if !part.is_empty() {
+                params.push(("level", part.to_string()));
+            }
+        }
+    }
+    if let Some(value) = limit {
+        params.push(("limit", value.to_string()));
+    }
+    if let Some(value) = cursor {
+        params.push(("cursor", value.to_string()));
+    }
+    if let Some(value) = since {
+        params.push(("since", value.to_string()));
+    }
+    let path = format!("/workflows/{}/logs", path_segment(execution_id));
+    if params.is_empty() {
+        return ApiRequest::get(path);
+    }
+    let encoded = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", query_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    ApiRequest::get(format!("{path}?{encoded}"))
+}
+
 fn usage_request(from: &str, to: &str, group_by: Option<&str>) -> ApiRequest {
     let mut params: Vec<(&'static str, String)> =
         vec![("from", from.to_string()), ("to", to.to_string())];
@@ -5516,6 +5584,19 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             "/workflows/{}/timeline",
             path_segment(execution_id)
         ))),
+        WorkflowCommand::Logs {
+            execution_id,
+            level,
+            limit,
+            cursor,
+            since,
+        } => Ok(workflow_logs_request(
+            execution_id,
+            level,
+            *limit,
+            *cursor,
+            since.as_deref(),
+        )),
         WorkflowCommand::Awaitables { execution_id } => Ok(ApiRequest::get(format!(
             "/workflows/{}/awaitables",
             path_segment(execution_id)

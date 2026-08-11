@@ -714,3 +714,103 @@ async fn replayer_produces_zero_log_events() {
         "WorkflowReplayer must produce 0 log events (pure replay), got {event_count}"
     );
 }
+
+// ── Tests: durable log sink `seq` stability (issue #790) ────────────────────
+
+/// A cheap, no-DB smoke check that the emitted `(seq, level, message)` triples
+/// are byte-identical across repeated drives of the same position.
+///
+/// **This is NOT the AC2 randomized-interleaving replay test.** It simulates the
+/// store with an in-memory map and never replays, so it cannot observe the
+/// durable dedup at all — deleting the unique index would not fail it. The real
+/// AC2 artifact is
+/// `workflow_logs_tests::randomized_replay_interleavings_never_duplicate_or_reorder_lines`,
+/// which drives the real executor over a growing history (including
+/// replay-transparent growth) and persists through the real
+/// `store::append_workflow_logs` into the real table.
+///
+/// Kept because it is the fast local guard: it fails in milliseconds without a
+/// database when `seq` stops being a stable identity for a position.
+#[test]
+fn record_log_seq_is_stable_across_repeated_drives_of_one_position() {
+    use autumn_harvest::{WorkflowCommand, WorkflowLogPolicy};
+
+    /// One "decision cycle": a fresh context over the given recorded history,
+    /// running the same author log statements, returning what the sink would
+    /// durably write.
+    fn drive(history: Vec<WorkflowEvent>) -> Vec<(u64, String, String)> {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history)
+            .with_log_policy(Some(WorkflowLogPolicy::default()));
+        ctx.log_info("resolving customer");
+        ctx.log_warn("cache miss");
+        ctx.log_error("downstream 503");
+        ctx.drain_commands()
+            .into_iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::RecordLog {
+                    seq,
+                    level,
+                    message,
+                } => Some((seq, level.as_str().to_string(), message)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let base = vec![WorkflowEvent::WorkflowStarted {
+        input: Value::Null,
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }];
+
+    let expected = drive(base.clone());
+    assert_eq!(
+        expected.len(),
+        3,
+        "non-vacuity: the position must genuinely be live and emit all 3 lines"
+    );
+
+    // A deterministic xorshift PRNG: no dev-dependency, but genuinely varies the
+    // number and ordering of re-drives per iteration.
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    // Simulate the durable table: seq -> stored row, `ON CONFLICT DO NOTHING`.
+    let mut stored: std::collections::BTreeMap<u64, (String, String)> =
+        std::collections::BTreeMap::new();
+
+    for _ in 0..200 {
+        // A randomized number of re-drives of this same position (1..=5),
+        // modelling spurious wakes / rolled-back-and-retried cycles.
+        let redrives = 1 + (next() % 5);
+        for _ in 0..redrives {
+            let emitted = drive(base.clone());
+            assert_eq!(
+                emitted, expected,
+                "every re-drive of the same position must emit the identical \
+                 (seq, level, message) triples — no reordering"
+            );
+            for (seq, level, message) in emitted {
+                // ON CONFLICT DO NOTHING: first write wins, repeats collapse.
+                stored.entry(seq).or_insert((level, message));
+            }
+        }
+    }
+
+    let rows: Vec<(u64, String, String)> = stored
+        .into_iter()
+        .map(|(seq, (level, message))| (seq, level, message))
+        .collect();
+    assert_eq!(
+        rows, expected,
+        "after hundreds of randomized re-drive interleavings the durable store \
+         holds exactly ONE copy of each line, in emission order"
+    );
+}

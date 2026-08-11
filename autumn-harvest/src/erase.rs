@@ -229,6 +229,14 @@ pub struct EraseOutcome {
     pub summary_scrubbed: bool,
     /// Number of `harvest_signals` rows whose `payload` was tombstoned.
     pub signals_scrubbed: usize,
+    /// Number of durable workflow log rows (issue #790) DELETED for this
+    /// execution. Unlike every other surface here these are removed outright
+    /// rather than tombstoned: a log line is a single free-form author string
+    /// with no field structure to preserve, so a tombstone would carry no
+    /// information a plain absence does not. Logs are observational and are
+    /// never replayed, so deleting them cannot affect determinism.
+    #[serde(default)]
+    pub logs_deleted: usize,
     /// Number of `harvest_completion_deliveries` rows (issue #605) whose
     /// frozen `payload` envelope was tombstoned. The delivery row itself
     /// (state, retry schedule) is left untouched — a still-pending,
@@ -457,6 +465,9 @@ mod db {
                 execution_row_scrubbed: false,
                 summary_scrubbed,
                 signals_scrubbed: 0,
+                // A summary-only node has no live execution row, but its log
+                // rows cascade-deleted with it, so there is nothing to remove.
+                logs_deleted: 0,
                 completion_deliveries_scrubbed,
                 dead_letters_scrubbed,
                 children,
@@ -733,6 +744,11 @@ mod db {
         .await
         .map_err(database_error)?;
 
+        // Durable per-execution workflow logs (issue #790). Author-emitted log
+        // messages are free-form text that can carry personal data, so a
+        // payload erasure must remove them too.
+        let logs_deleted = crate::store::delete_workflow_logs(conn, exec_id).await?;
+
         // Completion-callback PII (deliveries + CALLBACK DLQ), keyed only on
         // `workflow_exec_id` so it applies whether or not a live execution row
         // exists (issue #752 Codex P1 — the summary-only path must scrub these
@@ -754,6 +770,7 @@ mod db {
             // which scrubs the matching summary in the same transaction.
             summary_scrubbed: false,
             signals_scrubbed,
+            logs_deleted,
             completion_deliveries_scrubbed,
             dead_letters_scrubbed,
             children,
@@ -962,6 +979,7 @@ mod tests {
             execution_row_scrubbed: true,
             summary_scrubbed: false,
             signals_scrubbed: 2,
+            logs_deleted: 4,
             completion_deliveries_scrubbed: 3,
             dead_letters_scrubbed: 1,
             children: vec![],
@@ -977,6 +995,8 @@ mod tests {
         assert_eq!(v["execution_row_scrubbed"], true);
         // A false summary_scrubbed is omitted (issue #752).
         assert!(v.get("summary_scrubbed").is_none());
+        // Durable workflow logs deleted by the erase (issue #790).
+        assert_eq!(v["logs_deleted"], 4);
     }
 
     // ── summary scrub value (issue #752) ──────────────────────────────────────
@@ -999,6 +1019,7 @@ mod tests {
             execution_row_scrubbed: false,
             summary_scrubbed: true,
             signals_scrubbed: 0,
+            logs_deleted: 0,
             completion_deliveries_scrubbed: 0,
             dead_letters_scrubbed: 0,
             children: vec![],

@@ -719,6 +719,79 @@
     },
     {
       "method": "GET",
+      "path": "/workflows/{id}/logs",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Durable per-execution author log lines (issue #790): the lines a workflow emitted through ctx.logger()/ctx.log_info/log_warn/log_error, persisted to harvest_workflow_logs when the opt-in durable sink is enabled via HarvestBuilder::workflow_log_persistence. Admin-gated: a log message is free-form author text that routinely carries business detail, so this read takes the stricter posture of the sibling per-execution diagnostics (/awaitables) rather than the plain execution-row one. Lines are returned in EMISSION order (the deterministic seq logical-position key), never occurred_at, which is wall clock and can be non-monotonic across workers; seq is also the pagination cursor. Each element of lines[] carries seq (i64), level (info|warn|error), message (string, capped at write time), occurred_at (RFC 3339), and truncation_marker (bool, present only when true). When an execution exceeds its configured per-execution line cap, the newest lines are dropped and a single synthetic marker row is appended (drop-newest); the response-level truncated flag is filter-independent, so a ?level=error page still reports it. Logs are OBSERVATIONAL ONLY: they are not part of the event history, carry no determinism guarantee, and are never read back into workflow logic. With the sink disabled this endpoint returns an empty lines[] for every execution. Log rows are removed by the same ON DELETE CASCADE that removes the execution, so they can never outlive workflow-history retention, and targeted PII erasure (issue #495) deletes them too. Shard routing fails closed (no default-shard fallback): an empty list is a legitimate answer for a run that never logged, so a mis-routed read would be indistinguishable from \"no logs\" and returns 503 instead.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Page size; default 200. Values above 1000 are clamped down; a value \u003c= 0 is rejected with 400 rather than clamped up."
+        },
+        {
+          "name": "cursor",
+          "in": "query",
+          "required": false,
+          "description": "Exclusive keyset cursor: the previous page's last seq. `after` is accepted as an alias."
+        },
+        {
+          "name": "level",
+          "in": "query",
+          "required": false,
+          "description": "Repeatable, or comma-separated. One of info, warn, error. An unknown value returns 400 rather than silently matching nothing \u2014 a typo would otherwise answer \"no lines\" for a run that has plenty. Omitted means all levels."
+        },
+        {
+          "name": "since",
+          "in": "query",
+          "required": false,
+          "description": "RFC 3339 exclusive lower bound on occurred_at. A convenience bound only \u2014 paginate with cursor, since occurred_at is not monotonic across workers."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "lines",
+          "next_cursor",
+          "total_lines",
+          "truncated"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID, limit, cursor, level, or since."
+        },
+        {
+          "status": 401,
+          "description": "Caller lacks Harvest admin access."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        },
+        {
+          "status": 503,
+          "description": "The shard that owns this execution has no configured storage pool on this node, so existence cannot be determined without risking a false 404."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
+    },
+    {
+      "method": "GET",
       "path": "/workflows/{id}/awaitables",
       "category": "workflow",
       "read_only": true,
@@ -1674,7 +1747,11 @@
           "events_scrubbed",
           "fields_tombstoned",
           "execution_row_scrubbed",
+          "summary_scrubbed",
           "signals_scrubbed",
+          "logs_deleted",
+          "completion_deliveries_scrubbed",
+          "dead_letters_scrubbed",
           "children",
           "skipped_children",
           "failures"

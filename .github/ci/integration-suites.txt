@@ -83,6 +83,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          triage_tests
 linux        autumn-harvest         integration                      -                          typed_workflow_failure_tests
 linux        autumn-harvest         integration                      -                          workflow_id_targeted_tests
+linux        autumn-harvest         integration                      -                          workflow_logs_tests
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
 linux        autumn-harvest         integration                      testing                    dag_compensation
@@ -128,6 +129,7 @@ linux        autumn-harvest-plugin  token_auth_integration           -          
 linux        autumn-harvest-plugin  triage_integration               -                          -
 linux        autumn-harvest-plugin  ui_integration                   -                          -
 linux        autumn-harvest-plugin  webhook_receiver_integration     webhooks                   -
+linux        autumn-harvest-plugin  workflow_logs_integration        -                          -
 linux        autumn-harvest-plugin  workflow_reachability_integration  -                          -
 linux        autumn-harvest-plugin  workflow_rerun_integration       -                          -
 linux        autumn-harvest-plugin  workflow_summaries_integration   -                          -

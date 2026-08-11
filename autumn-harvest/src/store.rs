@@ -1631,6 +1631,221 @@ pub async fn update_current_details(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Durable per-execution workflow logs (issue #790)
+// ---------------------------------------------------------------------------
+
+/// `seq` reserved for the per-execution truncation marker (issue #790).
+///
+/// `i64::MAX` sorts strictly after every real line — a real `seq` is
+/// `epoch << 24 | local_index`, and `epoch` (the loaded-history length) would
+/// have to exceed 2^39 to reach it, which the history hard cap makes
+/// unreachable by many orders of magnitude. Using the ordering key itself to
+/// pin the marker last means no extra column and no special-casing in the read
+/// path: the marker is just the final line.
+pub const WORKFLOW_LOG_TRUNCATION_SEQ: i64 = i64::MAX;
+
+/// Message stored on the truncation marker row.
+pub const WORKFLOW_LOG_TRUNCATION_MESSAGE: &str =
+    "[harvest] per-execution log cap reached; subsequent lines were dropped";
+
+/// One log line to persist, as resolved from the drained command list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowLogLine {
+    /// Deterministic logical-position identity; the dedup + ordering key.
+    pub seq: i64,
+    /// `"info"` / `"warn"` / `"error"`.
+    pub level: &'static str,
+    /// The author's message (already byte-capped by the context).
+    pub message: String,
+}
+
+/// Append durable workflow log lines, enforcing the per-execution cap.
+///
+/// **Exactly-once (issue #790 AC2).** Every row is inserted with
+/// `ON CONFLICT DO NOTHING` against the unique `(workflow_exec_id, seq)` index.
+/// Replay-suppression alone is not sufficient — a decision cycle that logs and
+/// then parks can be re-driven at an *unchanged* history position (a spurious
+/// wake, or a cycle whose persist rolled back), where `is_replaying()` is still
+/// false and the line is emitted again. Because `seq` is a deterministic
+/// function of that position, the re-emitted line collides and is collapsed.
+///
+/// **Bounded volume (AC4) — drop-newest.** Once the execution holds `max_lines`
+/// real lines, further lines are dropped and a single terminal truncation
+/// marker (`WORKFLOW_LOG_TRUNCATION_SEQ`) is recorded instead, so the loss is
+/// visible rather than silent. Drop-newest keeps the start of the run (where a
+/// workflow's setup and branch decisions are) and costs one bounded `COUNT`
+/// per decision cycle rather than a `DELETE` per line.
+///
+/// Returns the number of real (non-marker) rows actually inserted.
+pub async fn append_workflow_logs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    lines: &[WorkflowLogLine],
+    max_lines: u32,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_workflow_logs::dsl;
+
+    if lines.is_empty() {
+        return Ok(0);
+    }
+
+    // Count only real lines that this batch is NOT about to re-insert.
+    //
+    // Two exclusions, each load-bearing:
+    //   * the marker, so its own presence can never push the count over the cap
+    //     and re-trigger truncation accounting; and
+    //   * this batch's own seqs (issue #790 review), because on the re-drive
+    //     path the design depends on -- the same position re-minting the same
+    //     seq -- those rows are ALREADY stored and `ON CONFLICT DO NOTHING`
+    //     will collapse them. Counting them would charge the cycle's lines to
+    //     the budget twice and fire the truncation marker on a run that
+    //     dropped nothing, which is exactly the false alarm the marker exists
+    //     to rule out.
+    let batch_seqs: Vec<i64> = lines.iter().map(|line| line.seq).collect();
+    let existing: i64 = dsl::harvest_workflow_logs
+        .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(dsl::seq.ne(WORKFLOW_LOG_TRUNCATION_SEQ))
+        .filter(dsl::seq.ne_all(batch_seqs))
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let remaining = i64::from(max_lines).saturating_sub(existing).max(0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let admit = (remaining as usize).min(lines.len());
+
+    if admit > 0 {
+        let rows: Vec<crate::models::NewHarvestWorkflowLog> = lines[..admit]
+            .iter()
+            .map(|line| crate::models::NewHarvestWorkflowLog {
+                workflow_exec_id: exec_id.as_uuid(),
+                seq: line.seq,
+                level: line.level.to_string(),
+                message: line.message.clone(),
+            })
+            .collect();
+        diesel::insert_into(dsl::harvest_workflow_logs)
+            .values(&rows)
+            .on_conflict((dsl::workflow_exec_id, dsl::seq))
+            .do_nothing()
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+
+    // Anything we could not admit is dropped -- record the marker exactly once.
+    if admit < lines.len() {
+        diesel::insert_into(dsl::harvest_workflow_logs)
+            .values(crate::models::NewHarvestWorkflowLog {
+                workflow_exec_id: exec_id.as_uuid(),
+                seq: WORKFLOW_LOG_TRUNCATION_SEQ,
+                level: "warn".to_string(),
+                message: WORKFLOW_LOG_TRUNCATION_MESSAGE.to_string(),
+            })
+            .on_conflict((dsl::workflow_exec_id, dsl::seq))
+            .do_nothing()
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+
+    Ok(admit)
+}
+
+/// Read filters for one page of an execution's durable log lines (issue #790).
+///
+/// Mirrors the `ScheduleRunQuery` params-struct precedent so the HTTP layer has
+/// one thing to build and the signature stays extensible.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowLogQuery<'a> {
+    /// Exclusive keyset cursor: the previous page's last `seq`.
+    pub after_seq: Option<i64>,
+    /// Wall-clock lower bound on `occurred_at` (exclusive). Independent of
+    /// `after_seq`; both may be set and are `AND`ed.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Level allow-list. Empty means "all levels".
+    pub levels: &'a [&'a str],
+    /// Page size. The caller is responsible for clamping it.
+    pub limit: i64,
+}
+
+/// Load one page of an execution's durable log lines, in emission order.
+///
+/// Ordering is by `seq`, the deterministic emission order -- **not** by
+/// `occurred_at`, which is wall-clock and can be non-monotonic across workers.
+/// `since` is offered as a convenience bound only; pagination must use
+/// `after_seq`.
+pub async fn load_workflow_logs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    query: &WorkflowLogQuery<'_>,
+) -> HarvestResult<Vec<crate::models::HarvestWorkflowLog>> {
+    use crate::schema::harvest_workflow_logs::dsl;
+
+    let mut q = dsl::harvest_workflow_logs
+        .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+        .into_boxed();
+    if let Some(after) = query.after_seq {
+        q = q.filter(dsl::seq.gt(after));
+    }
+    if let Some(since) = query.since {
+        q = q.filter(dsl::occurred_at.gt(since));
+    }
+    if !query.levels.is_empty() {
+        // The truncation marker is a `warn` row, so a `?level=warn` filter
+        // naturally still surfaces it; other filters correctly hide it.
+        q = q.filter(dsl::level.eq_any(query.levels.to_vec()));
+    }
+    q.order(dsl::seq.asc())
+        .limit(query.limit)
+        .select(crate::models::HarvestWorkflowLog::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Count an execution's **real** durable log lines, across all levels.
+///
+/// The synthetic truncation marker is excluded, matching the accounting in
+/// [`append_workflow_logs`]: it is engine bookkeeping, not an author line, so
+/// counting it would make a capped execution report `max_lines + 1` and break
+/// the `total_lines <= max_lines` invariant exactly on the runs an operator is
+/// most likely inspecting. Whether a run was truncated is reported separately,
+/// by probing for the marker directly.
+pub async fn count_workflow_logs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<i64> {
+    use crate::schema::harvest_workflow_logs::dsl;
+
+    dsl::harvest_workflow_logs
+        .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(dsl::seq.ne(WORKFLOW_LOG_TRUNCATION_SEQ))
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Delete every durable log line for an execution (issue #790 × issue #495).
+///
+/// Called by the targeted PII-erasure path: an author's log messages are
+/// free-form text that can carry personal data, so erasing an execution's
+/// payloads must erase its logs too. Returns the number of rows removed.
+pub async fn delete_workflow_logs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_workflow_logs::dsl;
+
+    diesel::delete(dsl::harvest_workflow_logs.filter(dsl::workflow_exec_id.eq(exec_id.as_uuid())))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
 /// Guarded exactly-once stamp for the operator early-warning soft threshold
 /// on workflow history bloat (issue #704).
 ///
