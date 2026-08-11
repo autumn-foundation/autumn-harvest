@@ -611,7 +611,7 @@ a restart would have to redo — not the cheaper number each broker offers first
 
 | Adapter | Reports | Why not the obvious one |
 |---|---|---|
-| Kafka | high-watermark minus the durable **committed group offset**, summed across **every partition of the topic** | The consumer's *read position* advances the moment a record is fetched, regardless of whether it was dispatched, is being retried, or is stuck behind a blocked commit prefix. Reading against it makes a wedged consumer report its lag falling to **zero** while a restart would replay the whole uncommitted span — inverting the gauge in exactly the case it exists to expose. A partition with nothing committed yet falls back to wherever the **effective** `auto.offset.reset` would resume: the `earliest` default makes it the low watermark, and a caller's `.property("auto.offset.reset", "latest")` makes it the high watermark, so a brand-new latest-starting group owes nothing instead of reporting the whole retained log as a backlog that never drains on a quiet topic. (Unlike `enable.auto.commit`, the reset policy is *not* forced — auto-commit would break the ack-after-commit contract, whereas where a new group starts breaks no invariant and stays the caller's choice.) A committed offset that retention has since advanced *past* is clamped up to the low watermark for the same reason: those records are gone from the log, so subtracting from the stale commit would report a backlog the consumer can never read. |
+| Kafka | high-watermark minus the durable **committed group offset**, summed across **every partition of the topic** | The consumer's *read position* advances the moment a record is fetched, regardless of whether it was dispatched, is being retried, or is stuck behind a blocked commit prefix. Reading against it makes a wedged consumer report its lag falling to **zero** while a restart would replay the whole uncommitted span — inverting the gauge in exactly the case it exists to expose. A partition with nothing committed yet is baselined at the first offset **this replica actually read** from it, which is where the group's `auto.offset.reset` resolved. If it has never read from the partition (one owned by another replica), the policy itself is the baseline: the `earliest` default makes it the low watermark, and a caller's `.property("auto.offset.reset", "latest")` makes it the high watermark, so a brand-new latest-starting group owes nothing rather than reporting the whole retained log as a backlog that never drains on a quiet topic. Reading the *live* high watermark for a `latest` group that has already started would make every sample `high - high = 0`: a group stuck at offset 100 while producers push the topic to 1000 would report an all-clear for the 900 records it owes, hiding exactly the pre-first-commit outage the gauge exists to expose. (Unlike `enable.auto.commit`, the reset policy is *not* forced — see "A `latest` group is anchored, not forbidden" below.) A committed offset that retention has since advanced *past* is clamped up to the low watermark for the same reason: those records are gone from the log, so subtracting from the stale commit would report a backlog the consumer can never read. |
 | SQS | `ApproximateNumberOfMessages` **plus** `ApproximateNumberOfMessagesNotVisible` | A message abandoned for visibility-timeout retry becomes *not visible*, so the visible count alone drains toward zero during a downstream outage while the outstanding population is unchanged. Both attributes ride the single `GetQueueAttributes` call, so this costs no extra round-trip. `ApproximateNumberOfMessagesDelayed` is excluded: a `DelaySeconds` message has not been delivered to anyone and is not work this connector currently owes. |
 
 > Because the gauge counts uncommitted and in-flight work, it stays **high**
@@ -630,6 +630,46 @@ backlog, `max` would surface the largest quarter, and a partition stalled on any
 other replica would be invisible. The cost is that each replica asks the broker
 about every partition, so calls per sample scale with replica count — bounded
 work on the `lag_sample_interval`, never on the message path.
+
+### A `latest` group is anchored, not forbidden
+
+`enable.auto.commit` is forced off no matter what a caller sets, because
+auto-commit breaks the ack-after-commit contract unconditionally.
+`auto.offset.reset` is **not** forced: starting a new binding at the tail of a
+huge existing topic is a legitimate thing to want.
+
+It does need care, though, because `latest` resolves against a **moving**
+target. It applies only while a partition has no committed offset — and for a
+group whose very first message keeps failing, nothing ever commits, so that
+window has no bound. Two things would follow the tail rather than the group:
+
+* **Recovery.** A stalled commit prefix is retried by rebuilding the consumer,
+  which normally resumes from the last commit. With no commit, the rebuild
+  re-resolves `latest` against the *current* tail — which the blocked record has
+  already advanced past — silently skipping it while the runtime reports a
+  successful retry.
+* **The lag gauge.** Baselining at the live high watermark makes every sample
+  `high - high = 0`, hiding the outage described in the table above.
+
+Harvest closes both with one fact: **the first offset the consumer reads from a
+partition is where `latest` resolved**, and that is fixed. It is recorded on
+receive, raised by every commit, committed synchronously before any rebuild, and
+used as the lag baseline. Committing it is not a loss — "everything below where
+I started is not mine" is precisely what `latest` *means*; this only makes that
+decision durable instead of re-deriving it against a tail that has since moved.
+As a side effect, it also makes an in-flight async ack-commit durable rather
+than racing the rebuild.
+
+If the anchor commit fails, recovery fails with it and the runtime backs off and
+retries rather than rebuilding into a possible skip.
+
+Two residuals, both deliberate. Anchors cover the partitions **this replica has
+read from**, so a partition owned by another replica still falls back to the
+reset policy for its lag baseline — no local fact establishes otherwise, and
+closing it would need cross-replica state. And a process that restarts before
+its group ever commits genuinely has no anchor: it starts at the then-current
+tail, which is what `latest` asks for. Neither applies to the default
+(`earliest`), which is anchored at the low watermark by definition.
 
 A broker-triggered execution also records `start_source = 'broker'` with
 `start_source_ref` set to the rendered coordinates, so a run traces back to the

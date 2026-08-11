@@ -44,8 +44,11 @@ pub enum OffsetReset {
     /// retained log. Harvest's default, so a binding added to an existing topic
     /// does not silently skip the backlog.
     Earliest,
-    /// Start at the high watermark: an uncommitted partition owes nothing,
-    /// because a restart would resume at the tail rather than replay.
+    /// Start at the high watermark. An uncommitted partition this source has
+    /// never read from owes nothing, because a resume would land at the tail.
+    /// Once it HAS read from one, [`PartitionAnchors`] pins where that
+    /// resolution actually landed and the policy no longer applies — otherwise
+    /// the baseline would chase the moving tail and report zero forever.
     Latest,
 }
 
@@ -96,9 +99,13 @@ impl KafkaSourceConfig {
     /// uncommitted partition resumes.
     ///
     /// Deliberately NOT forced the way `enable.auto.commit` is: auto-commit
-    /// would break the ack-after-commit contract, whereas an offset-reset
-    /// policy breaks no invariant and is a legitimate caller choice (a new
-    /// binding on a huge existing topic may well want only new messages). An
+    /// would break the ack-after-commit contract unconditionally, whereas an
+    /// offset-reset policy is a legitimate caller choice (a new binding on a
+    /// huge existing topic may well want only new messages). `latest` DOES
+    /// threaten at-least-once while the group has no committed offset — a
+    /// rebuild would re-resolve it against a tail the blocked record has
+    /// already advanced past — but that is closed by anchoring rather than by
+    /// forbidding the policy; see [`PartitionAnchors`]. An
     /// unrecognised value maps to `Earliest`, matching the default — librdkafka
     /// rejects a genuinely invalid value at client-create time, so such a
     /// string never reaches a running consumer.
@@ -139,6 +146,86 @@ impl KafkaSourceConfig {
     }
 }
 
+/// Per-partition record of where this source's group actually resumes.
+///
+/// # Why this exists
+///
+/// `auto.offset.reset` is only consulted when a partition has **no committed
+/// offset** — and for a `latest` group that window is unbounded: nothing
+/// commits until the first message settles, and if that first message keeps
+/// failing, nothing ever does. In that window the reset policy is not a fixed
+/// position but a *moving* one, because `latest` re-resolves against whatever
+/// the high watermark happens to be at the moment it is asked. Two things
+/// silently follow that moving tail:
+///
+/// * **Recovery.** [`EventSource::recover`] rebuilds the consumer to re-read the
+///   blocked record. With no commit to resume from, the rebuild re-resolves
+///   `latest` against the *current* tail — which the blocked record itself has
+///   already advanced past — so it skips that record permanently while the
+///   runtime reports a successful retry. That is message loss, not a delayed
+///   delivery.
+/// * **The lag gauge.** Baselining an uncommitted partition at the live high
+///   watermark makes every sample `high - high = 0`. A group that started at
+///   100 and is stuck while producers push the topic to 1000 reports an
+///   all-clear for the 900 records it owes — masking exactly the
+///   pre-first-commit outage the gauge exists to expose.
+///
+/// The fix for both is one fact: **the first offset this source ever read from
+/// a partition is where `latest` resolved**, and that is a fixed anchor. It is
+/// recorded on receive, raised by every commit, re-asserted synchronously
+/// before a rebuild (which also makes any in-flight async commit durable), and
+/// used as the lag baseline.
+///
+/// Committing that anchor is not a loss: for a `latest` group, "everything
+/// below where I started is not mine" is precisely what the policy *means*.
+/// All this does is make that decision durable instead of leaving it to be
+/// re-derived against a tail that has since moved.
+///
+/// # Residual
+///
+/// Anchors are per-source-instance and cover the partitions **this replica has
+/// read from**. A partition owned by another replica, or a fresh process whose
+/// group never committed, has no anchor and falls back to the reset policy —
+/// which is the honest answer, since no local fact establishes otherwise.
+/// Closing that would need cross-replica state this adapter deliberately does
+/// not keep.
+#[derive(Debug, Default)]
+pub struct PartitionAnchors {
+    /// `partition -> next offset to read`. `BTreeMap` so `pending_anchors` is
+    /// deterministically ordered, which keeps the commit list assertable.
+    floors: BTreeMap<i32, i64>,
+}
+
+impl PartitionAnchors {
+    /// Note a record read from `partition` at `offset`.
+    ///
+    /// First read wins: it is where the group resolved to, and later records
+    /// must never raise the floor past a record still awaiting settlement.
+    pub fn record_read(&mut self, partition: i32, offset: i64) {
+        self.floors.entry(partition).or_insert(offset);
+    }
+
+    /// Note that `next_offset` (Kafka's next-to-read) has been committed.
+    ///
+    /// Monotonic: an out-of-order or stale commit never rewinds the floor.
+    pub fn record_commit(&mut self, partition: i32, next_offset: i64) {
+        let floor = self.floors.entry(partition).or_insert(next_offset);
+        *floor = (*floor).max(next_offset);
+    }
+
+    /// The resume floor for `partition`, if this source has read from it.
+    #[must_use]
+    pub fn anchor_for(&self, partition: i32) -> Option<i64> {
+        self.floors.get(&partition).copied()
+    }
+
+    /// Every known floor, to be committed before a rebuild.
+    #[must_use]
+    pub fn pending_anchors(&self) -> Vec<(i32, i64)> {
+        self.floors.iter().map(|(p, o)| (*p, *o)).collect()
+    }
+}
+
 /// A Kafka-backed [`EventSource`].
 pub struct KafkaSource {
     /// Swappable so [`EventSource::recover`] can rebuild it in place when the
@@ -149,6 +236,11 @@ pub struct KafkaSource {
     topic: String,
     /// Retained so a rebuild produces an identically-configured consumer.
     config: KafkaSourceConfig,
+    /// Where this group actually resumes, per partition. Survives a consumer
+    /// rebuild, which is the whole point: see [`PartitionAnchors`]. Guarded by
+    /// a `std::sync::Mutex` held only for the map access, never across an
+    /// `.await`.
+    anchors: std::sync::Mutex<PartitionAnchors>,
 }
 
 impl std::fmt::Debug for KafkaSource {
@@ -171,6 +263,7 @@ impl KafkaSource {
             consumer: std::sync::Mutex::new(Self::build_consumer(config)?),
             topic: config.topic.clone(),
             config: config.clone(),
+            anchors: std::sync::Mutex::new(PartitionAnchors::default()),
         })
     }
 
@@ -197,6 +290,14 @@ impl KafkaSource {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
+    }
+
+    /// Run `f` against the anchor map under a short lock.
+    fn with_anchors<T>(&self, f: impl FnOnce(&mut PartitionAnchors) -> T) -> T {
+        f(&mut self
+            .anchors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 }
 
@@ -306,6 +407,9 @@ impl EventSource for KafkaSource {
                     .collect()
             });
 
+            // The first offset read from a partition is where this group
+            // resolved to, and is the floor a rebuild must not skip past.
+            self.with_anchors(|a| a.record_read(message.partition(), message.offset()));
             batch.push(to_inbound(
                 message.topic(),
                 message.partition(),
@@ -335,7 +439,12 @@ impl EventSource for KafkaSource {
             .map_err(|e| ConnectorError::Broker(format!("kafka offset list: {e}")))?;
         self.consumer()
             .commit(&tpl, CommitMode::Async)
-            .map_err(|e| ConnectorError::Broker(format!("kafka commit: {e}")))
+            .map_err(|e| ConnectorError::Broker(format!("kafka commit: {e}")))?;
+        // Raise the resume floor. The commit above is ASYNC, so it may not be
+        // durable yet; recording it here lets `recover` re-assert it
+        // synchronously before a rebuild rather than racing it.
+        self.with_anchors(|a| a.record_commit(partition, offset + 1));
+        Ok(())
     }
 
     async fn abandon(&self, _handle: &MessageHandle) -> Result<(), ConnectorError> {
@@ -362,16 +471,56 @@ impl EventSource for KafkaSource {
     /// rejoins the group and starts from the last **committed** offset, which
     /// is precisely the message the runtime is waiting on.
     ///
+    /// # Anchoring first, and why it is not optional
+    ///
+    /// "The last committed offset" is only a resume point if one exists. A
+    /// group that has never committed — the unbounded window for a `latest`
+    /// binding whose very first message keeps failing — resolves
+    /// `auto.offset.reset` again on the rebuild, and `latest` resolves against
+    /// the *current* tail, which the blocked record has itself advanced past.
+    /// The rebuild would skip that record permanently while the runtime
+    /// reported a successful retry: message loss dressed as a retry.
+    ///
+    /// So every known resume floor is committed **synchronously on the old
+    /// consumer, before the new one is built** (see [`PartitionAnchors`]). That
+    /// makes the docstring's promise true rather than conditional, and as a
+    /// side effect makes any in-flight async ack-commit durable instead of
+    /// racing the rebuild.
+    ///
+    /// A failed anchor commit fails the whole recovery rather than rebuilding
+    /// anyway. Rebuilding on an unanchored group is exactly the skip this
+    /// guards against, and the runtime's response to a failed `recover` is to
+    /// back off and retry — which is the correct answer for a transient commit
+    /// error, and infinitely better than a silent loss.
+    ///
     /// The old consumer is dropped once the last in-flight `Arc` to it goes,
     /// which closes its group membership and triggers a rebalance.
     async fn recover(&self) -> Result<bool, ConnectorError> {
         let config = self.config.clone();
-        // Creating and subscribing a consumer are blocking librdkafka calls.
-        let rebuilt = tokio::task::spawn_blocking(move || Self::build_consumer(&config))
-            .await
-            .map_err(|e| {
-                ConnectorError::Broker(format!("kafka consumer rebuild panicked: {e}"))
-            })??;
+        let anchors = self.with_anchors(|a| a.pending_anchors());
+        let topic = self.topic.clone();
+        let previous = self.consumer();
+        // Committing and creating a consumer are blocking librdkafka calls.
+        let rebuilt = tokio::task::spawn_blocking(move || {
+            // Skipped when nothing has been read: an EMPTY offset list is not a
+            // no-op to librdkafka (it commits the current assignment), and
+            // there is no floor to assert anyway.
+            if !anchors.is_empty() {
+                let mut tpl = TopicPartitionList::new();
+                for (partition, next_offset) in anchors {
+                    tpl.add_partition_offset(&topic, partition, Offset::Offset(next_offset))
+                        .map_err(|e| {
+                            ConnectorError::Broker(format!("kafka anchor offset list: {e}"))
+                        })?;
+                }
+                previous
+                    .commit(&tpl, CommitMode::Sync)
+                    .map_err(|e| ConnectorError::Broker(format!("kafka anchor commit: {e}")))?;
+            }
+            Self::build_consumer(&config)
+        })
+        .await
+        .map_err(|e| ConnectorError::Broker(format!("kafka consumer rebuild panicked: {e}")))??;
 
         *self
             .consumer
@@ -390,6 +539,10 @@ impl EventSource for KafkaSource {
         // The policy the RUNNING consumer uses, so an uncommitted partition is
         // baselined where that consumer would actually resume.
         let reset = self.config.effective_offset_reset();
+        // Snapshotted so the blocking task owns it without holding the lock.
+        let anchors = self.with_anchors(|a| PartitionAnchors {
+            floors: a.pending_anchors().into_iter().collect(),
+        });
         // `fetch_watermarks` is a blocking librdkafka call.
         tokio::task::spawn_blocking(move || {
             let timeout = std::time::Duration::from_secs(2);
@@ -443,9 +596,14 @@ impl EventSource for KafkaSource {
             }
             let committed = consumer.committed_offsets(wanted, timeout).ok()?;
 
-            group_lag(&topic, &partitions, &committed, reset, |partition| {
-                consumer.fetch_watermarks(&topic, partition, timeout).ok()
-            })
+            group_lag(
+                &topic,
+                &partitions,
+                &committed,
+                reset,
+                &anchors,
+                |partition| consumer.fetch_watermarks(&topic, partition, timeout).ok(),
+            )
         })
         .await
         .ok()
@@ -538,6 +696,7 @@ fn group_lag(
     partitions: &[i32],
     committed: &TopicPartitionList,
     reset: OffsetReset,
+    anchors: &PartitionAnchors,
     watermarks: impl Fn(i32) -> Option<(i64, i64)>,
 ) -> Option<i64> {
     let mut total: i64 = 0;
@@ -546,7 +705,13 @@ fn group_lag(
         let offset = committed
             .find_partition(topic, partition)
             .map_or(Offset::Invalid, |p| p.offset());
-        total = total.saturating_add(partition_lag(low, high, offset, reset));
+        total = total.saturating_add(partition_lag(
+            low,
+            high,
+            offset,
+            reset,
+            anchors.anchor_for(partition),
+        ));
     }
     Some(total)
 }
@@ -554,23 +719,48 @@ fn group_lag(
 /// Outstanding records for one partition, from its watermarks and the group's
 /// committed offset.
 ///
-/// Nothing committed yet means the whole retained backlog is outstanding: this
-/// consumer is pinned to `auto.offset.reset = earliest`, so a restart reads
-/// from the low watermark. Reporting zero for such a partition would hide a
-/// consumer that has processed nothing.
-fn partition_lag(low: i64, high: i64, committed: Offset, reset: OffsetReset) -> i64 {
+/// The baseline is the first of these that applies:
+///
+/// 1. **A committed offset** — the group resumes there, so the reset policy is
+///    irrelevant.
+/// 2. **An [anchor][PartitionAnchors]** — nothing committed, but this source has
+///    read from the partition, so the first offset it read is where the group
+///    resolved. Fixed, unlike the reset policy.
+/// 3. **The reset policy** — nothing committed and never read here (a partition
+///    owned by another replica), so the honest answer is where a resume would
+///    land: `low` for `earliest`, `high` for `latest`.
+///
+/// Baselines 1 and 2 are floored at the low watermark: retention can advance
+/// `low` past a stale position, and records gone from the log are not backlog.
+fn partition_lag(
+    low: i64,
+    high: i64,
+    committed: Offset,
+    reset: OffsetReset,
+    anchor: Option<i64>,
+) -> i64 {
     let current = match committed {
         // Retention can advance `low` past an old commit. Those records are
         // gone from the log, so subtracting from the stale commit would report
         // a backlog the consumer can never read -- a permanent false alarm on
         // exactly the gauge operators page on.
         Offset::Offset(o) => o.max(low),
-        // Nothing committed: the group resumes wherever its reset policy says,
-        // so that is the honest baseline for what a restart would replay.
-        _ => match reset {
-            OffsetReset::Earliest => low,
-            OffsetReset::Latest => high,
-        },
+        // Nothing committed. If this source has read from the partition, the
+        // first offset it read is where the group RESOLVED to, and that is a
+        // fixed baseline. Falling back to `reset` here would re-resolve
+        // `Latest` against the live high watermark on every sample, making the
+        // answer `high - high = 0` no matter how far the topic has run ahead --
+        // an all-clear for precisely the pre-first-commit outage this gauge
+        // exists to expose (see [`PartitionAnchors`]).
+        _ => anchor.map_or(
+            match reset {
+                OffsetReset::Earliest => low,
+                OffsetReset::Latest => high,
+            },
+            // Same retention guard as a stale commit: records below the low
+            // watermark are gone from the log, not backlog.
+            |a| a.max(low),
+        ),
     };
     (high - current).max(0)
 }
@@ -594,25 +784,110 @@ mod tests {
     #[test]
     fn a_latest_group_owes_nothing_for_an_uncommitted_partition() {
         assert_eq!(
-            partition_lag(0, 500, Offset::Invalid, OffsetReset::Latest),
+            partition_lag(0, 500, Offset::Invalid, OffsetReset::Latest, None),
             0,
             "a latest-starting group resumes at the high watermark, so nothing is owed"
         );
         assert_eq!(
-            partition_lag(0, 500, Offset::Invalid, OffsetReset::Earliest),
+            partition_lag(0, 500, Offset::Invalid, OffsetReset::Earliest, None),
             500,
             "an earliest-starting group would replay the whole retained log"
         );
         // Once the group HAS committed, the reset policy is irrelevant: it only
         // applies when there is no committed offset to resume from.
         assert_eq!(
-            partition_lag(0, 500, Offset::Offset(450), OffsetReset::Latest),
+            partition_lag(0, 500, Offset::Offset(450), OffsetReset::Latest, None),
             50
         );
         assert_eq!(
-            partition_lag(0, 500, Offset::Offset(450), OffsetReset::Earliest),
+            partition_lag(0, 500, Offset::Offset(450), OffsetReset::Earliest, None),
             50
         );
+    }
+
+    /// A `latest` group that has read but not yet committed owes what has
+    /// accrued since it started -- not zero.
+    ///
+    /// This is the pre-first-commit outage the gauge exists to expose. Without
+    /// an anchor the uncommitted branch baselines at the LIVE high watermark,
+    /// so the sample is `high - high = 0` on every pass: the group starts at
+    /// 100, producers push the topic to 1000 while dispatch is failing, and the
+    /// gauge reports an all-clear for the 900 records now owed. Baselining at
+    /// the position the group actually resolved to makes the backlog visible.
+    #[test]
+    fn an_uncommitted_latest_group_owes_what_accrued_since_it_started() {
+        assert_eq!(
+            partition_lag(0, 1000, Offset::Invalid, OffsetReset::Latest, Some(100)),
+            900,
+            "the group started at 100 and the topic is at 1000: 900 records owed"
+        );
+        // No anchor -- a partition owned by another replica, which this one has
+        // never read from -- keeps the reset-policy baseline. That residual is
+        // documented on `partition_lag`; it cannot be closed without
+        // cross-replica state.
+        assert_eq!(
+            partition_lag(0, 1000, Offset::Invalid, OffsetReset::Latest, None),
+            0
+        );
+        // Retention can advance `low` past a stale anchor exactly as it can past
+        // a stale commit, so the anchor gets the same floor guard.
+        assert_eq!(
+            partition_lag(400, 1000, Offset::Invalid, OffsetReset::Latest, Some(100)),
+            600,
+            "records below the low watermark are gone; they are not backlog"
+        );
+        // A committed offset always wins: the anchor only ever substitutes for
+        // the reset policy, which itself only applies when nothing is committed.
+        assert_eq!(
+            partition_lag(0, 1000, Offset::Offset(950), OffsetReset::Latest, Some(100)),
+            50
+        );
+    }
+
+    /// The rebuild's resume floor, per partition.
+    ///
+    /// A `latest` group with no committed offset has no durable anchor, so a
+    /// rebuild re-resolves `latest` against the *current* tail and skips the
+    /// very record the runtime is blocked on -- silent message loss reported as
+    /// a successful retry. The floor a rebuild must resume from is the first
+    /// offset this source ever read from the partition (which is where `latest`
+    /// resolved to), raised by anything already committed.
+    #[test]
+    fn partition_anchors_track_the_floor_a_rebuild_must_resume_from() {
+        let mut anchors = PartitionAnchors::default();
+        assert!(anchors.pending_anchors().is_empty(), "nothing read yet");
+        assert_eq!(anchors.anchor_for(0), None);
+
+        // First record read from p0 is offset 100: that is where `latest`
+        // resolved, and the floor a rebuild must not skip past.
+        anchors.record_read(0, 100);
+        anchors.record_read(0, 101);
+        anchors.record_read(0, 102);
+        assert_eq!(
+            anchors.anchor_for(0),
+            Some(100),
+            "the FIRST offset read wins; later reads do not advance the floor"
+        );
+        assert_eq!(anchors.pending_anchors(), vec![(0, 100)]);
+
+        // A commit raises the floor: `ack` commits `offset + 1`, the next
+        // offset to read.
+        anchors.record_commit(0, 101);
+        assert_eq!(anchors.anchor_for(0), Some(101));
+        assert_eq!(
+            anchors.pending_anchors(),
+            vec![(0, 101)],
+            "re-asserting a commit is idempotent and makes an async one durable"
+        );
+
+        // A stale/out-of-order commit never rewinds the floor.
+        anchors.record_commit(0, 99);
+        assert_eq!(anchors.anchor_for(0), Some(101));
+
+        // Partitions are tracked independently, in a stable order.
+        anchors.record_read(2, 7);
+        anchors.record_read(1, 3);
+        assert_eq!(anchors.pending_anchors(), vec![(0, 101), (1, 3), (2, 7)]);
     }
 
     #[test]
@@ -668,6 +943,7 @@ mod tests {
             &[0, 1, 2],
             &committed,
             OffsetReset::Earliest,
+            &PartitionAnchors::default(),
             |p| match p {
                 0 => Some((0, 100)),
                 1 => Some((0, 7)),
@@ -700,6 +976,7 @@ mod tests {
             &[0, 1],
             &committed,
             OffsetReset::Earliest,
+            &PartitionAnchors::default(),
             watermarks,
         )
         .expect("watermarks available");
@@ -708,6 +985,7 @@ mod tests {
             &[0, 1, 2, 3],
             &committed,
             OffsetReset::Earliest,
+            &PartitionAnchors::default(),
             watermarks,
         )
         .expect("watermarks available");
@@ -730,9 +1008,14 @@ mod tests {
     fn group_lag_is_none_when_a_watermark_is_unavailable() {
         let committed = TopicPartitionList::new();
         assert!(
-            group_lag("orders", &[0, 1], &committed, OffsetReset::Earliest, |p| (p
-                == 0)
-                .then_some((0, 5)))
+            group_lag(
+                "orders",
+                &[0, 1],
+                &committed,
+                OffsetReset::Earliest,
+                &PartitionAnchors::default(),
+                |p| (p == 0).then_some((0, 5))
+            )
             .is_none()
         );
     }
@@ -842,7 +1125,7 @@ mod tests {
         // the consumer can never read and cannot ever work off. Only the 100
         // records still between `low` and `high` are outstanding.
         assert_eq!(
-            partition_lag(1000, 1100, Offset::Offset(0), OffsetReset::Earliest),
+            partition_lag(1000, 1100, Offset::Offset(0), OffsetReset::Earliest, None),
             100
         );
     }
@@ -851,11 +1134,11 @@ mod tests {
     fn an_uncommitted_partition_reports_the_whole_retained_backlog() {
         // `auto.offset.reset = earliest`, so a restart replays from `low`.
         assert_eq!(
-            partition_lag(1000, 1100, Offset::Invalid, OffsetReset::Earliest),
+            partition_lag(1000, 1100, Offset::Invalid, OffsetReset::Earliest, None),
             100
         );
         assert_eq!(
-            partition_lag(0, 50, Offset::Beginning, OffsetReset::Earliest),
+            partition_lag(0, 50, Offset::Beginning, OffsetReset::Earliest, None),
             50
         );
     }
@@ -863,7 +1146,13 @@ mod tests {
     #[test]
     fn a_committed_offset_inside_the_window_subtracts_normally() {
         assert_eq!(
-            partition_lag(1000, 1100, Offset::Offset(1040), OffsetReset::Earliest),
+            partition_lag(
+                1000,
+                1100,
+                Offset::Offset(1040),
+                OffsetReset::Earliest,
+                None
+            ),
             60
         );
     }
@@ -871,13 +1160,25 @@ mod tests {
     #[test]
     fn a_caught_up_partition_never_reports_negative_lag() {
         assert_eq!(
-            partition_lag(1000, 1100, Offset::Offset(1100), OffsetReset::Earliest),
+            partition_lag(
+                1000,
+                1100,
+                Offset::Offset(1100),
+                OffsetReset::Earliest,
+                None
+            ),
             0
         );
         // A commit past `high` is not expected, but must not underflow into a
         // huge unsigned-looking number through `saturating_add`.
         assert_eq!(
-            partition_lag(1000, 1100, Offset::Offset(1200), OffsetReset::Earliest),
+            partition_lag(
+                1000,
+                1100,
+                Offset::Offset(1200),
+                OffsetReset::Earliest,
+                None
+            ),
             0
         );
     }

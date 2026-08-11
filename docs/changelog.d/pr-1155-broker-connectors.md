@@ -930,6 +930,41 @@ coordinates, so a run traces back to the exact message.
   (`kafka_reports_no_native_dead_letter_so_the_pairing_is_rejected`) pins the
   behaviour the doc has to describe, and was mutation-verified to genuinely
   assert rather than skip when librdkafka is present.
+- **Anchored a `latest` Kafka group so recovery cannot skip the record it is
+  retrying, and the lag gauge cannot report an all-clear while it is stuck.**
+  `auto.offset.reset` applies only while a partition has no committed offset,
+  and for a group whose first message keeps failing that window has no bound —
+  during it, `latest` is not a position but a *moving* one, re-resolved against
+  whatever the high watermark happens to be. Two things followed that tail
+  rather than the group. Recovery rebuilds the consumer to re-read the blocked
+  record, but with nothing committed the rebuild re-resolved `latest` against a
+  tail the blocked record had itself advanced past, skipping it permanently
+  while the runtime reported a successful retry — message loss dressed as a
+  retry. And the gauge baselined an uncommitted partition at the live high
+  watermark, making every sample `high - high = 0`: a group stuck at offset 100
+  while producers pushed the topic to 1000 reported an all-clear for the 900
+  records it owed, masking the pre-first-commit outage the gauge exists to
+  expose. One fact closes both — the first offset the consumer reads from a
+  partition is *where `latest` resolved*, and that is fixed. The new
+  `PartitionAnchors` records it on receive, raises it on every commit, commits
+  it synchronously before any rebuild, and supplies it as the lag baseline;
+  committing it is not a loss, because "everything below where I started is not
+  mine" is exactly what `latest` means, and this only makes that decision
+  durable. A failed anchor commit fails the whole recovery rather than
+  rebuilding into a possible skip — the runtime's answer to a failed `recover`
+  is to back off and retry, which is right for a transient commit error and
+  infinitely better than a silent loss; as a side effect the sync commit also
+  makes an in-flight async ack-commit durable instead of racing the rebuild.
+  This supersedes an earlier claim in `effective_offset_reset`'s docs that an
+  offset-reset policy "breaks no invariant": `latest` genuinely did threaten
+  at-least-once, which is why it is now anchored rather than merely documented.
+  Anchoring was chosen over forbidding `latest` outright (the other remedy on
+  the table) because it keeps a legitimate capability *and* makes it correct,
+  for about forty lines. Two residuals stay, both deliberate and documented: a
+  partition owned by another replica has no local anchor and keeps the
+  reset-policy baseline, and a process that restarts before its group ever
+  commits genuinely has no anchor — which is what `latest` asks for. Neither
+  applies to the `earliest` default.
 
 ### Success metric
 
