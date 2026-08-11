@@ -35,7 +35,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::binding::{IdempotencyMode, MappingError, SourceBinding, resolve_idempotency_mode};
-use super::dead_letter::{ConnectorDeadLetter, DeadLetterSink, NoopDeadLetterSink};
+use super::dead_letter::{ConnectorDeadLetter, DeadLetterSink, UnconfiguredDeadLetterSink};
 use super::dispatch::{DispatchRequest, dispatch};
 use super::disposition::{
     DeadLetterMode, DispatchOutcome, MessageDisposition, OffsetTracker, PoisonTracker,
@@ -187,7 +187,10 @@ impl ConnectorRuntime {
         metrics: Arc<dyn MetricsRecorder>,
         idempotency_mode: IdempotencyMode,
     ) -> Self {
-        let sink: Arc<dyn DeadLetterSink> = Arc::new(NoopDeadLetterSink);
+        // Fails rather than silently succeeding: a binding defaults to
+        // `HarvestSink`, so a no-op default would acknowledge a poison message
+        // with no record anywhere. See `UnconfiguredDeadLetterSink`.
+        let sink: Arc<dyn DeadLetterSink> = Arc::new(UnconfiguredDeadLetterSink);
         let permits = Arc::new(Semaphore::new(binding.max_in_flight.max(1)));
         Self {
             binding,
@@ -299,7 +302,10 @@ impl ConnectorRuntime {
     pub async fn run_once(&self) -> Result<PassSummary, ConnectorError> {
         let batch = self
             .source
-            .receive(self.config.max_batch, self.config.poll_timeout)
+            .receive(
+                effective_max_batch(self.config.max_batch),
+                self.config.poll_timeout,
+            )
             .await?;
 
         // Throttled: `lag()` is a billed broker round-trip, and the gauge only
@@ -744,6 +750,19 @@ impl ConnectorRuntime {
 #[must_use]
 pub const fn dead_letter_mode_of(binding: &SourceBinding) -> DeadLetterMode {
     binding.dead_letter_mode
+}
+
+/// The batch size actually handed to a source, floored at one.
+///
+/// A zero batch is a silent killer rather than a loud one: a source asked for
+/// zero messages returns an empty batch, the runtime reads that as an idle
+/// poll, and the binding consumes nothing forever with no error to alert on.
+/// Clamping here — at the runtime's single `receive` call site — covers every
+/// source including an embedder's own `EventSource`, not just the two adapters
+/// shipped in-tree.
+#[must_use]
+pub const fn effective_max_batch(configured: usize) -> usize {
+    if configured == 0 { 1 } else { configured }
 }
 
 #[cfg(test)]
@@ -1477,6 +1496,103 @@ mod tests {
         assert!(
             rt.run_once().await.is_ok(),
             "a drained prefix must stop failing passes"
+        );
+    }
+
+    /// A directly-constructed runtime defaults to `DeadLetterMode::HarvestSink`
+    /// (the binding default) but has no sink installed. Acknowledging there
+    /// would discard the message with no record anywhere — the one outcome a
+    /// dead-letter path must never produce. It has to fail loudly instead, so
+    /// the existing sink-failure branch abandons for redelivery.
+    #[tokio::test]
+    async fn an_unconfigured_sink_never_acks_a_dead_letter_away() {
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_kafka(0, 1, b"{{{");
+        let erased: Arc<dyn EventSource> = Arc::clone(&source) as Arc<dyn EventSource>;
+        let rt = ConnectorRuntime::new(
+            malformed_binding(),
+            erased,
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
+        );
+
+        let summary = rt.run_once().await.expect("the pass itself still succeeds");
+
+        assert_eq!(
+            summary,
+            PassSummary {
+                received: 1,
+                acked: 0,
+                retried: 1,
+                dead_lettered: 0,
+            },
+            "an unrecorded dead letter must be retried, never acked away"
+        );
+        assert!(
+            source.acked().is_empty(),
+            "the message must remain on the broker"
+        );
+    }
+
+    /// The fix is scoped to the broken pairing. A broker-native binding never
+    /// writes to the harvest sink at all (it abandons for the redrive policy),
+    /// so leaving its sink unset stays perfectly valid.
+    #[tokio::test]
+    async fn a_broker_native_binding_needs_no_harvest_sink() {
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_kafka(0, 1, b"{{{");
+        let binding = Arc::new(
+            SourceBinding::starts("orders", "orders", "order_flow")
+                .map_raw(|_ctx| Err(MappingError::Deserialize("not json".to_string())))
+                .broker_native_dead_letter(),
+        );
+        let erased: Arc<dyn EventSource> = Arc::clone(&source) as Arc<dyn EventSource>;
+        let rt = ConnectorRuntime::new(
+            binding,
+            erased,
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
+        );
+
+        let summary = rt.run_once().await.expect("pass succeeds");
+
+        assert_eq!(
+            summary.dead_lettered, 1,
+            "abandoned to the broker's redrive"
+        );
+        assert_eq!(summary.retried, 0);
+    }
+
+    /// A zero batch size makes every adapter return nothing, so the runtime
+    /// would read every pass as idle and consume forever without progress.
+    /// Clamped at the runtime's single call site, so an embedder's own
+    /// `EventSource` is covered too — not just the two shipped adapters.
+    #[test]
+    fn a_zero_batch_size_cannot_silently_stop_consumption() {
+        assert_eq!(effective_max_batch(0), 1, "zero must never reach a source");
+        assert_eq!(effective_max_batch(1), 1);
+        assert_eq!(effective_max_batch(32), 32);
+    }
+
+    #[tokio::test]
+    async fn a_zero_batch_config_still_consumes() {
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_kafka(0, 1, b"{{{");
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let rt = runtime(malformed_binding(), Arc::clone(&source), Arc::clone(&sink)).with_config(
+            ConnectorRuntimeConfig {
+                max_batch: 0,
+                ..ConnectorRuntimeConfig::default()
+            },
+        );
+
+        let summary = rt.run_once().await.expect("pass succeeds");
+
+        assert_eq!(
+            summary.received, 1,
+            "a misconfigured batch size must not stall the binding"
         );
     }
 }

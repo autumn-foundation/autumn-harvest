@@ -286,6 +286,35 @@ coordinates, so a run traces back to the exact message.
   (×4, floored at 32), which is what bounds *healthy* out-of-order settlement.
   `Some(0)` opts out.
 
+- **A directly-built runtime silently discarded every poison message.**
+  `ConnectorRuntime::new` / `for_binding` are both public, and both installed
+  `NoopDeadLetterSink` — while a `SourceBinding` defaults to
+  `DeadLetterMode::HarvestSink`. So an embedder wiring the runtime themselves
+  (a test harness, a custom supervisor) got "record this poison message" paired
+  with a sink that records nothing: the write "succeeded", the runtime
+  acknowledged the message, and it was gone with no row in any table and no
+  copy on any broker — the one outcome a dead-letter path must never produce.
+  `HarvestPlugin` always installs the Postgres sink, so the shipped path was
+  never affected. Fixed by making the default sink *fail* rather than silently
+  succeed: the new `UnconfiguredDeadLetterSink` returns a `Config` error naming
+  both remedies (`with_dead_letter_sink(...)`, or
+  `broker_native_dead_letter()`), which drops straight into the runtime's
+  existing — and already-tested — ack-only-after-a-durable-write branch, so the
+  message is abandoned for redelivery and logged loudly instead of lost. No
+  public signature changed. `NoopDeadLetterSink` stays exported for the
+  broker-native and test cases, where the sink is genuinely never consulted,
+  with its doc updated to say it is no longer the default and why.
+
+- **A `max_batch` of `0` stopped a binding consuming, forever and silently.**
+  The value went straight to the source: Kafka's `while batch.len() < max`
+  loop never ran and `MockSource` drained nothing, so every pass looked *idle*
+  rather than broken — no error, no metric, no log, just a binding that never
+  moves again. (SQS happened to survive it, clamping internally.) Floored at
+  the runtime's single `receive` call site rather than per adapter, so an
+  embedder's own `EventSource` is covered too — new pure
+  `effective_max_batch`, mutation-verified: reverting it to the identity makes
+  both new tests report `received: 0`.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

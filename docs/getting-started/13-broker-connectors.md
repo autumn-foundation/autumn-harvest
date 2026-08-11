@@ -158,7 +158,10 @@ for a cheap idle binding — a 1s poll (so SQS **long**-polls rather than
 short-polls, which would bill an API call per round trip), a 200ms idle
 backoff, and a consumer-lag sample at most every 15s. Lower `poll_timeout` for
 faster pickup at the cost of more idle API calls; raise `max_batch` for a
-high-throughput topic.
+high-throughput topic. A `max_batch` of `0` is floored to `1` at the runtime's
+own `receive` call — a source asked for zero messages returns an empty batch,
+which the runtime would read as an idle poll, so the binding would consume
+nothing forever with no error to alert on.
 
 ## 2. SQS → an entity workflow (start-or-signal)
 
@@ -576,6 +579,30 @@ assert_eq!(summary.retried, 0);
 the finer-grained split (`dispatched` vs `idempotent_replay` vs `deferred`)
 is on the `harvest.connector.dispatched` counter's `outcome` label, so assert
 it with a recording `MetricsRecorder`.
+
+The `.with_dead_letter_sink(...)` call is **not** optional when you build a
+runtime yourself. A binding dead-letters into harvest by default, and a
+directly-constructed runtime starts with a sink that deliberately *fails*
+rather than silently succeeding — otherwise a poison message would be
+acknowledged with no record in any table or broker, which is the one outcome a
+dead-letter path must never produce. Leave it out and the first poison message
+logs a configuration error naming both remedies and stays on the broker for
+redelivery; nothing is lost, but the binding will not make progress past it.
+
+`HarvestPlugin` wires the Postgres sink for you, so this only affects runtimes
+you construct directly (tests, embedding harness, a custom supervisor). Two
+ways to satisfy it:
+
+```rust
+// (a) record into harvest — the default mode:
+let runtime = ConnectorRuntime::new(/* ... */)
+    .with_dead_letter_sink(Arc::new(RecordingDeadLetterSink::new()));
+
+// (b) or let the broker's own redrive policy own dead-lettering, in which
+//     case no harvest sink is consulted at all:
+let binding = SourceBinding::starts("orders", "orders.placed", "order_flow")
+    .broker_native_dead_letter();
+```
 
 The `HarvestApiState` is the fiddly part; copy the `api_state(...)` helper from
 [`connector_integration.rs`](../../autumn-harvest-plugin/tests/connector_integration.rs),

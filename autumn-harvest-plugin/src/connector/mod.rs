@@ -115,7 +115,7 @@ pub use binding::{
 };
 pub use dead_letter::{
     ConnectorDeadLetter, DeadLetterSink, NoopDeadLetterSink, PostgresDeadLetterSink,
-    RecordingDeadLetterSink, insert_dead_letter,
+    RecordingDeadLetterSink, UnconfiguredDeadLetterSink, insert_dead_letter,
 };
 pub use disposition::{
     DeadLetterMode, DispatchOutcome, MessageDisposition, OffsetTracker, PoisonTracker,

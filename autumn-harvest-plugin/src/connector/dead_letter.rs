@@ -149,6 +149,14 @@ pub async fn insert_dead_letter(
 /// broker's own redrive policy owns the dead-letter destination and the
 /// runtime abandons the message rather than acknowledging it. Also useful in
 /// tests.
+///
+/// Deliberately **not** the runtime's default — see
+/// [`UnconfiguredDeadLetterSink`]. Installing this one under
+/// [`DeadLetterMode::HarvestSink`][hs] acknowledges every poison message with
+/// no record anywhere, so reach for it only when something else owns the
+/// dead-letter destination.
+///
+/// [hs]: super::disposition::DeadLetterMode::HarvestSink
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopDeadLetterSink;
 
@@ -156,6 +164,44 @@ pub struct NoopDeadLetterSink;
 impl DeadLetterSink for NoopDeadLetterSink {
     async fn write(&self, _entry: &ConnectorDeadLetter) -> Result<(), ConnectorError> {
         Ok(())
+    }
+}
+
+/// The default sink for a runtime nobody has given one to.
+///
+/// A binding defaults to
+/// [`DeadLetterMode::HarvestSink`][hs], so a runtime built directly — via
+/// [`ConnectorRuntime::new`][new] or [`for_binding`][fb], both public — would
+/// otherwise pair "record this poison message" with a sink that records
+/// nothing, acknowledge the message, and lose it permanently with no trace in
+/// any table or broker.
+///
+/// Failing is the safe default: the runtime only acknowledges a dead letter
+/// *after* the sink write succeeds, so an error here leaves the message on the
+/// broker for redelivery and logs loudly, turning silent data loss into a
+/// visible misconfiguration. Install a real sink with
+/// [`with_dead_letter_sink`][wds], or let the broker own dead-lettering with
+/// [`SourceBinding::broker_native_dead_letter`][bn] — that mode abandons
+/// rather than writing, so it never reaches a sink at all.
+///
+/// [hs]: super::disposition::DeadLetterMode::HarvestSink
+/// [new]: super::runtime::ConnectorRuntime::new
+/// [fb]: super::runtime::ConnectorRuntime::for_binding
+/// [wds]: super::runtime::ConnectorRuntime::with_dead_letter_sink
+/// [bn]: super::binding::SourceBinding::broker_native_dead_letter
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnconfiguredDeadLetterSink;
+
+#[async_trait]
+impl DeadLetterSink for UnconfiguredDeadLetterSink {
+    async fn write(&self, _entry: &ConnectorDeadLetter) -> Result<(), ConnectorError> {
+        Err(ConnectorError::Config(
+            "no dead-letter sink installed: this binding dead-letters into harvest, but the \
+             runtime has no sink to write to. Call `with_dead_letter_sink(...)`, or switch the \
+             binding to `broker_native_dead_letter()` so the broker's redrive policy owns it. \
+             The message was left on the broker rather than acknowledged."
+                .to_string(),
+        ))
     }
 }
 
@@ -228,6 +274,39 @@ mod tests {
             failed_at: Utc::now(),
         };
         assert!(sink.write(&entry).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_unconfigured_sink_refuses_and_says_how_to_fix_it() {
+        let entry = ConnectorDeadLetter {
+            binding: "orders".to_string(),
+            stream: "orders".to_string(),
+            coordinates: "orders:0:1".to_string(),
+            idempotency_key: "conn:L6:orders:L0::L11:orders:0:1".to_string(),
+            workflow_name: "order_flow".to_string(),
+            reason: PoisonReason::Malformed,
+            detail: "bad json".to_string(),
+            attempts: 1,
+            payload: b"{".to_vec(),
+            failed_at: Utc::now(),
+        };
+
+        let err = UnconfiguredDeadLetterSink
+            .write(&entry)
+            .await
+            .expect_err("an unconfigured sink must refuse, so the runtime never acks");
+
+        // The error is the operator's only signal here, so it has to name both
+        // remedies rather than just complaining.
+        let message = err.to_string();
+        assert!(
+            message.contains("with_dead_letter_sink"),
+            "must name the sink remedy: {message}"
+        );
+        assert!(
+            message.contains("broker_native_dead_letter"),
+            "must name the broker-native remedy: {message}"
+        );
     }
 
     fn entry() -> ConnectorDeadLetter {
