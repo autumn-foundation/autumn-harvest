@@ -97,9 +97,17 @@ privilege before concluding "the benchmark produced nothing".
 
 Two more things worth knowing before pointing this at a server you care about:
 
-* **Setup sweeps stale `harvest_claim_bench_%` databases**, not just teardown —
-  that is what reclaims databases orphaned by a run that panicked, which a
-  teardown hook can never do. The sole liveness authority is the **server**: the
+* **Setup sweeps stale benchmark databases**, not just teardown — that is what
+  reclaims databases orphaned by a run that panicked, which a teardown hook can
+  never do. Only names this harness could itself have minted are ever eligible:
+  the full shape `harvest_claim_bench_{pid}_{token}_{seq}`, where `pid` and
+  `seq` are decimal and `token` is exactly 16 lowercase hex digits. Sharing the
+  prefix is **not** enough — a database of your own called, say,
+  `harvest_claim_bench_123_production` fails the token and sequence checks and
+  is never a candidate. (The SQL prefilter matches on the prefix, but `_` is a
+  single-character wildcard in `LIKE`, so the prefilter is deliberately not the
+  authority; every candidate is re-checked against the whole shape before
+  anything destructive runs.) The sole liveness authority is the **server**: the
   sweep drops a database only when nothing holds a backend against it, and each
   run keeps one idle connection open for the whole life of its database
   precisely so that question has an answer even between scenarios. A local pid

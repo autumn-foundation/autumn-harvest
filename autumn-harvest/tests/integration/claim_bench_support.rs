@@ -582,6 +582,18 @@ pub fn db_name_from_url(url: &str) -> Option<&str> {
     Some(&path[..path_end])
 }
 
+/// Prefix of every database this harness creates against an admin URL.
+///
+/// Lives beside [`sweep_step`] rather than in [`db`] so the one function that
+/// decides whether a name is ours owns the whole shape, and so that decision
+/// stays testable with no server and no `db` feature.
+pub const BENCH_DB_PREFIX: &str = "harvest_claim_bench_";
+
+/// Width of the [`db::run_token`] field in a bench database name.
+///
+/// `format!("{:016x}", u64)` is always exactly this many lowercase hex digits.
+const RUN_TOKEN_HEX_LEN: usize = 16;
+
 /// What the stale-database sweep should do with one candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepStep {
@@ -623,14 +635,67 @@ pub enum SweepStep {
 /// The run token still earns its keep in the database **name**, where it makes
 /// two containerised runs on different hosts — both reporting pid 1 — collide
 /// neither at `CREATE DATABASE` nor in each other's sweep.
+///
+/// # Why this takes the whole name
+///
+/// It used to take an already-parsed `(pid, token)` pair, which put the parse —
+/// the part that decides whether a name is *ours at all* — outside everything
+/// this function is tested by. The parse was correspondingly loose: it required
+/// only a numeric first field and the mere presence of a second, so
+/// `harvest_claim_bench_123_production` read as pid `123`, token `production`,
+/// and a database nobody here minted reached `pg_terminate_backend` and
+/// `DROP DATABASE`. Taking `datname` means the shape check *is* the tested
+/// surface.
+///
+/// A name is ours only if it is exactly
+/// `harvest_claim_bench_{pid}_{token}_{seq}` with:
+///
+/// * `pid` — decimal digits in `u32` range (from `std::process::id`),
+/// * `token` — exactly [`RUN_TOKEN_HEX_LEN`] **lowercase** hex digits (from
+///   `format!("{:016x}", …)`),
+/// * `seq` — decimal digits in `u64` range (from an `AtomicU64` counter),
+/// * and **nothing else**: no fourth component, no empty ones.
+///
+/// Anything else is somebody's database. The asymmetry here is the whole
+/// argument for erring strict: refusing to reclaim one of ours leaks a
+/// database, while reclaiming one of theirs destroys data, so every ambiguous
+/// case resolves to [`SweepStep::Skip`].
 #[must_use]
-pub const fn sweep_step(owner_pid: Option<u32>, owner_token: Option<&str>) -> SweepStep {
-    // A name we did not mint: not ours to reclaim. Ours always carry both a
-    // numeric pid and a token, so a missing either way means someone else's.
-    if owner_pid.is_none() || owner_token.is_none() {
+pub fn sweep_step(datname: &str) -> SweepStep {
+    let Some(rest) = datname.strip_prefix(BENCH_DB_PREFIX) else {
+        return SweepStep::Skip;
+    };
+    // Exactly three components. The trailing `None` is what rejects a longer
+    // name: without it `harvest_claim_bench_1_<16 hex>_0_extra` would pass on
+    // its first three fields alone.
+    let mut parts = rest.split('_');
+    let (Some(pid), Some(token), Some(seq), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return SweepStep::Skip;
+    };
+    if !is_decimal::<u32>(pid) || !is_run_token(token) || !is_decimal::<u64>(seq) {
         return SweepStep::Skip;
     }
     SweepStep::AskServer
+}
+
+/// Non-empty ASCII digits that fit `T` — a field we could actually have minted.
+///
+/// Deliberately stricter than `parse` alone, which accepts a leading `+`: this
+/// gates a `DROP DATABASE`, and `+1` is not a pid we ever printed.
+fn is_decimal<T: std::str::FromStr>(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<T>().is_ok()
+}
+
+/// Exactly 16 lowercase hex digits, the only shape [`db::run_token`] emits.
+///
+/// Uppercase is rejected for the same reason a fourth component is: we never
+/// produce it, so a name carrying it is not ours.
+fn is_run_token(s: &str) -> bool {
+    s.len() == RUN_TOKEN_HEX_LEN
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 // ---------------------------------------------------------------------------
@@ -918,12 +983,15 @@ mod pure_tests {
     #[test]
     fn sweep_step_lets_the_lease_decide_for_our_own_earlier_databases() {
         assert_eq!(
-            sweep_step(Some(1), Some("mytoken")),
+            sweep_step("harvest_claim_bench_1_0123456789abcdef_0"),
             SweepStep::AskServer,
             "our own token must not exempt a database from the lease check",
         );
         assert_eq!(
-            sweep_step(Some(std::process::id()), Some("mytoken")),
+            sweep_step(&format!(
+                "harvest_claim_bench_{}_0123456789abcdef_7",
+                std::process::id()
+            )),
             SweepStep::AskServer,
         );
     }
@@ -934,7 +1002,10 @@ mod pure_tests {
     /// can never answer "is this in use"; only the server sees every client.
     #[test]
     fn sweep_step_asks_the_server_for_a_foreign_run() {
-        assert_eq!(sweep_step(Some(4242), Some("theirs")), SweepStep::AskServer);
+        assert_eq!(
+            sweep_step("harvest_claim_bench_4242_fedcba9876543210_3"),
+            SweepStep::AskServer,
+        );
     }
 
     /// A live same-host pid must NOT veto the server's judgement.
@@ -944,26 +1015,86 @@ mod pure_tests {
         // previous container run records exactly that pid. A liveness veto here
         // would skip it forever; the advisory lock already covers the only
         // window such a veto ever protected.
-        assert_eq!(sweep_step(Some(1), Some("theirs")), SweepStep::AskServer);
         assert_eq!(
-            sweep_step(Some(std::process::id()), Some("theirs")),
+            sweep_step("harvest_claim_bench_1_fedcba9876543210_0"),
+            SweepStep::AskServer,
+        );
+        assert_eq!(
+            sweep_step(&format!(
+                "harvest_claim_bench_{}_fedcba9876543210_0",
+                std::process::id()
+            )),
             SweepStep::AskServer,
         );
     }
 
     /// A name this harness did not mint is never reclaimed.
     ///
-    /// Ours are `harvest_claim_bench_{pid}_{token}_{seq}`, so a missing pid *or*
-    /// a missing token means the name came from somewhere else. With the sweep
-    /// otherwise unconditional, this is the only thing standing between a
-    /// same-prefix database belonging to someone else and a `DROP`.
+    /// This is the only thing standing between a same-prefix database belonging
+    /// to somebody else and `pg_terminate_backend` + `DROP DATABASE`, so it
+    /// checks the *whole* shape rather than the first field or two. Each case
+    /// below is a name that a looser check would have handed to the sweep.
     #[test]
-    fn sweep_step_leaves_unparseable_names_alone() {
-        assert_eq!(sweep_step(None, None), SweepStep::Skip);
-        // A numeric first component but no token: not our name shape.
-        assert_eq!(sweep_step(Some(123), None), SweepStep::Skip);
-        // A token but a non-numeric first component (parsed to `None`).
-        assert_eq!(sweep_step(None, Some("sometoken")), SweepStep::Skip);
+    fn sweep_step_leaves_names_we_did_not_mint_alone() {
+        for name in [
+            // The reported case: prefix plus a numeric field and *anything*.
+            // Under a two-field check this parsed as pid 123 / token
+            // "production" and was dropped.
+            "harvest_claim_bench_123_production",
+            // Right arity, but the token is not a run token.
+            "harvest_claim_bench_123_production_0",
+            // Token of the right length that is not hex.
+            "harvest_claim_bench_1_zzzzzzzzzzzzzzzz_0",
+            // Hex, but not the width `{:016x}` emits.
+            "harvest_claim_bench_1_0123456789abcde_0",
+            "harvest_claim_bench_1_0123456789abcdef0_0",
+            // Uppercase hex: we only ever print lowercase.
+            "harvest_claim_bench_1_0123456789ABCDEF_0",
+            // A fourth component — a suffix appended to one of ours.
+            "harvest_claim_bench_1_0123456789abcdef_0_backup",
+            // Missing the sequence entirely.
+            "harvest_claim_bench_1_0123456789abcdef",
+            // Non-numeric pid, and a non-numeric sequence.
+            "harvest_claim_bench_web_0123456789abcdef_0",
+            "harvest_claim_bench_1_0123456789abcdef_final",
+            // Empty components (a doubled separator).
+            "harvest_claim_bench_1__0",
+            "harvest_claim_bench__0123456789abcdef_0",
+            // Signed/whitespace forms `parse` alone would have accepted.
+            "harvest_claim_bench_+1_0123456789abcdef_0",
+            // Numeric but out of range for the types we mint from.
+            "harvest_claim_bench_4294967296_0123456789abcdef_0",
+            // The bare prefix, and a database that merely starts like one.
+            "harvest_claim_bench_",
+            "harvest_claim_bench_backup",
+            // No prefix at all. `_` is a single-character wildcard in `LIKE`,
+            // so the SQL prefilter really can hand us names like this.
+            "harvestXclaimXbenchX1_0123456789abcdef_0",
+            "production",
+        ] {
+            assert_eq!(
+                sweep_step(name),
+                SweepStep::Skip,
+                "{name} is not a name this harness mints, so it must never reach DROP DATABASE",
+            );
+        }
+    }
+
+    /// The shape accepted is exactly the shape minted.
+    ///
+    /// Built from the same pieces `setup_bench_db` formats its name from, so a
+    /// change to either side that the other does not follow fails here rather
+    /// than by silently leaking databases nothing will ever reclaim.
+    #[test]
+    fn sweep_step_accepts_a_freshly_minted_name() {
+        let minted = format!(
+            "{}{}_{:016x}_{}",
+            super::BENCH_DB_PREFIX,
+            std::process::id(),
+            u64::MAX,
+            u64::MAX,
+        );
+        assert_eq!(sweep_step(&minted), SweepStep::AskServer, "{minted}");
     }
 
     /// The inverse of `with_db_name` must not reintroduce the last-slash bug.
@@ -1315,7 +1446,11 @@ pub mod db {
     }
 
     /// Prefix of every database this harness creates against an admin URL.
-    const BENCH_DB_PREFIX: &str = "harvest_claim_bench_";
+    ///
+    /// Defined next to [`super::sweep_step`], which validates the rest of the
+    /// shape, so minting and reclaiming can never disagree about what our names
+    /// look like.
+    use super::BENCH_DB_PREFIX;
 
     /// Advisory-lock key serializing sweep-and-create across clients.
     ///
@@ -1455,16 +1590,11 @@ pub mod db {
         };
 
         for row in rows {
-            // Name shape: harvest_claim_bench_{pid}_{run_token}_{seq}.
-            let mut parts = row
-                .datname
-                .strip_prefix(BENCH_DB_PREFIX)
-                .into_iter()
-                .flat_map(|rest| rest.split('_'));
-            let owner_pid = parts.next().and_then(|pid| pid.parse::<u32>().ok());
-            let owner_token = parts.next();
-
-            if super::sweep_step(owner_pid, owner_token) == super::SweepStep::Skip {
+            // The authority on whether this name is ours at all. The `LIKE`
+            // above is only a prefilter — and a loose one, since `_` is a
+            // single-character wildcard — so every candidate is re-checked here
+            // against the full minted shape before anything destructive runs.
+            if super::sweep_step(&row.datname) == super::SweepStep::Skip {
                 continue;
             }
 

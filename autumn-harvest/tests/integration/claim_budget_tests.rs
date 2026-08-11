@@ -777,6 +777,111 @@ async fn a_later_setup_reclaims_this_processes_finished_databases() {
     drop(third);
 }
 
+/// A database that merely *shares our prefix* is never dropped.
+///
+/// The sweep is the only destructive thing this harness does to a server it
+/// does not own, so what counts as "ours" has to be the full minted shape —
+/// `harvest_claim_bench_{pid}_{16 hex}_{seq}` — and not a prefix plus a
+/// plausible field or two. Checking only a numeric first field and the presence
+/// of a second meant a name like `harvest_claim_bench_123_production` parsed as
+/// pid `123`, token `production`, and an idle database nobody here minted
+/// reached `pg_terminate_backend` and `DROP DATABASE`.
+///
+/// The decoy below is deliberately in that vulnerable class: prefixed, numeric
+/// second field, and a third field that is *not* a run token.
+///
+/// # Why this is written so defensively
+///
+/// The decoy has to sit **inside** the swept `harvest_claim_bench_%` prefix or
+/// it would not be a candidate and the test would prove nothing. That is also
+/// what makes it dangerous: once the fix lands, no sweep will ever reclaim it,
+/// so a panic between `CREATE DATABASE` and its `DROP` strands a database on a
+/// shared server permanently. So nothing here panics in that span — failures
+/// are collected into a value, cleanup runs unconditionally, and every
+/// assertion happens after it. (An earlier probe in this file learned that the
+/// hard way and left two orphans behind.)
+///
+/// Existing-server mode only — the testcontainer path sweeps a private server.
+#[tokio::test]
+async fn a_foreign_database_sharing_our_prefix_is_never_dropped() {
+    use diesel::QueryableByName;
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+
+    #[derive(QueryableByName)]
+    struct ExistsRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    async fn exists(admin: &mut AsyncPgConnection, datname: &str) -> Result<bool, String> {
+        diesel::sql_query("SELECT count(*) AS n FROM pg_database WHERE datname = $1")
+            .bind::<diesel::sql_types::Text, _>(datname.to_string())
+            .get_result::<ExistsRow>(admin)
+            .await
+            .map(|r| r.n > 0)
+            .map_err(|e| format!("read pg_database: {e}"))
+    }
+
+    let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+        eprintln!(
+            "SKIP a_foreign_database_sharing_our_prefix_is_never_dropped: \
+             existing-server mode only (HARVEST_TEST_DATABASE_URL unset)"
+        );
+        return;
+    };
+    let Ok(mut admin) = AsyncPgConnection::establish(&admin_url).await else {
+        eprintln!("SKIP a_foreign_database_sharing_our_prefix_is_never_dropped: admin connect");
+        return;
+    };
+
+    // Prefixed and numeric-then-arbitrary, so the old two-field check accepted
+    // it. Suffixed with our pid so two concurrent runs cannot fight over one
+    // decoy, and named unmistakably after this probe so it can never collide
+    // with a database an operator actually cares about.
+    let decoy = format!("harvest_claim_bench_123_sweepprobe{}", std::process::id());
+
+    // A previous crashed run of this test could have stranded one.
+    let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {decoy}"))
+        .execute(&mut admin)
+        .await;
+    if let Err(e) = diesel::sql_query(format!("CREATE DATABASE {decoy}"))
+        .execute(&mut admin)
+        .await
+    {
+        eprintln!("SKIP a_foreign_database_sharing_our_prefix_is_never_dropped: create decoy: {e}");
+        return;
+    }
+
+    // ---- nothing from here to `DROP DATABASE` may panic ----
+
+    // A setup sweeps before it creates. The decoy is idle, so the server check
+    // will say "no connections" — the name check is the only thing left.
+    let outcome = match db::setup_bench_db().await {
+        Ok(bench) => {
+            let survived = exists(&mut admin, &decoy).await;
+            drop(bench);
+            survived
+        }
+        Err(e) => Err(format!("SKIP: no database: {e:?}")),
+    };
+
+    let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {decoy}"))
+        .execute(&mut admin)
+        .await;
+
+    // ---- safe to panic again ----
+
+    match outcome {
+        Ok(survived) => assert!(
+            survived,
+            "{decoy} was dropped by the stale sweep: a database this harness \
+             never minted, sharing only its name prefix, was terminated and \
+             destroyed on a server the benchmark does not own",
+        ),
+        Err(why) => eprintln!("SKIP a_foreign_database_sharing_our_prefix_is_never_dropped: {why}"),
+    }
+}
+
 /// Setup serializes against a foreign sweep, so the create-to-lease window is
 /// not a hole.
 ///
