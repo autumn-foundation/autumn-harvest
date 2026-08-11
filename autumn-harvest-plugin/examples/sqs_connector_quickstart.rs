@@ -20,10 +20,13 @@
 //!
 //! * The first message for `device-dev-7` starts the entity workflow; every
 //!   later message for that device is delivered to the *same* run as a signal
-//!   (issue #244's atomic start-or-attach). That is also how you get **per-key
-//!   ordering** — the entity workflow serializes its own signals — since the
-//!   connector itself dispatches up to `max_in_flight` messages concurrently
-//!   and does not preserve queue order across them.
+//!   (issue #244's atomic start-or-attach). That buys **affinity, not
+//!   ordering**: all of one device's readings land in one run, but the
+//!   connector dispatches up to `max_in_flight` messages concurrently — two
+//!   readings for the same device can race, and the later one can persist its
+//!   signal first. The workflow then replays them in database-recorded order,
+//!   which need not be queue order. Set `.max_in_flight(1)` on the binding if
+//!   you need queue order, trading throughput for it.
 //! * The dedupe key is the message's own SQS coordinate — its broker-assigned
 //!   `MessageId`, which is stable across every redelivery of that message. A
 //!   genuine *re-publish* is a different message, so map a business key into

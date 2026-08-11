@@ -684,6 +684,34 @@ const fn coordinate_dedupe_window_untuned(
         && configured_window.is_none()
 }
 
+/// The first pair of registrations that share one event source, if any
+/// (issue #944, Codex review).
+///
+/// Each registration gets its own [`ConnectorRuntime`][r] and therefore its own
+/// `OffsetTracker`, so handing the same `Arc<dyn EventSource>` to two of them
+/// starts two receive loops over **one client** with two independent views of
+/// what is durable. On Kafka that is a message-loss hazard: the loops split the
+/// stream nondeterministically, so one tracker can commit a contiguous mark
+/// covering offsets the *other* loop is still dispatching, and a crash then
+/// skips them permanently. On SQS it is a silent fan-out failure: each message
+/// goes to exactly one of the two bindings, so neither target sees the whole
+/// queue.
+///
+/// Callers pass source identities (`Arc::as_ptr` addresses); taking plain
+/// integers keeps the decision unit-testable without constructing sources,
+/// mirroring [`binding_stream_matches_adapter`].
+///
+/// [r]: crate::connector::ConnectorRuntime
+#[cfg(feature = "connectors")]
+fn first_shared_source(identities: &[usize]) -> Option<(usize, usize)> {
+    for (i, id) in identities.iter().enumerate() {
+        if let Some(j) = identities[i + 1..].iter().position(|other| other == id) {
+            return Some((i, i + 1 + j));
+        }
+    }
+    None
+}
+
 /// Whether a binding's declared stream matches the stream its adapter
 /// actually consumes (issue #944).
 ///
@@ -877,6 +905,26 @@ impl Plugin for HarvestPlugin {
                 &dag_names,
             ) {
                 panic!("harvest connector configuration error: {e}");
+            }
+            // One source per binding. Sharing one across registrations gives
+            // each its own `OffsetTracker` over a single client, which loses
+            // messages on Kafka and silently splits the queue on SQS.
+            let identities: Vec<usize> = connectors
+                .iter()
+                .map(|r| std::sync::Arc::as_ptr(&r.source).cast::<()>() as usize)
+                .collect();
+            if let Some((i, j)) = first_shared_source(&identities) {
+                panic!(
+                    "harvest connector bindings '{}' and '{}' share one event source: each \
+                     binding gets its own consumer loop and its own offset tracker, so two \
+                     loops over one client would split the stream between them -- on Kafka \
+                     one tracker can commit past offsets the other has not made durable \
+                     (lost on a crash), and on SQS neither target would see every message. \
+                     Give each binding its own source. To fan one stream out to two targets, \
+                     use two Kafka consumers with distinct group ids, or two SQS queues \
+                     behind an SNS topic",
+                    connectors[i].binding.name, connectors[j].binding.name,
+                );
             }
             for registration in &connectors {
                 assert!(
@@ -2931,6 +2979,24 @@ mod tests {
         // Length-equal but different, so a naive length check cannot pass.
         assert!(!binding_stream_matches_adapter("orders", "ordera"));
         assert!(binding_stream_matches_adapter("", ""));
+    }
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn two_registrations_sharing_one_source_are_rejected() {
+        // Two receive loops over ONE client, each with its own OffsetTracker,
+        // is the failure this catches: on Kafka one loop can commit a mark
+        // covering offsets the other has not made durable, permanently
+        // skipping them on a crash; on SQS the stream is split between the
+        // bindings so neither target sees every message.
+        assert_eq!(first_shared_source(&[1, 2, 3]), None);
+        assert_eq!(first_shared_source(&[1, 2, 1]), Some((0, 2)));
+        assert_eq!(first_shared_source(&[7, 7]), Some((0, 1)));
+        // Reports the FIRST offending pair, so the panic names a stable pair
+        // rather than whichever one the iteration order happened to reach.
+        assert_eq!(first_shared_source(&[4, 4, 5, 5]), Some((0, 1)));
+        assert_eq!(first_shared_source(&[]), None);
+        assert_eq!(first_shared_source(&[9]), None);
     }
 
     #[cfg(feature = "connectors")]

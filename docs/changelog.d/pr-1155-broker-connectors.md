@@ -413,6 +413,30 @@ coordinates, so a run traces back to the exact message.
   raising the bound to 4 makes it fail (`[1, 2, 0, …]`), so the test measures
   the bound rather than the mock's insertion order.
 
+- **Two bindings could share one event source, losing Kafka messages.**
+  `spawn_connectors` builds a `ConnectorRuntime` per registration, so each gets
+  its own `OffsetTracker` — handing the same `Arc<dyn EventSource>` to two
+  registrations started two receive loops over **one client** with two
+  independent views of what is durable. The validator only rejected duplicate
+  `(stream, target)` pairs, so same-stream-different-target passed. On Kafka the
+  loops split the stream nondeterministically and one tracker could commit a
+  contiguous mark covering offsets the *other* loop was still dispatching, which
+  a crash then skips permanently; on SQS each message goes to exactly one loop,
+  so neither target sees the whole queue. Rejected at build time now, naming
+  both bindings and the two remedies that actually fan a stream out (two Kafka
+  consumers with distinct group ids, or two SQS queues behind an SNS topic). The
+  decision is the pure `first_shared_source`, unit-tested without constructing
+  sources — matching `binding_stream_matches_adapter` — and it reports the first
+  offending pair so the panic names a stable one rather than whichever the
+  iteration order reached.
+
+- **The runnable SQS example still promised per-key ordering.** Its doc comment
+  claimed the entity pattern "is also how you get per-key ordering" while
+  configuring `.max_in_flight(16)` — the same defect just corrected in the
+  guide, left behind in the example an embedder is most likely to copy. It now
+  says **affinity, not ordering**, states the same-device race, and points at
+  `.max_in_flight(1)` as the explicit throughput trade.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of
