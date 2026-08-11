@@ -888,3 +888,102 @@ async fn a_stale_row_delete_is_guarded_by_the_registration_lock() {
         "collection must resume once the peer releases the lock"
     );
 }
+
+// ── Defect 1, concurrency — the squatter release must be a compare-and-swap ──
+
+/// Load a row as the resolver would observe it, so a test can hold a *stale*
+/// observation across a concurrent correction.
+async fn load_schedule(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+) -> autumn_harvest::models::HarvestSchedule {
+    use autumn_harvest::models::HarvestSchedule;
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    dsl::harvest_schedules
+        .find(id)
+        .select(HarvestSchedule::as_select())
+        .first(conn)
+        .await
+        .expect("load schedule row")
+}
+
+#[tokio::test]
+async fn a_release_never_nulls_a_name_the_holder_has_since_claimed() {
+    let (mut conn, _db) = setup_db().await;
+
+    // Observed state: `other_dag` is squatting the name `wants_this`.
+    let squatter = insert_raw_row(
+        &mut conn,
+        Some("other_dag"),
+        Some("wants_this"),
+        "cron:0 1 * * *",
+    )
+    .await;
+    let observed = load_schedule(&mut conn, squatter).await;
+
+    // A concurrent registration pass corrects the holder before our release
+    // runs: `other_dag` claims its *own* name, so the row is now well-formed.
+    // The public registration path takes no advisory lock, so this interleave
+    // is reachable in a real fleet.
+    {
+        use autumn_harvest::schema::harvest_schedules::dsl;
+        diesel::update(dsl::harvest_schedules.find(squatter))
+            .set(dsl::workflow_name.eq("other_dag"))
+            .execute(&mut conn)
+            .await
+            .expect("concurrent correction");
+    }
+
+    let released = autumn_harvest::scheduler::release_squatted_workflow_name(
+        &mut conn,
+        &observed,
+        "wants_this",
+    )
+    .await
+    .expect("a lost race is not an error at the primitive layer");
+
+    assert!(
+        !released,
+        "the row no longer matches the squat that was classified, so the \
+         release must decline it"
+    );
+    assert_eq!(
+        row_by_id(&mut conn, squatter).await,
+        (Some("other_dag".to_string()), Some("other_dag".to_string())),
+        "nulling a workflow_name the holder has since legitimately claimed \
+         removes it from the due list -- a silent, permanent outage"
+    );
+}
+
+#[tokio::test]
+async fn a_release_still_frees_an_unchanged_squat() {
+    let (mut conn, _db) = setup_db().await;
+
+    let squatter = insert_raw_row(
+        &mut conn,
+        Some("other_dag"),
+        Some("wants_this"),
+        "cron:0 1 * * *",
+    )
+    .await;
+    let observed = load_schedule(&mut conn, squatter).await;
+
+    let released = autumn_harvest::scheduler::release_squatted_workflow_name(
+        &mut conn,
+        &observed,
+        "wants_this",
+    )
+    .await
+    .expect("release");
+
+    assert!(
+        released,
+        "the compare-and-swap must not be so strict that it stops repairing \
+         the case issue #1157 actually reported"
+    );
+    assert_eq!(
+        row_by_id(&mut conn, squatter).await,
+        (Some("other_dag".to_string()), None),
+        "release, not delete: the row keeps its own dag_name identity"
+    );
+}

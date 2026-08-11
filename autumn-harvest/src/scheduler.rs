@@ -1779,28 +1779,56 @@ const fn const_str_eq(a: &str, b: &str) -> bool {
 /// `runs_started` and `next_run_at` so its rightful owner's own registration
 /// re-stamps it in the same pass. `harvest_schedules_kind_check` still holds
 /// because the row's `dag_name` is non-NULL by construction here.
-async fn release_squatted_workflow_name(
+///
+/// **This is a compare-and-swap, not an id-keyed write, and that is
+/// load-bearing.** The `WHERE` clause re-asserts the exact condition that
+/// classified the row as a squatter — it still holds `contested_name`, and its
+/// own `dag_name` still is not that name. `dag_name <> $1` also excludes a NULL
+/// `dag_name`, which is the [`WorkflowNameHolder::WorkflowOnly`] shape and a
+/// different arm entirely.
+///
+/// The public registration path deliberately takes no advisory lock (see
+/// [`REGISTRATION_LOCK_KEY`]), so a peer can correct the holder between the
+/// resolver's read and this write — at which point an id-only `UPDATE` would
+/// null a `workflow_name` the holder had just legitimately claimed. Since the
+/// due list requires `workflow_name IS NOT NULL`, that schedule would then stop
+/// firing *silently and permanently*: a quiet outage traded for a loud storm,
+/// which is the failure this whole change set exists to avoid. Returns whether
+/// the release actually applied; `false` means the row changed underneath and
+/// the caller must not proceed as though the name were freed.
+#[doc(hidden)]
+pub async fn release_squatted_workflow_name(
     conn: &mut AsyncPgConnection,
     row: &HarvestSchedule,
-) -> HarvestResult<()> {
+    contested_name: &str,
+) -> HarvestResult<bool> {
     use crate::schema::harvest_schedules::dsl;
 
-    tracing::warn!(
-        schedule_id = %row.id,
-        dag_name = ?row.dag_name,
-        workflow_name = ?row.workflow_name,
-        "harvest: releasing a workflow_name squatted by a schedule row whose \
-         dag_name disagrees with it; the row keeps its own identity"
-    );
-    diesel::update(dsl::harvest_schedules.find(row.id))
+    let released = diesel::update(dsl::harvest_schedules.find(row.id))
+        .filter(
+            dsl::workflow_name
+                .eq(contested_name)
+                .and(dsl::dag_name.ne(contested_name)),
+        )
         .set((
             dsl::workflow_name.eq(Option::<String>::None),
             dsl::updated_at.eq(Utc::now()),
         ))
         .execute(conn)
         .await
-        .map_err(crate::error::database_error)?;
-    Ok(())
+        .map_err(crate::error::database_error)?
+        == 1;
+
+    if released {
+        tracing::warn!(
+            schedule_id = %row.id,
+            dag_name = ?row.dag_name,
+            workflow_name = ?row.workflow_name,
+            "harvest: releasing a workflow_name squatted by a schedule row whose \
+             dag_name disagrees with it; the row keeps its own identity"
+        );
+    }
+    Ok(released)
 }
 
 /// Upsert a `harvest_schedules` row for a [`WorkflowSchedule`].
@@ -1870,7 +1898,22 @@ async fn find_reusable_dag_workflow_schedule(
         }
         WorkflowNameHolder::Squatter => {
             let squatter = foreign_holder.expect("classified from a present holder");
-            release_squatted_workflow_name(conn, squatter).await?;
+            if !release_squatted_workflow_name(conn, squatter, workflow_name).await? {
+                // The holder stopped matching the squat we classified between
+                // the read above and the write. The public registration path
+                // takes no advisory lock, so a peer can legitimately re-stamp
+                // that row's `workflow_name` in that window; nulling it anyway
+                // would drop a valid schedule off the due list, silently and
+                // permanently. Refuse instead and let the next pass — tick
+                // backoff, or the caller on the public path — re-resolve from
+                // scratch against whatever the row now is.
+                return Err(HarvestError::Config(format!(
+                    "schedule registration raced a concurrent pass: the holder of \
+                     workflow_name '{workflow_name}' (schedule {}) changed while \
+                     dag '{dag_name}' was reclaiming it; retrying will re-resolve it",
+                    squatter.id
+                )));
+            }
             // `dag_row` may be None; the caller then inserts, now unobstructed.
             Ok(dag_row)
         }
