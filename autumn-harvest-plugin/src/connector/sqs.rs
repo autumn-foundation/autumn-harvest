@@ -415,20 +415,41 @@ impl EventSource for SqsSource {
         Ok(())
     }
 
+    /// Outstanding messages: visible **plus** in flight.
+    ///
+    /// `ApproximateNumberOfMessages` alone is the *visible* count, and a
+    /// message this connector abandoned for retry is invisible until its
+    /// visibility timeout lapses. During a downstream outage — precisely when
+    /// the gauge matters — successive polls would therefore drive the reported
+    /// lag toward zero while a large population is still in flight or waiting
+    /// to reappear, masking the backlog. `NotVisible` is what makes the number
+    /// mean "still owed to harvest" rather than "immediately fetchable".
+    ///
+    /// A missing or unparseable attribute contributes zero rather than
+    /// discarding the whole sample, so losing one of the two never reports a
+    /// wildly wrong total; both missing yields `None` and skips the sample.
     async fn lag(&self) -> Option<i64> {
+        use aws_sdk_sqs::types::QueueAttributeName;
+
         let response = self
             .client
             .get_queue_attributes()
             .queue_url(&self.queue_url)
-            .attribute_names(aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessages)
+            .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
+            .attribute_names(QueueAttributeName::ApproximateNumberOfMessagesNotVisible)
             .send()
             .await
             .ok()?;
-        response
-            .attributes?
-            .get(&aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessages)?
-            .parse::<i64>()
-            .ok()
+        let attributes = response.attributes?;
+        let read = |name: &QueueAttributeName| -> Option<i64> {
+            attributes.get(name).and_then(|v| v.parse::<i64>().ok())
+        };
+        let visible = read(&QueueAttributeName::ApproximateNumberOfMessages);
+        let in_flight = read(&QueueAttributeName::ApproximateNumberOfMessagesNotVisible);
+        match (visible, in_flight) {
+            (None, None) => None,
+            (v, f) => Some(v.unwrap_or(0).saturating_add(f.unwrap_or(0))),
+        }
     }
 }
 

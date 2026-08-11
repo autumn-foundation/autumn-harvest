@@ -17,6 +17,11 @@ use super::source::{ConnectorError, EventSource};
 #[derive(Debug, Default)]
 struct MockState {
     pending: VecDeque<InboundMessage>,
+    /// Delivered but not yet settled, keyed by handle token — the mock's
+    /// analogue of an SQS message that is invisible rather than deleted.
+    /// Retained so `abandon` can genuinely put a message back rather than
+    /// dropping the only copy (see [`EventSource::abandon`] on `MockSource`).
+    in_flight: std::collections::HashMap<String, InboundMessage>,
     acked: Vec<MessageHandle>,
     abandoned: Vec<MessageHandle>,
     nacked_for_dead_letter: Vec<MessageHandle>,
@@ -181,11 +186,24 @@ impl EventSource for MockSource {
             return Err(ConnectorError::Closed);
         }
         let take = max.min(state.pending.len());
-        Ok(state.pending.drain(..take).collect())
+        let batch: Vec<InboundMessage> = state.pending.drain(..take).collect();
+        // Retained so `abandon` can hand the message back rather than dropping
+        // the only copy. A settled message is removed again, so this holds at
+        // most the in-flight window.
+        for message in &batch {
+            state
+                .in_flight
+                .insert(message.handle.token.clone(), message.clone());
+        }
+        drop(state);
+        Ok(batch)
     }
 
     async fn ack(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
-        self.lock().acked.push(handle.clone());
+        let mut state = self.lock();
+        state.acked.push(handle.clone());
+        state.in_flight.remove(&handle.token);
+        drop(state);
         Ok(())
     }
 
@@ -195,13 +213,44 @@ impl EventSource for MockSource {
         true
     }
 
+    /// Records the nack and drops the message.
+    ///
+    /// The real SQS call resets visibility so the queue redelivers and counts
+    /// the receive toward `maxReceiveCount`, eventually moving it to the
+    /// configured DLQ. The mock has no redrive policy to terminate that loop,
+    /// so redelivering here would spin any test that drains to empty; a test
+    /// exercising the redelivery laps re-pushes the message explicitly.
     async fn nack_for_dead_letter(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
-        self.lock().nacked_for_dead_letter.push(handle.clone());
+        let mut state = self.lock();
+        state.nacked_for_dead_letter.push(handle.clone());
+        state.in_flight.remove(&handle.token);
+        drop(state);
         Ok(())
     }
 
+    /// Records the handle and, when this mock advertises redelivery, puts the
+    /// message back.
+    ///
+    /// `receive` has already removed it, so recording alone would make an
+    /// abandoned message vanish — the opposite of what `abandon_redelivers()
+    /// == true` promises, and enough for a retry-path test to silently miss
+    /// the eventual successful delivery it is supposed to prove. Requeued at
+    /// the *back*: SQS guarantees no redelivery order, and taking the tail
+    /// keeps a permanently-failing message from starving its siblings in a
+    /// test that drains a batch.
+    ///
+    /// [`Self::without_redelivery`] keeps the drop, which is the accurate
+    /// Kafka behaviour: not committing is not a nack, and the consumer's local
+    /// position has already advanced past the record.
     async fn abandon(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
-        self.lock().abandoned.push(handle.clone());
+        let mut state = self.lock();
+        state.abandoned.push(handle.clone());
+        if self.abandon_redelivers
+            && let Some(message) = state.in_flight.remove(&handle.token)
+        {
+            state.pending.push_back(message);
+        }
+        drop(state);
         Ok(())
     }
 
@@ -293,5 +342,80 @@ mod tests {
         assert_eq!(batch[0].handle.partition, Some(2));
         assert_eq!(batch[0].handle.position, Some(88));
         assert_eq!(batch[0].coordinates.render(), "orders:2:88");
+    }
+
+    #[tokio::test]
+    async fn a_redelivering_mock_actually_hands_an_abandoned_message_back() {
+        // The default mock advertises `abandon_redelivers() == true` (SQS's
+        // visibility timeout). `receive` has already removed the message, so
+        // recording the handle alone would make an abandoned message vanish --
+        // the opposite of the advertised semantics, and enough for a
+        // retry-path test to silently miss the eventual successful delivery it
+        // exists to prove.
+        let source = MockSource::new("orders");
+        source.push_opaque("m-1", b"payload");
+
+        let first = source
+            .receive(10, std::time::Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(source.pending(), 0, "delivery removes it from the queue");
+
+        source.abandon(&first[0].handle).await.unwrap();
+        assert_eq!(source.pending(), 1, "and abandoning must put it back");
+
+        let second = source
+            .receive(10, std::time::Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1, "so the retry genuinely redelivers");
+        assert_eq!(second[0].handle.token, "m-1");
+
+        // Settling for real ends the loop.
+        source.ack(&second[0].handle).await.unwrap();
+        assert_eq!(source.pending(), 0);
+        assert_eq!(source.acked().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_positional_mock_drops_an_abandoned_message() {
+        // The mirror image, and the accurate Kafka behaviour: not committing
+        // is not a nack, and the consumer's local position has already
+        // advanced past the record, so nothing hands it back in-session.
+        let source = MockSource::new("orders").without_redelivery();
+        source.push_kafka(0, 7, b"payload");
+
+        let batch = source
+            .receive(10, std::time::Duration::from_millis(1))
+            .await
+            .unwrap();
+        source.abandon(&batch[0].handle).await.unwrap();
+
+        assert_eq!(source.pending(), 0, "a positional broker wedges instead");
+        assert_eq!(source.abandoned().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn settling_releases_the_in_flight_copy() {
+        // The retained copy is what makes redelivery possible; it must not
+        // outlive the message. Both terminal paths release it.
+        let source = MockSource::new("orders");
+        source.push_opaque("acked", b"a");
+        source.push_opaque("nacked", b"b");
+        let batch = source
+            .receive(10, std::time::Duration::from_millis(1))
+            .await
+            .unwrap();
+
+        source.ack(&batch[0].handle).await.unwrap();
+        source.nack_for_dead_letter(&batch[1].handle).await.unwrap();
+
+        assert_eq!(
+            source.lock().in_flight.len(),
+            0,
+            "a settled message must not be retained"
+        );
+        assert_eq!(source.pending(), 0, "and a nack does not redeliver here");
     }
 }

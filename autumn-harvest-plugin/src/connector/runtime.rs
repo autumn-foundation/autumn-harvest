@@ -534,6 +534,14 @@ impl ConnectorRuntime {
     /// in-memory mark and would be mistaken for already-settled redeliveries,
     /// leaving the prefix blocked exactly as it was.
     ///
+    /// The clear is **whole-tracker**, not just the reported partition, because
+    /// `recover` rebuilds the whole client: every assigned partition re-reads
+    /// from its own last commit. A downstream outage wedges all of them, but
+    /// `stalled` reports one at a time, so clearing only that one would leave
+    /// the rest stale (the failure above, for every partition but the first)
+    /// and cost one more rebuild — and one more group rebalance — per affected
+    /// partition. `partition` is retained for the diagnostic.
+    ///
     /// Only the offsets are forgotten, never the poison strikes: a message
     /// that has been rejected N times is still on strike N after the rebuild,
     /// so it still reaches its threshold and dead-letters rather than
@@ -541,7 +549,7 @@ impl ConnectorRuntime {
     pub async fn recover_from_stall(&self, partition: i32) -> bool {
         match self.source.recover().await {
             Ok(true) => {
-                self.offsets.lock().await.forget(partition);
+                self.offsets.lock().await.forget_all();
                 tracing::warn!(
                     source = self.binding.name,
                     partition,
@@ -608,7 +616,17 @@ impl ConnectorRuntime {
 
         let outcome = self.map_and_dispatch(&message, &key, &coordinates).await;
 
-        let strikes = if matches!(outcome, DispatchOutcome::MappingRejected(_)) {
+        // `poison_threshold(0)` documents the strike counter as *disabled*, and
+        // `decide_disposition` never reads the count in that case (it
+        // short-circuits on `threshold > 0`). Striking anyway would record an
+        // entry that nothing can ever remove: the resulting `Retry` is not a
+        // terminal disposition, so neither `clear` nor the terminal-retention
+        // sweep covers it, and a sustained stream of distinct rejected
+        // messages would grow the tracker without bound — for a counter the
+        // operator explicitly turned off.
+        let strikes = if self.binding.poison_threshold > 0
+            && matches!(outcome, DispatchOutcome::MappingRejected(_))
+        {
             self.poison.lock().await.strike(&key)
         } else {
             0
@@ -1169,10 +1187,13 @@ mod tests {
         let sink = Arc::new(RecordingDeadLetterSink::new());
         let rt = runtime(binding, Arc::clone(&source), Arc::clone(&sink));
 
-        // Same coordinates every time: one message, three deliveries.
+        // Same coordinates every time: one message, three deliveries. Lap 1
+        // abandons, which this mock genuinely redelivers. Lap 2 nacks toward
+        // the broker's redrive -- the real SQS call resets visibility so the
+        // queue redelivers, which the mock cannot model without spinning, so
+        // lap 3's delivery is re-pushed explicitly.
         source.push_kafka(0, 1, b"{}");
         let first = rt.run_once().await.unwrap();
-        source.push_kafka(0, 1, b"{}");
         let second = rt.run_once().await.unwrap();
         source.push_kafka(0, 1, b"{}");
         let third = rt.run_once().await.unwrap();
@@ -1365,17 +1386,18 @@ mod tests {
         let rt = runtime(rejecting_binding(2), Arc::clone(&source), Arc::clone(&sink));
 
         sink.fail_writes(true);
+        source.push_kafka(0, 7, b"payload");
         for _ in 0..2 {
-            source.push_kafka(0, 7, b"payload");
             rt.run_once().await.unwrap();
         }
         assert!(sink.entries().is_empty());
         assert_eq!(source.abandoned().len(), 2);
 
         // The sink recovers; the next redelivery must quarantine immediately
-        // (strikes were 2 already), not need two more attempts.
+        // (strikes were 2 already), not need two more attempts. The message is
+        // already back on the queue -- the failed write downgraded to Retry,
+        // which abandons, and this mock redelivers.
         sink.fail_writes(false);
-        source.push_kafka(0, 7, b"payload");
         let summary = rt.run_once().await.unwrap();
         assert_eq!(summary.dead_lettered, 1);
         assert_eq!(sink.entries().len(), 1);
@@ -1389,9 +1411,11 @@ mod tests {
         let sink = Arc::new(RecordingDeadLetterSink::new());
         let rt = runtime(rejecting_binding(3), Arc::clone(&source), Arc::clone(&sink));
 
-        // Redeliver the same coordinates three times.
+        // Pushed once: the mock genuinely redelivers an abandoned message
+        // (its `abandon_redelivers()` is true), so the redelivery is the real
+        // adapter behaviour rather than a hand-simulated re-push.
+        source.push_kafka(0, 7, b"payload");
         for _ in 0..3 {
-            source.push_kafka(0, 7, b"payload");
             rt.run_once().await.unwrap();
         }
 
@@ -1410,14 +1434,20 @@ mod tests {
         let sink = Arc::new(RecordingDeadLetterSink::new());
         let rt = runtime(rejecting_binding(0), Arc::clone(&source), Arc::clone(&sink));
 
+        source.push_kafka(0, 7, b"payload");
         for _ in 0..5 {
-            source.push_kafka(0, 7, b"payload");
             rt.run_once().await.unwrap();
         }
 
         assert!(sink.entries().is_empty());
         assert!(source.acked().is_empty());
-        assert_eq!(source.abandoned().len(), 5);
+        assert_eq!(source.abandoned().len(), 5, "redelivered on every lap");
+        assert_eq!(
+            rt.poison.lock().await.tracked(),
+            0,
+            "and a disabled counter must record nothing: the Retry disposition \
+             never clears, so striking here would leak an entry per message"
+        );
     }
 
     #[tokio::test]
@@ -2260,6 +2290,55 @@ mod tests {
             "a recovered stall must back off before rebuilding again; saw \
              {recoveries} consumer rebuilds in {window:?} with a {backoff:?} \
              backoff (ceiling {ceiling})"
+        );
+    }
+
+    /// A downstream outage wedges *every* partition in the batch, not one.
+    ///
+    /// `EventSource::recover` rebuilds the whole client, so every partition
+    /// re-reads from its own last commit — but the stall is reported one
+    /// partition at a time (`stalled` returns the lowest wedged one). Clearing
+    /// only that one leaves the others' stale in-memory marks in place, and
+    /// their redelivered offsets then arrive *below* those marks and are
+    /// mistaken for already-settled redeliveries: exactly the failure
+    /// `forget` exists to prevent, left in place for every partition but the
+    /// first. It also costs one extra rebuild — and one group rebalance — per
+    /// affected partition before consumption can resume.
+    #[tokio::test]
+    async fn recovery_clears_every_partition_because_the_rebuild_is_whole_client() {
+        let source = Arc::new(RecoverableSource::new("orders"));
+        let rt = ConnectorRuntime::new(
+            malformed_binding(),
+            Arc::clone(&source) as Arc<dyn EventSource>,
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
+        )
+        .with_dead_letter_sink(Arc::new(RecordingDeadLetterSink::new()));
+
+        // Three partitions wedged in one pass, as a Postgres outage would.
+        for partition in 0..3 {
+            rt.offsets.lock().await.observe(partition, 0);
+            rt.offsets.lock().await.retried(partition, 0);
+        }
+        assert_eq!(
+            rt.offsets.lock().await.stalled(0).map(|(p, _)| p),
+            Some(0),
+            "the lowest wedged partition is the one reported"
+        );
+
+        assert!(rt.recover_from_stall(0).await);
+
+        assert_eq!(
+            source.recover_count(),
+            1,
+            "one rebuild covers the whole client"
+        );
+        assert_eq!(
+            rt.offsets.lock().await.stalled(0),
+            None,
+            "so every partition's stale generation must be cleared by it, not \
+             just the one that happened to be reported"
         );
     }
 

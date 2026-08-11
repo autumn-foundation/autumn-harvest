@@ -518,6 +518,54 @@ coordinates, so a run traces back to the exact message.
   deliberately generous, because expiring late costs only memory while
   expiring early costs a redelivered poison message a full strike countdown.
 
+- **Recovery cleared one partition when the rebuild is whole-client.** A
+  downstream outage wedges *every* partition in a batch, but `stalled` reports
+  them one at a time (the lowest wedged one), and `recover_from_stall` forgot
+  only that one — while `EventSource::recover` rebuilds the whole consumer, so
+  every assigned partition re-reads from its own last commit. Partitions 2..N
+  therefore kept stale in-memory marks, and their redelivered offsets arrived
+  *below* those marks and were mistaken for already-settled redeliveries: the
+  exact failure `forget` exists to prevent, left in place for every partition
+  but the first. It also cost one extra rebuild — and one extra group
+  rebalance — per affected partition before consumption could resume. The
+  clear is now whole-tracker (`OffsetTracker::forget_all`), matching the scope
+  of the rebuild that triggers it.
+
+- **A disabled poison counter still recorded strikes.**
+  `poison_threshold(0)` documents the strike counter as off, and
+  `decide_disposition` never reads the count in that case (it short-circuits on
+  `threshold > 0`) — but the runtime struck anyway on every mapping rejection.
+  The resulting `Retry` is not a terminal disposition, so neither `clear` nor
+  the terminal-retention sweep covers it, and on a redelivering source a
+  sustained stream of distinct rejected messages grew the tracker without
+  bound for a counter the operator had explicitly turned off. The strike is now
+  skipped when the threshold is zero.
+
+- **SQS lag counted only visible messages.** The gauge requested
+  `ApproximateNumberOfMessages`, but a message this connector abandons for
+  retry is *invisible* until its visibility timeout lapses. During a downstream
+  outage — precisely when the gauge matters — successive polls drove the
+  reported lag toward zero while a large population was still in flight,
+  masking the backlog. The same inversion as the Kafka `position()`-vs-committed
+  bug above, on the other adapter. It now sums
+  `ApproximateNumberOfMessagesNotVisible` as well, so the number means "still
+  owed to harvest" rather than "immediately fetchable"; a missing or
+  unparseable attribute contributes zero rather than discarding the sample.
+
+- **The exported mock did not honour its own advertised redelivery.**
+  `MockSource::new` reports `abandon_redelivers() == true` (SQS's visibility
+  timeout), but `receive` had already removed the message and `abandon` only
+  recorded the handle — so an abandoned message vanished. `MockSource` is a
+  **supported, exported** adapter an embedder uses to unit-test a mapping
+  function without a broker, so this both broke its contract and let
+  retry-path tests silently miss the eventual successful delivery they exist
+  to prove. It now retains delivered-but-unsettled messages (the mock's
+  analogue of an invisible SQS message) and genuinely requeues on abandon;
+  `without_redelivery()` keeps the drop, which is the accurate Kafka
+  behaviour. Four existing tests that hand-simulated redelivery with a manual
+  re-push now rely on the real thing — and reverting the fix fails **five**
+  tests, which is the measure of what was being missed.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

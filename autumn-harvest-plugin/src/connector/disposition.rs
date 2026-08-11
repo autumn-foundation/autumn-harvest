@@ -531,10 +531,22 @@ impl OffsetTracker {
             .insert(offset);
     }
 
-    /// Drop all state for `partition` (a rebalance revoked it, or recovery
-    /// rebuilt the consumer).
+    /// Drop all state for `partition` (a rebalance revoked it).
     pub fn forget(&mut self, partition: i32) {
         self.partitions.remove(&partition);
+    }
+
+    /// Drop every partition's state, for a **whole-client** consumer rebuild.
+    ///
+    /// [`EventSource::recover`](super::source::EventSource::recover) rebuilds
+    /// the entire consumer, so *every* assigned partition re-reads from its own
+    /// last commit — not just the one whose stall happened to be reported.
+    /// Forgetting one and keeping the rest leaves those partitions' stale
+    /// in-memory marks in place, and their redelivered offsets then arrive
+    /// below those marks and are mistaken for already-settled redeliveries:
+    /// the exact failure [`Self::forget`] exists to prevent.
+    pub fn forget_all(&mut self) {
+        self.partitions.clear();
     }
 
     /// How many completed offsets `partition` is holding behind a blocked
