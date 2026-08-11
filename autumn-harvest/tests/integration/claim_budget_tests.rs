@@ -391,9 +391,7 @@ async fn enqueue_stops_at_the_scenario_wall_clock_ceiling() {
     let budget = std::time::Duration::from_secs(1);
 
     // Far more rows than 1s of writing can absorb at the measured ~1-3 ms each.
-    let started = std::time::Instant::now();
     let report = db::run_enqueue_scenario_with_budget(&db, 100, 4, 250_000, budget).await;
-    let elapsed = started.elapsed();
 
     assert!(
         report.truncated,
@@ -406,12 +404,22 @@ async fn enqueue_stops_at_the_scenario_wall_clock_ceiling() {
 
     // The ceiling is only meaningful if the run actually *stopped*. `truncated`
     // alone would be satisfied by a run that set the flag and kept writing.
+    //
+    // Measured against `wall_secs` — the span from the earliest writer resume
+    // to the latest writer finish — and deliberately *not* against the elapsed
+    // time of the call. `budget` bounds the measured writes only; connect,
+    // `TRUNCATE`, seed and `ANALYZE` run under `setup_time_budget()`, which is
+    // the whole scenario budget. Timing the call therefore compares an
+    // unbounded-by-`budget` setup against a one-second ceiling, and fails on a
+    // loaded machine for a reason that has nothing to do with the deadline
+    // being enforced — observed as a flake in the full gate suite, passing in
+    // isolation. The window has to be the same one the deadline governs.
     let ceiling = budget + WALL_CLOCK_SLACK;
     assert!(
-        elapsed <= ceiling,
-        "enqueue ran {:.1}s past a {}s budget (+{}s slack): the deadline is set \
-         but some await is not bounded by it",
-        elapsed.as_secs_f64(),
+        report.wall_secs <= ceiling.as_secs_f64(),
+        "enqueue wrote for {:.1}s past a {}s budget (+{}s slack): the deadline \
+         is set but some await inside the measured phase is not bounded by it",
+        report.wall_secs,
         budget.as_secs(),
         WALL_CLOCK_SLACK.as_secs(),
     );

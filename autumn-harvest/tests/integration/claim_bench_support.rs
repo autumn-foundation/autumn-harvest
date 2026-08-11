@@ -762,6 +762,57 @@ fn unquote_span(span: &str) -> &str {
         .unwrap_or(span)
 }
 
+/// Re-emit a parsed value span so that it is **self-terminating**.
+///
+/// A raw span is only safe to re-emit at the offset it was read from. An
+/// unquoted value ends at the first *unescaped* whitespace, so a span whose
+/// last character is a dangling `\` — `application_name=bench\`, which the
+/// driver reads as `bench` because at end of input the escape has nothing to
+/// escape — stops being a terminated value the moment anything is appended
+/// after it. The backslash then escapes the joining space and the value
+/// swallows the ` dbname=…` selector [`with_db_name`] appends last, leaving a
+/// connection string with no `dbname` at all: libpq falls back to the server's
+/// default database, and this harness runs migrations and `TRUNCATE` through
+/// exactly these rewritten strings.
+///
+/// Quoting removes the whole class instead of special-casing the trailing
+/// backslash — a *closed* single-quoted span ends at its closing quote whatever
+/// follows it, so no re-emitted pair can absorb the next one. The value is
+/// decoded first (one layer of quoting stripped, escapes processed) and then
+/// re-quoted, so the driver reads back exactly the string it would have read
+/// from the original span.
+///
+/// One deliberate asymmetry: a span that decodes to empty (`key=\`, a lone
+/// escape) is re-emitted as `key=''`. `Parser::simple_value` rejects an empty
+/// unquoted value, so that input was already unusable; the rewrite makes it
+/// connectable rather than preserving the parse error. It cannot select the
+/// wrong database — `dbname` pairs never reach here, they are filtered out and
+/// replaced.
+fn requote_keyword_value(raw: &str) -> String {
+    let inner = unquote_span(raw);
+    let mut out = String::with_capacity(inner.len() + 2);
+    out.push('\'');
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        // `Parser::simple_value`/`quoted_value` push the escaped char itself,
+        // and drop a trailing `\` that escapes nothing.
+        let c = if c == '\\' {
+            match chars.next() {
+                Some(escaped) => escaped,
+                None => break,
+            }
+        } else {
+            c
+        };
+        if c == '\\' || c == '\'' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
 /// Byte offset of the first char at or after `i` satisfying `pred`, else `s.len()`.
 fn find_from(s: &str, i: usize, pred: impl Fn(char) -> bool) -> usize {
     s[i..].find(pred).map_or(s.len(), |off| i + off)
@@ -1042,6 +1093,10 @@ pub fn redact_url(url: &str) -> String {
 /// The libpq keyword/value form has no path at all, so there the database is
 /// selected by replacing `dbname` rather than by appending a path component —
 /// and that grammar is *not* percent-encoded, so its keys are compared raw.
+/// Every *carried* value in that form is re-quoted rather than re-emitted raw:
+/// appending the selector moves each span off the end of the string, which is
+/// where an unquoted value ending in `\` was terminated. See
+/// [`requote_keyword_value`].
 ///
 /// `db` is written verbatim, so it must already be in the form the driver will
 /// read back — no percent escapes, since [`db_name_from_url`] (and the driver's
@@ -1057,7 +1112,10 @@ pub fn with_db_name(url: &str, db: &str) -> String {
         let mut out: Vec<String> = pairs
             .iter()
             .filter(|p| !p.key.eq_ignore_ascii_case("dbname"))
-            .map(|p| format!("{}={}", p.key, p.raw_value))
+            // Re-quoted, not re-emitted raw: a raw span is only terminated at
+            // the offset it was parsed from, and everything here gains a
+            // ` dbname=…` suffix. See [`requote_keyword_value`].
+            .map(|p| format!("{}={}", p.key, requote_keyword_value(p.raw_value)))
             .collect();
         // Anything the parser could not consume is carried verbatim rather
         // than dropped: silently losing `sslmode=require` is the exact
@@ -1804,7 +1862,7 @@ mod pure_tests {
             "old dbname survived: {rewritten}"
         );
         assert!(
-            rewritten.contains("host=db") && rewritten.contains("password=http://hunter2"),
+            rewritten.contains("host='db'") && rewritten.contains("password='http://hunter2'"),
             "sibling parameters lost: {rewritten}"
         );
     }
@@ -2414,18 +2472,68 @@ mod pure_tests {
     /// to replace the keyword instead.
     #[test]
     fn with_db_name_replaces_dbname_in_the_keyword_value_form() {
+        // Carried values come back quoted — see `requote_keyword_value`; the
+        // decoded value is unchanged, and the quoting is what stops a pair from
+        // absorbing the selector appended after it.
         assert_eq!(
             with_db_name("host=h port=5432 dbname=admin", "b"),
-            "host=h port=5432 dbname=b",
+            "host='h' port='5432' dbname=b",
         );
         // Absent entirely: append it rather than leaving the target implicit
         // (libpq would otherwise default the database to the username).
-        assert_eq!(with_db_name("host=h", "b"), "host=h dbname=b");
+        assert_eq!(with_db_name("host=h", "b"), "host='h' dbname=b");
         // A quoted value elsewhere must survive the round trip intact.
         assert_eq!(
             with_db_name("host=h password='hunter two' dbname=admin", "b"),
-            "host=h password='hunter two' dbname=b",
+            "host='h' password='hunter two' dbname=b",
         );
+    }
+
+    /// A re-emitted value must be self-terminating, or it eats the selector.
+    ///
+    /// `application_name=bench\` is a *valid* keyword string: the trailing
+    /// backslash escapes nothing at end of input, so the driver reads the value
+    /// as `bench`. Re-emitting that raw span and joining ` dbname=<new>` onto
+    /// it moves the backslash off the end, where it escapes the joining space —
+    /// the value becomes `bench dbname=<new>` and the string then carries no
+    /// `dbname` at all. libpq falls back to the server's default database,
+    /// which is the database this harness would go on to run migrations and
+    /// `TRUNCATE` against.
+    #[test]
+    fn with_db_name_requotes_a_value_ending_in_a_dangling_escape() {
+        let rewritten = with_db_name(r"host=h user=postgres application_name=bench\", "bench_1");
+        assert_eq!(
+            rewritten,
+            "host='h' user='postgres' application_name='bench' dbname=bench_1",
+        );
+        assert_eq!(db_name_from_url(&rewritten).as_deref(), Some("bench_1"));
+    }
+
+    /// The class, not just the trailing backslash: no re-emitted pair may
+    /// absorb the selector appended after it.
+    ///
+    /// Every entry here parses cleanly, so the rewrite has to resolve to *our*
+    /// database — an unparseable remainder is a different path, covered by
+    /// [`with_db_name_carries_an_unparseable_keyword_remainder`], and fails
+    /// loudly at connect rather than silently selecting the wrong database.
+    #[test]
+    fn with_db_name_keyword_pairs_cannot_absorb_the_appended_selector() {
+        for admin in [
+            r"host=h application_name=bench\",
+            r"host=h application_name=bench\\",
+            r"host=h application_name=one\ two port=5432",
+            "host=h password='hunter two'",
+            "host=h password=p@ss'word",
+            "host=h dbname=admin",
+            "host=h",
+        ] {
+            let rewritten = with_db_name(admin, "bench_1");
+            assert_eq!(
+                db_name_from_url(&rewritten).as_deref(),
+                Some("bench_1"),
+                "selector absorbed rewriting {admin}: {rewritten}",
+            );
+        }
     }
 
     /// An unparseable remainder must be carried, not silently dropped.
@@ -2439,7 +2547,7 @@ mod pure_tests {
     fn with_db_name_carries_an_unparseable_keyword_remainder() {
         let rewritten = with_db_name("host=h sslmode=require dbname=admin oops", "b");
         assert!(
-            rewritten.contains("sslmode=require"),
+            rewritten.contains("sslmode='require'"),
             "parameter dropped: {rewritten}"
         );
         assert!(rewritten.contains("oops"), "remainder dropped: {rewritten}");
