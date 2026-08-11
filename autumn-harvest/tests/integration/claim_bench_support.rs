@@ -862,10 +862,46 @@ fn quoted_value_end(s: &str, i: usize) -> Option<usize> {
     None
 }
 
+/// Why [`keyword_value_pairs`] stopped before the end of the string.
+///
+/// Every variant is a condition the driver's own parser also rejects, so a
+/// string that produces one would not have connected as written.
+///
+/// The text is `&'static` **by design**, not by convenience: the whole point of
+/// reporting a reason is to give a caller something diagnostic to print that
+/// cannot contain any part of the input. At the stop offset the input may be an
+/// unterminated quoted value — i.e. an entire password — so there must be no
+/// interpolation site here for a later edit to widen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeywordStop {
+    /// A `=` with no keyword before it.
+    StrayEquals,
+    /// A keyword not followed by `=`.
+    MissingEquals,
+    /// A `=` at end of input; `simple_value` rejects an empty value.
+    EmptyValue,
+    /// An opening `'` with no closing one.
+    UnterminatedQuote,
+}
+
+impl KeywordStop {
+    /// A fixed phrase naming the stop. Never derived from the input.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::StrayEquals => "a `=` with no keyword",
+            Self::MissingEquals => "a keyword with no `=`",
+            Self::EmptyValue => "a keyword with no value",
+            Self::UnterminatedQuote => "an unterminated quoted value",
+        }
+    }
+}
+
 /// Parse a libpq keyword/value connection string into `(key, raw value)` pairs.
 ///
-/// Returns the pairs together with the offset at which parsing stopped, so a
-/// caller can **fail closed** on the remainder rather than printing it.
+/// Returns the pairs, the offset at which parsing stopped, and — when it stopped
+/// short — *why*, so a caller can **fail closed** on the remainder rather than
+/// printing it. The reason is `Some` exactly when the parse stopped short, so a
+/// caller can branch on it instead of comparing the offset against the length.
 ///
 /// Splitting on whitespace is not sufficient, and fails in the direction that
 /// leaks. libpq's own grammar (mirrored by `tokio_postgres::Config`'s
@@ -882,7 +918,7 @@ fn quoted_value_end(s: &str, i: usize) -> Option<usize> {
 ///
 /// A whitespace split turns the third into `password`, `=` and a bare secret —
 /// and the secret has no embedded `=`, so a key/value redactor waves it through.
-fn keyword_value_pairs(s: &str) -> (Vec<KeywordPair<'_>>, usize) {
+fn keyword_value_pairs(s: &str) -> (Vec<KeywordPair<'_>>, usize, Option<KeywordStop>) {
     let mut out = Vec::new();
     let mut i = skip_ws(s, 0);
 
@@ -895,19 +931,19 @@ fn keyword_value_pairs(s: &str) -> (Vec<KeywordPair<'_>>, usize) {
         let key_end = find_from(s, i, |c| c.is_whitespace() || c == '=');
         if key_end == i {
             // A stray `=` with no keyword before it.
-            return (out, pair_start);
+            return (out, pair_start, Some(KeywordStop::StrayEquals));
         }
         let key = &s[i..key_end];
 
         // `skip_ws`, `eat('=')`, `skip_ws` — all three, in that order.
         i = skip_ws(s, key_end);
         if !s[i..].starts_with('=') {
-            return (out, pair_start);
+            return (out, pair_start, Some(KeywordStop::MissingEquals));
         }
         i = skip_ws(s, i + 1);
         if i >= s.len() {
             // `simple_value` rejects an empty value; fail closed to match.
-            return (out, pair_start);
+            return (out, pair_start, Some(KeywordStop::EmptyValue));
         }
 
         let value_start = i;
@@ -915,7 +951,7 @@ fn keyword_value_pairs(s: &str) -> (Vec<KeywordPair<'_>>, usize) {
             let Some(end) = quoted_value_end(s, i) else {
                 // An unterminated quote swallows the rest of the string; the
                 // caller must treat all of it as potentially secret.
-                return (out, pair_start);
+                return (out, pair_start, Some(KeywordStop::UnterminatedQuote));
             };
             i = end;
         } else {
@@ -929,7 +965,7 @@ fn keyword_value_pairs(s: &str) -> (Vec<KeywordPair<'_>>, usize) {
         i = skip_ws(s, i);
     }
 
-    (out, s.len())
+    (out, s.len(), None)
 }
 
 /// Hide the value of every `key=value` pair outside [`PRINTABLE_CONN_PARAMS`].
@@ -976,7 +1012,7 @@ fn redact_keyword_values(params: &str) -> String {
             |at| format!("***@{}", &params[at + 1..]),
         );
     }
-    let (pairs, stopped) = keyword_value_pairs(params);
+    let (pairs, stopped, _) = keyword_value_pairs(params);
     let mut parts: Vec<String> = pairs
         .iter()
         .map(|p| {
@@ -1116,7 +1152,7 @@ pub fn redact_url(url: &str) -> String {
 pub fn with_db_name(url: &str, db: &str) -> Result<String, String> {
     // Keyword/value form (`host=h dbname=admin`): no `://`, no path.
     let Some(parts) = split_driver_url(url) else {
-        let (pairs, stopped) = keyword_value_pairs(url);
+        let (pairs, stopped, stop) = keyword_value_pairs(url);
         let mut out: Vec<String> = pairs
             .iter()
             .filter(|p| !p.key.eq_ignore_ascii_case("dbname"))
@@ -1140,17 +1176,27 @@ pub fn with_db_name(url: &str, db: &str) -> Result<String, String> {
         // hidden in the tail would win on libpq's last-wins rule. There is no
         // third position, and the tail cannot be quoted because it is not a
         // value.
-        let rest = url[stopped..].trim();
-        if !rest.is_empty() {
+        //
+        // The rejection reports the offset and a **fixed** reason and quotes
+        // nothing. The tail is not safe to print: at an unterminated quote the
+        // stop offset sits at the *start* of the pair, so the "tail" is the
+        // whole rest of the string — a complete credential — and this error is
+        // not something the caller inspects and discards. It becomes a
+        // `SkipReason` that the benchmark and the CI gate both print verbatim,
+        // which is a path around `redact_url` into CI logs.
+        if let Some(stop) = stop {
+            let reason = stop.as_str();
             return Err(format!(
                 "cannot rewrite the database of a connection string this harness \
-                 cannot fully parse: stopped at byte {stopped}, remaining tail \
-                 {rest:?}. Every stop here is one libpq also rejects (a stray \
-                 `=`, a keyword with no `=`, an empty value, or an unterminated \
-                 quote), so this string would not connect as written. It is \
-                 refused rather than repaired because the repaired form could \
-                 silently select a different database, and this harness runs \
-                 migrations and TRUNCATE through the result."
+                 cannot fully parse: stopped at byte {stopped} ({reason}). The \
+                 text at that offset is deliberately not repeated here — an \
+                 unterminated quote makes it the whole rest of the string, and \
+                 this message reaches the benchmark's and the CI gate's logs. \
+                 Every stop here is one libpq also rejects, so this string would \
+                 not connect as written. It is refused rather than repaired \
+                 because the repaired form could silently select a different \
+                 database, and this harness runs migrations and TRUNCATE through \
+                 the result."
             ));
         }
         out.push(format!("dbname={db}"));
@@ -1213,7 +1259,7 @@ pub fn db_name_from_url(url: &str) -> Option<String> {
     // Keyword/value form: no `://`, so there is no path to read — the name can
     // only come from a `dbname` keyword.
     let Some(parts) = split_driver_url(url) else {
-        let (pairs, _) = keyword_value_pairs(url);
+        let (pairs, ..) = keyword_value_pairs(url);
         return pairs
             .iter()
             .rev()
@@ -2596,20 +2642,28 @@ mod pure_tests {
         )
         .expect_err("an incomplete trailing pair must not produce a connection string");
         assert!(
-            err.contains("application_name="),
-            "the error must quote the tail it could not parse: {err}"
+            err.contains("byte 31") && err.contains("a keyword with no value"),
+            "the error must locate and name the stop without quoting it: {err}"
         );
 
         // The other stop conditions are the same class and must also reject.
-        for malformed in [
-            "host=h user=alice dbname=admin application_name=",
-            "host=h oops",
-            "host=h = value",
-            "host=h password='unterminated",
+        for (malformed, reason) in [
+            (
+                "host=h user=alice dbname=admin application_name=",
+                "a keyword with no value",
+            ),
+            ("host=h oops", "a keyword with no `=`"),
+            ("host=h = value", "a `=` with no keyword"),
+            (
+                "host=h password='unterminated",
+                "an unterminated quoted value",
+            ),
         ] {
+            let err = with_db_name(malformed, "bench_1")
+                .expect_err(&format!("carried an unparseable tail for {malformed}"));
             assert!(
-                with_db_name(malformed, "bench_1").is_err(),
-                "carried an unparseable tail for {malformed}"
+                err.contains(reason),
+                "wrong stop reason for {malformed}: {err}"
             );
         }
 
@@ -2618,6 +2672,41 @@ mod pure_tests {
             with_db_name("host=h dbname=admin", "bench_1").expect("valid"),
             "host='h' dbname=bench_1",
         );
+    }
+
+    /// The rejection error must not quote the text it could not parse.
+    ///
+    /// `keyword_value_pairs` says so at the stop itself — "an unterminated
+    /// quote swallows the rest of the string; the caller must treat all of it
+    /// as potentially secret" — and the stop offset for
+    /// `host=h password='hunter2` points at `password`, so the tail *is* the
+    /// credential. This error is not a value the caller inspects: it becomes a
+    /// `SkipReason` that the benchmark and the CI gate both print verbatim, so
+    /// echoing the tail routes a password around [`redact_url`] into CI logs.
+    ///
+    /// The offset and a fixed reason are enough to fix the string and cannot
+    /// carry any part of it. Every reason string here is `&'static` for that
+    /// reason: there is no interpolation site to regress.
+    #[test]
+    fn with_db_name_rejection_never_echoes_the_unparsed_tail() {
+        // One secret per stop condition, so a fix that only covers the quoted
+        // case still fails the others.
+        for malformed in [
+            "host=h password='hunter2",
+            "host=h password=hunter2 oops",
+            "host=h password=hunter2 = value",
+            "host=h password=hunter2 application_name=",
+        ] {
+            let err = with_db_name(malformed, "bench_1").expect_err("must reject");
+            assert!(
+                !err.contains("hunter2"),
+                "the rejection leaked the credential for {malformed}: {err}"
+            );
+            assert!(
+                err.contains("byte "),
+                "the rejection must still locate the stop for {malformed}: {err}"
+            );
+        }
     }
 
     /// An unparseable remainder is rejected — neither dropped nor carried.
@@ -2637,8 +2726,8 @@ mod pure_tests {
         let err = with_db_name("host=h sslmode=require dbname=admin oops", "b")
             .expect_err("an unparseable remainder must not produce a connection string");
         assert!(
-            err.contains("oops"),
-            "the error must quote the tail it could not parse: {err}"
+            err.contains("byte 36") && err.contains("a keyword with no `=`"),
+            "the error must locate and name the stop without quoting it: {err}"
         );
     }
 
