@@ -358,8 +358,15 @@ async fn enqueue_throughput_is_measured_against_a_non_empty_queue() {
 /// the budget can absorb, so the ceiling *must* bite. Without the deadline the
 /// run writes all of them — minutes of work — which is the bug.
 ///
-/// Existing-server mode only, and it sets its own budget, so it does not
-/// inherit `HARVEST_BENCH_SCENARIO_SECS` from the environment.
+/// Existing-server mode only. The budget is *injected* rather than set in the
+/// environment: `HARVEST_BENCH_SCENARIO_SECS` is process-global and `cargo
+/// test` runs a binary's tests in parallel by default, so setting it here would
+/// hand every sibling scenario a one-second ceiling they never asked for and
+/// would report as truncated. The CI manifest happens to pass
+/// `--test-threads=1`, but a plain local `cargo test ... claim_budget_tests`
+/// does not, and a test that only holds under a particular harness flag is a
+/// trap. Injection removes the shared mutable state instead of scheduling
+/// around it — there is no window to leave open, on panic or otherwise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enqueue_stops_at_the_scenario_wall_clock_ceiling() {
     let Some(db) = bench_db_or_skip().await else {
@@ -368,15 +375,12 @@ async fn enqueue_stops_at_the_scenario_wall_clock_ceiling() {
 
     // The floor `scenario_time_budget` allows. The measured phase starts after
     // seeding, so this bounds only the writes.
-    // SAFETY: single-threaded test setup before any spawn reads the env.
-    unsafe { std::env::set_var(SCENARIO_BUDGET_ENV_VAR, "1") };
-    let budget = scenario_time_budget();
+    let budget = std::time::Duration::from_secs(1);
 
     // Far more rows than 1s of writing can absorb at the measured ~1-3 ms each.
     let started = std::time::Instant::now();
-    let report = db::run_enqueue_scenario(&db, 100, 4, 250_000).await;
+    let report = db::run_enqueue_scenario_with_budget(&db, 100, 4, 250_000, budget).await;
     let elapsed = started.elapsed();
-    unsafe { std::env::remove_var(SCENARIO_BUDGET_ENV_VAR) };
 
     assert!(
         report.truncated,

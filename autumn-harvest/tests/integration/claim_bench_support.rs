@@ -674,18 +674,29 @@ pub fn sweep_step(datname: &str) -> SweepStep {
     else {
         return SweepStep::Skip;
     };
-    if !is_decimal::<u32>(pid) || !is_run_token(token) || !is_decimal::<u64>(seq) {
+    if !is_canonical_decimal::<u32>(pid)
+        || !is_run_token(token)
+        || !is_canonical_decimal::<u64>(seq)
+    {
         return SweepStep::Skip;
     }
     SweepStep::AskServer
 }
 
-/// Non-empty ASCII digits that fit `T` — a field we could actually have minted.
+/// A field whose text is exactly what `format!("{}", v: T)` would have printed.
 ///
-/// Deliberately stricter than `parse` alone, which accepts a leading `+`: this
-/// gates a `DROP DATABASE`, and `+1` is not a pid we ever printed.
-fn is_decimal<T: std::str::FromStr>(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<T>().is_ok()
+/// The round-trip is the whole check, and it is deliberately stricter than
+/// "digits that parse". `parse` is a *superset* of what we print: it accepts a
+/// leading `+` and any number of leading zeros, so `+1`, `01`, and `0007` all
+/// parse to values we could hold — while `{}` emits `1` and `7` and can never
+/// produce those spellings. Comparing against `to_string` rejects every such
+/// noncanonical form for free, without enumerating them.
+///
+/// This gates a `DROP DATABASE`, so "could parse to something we might hold" is
+/// the wrong question. The right one is "is this byte-for-byte a name we would
+/// have written", and only the round-trip asks it.
+fn is_canonical_decimal<T: std::str::FromStr + std::fmt::Display>(s: &str) -> bool {
+    s.parse::<T>().is_ok_and(|v| v.to_string() == s)
 }
 
 /// Exactly 16 lowercase hex digits, the only shape [`db::run_token`] emits.
@@ -1062,6 +1073,14 @@ mod pure_tests {
             "harvest_claim_bench__0123456789abcdef_0",
             // Signed/whitespace forms `parse` alone would have accepted.
             "harvest_claim_bench_+1_0123456789abcdef_0",
+            // Noncanonical decimal: `parse` accepts a leading zero, but we
+            // print with `{}`, which never emits one. A digits-and-parse check
+            // takes these; only comparing against the canonical rendering
+            // rejects them.
+            "harvest_claim_bench_01_0123456789abcdef_0",
+            "harvest_claim_bench_007_0123456789abcdef_0",
+            "harvest_claim_bench_1_0123456789abcdef_00",
+            "harvest_claim_bench_1_0123456789abcdef_0007",
             // Numeric but out of range for the types we mint from.
             "harvest_claim_bench_4294967296_0123456789abcdef_0",
             // The bare prefix, and a database that merely starts like one.
@@ -2023,6 +2042,33 @@ pub mod db {
     /// # Panics
     /// Panics if seeding or connection acquisition fails.
     pub async fn run_claim_scenario(db: &BenchDb, scenario: Scenario) -> ClaimReport {
+        run_claim_scenario_with_budget(db, scenario, super::scenario_time_budget()).await
+    }
+
+    /// [`run_claim_scenario`] with the wall-clock ceiling supplied directly.
+    ///
+    /// The budget is a *parameter* rather than something this function reads
+    /// from the process so that a test wanting a different ceiling can ask for
+    /// one without writing to the environment. `HARVEST_BENCH_SCENARIO_SECS` is
+    /// process-global and `cargo test` runs a binary's tests in parallel by
+    /// default, so a test that set it would be reaching into every sibling
+    /// scenario running at that moment — handing them a budget they never asked
+    /// for and would report as truncated. No amount of care at the write site
+    /// fixes that: a restore-on-drop guard still leaves the window open for as
+    /// long as the test runs, which for these is the whole point of them.
+    ///
+    /// So the environment is read exactly once, at the edge, by the caller that
+    /// wants the default; everything below here takes the answer as an
+    /// argument.
+    ///
+    /// # Panics
+    ///
+    /// Panics if seeding or claiming fails.
+    pub async fn run_claim_scenario_with_budget(
+        db: &BenchDb,
+        scenario: Scenario,
+        budget: std::time::Duration,
+    ) -> ClaimReport {
         let mut conn = connect(&db.url).await;
         let seed_outcome = seed(&mut conn, scenario).await;
         drop(conn);
@@ -2034,7 +2080,6 @@ pub mod db {
 
         let total_ops = measured_claims_for(scenario.backlog);
         let claimers = scenario.claimers.max(1);
-        let budget = super::scenario_time_budget();
 
         let started = Instant::now();
         // One ceiling for the whole scenario, fixed *before* any claimer runs.
@@ -2236,6 +2281,34 @@ pub mod db {
         writers: usize,
         rows_per_writer: usize,
     ) -> EnqueueReport {
+        run_enqueue_scenario_with_budget(
+            db,
+            backlog,
+            writers,
+            rows_per_writer,
+            super::scenario_time_budget(),
+        )
+        .await
+    }
+
+    /// [`run_enqueue_scenario`] with the wall-clock ceiling supplied directly.
+    ///
+    /// See [`run_claim_scenario_with_budget`] for why the budget is injected
+    /// rather than read from the environment here. Both paths take it the same
+    /// way deliberately: the last two rounds of review on this file were both
+    /// cases of the write path missing a property the claim path had, and a
+    /// helper that exists on only one of them is how that happens again.
+    ///
+    /// # Panics
+    ///
+    /// Panics if seeding or enqueueing fails.
+    pub async fn run_enqueue_scenario_with_budget(
+        db: &BenchDb,
+        backlog: usize,
+        writers: usize,
+        rows_per_writer: usize,
+        budget: std::time::Duration,
+    ) -> EnqueueReport {
         let scenario = Scenario {
             backlog,
             // `Scenario` is the seeding vocabulary; `seed` and `queue_names`
@@ -2260,7 +2333,7 @@ pub mod db {
         // server would otherwise hang the bench (and the CI gate that calls
         // this) until the outer workflow timeout, while the page advertises a
         // per-scenario cap.
-        let deadline = started + super::scenario_time_budget();
+        let deadline = started + budget;
         let mut handles = Vec::with_capacity(writers);
         for w in 0..writers.max(1) {
             let pool = pool.clone();
