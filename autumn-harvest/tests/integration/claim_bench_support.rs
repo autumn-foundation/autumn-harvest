@@ -266,6 +266,27 @@ pub fn scenario_time_budget() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Wall-clock ceiling for the *unmeasured* setup phase — connect, truncate,
+/// seed the backlog, `ANALYZE`.
+///
+/// Deliberately **not** the caller's measured-phase budget. The
+/// `*_with_budget` runners exist so a test can inject a tiny ceiling and assert
+/// the measured phase stops at it; handing that same ceiling to setup makes the
+/// test depend on how fast the *server* seeds, which is the opposite of the
+/// determinism those tests are written for. A one-second injected budget would
+/// panic with "benchmark setup stalled" on a loaded runner or a remote server
+/// before a single write was measured.
+///
+/// Setup still needs *a* ceiling — an unbounded await against a wedged server
+/// is what `with_setup_deadline` exists to stop — so it takes the process
+/// default, which is the ceiling a non-injecting run already gives it. For
+/// every ordinary run this is the same value as [`scenario_time_budget`] and
+/// nothing changes; only an injected budget makes the two differ.
+#[must_use]
+pub fn setup_time_budget() -> std::time::Duration {
+    scenario_time_budget()
+}
+
 /// How many claim operations claimer `index` of `claimers` should perform.
 ///
 /// Distributes `total_ops` exactly: the first `total_ops % claimers` claimers
@@ -3613,12 +3634,18 @@ pub mod db {
     /// connection is dropped here rather than returned: neither runner uses it
     /// past seeding, and holding it open would keep a session the pool then has
     /// to work around.
+    /// Connect and seed under the *setup* ceiling.
+    ///
+    /// `setup_budget` is deliberately separate from the caller's measured-phase
+    /// budget: see [`super::setup_time_budget`] for why passing the measured
+    /// one here makes the injected-budget regression tests depend on seeding
+    /// speed.
     async fn connect_and_seed(
         db: &BenchDb,
         scenario: Scenario,
-        budget: std::time::Duration,
+        setup_budget: std::time::Duration,
     ) -> SeedOutcome {
-        let deadline = Instant::now() + budget;
+        let deadline = Instant::now() + setup_budget;
         let mut conn = super::with_setup_deadline("connect", deadline, connect(&db.url)).await;
         let outcome = super::with_setup_deadline("seed", deadline, seed(&mut conn, scenario)).await;
         drop(conn);
@@ -3650,8 +3677,10 @@ pub mod db {
         budget: std::time::Duration,
     ) -> ClaimReport {
         // Setup runs before the measured phase and so before its deadline; it
-        // carries its own. See `with_setup_deadline`.
-        let seed_outcome = connect_and_seed(db, scenario, budget).await;
+        // carries its own. See `with_setup_deadline`. The comment used to say
+        // this while the code passed `budget` — the measured-phase ceiling —
+        // so an injected budget bounded seeding too.
+        let seed_outcome = connect_and_seed(db, scenario, super::setup_time_budget()).await;
 
         let pool = build_pool(&db.url, scenario.claimers);
         let queues = Arc::new(queue_names(scenario));
@@ -3941,7 +3970,9 @@ pub mod db {
             gate: ClaimGate::Baseline,
         };
         // Same two-phase ceiling as the claim path — see `with_setup_deadline`.
-        let _ = connect_and_seed(db, scenario, budget).await;
+        // The setup budget is independent of `budget`, which bounds only the
+        // measured writes.
+        let _ = connect_and_seed(db, scenario, super::setup_time_budget()).await;
 
         let pool = build_pool(&db.url, writers);
         let queues = Arc::new(queue_names(scenario));

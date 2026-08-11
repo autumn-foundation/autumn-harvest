@@ -424,6 +424,41 @@ async fn enqueue_stops_at_the_scenario_wall_clock_ceiling() {
     );
 }
 
+/// The injected budget bounds the measured writes only — never setup.
+///
+/// The `*_with_budget` runners exist so a test can inject a tiny ceiling and
+/// assert the measured phase stops at it. Passing that same ceiling to
+/// `connect_and_seed` made the test depend on how fast the server connects,
+/// truncates, seeds and `ANALYZE`s: on a loaded runner or a remote server the
+/// one second above is not enough for setup, and the run panics with
+/// "benchmark setup stalled" before a single write is measured — the opposite
+/// of the determinism the test above is written for.
+///
+/// A millisecond is unarguably too short for connect + seed, so this fails
+/// outright against the previous behaviour rather than only on a slow machine.
+/// It asserts the *measured* phase still stops, so a fix that simply removed
+/// the deadline could not satisfy it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn injected_budget_bounds_the_measured_phase_not_setup() {
+    let Some(db) = bench_db_or_skip().await else {
+        return;
+    };
+
+    let report = db::run_enqueue_scenario_with_budget(
+        &db,
+        100,
+        2,
+        50_000,
+        std::time::Duration::from_millis(1),
+    )
+    .await;
+
+    assert!(
+        report.truncated,
+        "a 1ms measured-phase budget must truncate the writes",
+    );
+}
+
 /// Every accreted gate must still be *measurable* — a scenario that silently
 /// stops exercising its predicate (because a seeding column was renamed, say)
 /// would leave the per-gate cost table in `docs/performance.md` lying.
