@@ -595,3 +595,72 @@ async fn an_idle_bench_database_still_holds_a_visible_lease() {
     }
     panic!("lease survived BenchDb drop: the stale sweep can never reclaim {datname}");
 }
+
+/// Setup serializes against a foreign sweep, so the create-to-lease window is
+/// not a hole.
+///
+/// A database is only defended once it has a backend in `pg_stat_activity`, and
+/// it cannot have one until it exists. Between `CREATE DATABASE` and the lease
+/// connection, a sweep running on another host sees a real database with zero
+/// connections and correctly concludes it is abandoned — no naming scheme fixes
+/// that. Setup therefore holds a cluster-wide advisory lock across the whole
+/// span, which is the same lock every sweep must take.
+///
+/// This proves the mechanism rather than trying to hit the window: hold the
+/// lock externally and assert setup blocks, then release it and assert setup
+/// completes. If the lock is ever dropped from the setup path, setup stops
+/// blocking and this fails.
+///
+/// Existing-server mode only — the testcontainer path has no foreign clients.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_waits_for_a_peers_sweep_before_creating_its_database() {
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+
+    let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+        eprintln!(
+            "SKIP setup_waits_for_a_peers_sweep_before_creating_its_database: \
+             existing-server mode only (HARVEST_TEST_DATABASE_URL unset)"
+        );
+        return;
+    };
+    let Ok(mut holder) = AsyncPgConnection::establish(&admin_url).await else {
+        eprintln!("SKIP setup_waits_for_a_peers_sweep_before_creating_its_database: no server");
+        return;
+    };
+
+    // Stand in for a peer that is mid-sweep.
+    diesel::sql_query("SELECT pg_advisory_lock($1)")
+        .bind::<diesel::sql_types::BigInt, _>(db::SWEEP_LOCK_KEY)
+        .execute(&mut holder)
+        .await
+        .expect("taking the sweep lock must succeed");
+
+    let mut setup = tokio::spawn(async { db::setup_bench_db().await });
+
+    // Setup must not get past the lock. Generous enough not to flake on a
+    // loaded runner, short enough to stay cheap.
+    let blocked = tokio::time::timeout(std::time::Duration::from_millis(1_500), &mut setup).await;
+    assert!(
+        blocked.is_err(),
+        "setup completed while a peer held the sweep lock: the create-to-lease \
+         window is unprotected and a foreign sweep can drop the database out \
+         from under a live run",
+    );
+
+    // Release, and it should now finish.
+    diesel::sql_query("SELECT pg_advisory_unlock($1)")
+        .bind::<diesel::sql_types::BigInt, _>(db::SWEEP_LOCK_KEY)
+        .execute(&mut holder)
+        .await
+        .expect("releasing the sweep lock must succeed");
+
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(120), setup)
+        .await
+        .expect("setup must proceed once the sweep lock is free")
+        .expect("setup task panicked");
+    assert!(
+        finished.is_ok(),
+        "setup failed after the lock was released: {:?}",
+        finished.err().map(|e| e.0),
+    );
+}

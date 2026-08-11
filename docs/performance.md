@@ -532,6 +532,14 @@ ANALYZE` of the claim query.
   `n` column is below its `rows` column. `rows/s` deliberately divides *all*
   rows by the *whole* wall clock, warmup included, so it is a conservative floor
   on sustained throughput rather than a peak.
+* **Throughput and latency use different windows, on purpose.** `claims/s` and
+  `rows/s` count *every* successful operation over the *whole* wall clock,
+  warmup included, because the clock starts at the first warmup call — a
+  fraction whose numerator and denominator cover different spans is not a rate.
+  The percentile columns exclude warmup, because there the first calls on a
+  fresh connection are exactly the unrepresentative ones. The `n` column belongs
+  to the latency window, so it is below the operation count the throughput
+  column divides.
 
 ### Profile does not matter
 

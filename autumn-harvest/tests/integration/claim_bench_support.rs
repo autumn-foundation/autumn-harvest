@@ -322,6 +322,69 @@ pub const fn warmup_divisor() -> usize {
     WARMUP_DIVISOR
 }
 
+/// What one claimer task reports back, split into the two windows a report
+/// needs.
+///
+/// Named rather than positional: three of these fields are `usize` and mean
+/// different things over different windows, so a tuple would make transposing
+/// `claimed` and `total_claimed` at the aggregation site a silent
+/// reintroduction of the numerator/denominator mismatch the second counter
+/// exists to prevent.
+///
+/// Lives in the pure section, away from the database code that produces it, so
+/// the window split is unit-tested on every OS — including the
+/// `--no-default-features` leg, where no claim ever runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaimerOutcome {
+    /// Post-warmup latencies, milliseconds.
+    pub samples: Vec<f64>,
+    /// Post-warmup calls that returned a task.
+    pub claimed: usize,
+    /// Post-warmup calls that returned `None`.
+    pub empty: usize,
+    /// Every call that returned a task, warmup included.
+    pub total_claimed: usize,
+    /// This claimer stopped early on the scenario deadline.
+    pub truncated: bool,
+}
+
+impl ClaimerOutcome {
+    /// Split one claimer's observations into the two windows.
+    ///
+    /// `observed` is `(latency_ms, claimed_a_task)` in call order.
+    ///
+    /// The head is trimmed as warmup for the *latency* statistics: the first
+    /// calls on a fresh connection pay plan-cache and buffer-cache costs that
+    /// are not steady state, and left in they dominate the tail. The
+    /// *throughput* numerator deliberately does not trim, because its
+    /// denominator — the scenario wall clock — starts at the first warmup call.
+    /// Trimming one side and not the other understated `claims/s` by the warmup
+    /// fraction, about 10%.
+    #[must_use]
+    pub fn from_observed(observed: Vec<(f64, bool)>, truncated: bool) -> Self {
+        let warmup = warmup_claims_for(observed.len());
+        let total_claimed = observed.iter().filter(|(_, got)| *got).count();
+        let mut samples: Vec<f64> = Vec::with_capacity(observed.len() - warmup);
+        let mut claimed = 0usize;
+        let mut empty = 0usize;
+        for (elapsed, got) in observed.into_iter().skip(warmup) {
+            samples.push(elapsed);
+            if got {
+                claimed += 1;
+            } else {
+                empty += 1;
+            }
+        }
+        Self {
+            samples,
+            claimed,
+            empty,
+            total_claimed,
+            truncated,
+        }
+    }
+}
+
 /// Nearest-rank percentile over a sample of millisecond latencies.
 ///
 /// Nearest-rank (rather than an interpolating definition) is deliberate: it
@@ -580,7 +643,7 @@ mod pure_tests {
     #![allow(unused_imports)]
 
     use super::{
-        BACKLOG_SWEEP, BudgetVerdict, ClaimGate, DEFAULT_SCENARIO_BUDGET_SECS,
+        BACKLOG_SWEEP, BudgetVerdict, ClaimGate, ClaimerOutcome, DEFAULT_SCENARIO_BUDGET_SECS,
         HEADLINE_P50_BUDGET_MS, LatencyStats, SweepStep, budget_from_str, budget_verdict,
         claims_for_claimer, db_name_from_url, headline_scenario, measured_claims_for,
         percentile_ms, redact_url, sweep_step, warmup_claims_for, with_db_name,
@@ -623,6 +686,68 @@ mod pure_tests {
             (percentile_ms(&ascending, 99.0) - percentile_ms(&descending, 99.0)).abs()
                 < f64::EPSILON
         );
+    }
+
+    /// The throughput numerator must span the same window as its denominator.
+    ///
+    /// `wall_secs` starts at the first warmup call, so counting only
+    /// post-warmup successes understated `claims/s` by the warmup fraction.
+    #[test]
+    fn throughput_numerator_counts_warmup_but_latency_does_not() {
+        // 20 observations, all successful: warmup trims 2 (one in ten).
+        let observed: Vec<(f64, bool)> = (0..20).map(|i| (f64::from(i), true)).collect();
+        let out = ClaimerOutcome::from_observed(observed, false);
+
+        assert_eq!(out.total_claimed, 20, "throughput counts every success");
+        assert_eq!(out.claimed, 18, "latency window drops the warmup head");
+        assert_eq!(out.samples.len(), 18, "one sample per post-warmup call");
+        assert_eq!(out.empty, 0);
+        // And the trim really is the *head*: sample 0 and 1 are gone.
+        assert!(
+            (out.samples[0] - 2.0).abs() < f64::EPSILON,
+            "warmup must be trimmed from the front, got {:?}",
+            out.samples.first(),
+        );
+    }
+
+    /// The two counters must disagree only about warmup, never about outcome.
+    #[test]
+    fn throughput_numerator_ignores_calls_that_claimed_nothing() {
+        // Alternating hit/miss over 20 calls: 10 successes, 2 trimmed as warmup
+        // (indices 0 and 1 — one hit, one miss).
+        let observed: Vec<(f64, bool)> = (0..20).map(|i| (f64::from(i), i % 2 == 0)).collect();
+        let out = ClaimerOutcome::from_observed(observed, false);
+
+        assert_eq!(out.total_claimed, 10, "every success, warmup included");
+        assert_eq!(out.claimed, 9, "post-warmup successes");
+        assert_eq!(out.empty, 9, "post-warmup misses");
+        assert_eq!(
+            out.claimed + out.empty,
+            out.samples.len(),
+            "claim_ratio's denominator must match the sample count",
+        );
+    }
+
+    /// A claimer that never got a connection reports nothing, but truthfully.
+    #[test]
+    fn a_claimer_with_no_observations_reports_zero_not_a_panic() {
+        let out = ClaimerOutcome::from_observed(Vec::new(), true);
+        assert_eq!(out.total_claimed, 0);
+        assert_eq!(out.claimed, 0);
+        assert_eq!(out.empty, 0);
+        assert!(out.samples.is_empty());
+        assert!(out.truncated, "truncation must survive the split");
+    }
+
+    /// Short runs discard nothing, so a truncated scenario still reports.
+    #[test]
+    fn a_short_run_keeps_every_observation_in_both_windows() {
+        let observed: Vec<(f64, bool)> = (0..9).map(|i| (f64::from(i), true)).collect();
+        let out = ClaimerOutcome::from_observed(observed, true);
+        assert_eq!(warmup_claims_for(9), 0, "fewer than ten discards nothing");
+        assert_eq!(out.total_claimed, 9);
+        assert_eq!(out.claimed, 9);
+        assert_eq!(out.samples.len(), 9);
     }
 
     #[test]
@@ -1114,6 +1239,11 @@ pub mod db {
             let mut admin = AsyncPgConnection::establish(&admin_url)
                 .await
                 .map_err(|e| SkipReason(format!("connect {safe_url}: {e}")))?;
+            // Everything from here to the lease runs under a cluster-wide
+            // advisory lock, so no other client can sweep while we are between
+            // `CREATE DATABASE` and holding a backend on it. See
+            // `SWEEP_LOCK_KEY`.
+            take_sweep_lock(&mut admin).await?;
             drop_stale_bench_databases(&mut admin).await;
             let n = DB_SEQ.fetch_add(1, Ordering::SeqCst);
             // Shape: harvest_claim_bench_{pid}_{run_token}_{seq}. The pid is a
@@ -1134,6 +1264,13 @@ pub mod db {
             let mut conn = AsyncPgConnection::establish(&url)
                 .await
                 .map_err(|e| SkipReason(format!("connect {db}: {e}")))?;
+            // The lease now exists, so the database is visible in
+            // `pg_stat_activity` and defends itself. Release before the
+            // migration — that is the slow part, and holding the lock across it
+            // would serialize concurrent runs for no benefit. Every `?` above
+            // drops `admin`, which ends the session and releases the lock too,
+            // so an early return cannot strand it.
+            release_sweep_lock(&mut admin).await;
             conn.batch_execute(autumn_harvest::full_migrations_sql())
                 .await
                 .map_err(|e| SkipReason(format!("migrate {db}: {e}")))?;
@@ -1175,6 +1312,63 @@ pub mod db {
 
     /// Prefix of every database this harness creates against an admin URL.
     const BENCH_DB_PREFIX: &str = "harvest_claim_bench_";
+
+    /// Advisory-lock key serializing sweep-and-create across clients.
+    ///
+    /// A database is only defended once it has a backend in `pg_stat_activity`,
+    /// but it cannot have one until it exists — so between `CREATE DATABASE`
+    /// and the lease connection there is a window where a foreign sweep sees a
+    /// real database with zero connections and correctly concludes it is
+    /// abandoned. No amount of naming fixes that; the window has to be closed
+    /// by making the two operations mutually exclusive.
+    ///
+    /// Postgres advisory locks are cluster-wide rather than per-database, so a
+    /// lock taken on the admin connection is visible to exactly the set of
+    /// clients that could sweep us — including ones on other hosts, which is
+    /// the case that motivated it. The value is arbitrary but must never
+    /// change: two harness versions using different keys would not serialize
+    /// against each other, which is the same as no lock at all.
+    ///
+    /// Public so the regression test that proves setup actually takes the lock
+    /// references this constant rather than a copy of the literal.
+    pub const SWEEP_LOCK_KEY: i64 = 786_0786_0786;
+
+    /// How long to wait for a peer's sweep-and-create before giving up.
+    ///
+    /// Generous: the guarded span is a sweep plus one `CREATE DATABASE` plus
+    /// one connect, and the sweep's `DROP`s are the only part that can drag.
+    /// The timeout exists so a wedged peer surfaces as a diagnosable failure
+    /// rather than an unbounded hang.
+    const SWEEP_LOCK_TIMEOUT: &str = "60s";
+
+    /// Take the sweep lock, blocking until a peer releases it.
+    async fn take_sweep_lock(admin: &mut AsyncPgConnection) -> Result<(), SkipReason> {
+        // `lock_timeout` covers advisory locks, so a peer that wedges while
+        // holding the lock aborts our wait with an error instead of hanging.
+        diesel::sql_query(format!("SET lock_timeout = '{SWEEP_LOCK_TIMEOUT}'"))
+            .execute(&mut *admin)
+            .await
+            .map_err(|e| SkipReason(format!("set lock_timeout: {e}")))?;
+        diesel::sql_query("SELECT pg_advisory_lock($1)")
+            .bind::<diesel::sql_types::BigInt, _>(SWEEP_LOCK_KEY)
+            .execute(admin)
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                SkipReason(format!(
+                    "waited {SWEEP_LOCK_TIMEOUT} for another benchmark run's \
+                     sweep-and-create to finish: {e}"
+                ))
+            })
+    }
+
+    /// Release the sweep lock. Best-effort: dropping `admin` also releases it.
+    async fn release_sweep_lock(admin: &mut AsyncPgConnection) {
+        let _ = diesel::sql_query("SELECT pg_advisory_unlock($1)")
+            .bind::<diesel::sql_types::BigInt, _>(SWEEP_LOCK_KEY)
+            .execute(admin)
+            .await;
+    }
 
     /// Drop benchmark databases left behind by earlier runs.
     ///
@@ -1597,7 +1791,18 @@ pub mod db {
         /// Measured operations that returned `None` (lost a `SKIP LOCKED` race,
         /// or the queue had nothing eligible).
         pub empty: usize,
-        /// Wall time for the whole measured phase.
+        /// *Every* call that returned a task, warmup included.
+        ///
+        /// Separate from [`Self::claimed`] because the two answer different
+        /// questions over different windows. `claimed` is a *post-warmup*
+        /// count, paired with the post-warmup sample set for latency and for
+        /// [`Self::claim_ratio`]. This one is paired with [`Self::wall_secs`],
+        /// which runs from the first warmup call, so a throughput fraction
+        /// built from it shares a window with its denominator. Dividing the
+        /// trimmed count by the untrimmed clock understated `claims/s` by the
+        /// warmup fraction — about 10%.
+        pub total_claimed: usize,
+        /// Wall time for the whole measured phase, warmup included.
         pub wall_secs: f64,
         /// At least one claimer hit the wall-clock budget before completing its
         /// planned operations. The percentiles are still real, but they rest on
@@ -1625,6 +1830,13 @@ pub mod db {
         }
 
         /// Claims per second across the measured phase.
+        ///
+        /// Numerator and denominator deliberately cover the *same* window:
+        /// every successful claim, warmup included, over the whole wall clock.
+        /// This matches [`EnqueueReport::rows_per_sec`], which divides all rows
+        /// by the whole clock for the same reason. Latency statistics still
+        /// exclude warmup — throughput and latency want different windows, and
+        /// the two counters exist so neither has to compromise.
         #[must_use]
         pub fn claims_per_sec(&self) -> f64 {
             if self.wall_secs <= 0.0 {
@@ -1632,7 +1844,7 @@ pub mod db {
             }
             #[allow(clippy::cast_precision_loss)]
             {
-                self.claimed as f64 / self.wall_secs
+                self.total_claimed as f64 / self.wall_secs
             }
         }
     }
@@ -1690,7 +1902,7 @@ pub mod db {
                 )
                 .await
                 else {
-                    return (Vec::new(), 0usize, 0usize, true);
+                    return super::ClaimerOutcome::from_observed(Vec::new(), true);
                 };
                 let mut truncated = false;
                 for _ in 0..per_claimer {
@@ -1738,36 +1950,25 @@ pub mod db {
                     observed.push((elapsed, got.is_some()));
                 }
 
-                // Trim warmup now that the real observation count is known: the
-                // first calls on a fresh connection pay plan-cache and
-                // buffer-cache costs that are not representative of steady
-                // state, and left in they dominate the tail.
-                let warmup = super::warmup_claims_for(observed.len());
-                let mut samples: Vec<f64> = Vec::with_capacity(observed.len() - warmup);
-                let mut claimed = 0usize;
-                let mut empty = 0usize;
-                for (elapsed, got) in observed.into_iter().skip(warmup) {
-                    samples.push(elapsed);
-                    if got {
-                        claimed += 1;
-                    } else {
-                        empty += 1;
-                    }
-                }
-                (samples, claimed, empty, truncated)
+                // Split into the latency window (warmup trimmed) and the
+                // throughput window (everything), now that the real observation
+                // count is known. See `ClaimerOutcome::from_observed`.
+                super::ClaimerOutcome::from_observed(observed, truncated)
             }));
         }
 
         let mut all_samples: Vec<f64> = Vec::with_capacity(total_ops);
         let mut claimed = 0usize;
         let mut empty = 0usize;
+        let mut total_claimed = 0usize;
         let mut truncated = false;
         for h in handles {
-            let (samples, c, e, t) = h.await.expect("claimer task panicked");
-            all_samples.extend(samples);
-            claimed += c;
-            empty += e;
-            truncated |= t;
+            let out = h.await.expect("claimer task panicked");
+            all_samples.extend(out.samples);
+            claimed += out.claimed;
+            empty += out.empty;
+            total_claimed += out.total_claimed;
+            truncated |= out.truncated;
         }
         let wall_secs = started.elapsed().as_secs_f64();
 
@@ -1777,6 +1978,7 @@ pub mod db {
             stats: LatencyStats::from_samples(&all_samples),
             claimed,
             empty,
+            total_claimed,
             wall_secs,
             truncated,
         }
