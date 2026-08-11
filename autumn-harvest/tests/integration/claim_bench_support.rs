@@ -2837,6 +2837,12 @@ pub mod db {
         // barrier: checkout is an unbounded await, so the ceiling has to exist
         // before it (see the comment on `deadline`). The measurement clock is
         // separate, and starts on release.
+        //
+        // Safe only because `build_pool` sizes the pool *above* the claimer
+        // count: every party can hold a connection at once. A pool smaller than
+        // the party count would turn checkout into a genuine deadlock, since
+        // the claimers holding connections would be waiting here for one that
+        // cannot check out until they release.
         let gate = Arc::new(tokio::sync::Barrier::new(claimers));
         let mut handles = Vec::with_capacity(claimers);
         for c in 0..claimers {
