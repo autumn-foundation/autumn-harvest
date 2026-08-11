@@ -57,6 +57,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          canary_tests
 linux        autumn-harvest         integration                      -                          chain_timeout_tests
 linux        autumn-harvest         integration                      -                          child_timeout_tests
+linux        autumn-harvest         integration                      -                          claim_budget_tests
 linux        autumn-harvest         integration                      -                          completion_callback_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_await_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_signal_tests

@@ -6,6 +6,13 @@ Harvest can spread workflow state across N independent Postgres databases (shard
 
 For the full sharding architecture, see `CLAUDE.md` §Sharding and `autumn-harvest/src/shard.rs`.
 
+**When should you shard?** [`performance.md`](performance.md) publishes measured
+task-claim latency against pending-backlog depth. Claim cost grows superlinearly
+with backlog depth and every worker pays the full scan, so beyond a certain depth
+adding workers stops helping and sharding (or shedding the backlog) is the
+answer. Measure your own steady-state backlog against that table before
+provisioning a second shard.
+
 ---
 
 ## Per-Key Concurrency Limits and Sharding (issue #247)

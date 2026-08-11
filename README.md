@@ -366,6 +366,19 @@ Prometheus examples use only ADR-0001/#138 metric names and bounded labels;
 operators without Prometheus can run the equivalent CLI/API checks documented
 in [`docs/alerts/README.md`](docs/alerts/README.md).
 
+### Measured performance baselines
+
+[`docs/performance.md`](docs/performance.md) publishes measured task-claim and
+enqueue baselines: how claim latency scales with pending-backlog depth (the
+number that answers *"when do I add a shard?"*), what five representative
+claim-path predicates cost (five more are in the query on every claim but are
+left on their cheapest null/empty path, so they are evaluated rather than
+measured — the page names them), and the `EXPLAIN (ANALYZE, BUFFERS)` plan
+behind both. Like the
+alert pack, these are starter reference numbers from one machine — reproduce
+them on your own hardware before designing against them. A CI gate defends the
+headline scenario so a change that collapses the claim path fails the build.
+
 ### Controlling duplicate workflow starts
 
 By default, starting a workflow with a `(workflow_name, workflow_id)` pair that already exists returns the existing execution. This "allow duplicate" behaviour is correct for upstream services that retry a start whose response was lost. It is **not** correct when you need at-most-one, retry-after-failure, or terminate-and-replace semantics.
