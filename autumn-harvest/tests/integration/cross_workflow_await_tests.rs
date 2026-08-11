@@ -1071,6 +1071,7 @@ async fn test_await_continued_as_new_target_follows_chain_to_successor() {
         &[WorkflowEvent::WorkflowContinuedAsNew {
             new_exec_id: successor,
             input: serde_json::json!({}),
+            new_workflow_type: None,
         }],
         thist.next_event_id,
     )

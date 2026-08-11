@@ -2048,6 +2048,7 @@ mod tests {
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),
                 input: Value::Null,
+                new_workflow_type: None,
             },
         ];
 
@@ -2221,6 +2222,7 @@ mod tests {
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),
                 input: Value::Null,
+                new_workflow_type: None,
             },
         ];
         assert_eq!(

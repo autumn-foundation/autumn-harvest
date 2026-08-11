@@ -3598,10 +3598,18 @@ impl WorkflowTestEnv {
                 history.push(WorkflowEvent::workflow_failed_typed(&decoded));
                 Err(decoded.message)
             }
-            WorkflowOutcome::ContinuedAsNew { input } => {
+            WorkflowOutcome::ContinuedAsNew {
+                input,
+                new_workflow_type,
+            } => {
+                // A cross-type continuation (issue #803) is recorded faithfully
+                // so `replay_check` round-trips the target type; the harness
+                // stops at the transition either way and never dispatches the
+                // successor, so it needs no handler for the target type.
                 history.push(WorkflowEvent::WorkflowContinuedAsNew {
                     new_exec_id: ExecutionId::new(),
                     input: input.clone(),
+                    new_workflow_type,
                 });
                 Ok(input)
             }

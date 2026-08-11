@@ -5106,14 +5106,27 @@ impl HistoryMatcher {
 
     /// Match a continue-as-new command against history.
     ///
-    /// Expects `WorkflowContinuedAsNew { input }` at the current cursor.
-    pub fn match_continue_as_new(&mut self, input: &Value) -> HistoryMatch {
+    /// Expects `WorkflowContinuedAsNew { input, new_workflow_type }` at the
+    /// current cursor.
+    ///
+    /// Both the input **and** the successor type are part of the recorded
+    /// command (issue #803): a code change that redirects a continuation to a
+    /// different workflow type — or that adds/removes the cross-type call
+    /// entirely — surfaces as non-determinism rather than silently forking the
+    /// chain into a different phase on replay. `None` (same type) and
+    /// `Some(t)` are distinct recorded intents and never compare equal.
+    pub fn match_continue_as_new(
+        &mut self,
+        input: &Value,
+        new_workflow_type: Option<&str>,
+    ) -> HistoryMatch {
         if !self.prepare_match() {
             return HistoryMatch::NoMatch;
         }
 
         let WorkflowEvent::WorkflowContinuedAsNew {
             input: recorded_input,
+            new_workflow_type: recorded_type,
             ..
         } = &self.events[self.cursor]
         else {
@@ -5124,6 +5137,21 @@ impl HistoryMatcher {
                 event_index: i32::try_from(self.cursor).ok(),
             };
         };
+
+        if recorded_type.as_deref() != new_workflow_type {
+            return HistoryMatch::Diverged {
+                expected: format!(
+                    "WorkflowContinuedAsNewType({})",
+                    new_workflow_type.unwrap_or("<same type>")
+                ),
+                actual: format!(
+                    "WorkflowContinuedAsNewType({})",
+                    recorded_type.as_deref().unwrap_or("<same type>")
+                ),
+
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        }
 
         if recorded_input != input {
             return HistoryMatch::Diverged {
@@ -5138,6 +5166,27 @@ impl HistoryMatcher {
         self.cursor += 1;
         self.advance_to_next_unconsumed_event();
         HistoryMatch::Matched { output }
+    }
+
+    /// Whether the recorded continue-as-new target type equals `expected`
+    /// (issue #803).
+    ///
+    /// Cursor-independent (it scans, rather than reading at the cursor) so it
+    /// can be consulted *after* [`Self::match_continue_as_new`] has advanced
+    /// past the event. Exists solely to back a `debug_assert!` on the
+    /// `Matched` arm, where the successor type is emitted from the live
+    /// argument rather than echoed from history; a history with no recorded
+    /// continuation reports `true` (there is nothing to contradict).
+    pub(crate) fn recorded_continue_as_new_type_matches(&self, expected: Option<&str>) -> bool {
+        self.events
+            .iter()
+            .find_map(|e| match e {
+                WorkflowEvent::WorkflowContinuedAsNew {
+                    new_workflow_type, ..
+                } => Some(new_workflow_type.as_deref() == expected),
+                _ => None,
+            })
+            .unwrap_or(true)
     }
 
     /// Match a child workflow command against history.
@@ -7411,10 +7460,11 @@ mod tests {
         let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
             new_exec_id: ExecutionId::new(),
             input: payload.clone(),
+            new_workflow_type: None,
         }];
 
         let mut matcher = HistoryMatcher::new(events);
-        let result = matcher.match_continue_as_new(&payload);
+        let result = matcher.match_continue_as_new(&payload, None);
         assert_eq!(result, HistoryMatch::Matched { output: payload });
         assert_eq!(matcher.position(), 1);
         assert!(!matcher.is_replaying());
@@ -7425,10 +7475,11 @@ mod tests {
         let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
             new_exec_id: ExecutionId::new(),
             input: serde_json::json!({"phase": "next"}),
+            new_workflow_type: None,
         }];
 
         let mut matcher = HistoryMatcher::new(events);
-        let result = matcher.match_continue_as_new(&serde_json::json!({"phase": "later"}));
+        let result = matcher.match_continue_as_new(&serde_json::json!({"phase": "later"}), None);
         assert!(matches!(result, HistoryMatch::Diverged { .. }));
         assert_eq!(matcher.position(), 0);
     }
@@ -7441,9 +7492,106 @@ mod tests {
         }];
 
         let mut matcher = HistoryMatcher::new(events);
-        let result = matcher.match_continue_as_new(&serde_json::json!({"phase": "next"}));
+        let result = matcher.match_continue_as_new(&serde_json::json!({"phase": "next"}), None);
         assert!(matches!(result, HistoryMatch::Diverged { .. }));
         assert_eq!(matcher.position(), 0);
+    }
+
+    // ── Cross-type continue-as-new matching (issue #803) ────────────────
+
+    /// AC6: a recorded cross-type continuation replays to the same successor
+    /// type it was recorded with.
+    #[test]
+    fn matcher_replays_cross_type_continue_as_new() {
+        let payload = serde_json::json!({"tier": "paid"});
+        let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: payload.clone(),
+            new_workflow_type: Some("paid_subscription".to_string()),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_continue_as_new(&payload, Some("paid_subscription"));
+        assert_eq!(result, HistoryMatch::Matched { output: payload });
+        assert_eq!(matcher.position(), 1);
+    }
+
+    /// AC6: redirecting a continuation to a *different* type is a code change
+    /// the recorded history cannot satisfy — it must surface as divergence,
+    /// not silently fork the chain into another phase.
+    #[test]
+    fn matcher_continue_as_new_type_mismatch_diverges() {
+        let payload = serde_json::json!({"tier": "paid"});
+        let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: payload.clone(),
+            new_workflow_type: Some("paid_subscription".to_string()),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_continue_as_new(&payload, Some("churned"));
+        match result {
+            HistoryMatch::Diverged {
+                expected, actual, ..
+            } => {
+                assert!(expected.contains("churned"), "got {expected}");
+                assert!(actual.contains("paid_subscription"), "got {actual}");
+            }
+            other => panic!("expected divergence, got {other:?}"),
+        }
+        assert_eq!(matcher.position(), 0, "a divergence must not advance");
+    }
+
+    /// `None` (same type) and `Some(t)` are distinct recorded intents:
+    /// *adding* a cross-type call over a same-type history diverges…
+    #[test]
+    fn matcher_same_type_history_diverges_against_a_cross_type_call() {
+        let payload = serde_json::json!({"cycle": 2});
+        let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: payload.clone(),
+            new_workflow_type: None,
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_continue_as_new(&payload, Some("paid_subscription"));
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        assert_eq!(matcher.position(), 0);
+    }
+
+    /// …and *removing* it over a cross-type history diverges too.
+    #[test]
+    fn matcher_cross_type_history_diverges_against_a_same_type_call() {
+        let payload = serde_json::json!({"cycle": 2});
+        let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: payload.clone(),
+            new_workflow_type: Some("paid_subscription".to_string()),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_continue_as_new(&payload, None);
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        assert_eq!(matcher.position(), 0);
+    }
+
+    /// The type is compared **before** the input, so a run that changed both
+    /// reports the type divergence — the actionable one for a phase redirect.
+    #[test]
+    fn matcher_continue_as_new_reports_type_divergence_before_input() {
+        let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: serde_json::json!({"a": 1}),
+            new_workflow_type: Some("paid_subscription".to_string()),
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        match matcher.match_continue_as_new(&serde_json::json!({"b": 2}), Some("churned")) {
+            HistoryMatch::Diverged { expected, .. } => {
+                assert!(expected.contains("Type"), "got {expected}");
+            }
+            other => panic!("expected divergence, got {other:?}"),
+        }
     }
 
     #[test]

@@ -258,6 +258,7 @@ fn continued_as_new_history(items: &[&str]) -> (ExecutionId, Value, Vec<Workflow
     events.push(WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id: ExecutionId::new(),
         input: json!({ "carry": items.len() }),
+        new_workflow_type: None,
     });
     (exec_id, input, events)
 }

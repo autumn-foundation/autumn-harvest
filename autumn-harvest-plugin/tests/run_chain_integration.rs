@@ -207,6 +207,7 @@ async fn insert_continue_event(
     let event = WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id: successor,
         input: json!({"n": 2}),
+        new_workflow_type: None,
     };
     let data = serde_json::to_value(&event).expect("event serializes");
     let event_type = data

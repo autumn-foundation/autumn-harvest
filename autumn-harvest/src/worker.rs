@@ -511,6 +511,16 @@ pub struct HandlerRegistry {
     /// [`crate::builder::WorkerConfig::retry_after_ceiling`]; default
     /// [`crate::builder::DEFAULT_RETRY_AFTER_CEILING`] (15 minutes).
     pub retry_after_ceiling: Duration,
+    /// Names of unified DAGs auto-registered as shadow workflows by
+    /// `HarvestBuilder::dags()` (issue #256).
+    ///
+    /// Those names live in [`Self::workflows`] like any other type, so a
+    /// core-crate component cannot otherwise tell a DAG apart from a plain
+    /// workflow — the plugin's `is_registered_dag` is unavailable here.
+    /// Threaded for the same reason as [`Self::max_workflow_execution_timeout`]:
+    /// so a core path can enforce a rule the HTTP layer already enforces.
+    /// Empty (the default) = no DAGs registered.
+    dag_workflow_names: std::collections::HashSet<String>,
 }
 
 impl HandlerRegistry {
@@ -650,6 +660,7 @@ impl HandlerRegistry {
             max_workflow_attempts_ceiling: None,
             max_workflow_chain_timeout: None,
             max_workflow_execution_timeout: None,
+            dag_workflow_names: std::collections::HashSet::new(),
             payload_offloader: None,
             activity_interceptors: Vec::new(),
             #[cfg(feature = "wasm-activities")]
@@ -762,6 +773,20 @@ impl HandlerRegistry {
         ceiling: Option<std::time::Duration>,
     ) -> Self {
         self.max_workflow_execution_timeout = ceiling;
+        self
+    }
+
+    /// Record which registered workflow names are auto-registered unified DAGs
+    /// (issue #256), so core paths can enforce DAG-specific rules the plugin's
+    /// `is_registered_dag` guards at the HTTP layer — currently the issue #803
+    /// rejection of a cross-type continue-as-new into a DAG.
+    #[must_use]
+    pub fn with_dag_workflow_names<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.dag_workflow_names = names.into_iter().map(Into::into).collect();
         self
     }
 
@@ -967,6 +992,7 @@ impl std::fmt::Debug for HandlerRegistry {
         let mut d = f.debug_struct("HandlerRegistry");
         d.field("workflows", &self.workflows.keys())
             .field("activities", &self.activities.keys())
+            .field("dag_workflow_names", &self.dag_workflow_names)
             .field("query_handler_count", &self.query_handlers.len())
             .field("update_handler_count", &self.update_handlers.len())
             .field("signal_handler_count", &self.signal_handlers.len())
@@ -10402,19 +10428,363 @@ async fn reject_child_continue_as_new(
     Ok(true)
 }
 
+/// Outcome of validating a continue-as-new's target workflow type (issue #803).
+enum ContinueAsNewTypeCheck<'a> {
+    /// The target type is blank or unregistered on this worker: the execution
+    /// has already been failed terminally and the caller must bail.
+    Rejected,
+    /// `new_workflow_type` was `None` — a same-type continuation, the legacy
+    /// path. Every lifecycle column is carried forward verbatim.
+    SameType,
+    /// A cross-type continuation into a type that *is* registered here. The
+    /// successor's lifecycle defaults come from this [`WorkflowInfo`].
+    CrossType(&'a crate::info::WorkflowInfo),
+}
+
+/// Validate a cross-type continue-as-new target before anything is persisted
+/// (issue #803 AC5).
+///
+/// Continuing into a type no worker can dispatch would seal the predecessor
+/// and leave a successor stuck `RUNNING` forever with nothing to claim it, so
+/// the check runs **before** the seal transaction opens and fails the
+/// predecessor terminally instead — the same shape as
+/// [`reject_child_continue_as_new`], and the same fail-closed posture the
+/// child-spawn paths already take for an unregistered child type.
+///
+/// Consequence worth knowing: the target must be registered on the worker that
+/// runs the *transition*, so a new phase handler has to reach the whole fleet
+/// before code that continues into it does.
+async fn check_continue_as_new_type<'a>(
+    conn: &mut AsyncPgConnection,
+    registry: &'a HandlerRegistry,
+    persistence: &WorkflowTaskPersistence<'_>,
+    execution: &WorkflowExecution,
+    new_workflow_type: Option<&str>,
+    slot: &mut SuccessorSlot,
+) -> HarvestResult<ContinueAsNewTypeCheck<'a>> {
+    let error = match classify_continue_as_new_target(registry, new_workflow_type) {
+        Ok(ContinueAsNewTypeCheck::CrossType(info)) => {
+            // The successor takes a DIFFERENT uniqueness slot —
+            // `(target, workflow_id)` — and sealing the predecessor does not
+            // free it. Resolve that slot now, under the same transaction, so a
+            // collision is an actionable terminal failure rather than a bare
+            // Postgres unique violation that rolls the whole cycle back.
+            match resolve_successor_slot(conn, info.name, &execution.workflow_id, execution.id)
+                .await?
+            {
+                Ok(resolved) => {
+                    *slot = resolved;
+                    return Ok(ContinueAsNewTypeCheck::CrossType(info));
+                }
+                Err(error) => error,
+            }
+        }
+        Ok(resolved) => return Ok(resolved),
+        Err(error) => error,
+    };
+
+    // Root-only by construction: `reject_child_continue_as_new` runs first, so
+    // a child execution never reaches here. Retry is deliberately not offered
+    // (`None` for the execution) — a re-run would resolve the same missing
+    // registration and fail identically, matching the child-guard precedent.
+    persist_workflow_failure(
+        conn,
+        persistence.task.id,
+        persistence.exec_id,
+        persistence.next_event_id,
+        persistence.worker_id,
+        &error,
+        None,
+        None,
+        None,
+        None,
+        None,
+        crate::types::Priority::default(),
+    )
+    .await?;
+    Ok(ContinueAsNewTypeCheck::Rejected)
+}
+
+/// State of the `(workflow_name, workflow_id)` uniqueness slot the successor
+/// is about to take (issue #803).
+///
+/// For a **same-type** continuation the predecessor *is* the occupant, and
+/// sealing it `CONTINUED_AS_NEW` inside the transaction frees the slot — which
+/// is why the legacy insert needed no check at all. A **cross-type**
+/// continuation takes a different slot that sealing the predecessor does not
+/// free, so it must be resolved explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuccessorSlot {
+    /// Nothing to do: nobody occupies the slot, or (the same-type case) the
+    /// predecessor's own seal frees it.
+    Free,
+    /// A *terminal* run of the target type already used this `workflow_id`.
+    /// Seal it `CONTINUED_AS_NEW` — the same release the predecessor's own
+    /// seal performs — so the successor can take the slot.
+    SealTerminal(uuid::Uuid),
+}
+
+/// Resolve the successor's uniqueness slot for a cross-type continuation.
+///
+/// Takes the occupying row (if any) `FOR UPDATE` so the decision is stable for
+/// the rest of the enclosing transaction — a concurrent start of the target
+/// type under the same `workflow_id` cannot slip in between this check and the
+/// successor insert.
+///
+/// `Ok(Err(msg))` is a *rejection* (an operator-facing message), not a database
+/// error: a **live** run of the target type already owns the identity, and
+/// harvest's `(workflow_name, workflow_id)` uniqueness admits exactly one.
+async fn resolve_successor_slot(
+    conn: &mut AsyncPgConnection,
+    target: &str,
+    workflow_id: &str,
+    predecessor: uuid::Uuid,
+) -> HarvestResult<Result<SuccessorSlot, String>> {
+    let occupant: Option<(uuid::Uuid, String)> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(target))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::state,
+        ))
+        .for_update()
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    Ok(classify_successor_slot(
+        target,
+        workflow_id,
+        predecessor,
+        occupant.as_ref().map(|(id, state)| (*id, state.as_str())),
+    ))
+}
+
+/// Pure decision behind [`resolve_successor_slot`] (issue #803).
+///
+/// Split out so the free / self / terminal-occupant / live-occupant matrix is
+/// unit-testable without a database.
+fn classify_successor_slot(
+    target: &str,
+    workflow_id: &str,
+    predecessor: uuid::Uuid,
+    occupant: Option<(uuid::Uuid, &str)>,
+) -> Result<SuccessorSlot, String> {
+    let Some((id, state)) = occupant else {
+        return Ok(SuccessorSlot::Free);
+    };
+    if id == predecessor {
+        // The caller named its OWN type — a supported request (it re-resolves
+        // that type's declared defaults, which the legacy `continue_as_new`
+        // deliberately does not). The predecessor is its own occupant, and its
+        // seal inside this same transaction frees the slot, exactly as it does
+        // for a same-type continuation. Without this arm the natural typed
+        // form `continue_as_new_as(&own_info(), input)` would report the run as
+        // blocking itself and fail it terminally.
+        return Ok(SuccessorSlot::Free);
+    }
+    if crate::erase::is_terminal_state(state) {
+        // A prior run of this phase finished (a win-back loop such as
+        // `churned -> trial -> churned`, or the separate run an external
+        // caller started by naming the old type). Releasing it is exactly what
+        // the predecessor's own seal does for a same-type continuation.
+        return Ok(SuccessorSlot::SealTerminal(id));
+    }
+    Err(format!(
+        "continue_as_new target workflow type '{target}' already has a live execution ({id}, \
+         state {state}) for workflow_id '{workflow_id}'; harvest admits one active run per \
+         (workflow_name, workflow_id), so this run was failed rather than displacing it — \
+         resolve execution {id}, then restart or reset (issue #148) this entity to reach that phase"
+    ))
+}
+
+/// Pure decision behind [`check_continue_as_new_type`] (issue #803).
+///
+/// `Ok` carries the resolved continuation shape; `Err` carries the operator-
+/// facing message the caller records as the predecessor's terminal failure.
+/// Split out so the blank/unregistered/registered matrix is unit-testable
+/// without a database.
+fn classify_continue_as_new_target<'a>(
+    registry: &'a HandlerRegistry,
+    new_workflow_type: Option<&str>,
+) -> Result<ContinueAsNewTypeCheck<'a>, String> {
+    let Some(target) = new_workflow_type else {
+        return Ok(ContinueAsNewTypeCheck::SameType);
+    };
+    if target.trim().is_empty() {
+        return Err("continue_as_new target workflow type must not be blank".to_string());
+    }
+    // A unified DAG's shadow `WorkflowInfo` sits in `registry.workflows` like
+    // any other type (issue #256), so without this it would be accepted — and
+    // the successor would run the DAG's level-walker while bypassing the
+    // `max_active_runs` and paused-schedule admission gates that
+    // `trigger_unified_dag` enforces on every other entry point. DAG
+    // continue-as-new is out of scope for issue #803, so reject it rather than
+    // half-support it with the gates off.
+    if registry.dag_workflow_names.contains(target) {
+        return Err(format!(
+            "continue_as_new target '{target}' is a registered DAG, not a plain workflow type; \
+             continuing into a DAG would bypass its admission gates — trigger it with \
+             POST /dags/{target}/trigger instead"
+        ));
+    }
+    registry.workflows.get(target).map_or_else(
+        || {
+            Err(format!(
+                "continue_as_new target workflow type '{target}' is not registered on this \
+                 worker; register the handler across the fleet before continuing into it"
+            ))
+        },
+        |info| Ok(ContinueAsNewTypeCheck::CrossType(info)),
+    )
+}
+
+/// Lifecycle defaults for a continue-as-new successor row (issue #803).
+///
+/// Borrows string metadata from whichever source won, so the caller can hand
+/// these straight to `NewWorkflowExecution`'s `&str` fields.
+struct ContinueAsNewSuccessorDefaults<'a> {
+    execution_timeout: Option<chrono::Duration>,
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    sla: Option<chrono::Duration>,
+    sla_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    owner: Option<&'a str>,
+    runbook_url: Option<&'a str>,
+    severity: Option<&'a str>,
+    workflow_retry_policy: Option<serde_json::Value>,
+    /// Issue #617 chain lifetime cap. Carried **verbatim** in both arms —
+    /// re-resolving it from the target type would make a type change an
+    /// escape hatch from the runaway-loop budget. Threaded through this
+    /// struct (rather than read straight off the row at the insert site) so
+    /// the invariant is covered by the pure `can803_*` tests instead of only
+    /// by a Docker-gated one.
+    chain_execution_timeout: Option<chrono::Duration>,
+    chain_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Decide the successor's lifecycle defaults for a continue-as-new (issue #803).
+///
+/// **Presence decides.** `target_info == None` is a same-type continuation and
+/// is byte-identical to the pre-#803 behavior: every column is carried verbatim
+/// from the predecessor row and only the two per-run deadlines are re-anchored
+/// to `now`. `Some(info)` is a cross-type continuation and resolves from *that
+/// type's* declared defaults, exactly as a spawned child resolves its own —
+/// so a phase's timeout, SLA, retry policy, and on-call ownership follow the
+/// phase rather than being inherited from the phase it replaced.
+///
+/// The #617 chain cap (`chain_execution_timeout` / `chain_deadline_at`) IS
+/// returned, but carried **verbatim in both arms**: the cap is anchored at the
+/// chain's first run, so changing type must not reset it. It is threaded
+/// through this struct rather than read off the row at the insert site purely
+/// so the "not an escape hatch" invariant is covered by the pure tests.
+///
+/// Deliberately **not** decided here, because they are carried verbatim and
+/// have no target-type analogue: queue, shard, schedule lineage, build id, and
+/// search attributes.
+fn resolve_continue_as_new_successor_defaults<'a>(
+    execution: &'a WorkflowExecution,
+    target_info: Option<&'a crate::info::WorkflowInfo>,
+    max_execution_timeout_ceiling: Option<chrono::Duration>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ContinueAsNewSuccessorDefaults<'a> {
+    let Some(info) = target_info else {
+        return ContinueAsNewSuccessorDefaults {
+            execution_timeout: execution.execution_timeout,
+            // Plain `+` (not `checked_add_signed`) preserves the pre-#803 path
+            // exactly. Safe because the value is a stored duration that was
+            // already validated when the chain's first run started.
+            deadline_at: execution.execution_timeout.map(|d| now + d),
+            sla: execution.sla,
+            sla_deadline_at: execution.sla.map(|d| now + d),
+            owner: execution.owner.as_deref(),
+            runbook_url: execution.runbook_url.as_deref(),
+            severity: execution.severity.as_deref(),
+            workflow_retry_policy: execution.workflow_retry_policy.clone(),
+            chain_execution_timeout: execution.chain_execution_timeout,
+            chain_deadline_at: execution.chain_deadline_at,
+        };
+    };
+
+    // Apply the operator's fleet-wide ceiling (issue #243) exactly as every
+    // other registry-aware start path does — otherwise a type change would be
+    // an escape hatch from the per-run cap the same declaration is clamped by
+    // when started over HTTP or fired by the scheduler.
+    let execution_timeout = info
+        .execution_timeout
+        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .map(|t| max_execution_timeout_ceiling.map_or(t, |ceiling| t.min(ceiling)));
+    // Clamp the soft SLA to at most the hard timeout, mirroring the start
+    // path's resolution — never a soft deadline the hard one would preempt.
+    // A non-positive budget is treated as "no SLA" for the same reason the
+    // start path does: an `sla_deadline_at` at or before `started_at` would be
+    // reported breached by the very next scan (issue #487).
+    let sla = info
+        .sla
+        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .filter(|sla| *sla > chrono::Duration::zero())
+        .map(|sla| execution_timeout.map_or(sla, |hard| sla.min(hard)));
+    ContinueAsNewSuccessorDefaults {
+        execution_timeout,
+        // `checked_add_signed` here (unlike the verbatim arm above): these are
+        // freshly converted `WorkflowInfo` durations that no start path has
+        // range-checked, and `DateTime + Duration` panics on overflow.
+        deadline_at: execution_timeout.and_then(|d| now.checked_add_signed(d)),
+        sla,
+        sla_deadline_at: sla.and_then(|d| now.checked_add_signed(d)),
+        owner: info.owner,
+        runbook_url: info.runbook_url,
+        severity: info.severity,
+        workflow_retry_policy: info
+            .retry_policy
+            .as_ref()
+            .and_then(|p| serde_json::to_value(p).ok()),
+        // Verbatim, deliberately: see the field docs. The chain cap belongs to
+        // the CHAIN, not to any one phase of it.
+        chain_execution_timeout: execution.chain_execution_timeout,
+        chain_deadline_at: execution.chain_deadline_at,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn persist_workflow_continue_as_new(
     conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
     persistence: WorkflowTaskPersistence<'_>,
     execution: &WorkflowExecution,
     input: serde_json::Value,
-    offloader: Option<&crate::payload_store::PayloadOffloader>,
+    new_workflow_type: Option<String>,
 ) -> HarvestResult<()> {
     use crate::schema::{harvest_signals, harvest_workflow_executions};
+
+    let offloader = registry.payload_offloader();
 
     if reject_child_continue_as_new(conn, &persistence, execution).await? {
         return Ok(());
     }
+
+    // Issue #803: validate a cross-type target before anything is written, so
+    // an unregistered type can never seal the predecessor and strand an
+    // undispatchable successor.
+    // Same-type: the predecessor's own seal frees the slot, so nothing to do.
+    // Cross-type: `check_continue_as_new_type` resolves the target slot into
+    // this and rejects a live occupant before anything is persisted.
+    let mut successor_slot = SuccessorSlot::Free;
+    let target_info = match check_continue_as_new_type(
+        conn,
+        registry,
+        &persistence,
+        execution,
+        new_workflow_type.as_deref(),
+        &mut successor_slot,
+    )
+    .await?
+    {
+        ContinueAsNewTypeCheck::Rejected => return Ok(()),
+        ContinueAsNewTypeCheck::SameType => None,
+        ContinueAsNewTypeCheck::CrossType(info) => Some(info),
+    };
 
     // Carry the predecessor's `last_completion_result` forward by its *stored*
     // representation (issue #524 / #488). If it was offloaded, copy the
@@ -10452,41 +10822,59 @@ async fn persist_workflow_continue_as_new(
     let continued_event = WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id,
         input: input.clone(),
+        new_workflow_type: new_workflow_type.clone(),
     };
-    // Re-anchor deadline to the new execution's start time (issue #243).
-    let new_deadline_at = execution.execution_timeout.map(|d| chrono::Utc::now() + d);
-    // Re-anchor soft SLA deadline per-run (issue #487).
-    let new_sla_deadline_at = execution.sla.map(|d| chrono::Utc::now() + d);
-    // Chain-scoped lifetime cap (issue #617): CARRY BOTH COLUMNS VERBATIM. Unlike
-    // the per-run `deadline_at`/`sla_deadline_at` above (re-anchored to `now`), the
-    // chain deadline is anchored at the FIRST run's start and must NOT be
-    // recomputed as `now + timeout` — copying the predecessor's absolute
-    // `chain_deadline_at` is what makes the whole continue-as-new chain share one
-    // lifetime cap, so a runaway loop cannot escape it by continuing-as-new.
+    // Successor lifecycle defaults (issues #243/#487/#372/#523, and #803 for the
+    // cross-type case): carried verbatim from the predecessor for a same-type
+    // continuation, resolved from the target type's own `WorkflowInfo` for a
+    // cross-type one. Per-run deadlines are re-anchored to the successor's start
+    // in both cases.
+    let defaults = resolve_continue_as_new_successor_defaults(
+        execution,
+        target_info,
+        registry
+            .max_workflow_execution_timeout
+            .and_then(|d| chrono::Duration::from_std(d).ok()),
+        chrono::Utc::now(),
+    );
+    // Chain-scoped lifetime cap (issue #617): CARRY BOTH COLUMNS VERBATIM, for a
+    // cross-type continuation too. Unlike the per-run `deadline_at`/
+    // `sla_deadline_at` above (re-anchored to `now`), the chain deadline is
+    // anchored at the FIRST run's start and must NOT be recomputed as
+    // `now + timeout` — copying the predecessor's absolute `chain_deadline_at` is
+    // what makes the whole continue-as-new chain share one lifetime cap, so a
+    // runaway loop cannot escape it by continuing-as-new *or by changing type*.
+
+    // The successor runs as the named type when one was requested, else as the
+    // predecessor's own (issue #803). Borrowed from the owned local, which
+    // outlives `new_row`.
+    let successor_workflow_name = new_workflow_type
+        .as_deref()
+        .unwrap_or(execution.workflow_name.as_str());
 
     let new_row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
-        workflow_name: &execution.workflow_name,
+        workflow_name: successor_workflow_name,
         workflow_id: &execution.workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: execution.shard_id,
         input: input.clone(),
         parent_id: None,
         queue_name: &execution.queue_name,
-        execution_timeout: execution.execution_timeout,
-        deadline_at: new_deadline_at,
+        execution_timeout: defaults.execution_timeout,
+        deadline_at: defaults.deadline_at,
         // Carried verbatim across continue-as-new (issue #617) — see comment above.
-        chain_execution_timeout: execution.chain_execution_timeout,
-        chain_deadline_at: execution.chain_deadline_at,
-        sla: execution.sla,
-        sla_deadline_at: new_sla_deadline_at,
+        chain_execution_timeout: defaults.chain_execution_timeout,
+        chain_deadline_at: defaults.chain_deadline_at,
+        sla: defaults.sla,
+        sla_deadline_at: defaults.sla_deadline_at,
         memo: execution.memo.clone(),
         search_attrs: execution.search_attrs.clone(),
         assigned_build_id: execution.assigned_build_id.clone(),
         parent_close_policy: None, // root workflow
-        owner: execution.owner.as_deref(),
-        runbook_url: execution.runbook_url.as_deref(),
-        severity: execution.severity.as_deref(),
+        owner: defaults.owner,
+        runbook_url: defaults.runbook_url,
+        severity: defaults.severity,
         context_headers: execution.context_headers.clone(),
         schedule_id: execution.schedule_id, // preserve schedule lineage through continue-as-new
         // Same logical slot as the predecessor: keep carryover ordering stable so the
@@ -10494,9 +10882,11 @@ async fn persist_workflow_continue_as_new(
         scheduled_for: execution.scheduled_for,
         // Continue-as-new starts a fresh run: attempt counter resets to 1,
         // but the retry policy is carried forward so the chain can still retry
-        // transient failures on the continued run.
+        // transient failures on the continued run. A cross-type continuation
+        // instead adopts the target type's own policy (issue #803) — the
+        // successor IS that type, so that type's declared retry governs it.
         workflow_attempt: 1,
-        workflow_retry_policy: execution.workflow_retry_policy.clone(),
+        workflow_retry_policy: defaults.workflow_retry_policy,
         retry_of_exec_id: None,
         // Preserve dispatch origin through continue-as-new so a continued scheduled run
         // stays attributed to its schedule's cadence (issue #534).
@@ -10517,17 +10907,31 @@ async fn persist_workflow_continue_as_new(
         start_source_ref: Some(predecessor_exec_id_str.as_str()),
         started_by: None,
     };
+    // Per-key concurrency (issue #247). Same-type: propagate the current task's
+    // key so the continued run stays under the same fair-share cap. Cross-type
+    // (issue #803): re-resolve against the TARGET type's own policy and the new
+    // input — the predecessor's key belonged to a different type's policy, and
+    // a target declaring no policy correctly yields no key at all.
+    let (successor_concurrency_key, successor_concurrency_cap) =
+        new_workflow_type.as_deref().map_or_else(
+            || {
+                (
+                    persistence.task.concurrency_key.clone(),
+                    persistence
+                        .task
+                        .concurrency_cap
+                        .and_then(|cap| u32::try_from(cap).ok()),
+                )
+            },
+            |target| resolve_workflow_concurrency(registry, target, &input),
+        );
+
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
     enqueue.required_build_id = execution.assigned_build_id.clone();
-    // Propagate the concurrency key from the current task so the new run
-    // continues to be governed by the same fair-share cap (issue #247).
-    enqueue.concurrency_key = persistence.task.concurrency_key.clone();
-    enqueue.max_concurrent = persistence
-        .task
-        .concurrency_cap
-        .and_then(|cap| u32::try_from(cap).ok());
+    enqueue.concurrency_key = successor_concurrency_key;
+    enqueue.max_concurrent = successor_concurrency_cap;
     enqueue.rate_limit_key = persistence.task.rate_limit_key.clone();
 
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
@@ -10561,6 +10965,22 @@ async fn persist_workflow_continue_as_new(
         // seal transaction (the same chokepoint as the completion-trigger
         // sweep); guarded, so a no-op when the feature/table is unused.
         crate::mutex::sweep_terminal_holder_and_wake(conn, exec_id).await?;
+
+        // Issue #803: a cross-type successor takes the `(target, workflow_id)`
+        // uniqueness slot, which sealing the predecessor above does NOT free.
+        // Release a *terminal* prior run of that phase (a win-back loop, or the
+        // separate run an external caller started by naming the old type) the
+        // same way the predecessor's own seal releases its slot. A LIVE
+        // occupant was already rejected before this transaction opened, and the
+        // `FOR UPDATE` taken there holds until commit, so nothing can claim the
+        // slot in between.
+        if let SuccessorSlot::SealTerminal(occupant) = successor_slot {
+            diesel::update(harvest_workflow_executions::table.find(occupant))
+                .set(harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+        }
 
         diesel::insert_into(harvest_workflow_executions::table)
             .values(&new_row)
@@ -10769,18 +11189,28 @@ async fn persist_workflow_outcome(
             }
             result.map(|()| (false, Vec::new()))
         }
-        (WorkflowOutcome::ContinuedAsNew { input }, _) => {
+        (
+            WorkflowOutcome::ContinuedAsNew {
+                input,
+                new_workflow_type,
+            },
+            _,
+        ) => {
             // task/worker_id are Copy references; capture before persistence is moved.
             let task = persistence.task;
             let worker_id = persistence.worker_id;
             let exec_id = persistence.exec_id;
+            // The completion-trigger sweep keys on the run that just went
+            // terminal — the PREDECESSOR — so this stays its own name even for
+            // a cross-type continuation (issue #803).
             let workflow_name = execution.workflow_name.clone();
             let result = persist_workflow_continue_as_new(
                 conn,
+                registry,
                 persistence,
                 execution,
                 input,
-                registry.payload_offloader(),
+                new_workflow_type,
             )
             .await;
             fail_execution_on_error(conn, task, worker_id, result)
@@ -20795,7 +21225,10 @@ mod tests {
                 handler_panic: false,
                 unhandled_signals: std::collections::BTreeMap::new(),
             },
-            WorkflowOutcome::ContinuedAsNew { input: Value::Null },
+            WorkflowOutcome::ContinuedAsNew {
+                input: Value::Null,
+                new_workflow_type: None,
+            },
         ] {
             let source = update_result_command_source(&outcome, &pending_cmds);
             assert_eq!(
@@ -20990,8 +21423,11 @@ mod tests {
             "a Suspended outcome is not terminal — nothing to emit"
         );
         assert!(
-            outcome_unhandled_signals(&WorkflowOutcome::ContinuedAsNew { input: Value::Null })
-                .is_empty(),
+            outcome_unhandled_signals(&WorkflowOutcome::ContinuedAsNew {
+                input: Value::Null,
+                new_workflow_type: None
+            })
+            .is_empty(),
             "continue-as-new carries no unhandled-signal map"
         );
     }
@@ -21311,5 +21747,472 @@ mod tests {
             ActivityFailure::retryable("Http429", "x").with_retry_after(Duration::from_secs(5));
         let delay = local_retry_delay(Some(Duration::from_secs(5)), Some(&failure), Duration::ZERO);
         assert_eq!(delay, Some(Duration::ZERO));
+    }
+
+    // ── Cross-type continue-as-new (issue #803) ─────────────────────────────
+
+    /// Minimal registered workflow type for the #803 target-resolution tests.
+    fn can803_wf_info(name: &'static str) -> WorkflowInfo {
+        WorkflowInfo {
+            mcp: false,
+            name,
+            module: "app::phases",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }
+    }
+
+    /// Predecessor row shaped like a live entity run whose lifecycle columns
+    /// all differ from the target type's declared defaults, so a test can tell
+    /// "carried verbatim" apart from "resolved from the new type".
+    fn can803_predecessor() -> WorkflowExecution {
+        WorkflowExecution {
+            id: uuid::Uuid::new_v4(),
+            workflow_name: "trial_subscription".to_string(),
+            workflow_id: "sub-42".to_string(),
+            run_id: uuid::Uuid::new_v4(),
+            shard_id: 0,
+            state: "RUNNING".to_string(),
+            input: serde_json::json!({}),
+            output: None,
+            error: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            parent_id: None,
+            queue_name: "default".to_string(),
+            execution_timeout: Some(chrono::Duration::seconds(600)),
+            deadline_at: None,
+            sla: Some(chrono::Duration::seconds(300)),
+            sla_deadline_at: None,
+            sla_breached: false,
+            sla_breached_at: None,
+            memo: None,
+            search_attrs: None,
+            sticky_worker_id: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+            owner: Some("growth-team".to_string()),
+            runbook_url: Some("https://runbooks/trial".to_string()),
+            severity: Some("SEV3".to_string()),
+            context_headers: None,
+            paused_at: None,
+            pause_reason: None,
+            pause_actor: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: Some(serde_json::json!({"predecessor": true})),
+            retry_of_exec_id: None,
+            nd_blocked_at: None,
+            nd_block_reason: None,
+            nd_block_count: 0,
+            legal_hold_set_at: None,
+            legal_hold_until: None,
+            legal_hold_reason: None,
+            legal_hold_actor: None,
+            origin: None,
+            completion_callbacks: None,
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
+            current_details: None,
+            chain_execution_timeout: Some(chrono::Duration::seconds(86_400)),
+            chain_deadline_at: Some(chrono::Utc::now() + chrono::Duration::seconds(80_000)),
+            history_bloat_warned_at: None,
+            triage_note: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// AC1/AC4: a same-type continuation (`new_workflow_type: None`) keeps the
+    /// pre-#803 behavior exactly — every lifecycle column carried verbatim from
+    /// the predecessor, only the two per-run deadlines re-anchored.
+    #[test]
+    fn can803_same_type_carries_every_lifecycle_column_verbatim() {
+        let execution = can803_predecessor();
+        let now = chrono::Utc::now();
+        let defaults = resolve_continue_as_new_successor_defaults(&execution, None, None, now);
+
+        assert_eq!(defaults.execution_timeout, execution.execution_timeout);
+        assert_eq!(defaults.sla, execution.sla);
+        assert_eq!(defaults.owner, Some("growth-team"));
+        assert_eq!(defaults.runbook_url, Some("https://runbooks/trial"));
+        assert_eq!(defaults.severity, Some("SEV3"));
+        assert_eq!(
+            defaults.workflow_retry_policy,
+            Some(serde_json::json!({"predecessor": true}))
+        );
+        // Per-run deadlines re-anchor to the successor's start.
+        assert_eq!(
+            defaults.deadline_at,
+            Some(now + chrono::Duration::seconds(600))
+        );
+        assert_eq!(
+            defaults.sla_deadline_at,
+            Some(now + chrono::Duration::seconds(300))
+        );
+        // The #617 chain cap is CHAIN-scoped: carried verbatim, never re-anchored.
+        assert_eq!(
+            defaults.chain_execution_timeout,
+            execution.chain_execution_timeout
+        );
+        assert_eq!(defaults.chain_deadline_at, execution.chain_deadline_at);
+    }
+
+    /// AC4 + issue #617: a *cross-type* continuation resolves per-run defaults
+    /// from the target, but the chain lifetime cap is still carried **verbatim**
+    /// — otherwise changing type would be an escape hatch from the runaway-loop
+    /// budget the whole chain shares. The target here deliberately declares its
+    /// OWN, different `chain_execution_timeout` so a re-resolve would be visible.
+    #[test]
+    fn can803_cross_type_carries_the_chain_cap_verbatim_not_from_the_target() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.chain_execution_timeout = Some(Duration::from_secs(3));
+        let now = chrono::Utc::now();
+
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, now);
+
+        assert_eq!(
+            defaults.chain_execution_timeout, execution.chain_execution_timeout,
+            "the chain cap belongs to the chain, not to the phase being entered"
+        );
+        assert_eq!(
+            defaults.chain_deadline_at, execution.chain_deadline_at,
+            "the absolute chain deadline must be copied, never re-anchored to now"
+        );
+        assert_ne!(
+            defaults.chain_execution_timeout,
+            target
+                .chain_execution_timeout
+                .and_then(|d| chrono::Duration::from_std(d).ok()),
+            "a type change must not adopt the target's own chain cap"
+        );
+    }
+
+    /// AC4 (the headline): a cross-type continuation resolves the successor's
+    /// lifecycle defaults from the TARGET type's `WorkflowInfo`, not the
+    /// predecessor's row.
+    #[test]
+    fn can803_cross_type_resolves_defaults_from_the_target_type() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.execution_timeout = Some(Duration::from_secs(7_200));
+        target.sla = Some(Duration::from_secs(1_800));
+        target.owner = Some("billing-team");
+        target.runbook_url = Some("https://runbooks/paid");
+        target.severity = Some("SEV1");
+        target.retry_policy = Some(crate::policy::RetryPolicy::fixed(5, Duration::from_secs(2)));
+
+        let now = chrono::Utc::now();
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, now);
+
+        assert_eq!(
+            defaults.execution_timeout,
+            Some(chrono::Duration::seconds(7_200)),
+            "execution_timeout must come from the target type (#243)"
+        );
+        assert_eq!(
+            defaults.sla,
+            Some(chrono::Duration::seconds(1_800)),
+            "sla must come from the target type (#487)"
+        );
+        assert_eq!(
+            defaults.owner,
+            Some("billing-team"),
+            "ops metadata follows the phase (#372)"
+        );
+        assert_eq!(defaults.runbook_url, Some("https://runbooks/paid"));
+        assert_eq!(defaults.severity, Some("SEV1"));
+        assert_eq!(
+            defaults.workflow_retry_policy,
+            Some(
+                serde_json::to_value(crate::policy::RetryPolicy::fixed(5, Duration::from_secs(2)))
+                    .unwrap()
+            ),
+            "the successor retries under its own type's policy (#523)"
+        );
+        assert_eq!(
+            defaults.deadline_at,
+            Some(now + chrono::Duration::seconds(7_200))
+        );
+        assert_eq!(
+            defaults.sla_deadline_at,
+            Some(now + chrono::Duration::seconds(1_800))
+        );
+    }
+
+    /// A target type that declares no lifecycle defaults yields none — the
+    /// predecessor's are NOT inherited as a fallback, or the successor would
+    /// silently run under a timeout its own type never declared.
+    #[test]
+    fn can803_cross_type_target_without_defaults_clears_them() {
+        let execution = can803_predecessor();
+        let target = can803_wf_info("churned");
+        let defaults = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            None,
+            chrono::Utc::now(),
+        );
+
+        assert!(defaults.execution_timeout.is_none());
+        assert!(defaults.deadline_at.is_none());
+        assert!(defaults.sla.is_none());
+        assert!(defaults.sla_deadline_at.is_none());
+        assert!(defaults.owner.is_none());
+        assert!(defaults.runbook_url.is_none());
+        assert!(defaults.severity.is_none());
+        assert!(defaults.workflow_retry_policy.is_none());
+    }
+
+    /// The soft SLA is clamped to at most the hard execution timeout, mirroring
+    /// the start path — never a soft deadline the hard one would preempt.
+    #[test]
+    fn can803_cross_type_clamps_sla_to_the_execution_timeout() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.execution_timeout = Some(Duration::from_secs(60));
+        target.sla = Some(Duration::from_secs(600));
+
+        let now = chrono::Utc::now();
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, now);
+        assert_eq!(
+            defaults.sla,
+            Some(chrono::Duration::seconds(60)),
+            "sla must clamp down to the hard timeout"
+        );
+        assert_eq!(
+            defaults.sla_deadline_at,
+            Some(now + chrono::Duration::seconds(60))
+        );
+    }
+
+    /// A pathological declared duration must yield `None` rather than panic on
+    /// the `DateTime + Duration` overflow.
+    #[test]
+    fn can803_cross_type_overflowing_timeout_does_not_panic() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.execution_timeout = Some(Duration::from_secs(u64::from(u32::MAX) * 4_000));
+
+        let defaults = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            None,
+            chrono::Utc::now(),
+        );
+        assert!(
+            defaults.deadline_at.is_none(),
+            "an unrepresentable deadline must degrade to None, never panic"
+        );
+    }
+
+    /// AC5: the blank / unregistered / registered matrix for a continuation
+    /// target, decided without touching a database.
+    #[test]
+    fn can803_target_classification_matrix() {
+        let registry = HandlerRegistry::new(vec![can803_wf_info("paid_subscription")], vec![]);
+
+        assert!(
+            matches!(
+                classify_continue_as_new_target(&registry, None),
+                Ok(ContinueAsNewTypeCheck::SameType)
+            ),
+            "no target named => same-type continuation"
+        );
+        assert!(
+            matches!(
+                classify_continue_as_new_target(&registry, Some("paid_subscription")),
+                Ok(ContinueAsNewTypeCheck::CrossType(_))
+            ),
+            "a registered target resolves to its WorkflowInfo"
+        );
+
+        let unregistered = classify_continue_as_new_target(&registry, Some("churned"))
+            .err()
+            .expect("an unregistered target must be rejected");
+        assert!(
+            unregistered.contains("churned") && unregistered.contains("not registered"),
+            "the operator message must name the type and the reason, got {unregistered}"
+        );
+
+        for blank in ["", "   "] {
+            let err = classify_continue_as_new_target(&registry, Some(blank))
+                .err()
+                .expect("a blank target must be rejected");
+            assert!(err.contains("blank"), "got {err}");
+        }
+    }
+
+    /// A unified DAG's shadow `WorkflowInfo` lives in `registry.workflows` like
+    /// any other type, so without an explicit check it would be accepted and
+    /// the successor would run the DAG's level-walker with the `max_active_runs`
+    /// / paused-schedule admission gates bypassed. DAG continue-as-new is out
+    /// of scope for issue #803: reject it, don't half-support it.
+    #[test]
+    fn can803_rejects_a_unified_dag_target() {
+        let registry = HandlerRegistry::new(
+            vec![
+                can803_wf_info("paid_subscription"),
+                can803_wf_info("nightly_rollup"),
+            ],
+            vec![],
+        )
+        .with_dag_workflow_names(["nightly_rollup"]);
+
+        let err = classify_continue_as_new_target(&registry, Some("nightly_rollup"))
+            .err()
+            .expect("a DAG target must be rejected even though it is 'registered'");
+        assert!(
+            err.contains("nightly_rollup") && err.contains("DAG") && err.contains("trigger"),
+            "the message must name the DAG and point at the trigger route, got {err}"
+        );
+
+        // A plain workflow of the same registry is unaffected.
+        assert!(matches!(
+            classify_continue_as_new_target(&registry, Some("paid_subscription")),
+            Ok(ContinueAsNewTypeCheck::CrossType(_))
+        ));
+    }
+
+    /// The successor takes the `(target, workflow_id)` uniqueness slot, which
+    /// sealing the predecessor does NOT free. A terminal prior run of that
+    /// phase is released (a win-back loop); a LIVE one is rejected, because
+    /// harvest admits exactly one active run per identity — EXCEPT the
+    /// predecessor itself, whose own seal frees the slot in the same
+    /// transaction.
+    #[test]
+    fn can803_successor_slot_classification_matrix() {
+        let predecessor = uuid::Uuid::new_v4();
+        let occupant = uuid::Uuid::new_v4();
+
+        assert_eq!(
+            classify_successor_slot("paid_subscription", "sub-1", predecessor, None),
+            Ok(SuccessorSlot::Free),
+            "an unoccupied slot needs no release"
+        );
+
+        for terminal in ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"] {
+            assert_eq!(
+                classify_successor_slot(
+                    "paid_subscription",
+                    "sub-1",
+                    predecessor,
+                    Some((occupant, terminal))
+                ),
+                Ok(SuccessorSlot::SealTerminal(occupant)),
+                "a {terminal} prior run of the target phase must be released, not collided with"
+            );
+        }
+
+        for live in ["RUNNING", "PAUSED"] {
+            let err = classify_successor_slot(
+                "paid_subscription",
+                "sub-1",
+                predecessor,
+                Some((occupant, live)),
+            )
+            .expect_err("a live occupant must be rejected");
+            assert!(
+                err.contains("paid_subscription")
+                    && err.contains("sub-1")
+                    && err.contains(live)
+                    && err.contains(&occupant.to_string()),
+                "the message must name the type, workflow_id, state and execution, got {err}"
+            );
+        }
+
+        // Naming your OWN type is supported (it re-resolves that type's
+        // declared defaults). The predecessor occupies the slot it is about to
+        // vacate, so it must never be read as blocking itself.
+        for own_state in ["RUNNING", "PAUSED"] {
+            assert_eq!(
+                classify_successor_slot(
+                    "paid_subscription",
+                    "sub-1",
+                    predecessor,
+                    Some((predecessor, own_state))
+                ),
+                Ok(SuccessorSlot::Free),
+                "the predecessor's own seal frees the slot; it cannot block itself"
+            );
+        }
+    }
+
+    /// The fleet-wide `execution_timeout` ceiling (#243) applies to a
+    /// cross-type successor exactly as it does to every other registry-aware
+    /// start path — otherwise a type change would be an escape hatch from the
+    /// per-run cap the same declaration is clamped by over HTTP.
+    #[test]
+    fn can803_cross_type_applies_the_execution_timeout_ceiling() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.execution_timeout = Some(Duration::from_secs(30 * 24 * 3_600));
+
+        let now = chrono::Utc::now();
+        let defaults = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            Some(chrono::Duration::hours(1)),
+            now,
+        );
+        assert_eq!(
+            defaults.execution_timeout,
+            Some(chrono::Duration::hours(1)),
+            "the declared 30d must clamp down to the operator's 1h ceiling"
+        );
+        assert_eq!(defaults.deadline_at, Some(now + chrono::Duration::hours(1)));
+
+        // A declaration already under the ceiling is untouched.
+        target.execution_timeout = Some(Duration::from_secs(60));
+        let under = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            Some(chrono::Duration::hours(1)),
+            now,
+        );
+        assert_eq!(under.execution_timeout, Some(chrono::Duration::seconds(60)));
+    }
+
+    /// A non-positive declared SLA is treated as "no SLA", mirroring the start
+    /// path: an `sla_deadline_at` at or before `started_at` would be reported
+    /// breached by the very next scan (#487).
+    #[test]
+    fn can803_cross_type_non_positive_sla_is_dropped() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.sla = Some(Duration::ZERO);
+
+        let defaults = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            None,
+            chrono::Utc::now(),
+        );
+        assert!(
+            defaults.sla.is_none() && defaults.sla_deadline_at.is_none(),
+            "a zero-length SLA must not persist an already-breached deadline"
+        );
     }
 }
