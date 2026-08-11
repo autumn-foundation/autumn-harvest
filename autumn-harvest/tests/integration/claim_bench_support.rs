@@ -51,8 +51,18 @@
 /// Which accreted claim-path gate a scenario exercises.
 ///
 /// `claim_task`'s `WHERE` clause has grown roughly a predicate per phase since
-/// 3.7. These variants let the benchmark attribute cost to each one instead of
-/// reporting a single opaque number.
+/// 3.7. These variants let the benchmark attribute cost to **five** of them
+/// instead of reporting a single opaque number.
+///
+/// Deliberately **not exhaustive**, and the gap is not visible from this list:
+/// capability labels (#382), queue pauses (#619), `schedule_to_close` (#378),
+/// worker sessions (#606) and sticky routing (#235) are all in the query on
+/// every claim, but `db::seed_backlog` leaves their columns null and nothing
+/// ever inserts a `harvest_queue_pauses` row, so those subplans only ever see
+/// empty or null input. They are evaluated, not measured — the cheapest path
+/// each of them has. Adding one means a seed variant *and* a report row; see
+/// the "Known limitations" section of `docs/performance.md`, which ranks them
+/// by how much the omission is likely to matter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimGate {
     /// Plain rows: no build id, no concurrency key, no rate limit, no pauses.
@@ -502,42 +512,108 @@ pub fn budget_from_env(default_ms: f64) -> f64 {
     budget_from_str(std::env::var(BUDGET_ENV_VAR).ok().as_deref(), default_ms)
 }
 
-/// Strip userinfo from a connection URL so it is safe to print.
+/// Connection-parameter names whose values are shape, never a credential.
+///
+/// An **allowlist**, not a denylist of `password`, because this gates what
+/// reaches a CI log: a parameter nobody thought of has to default to hidden.
+/// libpq alone carries `password` *and* `sslpassword`, and `options` can carry
+/// arbitrary text — a denylist would have to stay ahead of all of them forever,
+/// while this only has to stay ahead of what is worth printing. `user` is
+/// deliberately absent: the URL form already replaces the whole `user:password@`
+/// segment, so printing it from the query would be inconsistent.
+const PRINTABLE_CONN_PARAMS: &[&str] = &[
+    "application_name",
+    "connect_timeout",
+    "dbname",
+    "host",
+    "hostaddr",
+    "load_balance_hosts",
+    "port",
+    "sslmode",
+    "target_session_attrs",
+];
+
+/// Hide the value of every `key=value` pair outside [`PRINTABLE_CONN_PARAMS`].
+///
+/// Keys stay visible: knowing *which* options were set is diagnostic, and a key
+/// is not a secret. `sep` is `&` for a URL query and a space for the libpq
+/// keyword/value form.
+fn redact_param_values(params: &str, sep: char) -> String {
+    params
+        .split(sep)
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _))
+                if !PRINTABLE_CONN_PARAMS.contains(&key.trim().to_ascii_lowercase().as_str()) =>
+            {
+                format!("{key}=***")
+            }
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(&sep.to_string())
+}
+
+/// Strip credentials from a connection string so it is safe to print.
 ///
 /// `HARVEST_TEST_DATABASE_URL` is an *admin* connection string and normally
 /// carries a password. Both the benchmark and the CI gate print the
-/// [`db::SkipReason`] they fail with, so an unredacted URL in that message is a
-/// credential leaked into a CI log that anyone with read access can scroll
+/// [`db::SkipReason`] they fail with, so an unredacted string in that message is
+/// a credential leaked into a CI log that anyone with read access can scroll
 /// back through.
 ///
 /// Host, port and database are kept — those are what make the message
-/// diagnostic — and only the `user:password@` segment is replaced.
+/// diagnostic. Three places can carry a secret, and all three are covered:
 ///
-/// Our interpolation was the only leak: `diesel`/`tokio-postgres` were probed
-/// with a password-bearing URL across connection-refused, DNS-failure and
-/// malformed-string cases and reported only `"error connecting to server"` /
-/// `"invalid connection string"`, never the URL. So redacting here closes the
-/// exposure rather than merely narrowing it — but the call site still passes
-/// the redacted form on principle, so a future driver that starts echoing its
-/// input cannot silently reopen it.
+/// 1. **Userinfo**, `postgres://user:pw@host/db` — replaced wholesale.
+/// 2. **Query parameters**, `postgres://host/db?user=u&password=pw`. This is a
+///    valid form, not a curiosity: `tokio-postgres`'s `UrlParser` feeds every
+///    query pair to the same `Config::param` that handles `password`, so it
+///    authenticates exactly like userinfo does.
+/// 3. **The libpq keyword/value form**, `host=h password=pw` — no `://` at all,
+///    which an earlier revision returned verbatim. `Config::from_str` falls
+///    through to this form when the URL parser declines, so it is equally live.
+///
+/// Values are redacted by allowlist (see [`PRINTABLE_CONN_PARAMS`]), so an
+/// unrecognised parameter is hidden rather than printed on the assumption it is
+/// harmless.
+///
+/// The drivers themselves were probed and do not echo their input:
+/// `diesel`/`tokio-postgres` reported only `"error connecting to server"` /
+/// `"invalid connection string"` across connection-refused, DNS-failure and
+/// malformed-string cases. So our own interpolation is the only leak — but the
+/// call site still passes the redacted form on principle, so a future driver
+/// that starts echoing its input cannot silently reopen it.
 #[must_use]
 pub fn redact_url(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
+        // No scheme: the libpq keyword/value form, space-separated.
+        return redact_param_values(url, ' ');
     };
     let (prefix, rest) = url.split_at(scheme_end + 3);
     // Userinfo, if present, runs to the last '@' before the authority ends.
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
+
+    // Path, then query, then fragment — the same ordering `with_db_name` relies
+    // on, so a slash inside a parameter value cannot be mistaken for the path.
+    let tail = match rest[authority_end..].split_once('?') {
+        Some((path, after)) => {
+            let (query, fragment) = after
+                .split_once('#')
+                .map_or((after, None), |(q, f)| (q, Some(f)));
+            let mut out = format!("{path}?{}", redact_param_values(query, '&'));
+            if let Some(f) = fragment {
+                out.push('#');
+                out.push_str(f);
+            }
+            out
+        }
+        None => rest[authority_end..].to_string(),
+    };
+
     authority.rfind('@').map_or_else(
-        || url.to_string(),
-        |at| {
-            format!(
-                "{prefix}***@{}{}",
-                &authority[at + 1..],
-                &rest[authority_end..]
-            )
-        },
+        || format!("{prefix}{authority}{tail}"),
+        |at| format!("{prefix}***@{}{tail}", &authority[at + 1..]),
     )
 }
 
@@ -1005,6 +1081,71 @@ mod pure_tests {
         assert!(
             redacted.contains("host:5432/db"),
             "endpoint lost: {redacted}"
+        );
+    }
+
+    /// A password in the *query* authenticates exactly like one in userinfo.
+    ///
+    /// `tokio-postgres`'s URL parser feeds every query pair to the same
+    /// `Config::param` that handles `password`, so redacting only the authority
+    /// leaves a fully-working credential in the log line.
+    #[test]
+    fn redact_url_removes_a_password_given_as_a_query_parameter() {
+        let redacted =
+            redact_url("postgres://db.internal:5432/harvest?user=alice&password=hunter2");
+        assert!(
+            !redacted.contains("hunter2"),
+            "password survived: {redacted}"
+        );
+        assert!(!redacted.contains("alice"), "username survived: {redacted}");
+        assert!(
+            redacted.contains("db.internal:5432/harvest"),
+            "endpoint lost: {redacted}"
+        );
+    }
+
+    /// The keyword/value form carries the same secret and has no `://` at all.
+    ///
+    /// `Config::from_str` falls through to it when the URL parser declines, so
+    /// an operator can legitimately set `HARVEST_TEST_DATABASE_URL` this way.
+    #[test]
+    fn redact_url_removes_a_password_from_the_keyword_value_form() {
+        let redacted = redact_url("host=db.internal port=5432 dbname=harvest password=hunter2");
+        assert!(
+            !redacted.contains("hunter2"),
+            "password survived: {redacted}"
+        );
+        assert!(
+            redacted.contains("host=db.internal") && redacted.contains("dbname=harvest"),
+            "endpoint lost: {redacted}"
+        );
+    }
+
+    /// Unknown parameters are hidden, known-shape ones are not.
+    ///
+    /// The allowlist is the whole point: a parameter nobody anticipated must
+    /// default to hidden, or every future libpq addition is a potential leak.
+    #[test]
+    fn redact_url_hides_unknown_parameters_and_keeps_shape_ones() {
+        let redacted =
+            redact_url("postgres://h/db?sslmode=require&sslpassword=k3y&options=-csearch_path%3Dx");
+        assert!(
+            !redacted.contains("k3y"),
+            "sslpassword survived: {redacted}"
+        );
+        assert!(
+            !redacted.contains("search_path"),
+            "options survived: {redacted}"
+        );
+        assert!(
+            redacted.contains("sslmode=require"),
+            "a shape parameter was needlessly hidden: {redacted}"
+        );
+        // Keys stay visible — knowing an option was set is diagnostic, and a
+        // key is not a secret.
+        assert!(
+            redacted.contains("sslpassword=***"),
+            "the key should survive redaction: {redacted}"
         );
     }
 

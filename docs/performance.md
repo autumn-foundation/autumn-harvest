@@ -19,10 +19,10 @@ and the one that has accreted roughly a `WHERE` predicate per phase since 3.7:
 | sticky routing | #235 |
 
 Each was added for correctness. None was measured. This page is the measurement
-— for six of them. The attribution table below varies build-id routing, per-key
-concurrency, the rate-limit gate, the circuit-breaker tracked set and the PAUSED
-skip; queue pauses is exercised but folded into the baseline. The remaining four
-are present in the query and held constant; see
+— **for five of them**. The attribution table below varies build-id routing,
+per-key concurrency, the rate-limit gate, the circuit-breaker tracked set and
+the PAUSED skip. The other five are present in the query and held constant, so
+this page says nothing about what they cost; see
 [known limitations](#known-limitations).
 
 > **These are starter reference numbers, not an SLO.** They were taken on one
@@ -623,15 +623,26 @@ from the benchmark are directly comparable.
   what a production backlog looks like. A real queue with mixed priorities and
   spread arrival times may sort differently — probably not cheaper, but this is
   measured on the degenerate case and should be read that way.
-* **Not every claim-path predicate is varied.** The attribution table covers
-  build-id routing (#171), per-key concurrency (#247), the rate-limit gate
-  (#332/#699), the circuit-breaker tracked set (#369) and the PAUSED skip
-  (#383). Four more are present in the query but held constant: capability
-  labels (#382) — a real `NOT EXISTS` + `jsonb_array_elements` subplan, and the
-  most defensible next scenario to add — plus `schedule_to_close` (#378), worker
-  sessions (#606) and sticky routing (#235), which are cheap inline column
-  tests. Queue pauses (#619) *is* exercised but is folded into the baseline, so
-  its cost shows up in the `EXPLAIN` buffer counts rather than as a table row.
+* **Half the claim-path predicates are varied; the other half are not measured
+  at all.** The attribution table covers five: build-id routing (#171), per-key
+  concurrency (#247), the rate-limit gate (#332/#699), the circuit-breaker
+  tracked set (#369) and the PAUSED skip (#383). Five more are present in the
+  query on every claim but are never given anything to match, so their subplans
+  run against empty or null input and this page reports nothing about their
+  cost. Ranked by how much that omission is likely to matter:
+  * **Capability labels (#382)** — a `NOT EXISTS` + `jsonb_array_elements`
+    subplan, so the one whose real cost is least predictable from the query
+    text, and the most defensible next scenario to add. The seed leaves
+    `required_capabilities` null.
+  * **Queue pauses (#619)** — a `NOT EXISTS` against `harvest_queue_pauses`,
+    which the harness only ever `TRUNCATE`s. The predicate is evaluated on every
+    claim, but always against an *empty* relation, which is the cheapest path it
+    has. Being in the plan is not the same as being measured.
+  * **`schedule_to_close` (#378), worker sessions (#606), sticky routing
+    (#235)** — cheap inline column tests, against columns the seed leaves null.
+
+  Adding these is scenario work, not query work: each needs a seed variant and a
+  report row, on a bench that already runs 15-30 minutes.
 * **Queue count is a parameter, but it is not swept.** `Scenario.queues`
   parameterizes how many distinct queues the backlog spreads across, and every
   published row holds it at 4. Backlog depth and claimer count *are* varied.
