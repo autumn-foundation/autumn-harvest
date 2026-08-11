@@ -10687,6 +10687,7 @@ fn resolve_continue_as_new_successor_defaults<'a>(
     execution: &'a WorkflowExecution,
     target_info: Option<&'a crate::info::WorkflowInfo>,
     max_execution_timeout_ceiling: Option<chrono::Duration>,
+    max_workflow_attempts_ceiling: Option<u32>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> ContinueAsNewSuccessorDefaults<'a> {
     let Some(info) = target_info else {
@@ -10736,10 +10737,30 @@ fn resolve_continue_as_new_successor_defaults<'a>(
         owner: info.owner,
         runbook_url: info.runbook_url,
         severity: info.severity,
+        // Clamp the target's declared retry budget by the operator's fleet-wide
+        // ceiling (issue #523) before serializing, exactly as the normal start
+        // path (`execution.rs`) and the detached-child spawn path do. Both of
+        // those clamp at their own write site precisely because they resolve a
+        // policy from a `WorkflowInfo` and bypass `StartWorkflowParams`, where
+        // the ceiling is otherwise applied — and this is the third such site.
+        //
+        // Load-bearing: the retry consumer (`schedule_workflow_retry`'s
+        // `attempt >= policy.max_attempts` gate) reads the STORED value and
+        // never re-clamps, so an unclamped write here is authoritative. Without
+        // this, changing type would be an escape hatch from the fleet-wide cap
+        // (Codex P1). The same-type arm above needs no clamp: it carries the
+        // predecessor's already-clamped stored value verbatim.
         workflow_retry_policy: info
             .retry_policy
             .as_ref()
-            .and_then(|p| serde_json::to_value(p).ok()),
+            .map(|p| {
+                let mut p = p.clone();
+                if let Some(ceiling) = max_workflow_attempts_ceiling {
+                    p.max_attempts = p.max_attempts.min(ceiling);
+                }
+                p
+            })
+            .and_then(|p| serde_json::to_value(&p).ok()),
         // Verbatim, deliberately: see the field docs. The chain cap belongs to
         // the CHAIN, not to any one phase of it.
         chain_execution_timeout: execution.chain_execution_timeout,
@@ -10835,6 +10856,7 @@ async fn persist_workflow_continue_as_new(
         registry
             .max_workflow_execution_timeout
             .and_then(|d| chrono::Duration::from_std(d).ok()),
+        registry.max_workflow_attempts_ceiling,
         chrono::Utc::now(),
     );
     // Chain-scoped lifetime cap (issue #617): CARRY BOTH COLUMNS VERBATIM, for a
@@ -21848,7 +21870,8 @@ mod tests {
     fn can803_same_type_carries_every_lifecycle_column_verbatim() {
         let execution = can803_predecessor();
         let now = chrono::Utc::now();
-        let defaults = resolve_continue_as_new_successor_defaults(&execution, None, None, now);
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, None, None, None, now);
 
         assert_eq!(defaults.execution_timeout, execution.execution_timeout);
         assert_eq!(defaults.sla, execution.sla);
@@ -21889,7 +21912,7 @@ mod tests {
         let now = chrono::Utc::now();
 
         let defaults =
-            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, now);
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
 
         assert_eq!(
             defaults.chain_execution_timeout, execution.chain_execution_timeout,
@@ -21924,7 +21947,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let defaults =
-            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, now);
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
 
         assert_eq!(
             defaults.execution_timeout,
@@ -21972,6 +21995,7 @@ mod tests {
             &execution,
             Some(&target),
             None,
+            None,
             chrono::Utc::now(),
         );
 
@@ -21996,7 +22020,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let defaults =
-            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, now);
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
         assert_eq!(
             defaults.sla,
             Some(chrono::Duration::seconds(60)),
@@ -22019,6 +22043,7 @@ mod tests {
         let defaults = resolve_continue_as_new_successor_defaults(
             &execution,
             Some(&target),
+            None,
             None,
             chrono::Utc::now(),
         );
@@ -22175,6 +22200,7 @@ mod tests {
             &execution,
             Some(&target),
             Some(chrono::Duration::hours(1)),
+            None,
             now,
         );
         assert_eq!(
@@ -22190,9 +22216,95 @@ mod tests {
             &execution,
             Some(&target),
             Some(chrono::Duration::hours(1)),
+            None,
             now,
         );
         assert_eq!(under.execution_timeout, Some(chrono::Duration::seconds(60)));
+    }
+
+    /// The fleet-wide workflow-attempts ceiling (#523) applies to a cross-type
+    /// successor's retry policy, so changing type is not an escape hatch from
+    /// an operator's retry cap (Codex P1 on PR #1159).
+    ///
+    /// Load-bearing because the consumer is authoritative on the STORED value:
+    /// `schedule_workflow_retry` gates on `attempt >= policy.max_attempts` read
+    /// straight off the row and never re-clamps, so an unclamped write here
+    /// would let a target type declaring `max_attempts: 100` actually run 100
+    /// attempts under a ceiling of 3.
+    #[test]
+    fn can803_cross_type_applies_the_workflow_attempts_ceiling() {
+        let execution = can803_predecessor();
+        let mut target = can803_wf_info("paid_subscription");
+        target.retry_policy = Some(RetryPolicy::fixed(100, Duration::from_secs(1)));
+        let now = chrono::Utc::now();
+
+        let clamped = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            None,
+            Some(3),
+            now,
+        );
+        let stored: RetryPolicy = serde_json::from_value(
+            clamped
+                .workflow_retry_policy
+                .expect("a declared policy must be carried"),
+        )
+        .expect("stored policy round-trips");
+        assert_eq!(
+            stored.max_attempts, 3,
+            "the declared 100 attempts must clamp down to the operator's ceiling of 3"
+        );
+
+        // A declaration already under the ceiling is untouched...
+        target.retry_policy = Some(RetryPolicy::fixed(2, Duration::from_secs(1)));
+        let under = resolve_continue_as_new_successor_defaults(
+            &execution,
+            Some(&target),
+            None,
+            Some(3),
+            now,
+        );
+        let stored: RetryPolicy =
+            serde_json::from_value(under.workflow_retry_policy.expect("policy carried"))
+                .expect("stored policy round-trips");
+        assert_eq!(
+            stored.max_attempts, 2,
+            "the ceiling must not RAISE a budget"
+        );
+
+        // ...and with no ceiling configured the declaration passes through.
+        target.retry_policy = Some(RetryPolicy::fixed(100, Duration::from_secs(1)));
+        let unbounded =
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
+        let stored: RetryPolicy =
+            serde_json::from_value(unbounded.workflow_retry_policy.expect("policy carried"))
+                .expect("stored policy round-trips");
+        assert_eq!(stored.max_attempts, 100);
+    }
+
+    /// The SAME-type (legacy) arm carries the predecessor's stored policy
+    /// verbatim and must NOT be re-clamped: that value was already clamped when
+    /// the chain's first run started, and re-clamping here would silently
+    /// shrink an in-flight chain's budget if an operator lowered the ceiling
+    /// mid-flight. Pins the pre-#803 path as byte-identical.
+    #[test]
+    fn can803_same_type_retry_policy_is_not_reclamped_by_the_ceiling() {
+        let mut execution = can803_predecessor();
+        execution.workflow_retry_policy = Some(serde_json::json!({"max_attempts": 50}));
+
+        let defaults = resolve_continue_as_new_successor_defaults(
+            &execution,
+            None,
+            None,
+            Some(3),
+            chrono::Utc::now(),
+        );
+        assert_eq!(
+            defaults.workflow_retry_policy,
+            Some(serde_json::json!({"max_attempts": 50})),
+            "the same-type arm must carry the stored policy verbatim"
+        );
     }
 
     /// A non-positive declared SLA is treated as "no SLA", mirroring the start
@@ -22207,6 +22319,7 @@ mod tests {
         let defaults = resolve_continue_as_new_successor_defaults(
             &execution,
             Some(&target),
+            None,
             None,
             chrono::Utc::now(),
         );
