@@ -617,6 +617,34 @@ coordinates, so a run traces back to the exact message.
   consequence: the gauge stays *high* while a partition is wedged, so alert on a
   lag that is not falling.
 
+- **The poison cap bounded the map but not the queue behind it.** A direct
+  consequence of the previous round's own fix: `enforce_cap` gated on
+  `strikes.len()`, while `clear` — every harvest-owned terminal — retires a key
+  *without* retiring the expiry records naming it. A sustained stream of
+  distinct rejected messages is precisely the shape that holds the map near
+  empty, so the cap never fired while the queue grew one owned `String` per
+  strike until the retention window (an hour by default) drained it. Measured
+  before the fix: 31,500 records retained with `tracked() == 0`; at a few
+  thousand rejections a second that is millions of keys, so it is a
+  memory-exhaustion path rather than a slow leak. The ceiling now applies to
+  both structures independently. Draining to satisfy the queue's gate is cheap
+  when the excess is stale records — each pop is a no-op discard — and where it
+  does reach a live key it falls back on the same oldest-touched eviction the
+  map already used, which costs that message one extra lap and never
+  correctness.
+
+- **Kafka lag counted records retention had already deleted.** The gauge
+  subtracted the group's committed offset from the high watermark without
+  reference to the low one. When retention advances `low` past an old commit
+  those records are gone from the log, so a group at offset 0 against
+  watermarks `[1000, 1100)` reported 1,100 outstanding instead of the 100 it
+  can still read — a permanent overstatement on exactly the gauge operators
+  page on, and one the consumer can never work off. A valid committed offset is
+  now clamped to at least `low`, which is what the uncommitted arm had been
+  doing correctly all along. The arithmetic moved into a free `partition_lag`
+  so it is testable without a live consumer; its four cases (clamped,
+  uncommitted, in-window, caught-up) are now pinned.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

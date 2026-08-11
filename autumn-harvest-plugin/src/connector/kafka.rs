@@ -360,16 +360,7 @@ impl EventSource for KafkaSource {
                 let offset = committed
                     .find_partition(&topic, partition)
                     .map_or(Offset::Invalid, |p| p.offset());
-                // Nothing committed yet means the whole retained backlog is
-                // outstanding: this consumer is pinned to
-                // `auto.offset.reset = earliest`, so a restart reads from the
-                // low watermark. Skipping the partition instead would report
-                // zero lag for a consumer that has processed nothing.
-                let current = match offset {
-                    Offset::Offset(o) => o,
-                    _ => low,
-                };
-                total = total.saturating_add((high - current).max(0));
+                total = total.saturating_add(partition_lag(low, high, offset));
             }
             Some(total)
         })
@@ -379,9 +370,57 @@ impl EventSource for KafkaSource {
     }
 }
 
+/// Outstanding records for one partition, from its watermarks and the group's
+/// committed offset.
+///
+/// Nothing committed yet means the whole retained backlog is outstanding: this
+/// consumer is pinned to `auto.offset.reset = earliest`, so a restart reads
+/// from the low watermark. Reporting zero for such a partition would hide a
+/// consumer that has processed nothing.
+fn partition_lag(low: i64, high: i64, committed: Offset) -> i64 {
+    let current = match committed {
+        // Retention can advance `low` past an old commit. Those records are
+        // gone from the log, so subtracting from the stale commit would report
+        // a backlog the consumer can never read -- a permanent false alarm on
+        // exactly the gauge operators page on.
+        Offset::Offset(o) => o.max(low),
+        _ => low,
+    };
+    (high - current).max(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_committed_offset_below_the_low_watermark_is_clamped() {
+        // Kafka retention advances `low` past a group's old commit: those
+        // records are gone from the log, so counting them reports a backlog
+        // the consumer can never read and cannot ever work off. Only the 100
+        // records still between `low` and `high` are outstanding.
+        assert_eq!(partition_lag(1000, 1100, Offset::Offset(0)), 100);
+    }
+
+    #[test]
+    fn an_uncommitted_partition_reports_the_whole_retained_backlog() {
+        // `auto.offset.reset = earliest`, so a restart replays from `low`.
+        assert_eq!(partition_lag(1000, 1100, Offset::Invalid), 100);
+        assert_eq!(partition_lag(0, 50, Offset::Beginning), 50);
+    }
+
+    #[test]
+    fn a_committed_offset_inside_the_window_subtracts_normally() {
+        assert_eq!(partition_lag(1000, 1100, Offset::Offset(1040)), 60);
+    }
+
+    #[test]
+    fn a_caught_up_partition_never_reports_negative_lag() {
+        assert_eq!(partition_lag(1000, 1100, Offset::Offset(1100)), 0);
+        // A commit past `high` is not expected, but must not underflow into a
+        // huge unsigned-looking number through `saturating_add`.
+        assert_eq!(partition_lag(1000, 1100, Offset::Offset(1200)), 0);
+    }
 
     #[test]
     fn auto_commit_is_forced_off_even_when_a_caller_sets_it() {

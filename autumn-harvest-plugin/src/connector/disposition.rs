@@ -233,12 +233,19 @@ struct StrikeState {
     last_seen: std::time::Instant,
 }
 
-/// Hard ceiling on retained poison strikes, terminal or not.
+/// Hard ceiling on retained poison strikes, terminal or not — applied
+/// independently to the live map *and* to the expiry queue.
 ///
 /// Time-based retention alone is still unbounded against a sustained stream
 /// of *distinct* poison messages arriving faster than the window; this is what
 /// makes the bound hard. Evicting early only costs the evicted message one
 /// extra retry lap before it re-reaches the threshold — never correctness.
+///
+/// Both structures need the ceiling because they grow independently: a key
+/// contributes one queued record per touch, and `clear` retires the key
+/// without retiring its records. Bounding only the map leaves a
+/// distinct-poison stream — which holds the map near empty — free to grow the
+/// queue by one owned `String` per strike until the retention window drains it.
 pub const MAX_POISON_ENTRIES: usize = 10_000;
 
 impl PoisonTracker {
@@ -297,16 +304,25 @@ impl PoisonTracker {
         self.enforce_cap();
     }
 
-    /// Evict oldest-first until the tracker is back inside its hard ceiling.
+    /// Evict oldest-first until *both* the live map and the expiry queue are
+    /// back inside the hard ceiling.
     ///
     /// Applied at touch time, not at expiry time: a burst arriving between two
     /// passes must not be able to outrun the bound.
     ///
-    /// Terminates because every live key has exactly one queued entry matching
-    /// its `last_seen`, so each pop either retires a key or discards a stale
-    /// entry, and the queue is finite.
+    /// The queue needs its own gate rather than riding on the map's. A key
+    /// contributes one queued record per touch and `clear` retires the key
+    /// without retiring its records, so a stream of distinct poison messages
+    /// each cleared at its threshold holds the map near empty while the queue
+    /// grows without limit. Popping to satisfy the queue's gate is cheap when
+    /// the excess is stale records (each pop is a no-op discard) and, when it
+    /// does reach a live key, falls back on the same oldest-touched eviction
+    /// the map's gate uses.
+    ///
+    /// Terminates because every iteration pops exactly one queued record until
+    /// the queue is empty, and the queue is finite.
     fn enforce_cap(&mut self) {
-        while self.strikes.len() > MAX_POISON_ENTRIES {
+        while self.strikes.len() > MAX_POISON_ENTRIES || self.expiry.len() > MAX_POISON_ENTRIES {
             if !self.pop_oldest() && self.expiry.is_empty() {
                 break;
             }
@@ -365,6 +381,16 @@ impl PoisonTracker {
     #[must_use]
     pub fn tracked(&self) -> usize {
         self.strikes.len()
+    }
+
+    /// Number of queued expiry records, for assertions and diagnostics.
+    ///
+    /// Distinct from [`Self::tracked`]: a key contributes one queued record per
+    /// touch, and `clear` retires the key without retiring its records, so this
+    /// can far exceed the live key count and needs its own bound.
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.expiry.len()
     }
 
     /// Force `key`'s count, so a test can reach the saturation boundary
@@ -1148,6 +1174,35 @@ mod tests {
             t.strikes(&format!("m-{}", MAX_POISON_ENTRIES + 499)),
             1,
             "and the newest is the one retained"
+        );
+    }
+
+    #[test]
+    fn the_expiry_queue_is_bounded_even_when_every_key_is_cleared() {
+        // The cap was gated on the MAP, but `clear` retires a key without
+        // retiring its queued expiry records. A sustained stream of DISTINCT
+        // mapping-rejected messages therefore holds `tracked()` near zero --
+        // so the cap never fires -- while the queue grows one owned `String`
+        // per strike until the retention window (an hour by default) finally
+        // drains it. At a few thousand rejections a second that is millions of
+        // retained keys, which is a memory-exhaustion path, not a slow leak.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        let strikes_before_terminal = 3;
+        for i in 0..(MAX_POISON_ENTRIES + 500) {
+            let key = format!("m-{i}");
+            for _ in 0..strikes_before_terminal {
+                t.strike(&key, t0);
+            }
+            // Harvest owns this terminal (a `HarvestSink` dead-letter), so the
+            // live entry goes -- and every queued record for it stays.
+            t.clear(&key);
+        }
+        assert_eq!(t.tracked(), 0, "every key reached a harvest-owned terminal");
+        assert!(
+            t.queued() <= MAX_POISON_ENTRIES,
+            "the expiry queue must be bounded on its own footing; saw {}",
+            t.queued()
         );
     }
 
