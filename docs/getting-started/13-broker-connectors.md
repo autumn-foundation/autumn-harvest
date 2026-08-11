@@ -95,13 +95,31 @@ surface as a silently idle consumer or a message that retries forever:
 | Empty binding name, or empty stream | The name is the metrics `source` label and the idempotency-key namespace |
 | No mapping function | Nothing to map with |
 | Two bindings share a name | They would silently deduplicate each other's messages |
-| Two bindings consume the same stream into the same target | Every message would start twice |
+| Two bindings consume the same **physical subscription** (same brokers + group + topic; same SQS queue URL) | Both receive loops compete, so each binding sees an arbitrary *subset* rather than the whole stream |
 | Target is a registered DAG | Trigger DAGs via `POST /dags/{name}/trigger` |
 | Target workflow is not registered | Call `.workflows(...)` before `.connector(...)` |
 | Adapter's `stream()` does not match the binding's | The consumer would never deliver anything |
 | `IdempotencyMode::BrokerCoordinates` on a throttled / debounced / batched target | The start route rejects a keyed start for a deferred admission (`400`) |
 | `signals_with_start` onto a throttled / debounced / batched target | signal-with-start refuses a fresh start on a debounced/batched workflow (so the first message per entity would be dead-lettered) and bypasses a throttle entirely |
 | `.broker_native_dead_letter()` on an adapter with no dead-letter destination (Kafka always; SQS on a queue with no redrive policy) | Nothing quarantines the message, so a poison message would be re-read forever |
+
+One case **warns rather than panics**: two bindings consuming the same
+`(stream, target)` pair from *different* physical subscriptions. That is
+legitimate fan-in — two independent brokers exposing the same stream name into
+one workflow, as in an active/active deployment or a cluster migration — and
+only you know whether you meant it. But against a single broker it
+double-dispatches every message, because each binding namespaces its own
+idempotency key by binding name. The warning names both bindings; if the
+fan-in is deliberate, it is safe to ignore.
+
+Note the distinction the panic draws. Two consumers on one topic under
+**distinct** Kafka group ids are two subscriptions and each receives the whole
+stream — that is the supported way to fan one topic out to two workflows. Two
+consumers in the **same** group split the partitions between them, which is
+what the panic catches. For Kafka the subscription identity is
+`bootstrap.servers` + `group.id` + topic, read from the *effective* client
+config (so a `.property("group.id", …)` override is what counts) and with the
+broker seed list canonicalized, since it is a seed list rather than an address.
 
 ## Before you start: apply the plugin migration
 

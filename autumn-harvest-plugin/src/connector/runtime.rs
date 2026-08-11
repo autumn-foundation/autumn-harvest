@@ -785,6 +785,27 @@ impl ConnectorRuntime {
                 .await
                 .mark_terminal_as_of(&key, std::time::Instant::now());
         } else if matches!(effective, MessageDisposition::Retry) {
+            // A `Retry` reaches here for three different reasons, and only two
+            // of them may keep the strikes:
+            //
+            //   - `MappingRejected` below threshold — the strikes ARE the
+            //     counter, so keeping them is the whole mechanism;
+            //   - a dead-letter whose sink write failed, downgraded to
+            //     `Retry` — keeping them makes the next delivery quarantine on
+            //     sight instead of crawling the countdown again;
+            //   - a `Transient` dispatch failure — the mapping SUCCEEDED, so
+            //     the consecutive-rejection streak is broken and the strikes
+            //     are stale.
+            //
+            // Keeping them for the third case lets a later rejection continue
+            // a streak that was never consecutive, dead-lettering the message
+            // before its `poison_threshold` is genuinely reached. Gated on the
+            // OUTCOME rather than the disposition, because the failed
+            // dead-letter write also presents as `Retry` but carries a
+            // rejection outcome.
+            if matches!(outcome, DispatchOutcome::Transient(_)) {
+                self.poison.lock().await.clear(&key);
+            }
             // On a source whose `abandon` cannot force a redelivery, this
             // offset is now a permanently blocked prefix head: the local
             // position has already moved past it, so nothing hands it back.
@@ -1077,7 +1098,7 @@ pub const fn effective_max_batch(configured: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::binding::SourceBinding;
+    use crate::connector::binding::{MappedMessage, SourceBinding};
     use crate::connector::dead_letter::RecordingDeadLetterSink;
     use crate::connector::mock::MockSource;
     use autumn_harvest::telemetry::NoOpMetrics;
@@ -1537,6 +1558,64 @@ mod tests {
         source.push_kafka(0, 2, b"{}");
         rt.run_once().await.unwrap();
         assert_eq!(metrics.poisoned().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_successful_mapping_breaks_the_consecutive_rejection_streak() {
+        // The strike counter is documented as CONSECUTIVE rejections, and
+        // `MappingRejected` is explicitly the "possibly transient" refusal --
+        // a mapper waiting on a dependency that has not arrived yet. So a
+        // delivery that maps successfully broke the streak, even when its
+        // dispatch then fails transiently and the message is retried.
+        //
+        // Retaining strikes across it conflates three different reasons for
+        // `Retry`: a rejection below threshold (must retain -- that IS the
+        // counter), a failed dead-letter write (must retain, so the next
+        // delivery quarantines on sight), and a transient dispatch failure
+        // (must clear). The message would then dead-letter a delivery early,
+        // on a streak that was never consecutive.
+        let attempt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&attempt);
+        let binding = Arc::new(
+            SourceBinding::starts("orders", "orders", "order_flow")
+                .map_raw(move |_ctx| {
+                    // reject, map-ok (dispatch then fails transiently, since
+                    // no runtime is installed), reject.
+                    let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n == 1 {
+                        Ok(MappedMessage::new("wf-1", serde_json::json!({})))
+                    } else {
+                        Err(MappingError::Rejected("not yet".to_string()))
+                    }
+                })
+                .poison_threshold(2),
+        );
+        let source = Arc::new(MockSource::new("orders"));
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let rt = runtime_with_metrics(
+            binding,
+            Arc::clone(&source),
+            Arc::clone(&sink),
+            Arc::new(RecordingMetrics::default()),
+        );
+
+        // One physical message, three deliveries: the mock redelivers on
+        // abandon, so each `Retry` hands it straight back.
+        source.push_kafka(0, 1, b"{}");
+        for _ in 0..3 {
+            rt.run_once().await.unwrap();
+        }
+
+        assert_eq!(
+            attempt.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the fixture must actually reach the third delivery"
+        );
+        assert!(
+            sink.entries().is_empty(),
+            "the successful mapping broke the streak, so the third delivery is \
+             strike 1 -- below the threshold of 2 -- and must not dead-letter"
+        );
     }
 
     #[tokio::test]

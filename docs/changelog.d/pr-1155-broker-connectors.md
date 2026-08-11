@@ -792,6 +792,26 @@ coordinates, so a run traces back to the exact message.
   the broker's cluster id settles that, and fetching it means a live metadata
   round-trip during plugin *build* — trading a rare config-typo detection for
   a startup that fails whenever the broker is briefly unreachable.
+- **A successful mapping breaks the consecutive-rejection streak.** The strike
+  counter is documented as *consecutive* rejections, and `MappingRejected` is
+  explicitly the possibly-transient refusal — so a delivery that maps
+  successfully ends the streak. But strikes were retained for every `Retry`,
+  which reaches that arm for three different reasons: a rejection below
+  threshold (must retain — that *is* the counter), a dead-letter whose sink
+  write failed (must retain, so the next delivery quarantines on sight), and a
+  transient dispatch failure after a *successful* mapping (must clear). The
+  third kept stale strikes, so a later rejection continued a streak that was
+  never consecutive and dead-lettered the message before `poison_threshold`
+  was genuinely reached. Now cleared when the outcome is `Transient`, gated on
+  the **outcome** rather than the disposition — the failed dead-letter write
+  also presents as `Retry` but carries a rejection outcome.
+- **Docs: the same-stream-same-target pair warns, it does not panic.** The
+  connector guide's rejection table still promised `HarvestPlugin::build`
+  panics on it, but since the multi-cluster fan-in fix that pair only warns —
+  what panics is a shared *physical subscription*. Operators reading the table
+  would have relied on startup validation that no longer fires. The table row
+  now names the physical-subscription rule, with the warning and the
+  deliberate independent-broker exception described alongside it.
 
 ### Success metric
 
