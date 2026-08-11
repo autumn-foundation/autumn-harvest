@@ -50,6 +50,17 @@ pub enum OffsetReset {
     /// resolution actually landed and the policy no longer applies — otherwise
     /// the baseline would chase the moving tail and report zero forever.
     Latest,
+    /// Do not start at all: librdkafka reports an offset-reset error instead of
+    /// choosing a position. A valid policy, not a typo — so unlike a
+    /// misspelling it survives client-create validation and reaches a running
+    /// consumer.
+    ///
+    /// An uncommitted partition therefore has no resumable position, and no
+    /// honest lag: the retained log is not backlog the consumer can work
+    /// through, and zero would read as caught-up. [`partition_lag`] declines to
+    /// answer instead. A partition with a commit or an [anchor][PartitionAnchors]
+    /// is unaffected — the position is known and this policy never applies.
+    Error,
 }
 
 /// Connection settings for a [`KafkaSource`].
@@ -105,10 +116,16 @@ impl KafkaSourceConfig {
     /// threaten at-least-once while the group has no committed offset — a
     /// rebuild would re-resolve it against a tail the blocked record has
     /// already advanced past — but that is closed by anchoring rather than by
-    /// forbidding the policy; see [`PartitionAnchors`]. An
-    /// unrecognised value maps to `Earliest`, matching the default — librdkafka
-    /// rejects a genuinely invalid value at client-create time, so such a
-    /// string never reaches a running consumer.
+    /// forbidding the policy; see [`PartitionAnchors`].
+    ///
+    /// librdkafka has exactly three policies, and all three are modelled:
+    /// `earliest`/`smallest`/`beginning`, `latest`/`end`/`largest`, and
+    /// `error`. Only a genuinely unrecognised value maps to `Earliest`, and
+    /// that fallback is unreachable in practice — librdkafka rejects such a
+    /// string at client-create time, so it never reaches a running consumer.
+    /// `error` emphatically does not fall in that bucket: it is accepted, it
+    /// runs, and it means "resolve nothing", so it gets its own variant rather
+    /// than being folded into the default.
     #[must_use]
     pub fn effective_offset_reset(&self) -> OffsetReset {
         self.extra
@@ -118,6 +135,7 @@ impl KafkaSourceConfig {
             .map_or(OffsetReset::Earliest, |(_, v)| {
                 match v.trim().to_ascii_lowercase().as_str() {
                     "latest" | "end" | "largest" => OffsetReset::Latest,
+                    "error" => OffsetReset::Error,
                     _ => OffsetReset::Earliest,
                 }
             })
@@ -366,15 +384,25 @@ fn covered_anchor_partitions(owed: &[(i32, i64)], assigned: &[i32]) -> Vec<i32> 
 /// to do eagerly: it asserts only that records *below* it are not ours — exactly
 /// what `latest` means — and leaves the record itself to be re-read.
 ///
-/// `earliest` owes nothing. It re-resolves to the low watermark, which does not
-/// move backwards, so a restart with no committed offset re-reads rather than
-/// skips. Returning empty keeps the default path byte-for-byte free of this
-/// commit.
+/// `latest` is the ONLY policy that owes this, and the guard says so positively
+/// rather than excluding the others one by one:
+///
+/// * `earliest` re-resolves to the low watermark, which does not move
+///   backwards, so a restart with no committed offset re-reads rather than
+///   skips. Returning empty keeps the default path byte-for-byte free of this
+///   commit.
+/// * `error` resolves nowhere — librdkafka fails the consumer rather than
+///   picking a position — so a restart cannot skip anything silently; it stops
+///   loudly instead.
+///
+/// Keying on `Latest` also stops a future fourth policy from inheriting the
+/// commit by default: a new variant owes nothing until someone shows it can
+/// resolve forward past an accepted record.
 ///
 /// Only partitions not yet in `durable` are returned, so a landed commit is
 /// retired and a failed one stays queued for the next receive to retry.
 fn anchors_needing_durability(reset: OffsetReset, anchors: &PartitionAnchors) -> Vec<(i32, i64)> {
-    if reset == OffsetReset::Earliest {
+    if !matches!(reset, OffsetReset::Latest) {
         return Vec::new();
     }
     anchors
@@ -1083,7 +1111,8 @@ fn remaining_lag_budget(
 /// which is the common shape for a partition owned by another replica — is
 /// baselined by `reset`, per [`partition_lag`].
 ///
-/// Returns `None` if any watermark is unavailable. A partial sum is
+/// Returns `None` if any watermark is unavailable, or if any partition has no
+/// resolvable position at all (see [`partition_lag`]). A partial sum is
 /// indistinguishable from a real drop in backlog, and reporting one would turn
 /// a broker hiccup into a false all-clear on the gauge operators page on.
 fn group_lag(
@@ -1106,7 +1135,7 @@ fn group_lag(
             offset,
             reset,
             anchors.anchor_for(partition),
-        ));
+        )?);
     }
     Some(total)
 }
@@ -1123,17 +1152,22 @@ fn group_lag(
 ///    resolved. Fixed, unlike the reset policy.
 /// 3. **The reset policy** — nothing committed and never read here (a partition
 ///    owned by another replica), so the honest answer is where a resume would
-///    land: `low` for `earliest`, `high` for `latest`.
+///    land: `low` for `earliest`, `high` for `latest`. Under `error` a resume
+///    lands nowhere — librdkafka fails the consumer instead of picking a
+///    position — so there is no answer to give and this returns `None`.
 ///
 /// Baselines 1 and 2 are floored at the low watermark: retention can advance
 /// `low` past a stale position, and records gone from the log are not backlog.
+///
+/// `None` means "no honest number", never "zero": a caller must propagate it
+/// rather than treating it as an empty backlog.
 fn partition_lag(
     low: i64,
     high: i64,
     committed: Offset,
     reset: OffsetReset,
     anchor: Option<i64>,
-) -> i64 {
+) -> Option<i64> {
     let current = match committed {
         // Retention can advance `low` past an old commit. Those records are
         // gone from the log, so subtracting from the stale commit would report
@@ -1147,17 +1181,22 @@ fn partition_lag(
         // answer `high - high = 0` no matter how far the topic has run ahead --
         // an all-clear for precisely the pre-first-commit outage this gauge
         // exists to expose (see [`PartitionAnchors`]).
-        _ => anchor.map_or(
-            match reset {
-                OffsetReset::Earliest => low,
-                OffsetReset::Latest => high,
-            },
+        _ => match anchor {
             // Same retention guard as a stale commit: records below the low
             // watermark are gone from the log, not backlog.
-            |a| a.max(low),
-        ),
+            Some(a) => a.max(low),
+            None => match reset {
+                OffsetReset::Earliest => low,
+                OffsetReset::Latest => high,
+                // No commit, no anchor, and a policy that resolves nothing.
+                // The consumer cannot start, so neither the retained log
+                // (backlog it can never reach) nor zero (an all-clear) is
+                // true. Decline instead of inventing one.
+                OffsetReset::Error => return None,
+            },
+        },
     };
-    (high - current).max(0)
+    Some((high - current).max(0))
 }
 
 #[cfg(test)]
@@ -1180,23 +1219,23 @@ mod tests {
     fn a_latest_group_owes_nothing_for_an_uncommitted_partition() {
         assert_eq!(
             partition_lag(0, 500, Offset::Invalid, OffsetReset::Latest, None),
-            0,
+            Some(0),
             "a latest-starting group resumes at the high watermark, so nothing is owed"
         );
         assert_eq!(
             partition_lag(0, 500, Offset::Invalid, OffsetReset::Earliest, None),
-            500,
+            Some(500),
             "an earliest-starting group would replay the whole retained log"
         );
         // Once the group HAS committed, the reset policy is irrelevant: it only
         // applies when there is no committed offset to resume from.
         assert_eq!(
             partition_lag(0, 500, Offset::Offset(450), OffsetReset::Latest, None),
-            50
+            Some(50)
         );
         assert_eq!(
             partition_lag(0, 500, Offset::Offset(450), OffsetReset::Earliest, None),
-            50
+            Some(50)
         );
     }
 
@@ -1213,7 +1252,7 @@ mod tests {
     fn an_uncommitted_latest_group_owes_what_accrued_since_it_started() {
         assert_eq!(
             partition_lag(0, 1000, Offset::Invalid, OffsetReset::Latest, Some(100)),
-            900,
+            Some(900),
             "the group started at 100 and the topic is at 1000: 900 records owed"
         );
         // No anchor -- a partition owned by another replica, which this one has
@@ -1222,20 +1261,20 @@ mod tests {
         // cross-replica state.
         assert_eq!(
             partition_lag(0, 1000, Offset::Invalid, OffsetReset::Latest, None),
-            0
+            Some(0)
         );
         // Retention can advance `low` past a stale anchor exactly as it can past
         // a stale commit, so the anchor gets the same floor guard.
         assert_eq!(
             partition_lag(400, 1000, Offset::Invalid, OffsetReset::Latest, Some(100)),
-            600,
+            Some(600),
             "records below the low watermark are gone; they are not backlog"
         );
         // A committed offset always wins: the anchor only ever substitutes for
         // the reset policy, which itself only applies when nothing is committed.
         assert_eq!(
             partition_lag(0, 1000, Offset::Offset(950), OffsetReset::Latest, Some(100)),
-            50
+            Some(50)
         );
     }
 
@@ -1418,6 +1457,31 @@ mod tests {
         );
     }
 
+    /// Only `latest` owes an eager commit, and the guard says so positively.
+    ///
+    /// The eager commit is a cost paid to close one specific hazard: `latest`
+    /// is the only policy that re-resolves an uncommitted partition *forward*,
+    /// past records this source already accepted. `earliest` resolves
+    /// backwards, and `error` does not resolve at all -- it fails the consumer
+    /// loudly instead, which cannot silently skip anything. Keying on `Latest`
+    /// rather than excluding `Earliest` also stops a future fourth policy from
+    /// inheriting the commit by default.
+    #[test]
+    fn only_a_latest_group_owes_an_eager_anchor_commit() {
+        let mut anchors = PartitionAnchors::default();
+        anchors.record_read(0, 100);
+
+        assert!(
+            anchors_needing_durability(OffsetReset::Error, &anchors).is_empty(),
+            "an error policy fails loudly rather than skipping, so nothing is owed"
+        );
+        assert_eq!(
+            anchors_needing_durability(OffsetReset::Latest, &anchors),
+            vec![(0, 100)],
+            "latest is the one policy that can resolve past an accepted record"
+        );
+    }
+
     /// The case the anchor exists for still commits.
     ///
     /// A `latest` binding whose first message keeps failing has nothing
@@ -1514,6 +1578,80 @@ mod tests {
             flipped.effective_offset_reset(),
             OffsetReset::Earliest,
             "the LAST extra wins, matching to_client_config"
+        );
+    }
+
+    /// `error` is a THIRD valid `auto.offset.reset`, not a typo.
+    ///
+    /// librdkafka accepts it and, for an uncommitted partition, declines to
+    /// pick a starting position at all -- it surfaces an offset-reset error to
+    /// the consumer instead. So it passes client-create validation and DOES
+    /// reach a running consumer, which is exactly the case the `_ => Earliest`
+    /// fallback's "librdkafka rejects a genuinely invalid value" argument does
+    /// not cover. Folding it into `Earliest` would baseline an uncommitted
+    /// partition at the low watermark and report the whole retained log as
+    /// consumable backlog for a consumer that cannot resume at all.
+    #[test]
+    fn the_error_reset_policy_is_modelled_not_folded_into_earliest() {
+        for spelling in ["error", "ERROR", " error "] {
+            let cfg = KafkaSourceConfig::new("b:9092", "g", "orders")
+                .property("auto.offset.reset", spelling);
+            assert_eq!(
+                cfg.effective_offset_reset(),
+                OffsetReset::Error,
+                "{spelling} is a valid librdkafka policy, not an unknown one"
+            );
+        }
+
+        // A genuinely unrecognised value still maps to the default: librdkafka
+        // rejects it at client-create time, so it never reaches a consumer.
+        let bogus = KafkaSourceConfig::new("b:9092", "g", "orders")
+            .property("auto.offset.reset", "sideways");
+        assert_eq!(bogus.effective_offset_reset(), OffsetReset::Earliest);
+    }
+
+    /// Under `error`, a partition with no position yet has no honest lag.
+    ///
+    /// Baselines 1 (a committed offset) and 2 (an anchor) still resolve -- the
+    /// position IS known in both -- so only the fall-through to the reset
+    /// policy is unanswerable. Reporting the retained log there would page an
+    /// operator with a backlog the consumer is not even able to start reading;
+    /// reporting zero would be an all-clear for a wedged group. Neither is
+    /// true, so the total is suppressed, exactly as it is for a missing
+    /// watermark.
+    #[test]
+    fn an_unresolvable_position_suppresses_the_lag_rather_than_inventing_one() {
+        assert_eq!(
+            partition_lag(0, 500, Offset::Invalid, OffsetReset::Error, None),
+            None,
+            "no commit, no anchor, no reset resolution -- no honest answer"
+        );
+
+        // Baseline 1: the group committed, so `error` never applies.
+        assert_eq!(
+            partition_lag(0, 500, Offset::Offset(450), OffsetReset::Error, None),
+            Some(50),
+        );
+        // Baseline 2: this source read the partition, so the resolution is
+        // already pinned.
+        assert_eq!(
+            partition_lag(0, 500, Offset::Invalid, OffsetReset::Error, Some(400)),
+            Some(100),
+        );
+
+        // And one unresolvable partition suppresses the whole topic's total,
+        // rather than contributing a silent zero to it.
+        let committed = TopicPartitionList::new();
+        assert_eq!(
+            group_lag(
+                "orders",
+                &[0, 1],
+                &committed,
+                OffsetReset::Error,
+                &PartitionAnchors::default(),
+                |_p| Some((0, 100)),
+            ),
+            None,
         );
     }
 
@@ -1724,7 +1862,7 @@ mod tests {
         // records still between `low` and `high` are outstanding.
         assert_eq!(
             partition_lag(1000, 1100, Offset::Offset(0), OffsetReset::Earliest, None),
-            100
+            Some(100)
         );
     }
 
@@ -1733,11 +1871,11 @@ mod tests {
         // `auto.offset.reset = earliest`, so a restart replays from `low`.
         assert_eq!(
             partition_lag(1000, 1100, Offset::Invalid, OffsetReset::Earliest, None),
-            100
+            Some(100)
         );
         assert_eq!(
             partition_lag(0, 50, Offset::Beginning, OffsetReset::Earliest, None),
-            50
+            Some(50)
         );
     }
 
@@ -1751,7 +1889,7 @@ mod tests {
                 OffsetReset::Earliest,
                 None
             ),
-            60
+            Some(60)
         );
     }
 
@@ -1765,7 +1903,7 @@ mod tests {
                 OffsetReset::Earliest,
                 None
             ),
-            0
+            Some(0)
         );
         // A commit past `high` is not expected, but must not underflow into a
         // huge unsigned-looking number through `saturating_add`.
@@ -1777,7 +1915,7 @@ mod tests {
                 OffsetReset::Earliest,
                 None
             ),
-            0
+            Some(0)
         );
     }
 

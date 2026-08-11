@@ -168,7 +168,10 @@ per ADR-0001 §7 the message key, offset and execution id are never labels:
 message, so the series sums to `received` and a dashboard can show the full
 disposition mix rather than only the successes —
 where the client exposes it (Kafka high-watermark minus committed offset; SQS
-`ApproximateNumberOfMessages`). A broker-triggered execution also records
+`ApproximateNumberOfMessages` **plus** `ApproximateNumberOfMessagesNotVisible`,
+so a message abandoned for retry still counts as outstanding rather than
+vanishing from the gauge until its visibility timeout lapses). A
+broker-triggered execution also records
 `start_source = 'broker'` with `start_source_ref` set to the rendered
 coordinates, so a run traces back to the exact message.
 
@@ -1093,6 +1096,44 @@ coordinates, so a run traces back to the exact message.
   retired. The cost of not retiring an unassigned anchor is a `committed_offsets`
   call on the next receive while it lingers: a rare failure-path cost (read,
   commit failed, then revoked), not a steady-state one.
+- **`auto.offset.reset = "error"` was folded into the default.** librdkafka has
+  three policies, not two: `error` tells it to report an offset-reset error for
+  an uncommitted partition rather than pick a position. The `_ => Earliest`
+  fallback treated it as unrecognised, and its rustdoc justified that with
+  "librdkafka rejects a genuinely invalid value at client-create time" — true,
+  but `error` is *valid*, so it passes that validation and reaches a running
+  consumer. The lag gauge then baselined an uncommitted partition at the low
+  watermark and reported the whole retained log as consumable backlog for a
+  consumer that cannot start at all. Now its own `OffsetReset::Error` variant.
+  Baselines 1 (a commit) and 2 (an anchor) still resolve under it — the position
+  is known in both — so only the fall-through is unanswerable, and there
+  `partition_lag` returns `None` rather than choosing between a backlog the
+  consumer can never reach and a zero that reads as caught-up; `group_lag`
+  propagates it exactly as it already does for a missing watermark. The eager
+  anchor commit now keys **positively** on `Latest` instead of excluding
+  `Earliest`: `latest` is the only policy that resolves an uncommitted partition
+  *forward* past an accepted record, and keying positively stops a future fourth
+  policy from inheriting the commit by default.
+- **The exported `DeadLetterMode::BrokerNative` rustdoc still offered Kafka.**
+  The builder rustdoc and the connector guide were corrected earlier, but the
+  enum's own doc — the one a reader lands on from the API surface — still gave
+  "a Kafka DLQ topic wired by the operator" as an example of the mode, while
+  `broker_native_dead_letter_is_supported` **in the same file, immediately
+  below it** rejects that pairing and `ConnectorRuntime::new` fails it at
+  startup. It now names the two shapes that actually work (SQS *with a redrive
+  policy*, and custom adapters whose `abandon` genuinely nacks), states that
+  Kafka is excluded because abandoning is the quarantine mechanism and Kafka's
+  `abandon` is a no-op, and links the guard so a rename breaks the build. Prose
+  was the entire defect, so there is no RED phase to claim; the behaviour it
+  describes is already pinned by
+  `kafka_reports_no_native_dead_letter_so_the_pairing_is_rejected`.
+- **The changelog's own feature summary described SQS lag as visible-only.**
+  Line 171 still said the gauge reads `ApproximateNumberOfMessages`, which a
+  later entry in this same file records as a *fixed bug* — so the document
+  contradicted itself and the release-facing summary carried the pre-fix
+  semantics. It now names both attributes and why the in-flight one belongs.
+  (The two remaining visible-only mentions are past-tense descriptions of that
+  bug and are accurate as history.)
 
 ### Success metric
 

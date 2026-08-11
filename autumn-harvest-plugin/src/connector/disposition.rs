@@ -76,9 +76,21 @@ pub enum DeadLetterMode {
     /// broker, including those with no native dead-letter concept.
     #[default]
     HarvestSink,
-    /// Leave the message for the broker's own dead-letter machinery (an SQS
-    /// redrive policy, a Kafka DLQ topic wired by the operator) by abandoning
-    /// it rather than acknowledging it.
+    /// Leave the message for the broker's own dead-letter machinery by
+    /// abandoning it rather than acknowledging it — an SQS queue with a redrive
+    /// policy, or a custom adapter whose `abandon` genuinely nacks toward a
+    /// destination.
+    ///
+    /// **Not available on Kafka, and not a matter of wiring a DLQ topic.**
+    /// Abandoning is how this mode quarantines, and on Kafka `abandon` is a
+    /// no-op — *not committing* is the entire redelivery mechanism — so the
+    /// message would be re-read forever and reach no destination. Nor is it
+    /// unconditional on SQS: without a redrive policy there is no target to
+    /// move to. The adapter answers for itself via
+    /// [`EventSource::has_native_dead_letter`](crate::connector::EventSource::has_native_dead_letter),
+    /// [`broker_native_dead_letter_is_supported`] decides, and an unsupported
+    /// pairing is rejected at build time rather than silently wedging the
+    /// partition. Use [`Self::HarvestSink`] on Kafka.
     BrokerNative,
 }
 
