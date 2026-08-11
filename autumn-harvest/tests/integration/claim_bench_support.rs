@@ -279,6 +279,37 @@ pub const fn claims_for_claimer(total_ops: usize, claimers: usize, index: usize)
     if index < remainder { base + 1 } else { base }
 }
 
+/// The measured window for a scenario: earliest resume to last completion.
+///
+/// Each worker reports the `(resume, finish)` pair from its **own** clock, and
+/// this folds them into one interval on the shared monotonic clock. That matters
+/// because the two are not interchangeable: with more workers than runtime
+/// threads a worker is not polled the instant the start barrier releases, so
+/// `max(finish_i - resume_i)` silently drops every worker's release-to-resume
+/// delay while still counting all of its work — a too-small denominator, i.e.
+/// throughput reported higher than it actually was. The earliest resume is the
+/// closest observable stand-in for the release itself, so folding against it
+/// charges that delay to every later worker.
+///
+/// Returns `0.0` for an empty slice, which the callers' `wall_secs <= 0.0`
+/// guards already treat as "no measurement".
+#[must_use]
+pub fn measured_window(spans: &[(std::time::Instant, std::time::Instant)]) -> f64 {
+    let Some(start) = spans.iter().map(|&(s, _)| s).min() else {
+        return 0.0;
+    };
+    // `max(start)` keeps the interval non-negative even if a worker somehow
+    // reported a finish before the earliest resume; `duration_since` would
+    // otherwise saturate to zero anyway, but being explicit documents it.
+    let end = spans
+        .iter()
+        .map(|&(_, e)| e)
+        .max()
+        .unwrap_or(start)
+        .max(start);
+    end.duration_since(start).as_secs_f64()
+}
+
 /// Fewest measured samples for a percentile to be worth reporting.
 ///
 /// At 100 samples a nearest-rank p99 is the second-worst observation — coarse,
@@ -607,8 +638,12 @@ fn decode_or_raw(s: &str) -> String {
 struct DriverUrl<'a> {
     /// Scheme through `://`.
     prefix: &'a str,
-    /// Everything the driver hands to `parse_credentials` + `parse_host`.
-    authority: &'a str,
+    /// Everything `parse_credentials` consumes, `@` excluded. `None` when the
+    /// remainder holds no `@` at all, which is when the driver's
+    /// `parse_credentials` declines and leaves the whole span to `parse_host`.
+    credentials: Option<&'a str>,
+    /// What `parse_host` reads: up to the first `/` or `?` *after* credentials.
+    host: &'a str,
     /// Path without its leading `/`; `None` when the URL carries no path.
     path: Option<&'a str>,
     /// Everything after the first `?`, verbatim. `None` when there is no `?`.
@@ -616,12 +651,29 @@ struct DriverUrl<'a> {
 }
 
 /// Split a URL-form connection string, or `None` for the keyword/value form.
+///
+/// The split follows `UrlParser::parse`'s *order* — credentials, then host,
+/// then path, then query — rather than the RFC 3986 authority grammar. The
+/// difference is load-bearing: `parse_credentials` scans for the first `@` in
+/// the **whole** remaining string, so a password containing `/` or `?` still
+/// terminates at that `@`, whereas an authority-first split would stop short
+/// and never see it.
 fn split_driver_url(url: &str) -> Option<DriverUrl<'_>> {
     let scheme_end = url.find("://")?;
     let (prefix, rest) = url.split_at(scheme_end + 3);
-    // `#` is deliberately absent: the driver has no fragment concept.
-    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(authority_end);
+
+    // `parse_credentials`: `take_until(&['@'])` over everything that is left,
+    // so the first `@` wins no matter what precedes it.
+    let (credentials, after_credentials) = rest
+        .find('@')
+        .map_or((None, rest), |at| (Some(&rest[..at]), &rest[at + 1..]));
+
+    // `parse_host`: `take_until(&['/', '?'])`, else the rest. `#` is
+    // deliberately absent — the driver has no fragment concept.
+    let host_end = after_credentials
+        .find(['/', '?'])
+        .unwrap_or(after_credentials.len());
+    let (host, tail) = after_credentials.split_at(host_end);
 
     let (path, query) = tail.strip_prefix('/').map_or_else(
         // No leading `/`, so `parse_path` declines: there is no path at all,
@@ -636,7 +688,8 @@ fn split_driver_url(url: &str) -> Option<DriverUrl<'_>> {
 
     Some(DriverUrl {
         prefix,
-        authority,
+        credentials,
+        host,
         path,
         query,
     })
@@ -661,15 +714,53 @@ fn unquote_span(span: &str) -> &str {
         .unwrap_or(span)
 }
 
-const fn is_ws(b: u8) -> bool {
-    b.is_ascii_whitespace()
+/// Byte offset of the first char at or after `i` satisfying `pred`, else `s.len()`.
+fn find_from(s: &str, i: usize, pred: impl Fn(char) -> bool) -> usize {
+    s[i..].find(pred).map_or(s.len(), |off| i + off)
 }
 
-fn skip_ws(b: &[u8], mut i: usize) -> usize {
-    while i < b.len() && is_ws(b[i]) {
-        i += 1;
+/// Byte offset of the first non-whitespace char at or after `i`.
+///
+/// The predicate is `char::is_whitespace`, matching `Parser::skip_ws` exactly.
+/// An ASCII-only predicate is not a harmless approximation: on
+/// `host=db.internal\u{00A0}password=hunter2` it reads the no-break space as an
+/// ordinary value char, so the whole tail becomes the value of the *allowlisted*
+/// `host` key and the redactor prints the password verbatim.
+fn skip_ws(s: &str, i: usize) -> usize {
+    find_from(s, i, |c| !c.is_whitespace())
+}
+
+/// End offset of an unquoted value starting at `i`, per `Parser::simple_value`.
+///
+/// A `\` escapes whatever char follows — including a whitespace char, which is
+/// why this cannot be a plain "scan to the next space".
+fn simple_value_end(s: &str, i: usize) -> usize {
+    let mut it = s[i..].char_indices();
+    while let Some((off, c)) = it.next() {
+        if c == '\\' {
+            // Consume the escaped char, whatever its width.
+            it.next();
+        } else if c.is_whitespace() {
+            return i + off;
+        }
     }
-    i
+    s.len()
+}
+
+/// End offset *past* the closing quote of a quoted value starting at `i`, or
+/// `None` when the quote is never closed (which the driver treats as an error).
+fn quoted_value_end(s: &str, i: usize) -> Option<usize> {
+    // The opening quote is one ASCII byte.
+    let open = i + 1;
+    let mut it = s[open..].char_indices();
+    while let Some((off, c)) = it.next() {
+        if c == '\\' {
+            it.next()?;
+        } else if c == '\'' {
+            return Some(open + off + 1);
+        }
+    }
+    None
 }
 
 /// Parse a libpq keyword/value connection string into `(key, raw value)` pairs.
@@ -693,69 +784,50 @@ fn skip_ws(b: &[u8], mut i: usize) -> usize {
 /// A whitespace split turns the third into `password`, `=` and a bare secret —
 /// and the secret has no embedded `=`, so a key/value redactor waves it through.
 fn keyword_value_pairs(s: &str) -> (Vec<KeywordPair<'_>>, usize) {
-    let b = s.as_bytes();
     let mut out = Vec::new();
-    let mut i = skip_ws(b, 0);
+    let mut i = skip_ws(s, 0);
 
-    while i < b.len() {
+    while i < s.len() {
         // The offset to report if this pair turns out to be malformed: the
         // whole pair is then unparsed, not just its tail.
         let pair_start = i;
 
-        let key_start = i;
-        while i < b.len() && !is_ws(b[i]) && b[i] != b'=' {
-            i += 1;
-        }
-        if i == key_start {
+        // `Parser::keyword`: everything up to whitespace or `=`.
+        let key_end = find_from(s, i, |c| c.is_whitespace() || c == '=');
+        if key_end == i {
             // A stray `=` with no keyword before it.
             return (out, pair_start);
         }
-        let key = &s[key_start..i];
+        let key = &s[i..key_end];
 
-        i = skip_ws(b, i);
-        if i >= b.len() || b[i] != b'=' {
+        // `skip_ws`, `eat('=')`, `skip_ws` — all three, in that order.
+        i = skip_ws(s, key_end);
+        if !s[i..].starts_with('=') {
             return (out, pair_start);
         }
-        i = skip_ws(b, i + 1);
-        if i >= b.len() {
+        i = skip_ws(s, i + 1);
+        if i >= s.len() {
+            // `simple_value` rejects an empty value; fail closed to match.
             return (out, pair_start);
         }
 
         let value_start = i;
-        if b[i] == b'\'' {
-            i += 1;
-            let mut closed = false;
-            while i < b.len() {
-                if b[i] == b'\\' && i + 1 < b.len() {
-                    i += 2;
-                } else if b[i] == b'\'' {
-                    i += 1;
-                    closed = true;
-                    break;
-                } else {
-                    i += 1;
-                }
-            }
-            if !closed {
+        if s[i..].starts_with('\'') {
+            let Some(end) = quoted_value_end(s, i) else {
                 // An unterminated quote swallows the rest of the string; the
                 // caller must treat all of it as potentially secret.
                 return (out, pair_start);
-            }
+            };
+            i = end;
         } else {
-            while i < b.len() && !is_ws(b[i]) {
-                i += if b[i] == b'\\' && i + 1 < b.len() {
-                    2
-                } else {
-                    1
-                };
-            }
+            i = simple_value_end(s, i);
         }
 
         out.push(KeywordPair {
             key,
-            raw_value: &s[value_start..i.min(s.len())],
+            raw_value: &s[value_start..i],
         });
-        i = skip_ws(b, i);
+        i = skip_ws(s, i);
     }
 
     (out, s.len())
@@ -871,14 +943,14 @@ pub fn redact_url(url: &str) -> String {
         tail.push_str(&redact_query_values(query));
     }
 
-    // Userinfo, if present, runs to the last `@` in the authority. The driver
-    // instead cuts at the *first* `@` anywhere in the string, which for a
-    // well-formed URL is the same `@`; where they differ this redacts a
-    // superset, which is the safe direction for a log line.
-    parts.authority.rfind('@').map_or_else(
-        || format!("{}{}{tail}", parts.prefix, parts.authority),
-        |at| format!("{}***@{}{tail}", parts.prefix, &parts.authority[at + 1..]),
-    )
+    // Credentials are whatever the driver itself would authenticate with, so
+    // the whole span goes — a password holding `/`, `?` or a second `:` is
+    // covered because the split already followed the driver's parse order.
+    if parts.credentials.is_some() {
+        format!("{}***@{}{tail}", parts.prefix, parts.host)
+    } else {
+        format!("{}{}{tail}", parts.prefix, parts.host)
+    }
 }
 
 /// Rewrite a connection URL to point at a different database.
@@ -950,7 +1022,12 @@ pub fn with_db_name(url: &str, db: &str) -> String {
         .filter(|pair| !pair.is_empty() && !decoded_query_key(pair).eq_ignore_ascii_case("dbname"))
         .collect();
 
-    let mut out = format!("{}{}/{db}", parts.prefix, parts.authority);
+    // Credentials are re-emitted verbatim, `@` included: this rewrites the
+    // connection *target*, so dropping them would make the result unusable.
+    let mut out = parts.credentials.map_or_else(
+        || format!("{}{}/{db}", parts.prefix, parts.host),
+        |creds| format!("{}{creds}@{}/{db}", parts.prefix, parts.host),
+    );
     if !kept.is_empty() {
         out.push('?');
         out.push_str(&kept.join("&"));
@@ -1186,8 +1263,8 @@ mod pure_tests {
         BACKLOG_SWEEP, BudgetVerdict, ClaimGate, ClaimerOutcome, DEFAULT_SCENARIO_BUDGET_SECS,
         HEADLINE_P50_BUDGET_MS, LatencyStats, SweepStep, budget_from_str, budget_verdict,
         claims_for_claimer, db_name_from_url, headline_scenario, measured_claims_for,
-        percentile_ms, redact_url, sweep_probe_decoy_name, sweep_step, warmup_claims_for,
-        with_db_name,
+        measured_window, percentile_ms, redact_url, sweep_probe_decoy_name, sweep_step,
+        warmup_claims_for, with_db_name,
     };
 
     #[test]
@@ -1503,6 +1580,112 @@ mod pure_tests {
         assert!(
             shown.contains("require"),
             "recognised parameter was hidden: {shown}"
+        );
+    }
+
+    /// The measured window must span every worker, not the widest single one.
+    ///
+    /// A worker that resumes late still does all of its work, so charging only
+    /// its own `finish - resume` to the denominator drops the release-to-resume
+    /// delay while keeping the numerator whole — the throughput figure then
+    /// reads higher than the run actually achieved. Here two workers each run
+    /// for 1 s but the second resumes 2 s late, so the true window is 3 s while
+    /// the per-worker maximum is 1 s.
+    #[test]
+    fn measured_window_spans_all_workers_not_the_widest_one() {
+        let base = std::time::Instant::now();
+        let s = |ms: u64| base + std::time::Duration::from_millis(ms);
+        let spans = [(s(0), s(1_000)), (s(2_000), s(3_000))];
+
+        let window = measured_window(&spans);
+        assert!(
+            (window - 3.0).abs() < 1e-6,
+            "window must span the earliest resume to the last finish, got {window}"
+        );
+
+        // The bug this replaced: the widest single worker span, which here is
+        // 1 s and would report three times the real throughput.
+        let widest = spans
+            .iter()
+            .map(|&(a, b)| b.duration_since(a).as_secs_f64())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            window > widest,
+            "window {window} must exceed the widest single span {widest}"
+        );
+    }
+
+    /// Degenerate inputs stay non-negative and finite.
+    ///
+    /// An empty slice means nothing was measured, and the callers' existing
+    /// `wall_secs <= 0.0` guards already read `0.0` as "no measurement".
+    #[test]
+    fn measured_window_handles_empty_and_out_of_order_spans() {
+        assert!((measured_window(&[]) - 0.0).abs() < f64::EPSILON);
+
+        let base = std::time::Instant::now();
+        let s = |ms: u64| base + std::time::Duration::from_millis(ms);
+        // A worker that finished before the earliest resume cannot make the
+        // window negative (which would flip the throughput sign).
+        let window = measured_window(&[(s(500), s(100))]);
+        assert!(window >= 0.0, "window went negative: {window}");
+    }
+
+    /// A password containing `/` or `?` still ends at the first `@`.
+    ///
+    /// `UrlParser::parse` runs `parse_credentials` *before* `parse_host`, and
+    /// credentials are `take_until(&['@'])` over the whole remaining string —
+    /// no `/` or `?` terminator. So `postgres://alice:sec/ret@db/postgres`
+    /// authenticates as `alice`/`sec/ret` against host `db`. Splitting on the
+    /// RFC's authority instead stops at the `/`, finds no `@` in `alice:sec`,
+    /// and prints the entire credential on a connection-failure line.
+    #[test]
+    fn redact_url_removes_a_password_containing_a_path_separator() {
+        for url in [
+            "postgres://alice:sec/ret@db.internal:5432/postgres",
+            "postgres://alice:sec?ret@db.internal:5432/postgres",
+        ] {
+            let redacted = redact_url(url);
+            assert!(!redacted.contains("sec"), "password survived: {redacted}");
+            assert!(!redacted.contains("alice"), "username survived: {redacted}");
+            assert!(
+                redacted.contains("db.internal:5432"),
+                "endpoint lost: {redacted}"
+            );
+        }
+    }
+
+    /// The same split has to keep the URL *usable*, not just safe.
+    ///
+    /// `with_db_name` rewrites the connection target, so a credential holding
+    /// `/` must be re-emitted verbatim — dropping or truncating it produces a
+    /// string that no longer authenticates.
+    #[test]
+    fn with_db_name_preserves_credentials_containing_a_path_separator() {
+        let rewritten = with_db_name(
+            "postgres://alice:sec/ret@db.internal:5432/postgres",
+            "bench",
+        );
+        assert_eq!(rewritten, "postgres://alice:sec/ret@db.internal:5432/bench");
+    }
+
+    /// `tokio-postgres` separates keyword pairs on `char::is_whitespace`.
+    ///
+    /// `Parser::skip_ws` is `take_while(char::is_whitespace)` and both value
+    /// readers break on `c.is_whitespace()` — all Unicode, not ASCII. So a
+    /// no-break space really does end the `host` value and start a new pair,
+    /// and an ASCII-only tokenizer folds the following `password=...` into the
+    /// allowlisted `host` value, which is then printed in full.
+    #[test]
+    fn redact_url_splits_keyword_pairs_on_unicode_whitespace() {
+        let redacted = redact_url("host=db.internal\u{00A0}password=hunter2");
+        assert!(
+            !redacted.contains("hunter2"),
+            "password survived: {redacted}"
+        );
+        assert!(
+            redacted.contains("db.internal"),
+            "endpoint lost: {redacted}"
         );
     }
 
@@ -3012,12 +3195,13 @@ pub mod db {
     /// deadline bound is the backstop for any future path that forgets: it
     /// keeps this await under the same ceiling as every other await in the
     /// task, so the advertised cap stays real.
-    async fn arrive_at_start_gate(gate: &tokio::sync::Barrier, deadline: Instant) {
+    async fn arrive_at_start_gate(gate: &tokio::sync::Barrier, deadline: Instant) -> Instant {
         let _ = tokio::time::timeout(
             deadline.saturating_duration_since(Instant::now()),
             gate.wait(),
         )
         .await;
+        Instant::now()
     }
 
     /// [`run_claim_scenario`] with the wall-clock ceiling supplied directly.
@@ -3112,13 +3296,18 @@ pub mod db {
                 )
                 .await
                 else {
-                    arrive_at_start_gate(&gate, deadline).await;
-                    return (super::ClaimerOutcome::from_observed(Vec::new(), true), 0.0);
+                    // Still reports a span: its resume is a valid observation
+                    // of when the gate released, and folding it in can only
+                    // move the shared window's start *earlier*, never later.
+                    let resumed = arrive_at_start_gate(&gate, deadline).await;
+                    return (
+                        super::ClaimerOutcome::from_observed(Vec::new(), true),
+                        (resumed, resumed),
+                    );
                 };
-                arrive_at_start_gate(&gate, deadline).await;
-                // The measurement clock starts here, not at `started`: the
-                // span before the barrier is setup, not measured work.
-                let measured_from = Instant::now();
+                // The measurement clock starts at the barrier, not at
+                // `started`: the span before it is setup, not measured work.
+                let resumed = arrive_at_start_gate(&gate, deadline).await;
                 let mut truncated = false;
                 for _ in 0..per_claimer {
                     // Wall-clock ceiling: claim latency scales with backlog
@@ -3170,7 +3359,7 @@ pub mod db {
                 // count is known. See `ClaimerOutcome::from_observed`.
                 (
                     super::ClaimerOutcome::from_observed(observed, truncated),
-                    measured_from.elapsed().as_secs_f64(),
+                    (resumed, Instant::now()),
                 )
             }));
         }
@@ -3180,13 +3369,12 @@ pub mod db {
         let mut empty = 0usize;
         let mut total_claimed = 0usize;
         let mut truncated = false;
-        // The measured phase spans the barrier release (every claimer starts
-        // together) to the slowest claimer finishing, so the widest per-claimer
-        // span *is* the scenario's measured wall clock.
-        let mut measured_secs = 0.0f64;
+        // Every claimer's `(resume, finish)` pair, folded into one interval on
+        // the shared clock by `measured_window`.
+        let mut spans: Vec<(Instant, Instant)> = Vec::with_capacity(claimers);
         for h in handles {
-            let (out, claimer_secs) = h.await.expect("claimer task panicked");
-            measured_secs = measured_secs.max(claimer_secs);
+            let (out, span) = h.await.expect("claimer task panicked");
+            spans.push(span);
             all_samples.extend(out.samples);
             claimed += out.claimed;
             empty += out.empty;
@@ -3196,7 +3384,7 @@ pub mod db {
         // Deliberately not `started.elapsed()`: `started` anchors the deadline
         // and therefore precedes pool checkout, and counting that ramp-up as
         // measured work inflated the throughput denominator.
-        let wall_secs = measured_secs;
+        let wall_secs = super::measured_window(&spans);
 
         ClaimReport {
             scenario,
@@ -3369,11 +3557,11 @@ pub mod db {
                 )
                 .await
                 else {
-                    arrive_at_start_gate(&gate, deadline).await;
-                    return (Vec::new(), true, 0.0);
+                    // Still reports a span; see the claim path's equivalent.
+                    let resumed = arrive_at_start_gate(&gate, deadline).await;
+                    return (Vec::new(), true, (resumed, resumed));
                 };
-                arrive_at_start_gate(&gate, deadline).await;
-                let measured_from = Instant::now();
+                let resumed = arrive_at_start_gate(&gate, deadline).await;
                 let mut truncated = false;
                 for i in 0..rows_per_writer {
                     let now = Instant::now();
@@ -3399,19 +3587,19 @@ pub mod db {
                     wrote.expect("enqueue failed");
                     samples.push(t0.elapsed().as_secs_f64() * 1000.0);
                 }
-                (samples, truncated, measured_from.elapsed().as_secs_f64())
+                (samples, truncated, (resumed, Instant::now()))
             }));
         }
 
         let mut rows = 0usize;
         let mut warmup_rows = 0usize;
         let mut truncated = false;
-        // Widest per-writer span from the barrier release: the measured phase.
-        let mut measured_secs = 0.0f64;
+        // One shared interval across every writer; see `measured_window`.
+        let mut spans: Vec<(Instant, Instant)> = Vec::with_capacity(writers);
         let mut all_samples = Vec::with_capacity(writers * rows_per_writer);
         for h in handles {
-            let (samples, writer_truncated, writer_secs) = h.await.expect("writer task panicked");
-            measured_secs = measured_secs.max(writer_secs);
+            let (samples, writer_truncated, span) = h.await.expect("writer task panicked");
+            spans.push(span);
             truncated |= writer_truncated;
             rows += samples.len();
             // Same post-hoc warmup trim as the claim path: the first writes on
@@ -3423,7 +3611,7 @@ pub mod db {
         }
         // Not `started.elapsed()`: `started` anchors the deadline and precedes
         // pool checkout (see the barrier above).
-        let wall_secs = measured_secs;
+        let wall_secs = super::measured_window(&spans);
 
         EnqueueReport {
             backlog,
