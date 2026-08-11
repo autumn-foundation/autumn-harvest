@@ -110,7 +110,15 @@ Two more things worth knowing before pointing this at a server you care about:
   anything destructive runs.) The sole liveness authority is the **server**: the
   sweep drops a database only when nothing holds a backend against it, and each
   run keeps one idle connection open for the whole life of its database
-  precisely so that question has an answer even between scenarios. A local pid
+  precisely so that question has an answer even between scenarios. That lease
+  disables `idle_session_timeout` on its own session: the lease defends the run
+  by *being* an idle backend, which is exactly what the reaper introduced in
+  PostgreSQL 14 kills, so on a server that sets it the lease would otherwise be
+  terminated mid-run and a concurrent sweep would then see the live database as
+  abandoned. The override is session-local, needs no privilege, and touches
+  nothing else on the server; if it cannot be applied on a 14+ server the run
+  warns rather than proceeding quietly, since an unarmed lease is not a lease.
+  A local pid
   is deliberately *not* consulted — it cannot answer for a run on another host,
   it cannot answer at all on non-Linux, and two containerised runs on different
   hosts both report pid 1, so treating it as a liveness signal would either veto

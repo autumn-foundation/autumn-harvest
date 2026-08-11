@@ -695,6 +695,144 @@ async fn an_idle_bench_database_still_holds_a_visible_lease() {
     panic!("lease survived BenchDb drop: the stale sweep can never reclaim {datname}");
 }
 
+/// The lease survives a server that reaps idle sessions.
+///
+/// The lease defends a running benchmark by *being* an idle backend, which is
+/// exactly what Postgres 14's `idle_session_timeout` kills — and setting it is
+/// an entirely reasonable thing to do on the shared cluster existing-server mode
+/// is designed for. Reaped mid-run, the lease leaves `BenchDb` holding a dead
+/// handle while a concurrent sweep sees zero backends, concludes the database is
+/// abandoned, and drops it. Both sides fail silently: nothing tells the victim,
+/// and the sweeper is reasoning correctly from the evidence it has.
+///
+/// Deliberately session-scoped. The realistic trigger is a server- or role-level
+/// default, but setting one here would be shared mutable state on a server other
+/// tests are using concurrently — the same hazard as writing the scenario budget
+/// into the environment. A session-local `SET` reproduces exactly what the lease
+/// inherits, and reaches nothing else.
+///
+/// Falsifiable in both directions: an unarmed session under the same timeout must
+/// actually die, or the armed one proves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_lease_survives_a_server_that_reaps_idle_sessions() {
+    use diesel::QueryableByName;
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+
+    /// How long a session may sit idle before the reaper takes it. Paired with
+    /// the idle wait below: that wait must comfortably exceed this, or the
+    /// control session survives for timing reasons and proves nothing.
+    const REAP_AFTER: &str = "2s";
+
+    #[derive(QueryableByName)]
+    struct PidRow {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        pid: i32,
+    }
+    #[derive(QueryableByName)]
+    struct SettingRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        value: Option<String>,
+    }
+    #[derive(QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    async fn pid_of(conn: &mut AsyncPgConnection) -> i32 {
+        diesel::sql_query("SELECT pg_backend_pid() AS pid")
+            .get_result::<PidRow>(conn)
+            .await
+            .expect("pg_backend_pid always answers")
+            .pid
+    }
+    async fn alive(observer: &mut AsyncPgConnection, pid: i32) -> bool {
+        diesel::sql_query("SELECT count(*) AS n FROM pg_stat_activity WHERE pid = $1")
+            .bind::<diesel::sql_types::Integer, _>(pid)
+            .get_result::<CountRow>(observer)
+            .await
+            .expect("pg_stat_activity is always readable")
+            .n
+            > 0
+    }
+
+    let Some(bench) = bench_db_or_skip().await else {
+        return;
+    };
+    let Ok(mut observer) = AsyncPgConnection::establish(&bench.url).await else {
+        eprintln!("SKIP the_lease_survives_a_server_that_reaps_idle_sessions: observer connect");
+        return;
+    };
+
+    // PG 12/13 have no idle reaper, so there is nothing to defend against and
+    // the premise of the test does not exist. `missing_ok := true` yields NULL
+    // for an unknown GUC, which is how we tell "too old" from "disabled".
+    let known = diesel::sql_query("SELECT current_setting('idle_session_timeout', true) AS value")
+        .get_result::<SettingRow>(&mut observer)
+        .await
+        .ok()
+        .and_then(|r| r.value)
+        .is_some();
+    if !known {
+        eprintln!(
+            "SKIP the_lease_survives_a_server_that_reaps_idle_sessions: \
+             server predates idle_session_timeout (PG 14+)"
+        );
+        return;
+    }
+
+    let idle_for = std::time::Duration::from_secs(6);
+
+    // Control: the reaper is real and does kill an unarmed idle session.
+    let Ok(mut unarmed) = AsyncPgConnection::establish(&bench.url).await else {
+        eprintln!("SKIP the_lease_survives_a_server_that_reaps_idle_sessions: control connect");
+        return;
+    };
+    diesel::sql_query(format!("SET idle_session_timeout = '{REAP_AFTER}'"))
+        .execute(&mut unarmed)
+        .await
+        .expect("idle_session_timeout is USERSET on PG 14+");
+    let unarmed_pid = pid_of(&mut unarmed).await;
+
+    // The lease: same inherited timeout, then armed the way setup arms it.
+    let Ok(mut armed) = AsyncPgConnection::establish(&bench.url).await else {
+        eprintln!("SKIP the_lease_survives_a_server_that_reaps_idle_sessions: lease connect");
+        return;
+    };
+    diesel::sql_query(format!("SET idle_session_timeout = '{REAP_AFTER}'"))
+        .execute(&mut armed)
+        .await
+        .expect("idle_session_timeout is USERSET on PG 14+");
+    db::arm_lease_session(&mut armed).await;
+    let armed_pid = pid_of(&mut armed).await;
+
+    // Both sessions now sit idle, which is the only state the reaper acts on.
+    tokio::time::sleep(idle_for).await;
+
+    assert!(
+        !alive(&mut observer, unarmed_pid).await,
+        "the control session survived a {REAP_AFTER} idle timeout after {}s idle: \
+         the reaper is not actually firing, so this test cannot prove the lease \
+         is defended against it",
+        idle_for.as_secs(),
+    );
+    assert!(
+        alive(&mut observer, armed_pid).await,
+        "the armed lease was reaped after {}s idle despite a {REAP_AFTER} timeout \
+         being disabled on its session. A reaped lease makes a live run look \
+         abandoned, so a concurrent sweep would drop this run's database.",
+        idle_for.as_secs(),
+    );
+
+    // A backend in `pg_stat_activity` is what other clients see; that the
+    // handle still works is what *this* run depends on.
+    assert_eq!(
+        pid_of(&mut armed).await,
+        armed_pid,
+        "the armed lease is still listed but no longer usable from this side",
+    );
+}
+
 /// A process reclaims its **own** finished databases, not just other runs'.
 ///
 /// `run_token()` is constant for the life of a process, so an ownership-keyed

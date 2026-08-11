@@ -1418,6 +1418,11 @@ pub mod db {
             let mut conn = AsyncPgConnection::establish(&url)
                 .await
                 .map_err(|e| SkipReason(format!("connect {db}: {e}")))?;
+            // Arm the lease before anything can observe it: a lease the server
+            // is free to reap is not a lease. Done under the lock so the
+            // database is never visible to a foreign sweep in a state where its
+            // only defence has an expiry date.
+            arm_lease_session(&mut conn).await;
             // The lease now exists, so the database is visible in
             // `pg_stat_activity` and defends itself. Release before the
             // migration — that is the slow part, and holding the lock across it
@@ -1470,6 +1475,81 @@ pub mod db {
     /// shape, so minting and reclaiming can never disagree about what our names
     /// look like.
     use super::BENCH_DB_PREFIX;
+
+    /// Make the ownership lease immune to the server's idle-session reaper.
+    ///
+    /// The lease defends a running benchmark by *being* an idle backend, which
+    /// is precisely the thing Postgres 14's `idle_session_timeout` exists to
+    /// kill. On a server that sets it — an entirely reasonable thing to do on
+    /// the shared cluster this mode is designed to point at — the lease is
+    /// terminated mid-run while [`BenchDb`] still holds the (now dead) handle,
+    /// so [`database_has_connections`] reports the live run's database as
+    /// abandoned and a concurrent sweep drops it out from under us. The failure
+    /// is silent on both sides: nothing tells the victim its lease is gone, and
+    /// the sweeper is behaving correctly on the evidence available to it.
+    ///
+    /// `SET` is session-local and `idle_session_timeout` is `USERSET`, so this
+    /// overrides a `postgresql.conf`, `ALTER DATABASE` or `ALTER ROLE` default
+    /// without needing any privilege, and affects only the lease.
+    ///
+    /// Disabling the timeout is preferred over heartbeating the lease: a
+    /// heartbeat needs a background task whose lifetime is tied to `BenchDb`,
+    /// and it would still leave a window one interval wide. This closes the
+    /// hole outright with one statement and no task.
+    ///
+    /// # Version tolerance and the read-back
+    ///
+    /// The `SET` fails on Postgres 12/13, where the GUC does not exist — and
+    /// on those versions there is nothing to defend against, so the error is
+    /// ignored. That tolerance is exactly what could hide a *real* failure on
+    /// 14+, so the value is read back rather than assumed:
+    /// `current_setting(name, missing_ok := true)` returns `NULL` for an
+    /// unknown GUC, which distinguishes "too old to have the reaper" from "the
+    /// reaper is armed and we failed to disable it". Only the second case
+    /// warns, and it warns rather than aborting because an unprotected lease
+    /// degrades a concurrent run, and this mode is usually a single run.
+    pub async fn arm_lease_session(conn: &mut AsyncPgConnection) {
+        #[derive(QueryableByName)]
+        struct SettingRow {
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            value: Option<String>,
+        }
+
+        // Ignored: on PG < 14 this is "unrecognized configuration parameter",
+        // which is the benign case. The read-back below is what catches a
+        // failure that actually matters.
+        let _ = diesel::sql_query("SET idle_session_timeout = 0")
+            .execute(&mut *conn)
+            .await;
+
+        let Ok(row) =
+            diesel::sql_query("SELECT current_setting('idle_session_timeout', true) AS value")
+                .get_result::<SettingRow>(&mut *conn)
+                .await
+        else {
+            // Could not read it back. Nothing actionable to report: the lease
+            // either has the timeout disabled or the connection is already in
+            // trouble, and both surface elsewhere.
+            return;
+        };
+
+        match row.value.as_deref() {
+            // Two ways to be safe, and they are genuinely different facts:
+            // `NULL` means the GUC does not exist, so this server has no idle
+            // reaper at all, while `"0"` is how Postgres renders a timeout we
+            // successfully disabled. Neither leaves the lease exposed, so they
+            // share an arm; any other value means the reaper is still armed.
+            None | Some("0") => {}
+            Some(other) => eprintln!(
+                "warning: could not disable idle_session_timeout on the bench \
+                 database lease (still {other}). The lease is what tells other \
+                 clients this database is in use, so if it is reaped mid-run a \
+                 concurrent benchmark's sweep may drop this run's database. \
+                 Run benchmarks one at a time against this server, or set \
+                 idle_session_timeout = 0 for the role."
+            ),
+        }
+    }
 
     /// Advisory-lock key serializing sweep-and-create across clients.
     ///
