@@ -770,23 +770,6 @@ const fn binding_stream_matches_adapter(declared: &str, adapter: &str) -> bool {
     true
 }
 
-/// Whether a binding's dead-letter mode is one its adapter can actually
-/// honour (issue #944).
-///
-/// Broker-native dead-lettering quarantines a poison message by *abandoning*
-/// it and letting the broker route it away. On an adapter with no real nack
-/// (Kafka: not committing IS the mechanism, so `abandon` is a no-op) that
-/// never terminates — the message is re-read forever and reaches no
-/// dead-letter destination at all, wedging the partition. Only a binding whose
-/// adapter genuinely feeds a broker DLQ may use it.
-#[cfg(feature = "connectors")]
-const fn broker_native_dead_letter_is_supported(
-    mode: crate::connector::DeadLetterMode,
-    adapter_has_native: bool,
-) -> bool {
-    !matches!(mode, crate::connector::DeadLetterMode::BrokerNative) || adapter_has_native
-}
-
 #[cfg(feature = "connectors")]
 fn spawn_connectors(
     registrations: &[ConnectorRegistration],
@@ -1025,7 +1008,7 @@ impl Plugin for HarvestPlugin {
                     None => {}
                 }
                 assert!(
-                    broker_native_dead_letter_is_supported(
+                    crate::connector::broker_native_dead_letter_is_supported(
                         registration.binding.dead_letter_mode,
                         registration.source.has_native_dead_letter(),
                     ),
@@ -3150,32 +3133,6 @@ mod tests {
             untuned_coordinate_dedupe_bound(IdempotencyMode::WorkflowId, STARTS, None, None),
             None,
         );
-    }
-
-    #[cfg(feature = "connectors")]
-    #[test]
-    fn broker_native_dead_lettering_requires_an_adapter_that_supports_it() {
-        use crate::connector::DeadLetterMode;
-
-        // The rejected combination: the mode is only honourable on an adapter
-        // with a real nack. Kafka has none, so abandoning never terminates.
-        assert!(!broker_native_dead_letter_is_supported(
-            DeadLetterMode::BrokerNative,
-            false,
-        ));
-        assert!(broker_native_dead_letter_is_supported(
-            DeadLetterMode::BrokerNative,
-            true,
-        ));
-        // The harvest sink always works -- it is the plugin's own table.
-        assert!(broker_native_dead_letter_is_supported(
-            DeadLetterMode::HarvestSink,
-            false,
-        ));
-        assert!(broker_native_dead_letter_is_supported(
-            DeadLetterMode::HarvestSink,
-            true,
-        ));
     }
 
     #[cfg(feature = "connectors")]

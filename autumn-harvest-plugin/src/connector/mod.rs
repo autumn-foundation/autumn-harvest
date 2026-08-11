@@ -119,7 +119,7 @@ pub use dead_letter::{
 };
 pub use disposition::{
     DeadLetterMode, DispatchOutcome, MessageDisposition, OffsetTracker, PoisonTracker,
-    decide_disposition, success_outcome,
+    broker_native_dead_letter_is_supported, decide_disposition, success_outcome,
 };
 pub use idempotency::{
     CONNECTOR_KEY_PREFIX, MAX_KEY_COMPONENT_LEN, bound_key_component, message_idempotency_key,

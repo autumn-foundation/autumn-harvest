@@ -82,6 +82,28 @@ pub enum DeadLetterMode {
     BrokerNative,
 }
 
+/// Whether a binding's dead-letter mode is one its adapter can actually
+/// honour (issue #944).
+///
+/// Broker-native dead-lettering quarantines a poison message by *abandoning*
+/// it and letting the broker route it away. On an adapter with no real nack
+/// (Kafka: not committing IS the mechanism, so `abandon` is a no-op) that
+/// never terminates — the message is re-read forever and reaches no
+/// dead-letter destination at all, wedging the partition. Only a binding whose
+/// adapter genuinely feeds a broker DLQ may use it.
+///
+/// Lives here, beside [`DeadLetterMode`], so the plugin's build-time check and
+/// [`ConnectorRuntime::new`](crate::connector::ConnectorRuntime::new)'s own
+/// guard cannot drift apart: the runtime is exported, so an embedder driving
+/// it directly must hit the same rule.
+#[must_use]
+pub const fn broker_native_dead_letter_is_supported(
+    mode: DeadLetterMode,
+    adapter_has_native: bool,
+) -> bool {
+    !matches!(mode, DeadLetterMode::BrokerNative) || adapter_has_native
+}
+
 /// What the runtime must do with a message once dispatch has been attempted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageDisposition {
@@ -1030,6 +1052,29 @@ mod tests {
             decide_disposition(&dispatched(), 0, 3, DeadLetterMode::BrokerNative),
             MessageDisposition::Ack,
         );
+    }
+
+    #[test]
+    fn broker_native_dead_lettering_requires_an_adapter_that_supports_it() {
+        // The rejected combination: the mode is only honourable on an adapter
+        // with a real nack. Kafka has none, so abandoning never terminates.
+        assert!(!broker_native_dead_letter_is_supported(
+            DeadLetterMode::BrokerNative,
+            false,
+        ));
+        assert!(broker_native_dead_letter_is_supported(
+            DeadLetterMode::BrokerNative,
+            true,
+        ));
+        // The harvest sink always works -- it is the plugin's own table.
+        assert!(broker_native_dead_letter_is_supported(
+            DeadLetterMode::HarvestSink,
+            false,
+        ));
+        assert!(broker_native_dead_letter_is_supported(
+            DeadLetterMode::HarvestSink,
+            true,
+        ));
     }
 
     #[test]

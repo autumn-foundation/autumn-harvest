@@ -644,6 +644,30 @@ coordinates, so a run traces back to the exact message.
   doing correctly all along. The arithmetic moved into a free `partition_lag`
   so it is testable without a live consumer; its four cases (clamped,
   uncommitted, in-window, caught-up) are now pinned.
+- **The unsupported dead-letter pairing was only refused at plugin build
+  time.** `ConnectorRuntime::new`/`for_binding` are exported, so an embedder
+  driving the runtime directly bypassed the guard entirely: a binding asking
+  for broker-native dead-lettering on an adapter with no dead-letter
+  destination reached `AbandonToBrokerDeadLetter`, whose nack falls through to
+  the no-op `abandon`, and reported a *terminal* disposition for a message that
+  was quarantined nowhere and never handed back in-session — at a quiet
+  partition tail, silently dropped. The predicate moved to `disposition.rs`
+  beside `DeadLetterMode` and is now asserted in the runtime constructor too,
+  so the two entry points cannot drift apart. Its rejection and both
+  acceptances (broker-native on a supporting adapter; the default harvest sink
+  on any adapter) are pinned, so the guard cannot over-reject either.
+- **A panicked dispatch stranded the message on a redelivering source.** The
+  join arm marked the offset only on a source whose `abandon` cannot force a
+  redelivery, and did nothing at all otherwise. But `abandon_redelivers()`
+  describes what `abandon` *does*, not a promise the message returns unaided:
+  `MockSource` — a supported, exported adapter — redelivers exclusively from
+  that call, so the panicked message stayed in `in_flight` where no later pass
+  could see it, and any custom adapter needing an explicit nack fails the same
+  way. This reverses an earlier decision in this review round, which reasoned
+  from SQS's visibility timeout and did not hold for the general case. The
+  message handle is now cloned out before `message` moves into the task, and
+  the arm abandons on a redelivering source while keeping the offset marking
+  for the positional one.
 
 ### Success metric
 

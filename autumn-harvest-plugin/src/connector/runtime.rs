@@ -207,6 +207,14 @@ pub struct PassSummary {
 
 impl ConnectorRuntime {
     /// Build a runtime for `binding` over `source`.
+    ///
+    /// # Panics
+    ///
+    /// If `binding` asks for [`DeadLetterMode::BrokerNative`] but `source`
+    /// reports no broker-native dead-letter destination
+    /// ([`EventSource::has_native_dead_letter`]) — that pairing quarantines
+    /// nothing and re-reads the poison message forever. See
+    /// [`broker_native_dead_letter_is_supported`](super::broker_native_dead_letter_is_supported).
     #[must_use]
     pub fn new(
         binding: Arc<SourceBinding>,
@@ -215,6 +223,31 @@ impl ConnectorRuntime {
         metrics: Arc<dyn MetricsRecorder>,
         idempotency_mode: IdempotencyMode,
     ) -> Self {
+        // Same rule the plugin enforces at build time, applied here because
+        // this constructor is exported: an embedder driving the runtime
+        // directly would otherwise reach `AbandonToBrokerDeadLetter`, whose
+        // nack is a no-op on such an adapter, and report a terminal
+        // disposition for a message that reached no dead-letter destination
+        // and is not handed back in-session. Panicking matches the plugin's
+        // posture -- this is a wiring mistake, not a runtime condition.
+        assert!(
+            super::broker_native_dead_letter_is_supported(
+                binding.dead_letter_mode,
+                source.has_native_dead_letter(),
+            ),
+            "harvest connector binding '{}' asks for broker-native dead-lettering, but its \
+             adapter for stream '{}' reports no dead-letter destination that abandoning a \
+             message feeds, so a poison message would be re-read forever instead of being \
+             quarantined. Kafka has no per-message nack at all. SQS needs a redrive policy on \
+             the queue: add one, or (when the source was built with `SqsSource::new`, or its \
+             `GetQueueAttributes` probe was denied) declare it with \
+             `SqsSourceConfig::has_redrive_policy(true)`. Otherwise drop \
+             `.broker_native_dead_letter()` so poison messages land in \
+             `harvest_connector_dead_letters` instead",
+            binding.name,
+            binding.stream,
+        );
+
         // Fails rather than silently succeeding: a binding defaults to
         // `HarvestSink`, so a no-op default would acknowledge a poison message
         // with no record anywhere. See `UnconfiguredDeadLetterSink`.
@@ -237,6 +270,10 @@ impl ConnectorRuntime {
 
     /// Resolve the dedupe mode from the binding and the target workflow, then
     /// build the runtime.
+    ///
+    /// # Panics
+    ///
+    /// Inherits [`Self::new`]'s dead-letter-mode check.
     #[must_use]
     pub fn for_binding(
         binding: Arc<SourceBinding>,
@@ -410,7 +447,9 @@ impl ConnectorRuntime {
             self.metrics.record_connector_received(self.binding.name);
             // Kept alongside the join handle: a panicked task never reaches
             // `settle`, so the join arm below has to do the recovery marking
-            // itself — and `message` is moved into the spawned task.
+            // and the abandon itself — and `message` is moved into the
+            // spawned task, so the handle has to be cloned out first.
+            let handle = message.handle.clone();
             let positional = match (message.handle.partition, message.handle.position) {
                 (Some(partition), Some(position)) => {
                     self.offsets.lock().await.observe(partition, position);
@@ -428,6 +467,7 @@ impl ConnectorRuntime {
 
             let this = self.clone_handles();
             handles.push((
+                handle,
                 positional,
                 tokio::spawn(async move {
                     let disposition = this.process(message).await;
@@ -437,8 +477,8 @@ impl ConnectorRuntime {
             ));
         }
 
-        for (positional, handle) in handles {
-            match handle.await {
+        for (handle, positional, task) in handles {
+            match task.await {
                 Ok(MessageDisposition::Ack) => summary.acked += 1,
                 Ok(MessageDisposition::Retry) => summary.retried += 1,
                 Ok(
@@ -461,20 +501,27 @@ impl ConnectorRuntime {
                         error = %e,
                         "connector dispatch task failed; message left for redelivery"
                     );
-                    // The task died before `settle`, so the normal `Retry`
-                    // path's recovery marking never ran. On a source whose
-                    // `abandon` cannot force a redelivery the local position
-                    // has already advanced past this record, so nothing hands
-                    // it back: mark the head so recovery fires on it directly
-                    // rather than waiting for later offsets to pile up behind
-                    // it — at the tail of a quiet partition, none ever will.
-                    //
-                    // A redelivering broker (SQS's visibility timeout) is not
-                    // wedged and must not trigger a rebuild, or every
-                    // engine-side panic would recycle the consumer.
-                    if let (false, Some((partition, position))) =
-                        (self.source.abandon_redelivers(), positional)
-                    {
+                    // The task died before `settle`, so neither of the normal
+                    // `Retry` path's two recovery steps ran. Both are needed,
+                    // and which one is load-bearing depends on the source.
+                    if self.source.abandon_redelivers() {
+                        // `abandon_redelivers()` describes what `abandon`
+                        // DOES, not a promise the message returns on its own:
+                        // `MockSource` (a supported, exported adapter) and any
+                        // adapter needing an explicit nack redeliver solely
+                        // from that call, so skipping it strands the message
+                        // where no later pass can see it. Such a source is not
+                        // wedged, so no offset is marked — otherwise every
+                        // engine-side panic would recycle the consumer.
+                        self.abandon(&handle).await;
+                    } else if let Some((partition, position)) = positional {
+                        // The mirror case: `abandon` cannot force a
+                        // redelivery, and the local position has already
+                        // advanced past this record, so nothing hands it back.
+                        // Mark the head so recovery fires on it directly
+                        // rather than waiting for later offsets to pile up
+                        // behind it — at the tail of a quiet partition, none
+                        // ever will.
                         self.offsets.lock().await.retried(partition, position);
                     }
                     summary.retried += 1;
@@ -1058,6 +1105,35 @@ mod tests {
         )
     }
 
+    /// A source with no broker-native dead-letter destination — the Kafka
+    /// shape, and the trait's default.
+    ///
+    /// Only delegates the four required `EventSource` methods, so
+    /// `has_native_dead_letter()` falls through to the `false` default rather
+    /// than `MockSource`'s permissive `true`.
+    #[derive(Debug)]
+    struct NoNativeDeadLetterSource(MockSource);
+
+    #[async_trait::async_trait]
+    impl EventSource for NoNativeDeadLetterSource {
+        fn stream(&self) -> &str {
+            self.0.stream()
+        }
+        async fn receive(
+            &self,
+            max: usize,
+            timeout: std::time::Duration,
+        ) -> Result<Vec<crate::connector::message::InboundMessage>, ConnectorError> {
+            self.0.receive(max, timeout).await
+        }
+        async fn ack(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            self.0.ack(handle).await
+        }
+        async fn abandon(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            self.0.abandon(handle).await
+        }
+    }
+
     /// A sink whose `write` panics, so a dispatch task dies with a `JoinError`
     /// rather than returning a disposition.
     ///
@@ -1167,6 +1243,98 @@ mod tests {
             rt.offsets.lock().await.stalled(0),
             None,
             "a redelivering source is not wedged by a panicked dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicked_dispatch_on_a_redelivering_source_is_abandoned() {
+        // Marking no offset is right for a redelivering source, but doing
+        // *nothing* is not: "redelivers on abandon" is a statement about what
+        // `abandon` does, not a promise that the message comes back on its
+        // own. `MockSource` -- an exported, supported adapter -- redelivers
+        // exclusively from `abandon`, so a panicked task that never calls it
+        // strands the message in `in_flight` where no later pass can see it.
+        // Any custom adapter needing an explicit abandon fails the same way.
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_kafka(0, 7, b"{{{");
+        let rt = ConnectorRuntime::new(
+            malformed_binding(),
+            Arc::clone(&source) as Arc<dyn EventSource>,
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
+        )
+        .with_dead_letter_sink(Arc::new(PanickingDeadLetterSink));
+
+        let summary = rt.run_once().await.unwrap();
+        assert_eq!(summary.retried, 1);
+
+        assert_eq!(
+            source.abandoned().len(),
+            1,
+            "a panicked dispatch must abandon so a redelivering source hands the message back"
+        );
+        assert_eq!(
+            source.pending(),
+            1,
+            "the abandoned message must be queued again, not stranded in flight"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "broker-native dead-lettering")]
+    fn constructing_a_runtime_rejects_broker_native_on_a_source_without_one() {
+        // The plugin refuses this pairing at build time, but `ConnectorRuntime`
+        // is exported: an embedder driving it directly bypasses that guard, and
+        // the disposition then calls a nack that is a no-op, reporting a
+        // terminal outcome for a message that reached no dead-letter
+        // destination and is never redelivered in-session.
+        let binding = Arc::new(
+            SourceBinding::starts("orders", "orders", "order_flow")
+                .map_raw(|_ctx| Err(MappingError::Rejected("no thanks".to_string())))
+                .broker_native_dead_letter(),
+        );
+        let source = Arc::new(NoNativeDeadLetterSource(MockSource::new("orders")));
+        let _ = ConnectorRuntime::new(
+            binding,
+            source as Arc<dyn EventSource>,
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
+        );
+    }
+
+    #[test]
+    fn constructing_a_runtime_accepts_broker_native_on_a_source_with_one() {
+        // The guard must not reject the supported pairing: an adapter that
+        // genuinely feeds a broker DLQ (SQS with a redrive policy, which
+        // `MockSource` models) is exactly what the mode is for.
+        let binding = Arc::new(
+            SourceBinding::starts("orders", "orders", "order_flow")
+                .map_raw(|_ctx| Err(MappingError::Rejected("no thanks".to_string())))
+                .broker_native_dead_letter(),
+        );
+        let source = Arc::new(MockSource::new("orders"));
+        let _ = ConnectorRuntime::new(
+            binding,
+            source as Arc<dyn EventSource>,
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
+        );
+    }
+
+    #[test]
+    fn constructing_a_runtime_accepts_harvest_sink_on_any_source() {
+        // The default mode is unaffected: harvest's own sink needs no broker
+        // dead-letter destination at all.
+        let source = Arc::new(NoNativeDeadLetterSource(MockSource::new("orders")));
+        let _ = ConnectorRuntime::new(
+            malformed_binding(),
+            source as Arc<dyn EventSource>,
+            HarvestApiState::new(),
+            Arc::new(NoOpMetrics),
+            IdempotencyMode::BrokerCoordinates,
         );
     }
 
