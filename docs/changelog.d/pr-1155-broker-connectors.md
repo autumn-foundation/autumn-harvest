@@ -878,6 +878,58 @@ coordinates, so a run traces back to the exact message.
   existing tests now drain across passes rather than in one, keeping their
   intent (`in_flight_dispatch_is_bounded_by_max_in_flight` still observes real
   concurrency, since a pass dispatches its whole capped batch concurrently).
+- **Sample consumer lag before receiving, never while holding a batch.** The
+  throttled `lag()` call sat between `receive()` and the dispatch loop, so a
+  slow or internally-retrying broker round-trip — SQS bills a
+  `GetQueueAttributes`, Kafka does a metadata + watermark fetch — ran with a
+  batch already in custody. On SQS the visibility timer starts at
+  `ReceiveMessage`, not at dispatch, so that spends the batch's visibility
+  budget: another replica receives the messages, their
+  `ApproximateReceiveCount` climbs toward `maxReceiveCount`, and a perfectly
+  processable message reaches the broker DLQ having never once failed. Same
+  hazard class as the prefetch cap above, from the opposite direction. The
+  sample now runs before `receive`, which costs nothing — the gauge is
+  throttled to a scrape cadence, so which side of the receive it lands on does
+  not affect its accuracy — and guarantees no message is ever in custody while
+  the call is outstanding. Pinned by an ordering test over a call-recording
+  source (`lag_is_sampled_before_any_message_is_in_custody`).
+- **State the honest bound on poison-strike eviction, and report the
+  degradation.** `MAX_POISON_ENTRIES` claimed evicting early "only costs the
+  evicted message one extra retry lap — never correctness". That is false past
+  the cap: with more than 10 000 distinct messages rejected in round-robin
+  order and a `poison_threshold` above 1, every key is evicted before its next
+  delivery, so every attempt is strike 1 and no message ever reaches the
+  threshold — the harvest sink never fires, silently. The limitation is
+  inherent (tracking N concurrent streaks costs O(N)), so it is now documented
+  as what it is rather than waved away, pinned by a test that drives the exact
+  10 001-key round-robin, and — the actual improvement — made **observable**:
+  `PoisonTracker::strike_progress_discarded()` counts every eviction that threw
+  away a live strike count, and the first one logs a warning naming the
+  mitigations. Durable per-strike storage was declined deliberately: it buys a
+  hot-path write and a table (which the AC forbids) for a case with three
+  cheaper answers, all now documented in the connector guide —
+  `poison_threshold(1)` (nothing needs to survive between deliveries, so the
+  cap stops mattering), an SQS redrive policy (`ApproximateReceiveCount` is
+  per-message, lives in the broker, and survives eviction *and* restarts), and
+  the fact that Kafka cannot reach the round-robin shape at all, since a
+  retried message blocks its partition prefix and trips the stall detector
+  first.
+- **Stop advertising Kafka broker-native dead-lettering.**
+  `SourceBindingBuilder::broker_native_dead_letter`'s rustdoc offered it for
+  "SQS redrive, a Kafka DLQ topic", but `KafkaSource` never overrides
+  `has_native_dead_letter()` — it inherits the trait's `false` default, and both
+  `ConnectorRuntime::new` and plugin validation reject that pairing at build
+  time. A Kafka user following the rustdoc got a startup panic. Kafka has no
+  per-message nack, so there is nothing for abandoning to hand the message to;
+  routing a DLQ topic is a *producer* action a consumer cannot perform. The doc
+  now scopes the mode to SQS-with-a-redrive-policy and custom adapters, and
+  points Kafka users at the default harvest sink — which is also what keeps the
+  partition moving, since a dead-lettered message is acked whereas one left to
+  retry blocks its prefix. The prose was the whole defect, so there is no RED
+  phase to claim; a drift guard
+  (`kafka_reports_no_native_dead_letter_so_the_pairing_is_rejected`) pins the
+  behaviour the doc has to describe, and was mutation-verified to genuinely
+  assert rather than skip when librdkafka is present.
 
 ### Success metric
 

@@ -237,6 +237,18 @@ pub struct PoisonTracker {
     /// current `terminal_at` actually retires it, so the retention window
     /// runs from the *last* delivery.
     expiry: std::collections::VecDeque<(std::time::Instant, String)>,
+    /// How many times the hard cap threw away an entry that still carried a
+    /// live strike count.
+    ///
+    /// Non-zero means the active poison working set has outgrown
+    /// [`MAX_POISON_ENTRIES`] and strike-based quarantine is degraded — see
+    /// that constant for what that costs and how to mitigate it. Counted
+    /// because the failure is otherwise invisible: every delivery still looks
+    /// like an ordinary first rejection.
+    strike_progress_discarded: u64,
+    /// Whether the overflow warning has already been logged, so a sustained
+    /// overflow reports once rather than once per evicted message.
+    warned_overflow: bool,
 }
 
 #[derive(Debug)]
@@ -275,8 +287,37 @@ impl StrikeState {
 ///
 /// Time-based retention alone is still unbounded against a sustained stream
 /// of *distinct* poison messages arriving faster than the window; this is what
-/// makes the bound hard. Evicting early only costs the evicted message one
-/// extra retry lap before it re-reaches the threshold — never correctness.
+/// makes the bound hard.
+///
+/// # What eviction costs
+///
+/// While the **active** poison working set fits inside the cap, evicting an
+/// entry costs its message one extra retry lap before it re-reaches the
+/// threshold — an efficiency cost, not a correctness one.
+///
+/// Past that the cost is real, and waiting does not recover it: with more than
+/// `MAX_POISON_ENTRIES` messages being rejected in round-robin order and a
+/// `poison_threshold` above 1, every key is evicted before its next delivery,
+/// so every attempt is strike 1 and no message ever reaches the threshold —
+/// the harvest dead-letter sink never fires. This is inherent to a bounded
+/// in-process counter: tracking N concurrent strike streaks costs O(N), so a
+/// working set larger than the bound must lose something. Storing strikes
+/// durably would fix it and is deliberately not done — it buys a write on the
+/// hot path, and a table, for a case with three cheaper answers:
+///
+/// * `poison_threshold(1)` dead-letters on the first rejection, so nothing has
+///   to survive between deliveries and the cap stops mattering at all.
+/// * An SQS redrive policy is the durable backstop at that scale:
+///   `ApproximateReceiveCount` lives in the broker, is per-message, and
+///   survives both eviction and process restarts.
+/// * Kafka cannot reach the round-robin shape — a retried message blocks its
+///   partition prefix, so the stall detector fires long before a working set
+///   this large accumulates.
+///
+/// The degradation is **reported, not silent**:
+/// [`PoisonTracker::strike_progress_discarded`] counts every eviction that
+/// threw away a live strike count, and the first one logs a warning naming
+/// those mitigations.
 ///
 /// Both structures need the ceiling because they grow independently: a key
 /// contributes one queued record per touch, and `clear` retires the key
@@ -376,7 +417,7 @@ impl PoisonTracker {
     /// the queue is empty, and the queue is finite.
     fn enforce_cap(&mut self) {
         while self.strikes.len() > MAX_POISON_ENTRIES || self.expiry.len() > MAX_POISON_ENTRIES {
-            if !self.pop_oldest() && self.expiry.is_empty() {
+            if !self.pop_oldest(true) && self.expiry.is_empty() {
                 break;
             }
         }
@@ -400,7 +441,10 @@ impl PoisonTracker {
             if now.saturating_duration_since(*at) < retention {
                 break;
             }
-            if self.pop_oldest() {
+            // `false`: retiring a stale entry is by design, not degradation. A
+            // strike streak is *consecutive* by definition, so a key nothing
+            // has rejected for a whole retention window is not mid-streak.
+            if self.pop_oldest(false) {
                 retired += 1;
             }
         }
@@ -413,15 +457,38 @@ impl PoisonTracker {
     /// Returns whether a key was actually retired: a stale entry (the key was
     /// struck or re-marked later, or `clear`ed and re-struck) must be a no-op
     /// rather than disturbing live state.
-    fn pop_oldest(&mut self) -> bool {
+    /// `from_cap` distinguishes a *forced* eviction (the hard ceiling) from a
+    /// retention expiry, because only the former can discard a strike streak
+    /// that was still accumulating — see [`MAX_POISON_ENTRIES`].
+    fn pop_oldest(&mut self, from_cap: bool) -> bool {
         let Some((at, key)) = self.expiry.pop_front() else {
             return false;
         };
-        if self.strikes.get(&key).map(|s| s.last_seen) == Some(at) {
-            self.strikes.remove(&key);
-            return true;
+        let Some(state) = self.strikes.get(&key) else {
+            return false;
+        };
+        if state.last_seen != at {
+            return false;
         }
-        false
+        let discarded_progress = from_cap && state.count > 0;
+        self.strikes.remove(&key);
+        if discarded_progress {
+            self.strike_progress_discarded = self.strike_progress_discarded.saturating_add(1);
+            if !self.warned_overflow {
+                self.warned_overflow = true;
+                tracing::warn!(
+                    cap = MAX_POISON_ENTRIES,
+                    "harvest connector poison tracker hit its hard cap and is discarding \
+                     in-progress strike counts: the active poison working set is larger than \
+                     the tracker can hold, so a message may never reach its poison_threshold \
+                     and the harvest dead-letter sink may never fire. Mitigate with \
+                     poison_threshold(1) (dead-letter on first rejection, so nothing has to \
+                     survive between deliveries), or rely on an SQS redrive policy as the \
+                     durable backstop"
+                );
+            }
+        }
+        true
     }
 
     /// Current strike count for `key`, for assertions and diagnostics.
@@ -434,6 +501,18 @@ impl PoisonTracker {
     #[must_use]
     pub fn tracked(&self) -> usize {
         self.strikes.len()
+    }
+
+    /// How many evictions have thrown away a live strike count.
+    ///
+    /// Zero on every healthy binding. Non-zero means the active poison working
+    /// set has outgrown [`MAX_POISON_ENTRIES`], so strike-based quarantine is
+    /// degraded and a message may never reach its `poison_threshold` — see that
+    /// constant for the mitigations. Exposed because the failure is otherwise
+    /// indistinguishable from ordinary first-time rejections.
+    #[must_use]
+    pub const fn strike_progress_discarded(&self) -> u64 {
+        self.strike_progress_discarded
     }
 
     /// Number of queued expiry records, for assertions and diagnostics.
@@ -1313,6 +1392,79 @@ mod tests {
             t.strikes(&format!("m-{}", MAX_POISON_ENTRIES + 499)),
             1,
             "and the newest is the one retained"
+        );
+    }
+
+    /// The honest bound on a fixed-size in-process strike counter.
+    ///
+    /// While the active poison working set fits inside the cap, eviction costs
+    /// a message one extra retry lap. Past it the cost is correctness: with
+    /// more keys than the cap rejected round-robin, every key is evicted before
+    /// its next delivery, so every attempt is strike 1 and no message ever
+    /// reaches a `poison_threshold` above 1 — the harvest sink never fires.
+    ///
+    /// This is inherent (tracking N concurrent streaks costs O(N)), so the test
+    /// pins the limitation rather than pretending it away — and pins that it is
+    /// *reported* rather than silent, which is what makes it survivable.
+    #[test]
+    fn a_working_set_larger_than_the_cap_cannot_accumulate_strikes() {
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        let keys: Vec<String> = (0..=MAX_POISON_ENTRIES).map(|i| format!("m-{i}")).collect();
+
+        let mut reached_threshold = 0usize;
+        for _lap in 0..3 {
+            for key in &keys {
+                if t.strike(key, t0) >= 3 {
+                    reached_threshold += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            reached_threshold, 0,
+            "documented limitation: a working set larger than the cap never \
+             accumulates past strike 1, so a threshold above 1 is unreachable",
+        );
+        assert!(
+            t.tracked() <= MAX_POISON_ENTRIES,
+            "the bound itself must still hold; saw {}",
+            t.tracked(),
+        );
+        assert!(
+            t.strike_progress_discarded() > 0,
+            "the degradation must be reported, not silent -- an operator whose \
+             poison working set exceeds the cap gets no other signal that \
+             strike-based quarantine has stopped working",
+        );
+    }
+
+    /// The contrast that stops the test above from passing vacuously: inside
+    /// the cap, strikes accumulate exactly as documented and nothing is
+    /// discarded.
+    #[test]
+    fn a_working_set_inside_the_cap_accumulates_strikes_normally() {
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        let keys = ["a", "b", "c"];
+
+        let mut reached_threshold = 0usize;
+        for _lap in 0..3 {
+            for key in keys {
+                if t.strike(key, t0) >= 3 {
+                    reached_threshold += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            reached_threshold, 3,
+            "every key must reach the threshold on its third rejection",
+        );
+        assert_eq!(
+            t.strike_progress_discarded(),
+            0,
+            "nothing is discarded while the working set fits",
         );
     }
 

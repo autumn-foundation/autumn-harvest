@@ -958,6 +958,42 @@ mod tests {
         assert!(format!("{err}").contains("partition/offset"));
     }
 
+    /// Kafka has no per-message nack, so there is nothing for a
+    /// "broker-native" dead-letter mode to hand a poison message to: routing a
+    /// DLQ topic is a *producer* concern the consumer cannot perform by
+    /// abandoning. `KafkaSource` therefore never overrides
+    /// [`EventSource::has_native_dead_letter`] and inherits the trait's `false`
+    /// default, which makes the `BrokerNative` pairing unsupported — rejected
+    /// at build time rather than silently re-reading the poison message
+    /// forever.
+    ///
+    /// Pinned as a drift guard for
+    /// [`SourceBindingBuilder::broker_native_dead_letter`]'s rustdoc, which
+    /// used to advertise "a Kafka DLQ topic" and would have walked a caller
+    /// straight into that build-time rejection.
+    #[tokio::test]
+    async fn kafka_reports_no_native_dead_letter_so_the_pairing_is_rejected() {
+        let cfg = KafkaSourceConfig::new("localhost:9092", "g", "orders");
+        // Building the consumer needs no live broker (librdkafka connects
+        // lazily), so this exercises the real adapter, not a stand-in.
+        let Ok(source) = KafkaSource::connect(&cfg) else {
+            return; // no librdkafka in this environment; nothing to assert
+        };
+        assert!(
+            !source.has_native_dead_letter(),
+            "Kafka cannot nack, so it must not advertise a native dead-letter \
+             destination",
+        );
+        assert!(
+            !crate::connector::broker_native_dead_letter_is_supported(
+                crate::connector::DeadLetterMode::BrokerNative,
+                source.has_native_dead_letter(),
+            ),
+            "a Kafka binding asking for broker-native dead-lettering must be \
+             rejected, so the builder rustdoc must not offer it",
+        );
+    }
+
     #[test]
     fn a_recv_error_after_partial_drain_yields_the_batch_instead_of_dropping_it() {
         // Records already drained from the consumer have advanced librdkafka's

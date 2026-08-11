@@ -439,6 +439,34 @@ Setting `poison_threshold(0)` disables the strike counter (retry a rejection
 forever) but **not** deterministic dead-lettering, because retrying an
 undecodable body forever is exactly the wedge this exists to prevent.
 
+### The strike counter is in-process and bounded
+
+Strikes have to survive *between* deliveries to be counted at all, and they are
+held in memory, capped at 10 000 entries per binding. Two consequences worth
+knowing before you rely on a threshold above 1:
+
+* **A restart resets them.** At worst a message in flight gets `threshold` more
+  redeliveries before it is dead-lettered.
+* **An active poison working set larger than the cap never accumulates.** With
+  more than 10 000 distinct messages being rejected in round-robin order, each
+  one is evicted before its next delivery, so every attempt is strike 1 and
+  nothing ever reaches a threshold above 1 — the harvest sink never fires. This
+  is inherent to a bounded in-process counter, so it is *reported* rather than
+  hidden: the first eviction that discards a live strike count logs a warning.
+
+If you expect a poison working set anywhere near that size, use one of:
+
+* `poison_threshold(1)` — dead-letter on the first rejection. Nothing needs to
+  survive between deliveries, so the cap stops mattering entirely. This is the
+  right setting whenever your mapping rejections are deterministic (a schema
+  mismatch does not become mappable on the third try).
+* **An SQS redrive policy** — `ApproximateReceiveCount` is per-message, lives in
+  the broker, and survives both eviction and restarts. It is the durable
+  backstop at that scale.
+
+Kafka cannot reach this shape: a retried message blocks its partition prefix, so
+the stall detector fires long before a working set that large builds up.
+
 Where it goes depends on the binding:
 
 * Default (`DeadLetterMode::HarvestSink`) — a row in

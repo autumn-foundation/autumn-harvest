@@ -314,8 +314,26 @@ impl SourceBinding {
         self
     }
 
-    /// Use the broker's own dead-letter machinery (SQS redrive, a Kafka DLQ
-    /// topic) instead of a harvest-side record.
+    /// Use the broker's own dead-letter machinery instead of a harvest-side
+    /// record.
+    ///
+    /// Only for sources that report a dead-letter destination *abandoning a
+    /// message actually feeds* — in practice an SQS queue carrying a redrive
+    /// policy, or a custom adapter that overrides
+    /// [`EventSource::has_native_dead_letter`][hn]. The pairing is rejected at
+    /// build time on any other source rather than silently re-reading the
+    /// poison message forever.
+    ///
+    /// **Not available on Kafka.** Kafka has no per-message nack, so there is
+    /// nothing for abandoning to hand the message to — routing a DLQ topic is a
+    /// *producer* action the consumer cannot perform. A Kafka binding should
+    /// leave this unset and let poison messages land in
+    /// `harvest_connector_dead_letters` (the default
+    /// [`DeadLetterMode::HarvestSink`]), which is also what keeps the partition
+    /// moving: a dead-lettered message is acked, whereas one left to retry
+    /// blocks its prefix.
+    ///
+    /// [hn]: super::source::EventSource::has_native_dead_letter
     #[must_use]
     pub const fn broker_native_dead_letter(mut self) -> Self {
         self.dead_letter_mode = DeadLetterMode::BrokerNative;

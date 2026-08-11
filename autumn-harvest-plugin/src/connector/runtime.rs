@@ -444,6 +444,23 @@ impl ConnectorRuntime {
             .await
             .expire_stale_as_of(std::time::Instant::now(), self.config.poison_retention);
 
+        // Sampled BEFORE receiving, so no message is ever in custody while this
+        // runs. `lag()` is a live broker round-trip -- SQS bills a
+        // `GetQueueAttributes`, Kafka does a metadata + watermark fetch -- and
+        // either can be slow or retry internally. On SQS the visibility timer
+        // starts at `ReceiveMessage`, not at dispatch, so sampling with a batch
+        // already in hand spends that batch's visibility budget: another
+        // replica receives the messages, their `ApproximateReceiveCount` climbs
+        // toward the queue's `maxReceiveCount`, and a perfectly processable
+        // message reaches the broker DLQ having never once failed. The gauge is
+        // throttled to a scrape cadence anyway, so which side of the receive it
+        // lands on is immaterial to its accuracy.
+        if self.lag_sample_is_due()
+            && let Some(lag) = self.source.lag().await
+        {
+            self.metrics.record_connector_lag(self.binding.name, lag);
+        }
+
         let batch = self
             .source
             .receive(
@@ -451,14 +468,6 @@ impl ConnectorRuntime {
                 self.config.poll_timeout,
             )
             .await?;
-
-        // Throttled: `lag()` is a billed broker round-trip, and the gauge only
-        // needs to move on a scrape cadence.
-        if self.lag_sample_is_due()
-            && let Some(lag) = self.source.lag().await
-        {
-            self.metrics.record_connector_lag(self.binding.name, lag);
-        }
 
         if batch.is_empty() {
             return Ok(PassSummary::default());
@@ -2307,6 +2316,111 @@ mod tests {
             vec![("orders".to_string(), 42)],
             "lag must be emitted with the binding name, not swallowed",
         );
+    }
+
+    /// Records the order in which the runtime calls the source, so a test can
+    /// assert *when* telemetry runs relative to message custody.
+    #[derive(Debug)]
+    struct CallOrderSource {
+        inner: MockSource,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl CallOrderSource {
+        fn new(stream: &str) -> Self {
+            Self {
+                inner: MockSource::new(stream),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn note(&self, what: &'static str) {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(what);
+        }
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventSource for CallOrderSource {
+        fn stream(&self) -> &str {
+            self.inner.stream()
+        }
+        async fn receive(
+            &self,
+            max: usize,
+            timeout: std::time::Duration,
+        ) -> Result<Vec<InboundMessage>, ConnectorError> {
+            self.note("receive");
+            self.inner.receive(max, timeout).await
+        }
+        async fn ack(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            self.note("ack");
+            self.inner.ack(handle).await
+        }
+        async fn abandon(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            self.note("abandon");
+            self.inner.abandon(handle).await
+        }
+        async fn lag(&self) -> Option<i64> {
+            self.note("lag");
+            self.inner.lag().await
+        }
+    }
+
+    /// Telemetry must never sit between `receive` and dispatch.
+    ///
+    /// `lag()` is a live broker round-trip — SQS bills a `GetQueueAttributes`,
+    /// Kafka does a metadata + watermark fetch — and either can be slow or
+    /// retry internally. On SQS the visibility timer starts at
+    /// `ReceiveMessage`, not at dispatch, so a lag call made while a batch is
+    /// already in hand spends that batch's visibility budget: another replica
+    /// receives the messages, their `ApproximateReceiveCount` climbs toward the
+    /// queue's `maxReceiveCount`, and a perfectly processable message reaches
+    /// the broker DLQ having never once failed.
+    ///
+    /// Sampling before `receive` costs nothing — the gauge is throttled to a
+    /// scrape cadence, so which side of the receive it lands on is immaterial
+    /// to its accuracy — and it means no message is ever in custody while the
+    /// call is outstanding.
+    #[tokio::test]
+    async fn lag_is_sampled_before_any_message_is_in_custody() {
+        let source = Arc::new(CallOrderSource::new("orders"));
+        source.inner.set_lag(Some(42));
+        source.inner.push_kafka(0, 1, b"{{{");
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let rt = ConnectorRuntime::new(
+            malformed_binding(),
+            Arc::clone(&source) as Arc<dyn EventSource>,
+            HarvestApiState::new(),
+            Arc::clone(&metrics) as Arc<dyn MetricsRecorder>,
+            IdempotencyMode::BrokerCoordinates,
+        )
+        .with_dead_letter_sink(sink);
+
+        rt.run_once().await.unwrap();
+
+        let calls = source.calls();
+        let lag_at = calls.iter().position(|c| *c == "lag");
+        let receive_at = calls.iter().position(|c| *c == "receive");
+        assert!(
+            lag_at.is_some() && receive_at.is_some(),
+            "both calls must happen: {calls:?}",
+        );
+        assert!(
+            lag_at < receive_at,
+            "lag() must be sampled BEFORE receive() so no message is held \
+             across a billed broker round-trip, got {calls:?}",
+        );
+        // The sample still lands -- moving it must not silence the gauge.
+        assert_eq!(metrics.lag(), vec![("orders".to_string(), 42)]);
     }
 
     #[tokio::test]
