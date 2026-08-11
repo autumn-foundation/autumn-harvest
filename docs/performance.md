@@ -599,6 +599,15 @@ ANALYZE` of the claim query.
   fresh connection are exactly the unrepresentative ones. The `n` column belongs
   to the latency window, so it is below the operation count the throughput
   column divides.
+* **Every worker starts together, and the clock starts with them.** Each claimer
+  (or writer) checks out its pooled connection and then waits at a start
+  barrier, so a row labelled "8 concurrent claimers" measures eight of them
+  contending, not a ramp-up in which the first is already sampling while the
+  last is still connecting. The throughput denominator is the span from that
+  release to the slowest worker finishing, so pool construction is not counted
+  as measured work. This is a *different* clock from the per-scenario ceiling
+  below, which deliberately starts *before* checkout — `pool.get()` is an
+  unbounded await, so a ceiling that started after it would not bound it.
 
 ### Profile does not matter
 

@@ -538,51 +538,123 @@ fn token_key(token: &str) -> &str {
     token.split_once('=').map_or(token, |(k, _)| k).trim()
 }
 
-/// Split a libpq keyword/value connection string into whole `key=value` tokens.
-///
-/// Splitting on whitespace is wrong, and wrong in the direction that leaks: a
-/// value may be single-quoted and may carry backslash escapes, so
-/// `password='hunter two'` is **one** token. Cutting it at the space yields
-/// `password='hunter` (redacted) and `two'` (no `=`, so passed through as if it
-/// were a separate parameter) — printing half the password.
-///
-/// Escapes are consumed as a unit, so `\'` does not close the quote. Iterating
-/// `char_indices` keeps every slice on a UTF-8 boundary without needing an
-/// argument about where multi-byte characters can land.
-fn keyword_value_tokens(s: &str) -> Vec<&str> {
-    let mut tokens = Vec::new();
-    let mut start: Option<usize> = None;
-    let mut quoted = false;
-    let mut escape = false;
+/// One `keyword = value` pair from a libpq keyword/value connection string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeywordPair<'a> {
+    key: &'a str,
+    /// The value's raw span, quotes included if it was quoted.
+    raw_value: &'a str,
+}
 
-    for (i, ch) in s.char_indices() {
-        if escape {
-            // Consume the escaped character whatever it is, so `\'` cannot
-            // close the quote and `\ ` cannot end the token.
-            escape = false;
-            continue;
+/// Strip one layer of libpq single-quoting from a value span.
+///
+/// Escapes are deliberately *not* unescaped, so the result stays a borrowed
+/// slice. Every name this harness generates is `[a-z0-9_]`, so it never needs
+/// either.
+fn unquote_span(span: &str) -> &str {
+    span.strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .unwrap_or(span)
+}
+
+const fn is_ws(b: u8) -> bool {
+    b.is_ascii_whitespace()
+}
+
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && is_ws(b[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// Parse a libpq keyword/value connection string into `(key, raw value)` pairs.
+///
+/// Returns the pairs together with the offset at which parsing stopped, so a
+/// caller can **fail closed** on the remainder rather than printing it.
+///
+/// Splitting on whitespace is not sufficient, and fails in the direction that
+/// leaks. libpq's own grammar (mirrored by `tokio_postgres::Config`'s
+/// `Parser::keyword`/`value`) reads a keyword up to whitespace *or* `=`, then
+/// skips whitespace on both sides of the `=`, then reads a value that may be
+/// single-quoted and may carry backslash escapes. So all of these are one pair:
+///
+/// ```text
+/// password=hunter2
+/// password='hunter two'
+/// password = 'hunter two'
+/// password='hun\'ter two'
+/// ```
+///
+/// A whitespace split turns the third into `password`, `=` and a bare secret —
+/// and the secret has no embedded `=`, so a key/value redactor waves it through.
+fn keyword_value_pairs(s: &str) -> (Vec<KeywordPair<'_>>, usize) {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = skip_ws(b, 0);
+
+    while i < b.len() {
+        // The offset to report if this pair turns out to be malformed: the
+        // whole pair is then unparsed, not just its tail.
+        let pair_start = i;
+
+        let key_start = i;
+        while i < b.len() && !is_ws(b[i]) && b[i] != b'=' {
+            i += 1;
         }
-        if ch.is_whitespace() && !quoted {
-            if let Some(st) = start.take() {
-                tokens.push(&s[st..i]);
+        if i == key_start {
+            // A stray `=` with no keyword before it.
+            return (out, pair_start);
+        }
+        let key = &s[key_start..i];
+
+        i = skip_ws(b, i);
+        if i >= b.len() || b[i] != b'=' {
+            return (out, pair_start);
+        }
+        i = skip_ws(b, i + 1);
+        if i >= b.len() {
+            return (out, pair_start);
+        }
+
+        let value_start = i;
+        if b[i] == b'\'' {
+            i += 1;
+            let mut closed = false;
+            while i < b.len() {
+                if b[i] == b'\\' && i + 1 < b.len() {
+                    i += 2;
+                } else if b[i] == b'\'' {
+                    i += 1;
+                    closed = true;
+                    break;
+                } else {
+                    i += 1;
+                }
             }
-            continue;
+            if !closed {
+                // An unterminated quote swallows the rest of the string; the
+                // caller must treat all of it as potentially secret.
+                return (out, pair_start);
+            }
+        } else {
+            while i < b.len() && !is_ws(b[i]) {
+                i += if b[i] == b'\\' && i + 1 < b.len() {
+                    2
+                } else {
+                    1
+                };
+            }
         }
-        if start.is_none() {
-            start = Some(i);
-        }
-        match ch {
-            '\\' => escape = true,
-            '\'' => quoted = !quoted,
-            _ => {}
-        }
+
+        out.push(KeywordPair {
+            key,
+            raw_value: &s[value_start..i.min(s.len())],
+        });
+        i = skip_ws(b, i);
     }
-    // An unterminated quote runs to the end of the string, which is what libpq
-    // would reject — but redacting it as one token is the safe reading.
-    if let Some(st) = start {
-        tokens.push(&s[st..]);
-    }
-    tokens
+
+    (out, s.len())
 }
 
 /// Hide the value of every `key=value` pair outside [`PRINTABLE_CONN_PARAMS`].
@@ -600,14 +672,34 @@ fn redact_query_values(query: &str) -> String {
 
 /// The keyword/value counterpart of [`redact_query_values`].
 ///
-/// Rejoins on a single space, so runs of whitespace between parameters are
-/// collapsed. That is a cosmetic change to a log line, not a semantic one.
+/// Rejoins as `key=value` separated by single spaces, so `password = 'x'`
+/// normalises to `password=***`. That is a cosmetic change to a log line.
+///
+/// **Fails closed.** Anything the grammar cannot parse — an unterminated quote,
+/// a stray `=` — is replaced wholesale rather than echoed, because an
+/// unparseable remainder is exactly where a value would be hiding. The one
+/// exception is a string with no `=` anywhere, which cannot be a keyword/value
+/// connection string at all and so carries no `key=value` secret; printing it
+/// keeps a malformed-URL message diagnostic.
 fn redact_keyword_values(params: &str) -> String {
-    keyword_value_tokens(params)
-        .into_iter()
-        .map(redact_one_token)
-        .collect::<Vec<_>>()
-        .join(" ")
+    if !params.contains('=') {
+        return params.to_string();
+    }
+    let (pairs, stopped) = keyword_value_pairs(params);
+    let mut parts: Vec<String> = pairs
+        .iter()
+        .map(|p| {
+            if PRINTABLE_CONN_PARAMS.contains(&p.key.trim().to_ascii_lowercase().as_str()) {
+                format!("{}={}", p.key, p.raw_value)
+            } else {
+                format!("{}=***", p.key)
+            }
+        })
+        .collect();
+    if stopped < params.len() {
+        parts.push("***".to_string());
+    }
+    parts.join(" ")
 }
 
 fn redact_one_token(token: &str) -> String {
@@ -714,13 +806,14 @@ pub fn redact_url(url: &str) -> String {
 pub fn with_db_name(url: &str, db: &str) -> String {
     // Keyword/value form (`host=h dbname=admin`): no `://`, no path.
     if !url.contains("://") {
-        let mut kept: Vec<&str> = keyword_value_tokens(url)
-            .into_iter()
-            .filter(|t| !token_key(t).eq_ignore_ascii_case("dbname"))
+        let (pairs, _) = keyword_value_pairs(url);
+        let mut parts: Vec<String> = pairs
+            .iter()
+            .filter(|p| !p.key.eq_ignore_ascii_case("dbname"))
+            .map(|p| format!("{}={}", p.key, p.raw_value))
             .collect();
-        let replacement = format!("dbname={db}");
-        kept.push(&replacement);
-        return kept.join(" ");
+        parts.push(format!("dbname={db}"));
+        return parts.join(" ");
     }
 
     let (prefix, rest) = url.split_at(url.find("://").map_or(0, |i| i + 3));
@@ -758,7 +851,7 @@ pub fn with_db_name(url: &str, db: &str) -> String {
     out
 }
 
-/// Read the database name back out of a connection URL.
+/// Read the database name back out of a connection string.
 ///
 /// The inverse of [`with_db_name`], and deliberately its neighbour: reading the
 /// name back with a naive `rsplit('/')` reintroduces exactly the bug that
@@ -766,12 +859,53 @@ pub fn with_db_name(url: &str, db: &str) -> String {
 /// slash sits inside the *query*, so the "database name" comes back as
 /// `root.crt`. Parse the path first, then stop at the query.
 ///
-/// `None` when the URL carries no path component at all (`postgres://host`).
+/// Handles **both** connection-string forms `libpq` (and so `tokio-postgres`)
+/// accepts, because [`db::setup_bench_db`] hands back whichever form the
+/// operator supplied in `HARVEST_TEST_DATABASE_URL` and the gate suite unwraps
+/// this result — a `None` there is a panic, not a skip:
+///
+/// * **URL** (`postgres://host/db`): a `dbname` *query* parameter wins over the
+///   path, matching `tokio-postgres`' `UrlParser::parse`, which runs
+///   `parse_path` before `parse_params`, so the later assignment survives. This
+///   is the same precedence [`with_db_name`] honours by stripping the query
+///   parameter; the two must agree or one could strip a `dbname` the other
+///   would not have found.
+/// * **keyword/value** (`host=h dbname=db`): the *last* `dbname` wins, matching
+///   `Config::param`, which simply assigns on each occurrence.
+///
+/// `None` only when the string names no database at all (`postgres://host`,
+/// `host=h port=5432`).
 #[must_use]
 pub fn db_name_from_url(url: &str) -> Option<&str> {
+    // Keyword/value form: no `://`, so there is no path to read — the name can
+    // only come from a `dbname` keyword.
+    if !url.contains("://") {
+        let (pairs, _) = keyword_value_pairs(url);
+        return pairs
+            .iter()
+            .rev()
+            .find(|p| p.key.eq_ignore_ascii_case("dbname"))
+            .map(|p| unquote_span(p.raw_value));
+    }
+
     let rest = url.find("://").map_or(url, |i| &url[i + 3..]);
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let tail = &rest[authority_end..];
+
+    // A `dbname` query parameter overrides the path (see the doc comment). A
+    // bare `dbname` with no `=` reads as empty, matching how the `url` crate's
+    // `query_pairs` feeds `tokio-postgres`.
+    if let Some(name) = tail
+        .split_once('?')
+        .map(|(_, after)| after.split_once('#').map_or(after, |(q, _)| q))
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .rfind(|pair| token_key(pair).eq_ignore_ascii_case("dbname"))
+        .map(|pair| pair.split_once('=').map_or("", |(_, v)| v))
+    {
+        return Some(name);
+    }
+
     // Only a leading `/` introduces a path; `?`/`#` mean there is none.
     let path = tail.strip_prefix('/')?;
     let path_end = path.find(['?', '#']).unwrap_or(path.len());
@@ -1250,6 +1384,43 @@ mod pure_tests {
         );
     }
 
+    /// libpq allows whitespace around the `=`, which splits a naive tokenizer.
+    ///
+    /// `Parser::keyword` stops at whitespace *or* `=`, then `skip_ws`/`eat('=')`
+    /// /`skip_ws` runs before the value — so `password = 'hunter two'` is a
+    /// valid string that a whitespace tokenizer shreds into `password`, `=` and
+    /// the bare secret. The secret token has no embedded `=`, so the redactor's
+    /// pass-through rule printed it in full.
+    #[test]
+    fn redact_url_removes_a_keyword_password_with_spaces_around_equals() {
+        let redacted = redact_url("host=db.internal password = 'hunter two' sslmode=require");
+        assert!(
+            !redacted.contains("hunter"),
+            "password survived: {redacted}"
+        );
+        assert!(
+            !redacted.contains("two"),
+            "password tail survived: {redacted}"
+        );
+        assert!(
+            redacted.contains("host=db.internal") && redacted.contains("sslmode=require"),
+            "endpoint lost: {redacted}"
+        );
+    }
+
+    /// Anything the keyword grammar cannot parse is hidden, not printed.
+    #[test]
+    fn redact_url_fails_closed_on_an_unparseable_keyword_remainder() {
+        // An unterminated quote: everything after it is unclassifiable, so it
+        // must not be echoed on the assumption it is harmless.
+        let redacted = redact_url("host=h password='hunter two sslmode=require");
+        assert!(
+            !redacted.contains("hunter"),
+            "password survived: {redacted}"
+        );
+        assert!(redacted.contains("host=h"), "endpoint lost: {redacted}");
+    }
+
     /// A backslash-escaped quote keeps the value open past the next `'`.
     #[test]
     fn redact_url_removes_a_keyword_password_containing_an_escaped_quote() {
@@ -1567,6 +1738,67 @@ mod pure_tests {
         assert_eq!(
             with_db_name("postgres://h/admin?dbname=admin#frag", "b"),
             "postgres://h/b#frag",
+        );
+    }
+
+    /// `db_name_from_url` must invert `with_db_name` for **both** forms.
+    ///
+    /// Round 14 taught `with_db_name` to emit a proper keyword/value string,
+    /// which made its inverse return `None` for exactly the strings it now
+    /// produces — and both existing-server tests `.expect()` that value, so the
+    /// documented gate suite panicked for a supported connection-string form.
+    /// (Before round 14 the rewrite emitted a stray `/`, which this parser
+    /// happened to read as a path; the inverse worked only by accident.)
+    #[test]
+    fn db_name_from_url_reads_the_keyword_value_form() {
+        assert_eq!(
+            db_name_from_url("host=h port=5432 dbname=harvest_claim_bench_1_abc_0"),
+            Some("harvest_claim_bench_1_abc_0"),
+        );
+        // Round-trips with what `with_db_name` emits, which is the property the
+        // gate suite actually depends on.
+        let rewritten = with_db_name("host=h dbname=admin", "bench_1");
+        assert_eq!(db_name_from_url(&rewritten), Some("bench_1"));
+        // libpq is last-wins on a repeated keyword.
+        assert_eq!(
+            db_name_from_url("dbname=first dbname=second"),
+            Some("second")
+        );
+        // A quoted value is returned without its quotes.
+        assert_eq!(db_name_from_url("host=h dbname='b 1'"), Some("b 1"));
+        // Genuinely absent stays `None`.
+        assert_eq!(db_name_from_url("host=h port=5432"), None);
+    }
+
+    /// The URL form must read `dbname` with the same precedence `with_db_name`
+    /// strips it: query over path.
+    ///
+    /// Round 14 established that `tokio-postgres` runs `parse_path` *before*
+    /// `parse_params`, so `?dbname=` wins — which is why `with_db_name` drops
+    /// it. If the inverse still read only the path, the two neighbours would
+    /// disagree about which parameter counts as the database for the same
+    /// string, and this reader would name a database the connection never
+    /// opens.
+    #[test]
+    fn db_name_from_url_lets_a_dbname_query_override_the_path() {
+        assert_eq!(
+            db_name_from_url("postgres://h/admin?dbname=real"),
+            Some("real"),
+        );
+        // Case-insensitive, and unaffected by a trailing fragment.
+        assert_eq!(
+            db_name_from_url("postgres://h/admin?sslmode=require&DBName=real#frag"),
+            Some("real"),
+        );
+        // Last-wins, matching `query_pairs` feeding `Config::param`.
+        assert_eq!(
+            db_name_from_url("postgres://h/admin?dbname=first&dbname=second"),
+            Some("second"),
+        );
+        // No query `dbname`: the path still answers.
+        assert_eq!(
+            db_name_from_url("postgres://h/admin?sslmode=require"),
+            Some("admin"),
         );
     }
 
@@ -2533,6 +2765,21 @@ pub mod db {
         run_claim_scenario_with_budget(db, scenario, super::scenario_time_budget()).await
     }
 
+    /// Arrive at the scenario start barrier, bounded by the scenario deadline.
+    ///
+    /// Every task arrives — including one that failed checkout and is about to
+    /// return — so a party that is never coming cannot park its peers here. The
+    /// deadline bound is the backstop for any future path that forgets: it
+    /// keeps this await under the same ceiling as every other await in the
+    /// task, so the advertised cap stays real.
+    async fn arrive_at_start_gate(gate: &tokio::sync::Barrier, deadline: Instant) {
+        let _ = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            gate.wait(),
+        )
+        .await;
+    }
+
     /// [`run_claim_scenario`] with the wall-clock ceiling supplied directly.
     ///
     /// The budget is a *parameter* rather than something this function reads
@@ -2577,12 +2824,27 @@ pub mod db {
         // and the advertised cap would be a fiction. A scenario-wide deadline
         // also means the cap bounds the scenario, not each claimer separately.
         let deadline = started + budget;
+        // Every claimer checks out its connection and then waits here, so the
+        // measured phase begins with all of them contending at once. Without
+        // it, claimer 0 could take its first samples while claimer N-1 was
+        // still inside `pool.get()`: the head of the sample would be measured
+        // under less contention than the scenario nominally models — flattering
+        // p50 for exactly the multi-claimer scenarios that exist to measure
+        // contention — and the throughput denominator would count the ramp-up
+        // as if it were measured work.
+        //
+        // The deadline above is deliberately *not* re-anchored after this
+        // barrier: checkout is an unbounded await, so the ceiling has to exist
+        // before it (see the comment on `deadline`). The measurement clock is
+        // separate, and starts on release.
+        let gate = Arc::new(tokio::sync::Barrier::new(claimers));
         let mut handles = Vec::with_capacity(claimers);
         for c in 0..claimers {
             let pool = pool.clone();
             let queues = Arc::clone(&queues);
             let cb_set = Arc::clone(&cb_set);
             let build_id = build_id.clone();
+            let gate = Arc::clone(&gate);
             // Exact split, so the sum across claimers never exceeds the
             // drain bound (see `claims_for_claimer`).
             let per_claimer = super::claims_for_claimer(total_ops, claimers, c);
@@ -2604,8 +2866,13 @@ pub mod db {
                 )
                 .await
                 else {
-                    return super::ClaimerOutcome::from_observed(Vec::new(), true);
+                    arrive_at_start_gate(&gate, deadline).await;
+                    return (super::ClaimerOutcome::from_observed(Vec::new(), true), 0.0);
                 };
+                arrive_at_start_gate(&gate, deadline).await;
+                // The measurement clock starts here, not at `started`: the
+                // span before the barrier is setup, not measured work.
+                let measured_from = Instant::now();
                 let mut truncated = false;
                 for _ in 0..per_claimer {
                     // Wall-clock ceiling: claim latency scales with backlog
@@ -2655,7 +2922,10 @@ pub mod db {
                 // Split into the latency window (warmup trimmed) and the
                 // throughput window (everything), now that the real observation
                 // count is known. See `ClaimerOutcome::from_observed`.
-                super::ClaimerOutcome::from_observed(observed, truncated)
+                (
+                    super::ClaimerOutcome::from_observed(observed, truncated),
+                    measured_from.elapsed().as_secs_f64(),
+                )
             }));
         }
 
@@ -2664,15 +2934,23 @@ pub mod db {
         let mut empty = 0usize;
         let mut total_claimed = 0usize;
         let mut truncated = false;
+        // The measured phase spans the barrier release (every claimer starts
+        // together) to the slowest claimer finishing, so the widest per-claimer
+        // span *is* the scenario's measured wall clock.
+        let mut measured_secs = 0.0f64;
         for h in handles {
-            let out = h.await.expect("claimer task panicked");
+            let (out, claimer_secs) = h.await.expect("claimer task panicked");
+            measured_secs = measured_secs.max(claimer_secs);
             all_samples.extend(out.samples);
             claimed += out.claimed;
             empty += out.empty;
             total_claimed += out.total_claimed;
             truncated |= out.truncated;
         }
-        let wall_secs = started.elapsed().as_secs_f64();
+        // Deliberately not `started.elapsed()`: `started` anchors the deadline
+        // and therefore precedes pool checkout, and counting that ramp-up as
+        // measured work inflated the throughput denominator.
+        let wall_secs = measured_secs;
 
         ClaimReport {
             scenario,
@@ -2822,10 +3100,17 @@ pub mod db {
         // this) until the outer workflow timeout, while the page advertises a
         // per-scenario cap.
         let deadline = started + budget;
+        // Same start barrier as the claim path, for the same reason: a
+        // start-storm measured while some writers are still checking out is a
+        // smaller storm than the one advertised, and the ramp-up would inflate
+        // the throughput denominator. The deadline stays anchored before
+        // checkout; only the measurement clock moves.
+        let gate = Arc::new(tokio::sync::Barrier::new(writers.max(1)));
         let mut handles = Vec::with_capacity(writers);
         for w in 0..writers.max(1) {
             let pool = pool.clone();
             let queues = Arc::clone(&queues);
+            let gate = Arc::clone(&gate);
             handles.push(tokio::spawn(async move {
                 let mut samples = Vec::with_capacity(rows_per_writer);
                 // Failing to check out is terminal for this writer: it takes no
@@ -2838,8 +3123,11 @@ pub mod db {
                 )
                 .await
                 else {
-                    return (Vec::new(), true);
+                    arrive_at_start_gate(&gate, deadline).await;
+                    return (Vec::new(), true, 0.0);
                 };
+                arrive_at_start_gate(&gate, deadline).await;
+                let measured_from = Instant::now();
                 let mut truncated = false;
                 for i in 0..rows_per_writer {
                     let now = Instant::now();
@@ -2865,16 +3153,19 @@ pub mod db {
                     wrote.expect("enqueue failed");
                     samples.push(t0.elapsed().as_secs_f64() * 1000.0);
                 }
-                (samples, truncated)
+                (samples, truncated, measured_from.elapsed().as_secs_f64())
             }));
         }
 
         let mut rows = 0usize;
         let mut warmup_rows = 0usize;
         let mut truncated = false;
+        // Widest per-writer span from the barrier release: the measured phase.
+        let mut measured_secs = 0.0f64;
         let mut all_samples = Vec::with_capacity(writers * rows_per_writer);
         for h in handles {
-            let (samples, writer_truncated) = h.await.expect("writer task panicked");
+            let (samples, writer_truncated, writer_secs) = h.await.expect("writer task panicked");
+            measured_secs = measured_secs.max(writer_secs);
             truncated |= writer_truncated;
             rows += samples.len();
             // Same post-hoc warmup trim as the claim path: the first writes on
@@ -2884,7 +3175,9 @@ pub mod db {
             warmup_rows += warmup;
             all_samples.extend(samples.into_iter().skip(warmup));
         }
-        let wall_secs = started.elapsed().as_secs_f64();
+        // Not `started.elapsed()`: `started` anchors the deadline and precedes
+        // pool checkout (see the barrier above).
+        let wall_secs = measured_secs;
 
         EnqueueReport {
             backlog,
