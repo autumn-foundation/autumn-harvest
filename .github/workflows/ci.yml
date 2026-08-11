@@ -129,8 +129,13 @@ jobs:
       #
       # Guarded by `performance_docs::performance_guards_run_on_docs_only_changes`,
       # which fails if this step is removed or becomes conditional.
+      # The filter is quoted because it ends in `::`, and a trailing colon in an
+      # unquoted YAML scalar is a mapping indicator — unquoted, this line makes
+      # the entire workflow file unparseable, so GitHub loads zero jobs and every
+      # run fails instantly. Guarded by
+      # `performance_docs::ci_yaml_plain_scalars_do_not_contain_a_mapping_colon`.
       - name: Run docs/performance.md guards (also on docs-only PRs)
-        run: cargo test -p autumn-harvest --no-default-features --features testing --test integration performance_docs::
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration performance_docs::"
 
   test:
     name: Test (${{ matrix.os }})

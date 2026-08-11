@@ -282,9 +282,19 @@ async fn gate_breakdown(db: &BenchDb) {
         "> `paused_rows` seeds unclaimable PAUSED-execution ballast *in addition \
          to* the claimable backlog, so it walks a table twice as deep as \
          `baseline`. Because claim latency is strongly superlinear in depth, it \
-         is reported against the equal-depth `double_backlog` control — which \
-         seeds the same total rows, all claimable — so the delta is the \
-         anti-join's cost rather than the extra depth's."
+         is reported against the equal-depth `double_backlog` control rather \
+         than against `baseline`, so its delta is not merely the extra depth."
+    );
+    println!(
+        "> **That delta is not the anti-join's cost in isolation.** The control \
+         matches *total rows in the table*, not the population reaching the \
+         sort — and the anti-join is a `WHERE` predicate, so it runs *before* \
+         the `ORDER BY`. `paused_rows` therefore sorts 10 000 rows where the \
+         control sorts 20 000, and the delta is the probe cost minus that sort \
+         saving: two effects of opposite sign that this measurement cannot \
+         separate. Read it as \"a paused population is not free to skip\", not \
+         as a predicate cost. See the \"What that control does *not* establish\" \
+         section of `docs/performance.md`."
     );
     println!(
         "> `double_backlog` is a control, not a gate: `double_backlog vs baseline` \

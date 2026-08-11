@@ -717,3 +717,138 @@ fn truncated_sample_counts_in_prose_match_the_table() {
         paused_rows.samples
     );
 }
+
+/// Every unquoted value in `ci.yml` must be a legal YAML plain scalar.
+///
+/// This exists because the guard above — which asserts the `performance_docs`
+/// step is present, ungated, and in the right job — passed happily while the
+/// workflow file was **not valid YAML at all**, so GitHub loaded no jobs and
+/// every run failed instantly. A guard that asserts a CI step exists is
+/// worthless if the file containing it cannot be parsed; the step was there,
+/// correct, and dead.
+///
+/// The specific trap: a plain (unquoted) YAML scalar may not contain a colon
+/// that the parser reads as a mapping separator — either `: ` mid-value, or a
+/// trailing `:` at end of line. The step this module added ended in
+/// `performance_docs::`, so YAML saw a mapping indicator and rejected the file
+/// with "mapping values are not allowed here". Quoting the value fixes it.
+///
+/// This is a targeted rule, not a YAML parser, and it is named for what it
+/// checks rather than for "the workflow is valid". It is the right rule for
+/// *this* file specifically: `ci.yml` is dominated by long shell one-liners,
+/// and cargo test filters (`module::`), URLs (`https://`) and time expressions
+/// are exactly the values that acquire colons. A full parse would need a YAML
+/// dependency on the core crate, and the only one already in the lockfile is
+/// both deprecated and reachable solely through `autumn-web`, which this crate
+/// does not depend on.
+#[test]
+fn ci_yaml_plain_scalars_do_not_contain_a_mapping_colon() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crate directory must have a parent")
+        .join(".github/workflows/ci.yml");
+    let workflow = read_normalized(&path);
+
+    for (n, line) in workflow.lines().enumerate() {
+        let trimmed = line.trim_start();
+
+        // Only `key: value` lines carry a plain scalar. Comments, list items
+        // without a key, and blank lines cannot hit the trap.
+        let Some(colon) = trimmed.find(": ") else {
+            continue;
+        };
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let value = trimmed[colon + 2..].trim();
+        if value.is_empty() {
+            continue;
+        }
+
+        // A quoted value is exempt: quoting is precisely the fix, so a guard
+        // that flagged it too would forbid the correct spelling.
+        let quoted = (value.starts_with('"') && value.ends_with('"') && value.len() > 1)
+            || (value.starts_with('\'') && value.ends_with('\'') && value.len() > 1);
+        // Block scalars (`|`, `>`, and their chomping/indent variants) are not
+        // plain scalars at all — their content lines are opaque to the parser's
+        // mapping rules, which is why every long multi-line `run:` in this file
+        // is already safe.
+        let block = value.starts_with('|') || value.starts_with('>');
+        if quoted || block {
+            continue;
+        }
+
+        assert!(
+            !value.ends_with(':'),
+            "ci.yml line {} ends an unquoted value with `:`, which YAML reads as \
+             a mapping indicator — the whole file then fails to parse, GitHub \
+             loads zero jobs, and every run fails instantly with the workflow \
+             named after its own path. Quote the value. Line:\n{}",
+            n + 1,
+            line
+        );
+        assert!(
+            !value.contains(": "),
+            "ci.yml line {} has an unquoted value containing `: `, which YAML \
+             reads as a mapping separator. Quote the value. Line:\n{}",
+            n + 1,
+            line
+        );
+    }
+}
+
+/// The benchmark's *generated report* must not republish the retracted
+/// attribution either.
+///
+/// Round 24 narrowed the claim in `docs/performance.md`; round 26 found the
+/// changelog's leading entry still carried it; this covers the third surface —
+/// the note `benches/claim_bench.rs` prints under its per-gate table. That note
+/// is arguably the worst place for it to survive: the doc is read once, but the
+/// bench output is what someone pastes into a PR when they regenerate the
+/// numbers, so a stale interpretation there propagates into new writing.
+///
+/// Scoped to `println!` string content rather than the whole file: the source
+/// may freely *discuss* the retraction in comments (this fix does), and a guard
+/// that could not tell an explanation from an assertion would forbid explaining
+/// it — the same self-trip that
+/// [`changelog_fragment_quotes_the_published_figures`] hit and solves by
+/// quote-detection.
+#[test]
+fn the_bench_report_does_not_republish_the_retracted_attribution() {
+    let bench =
+        read_normalized(&Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/claim_bench.rs"));
+
+    // Everything the bench actually prints, with comments excluded.
+    let printed: String = bench
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for banned in [
+        "the delta is the anti-join's cost",
+        "the anti-join's cost rather than",
+        "so the delta is the anti-join",
+    ] {
+        assert!(
+            !printed.contains(banned),
+            "benches/claim_bench.rs prints \"{banned}\", attributing the \
+             `paused_rows` delta to the anti-join predicate in isolation. The \
+             `double_backlog` control matches total table rows but not the \
+             population reaching the sort (20 000 vs 10 000), so the delta is \
+             the probe cost minus a sort saving and cannot isolate either. \
+             `docs/performance.md` retracted this reading in round 24; the \
+             generated report must not keep publishing it."
+        );
+    }
+
+    // And it must positively carry the correction, so the note cannot simply be
+    // deleted and leave the table unqualified.
+    assert!(
+        printed.contains("not the anti-join's cost in isolation"),
+        "benches/claim_bench.rs must state, in the report it prints, that the \
+         `paused_rows` delta is not the anti-join's cost in isolation. Dropping \
+         the note entirely leaves the per-gate table's `vs` column unqualified, \
+         which is how the misreading started."
+    );
+}
