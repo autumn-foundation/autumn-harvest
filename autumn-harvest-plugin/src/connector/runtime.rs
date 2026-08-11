@@ -1367,6 +1367,73 @@ mod tests {
         assert_eq!(source.acked().len(), 1);
     }
 
+    // Multi-thread for the same reason as the peak test below: on a
+    // current-thread runtime every dispatch is serialized anyway, so an
+    // ordering assertion would hold vacuously and prove nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn max_in_flight_one_dispatches_in_broker_order() {
+        // The ordering caveat in `13-broker-connectors.md` offers exactly one
+        // remedy for per-key order -- `.max_in_flight(1)` -- so that remedy
+        // has to be true. A permit is acquired BEFORE the next message is
+        // dispatched, so a single permit makes dispatch strictly sequential in
+        // batch order, which for one partition is broker order.
+        //
+        // Falsifiable: raising this to 4 makes the assertion fail (the
+        // observed order interleaves), so the test is measuring the bound and
+        // not the mock's insertion order.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        let seen_m = Arc::clone(&seen);
+
+        let binding = Arc::new(
+            SourceBinding::starts("orders", "orders", "order_flow")
+                .map_raw(move |ctx| {
+                    // Runs while the permit is held, so it observes dispatch
+                    // order rather than completion order.
+                    let offset = ctx.coordinates.render();
+                    let n: i64 = offset
+                        .rsplit(':')
+                        .next()
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(-1);
+                    seen_m
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(n);
+                    // Stagger the work so an unbounded runtime would visibly
+                    // interleave rather than accidentally staying in order.
+                    std::thread::sleep(std::time::Duration::from_millis(if n % 2 == 0 {
+                        6
+                    } else {
+                        1
+                    }));
+                    Err(MappingError::Deserialize("x".to_string()))
+                })
+                .max_in_flight(1),
+        );
+
+        let source = Arc::new(MockSource::new("orders"));
+        for offset in 0..12 {
+            source.push_kafka(0, offset, b"{}");
+        }
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let rt = runtime(binding, Arc::clone(&source), sink);
+
+        let summary = rt.run_once().await.unwrap();
+        assert_eq!(summary.received, 12);
+
+        let order = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            order,
+            (0..12).collect::<Vec<i64>>(),
+            "max_in_flight(1) must dispatch in broker order -- it is the only \
+             per-key ordering remedy the guide offers",
+        );
+    }
+
     // Multi-thread: the observation below blocks its worker thread, which on
     // the default current-thread runtime would serialize the dispatches and
     // make the test pass vacuously with a peak of 1.

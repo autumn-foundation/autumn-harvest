@@ -322,11 +322,24 @@ There is one interaction worth knowing. Harvest's start route rejects an
 `idempotency_key` combined with a throttle / debounce / batch admission policy
 (they defer the start, so there is no execution id to return). When your target
 workflow has one of those policies, the connector automatically falls back to
-**workflow-id** dedupe: the mapping function's `workflow_id` is the dedupe unit,
-and a redelivery resolves to the same run through the normal id-reuse policy.
-Override with `.idempotency_mode(...)` if you want to force one or the other —
-forcing `BrokerCoordinates` onto a deferred-admission workflow is rejected at
-build time rather than at the first message.
+**workflow-id** dedupe: the mapping function's `workflow_id` becomes the dedupe
+unit. Override with `.idempotency_mode(...)` if you want to force one or the
+other — forcing `BrokerCoordinates` onto a deferred-admission workflow is
+rejected at build time rather than at the first message.
+
+That fallback is worth being precise about, because workflow-id reuse only
+arbitrates when an execution is **created**, and a deferred admission mutates a
+pending record long before that:
+
+| Target policy | `starts` binding | What a redelivery costs |
+|---|---|---|
+| **throttle** (#607) | allowed | Nothing. Each pending row fires through `start_or_load_workflow_execution`, where id reuse collapses the duplicate onto the original run and refunds its token. Exactly one run. |
+| **debounce** (#499) | allowed | A bounded delay. The upsert collapses on `(workflow_name, debounce_key)`, so the redelivery lands on the *same* pending row — still exactly one run — but it resets the trailing-edge deadline (capped by `max_wait`) and increments `pending_count`, which therefore counts admissions rather than distinct messages. |
+| **batch** (#518) | **rejected at build time** | A visible duplicate, which is why it is refused. Batch admission appends to `buffered_payloads`, so a redelivery would put the same message in the collapsed run's input twice — and it counts toward `max_size`, so it can flush the batch early. |
+
+To consume a broker into a batched workflow, bind to an unbatched workflow and
+have *it* start the batched one: the connector then dedupes the broker message
+on coordinates as usual, and the batch only ever sees one admission per message.
 
 `signals_with_start` bindings always use broker coordinates: the signal path's
 key is a body field with no such mutual exclusion.
@@ -441,12 +454,14 @@ to `max_in_flight` messages concurrently, so two messages from the same
 partition can commit out of order. This is deliberate — serialising every
 message would cap throughput at one dispatch per round trip.
 
-If you need per-key ordering, use the entity pattern. A `signals_with_start`
+If you need per-key **affinity**, use the entity pattern. A `signals_with_start`
 binding whose mapping function derives a stable `workflow_id` from the
 partition key routes every message for that key into the **same execution**,
-and a workflow processes its own signals in the order they were recorded.
-Ordering then holds per entity — which is almost always the property you
-actually wanted — while distinct entities still run concurrently.
+while distinct entities still run concurrently.
+
+Affinity is not ordering, and the distinction matters: the entity pattern gives
+you *"all of one key's messages land in one run"*, **not** *"in broker order"*.
+See the caveat below for why, and for the one knob that does buy you order.
 
 The key is on the mapping context:
 
@@ -467,13 +482,23 @@ the key is UTF-8 (`ctx.key` is the raw bytes). **SQS has no record key**, so
 derive the entity id from a body field or a message attribute
 (`ctx.header("...")`) there instead.
 
-**One caveat on the entity pattern, stated plainly.** The entity workflow
+**Why affinity is not ordering, stated plainly.** The entity workflow
 serializes the signals it receives, but the *order it receives them in* is the
-order the connector dispatched them — and the connector dispatches up to
-`max_in_flight` concurrently, including two messages for the same key. So the
-entity pattern alone gives you *"all of one key's messages land in one run"*,
-not *"in queue order"*. If you need the stronger property, add
-`.max_in_flight(1)` to that binding; you trade throughput for it.
+order the connector dispatched them — and the connector spawns up to
+`max_in_flight` dispatches concurrently, **including two messages for the same
+key in the same batch**. Two same-key records can therefore race for a
+connection, and the later offset can persist its signal first. The workflow
+then replays them in database-recorded order, which is not broker order. The
+run is still exactly one, and every message still lands in it; only the
+sequence is unguaranteed.
+
+The one knob that does buy you order is `.max_in_flight(1)` on that binding: a
+permit is acquired *before* the next message is dispatched, so a single permit
+makes dispatch strictly sequential in batch order — which, within one
+partition, is broker order. You trade throughput for it, and it applies to the
+whole binding rather than per key. (Locked in by
+`max_in_flight_one_dispatches_in_broker_order`, which fails if the bound is
+raised.)
 
 Global total ordering across a whole topic is out of scope.
 

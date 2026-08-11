@@ -471,45 +471,7 @@ pub fn validate_bindings_refs(
             ));
         };
 
-        // A `SignalsWithStart` binding cannot compose with a deferred
-        // admission policy, and every failure mode is silent:
-        //
-        // * **debounce** — `signal-with-start` refuses a *fresh* start on a
-        //   debounced workflow with a `400` (it can only attach). The
-        //   connector classifies that as a deterministic refusal, so the
-        //   FIRST message for every entity is dead-lettered while later ones
-        //   attach fine. That reads as "some messages vanish".
-        // * **batch** — same shape: no signal-with-start batch admission path
-        //   exists, so a fresh start is refused.
-        // * **throttle** — worse, because it *succeeds*: signal-with-start
-        //   does not consult the start throttle at all, so the binding would
-        //   silently bypass the very backpressure the operator configured.
-        //
-        // Fail at build time rather than let any of those reach production.
-        if matches!(b.target, ConnectorTarget::SignalsWithStart { .. })
-            && has_deferred_admission(info)
-        {
-            return Err(format!(
-                "connector binding '{}' is a signals_with_start binding, but target workflow \
-                 '{workflow}' carries a throttle/debounce/batch policy. signal-with-start \
-                 refuses a fresh start on a debounced/batched workflow (so the first message \
-                 for each entity would be dead-lettered) and bypasses a throttle entirely. \
-                 Use a `starts` binding, or remove the deferred-admission policy",
-                b.name
-            ));
-        }
-
-        if b.idempotency_mode == Some(IdempotencyMode::BrokerCoordinates)
-            && has_deferred_admission(info)
-        {
-            return Err(format!(
-                "connector binding '{}' sets IdempotencyMode::BrokerCoordinates but target \
-                 workflow '{workflow}' carries a throttle/debounce/batch policy: a keyed start \
-                 is rejected for a deferred admission. Drop the explicit mode (it will resolve \
-                 to WorkflowId automatically) or remove the deferred-admission policy",
-                b.name
-            ));
-        }
+        validate_target_compatibility(b, info, workflow)?;
 
         // A `broker_native_dead_letter()` binding hands poison quarantine to
         // the broker's own redrive policy — which only works if the adapter
@@ -521,6 +483,88 @@ pub fn validate_bindings_refs(
         // here, so this is caught adapter-side in `spawn_connectors`; what we
         // can check is that the mode was set deliberately.
     }
+    Ok(())
+}
+
+/// Reject binding/target pairings whose dedupe or admission semantics do not
+/// compose, at build time rather than on the first message.
+fn validate_target_compatibility(
+    b: &SourceBinding,
+    info: &WorkflowInfo,
+    workflow: &str,
+) -> Result<(), String> {
+    // A `SignalsWithStart` binding cannot compose with a deferred admission
+    // policy, and every failure mode is silent:
+    //
+    // * **debounce** — `signal-with-start` refuses a *fresh* start on a
+    //   debounced workflow with a `400` (it can only attach). The connector
+    //   classifies that as a deterministic refusal, so the FIRST message for
+    //   every entity is dead-lettered while later ones attach fine. That
+    //   reads as "some messages vanish".
+    // * **batch** — same shape: no signal-with-start batch admission path
+    //   exists, so a fresh start is refused.
+    // * **throttle** — worse, because it *succeeds*: signal-with-start does
+    //   not consult the start throttle at all, so the binding would silently
+    //   bypass the very backpressure the operator configured.
+    if matches!(b.target, ConnectorTarget::SignalsWithStart { .. }) && has_deferred_admission(info)
+    {
+        return Err(format!(
+            "connector binding '{}' is a signals_with_start binding, but target workflow \
+             '{workflow}' carries a throttle/debounce/batch policy. signal-with-start \
+             refuses a fresh start on a debounced/batched workflow (so the first message \
+             for each entity would be dead-lettered) and bypasses a throttle entirely. \
+             Use a `starts` binding, or remove the deferred-admission policy",
+            b.name
+        ));
+    }
+
+    // A `Starts` binding onto a *batched* workflow cannot dedupe a
+    // redelivery, and the duplicate is visible to the workflow.
+    //
+    // `resolve_idempotency_mode` falls back to `WorkflowId` for every
+    // deferred-admission target, because a keyed start is a `400` there. That
+    // fallback leans on workflow-id reuse — which only arbitrates when an
+    // execution is *created*. Batch admission mutates a pending aggregate
+    // long before that: `admit_batched_start` upserts with
+    // `buffered_payloads = existing || EXCLUDED`, so a redelivered message is
+    // appended a second time and the collapsed run receives it twice. It also
+    // counts toward `max_size`, so it can flush the batch early.
+    //
+    // The other two deferred policies are genuinely safe and stay allowed:
+    //
+    // * **debounce** collapses on `(workflow_name, debounce_key)`, so a
+    //   redelivery lands on the same pending row. Exactly one run still
+    //   results; the cost is a trailing-edge deadline extension (bounded by
+    //   `max_wait`) and a `pending_count` that counts admissions rather than
+    //   distinct messages. Documented, not rejected.
+    // * **throttle** keeps one row per admission, but each fires through
+    //   `start_or_load_workflow_execution`, where workflow-id reuse collapses
+    //   the duplicate onto the original run (and refunds its token).
+    if matches!(b.target, ConnectorTarget::Starts { .. }) && info.batch.is_some() {
+        return Err(format!(
+            "connector binding '{}' starts '{workflow}', which carries a batch policy: a \
+             keyed start is rejected for a deferred admission, so dedupe would fall back to \
+             workflow-id reuse -- and that only arbitrates once an execution is created. A \
+             broker redelivery would append the same message to the pending batch twice \
+             (counting toward max_size, so it can flush early), and the collapsed run would \
+             see one message duplicated. Remove the batch policy from '{workflow}', or map \
+             this binding to an unbatched workflow that starts the batched one itself",
+            b.name
+        ));
+    }
+
+    if b.idempotency_mode == Some(IdempotencyMode::BrokerCoordinates)
+        && has_deferred_admission(info)
+    {
+        return Err(format!(
+            "connector binding '{}' sets IdempotencyMode::BrokerCoordinates but target \
+             workflow '{workflow}' carries a throttle/debounce/batch policy: a keyed start \
+             is rejected for a deferred admission. Drop the explicit mode (it will resolve \
+             to WorkflowId automatically) or remove the deferred-admission policy",
+            b.name
+        ));
+    }
+
     Ok(())
 }
 
@@ -795,6 +839,66 @@ mod tests {
         ];
         let err = validate_bindings(&bindings, &[throttled], &[]).unwrap_err();
         assert!(err.contains("throttle/debounce/batch"), "{err}");
+    }
+
+    fn batch_policy() -> autumn_harvest::event_batch::BatchPolicy {
+        autumn_harvest::event_batch::BatchPolicy {
+            key_expr: "tenant_id".to_string(),
+            max_size: 10,
+            max_wait: std::time::Duration::from_secs(30),
+        }
+    }
+
+    fn debounce_policy() -> autumn_harvest::debounce::DebouncePolicy {
+        autumn_harvest::debounce::DebouncePolicy {
+            key_expr: "tenant_id",
+            window: std::time::Duration::from_secs(30),
+            max_wait: None,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_starts_binding_onto_a_batched_workflow() {
+        // A batch target is the one deferred-admission policy where a broker
+        // redelivery is *visible to the workflow*: the redelivery appends the
+        // same payload to `buffered_payloads` a second time, so the collapsed
+        // run receives one message twice — and it counts toward `max_size`,
+        // so it can flush the batch early too. Workflow-id reuse cannot save
+        // it, because no execution exists yet when the append happens.
+        let batched = wf("wf").with_batch(batch_policy());
+        let bindings =
+            vec![SourceBinding::starts("orders", "orders", "wf").map_raw(|_| Ok(ok_mapped()))];
+        let err = validate_bindings(&bindings, &[batched], &[]).unwrap_err();
+        assert!(err.contains("batch"), "{err}");
+        assert!(
+            err.contains("twice") || err.contains("duplicate"),
+            "the error must say what actually goes wrong: {err}"
+        );
+    }
+
+    #[test]
+    fn a_starts_binding_onto_a_debounced_workflow_is_allowed() {
+        // Debounce collapses on `(workflow_name, debounce_key)`, so a
+        // redelivery lands on the SAME pending row and still yields exactly
+        // one run. It costs a bounded deadline extension, not a duplicate.
+        let debounced = wf("wf").with_debounce(debounce_policy());
+        let bindings =
+            vec![SourceBinding::starts("orders", "orders", "wf").map_raw(|_| Ok(ok_mapped()))];
+        assert!(validate_bindings(&bindings, &[debounced], &[]).is_ok());
+    }
+
+    #[test]
+    fn a_starts_binding_onto_a_throttled_workflow_is_allowed() {
+        // Throttle keeps one pending row per admission, but every row fires
+        // through `start_or_load_workflow_execution`, where workflow-id reuse
+        // collapses the redelivery onto the original run.
+        let throttled = wf("wf").with_throttle(
+            autumn_harvest::throttle::ThrottlePolicy::from_rate_str("100/m", None, None, None)
+                .expect("valid rate"),
+        );
+        let bindings =
+            vec![SourceBinding::starts("orders", "orders", "wf").map_raw(|_| Ok(ok_mapped()))];
+        assert!(validate_bindings(&bindings, &[throttled], &[]).is_ok());
     }
 
     #[test]

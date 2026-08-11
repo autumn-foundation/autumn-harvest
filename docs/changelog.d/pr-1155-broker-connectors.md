@@ -381,6 +381,38 @@ coordinates, so a run traces back to the exact message.
   appears on each doc surface *and* that neither stale value does, so a future
   variant fails the build until it is documented.
 
+- **A `starts` binding onto a *batched* workflow could deliver one message
+  twice.** For a deferred-admission target a keyed start is a `400`, so dedupe
+  falls back to workflow-id reuse — and reuse only arbitrates when an execution
+  is *created*. Batch admission mutates a pending aggregate long before that:
+  `admit_batched_start` upserts `buffered_payloads = existing || EXCLUDED`, so a
+  broker redelivery appends the same message a second time and the collapsed run
+  sees it twice; it also counts toward `max_size`, so it can flush the batch
+  early. Rejected at build time now, with the error naming the remedy (bind to
+  an unbatched workflow that starts the batched one, so the connector dedupes on
+  coordinates as usual and the batch only ever sees one admission per message).
+  The other two deferred policies were checked rather than assumed, and both are
+  genuinely safe, so both stay allowed and are documented instead of rejected:
+  **debounce** collapses on `(workflow_name, debounce_key)`, so a redelivery
+  lands on the same pending row and still yields exactly one run — it costs a
+  trailing-edge deadline extension bounded by `max_wait`, and a `pending_count`
+  that counts admissions rather than distinct messages; **throttle** keeps one
+  row per admission, but each fires through `start_or_load_workflow_execution`,
+  where reuse collapses the duplicate and refunds its token.
+
+- **The ordering section promised order the connector does not provide.** The
+  entity-pattern paragraph said a workflow "processes its own signals in the
+  order they were recorded", which the caveat twenty lines below it already
+  contradicted. Two same-key records in one batch are dispatched concurrently
+  (`for message in batch { … tokio::spawn(…) }`), so the later offset can
+  persist its signal first and the recorded order is not broker order. The
+  paragraph now claims **affinity, not ordering**, and the caveat states the
+  race explicitly. The one remedy it offers — `.max_in_flight(1)` — is no longer
+  taken on faith: `max_in_flight_one_dispatches_in_broker_order` drives twelve
+  staggered records through a real dispatch and asserts the observed order, and
+  raising the bound to 4 makes it fail (`[1, 2, 0, …]`), so the test measures
+  the bound rather than the mock's insertion order.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of
