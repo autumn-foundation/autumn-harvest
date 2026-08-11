@@ -20,12 +20,24 @@
 
 use std::path::{Path, PathBuf};
 
-fn performance_doc_path() -> PathBuf {
-    // CARGO_MANIFEST_DIR is `<repo>/autumn-harvest`; the doc lives at the root.
+/// `<repo>`, i.e. the parent of `CARGO_MANIFEST_DIR` (`<repo>/autumn-harvest`).
+///
+/// Three guards now need to reach files outside the crate (the published page,
+/// the changelog fragment, and the two overview READMEs), so the walk up lives
+/// here rather than being spelled out at each call site.
+fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("crate directory must have a parent")
-        .join("docs/performance.md")
+        .to_path_buf()
+}
+
+fn performance_doc_path() -> PathBuf {
+    repo_root().join("docs/performance.md")
+}
+
+fn changelog_fragment_path() -> PathBuf {
+    repo_root().join("docs/changelog.d/pr-786-claim-throughput-benchmark.md")
 }
 
 /// Read a file with line endings normalised to `\n`.
@@ -618,12 +630,7 @@ fn changelog_fragment_quotes_the_published_figures() {
         .get("double_backlog")
         .expect("the control row must exist");
 
-    let fragment = read_normalized(
-        &Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("crate directory must have a parent")
-            .join("docs/changelog.d/pr-786-claim-throughput-benchmark.md"),
-    );
+    let fragment = read_normalized(&changelog_fragment_path());
 
     // The control's multiplier is the one the retracted attribution was built
     // on, so it is the one most likely to be left stale. Read the current value
@@ -960,5 +967,109 @@ fn the_all_gates_delta_is_not_published_as_a_predicate_bound() {
          comparison yields a floor rather than a bound on combined predicate \
          cost. Deleting the claim without stating the direction of the bias \
          leaves the +28% in the table for a reader to misread the same way."
+    );
+}
+
+/// The two overview files and the bench's own docs must not claim to price
+/// *every* claim-path predicate.
+///
+/// The harness measures five. The other five — `schedule_to_close`, worker
+/// sessions, queue pauses, capability labels and sticky routing — are evaluated
+/// on every claim but sit on their cheapest null/empty path in every scenario
+/// here, so they are exercised rather than measured.
+///
+/// This is the same overclaim round 28 retracted in `docs/performance.md`, one
+/// level out. It matters more here than on the page: an overview is what a
+/// reader sees *before* deciding whether to open the page, so "each predicate"
+/// invites precisely the "predicates are a rounding error" conclusion — and it
+/// does so one step further from the caveats that would have stopped them.
+///
+/// It also covers the bench source, because the first pass at this fix
+/// corrected only the two files the review named and left the identical wording
+/// in the module doc and on `gate_breakdown` — the doc comment of the function
+/// that does the measuring.
+#[test]
+fn overview_docs_do_not_claim_complete_predicate_coverage() {
+    // Quoted occurrences are exempt for the same reason as elsewhere in this
+    // module: a retraction has to name the claim it withdraws. See
+    // [`asserted_in_own_voice`].
+    const BANNED: [&str; 5] = [
+        "each accreted claim-path predicate",
+        "each accreted predicate",
+        "each accreted gate",
+        "every claim-path predicate",
+        "all claim-path predicates",
+    ];
+
+    for rel in [
+        "README.md",
+        "docs/getting-started/README.md",
+        "autumn-harvest/benches/claim_bench.rs",
+    ] {
+        let text = read_normalized(&repo_root().join(rel));
+
+        for banned in BANNED {
+            assert!(
+                !asserted_in_own_voice(&text, banned),
+                "{rel} states \"{banned}\", claiming the benchmark prices every \
+                 claim-path predicate. It prices five of ten; the rest are \
+                 evaluated on their null/empty path and are not measured."
+            );
+        }
+
+        assert!(
+            text.contains("five representative"),
+            "{rel} must say the benchmark attributes cost to five \
+             *representative* predicates. Dropping the qualifier while \
+             describing the gate breakdown reads as complete coverage."
+        );
+    }
+}
+
+/// The changelog fragment's *leading* entry must not publish the retracted
+/// `all_gates` bound.
+///
+/// Scoped to the leading entry, not the whole fragment, and the distinction is
+/// the whole point. The fragment is collated into the public `CHANGELOG.md`, so
+/// its first top-level bullet *is* the released claim; the round-by-round diary
+/// appended below it legitimately records what was believed at each stage and
+/// then corrected, and a guard that forbade the superseded wording anywhere
+/// would forbid the diary from recording the correction at all.
+///
+/// This is the second time this exact drift has occurred (round 26 was the
+/// first) and the existing `changelog_fragment_quotes_the_published_figures`
+/// did not catch it, because that guard checks the *figures* the entry quotes
+/// against the published tables. Here the figure was right and the *conclusion*
+/// drawn from it was withdrawn — a class the figure check cannot see.
+#[test]
+fn the_changelog_leading_entry_does_not_publish_the_retracted_bound() {
+    let fragment = read_normalized(&changelog_fragment_path());
+    let leading = fragment
+        .lines()
+        .next()
+        .expect("the fragment must have a leading entry");
+
+    for banned in [
+        "The bound that does survive on predicate cost",
+        "bound that does survive",
+    ] {
+        assert!(
+            !asserted_in_own_voice(leading, banned),
+            "the changelog fragment's leading entry states \"{banned}\", \
+             presenting the `all_gates` +28% as a surviving bound on combined \
+             predicate cost. Round 28 retracted that: `all_gates` seeds the \
+             PAUSED ballast, so it sorts 10 000 rows where its equal-depth \
+             comparand sorts 20 000, and the comparison bounds nothing. The \
+             diary below may record the superseded claim; the released entry \
+             may not."
+        );
+    }
+
+    assert!(
+        leading.contains("floor, not a bound"),
+        "the changelog fragment's leading entry must carry the narrowed \
+         conclusion, including the direction of the bias (\"floor, not a \
+         bound\"). Deleting the claim without it leaves +28% in the release \
+         note for a reader to draw the retracted conclusion from."
     );
 }

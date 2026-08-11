@@ -4,9 +4,14 @@
 //! issue #135) but had no number at all for `queue::claim_task` — the single
 //! most scalability-critical query in the engine, and the one that has accreted
 //! roughly a `WHERE` predicate per phase since 3.7. This benchmark produces the
-//! reference numbers published in `docs/performance.md`, attributes cost to each
-//! accreted gate, and prints the claim plan so the next contributor to touch
-//! that query can see what they are changing.
+//! reference numbers published in `docs/performance.md`, attributes cost to five
+//! representative accreted gates, and prints the claim plan so the next
+//! contributor to touch that query can see what they are changing.
+//!
+//! The gate breakdown measures five predicates. The other five are evaluated on
+//! every claim but are left on their cheapest null/empty path by every scenario
+//! here, so they are exercised rather than measured — `docs/performance.md`
+//! names them and says so.
 //!
 //! # Running
 //!
@@ -236,7 +241,10 @@ fn print_claim_row(report: &ClaimReport, label: &str) {
 /// contention is the point *there*.
 const ATTRIBUTION_CLAIMERS: usize = 2;
 
-/// Per-gate attribution: what does each accreted predicate cost?
+/// Per-gate attribution: what do five representative accreted predicates cost?
+///
+/// Five, not all ten: the rest sit on their null/empty path in every scenario
+/// here, so this section cannot price them. See `docs/performance.md`.
 async fn gate_breakdown(db: &BenchDb) {
     let headline = Scenario {
         claimers: ATTRIBUTION_CLAIMERS,
