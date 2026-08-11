@@ -10464,19 +10464,30 @@ async fn check_continue_as_new_type<'a>(
 ) -> HarvestResult<ContinueAsNewTypeCheck<'a>> {
     let error = match classify_continue_as_new_target(registry, new_workflow_type) {
         Ok(ContinueAsNewTypeCheck::CrossType(info)) => {
-            // The successor takes a DIFFERENT uniqueness slot —
-            // `(target, workflow_id)` — and sealing the predecessor does not
-            // free it. Resolve that slot now, under the same transaction, so a
-            // collision is an actionable terminal failure rather than a bare
-            // Postgres unique violation that rolls the whole cycle back.
-            match resolve_successor_slot(conn, info.name, &execution.workflow_id, execution.id)
-                .await?
-            {
-                Ok(resolved) => {
-                    *slot = resolved;
-                    return Ok(ContinueAsNewTypeCheck::CrossType(info));
+            // Routing first: the slot resolution below can only see the
+            // predecessor's shard, so it is only sound once we know the target
+            // key routes to that same shard (Codex P1 on PR #1159).
+            if let Err(error) = reject_cross_shard_continue_as_new(
+                info.name,
+                &execution.workflow_id,
+                execution.shard_id,
+            ) {
+                error
+            } else {
+                // The successor takes a DIFFERENT uniqueness slot —
+                // `(target, workflow_id)` — and sealing the predecessor does not
+                // free it. Resolve that slot now, under the same transaction, so a
+                // collision is an actionable terminal failure rather than a bare
+                // Postgres unique violation that rolls the whole cycle back.
+                match resolve_successor_slot(conn, info.name, &execution.workflow_id, execution.id)
+                    .await?
+                {
+                    Ok(resolved) => {
+                        *slot = resolved;
+                        return Ok(ContinueAsNewTypeCheck::CrossType(info));
+                    }
+                    Err(error) => error,
                 }
-                Err(error) => error,
             }
         }
         Ok(resolved) => return Ok(resolved),
@@ -10524,12 +10535,96 @@ enum SuccessorSlot {
     SealTerminal(uuid::Uuid),
 }
 
+/// Reject a cross-type continuation whose target key routes to a *different*
+/// shard than the predecessor lives on (issue #803, Codex P1 on PR #1159).
+///
+/// Rendezvous routing hashes the **pair** `(workflow_name, workflow_id)`, so
+/// changing the type changes the shard the key resolves to — empirically for
+/// ~75% of ids on a 4-shard router. The successor, however, is inserted on the
+/// predecessor's shard: the seal and the insert are one transaction, and
+/// Postgres has no cross-shard transaction to move it with.
+///
+/// Left unguarded that silently breaks two things a multi-shard deployment
+/// relies on:
+///
+/// 1. **`workflow_id`-addressed signal/cancel/await (issue #751)** resolves its
+///    target with `shard::external_target_owning_shard`, which hashes the new
+///    pair — so it queries the wrong database and reports the live successor as
+///    `target_unknown`. That is precisely the addressing mode this feature tells
+///    callers to use for an entity that changes type.
+/// 2. **`(workflow_name, workflow_id)` uniqueness**, because
+///    [`resolve_successor_slot`] can only see the predecessor's shard: a live
+///    run of the target type sitting on the hash-derived shard is invisible, so
+///    the successor is created alongside it and two live runs share one key.
+///
+/// So this fails the transition **closed**, matching what the feature already
+/// does for every other unsupported target (blank, unregistered, DAG, occupied
+/// slot): a loud, deterministic, actionable terminal failure instead of silent
+/// misrouting and a broken uniqueness invariant.
+///
+/// **Single-shard deployments are unaffected** — one shard means the key can
+/// only ever resolve to it, so this never fires. It is also inert when no
+/// global router is installed (tests, embedders that never call
+/// `install_global_router`), since the target shard is then unknowable and
+/// guessing would be worse than the status quo.
+fn reject_cross_shard_continue_as_new(
+    target: &str,
+    workflow_id: &str,
+    predecessor_shard: i32,
+) -> Result<(), String> {
+    let target_shard =
+        crate::shard::external_target_owning_shard(&crate::types::ExternalTarget::WorkflowId {
+            workflow_name: target.to_string(),
+            workflow_id: workflow_id.to_string(),
+        });
+    classify_cross_shard_continue_as_new(target, workflow_id, predecessor_shard, target_shard)
+}
+
+/// Pure decision behind [`reject_cross_shard_continue_as_new`].
+///
+/// Split out so the inert / co-located / divergent matrix is unit-testable
+/// without installing a process-global router (which would race sibling tests
+/// in the same binary), matching how [`classify_successor_slot`] and
+/// [`classify_continue_as_new_target`] are tested.
+///
+/// `target_shard == None` means no global router is installed.
+fn classify_cross_shard_continue_as_new(
+    target: &str,
+    workflow_id: &str,
+    predecessor_shard: i32,
+    target_shard: Option<crate::types::ShardId>,
+) -> Result<(), String> {
+    let Some(target_shard) = target_shard else {
+        // No global router installed: the target shard is unknowable here, and
+        // a deployment without a router is single-shard by construction.
+        return Ok(());
+    };
+    if target_shard.as_i32() == predecessor_shard {
+        return Ok(());
+    }
+    Err(format!(
+        "continue_as_new into '{target}' would place the successor on shard {predecessor_shard} \
+         (the predecessor's shard, since the seal and the successor insert are one transaction), \
+         but the key ('{target}', '{workflow_id}') routes to shard {}. Cross-shard relocation is \
+         not supported, and proceeding would make the successor unreachable by workflow_id-\
+         addressed signal/cancel (issue #751) and could admit a second live run of the target type \
+         on the routed shard. Keep this entity on one type and branch internally, or run a \
+         single-shard deployment",
+        target_shard.as_i32()
+    ))
+}
+
 /// Resolve the successor's uniqueness slot for a cross-type continuation.
 ///
 /// Takes the occupying row (if any) `FOR UPDATE` so the decision is stable for
 /// the rest of the enclosing transaction — a concurrent start of the target
 /// type under the same `workflow_id` cannot slip in between this check and the
 /// successor insert.
+///
+/// Scope note: this can only see the **predecessor's shard**. That is sound
+/// only because [`reject_cross_shard_continue_as_new`] has already rejected any
+/// transition whose target key routes elsewhere, so the routed shard and the
+/// queried shard are necessarily the same one.
 ///
 /// `Ok(Err(msg))` is a *rejection* (an operator-facing message), not a database
 /// error: a **live** run of the target type already owns the identity, and
@@ -22304,6 +22399,91 @@ mod tests {
             defaults.workflow_retry_policy,
             Some(serde_json::json!({"max_attempts": 50})),
             "the same-type arm must carry the stored policy verbatim"
+        );
+    }
+
+    /// Establishes the PREMISE of the cross-shard guard: rendezvous routing
+    /// hashes the `(workflow_name, workflow_id)` **pair**, so changing the type
+    /// genuinely re-routes the key for most ids. Without this the guard below
+    /// could be dead code that nobody notices.
+    #[test]
+    fn can803_cross_type_key_routes_to_a_different_shard_for_most_ids() {
+        use crate::shard::ShardRouter;
+        use crate::types::ShardId;
+        let shards: Vec<ShardId> = (0..4).map(ShardId::new).collect();
+        let router = ShardRouter::new(shards.clone(), shards, ShardId::new(0));
+
+        let diverged = (0..200)
+            .filter(|i| {
+                let wid = format!("sub-{i}");
+                router.pick_for_new_workflow("trial_subscription", &wid)
+                    != router.pick_for_new_workflow("paid_subscription", &wid)
+            })
+            .count();
+
+        // ~3/4 expected on 4 shards. A loose floor keeps this a premise check
+        // rather than a brittle assertion on the hash function.
+        assert!(
+            diverged > 100,
+            "the pair-hash premise is false: only {diverged}/200 ids re-routed on a type change, \
+             so reject_cross_shard_continue_as_new would be guarding nothing"
+        );
+    }
+
+    /// The full inert / co-located / divergent matrix for the cross-shard
+    /// guard, driven through the pure decision so no process-global router is
+    /// installed (which would race sibling tests in this binary).
+    #[test]
+    fn can803_cross_shard_guard_matrix() {
+        use crate::types::ShardId;
+
+        // No router installed => inert. A deployment without one is
+        // single-shard by construction, and guessing would be worse.
+        assert!(
+            classify_cross_shard_continue_as_new("paid_subscription", "sub-1", 0, None).is_ok(),
+            "with no router installed the guard must not reject"
+        );
+
+        // Target key routes to the predecessor's own shard => allowed. This is
+        // every single-shard deployment, and the co-located slice of a
+        // multi-shard one.
+        assert!(
+            classify_cross_shard_continue_as_new(
+                "paid_subscription",
+                "sub-1",
+                0,
+                Some(ShardId::new(0))
+            )
+            .is_ok(),
+            "a co-located target must never be rejected"
+        );
+        assert!(
+            classify_cross_shard_continue_as_new(
+                "paid_subscription",
+                "sub-1",
+                3,
+                Some(ShardId::new(3))
+            )
+            .is_ok(),
+            "co-location on a non-zero shard must also be allowed"
+        );
+
+        // Divergent => rejected, and the message must name BOTH shards so an
+        // operator can tell which way it diverged without reading the source.
+        let error = classify_cross_shard_continue_as_new(
+            "paid_subscription",
+            "sub-42",
+            0,
+            Some(ShardId::new(2)),
+        )
+        .expect_err("a target routing to another shard must be rejected");
+        assert!(
+            error.contains("shard 0") && error.contains("shard 2"),
+            "the rejection must name both the predecessor's and the routed shard: {error}"
+        );
+        assert!(
+            error.contains("paid_subscription") && error.contains("sub-42"),
+            "the rejection must name the target key: {error}"
         );
     }
 
