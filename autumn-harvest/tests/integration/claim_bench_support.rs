@@ -656,6 +656,15 @@ struct DriverUrl<'a> {
     query: Option<&'a str>,
 }
 
+/// The exact scheme prefixes `UrlParser::remove_url_prefix` accepts.
+///
+/// Byte-exact and **prefix-only**: the driver strips these with
+/// `str::strip_prefix` and, failing that, hands the *whole* string to the
+/// keyword/value parser. So the two forms are chosen by how the string begins,
+/// never by what it contains — `host=db password=http://hunter2` is keyword
+/// form, and a case variant like `POSTGRES://…` is too.
+const URL_SCHEME_PREFIXES: [&str; 2] = ["postgres://", "postgresql://"];
+
 /// Split a URL-form connection string, or `None` for the keyword/value form.
 ///
 /// The split follows `UrlParser::parse`'s *order* — credentials, then host,
@@ -664,9 +673,15 @@ struct DriverUrl<'a> {
 /// the **whole** remaining string, so a password containing `/` or `?` still
 /// terminates at that `@`, whereas an authority-first split would stop short
 /// and never see it.
+///
+/// Form selection is likewise the driver's, not a guess: only the prefixes in
+/// [`URL_SCHEME_PREFIXES`] make a string a URL. Searching for `://` anywhere
+/// would read an ordinary keyword value such as `password=http://hunter2` as a
+/// scheme, and then redact none of the string that followed it.
 fn split_driver_url(url: &str) -> Option<DriverUrl<'_>> {
-    let scheme_end = url.find("://")?;
-    let (prefix, rest) = url.split_at(scheme_end + 3);
+    let (prefix, rest) = URL_SCHEME_PREFIXES
+        .iter()
+        .find_map(|scheme| url.strip_prefix(scheme).map(|rest| (*scheme, rest)))?;
 
     // `parse_credentials`: `take_until(&['@'])` over everything that is left,
     // so the first `@` wins no matter what precedes it.
@@ -865,13 +880,23 @@ fn redact_query_values(query: &str) -> String {
 ///
 /// **Fails closed.** Anything the grammar cannot parse — an unterminated quote,
 /// a stray `=` — is replaced wholesale rather than echoed, because an
-/// unparseable remainder is exactly where a value would be hiding. The one
-/// exception is a string with no `=` anywhere, which cannot be a keyword/value
-/// connection string at all and so carries no `key=value` secret; printing it
-/// keeps a malformed-URL message diagnostic.
+/// unparseable remainder is exactly where a value would be hiding.
+///
+/// A string with no `=` anywhere carries no `key=value` secret, so it is
+/// printed to keep a malformed-connection-string message diagnostic — *unless*
+/// it contains an `@`. That carve-out is not hypothetical: a case variant of a
+/// scheme, `POSTGRES://alice:hunter2@db/x`, is keyword form to the driver
+/// (`remove_url_prefix` is byte-exact) and reaches this function, and its
+/// secret is in userinfo rather than in a `key=value` pair. Everything through
+/// the **last** `@` is dropped — more than userinfo strictly requires, which is
+/// the right direction for a string whose grammar we have already failed to
+/// parse — while the tail after it is kept, so the endpoint stays readable.
 fn redact_keyword_values(params: &str) -> String {
     if !params.contains('=') {
-        return params.to_string();
+        return params.rfind('@').map_or_else(
+            || params.to_string(),
+            |at| format!("***@{}", &params[at + 1..]),
+        );
     }
     let (pairs, stopped) = keyword_value_pairs(params);
     let mut parts: Vec<String> = pairs
@@ -1635,6 +1660,70 @@ mod pure_tests {
         // window negative (which would flip the throughput sign).
         let window = measured_window(&[(s(500), s(100))]);
         assert!(window >= 0.0, "window went negative: {window}");
+    }
+
+    /// `://` inside a keyword value does not make the string a URL.
+    ///
+    /// `UrlParser::remove_url_prefix` strips `postgres://` / `postgresql://`
+    /// with `strip_prefix` and otherwise declines, so `Config::from_str` hands
+    /// the whole string to the keyword parser. Searching for `://` anywhere
+    /// instead reads `password=http://hunter2` as a scheme, which leaves the
+    /// password on the far side of a split that redacts nothing.
+    #[test]
+    fn redact_url_treats_a_scheme_inside_a_value_as_keyword_form() {
+        let redacted = redact_url("host=db password=http://hunter2");
+        assert!(
+            !redacted.contains("hunter2"),
+            "password survived: {redacted}"
+        );
+        assert!(redacted.contains("host=db"), "endpoint lost: {redacted}");
+    }
+
+    /// The same misclassification corrupts a rewritten target.
+    ///
+    /// Read as a URL, the keyword string is spliced into `.../bench` and stops
+    /// being a connection string at all; read as keyword form, `dbname` is
+    /// replaced and every other pair is preserved.
+    #[test]
+    fn with_db_name_treats_a_scheme_inside_a_value_as_keyword_form() {
+        let rewritten = with_db_name("host=db dbname=admin sslmode=require", "bench");
+        assert!(
+            rewritten.contains("dbname=bench"),
+            "target not rewritten: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("dbname=admin"),
+            "old dbname survived: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("host=db") && rewritten.contains("sslmode=require"),
+            "sibling parameters lost: {rewritten}"
+        );
+    }
+
+    /// A case-variant scheme is keyword form too — and still must not leak.
+    ///
+    /// `remove_url_prefix` is byte-exact, so `POSTGRES://` is *not* a URL to the
+    /// driver. Such a string reaches the keyword redactor, where it has no `=`
+    /// at all: the passthrough that keeps a malformed-string message diagnostic
+    /// would otherwise print its userinfo verbatim. The endpoint after the last
+    /// `@` is still shown.
+    #[test]
+    fn redact_url_hides_userinfo_in_an_unparseable_scheme_variant() {
+        let redacted = redact_url("POSTGRES://alice:hunter2@db.internal/x");
+        assert!(
+            !redacted.contains("hunter2"),
+            "password survived: {redacted}"
+        );
+        assert!(!redacted.contains("alice"), "username survived: {redacted}");
+        assert!(
+            redacted.contains("db.internal/x"),
+            "endpoint lost: {redacted}"
+        );
+
+        // A genuinely harmless string with no `=` and no `@` still prints, so
+        // the diagnostic value of the passthrough is not lost wholesale.
+        assert_eq!(redact_url("localhost"), "localhost");
     }
 
     /// A password containing `/` or `?` still ends at the first `@`.
