@@ -1137,3 +1137,82 @@ fn changelog_leading_entry_per_gate_figures_match_the_published_table() {
         );
     }
 }
+
+/// Every millisecond figure the changelog's headline findings quote must still
+/// appear somewhere on the published page.
+///
+/// The per-gate guard above covers the AC2 list. Auditing that fix turned up
+/// that the *same* round-22 regeneration had also left findings (1) and (4)
+/// behind — the release note claimed 1k→10k cost ~24x (9.92 ms → 234.22 ms) and
+/// that 100k drains at ~2 claims/s against ~3 650 enqueues/s, while the page's
+/// own sweep table published 10.44 ms → 200.03 ms → 2 919.99 ms, ~3 claims/s and
+/// ~4 600 enqueues/s. So the drift was never specific to the gate list; it was
+/// the whole headline.
+///
+/// A containment check rather than a table parse, deliberately: the headline is
+/// prose that quotes figures from several tables (the sweep, the enqueue sweep,
+/// the plan's buffer counts), and a parser per table would have to be extended
+/// every time the prose cites a new one — the same instance-by-instance trap
+/// that let this survive. Requiring each quoted figure to appear *somewhere* on
+/// the page needs no such extension: regenerating any table drops its old
+/// values off the page, and the stale quote fails here.
+///
+/// Scoped to the headline findings for the same reason the AC2 guard is scoped
+/// to its list: the entry quotes other runs on purpose elsewhere (the
+/// reproducibility spread), which the page publishes as a spread.
+#[test]
+fn changelog_headline_millisecond_figures_still_appear_on_the_page() {
+    let doc = read_performance_doc();
+    let fragment = read_normalized(&changelog_fragment_path());
+    let leading = fragment
+        .lines()
+        .next()
+        .expect("the fragment must have a leading entry");
+
+    let start = leading
+        .find("Headline measured findings")
+        .expect("the leading entry must summarise the headline findings");
+    let end = leading[start..]
+        .find("An equal-depth control")
+        .map_or(leading.len(), |o| start + o);
+    let headline = &leading[start..end];
+
+    // `9.92 ms`, `234.22 ms`, `3 531.95 ms` — digits with optional ASCII-space
+    // thousands separators, two decimals, followed by the unit.
+    let mut quoted = Vec::new();
+    let bytes: Vec<char> = headline.chars().collect();
+    for (i, c) in bytes.iter().enumerate() {
+        if !c.is_ascii_digit() {
+            continue;
+        }
+        if i > 0 && (bytes[i - 1].is_ascii_digit() || bytes[i - 1] == '.') {
+            continue;
+        }
+        let rest: String = bytes[i..].iter().collect();
+        let num_len = rest.find(" ms").filter(|&n| n > 0 && n <= 12).filter(|&n| {
+            let s = &rest[..n];
+            s.contains('.')
+                && s.chars()
+                    .all(|c| c.is_ascii_digit() || c == '.' || c == ' ')
+        });
+        if let Some(n) = num_len {
+            quoted.push(rest[..n].to_string());
+        }
+    }
+
+    assert!(
+        !quoted.is_empty(),
+        "the headline findings must quote at least one millisecond figure; if \
+         they no longer do, this guard is watching the wrong text and should be \
+         re-scoped rather than deleted"
+    );
+
+    for figure in quoted {
+        assert!(
+            doc.contains(&figure),
+            "the changelog's headline findings quote `{figure} ms`, which no \
+             longer appears anywhere in docs/performance.md. The page was \
+             regenerated and the release note kept the previous run's number."
+        );
+    }
+}
