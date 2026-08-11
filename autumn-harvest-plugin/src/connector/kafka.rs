@@ -326,6 +326,32 @@ fn committable_anchors(
         .collect()
 }
 
+/// The partitions a successful commit pass may retire as durable.
+///
+/// Deliberately **not** "everything we tried to commit". A commit pass filters
+/// `owed` through [`committable_anchors`], and the two filters mean different
+/// things for durability:
+///
+/// * **Not assigned** — nothing spoke for the partition. Retiring it would be a
+///   silent lie with a long fuse: `durable` is permanent process state, so if a
+///   rebalance hands that partition back later the eager commit is suppressed
+///   *forever*, and a crash under an otherwise-uncommitted `latest` group
+///   re-resolves at the tail and skips accepted records.
+/// * **Assigned but does not raise** — the group is already committed at or
+///   above the floor, so a crash resumes covered. Genuinely durable, even
+///   though this pass committed nothing for it.
+///
+/// So ownership, not the commit list, is what makes a partition retirable. The
+/// cost of *not* retiring an unassigned one is a `committed_offsets` call on the
+/// next receive while the stale anchor lingers — a rare failure-path cost
+/// (read, commit failed, then revoked), not a steady-state one.
+fn covered_anchor_partitions(owed: &[(i32, i64)], assigned: &[i32]) -> Vec<i32> {
+    owed.iter()
+        .map(|(partition, _)| *partition)
+        .filter(|partition| assigned.contains(partition))
+        .collect()
+}
+
 /// The anchors that must be made durable *before* their records are dispatched.
 ///
 /// [`PartitionAnchors`] is in-process state, and only [`EventSource::recover`]
@@ -442,10 +468,9 @@ impl KafkaSource {
     ///
     /// Guarded by the same [`committable_anchors`] filter [`EventSource::recover`]
     /// uses, so an eager commit is still monotonic and local — it can only raise
-    /// a partition this replica currently owns. A partition filtered out is
-    /// still retired: either the group is already committed at or above the
-    /// floor (so a crash resumes covered), or this replica does not own it and
-    /// cannot speak for it in the first place.
+    /// a partition this replica currently owns. Only the partitions the pass
+    /// actually spoke for are retired; see [`covered_anchor_partitions`] for why
+    /// "assigned" and not "committed" is the right line.
     ///
     /// **Best-effort.** A failed commit warns and leaves the partition owed, so
     /// the next receive retries. Failing the receive instead would discard the
@@ -462,7 +487,7 @@ impl KafkaSource {
         let consumer = Arc::clone(consumer);
         let to_commit = owed.clone();
         // Committing and reading committed offsets are blocking librdkafka calls.
-        let landed = tokio::task::spawn_blocking(move || {
+        let landed = tokio::task::spawn_blocking(move || -> Result<Vec<i32>, ConnectorError> {
             let assigned: Vec<i32> = consumer
                 .assignment()
                 .map_err(|e| ConnectorError::Broker(format!("kafka assignment: {e}")))?
@@ -494,8 +519,12 @@ impl KafkaSource {
                     }
                 });
 
+            // Retirable regardless of whether anything is left to commit: an
+            // assigned partition the group already covers is durable too.
+            let covered = covered_anchor_partitions(&to_commit, &assigned);
+
             if committable.is_empty() {
-                return Ok(());
+                return Ok(covered);
             }
             let mut tpl = TopicPartitionList::new();
             for (partition, floor) in committable {
@@ -506,15 +535,16 @@ impl KafkaSource {
             }
             consumer
                 .commit(&tpl, CommitMode::Sync)
-                .map_err(|e| ConnectorError::Broker(format!("kafka anchor commit: {e}")))
+                .map_err(|e| ConnectorError::Broker(format!("kafka anchor commit: {e}")))?;
+            Ok(covered)
         })
         .await;
 
         match landed {
-            Ok(Ok(())) => {
+            Ok(Ok(covered)) => {
                 self.with_anchors(|a| {
-                    for (partition, _) in &owed {
-                        a.mark_durable(*partition);
+                    for partition in covered {
+                        a.mark_durable(partition);
                     }
                 });
             }
@@ -529,6 +559,95 @@ impl KafkaSource {
                 "kafka anchor commit panicked; a crash before the next attempt may skip these records"
             ),
         }
+    }
+
+    /// Drain up to `max` records, waiting `timeout` only for the first.
+    ///
+    /// Split out of [`EventSource::receive`] so that function has exactly ONE
+    /// exit that produces a batch — see the comment there. A deferred `recv()`
+    /// error returns the partial batch as `Ok`, which is what
+    /// [`defer_recv_error`] is for.
+    async fn drain_batch(
+        &self,
+        consumer: &Arc<StreamConsumer>,
+        max: usize,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<InboundMessage>, ConnectorError> {
+        let mut batch = Vec::new();
+        // Wait `timeout` for the first message, then drain whatever else is
+        // already buffered without blocking again.
+        let mut budget = timeout;
+        while batch.len() < max {
+            let next = tokio::time::timeout(budget, consumer.recv()).await;
+            let Ok(result) = next else { break };
+            let message = match result {
+                Ok(message) => message,
+                Err(e) if defer_recv_error(batch.len()) => {
+                    // Hand back what we already drained; the next poll surfaces
+                    // the error with an empty batch. Dropping these records
+                    // would lose them permanently (see `defer_recv_error`).
+                    tracing::warn!(
+                        topic = %self.topic,
+                        drained = batch.len(),
+                        error = %e,
+                        "kafka receive failed mid-batch; yielding the drained records first"
+                    );
+                    return Ok(batch);
+                }
+                Err(e) => {
+                    return Err(ConnectorError::Broker(format!("kafka receive: {e}")));
+                }
+            };
+
+            let headers = message.headers().map_or_else(BTreeMap::new, |hs| {
+                (0..hs.count())
+                    .map(|i| hs.get(i))
+                    .map(|h| {
+                        (
+                            h.key.to_string(),
+                            h.value
+                                .map(|v| String::from_utf8_lossy(v).into_owned())
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect()
+            });
+
+            // The first offset read from a partition is where this group
+            // resolved to, and is the floor a rebuild must not skip past.
+            self.with_anchors(|a| a.record_read(message.partition(), message.offset()));
+            batch.push(to_inbound(
+                message.topic(),
+                message.partition(),
+                message.offset(),
+                message.key().map(<[u8]>::to_vec),
+                message.payload().unwrap_or_default().to_vec(),
+                headers,
+            ));
+            budget = std::time::Duration::ZERO;
+        }
+        Ok(batch)
+    }
+
+    /// Commit a settled offset for one partition and raise its anchor.
+    ///
+    /// Split out of [`EventSource::ack`] only so the coordinate check reads as
+    /// a guard clause; the behaviour is unchanged.
+    fn commit_settled_offset(&self, partition: i32, offset: i64) -> Result<(), ConnectorError> {
+        let mut tpl = TopicPartitionList::new();
+        // Kafka's committed offset is the NEXT offset to read, so commit
+        // `offset + 1`. The runtime has already established that every lower
+        // offset in this partition is settled.
+        tpl.add_partition_offset(&self.topic, partition, Offset::Offset(offset + 1))
+            .map_err(|e| ConnectorError::Broker(format!("kafka offset list: {e}")))?;
+        self.consumer()
+            .commit(&tpl, CommitMode::Async)
+            .map_err(|e| ConnectorError::Broker(format!("kafka commit: {e}")))?;
+        // Raise the resume floor. The commit above is ASYNC, so it may not be
+        // durable yet; recording it here lets `recover` re-assert it
+        // synchronously before a rebuild rather than racing it.
+        self.with_anchors(|a| a.record_commit(partition, offset + 1));
+        Ok(())
     }
 }
 
@@ -595,62 +714,16 @@ impl EventSource for KafkaSource {
         max: usize,
         timeout: std::time::Duration,
     ) -> Result<Vec<InboundMessage>, ConnectorError> {
-        let mut batch = Vec::new();
         // Snapshot the consumer once: a rebuild mid-pass must not split this
         // batch across two generations.
         let consumer = self.consumer();
-        // Wait `timeout` for the first message, then drain whatever else is
-        // already buffered without blocking again.
-        let mut budget = timeout;
-        while batch.len() < max {
-            let next = tokio::time::timeout(budget, consumer.recv()).await;
-            let Ok(result) = next else { break };
-            let message = match result {
-                Ok(message) => message,
-                Err(e) if defer_recv_error(batch.len()) => {
-                    // Hand back what we already drained; the next poll surfaces
-                    // the error with an empty batch. Dropping these records
-                    // would lose them permanently (see `defer_recv_error`).
-                    tracing::warn!(
-                        topic = %self.topic,
-                        drained = batch.len(),
-                        error = %e,
-                        "kafka receive failed mid-batch; yielding the drained records first"
-                    );
-                    return Ok(batch);
-                }
-                Err(e) => {
-                    return Err(ConnectorError::Broker(format!("kafka receive: {e}")));
-                }
-            };
-
-            let headers = message.headers().map_or_else(BTreeMap::new, |hs| {
-                (0..hs.count())
-                    .map(|i| hs.get(i))
-                    .map(|h| {
-                        (
-                            h.key.to_string(),
-                            h.value
-                                .map(|v| String::from_utf8_lossy(v).into_owned())
-                                .unwrap_or_default(),
-                        )
-                    })
-                    .collect()
-            });
-
-            // The first offset read from a partition is where this group
-            // resolved to, and is the floor a rebuild must not skip past.
-            self.with_anchors(|a| a.record_read(message.partition(), message.offset()));
-            batch.push(to_inbound(
-                message.topic(),
-                message.partition(),
-                message.offset(),
-                message.key().map(<[u8]>::to_vec),
-                message.payload().unwrap_or_default().to_vec(),
-                headers,
-            ));
-            budget = std::time::Duration::ZERO;
-        }
+        // ONE exit for a produced batch, deliberately. The drain has two ways to
+        // stop early (the `max`/budget break and the deferred-error path), and
+        // when the anchor step lived at the end of that loop the deferred path
+        // returned around it -- shipping records for dispatch with no durable
+        // floor. Keeping the drain in its own function makes the bypass
+        // impossible to reintroduce rather than merely fixed.
+        let batch = self.drain_batch(&consumer, max, timeout).await?;
         // Before these records leave this function and become someone's
         // in-flight work, make the `latest` resume floor durable to the group.
         // Best-effort: see `make_anchors_durable`.
@@ -667,21 +740,7 @@ impl EventSource for KafkaSource {
                 handle.token
             )));
         };
-
-        let mut tpl = TopicPartitionList::new();
-        // Kafka's committed offset is the NEXT offset to read, so commit
-        // `offset + 1`. The runtime has already established that every lower
-        // offset in this partition is settled.
-        tpl.add_partition_offset(&self.topic, partition, Offset::Offset(offset + 1))
-            .map_err(|e| ConnectorError::Broker(format!("kafka offset list: {e}")))?;
-        self.consumer()
-            .commit(&tpl, CommitMode::Async)
-            .map_err(|e| ConnectorError::Broker(format!("kafka commit: {e}")))?;
-        // Raise the resume floor. The commit above is ASYNC, so it may not be
-        // durable yet; recording it here lets `recover` re-assert it
-        // synchronously before a rebuild rather than racing it.
-        self.with_anchors(|a| a.record_commit(partition, offset + 1));
-        Ok(())
+        self.commit_settled_offset(partition, offset)
     }
 
     async fn abandon(&self, _handle: &MessageHandle) -> Result<(), ConnectorError> {
@@ -690,7 +749,6 @@ impl EventSource for KafkaSource {
         // the connector's derived idempotency key.
         Ok(())
     }
-
     fn abandon_redelivers(&self) -> bool {
         // Not committing is the whole mechanism, so `abandon` above is a no-op
         // and `recv()` has already advanced the local position past the
@@ -1308,6 +1366,39 @@ mod tests {
         );
         anchors.mark_durable(1);
         assert!(anchors_needing_durability(OffsetReset::Latest, &anchors).is_empty());
+    }
+
+    /// Only a partition the commit pass actually spoke for is retired.
+    ///
+    /// `durable` is permanent process state, so retiring a partition no commit
+    /// covered is not a harmless optimism: if a rebalance hands that partition
+    /// back later, the eager commit is suppressed forever and a crash under an
+    /// otherwise-uncommitted `latest` group re-resolves at the tail.
+    #[test]
+    fn only_partitions_the_commit_pass_covered_are_retired() {
+        let owed = vec![(0, 100), (1, 7), (2, 42)];
+
+        // Partition 1 was revoked between the read and the commit, so
+        // `committable_anchors` filtered it out and nothing spoke for it.
+        assert_eq!(
+            covered_anchor_partitions(&owed, &[0, 2]),
+            vec![0, 2],
+            "an unassigned partition is not covered, however the commit ended",
+        );
+
+        // An assigned partition filtered out by the RAISES guard IS covered:
+        // the group is already committed at or above the floor, so a crash
+        // resumes covered even though this pass committed nothing for it.
+        assert_eq!(
+            covered_anchor_partitions(&owed, &[0, 1, 2]),
+            vec![0, 1, 2],
+            "ownership is what makes the pass able to speak for a partition",
+        );
+
+        assert!(
+            covered_anchor_partitions(&owed, &[]).is_empty(),
+            "a pass that owns nothing retires nothing",
+        );
     }
 
     /// The default policy pays nothing for this.

@@ -1070,6 +1070,30 @@ coordinates, so a run traces back to the exact message.
   to name both mechanisms truthfully rather than only the `signals_with_start`
   one.
 
+- **The eager anchor commit was bypassed on the partial-batch exit.** `receive`
+  had two ways to produce a batch — the normal loop exit and the
+  `defer_recv_error` early return that hands back what was already drained — and
+  the anchor step sat only on the first. A deferred `recv()` error therefore
+  shipped accepted records for dispatch with no durable floor, which is exactly
+  the crash-skip the eager commit exists to close. Fixed structurally rather
+  than by adding a second call site: the drain loop moved into `drain_batch`, so
+  `receive` has **one** exit that produces a batch and the bypass is impossible
+  to reintroduce.
+- **A partition no commit covered was retired as durable.** `make_anchors_durable`
+  marked every *owed* partition durable on a successful pass, but
+  `committable_anchors` filters on two conditions, and only one of them implies
+  durability. A partition filtered out because it is **no longer assigned** had
+  nothing speak for it — and `durable` is permanent process state, so if a
+  rebalance handed that partition back later the eager commit was suppressed
+  forever and a crash under an otherwise-uncommitted `latest` group re-resolved
+  at the tail. (A partition filtered out by the **raises** guard *is* covered:
+  the group is already committed at or above the floor.) So ownership, not the
+  commit list, is the right line — the new pure `covered_anchor_partitions`
+  returns it and the blocking pass hands it back, so only what it spoke for is
+  retired. The cost of not retiring an unassigned anchor is a `committed_offsets`
+  call on the next receive while it lingers: a rare failure-path cost (read,
+  commit failed, then revoked), not a steady-state one.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of
