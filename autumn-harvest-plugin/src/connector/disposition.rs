@@ -268,6 +268,13 @@ struct StrikeState {
     count: u32,
     /// When this key was last handed to the broker's own redrive, if ever.
     terminal_at: Option<std::time::Instant>,
+    /// Whether `terminal_at` came from harvest's own sink rather than the
+    /// broker's redrive.
+    ///
+    /// The two differ in one respect that outlives the handoff: only the sink
+    /// one restarts the countdown, so only it can leave a *marked* entry
+    /// accumulating a fresh streak. See [`Self::is_active`].
+    sink_terminal: bool,
     /// When this key was last touched — by a strike or a terminal mark.
     ///
     /// The ordering key for *both* the hard cap and retention expiry, so a
@@ -289,8 +296,35 @@ impl StrikeState {
         Self {
             count: 0,
             terminal_at: None,
+            sink_terminal: false,
             last_seen: now,
         }
+    }
+
+    /// Whether a *redelivery* is what advances this entry, and so whether its
+    /// retention floor belongs to the broker rather than the operator.
+    ///
+    /// Deliberately not `terminal_at.is_none()`, which is the **dedupe**
+    /// question ("have we already counted this as poisoned?"). The two
+    /// diverge, and conflating them under-retains a live streak:
+    /// [`PoisonTracker::mark_sink_terminal_as_of`] restarts the countdown
+    /// while leaving the mark set, so a message redelivered after a failed ack
+    /// accumulates a **new** streak on an entry that still reads as terminal.
+    /// Swept on the operator's (usually far shorter) `poison_retention`, that
+    /// progress is discarded before each next delivery, so every redelivery is
+    /// strike one and a `poison_threshold > 1` never bites.
+    ///
+    /// Scoped to the **sink** mark rather than any retained count, because a
+    /// broker-native entry's strikes are retained *at* or above the threshold
+    /// so every redrive lap re-nacks on sight — it is not accumulating toward
+    /// anything, and those entries are deliberately expired on the operator's
+    /// window so a stream of distinct poison messages cannot pin the map.
+    ///
+    /// A zero count with a mark set is the genuinely settled case — a
+    /// deterministic poison, or a sink quarantine nothing has re-struck — and
+    /// keeps the operator's retention too.
+    const fn is_active(&self) -> bool {
+        self.terminal_at.is_none() || (self.sink_terminal && self.count > 0)
     }
 }
 
@@ -441,12 +475,22 @@ impl PoisonTracker {
     /// bounded exactly like a strike-bearing one: it joins the same expiry
     /// order and retires on the same retention deadline.
     pub fn mark_terminal_as_of(&mut self, key: &str, now: std::time::Instant) -> bool {
+        self.mark_terminal_of_kind(key, now, false)
+    }
+
+    /// Shared body of the two terminal marks, carrying which one it is.
+    ///
+    /// The kind is recorded rather than inferred because it outlives the call:
+    /// only the sink handoff restarts the countdown, so only it can leave a
+    /// marked entry accumulating a fresh streak (see [`StrikeState::is_active`]).
+    fn mark_terminal_of_kind(&mut self, key: &str, now: std::time::Instant, sink: bool) -> bool {
         let state = self
             .strikes
             .entry(key.to_string())
             .or_insert_with(|| StrikeState::fresh(now));
         let first = state.terminal_at.is_none();
         state.terminal_at = Some(now);
+        state.sink_terminal = sink;
         state.last_seen = now;
         self.expiry.push_back((now, key.to_string()));
         self.enforce_cap();
@@ -473,7 +517,7 @@ impl PoisonTracker {
     /// The entry is bounded exactly like any other: same expiry order, same
     /// retention deadline.
     pub fn mark_sink_terminal_as_of(&mut self, key: &str, now: std::time::Instant) -> bool {
-        let first = self.mark_terminal_as_of(key, now);
+        let first = self.mark_terminal_of_kind(key, now, true);
         if let Some(state) = self.strikes.get_mut(key) {
             state.count = 0;
         }
@@ -526,11 +570,7 @@ impl PoisonTracker {
     ) -> usize {
         let mut retired = 0;
         while let Some((at, key)) = self.expiry.front() {
-            let due_after = if self
-                .strikes
-                .get(key)
-                .is_some_and(|s| s.terminal_at.is_none())
-            {
+            let due_after = if self.strikes.get(key).is_some_and(StrikeState::is_active) {
                 retention.max(ACTIVE_STRIKE_RETENTION_FLOOR)
             } else {
                 retention
@@ -629,11 +669,7 @@ impl PoisonTracker {
         let now = std::time::Instant::now();
         self.strikes
             .entry(key.to_string())
-            .or_insert_with(|| StrikeState {
-                count: 0,
-                terminal_at: None,
-                last_seen: now,
-            })
+            .or_insert_with(|| StrikeState::fresh(now))
             .count = count;
     }
 }
@@ -1878,6 +1914,66 @@ mod tests {
             t.tracked(),
             0,
             "and it still ages out at the configured window"
+        );
+    }
+
+    #[test]
+    fn a_post_sink_strike_is_retained_as_active_not_terminal() {
+        // `mark_sink_terminal_as_of` restarts the countdown but leaves the
+        // terminal mark set, so a redelivery after a failed ack builds a NEW
+        // streak on an entry the sweep still classified as terminal -- and
+        // swept it on the operator's retention rather than the broker's
+        // redelivery interval. With `poison_threshold > 1` that discards the
+        // progress before every next delivery, so the message never reaches
+        // the sink path again.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        let retention = std::time::Duration::from_secs(60);
+
+        assert!(t.mark_sink_terminal_as_of("k", t0));
+        assert_eq!(t.strikes("k"), 0, "the sink handoff restarts the countdown");
+
+        // The ack failed, the broker redelivered, and it was rejected again.
+        assert_eq!(t.strike("k", t0), 1, "that redelivery starts a new streak");
+
+        t.expire_stale_as_of(
+            t0 + retention + std::time::Duration::from_secs(1),
+            retention,
+        );
+        assert_eq!(
+            t.strikes("k"),
+            1,
+            "a streak a redelivery advances must survive the broker's interval, \
+             not the operator's retention"
+        );
+
+        // Still bounded: the floor is a floor, not immortality.
+        t.expire_stale_as_of(
+            t0 + ACTIVE_STRIKE_RETENTION_FLOOR + std::time::Duration::from_secs(1),
+            retention,
+        );
+        assert_eq!(t.tracked(), 0, "and it still ages out past the floor");
+    }
+
+    #[test]
+    fn a_broker_native_relap_strike_keeps_its_dedupe_mark() {
+        // The mirror of the case above, and the reason the reset is gated on
+        // the count rather than applied to every strike. A broker-native
+        // handoff RETAINS its strikes precisely so each redrive lap re-nacks
+        // on sight, so those laps strike a count that is already >= 1. Its
+        // mark is the only dedupe that path has -- SQS moves a message to its
+        // DLQ without telling this process, so unlike the sink path there is
+        // no durable `AlreadyRecorded` half to fall back on. Clearing it here
+        // would count one physical poison message once per lap.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+
+        assert_eq!(t.strike("k", t0), 1);
+        assert!(t.mark_terminal_as_of("k", t0), "first handoff counts");
+        assert_eq!(t.strike("k", t0), 2, "the next lap re-nacks on sight");
+        assert!(
+            !t.mark_terminal_as_of("k", t0),
+            "and must not report itself as a second poison message"
         );
     }
 

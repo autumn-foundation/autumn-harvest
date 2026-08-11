@@ -207,6 +207,37 @@ impl EventSource for MockSource {
         Ok(())
     }
 
+    /// Release the committed prefix from custody.
+    ///
+    /// Overridden rather than inherited because the default delegates to
+    /// [`EventSource::ack`] with a **token-less** handle, and this mock keys
+    /// custody by token: the default would look up `""`, match nothing, and
+    /// retain every positional (`push_kafka*`) message for the life of the
+    /// source — a long-running harness growing in proportion to all messages
+    /// ever processed. There is no token to look up *by design*; a positional
+    /// commit is a high-water mark over a contiguous prefix rather than one
+    /// message's acknowledgement, so it carries coordinates only.
+    ///
+    /// So the prefix is what is released: every retained copy for `partition`
+    /// at or below `position`. A retained message with no `position` is left
+    /// alone — it cannot be part of a positional prefix. `acked` still records
+    /// the same bare positional handle the default would have passed, so a
+    /// test observing acknowledgements sees no difference.
+    async fn commit_position(&self, partition: i32, position: i64) -> Result<(), ConnectorError> {
+        let mut state = self.lock();
+        state.acked.push(MessageHandle {
+            token: String::new(),
+            partition: Some(partition),
+            position: Some(position),
+        });
+        state.in_flight.retain(|_, message| {
+            message.handle.partition != Some(partition)
+                || message.handle.position.is_none_or(|p| p > position)
+        });
+        drop(state);
+        Ok(())
+    }
+
     fn has_native_dead_letter(&self) -> bool {
         // The mock can stand in for either adapter shape, so it advertises
         // support and lets a test choose the binding's dead-letter mode.
@@ -417,5 +448,50 @@ mod tests {
             "a settled message must not be retained"
         );
         assert_eq!(source.pending(), 0, "and a nack does not redeliver here");
+    }
+
+    #[tokio::test]
+    async fn a_positional_commit_releases_the_prefix_from_custody() {
+        // The sibling above covers only the opaque (SQS) shape. A positional
+        // message settles through `commit_position`, whose default hands `ack`
+        // a token-LESS handle -- so a token-keyed custody map removes `""` and
+        // retains every Kafka-shaped message forever, growing a long-running
+        // harness in proportion to all messages ever processed.
+        let source = MockSource::new("orders");
+        source.push_kafka(0, 1, b"a");
+        source.push_kafka(0, 2, b"b");
+        source.push_kafka(1, 7, b"c");
+        let _batch = source
+            .receive(10, std::time::Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert_eq!(source.lock().in_flight.len(), 3, "all three are in flight");
+
+        source.commit_position(0, 1).await.unwrap();
+        assert_eq!(
+            source.lock().in_flight.len(),
+            2,
+            "a commit is a high-water MARK: only the prefix at or below it goes"
+        );
+
+        source.commit_position(0, 2).await.unwrap();
+        assert_eq!(
+            source.lock().in_flight.len(),
+            1,
+            "the rest of partition 0's prefix goes with the advanced mark"
+        );
+        assert!(
+            source
+                .lock()
+                .in_flight
+                .values()
+                .all(|m| m.handle.partition == Some(1)),
+            "and it is the uncommitted partition that survives"
+        );
+        assert_eq!(
+            source.acked().len(),
+            2,
+            "each commit is still observable as an acknowledgement"
+        );
     }
 }

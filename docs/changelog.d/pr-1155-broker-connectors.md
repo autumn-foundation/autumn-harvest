@@ -1434,6 +1434,43 @@ coordinates, so a run traces back to the exact message.
   is inline rather than in the join loop), because re-acquiring a permit in the
   join loop cannot help — a cancelled `run` drops `run_once` and its permit
   before the drain starts.
+- **A post-sink strike was swept on the operator's clock, not the broker's.**
+  `mark_sink_terminal_as_of` restarts the countdown but leaves the terminal
+  mark set, so a message redelivered after a failed ack accumulated a **new**
+  streak on an entry the retention sweep still read as terminal — and retired
+  it on `poison_retention` rather than `ACTIVE_STRIKE_RETENTION_FLOOR`. With a
+  redelivery interval above that retention and a `poison_threshold > 1`, every
+  sweep discarded the progress before the next delivery, so each rejection was
+  strike one forever and the message never reached the sink path again. Root
+  cause was that `terminal_at` answered two questions that had diverged: *have
+  we already counted this as poisoned* (dedupe) and *is a redelivery what
+  advances this entry* (retention class). They are now separate: a
+  `sink_terminal` flag records which handoff set the mark, and the new
+  `StrikeState::is_active` classifies an entry as active when it is unmarked
+  **or** carries a re-struck sink mark. Deliberately **not** "any retained
+  count": a broker-native entry keeps its strikes at or above the threshold so
+  each redrive lap re-nacks on sight rather than accumulating, and those
+  entries are expired on the operator's window on purpose so a stream of
+  distinct poison messages cannot pin the map — widening that was tried and
+  broke three tests pinning exactly it. The dedupe mark itself is untouched,
+  which matters: an earlier attempt cleared it from `strike()` and regressed
+  the sink dedupe. RED: `a_post_sink_strike_is_retained_as_active_not_terminal`
+  (swept to 0 pre-fix), plus `a_broker_native_relap_strike_keeps_its_dedupe_mark`
+  guarding the half that must not change.
+- **`MockSource` never released positionally-committed messages.** Custody is
+  keyed by handle token, but the default `EventSource::commit_position` passes
+  a **token-less** handle by design — a positional commit is a high-water mark
+  over a prefix, not one message's ack — so `ack` looked up `""`, matched
+  nothing, and every `push_kafka` message stayed cloned in `in_flight` for the
+  life of the source, growing a long-running harness in proportion to all
+  messages ever processed. `MockSource` now overrides `commit_position` to
+  release the whole committed prefix (every retained copy for that partition at
+  or below the mark) while still recording the same bare positional handle in
+  `acked`, so tests observing acknowledgements are unaffected. RED:
+  `a_positional_commit_releases_the_prefix_from_custody` — three in flight, two
+  commits, and pre-fix nothing is released. The existing
+  `settling_releases_the_in_flight_copy` covered only the opaque (SQS) shape,
+  which is why the positional leak went unpinned.
 
 ### Success metric
 
