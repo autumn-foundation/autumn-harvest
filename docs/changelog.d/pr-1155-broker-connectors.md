@@ -1134,6 +1134,27 @@ coordinates, so a run traces back to the exact message.
   semantics. It now names both attributes and why the in-flight one belongs.
   (The two remaining visible-only mentions are past-tense descriptions of that
   bug and are accurate as history.)
+- **A wedged dispatch could hang the whole application's shutdown forever.**
+  Cancelling `run` drops `run_once` mid-`select!`, and dropping a `JoinHandle`
+  *detaches* the task rather than aborting it — so every spawned dispatch kept
+  running and kept holding its `OwnedSemaphorePermit`. The drain that followed
+  (`self.permits.acquire_many(permits).await`) had no deadline, and
+  `stop_harvest_runtime` awaits every connector handle **before** it stops the
+  runner, so a single stuck dispatch parked the entire shutdown outside the
+  reach of the engine's own `worker_shutdown_timeout`. The drain is now bounded
+  by a new `ConnectorRuntimeConfig::shutdown_timeout` (30s, mirroring
+  `WorkerConfig::shutdown_timeout`); on elapse it warns with the in-flight count
+  and cancels a dedicated `hard_stop` token that each spawned dispatch selects
+  on, unwinding it at its next await point. Bounding it is safe **by
+  construction**: the drain is an optimisation (it spares a redelivery for work
+  that already committed), not an invariant — giving up early costs exactly that
+  redelivery, which at-least-once already permits and the idempotency key
+  already dedupes. The token is deliberately *not* the binding's own cancel
+  token, which fires at the *start* of shutdown and would abandon every
+  in-flight dispatch, turning every clean stop into needless redelivery. RED:
+  `a_wedged_dispatch_cannot_hang_shutdown_forever` (restoring the unbounded
+  drain hangs the suite outright rather than merely failing) and
+  `a_clean_drain_never_hard_stops`.
 
 ### Success metric
 

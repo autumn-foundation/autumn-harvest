@@ -94,6 +94,9 @@ aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio",
 autumn-web = { version = "0.6", features = ["test-support", "mcp"] }
 autumn-harvest = { version = "0.5.0", path = "../autumn-harvest", features = ["db", "testing"] }
 tower = "0.5"
+# `test-util` for `#[tokio::test(start_paused = true)]`: the shutdown-drain
+# deadline is a 30s wall-clock wait that must be asserted, not slept through.
+tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tracing-subscriber = "0.3"

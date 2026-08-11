@@ -124,6 +124,22 @@ pub struct ConnectorRuntimeConfig {
     /// *late* costs only memory, so the default is deliberately generous.
     /// [`MAX_POISON_ENTRIES`] is the hard backstop.
     pub poison_retention: std::time::Duration,
+    /// Longest the shutdown drain waits for in-flight dispatches to settle.
+    ///
+    /// Cancelling `run` drops the in-flight pass, which **detaches** its
+    /// spawned dispatches — dropping a `JoinHandle` does not abort the task —
+    /// so each keeps its permit until it finishes on its own. One wedged in a
+    /// database call, a broker ack or a custom sink would otherwise hold the
+    /// drain forever, and `stop_harvest_runtime` awaits every connector
+    /// *before* it stops the runner, so that is a permanently hung shutdown
+    /// rather than a slow one.
+    ///
+    /// Bounding it is safe because the drain is an **optimisation, not an
+    /// invariant**: it exists so a dispatch that already committed also gets
+    /// acked, sparing a redelivery. Giving up early costs exactly that
+    /// redelivery, which at-least-once already permits and the idempotency key
+    /// already dedupes. Mirrors the engine's own `WorkerConfig::shutdown_timeout`.
+    pub shutdown_timeout: std::time::Duration,
 }
 
 /// Never derive a bound below this, so a binding with tiny `max_in_flight`
@@ -171,6 +187,11 @@ impl Default for ConnectorRuntimeConfig {
             // An hour covers a 30s visibility timeout against SQS's
             // `maxReceiveCount` maximum of 1000 with room to spare.
             poison_retention: std::time::Duration::from_secs(60 * 60),
+            // Same 30s the engine gives its own worker drain, for the same
+            // reason: long enough that an ordinary in-flight dispatch settles
+            // and gets acked, short enough that a rolling deployment is not
+            // held hostage by one wedged call.
+            shutdown_timeout: std::time::Duration::from_secs(30),
         }
     }
 }
@@ -190,6 +211,22 @@ pub struct ConnectorRuntime {
     /// When the consumer-lag gauge was last sampled, so an idle binding does
     /// not issue a billed broker query on every pass.
     last_lag_sample: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// Cancelled only when the shutdown drain gives up, to stop a dispatch
+    /// that outlived its deadline.
+    ///
+    /// Cancelling `run` detaches the in-flight dispatches rather than aborting
+    /// them, and this process may outlive harvest (an embedder stopping the
+    /// runtime while its web app keeps serving), so "detached and wedged"
+    /// means leaked, not merely late. Each spawned dispatch selects on this,
+    /// so it unwinds at its next await point — the same effect
+    /// `JoinHandle::abort` would have, without threading handles back out of
+    /// the pass.
+    ///
+    /// Deliberately NOT the binding's own cancellation token: that fires at
+    /// the *start* of shutdown, which would abandon every in-flight dispatch
+    /// immediately and turn every clean stop into needless redelivery. This
+    /// fires only after the drain has already waited its full deadline.
+    hard_stop: Arc<CancellationToken>,
 }
 
 /// What a stall-recovery attempt achieved.
@@ -284,6 +321,7 @@ impl ConnectorRuntime {
             poison: Arc::new(tokio::sync::Mutex::new(PoisonTracker::new())),
             offsets: Arc::new(tokio::sync::Mutex::new(OffsetTracker::new())),
             last_lag_sample: Arc::new(std::sync::Mutex::new(None)),
+            hard_stop: Arc::new(CancellationToken::new()),
         }
     }
 
@@ -412,11 +450,54 @@ impl ConnectorRuntime {
             }
         }
 
-        // Drain in-flight dispatches so a shutdown never abandons a message
-        // whose dispatch already committed but whose ack has not run yet.
-        let permits = u32::try_from(self.binding.max_in_flight.max(1)).unwrap_or(u32::MAX);
-        let _ = self.permits.acquire_many(permits).await;
+        self.drain_in_flight().await;
         tracing::info!(source = source_name, "harvest connector stopped");
+    }
+
+    /// Wait — for a bounded time — for in-flight dispatches to settle.
+    ///
+    /// Cancelling `run` drops the in-flight pass, which **detaches** its
+    /// spawned dispatches (dropping a `JoinHandle` does not abort the task),
+    /// so each holds its permit until it finishes on its own. Draining is what
+    /// lets a dispatch that already committed also get acked, sparing the
+    /// broker a redelivery.
+    ///
+    /// That is an optimisation, not an invariant, which is exactly why it may
+    /// be abandoned: the contract is at-least-once, so an unacked message is
+    /// redelivered and deduped by its idempotency key. An **unbounded** wait
+    /// is not the safe choice — `stop_harvest_runtime` awaits every connector
+    /// before it stops the runner, so one dispatch wedged in a database call,
+    /// a broker ack or a custom sink hangs the whole application's shutdown,
+    /// beyond the reach of the engine's own `shutdown_timeout`.
+    ///
+    /// On timeout the stragglers are hard-stopped rather than left detached:
+    /// this process may outlive harvest, and a task that will never return is
+    /// a leak, not a straggler.
+    async fn drain_in_flight(&self) {
+        let permits = u32::try_from(self.binding.max_in_flight.max(1)).unwrap_or(u32::MAX);
+        if tokio::time::timeout(
+            self.config.shutdown_timeout,
+            self.permits.acquire_many(permits),
+        )
+        .await
+        .is_err()
+        {
+            // `available_permits` is a snapshot, but every holder is an
+            // in-flight dispatch, so it names the work being abandoned.
+            let in_flight = self
+                .binding
+                .max_in_flight
+                .max(1)
+                .saturating_sub(self.permits.available_permits());
+            tracing::warn!(
+                source = self.binding.name,
+                in_flight,
+                timeout_secs = self.config.shutdown_timeout.as_secs(),
+                "harvest connector gave up draining in-flight dispatches at shutdown; they are \
+                 being abandoned and their messages will be redelivered"
+            );
+            self.hard_stop.cancel();
+        }
     }
 
     /// One receive → dispatch → settle pass.
@@ -527,7 +608,17 @@ impl ConnectorRuntime {
                 handle,
                 positional,
                 tokio::spawn(async move {
-                    let disposition = this.process(message).await;
+                    // `hard_stop` fires only after the shutdown drain has
+                    // already waited its full deadline for this dispatch. It
+                    // gives up on the message rather than the process: no
+                    // settle runs, so it stays unacked and the broker
+                    // redelivers it — at-least-once, deduped by the
+                    // idempotency key. The alternative is a detached task
+                    // wedged forever in a process that outlives harvest.
+                    let disposition = tokio::select! {
+                        d = this.process(message) => d,
+                        () = this.hard_stop.cancelled() => MessageDisposition::Retry,
+                    };
                     drop(permit);
                     disposition
                 }),
@@ -756,6 +847,7 @@ impl ConnectorRuntime {
             poison: Arc::clone(&self.poison),
             offsets: Arc::clone(&self.offsets),
             last_lag_sample: Arc::clone(&self.last_lag_sample),
+            hard_stop: Arc::clone(&self.hard_stop),
         }
     }
 
@@ -2149,6 +2241,64 @@ mod tests {
             .await
             .expect("run must observe cancellation")
             .expect("run task must not panic");
+    }
+
+    /// A dispatch that never returns must not hang the whole application.
+    ///
+    /// Cancelling `run` drops `run_once` mid-flight, which **detaches** its
+    /// spawned dispatches — a dropped `JoinHandle` does not abort the task —
+    /// and each one still holds an owned permit. If that task is wedged in a
+    /// database call, a broker ack or a custom sink, its permit is never
+    /// released. `stop_harvest_runtime` awaits every connector *before* it
+    /// stops the runner, so an unbounded drain here is not a slow shutdown:
+    /// it is a permanently hung one, outside the reach of the engine's own
+    /// `shutdown_timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_dispatch_cannot_hang_shutdown_forever() {
+        let source = Arc::new(MockSource::new("orders"));
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let mut rt = runtime(malformed_binding(), source, sink);
+        rt.config.shutdown_timeout = std::time::Duration::from_secs(30);
+
+        // Stand in for the wedged task: hold a permit and never give it back.
+        let wedged = Arc::clone(&rt.permits)
+            .acquire_owned()
+            .await
+            .expect("permit");
+
+        let started = tokio::time::Instant::now();
+        rt.drain_in_flight().await;
+        let waited = tokio::time::Instant::now() - started;
+
+        assert!(
+            waited >= rt.config.shutdown_timeout,
+            "the drain must give in-flight work its full deadline"
+        );
+        assert!(
+            rt.hard_stop.is_cancelled(),
+            "a drain that timed out must hard-stop the stragglers, or a detached \
+             task wedged forever leaks in a process that outlives harvest"
+        );
+        drop(wedged);
+    }
+
+    /// The normal path is unchanged: a clean drain never hard-stops anything.
+    ///
+    /// The hard stop is a last resort — it abandons a dispatch at its next
+    /// await point, which costs a redelivery. Firing it on an ordinary
+    /// shutdown would turn every clean stop into needless duplicate work.
+    #[tokio::test(start_paused = true)]
+    async fn a_clean_drain_never_hard_stops() {
+        let source = Arc::new(MockSource::new("orders"));
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let rt = runtime(malformed_binding(), source, sink);
+
+        rt.drain_in_flight().await;
+
+        assert!(
+            !rt.hard_stop.is_cancelled(),
+            "nothing was in flight, so nothing should have been abandoned"
+        );
     }
 
     #[tokio::test]
