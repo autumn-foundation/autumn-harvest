@@ -1073,3 +1073,67 @@ fn the_changelog_leading_entry_does_not_publish_the_retracted_bound() {
          note for a reader to draw the retracted conclusion from."
     );
 }
+
+/// Every per-gate figure the changelog's *leading* entry quotes must be the one
+/// the published table currently carries.
+///
+/// The existing `changelog_fragment_quotes_the_published_figures` pins exactly
+/// one number — the control's multiplier — because that was the figure the
+/// round-26 drift turned on. It therefore did not notice that the leading
+/// entry's "per-gate attribution (AC2)" list had gone stale in *all five* of its
+/// figures when round 22 regenerated the tables from a fresh run: the diary
+/// recorded the regeneration, the page carried the new numbers, and the entry
+/// that becomes the release note kept the old ones. Two of them had even swapped
+/// rank with each other, so the release note published an ordering the page
+/// explicitly says does not reproduce.
+///
+/// Rather than pin a sixth specific number, this reads every gate name the
+/// leading entry mentions alongside a percentage and checks that percentage
+/// against the table. A future regeneration cannot leave any of them behind.
+#[test]
+fn changelog_leading_entry_per_gate_figures_match_the_published_table() {
+    let doc = read_performance_doc();
+    let rows = parse_gate_table(&doc);
+    let fragment = read_normalized(&changelog_fragment_path());
+    let leading = fragment
+        .lines()
+        .next()
+        .expect("the fragment must have a leading entry");
+
+    // The AC2 list is the part of the entry that summarises the gate table.
+    // Scoped to it because the entry legitimately quotes other runs elsewhere
+    // (the reproducibility spread), which the page publishes on purpose.
+    let start = leading
+        .find("per-gate attribution (AC2)")
+        .expect("the leading entry must summarise the per-gate attribution");
+    let end = leading[start..]
+        .find("; (4)")
+        .map_or(leading.len(), |o| start + o);
+    let ac2 = &leading[start..end];
+
+    // Prose names gates in words ("build-id routing"), not by table key, so map
+    // the two explicitly rather than guessing from the identifier.
+    for (gate, prose) in [
+        ("rate_limited", "rate-limit gate"),
+        ("circuit_breaker_set", "circuit-breaker tracked set"),
+        ("build_policy", "build-id routing"),
+        ("concurrency_key", "per-key concurrency"),
+        ("all_gates", "all gates together"),
+    ] {
+        let Some(row) = rows.iter().find(|r| r.gate == gate) else {
+            continue;
+        };
+        if !ac2.contains(prose) {
+            continue;
+        }
+        let published = format!("+{}%", row.delta_pct);
+        assert!(
+            ac2.contains(&published),
+            "the changelog's leading entry quotes a figure for `{gate}` \
+             (\"{prose}\") that is not the published {published}. The AC2 list \
+             is a summary of the gate table, so regenerating the table must \
+             carry it along; the release note otherwise contradicts the page it \
+             points at. Leading-entry AC2 text: {ac2}"
+        );
+    }
+}
