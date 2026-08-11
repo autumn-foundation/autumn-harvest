@@ -720,13 +720,30 @@ read-only and per-replica, so a stale anchor can only skew one sample — wherea
 dropping anchors during a rebalance would re-open the `latest` under-report and
 show a false all-clear, which is the failure direction that actually hurts.
 
+**A rebuild is in-process, so a crash never runs it.** Re-asserting the anchor
+before a rebuild covers a wedged prefix, but a crash or `SIGKILL` skips that path
+entirely: a replacement process has neither a committed offset nor the anchor
+map, and re-resolves `latest` against a tail the in-flight record has already
+advanced past. That is the same permanent skip, for a record the connector had
+already *accepted* — so under `latest` the floor is committed **eagerly**, before
+the batch is dispatched, through the same ownership filter. It costs one
+synchronous commit per partition per process: once it lands, the partition is
+retired and never revisited. `earliest` pays nothing for this, because its
+baseline is the low watermark, which does not move backwards — a restart with no
+committed offset re-reads the record rather than skipping it.
+
+An eager commit that fails is logged and left queued for the next receive to
+retry; the batch is still returned, because discarding it would lose records the
+consumer's local position has already advanced past.
+
 Two residuals, both deliberate. A partition this replica has **never read** —
-one owned by another replica, or any partition of a fresh process whose group
-never committed — has no anchor and falls back to the reset policy for its lag
-baseline; no local fact establishes otherwise, and closing it would need
-cross-replica state. And a process that restarts before its group ever commits
-genuinely has no anchor: it starts at the then-current tail, which is what
-`latest` asks for. Neither applies to the default (`earliest`), which is anchored
+one owned by another replica — has no anchor and falls back to the reset policy
+for its lag baseline; no local fact establishes otherwise, and closing it would
+need cross-replica state. For `latest` that is also the correct answer: records
+that arrived before this source existed are genuinely not its work. The narrower
+one is a partition read since the last successful eager commit, whose commit
+failed and is awaiting retry — a crash inside that window still skips its
+in-flight record. Neither applies to the default (`earliest`), which is anchored
 at the low watermark by definition.
 
 A broker-triggered execution also records `start_source = 'broker'` with

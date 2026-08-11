@@ -181,6 +181,21 @@ impl KafkaSourceConfig {
 /// All this does is make that decision durable instead of leaving it to be
 /// re-derived against a tail that has since moved.
 ///
+/// # Durability: the map is in-process, so a crash does not run `recover`
+///
+/// A rebuild is an *in-process* re-assert, which covers a wedged prefix but not
+/// a crash or `SIGKILL` — those never run [`EventSource::recover`] at all. A
+/// replacement process would have neither a committed offset nor this map, and
+/// would re-resolve `latest` against a tail the in-flight record has already
+/// advanced past: the same permanent skip, for a record the connector had
+/// already *accepted*.
+///
+/// So under `latest` the floor is committed **eagerly**, before the batch is
+/// dispatched, by [`anchors_needing_durability`] — once per partition per
+/// process, since a landed commit retires it. `earliest` owes nothing: its
+/// baseline is the low watermark, which does not move backwards, so a restart
+/// re-reads rather than skips.
+///
 /// # Scope: a local fact, not a group one
 ///
 /// An anchor records what **this source instance** read. Nothing evicts one
@@ -203,16 +218,25 @@ impl KafkaSourceConfig {
 ///
 /// # Residual
 ///
-/// A partition this replica has never read — one owned by another replica, or
-/// any partition of a fresh process whose group never committed — has no anchor
-/// and falls back to the reset policy. That is the honest answer, since no
-/// local fact establishes otherwise; closing it would need cross-replica state
-/// this adapter deliberately does not keep.
+/// A partition this replica has **never read** has no anchor and falls back to
+/// the reset policy. That is the honest answer, and for `latest` it is also the
+/// correct one: records that arrived before this source existed genuinely are
+/// not its work. Closing it further would need cross-replica state this adapter
+/// deliberately does not keep.
+///
+/// The narrower residual is a partition read since the last successful eager
+/// commit — one whose commit failed and is queued for retry. A crash inside that
+/// window still skips its in-flight record. It is bounded by the retry on the
+/// next receive, and the failure is logged rather than silent.
 #[derive(Debug, Default)]
 pub struct PartitionAnchors {
     /// `partition -> next offset to read`. `BTreeMap` so `pending_anchors` is
     /// deterministically ordered, which keeps the commit list assertable.
     floors: BTreeMap<i32, i64>,
+    /// Partitions whose floor is known committed to the **group**, so a crash
+    /// resumes there. Only [`Self::mark_durable`] populates it, and only after
+    /// a synchronous commit has actually landed.
+    durable: std::collections::BTreeSet<i32>,
 }
 
 impl PartitionAnchors {
@@ -222,6 +246,20 @@ impl PartitionAnchors {
     /// must never raise the floor past a record still awaiting settlement.
     pub fn record_read(&mut self, partition: i32, offset: i64) {
         self.floors.entry(partition).or_insert(offset);
+    }
+
+    /// Note that this partition's floor is now committed to the group.
+    ///
+    /// Only called after a **synchronous** commit returns success, so it means
+    /// "a crash resumes here", not "a commit was queued".
+    pub fn mark_durable(&mut self, partition: i32) {
+        self.durable.insert(partition);
+    }
+
+    /// Whether this partition's floor is already committed to the group.
+    #[must_use]
+    pub fn is_durable(&self, partition: i32) -> bool {
+        self.durable.contains(&partition)
     }
 
     /// Note that `next_offset` (Kafka's next-to-read) has been committed.
@@ -285,6 +323,38 @@ fn committable_anchors(
         .filter(|(partition, _)| assigned.contains(partition))
         .filter(|(partition, anchor)| committed(*partition).is_none_or(|c| *anchor > c))
         .copied()
+        .collect()
+}
+
+/// The anchors that must be made durable *before* their records are dispatched.
+///
+/// [`PartitionAnchors`] is in-process state, and only [`EventSource::recover`]
+/// commits it — an in-process rebuild a crash or SIGKILL never runs. Under
+/// `latest` that leaves a real at-least-once hole: a replacement process has
+/// neither a committed offset nor the map, re-resolves `latest` against a tail
+/// the in-flight record has already advanced past, and skips it permanently.
+/// The record was *accepted* and awaiting settlement, so that is loss, not the
+/// "records that arrived before I existed are not mine" the policy promises.
+///
+/// Committing the first-read offset (not `offset + 1`) is what makes this safe
+/// to do eagerly: it asserts only that records *below* it are not ours — exactly
+/// what `latest` means — and leaves the record itself to be re-read.
+///
+/// `earliest` owes nothing. It re-resolves to the low watermark, which does not
+/// move backwards, so a restart with no committed offset re-reads rather than
+/// skips. Returning empty keeps the default path byte-for-byte free of this
+/// commit.
+///
+/// Only partitions not yet in `durable` are returned, so a landed commit is
+/// retired and a failed one stays queued for the next receive to retry.
+fn anchors_needing_durability(reset: OffsetReset, anchors: &PartitionAnchors) -> Vec<(i32, i64)> {
+    if reset == OffsetReset::Earliest {
+        return Vec::new();
+    }
+    anchors
+        .pending_anchors()
+        .into_iter()
+        .filter(|(partition, _)| !anchors.is_durable(*partition))
         .collect()
 }
 
@@ -360,6 +430,105 @@ impl KafkaSource {
             .anchors
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
+    /// Commit the resume floors a `latest` group owes, before its records are
+    /// dispatched.
+    ///
+    /// See [`anchors_needing_durability`] for why only `latest` owes anything
+    /// and why the first-read offset is the right thing to commit. This runs
+    /// once per partition per process: a landed commit marks the partition
+    /// durable and it is never revisited.
+    ///
+    /// Guarded by the same [`committable_anchors`] filter [`EventSource::recover`]
+    /// uses, so an eager commit is still monotonic and local — it can only raise
+    /// a partition this replica currently owns. A partition filtered out is
+    /// still retired: either the group is already committed at or above the
+    /// floor (so a crash resumes covered), or this replica does not own it and
+    /// cannot speak for it in the first place.
+    ///
+    /// **Best-effort.** A failed commit warns and leaves the partition owed, so
+    /// the next receive retries. Failing the receive instead would discard the
+    /// drained records, whose local consumer position has already advanced past
+    /// them — the permanent-loss hazard [`defer_recv_error`] exists to avoid.
+    async fn make_anchors_durable(&self, consumer: &Arc<StreamConsumer>) {
+        let reset = self.config.effective_offset_reset();
+        let owed = self.with_anchors(|a| anchors_needing_durability(reset, a));
+        if owed.is_empty() {
+            return;
+        }
+
+        let topic = self.topic.clone();
+        let consumer = Arc::clone(consumer);
+        let to_commit = owed.clone();
+        // Committing and reading committed offsets are blocking librdkafka calls.
+        let landed = tokio::task::spawn_blocking(move || {
+            let assigned: Vec<i32> = consumer
+                .assignment()
+                .map_err(|e| ConnectorError::Broker(format!("kafka assignment: {e}")))?
+                .elements_for_topic(&topic)
+                .iter()
+                .map(rdkafka::topic_partition_list::TopicPartitionListElem::partition)
+                .collect();
+
+            let mut wanted = TopicPartitionList::new();
+            for partition in &assigned {
+                wanted.add_partition(&topic, *partition);
+            }
+            let committed = if assigned.is_empty() {
+                TopicPartitionList::new()
+            } else {
+                consumer
+                    .committed_offsets(wanted, ANCHOR_COMMIT_TIMEOUT)
+                    .map_err(|e| ConnectorError::Broker(format!("kafka committed offsets: {e}")))?
+            };
+
+            let committable =
+                committable_anchors(&to_commit, &assigned, |partition| {
+                    match committed
+                        .find_partition(&topic, partition)
+                        .map(|p| p.offset())
+                    {
+                        Some(Offset::Offset(o)) => Some(o),
+                        _ => None,
+                    }
+                });
+
+            if committable.is_empty() {
+                return Ok(());
+            }
+            let mut tpl = TopicPartitionList::new();
+            for (partition, floor) in committable {
+                tpl.add_partition_offset(&topic, partition, Offset::Offset(floor))
+                    .map_err(|e| {
+                        ConnectorError::Broker(format!("kafka anchor offset list: {e}"))
+                    })?;
+            }
+            consumer
+                .commit(&tpl, CommitMode::Sync)
+                .map_err(|e| ConnectorError::Broker(format!("kafka anchor commit: {e}")))
+        })
+        .await;
+
+        match landed {
+            Ok(Ok(())) => {
+                self.with_anchors(|a| {
+                    for (partition, _) in &owed {
+                        a.mark_durable(*partition);
+                    }
+                });
+            }
+            Ok(Err(e)) => tracing::warn!(
+                topic = %self.topic,
+                error = %e,
+                "kafka anchor commit failed; a crash before the next attempt may skip these records"
+            ),
+            Err(e) => tracing::warn!(
+                topic = %self.topic,
+                error = %e,
+                "kafka anchor commit panicked; a crash before the next attempt may skip these records"
+            ),
+        }
     }
 }
 
@@ -481,6 +650,12 @@ impl EventSource for KafkaSource {
                 headers,
             ));
             budget = std::time::Duration::ZERO;
+        }
+        // Before these records leave this function and become someone's
+        // in-flight work, make the `latest` resume floor durable to the group.
+        // Best-effort: see `make_anchors_durable`.
+        if !batch.is_empty() {
+            self.make_anchors_durable(&consumer).await;
         }
         Ok(batch)
     }
@@ -652,6 +827,9 @@ impl EventSource for KafkaSource {
         // Snapshotted so the blocking task owns it without holding the lock.
         let anchors = self.with_anchors(|a| PartitionAnchors {
             floors: a.pending_anchors().into_iter().collect(),
+            // Durability is a write-side concern; the lag baseline only reads
+            // floors, so the snapshot does not carry it.
+            ..PartitionAnchors::default()
         });
         // `fetch_watermarks` is a blocking librdkafka call.
         tokio::task::spawn_blocking(move || {
@@ -1098,6 +1276,54 @@ mod tests {
             committable_anchors(&anchors, &[0], |_| Some(40)),
             vec![(0, 100)],
             "a floor ahead of the group makes this replica's settled work durable"
+        );
+    }
+
+    /// A `latest` group makes its resume floor durable before dispatching.
+    ///
+    /// `recover()` is an *in-process* rebuild, so a crash or SIGKILL never runs
+    /// it. A replacement process has neither a committed offset nor this map,
+    /// re-resolves `latest` against a tail the in-flight record has already
+    /// advanced past, and skips it permanently — at-least-once broken for a
+    /// record the connector had already accepted.
+    #[test]
+    fn a_latest_group_makes_its_resume_floor_durable_before_dispatch() {
+        let mut anchors = PartitionAnchors::default();
+        anchors.record_read(0, 100);
+        anchors.record_read(1, 7);
+
+        assert_eq!(
+            anchors_needing_durability(OffsetReset::Latest, &anchors),
+            vec![(0, 100), (1, 7)],
+            "a freshly-read latest partition owes a durable floor before its records are dispatched"
+        );
+
+        // A successful commit retires it; a failed one leaves it queued, so the
+        // next receive retries rather than leaving the window open forever.
+        anchors.mark_durable(0);
+        assert_eq!(
+            anchors_needing_durability(OffsetReset::Latest, &anchors),
+            vec![(1, 7)],
+            "only the partition whose commit landed is retired"
+        );
+        anchors.mark_durable(1);
+        assert!(anchors_needing_durability(OffsetReset::Latest, &anchors).is_empty());
+    }
+
+    /// The default policy pays nothing for this.
+    ///
+    /// `earliest` re-resolves to the LOW watermark, which does not move
+    /// backwards, so a restart with no committed offset re-reads the record
+    /// rather than skipping it. There is no window to close, and the eager
+    /// commit would be a pure cost on the receive path.
+    #[test]
+    fn an_earliest_group_never_pays_for_an_eager_anchor_commit() {
+        let mut anchors = PartitionAnchors::default();
+        anchors.record_read(0, 100);
+
+        assert!(
+            anchors_needing_durability(OffsetReset::Earliest, &anchors).is_empty(),
+            "earliest already resumes below the record, so no eager commit is warranted"
         );
     }
 

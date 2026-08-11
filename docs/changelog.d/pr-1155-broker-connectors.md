@@ -1031,6 +1031,44 @@ coordinates, so a run traces back to the exact message.
   bug rather than reaching for `visibility_timeout_secs`. Doc-only: the code,
   the connector guide and `docs/telemetry.md` were all already correct, so this
   was single-site drift rather than a misunderstanding of the design.
+- **A crash never ran the anchor commit, so `latest` could still skip a record
+  it had already accepted.** `PartitionAnchors` is in-process state, and only
+  `EventSource::recover` committed it — an *in-process* rebuild that a crash or
+  `SIGKILL` skips entirely. A replacement process therefore had neither a
+  committed offset nor the map, re-resolved `latest` against a tail the
+  in-flight record had already advanced past, and skipped it permanently. The
+  previously-documented residual conflated two different cases: records that
+  arrived *before this source existed* (skipping them **is** `latest`) with a
+  record the connector had **accepted and was retrying** (loss). Under `latest`
+  the floor is now committed **eagerly**, before the batch is dispatched, via
+  the new pure `anchors_needing_durability` and the same `committable_anchors`
+  ownership filter `recover` uses — so an eager commit is still monotonic and
+  local. It costs one synchronous commit per partition per process: a landed
+  commit marks the partition durable and it is never revisited. Committing the
+  *first-read* offset (not `offset + 1`) is what makes this safe to do eagerly —
+  it asserts only that records *below* it are not ours, which is precisely what
+  `latest` means, and leaves the record itself to be re-read. `earliest` pays
+  nothing and is byte-for-byte unchanged: its baseline is the low watermark,
+  which does not move backwards, so a restart re-reads rather than skips. A
+  failed commit warns and stays queued for the next receive rather than failing
+  the receive, which would discard drained records whose local consumer position
+  has already advanced past them — the same permanent-loss hazard
+  `defer_recv_error` exists to avoid.
+- **`WorkflowId` dedupe was reported as unbounded when it is retention-bounded.**
+  `untuned_coordinate_dedupe_bound` returned `None` for the whole mode on the
+  reasoning that it "rides neither claim table" — a non-sequitur: not riding a
+  claim table does not make a guarantee unbounded, it makes it bounded by
+  something else. The dispatcher passes `idempotency_key: None` in this mode, so
+  dedupe rests entirely on the `(workflow_name, workflow_id)` reuse-policy attach
+  against the **execution row**, exactly like `SignalsWithStart` — and retention
+  deleting that row deletes the only evidence a redelivery was already handled.
+  The startup warning that exists precisely to name the right knob was therefore
+  silent for this path. Renamed to `untuned_dedupe_bound` (it is no longer
+  coordinate-only) and restructured around the real rule: exactly one shape rides
+  the start-idempotency claim table — a coordinate-keyed `Starts` binding —
+  and everything else is execution-row-bound. The warning text was generalized
+  to name both mechanisms truthfully rather than only the `signals_with_start`
+  one.
 
 ### Success metric
 
