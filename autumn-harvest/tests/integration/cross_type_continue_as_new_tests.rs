@@ -594,14 +594,22 @@ async fn park_occupant(
     occupant
 }
 
-/// A win-back loop (`churned -> trial -> churned`) must work: the earlier,
-/// already-terminal run of the target phase still *occupies* the successor's
-/// uniqueness slot (the partial index excludes only `CONTINUED_AS_NEW` /
-/// `TERMINATED`), so the transition seals it — exactly the release a same-type
-/// continuation performs on its own predecessor — rather than dying on a bare
-/// unique violation.
+/// A terminal prior run of the target phase (the win-back shape
+/// `churned -> trial -> churned`) still *occupies* the successor's uniqueness
+/// slot — the partial index excludes only `CONTINUED_AS_NEW` / `TERMINATED` —
+/// and the transition is REJECTED rather than releasing it.
+///
+/// An earlier cut released the slot by re-stating that run `CONTINUED_AS_NEW`.
+/// Two Codex P1s on PR #1159 showed that is unsafe: `CONTINUED_AS_NEW` is read
+/// as a *link*, so `await_external_workflow` (#757) on the old id parks forever
+/// and `/result` (#527) stops reporting its outcome; and a schedule-attributed
+/// run dropped out of #488 carryover would roll an incremental cursor backward
+/// (a rule `execution.rs`'s re-run path already spells out). A terminal run is
+/// a durable record callers may hold an id for, so this path does not rewrite
+/// it — the operator resets/erases it, or continues under a different
+/// `workflow_id`.
 #[tokio::test]
-async fn a_terminal_prior_run_of_the_target_type_is_sealed_so_the_successor_takes_its_slot() {
+async fn a_terminal_prior_run_of_the_target_type_blocks_the_transition() {
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -620,32 +628,48 @@ async fn a_terminal_prior_run_of_the_target_type_is_sealed_so_the_successor_take
     .await;
 
     let reg = registry(vec![wf(phase1, phase_one), wf(phase2, phase_two)]);
-    let (successor, recorded_type) =
-        drive_transition(&url, predecessor, reg, "w-803-slot-terminal").await;
+    let worker = build_runtime_worker("w-803-slot-terminal", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+    let failed = wait_for_execution_state(&url, predecessor, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
 
-    assert_eq!(recorded_type.as_deref(), Some(phase2));
-    let after = load_execution(&mut conn, successor).await;
-    assert_eq!(after.workflow_name, phase2);
-    assert_eq!(after.workflow_id, workflow_id);
-
-    let sealed = load_execution(&mut conn, occupant).await;
-    assert_eq!(
-        sealed.state, "CONTINUED_AS_NEW",
-        "the terminal prior run of the target phase must be released so the \
-         successor can take its uniqueness slot"
+    let error = failed
+        .error
+        .expect("a terminal failure must carry an error");
+    assert!(
+        error.contains(&occupant.to_string()) && error.contains(phase2),
+        "the failure must name the blocking execution and the target type, got {error}"
     );
 
+    // No continue-as-new recorded.
+    let history = load_history_from_url(&url, predecessor).await;
+    assert!(
+        !history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. })),
+        "a blocked transition may not record a continue-as-new"
+    );
+
+    // The occupant's recorded outcome is UNTOUCHED — the whole point.
+    let untouched = load_execution(&mut conn, occupant).await;
+    assert_eq!(
+        untouched.state, "COMPLETED",
+        "a terminal run's recorded outcome must never be rewritten to make room"
+    );
+
+    // And no successor was created.
     let rows: i64 = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
         .filter(harvest_workflow_executions::workflow_name.eq(phase2))
-        .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
         .count()
         .get_result(&mut conn)
         .await
-        .expect("count active rows of the target type");
+        .expect("count rows of the target type");
     assert_eq!(
         rows, 1,
-        "exactly one active run of the target phase may hold the identity"
+        "only the pre-existing occupant may exist; no successor was created"
     );
 }
 

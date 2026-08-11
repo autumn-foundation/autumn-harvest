@@ -10529,10 +10529,6 @@ enum SuccessorSlot {
     /// Nothing to do: nobody occupies the slot, or (the same-type case) the
     /// predecessor's own seal frees it.
     Free,
-    /// A *terminal* run of the target type already used this `workflow_id`.
-    /// Seal it `CONTINUED_AS_NEW` — the same release the predecessor's own
-    /// seal performs — so the successor can take the slot.
-    SealTerminal(uuid::Uuid),
 }
 
 /// Reject a cross-type continuation whose target key routes to a *different*
@@ -10681,11 +10677,46 @@ fn classify_successor_slot(
         return Ok(SuccessorSlot::Free);
     }
     if crate::erase::is_terminal_state(state) {
-        // A prior run of this phase finished (a win-back loop such as
-        // `churned -> trial -> churned`, or the separate run an external
-        // caller started by naming the old type). Releasing it is exactly what
-        // the predecessor's own seal does for a same-type continuation.
-        return Ok(SuccessorSlot::SealTerminal(id));
+        // A prior run of this phase finished — a win-back loop such as
+        // `churned -> trial -> churned`, or the separate run an external caller
+        // started by naming the old type.
+        //
+        // An earlier cut RELEASED the slot by rewriting that run's state to
+        // `CONTINUED_AS_NEW`, reasoning that this is what the predecessor's own
+        // seal does. It is not, and two Codex P1s on PR #1159 were right to
+        // reject it — the predecessor genuinely did continue into the
+        // successor and records a `WorkflowContinuedAsNew` event saying so,
+        // whereas this occupant is an UNRELATED completed run:
+        //
+        // 1. `CONTINUED_AS_NEW` is read as a LINK, not a terminal.
+        //    `execution::read_external_await_terminal` walks history for the
+        //    successor id and returns `NotYetTerminal` when none is recorded,
+        //    so an `await_external_workflow` (#757) on that old id would park
+        //    FOREVER; `/result` (#527) likewise stops reporting its outcome.
+        //    Appending a link event instead would be worse, not better: the old
+        //    run never continued into the successor, so `/result` and awaits on
+        //    it would start reporting the SUCCESSOR's outcome as its own.
+        // 2. For a schedule-attributed run it corrupts #488 carryover.
+        //    `resolve_carryover`'s output query selects `state = 'COMPLETED'`,
+        //    so re-stating the most recent slot drops it and the next fire
+        //    reads an older or empty `last_completion_result` — an incremental
+        //    cursor rolling BACKWARD. `execution.rs`'s re-run path already
+        //    forbids sealing a schedule-attributed source in as many words.
+        //
+        // No seal state is safe: `TERMINATED` avoids the infinite park but
+        // still rewrites a COMPLETED run's reported outcome and still drops it
+        // from carryover. A terminal run is a durable historical record that
+        // callers may hold an id for, so it is not this path's to rewrite —
+        // reject and let the operator decide.
+        return Err(format!(
+            "continue_as_new target workflow type '{target}' already has a terminal execution \
+             ({id}, state {state}) for workflow_id '{workflow_id}', and harvest's \
+             (workflow_name, workflow_id) uniqueness counts a terminal run as occupying the key. \
+             Releasing it would rewrite that run's recorded outcome — breaking await/result for \
+             anyone holding its id, and rolling a scheduled carryover cursor backward — so this \
+             run was failed instead. Reset (issue #148) or erase execution {id} to free the key, \
+             or continue under a different workflow_id"
+        ));
     }
     Err(format!(
         "continue_as_new target workflow type '{target}' already has a live execution ({id}, \
@@ -11091,14 +11122,6 @@ async fn persist_workflow_continue_as_new(
         // occupant was already rejected before this transaction opened, and the
         // `FOR UPDATE` taken there holds until commit, so nothing can claim the
         // slot in between.
-        if let SuccessorSlot::SealTerminal(occupant) = successor_slot {
-            diesel::update(harvest_workflow_executions::table.find(occupant))
-                .set(harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-        }
-
         diesel::insert_into(harvest_workflow_executions::table)
             .values(&new_row)
             .execute(conn)
@@ -22217,11 +22240,11 @@ mod tests {
     }
 
     /// The successor takes the `(target, workflow_id)` uniqueness slot, which
-    /// sealing the predecessor does NOT free. A terminal prior run of that
-    /// phase is released (a win-back loop); a LIVE one is rejected, because
-    /// harvest admits exactly one active run per identity — EXCEPT the
-    /// predecessor itself, whose own seal frees the slot in the same
-    /// transaction.
+    /// sealing the predecessor does NOT free. **Any** occupant is rejected —
+    /// live because harvest admits one active run per identity, terminal
+    /// because releasing it would rewrite an unrelated run's recorded outcome
+    /// (Codex P1s on PR #1159) — EXCEPT the predecessor itself, whose own seal
+    /// frees the slot in the same transaction.
     #[test]
     fn can803_successor_slot_classification_matrix() {
         let predecessor = uuid::Uuid::new_v4();
@@ -22233,16 +22256,29 @@ mod tests {
             "an unoccupied slot needs no release"
         );
 
+        // A TERMINAL occupant is rejected, never released. Releasing it by
+        // re-stating it `CONTINUED_AS_NEW` would make it read as a dangling
+        // LINK (parking `await_external_workflow` forever, blanking `/result`)
+        // and would drop a schedule-attributed run out of #488 carryover,
+        // rolling an incremental cursor backward.
         for terminal in ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"] {
-            assert_eq!(
-                classify_successor_slot(
-                    "paid_subscription",
-                    "sub-1",
-                    predecessor,
-                    Some((occupant, terminal))
-                ),
-                Ok(SuccessorSlot::SealTerminal(occupant)),
-                "a {terminal} prior run of the target phase must be released, not collided with"
+            let err = classify_successor_slot(
+                "paid_subscription",
+                "sub-1",
+                predecessor,
+                Some((occupant, terminal)),
+            )
+            .expect_err("a terminal occupant must be rejected, not silently released");
+            assert!(
+                err.contains("paid_subscription")
+                    && err.contains("sub-1")
+                    && err.contains(terminal)
+                    && err.contains(&occupant.to_string()),
+                "the message must name the type, workflow_id, state and execution, got {err}"
+            );
+            assert!(
+                err.contains("Reset") || err.contains("reset"),
+                "the message must tell the operator how to free the key, got {err}"
             );
         }
 
