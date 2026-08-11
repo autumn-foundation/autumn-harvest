@@ -89,8 +89,9 @@ const QUEUE_PAUSE_LOCK_DOMAIN: &str = "harvest:queue_pause:v1:";
 /// (`pg_advisory_xact_lock(int, int)`). A key in one can never collide with a
 /// key in the other, and **every other advisory-lock user in this engine is in
 /// the single-argument one** — the per-key concurrency gate on the hot claim
-/// path (`crate::queue::claim_task`), `crate::mutex`, `crate::wasm_store` and
-/// `crate::admission_gate`. So the two-argument keyspace belongs to this
+/// path (`crate::queue::claim_task`), `crate::mutex`, `crate::wasm_store`,
+/// `crate::admission_gate` and `crate::scheduler`'s registration lock
+/// (issue #1157). So the two-argument keyspace belongs to this
 /// feature alone, which is the load-bearing separation round 16 established and
 /// this function preserves. A source-level guard test keeps it true.
 ///
@@ -2354,7 +2355,8 @@ mod tests {
     /// locks from colliding with another subsystem is that no other subsystem
     /// uses the two-argument form. Every other advisory-lock user in the engine
     /// is in the single-argument `bigint` keyspace (`queue::claim_task`'s
-    /// concurrency gate, `mutex`, `wasm_store`, `admission_gate`), and this
+    /// concurrency gate, `mutex`, `wasm_store`, `admission_gate`,
+    /// `scheduler`'s registration lock), and this
     /// walks the crate to keep that true -- turning a documented convention
     /// into a CI-enforced one.
     #[test]

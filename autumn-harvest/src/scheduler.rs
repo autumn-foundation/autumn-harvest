@@ -31,6 +31,139 @@ use crate::worker::{DbPool, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Delay applied after a schedule's first failed registration (issue #1157).
+const REGISTRATION_BACKOFF_BASE: Duration = Duration::from_secs(2);
+
+/// Ceiling on the per-schedule registration backoff (issue #1157).
+///
+/// A schedule that cannot converge is retried at most this often instead of
+/// re-issuing the identical failing write on every 1 Hz tick. Kept modest so an
+/// operator repair is picked up promptly; a success clears the penalty outright.
+const REGISTRATION_BACKOFF_CAP: Duration = Duration::from_secs(300);
+
+/// The advisory-lock key guarding a schedule-registration pass (issue #1157).
+///
+/// Advisory locks are database-scoped and each shard is its own database, so a
+/// single constant naturally yields one reconciler per shard per fleet.
+pub const REGISTRATION_LOCK_KEY: &str = "harvest:schedule_registration:v1";
+
+/// The statement taking the registration advisory lock.
+///
+/// Exposed so a test can hold the lock from a peer connection and observe the
+/// pass skip. Uses the **one-argument** `hashtext` form: the two-argument
+/// keyspace is reserved to `queue_pause` by a guard test in that module.
+#[must_use]
+pub const fn registration_lock_stmt() -> &'static str {
+    "SELECT pg_try_advisory_xact_lock(hashtext($1)::int8) AS acquired"
+}
+
+/// Delay before a schedule that has failed registration `failures` times in a
+/// row is retried. Capped exponential; `0` failures means "no penalty".
+fn registration_backoff_delay(failures: u32) -> Duration {
+    if failures == 0 {
+        return Duration::ZERO;
+    }
+    // 2^(failures-1), saturating well before the shift would overflow.
+    let shift = failures.saturating_sub(1).min(32);
+    let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
+    REGISTRATION_BACKOFF_BASE
+        .saturating_mul(u32::try_from(multiplier).unwrap_or(u32::MAX))
+        .min(REGISTRATION_BACKOFF_CAP)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RegistrationBackoffEntry {
+    failures: u32,
+    retry_at: DateTime<Utc>,
+}
+
+/// Per-schedule registration backoff (issue #1157, defect 2).
+///
+/// The reconciler used to re-issue an identical failing write once per second
+/// forever, with no memory of the previous failure. This holds, per schedule
+/// key, how many consecutive registration failures it has seen and when it may
+/// next be attempted, so an unconvergeable schedule quiesces to one attempt per
+/// [`REGISTRATION_BACKOFF_CAP`] instead of 3600/hour — while every other
+/// schedule keeps reconciling at full rate.
+///
+/// Owned by [`SchedulerRuntime`] so the state spans ticks. One-shot callers of
+/// [`tick_once_sharded`] get a fresh instance, which is behaviourally identical
+/// to the pre-#1157 "always attempt" path.
+///
+/// # Contract
+///
+/// Two properties operators need, neither of which this type provides:
+///
+/// - **Not durable.** The state is an in-process map. A restart or redeploy
+///   resets every penalty, so a permanently-broken schedule resumes at full
+///   1 Hz until it fails enough times again. Backoff bounds a *running*
+///   process's write volume; it is not a persistent circuit breaker.
+/// - **Per-process, not fleet-wide.** N scheduler replicas each keep their own
+///   registry, so the fleet-wide *attempt* rate for a broken schedule is
+///   N/[`REGISTRATION_BACKOFF_CAP`]. (The registration advisory lock bounds
+///   concurrent *writes*, not attempts — `should_attempt` is consulted before
+///   the lock is ever taken.)
+///
+/// Not part of the stable public API: exposed only so a test in another crate
+/// can own a registry across ticks, mirroring the `claim_and_fire_workflow_schedule`
+/// seam.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct ScheduleRegistrationBackoff {
+    entries: Mutex<HashMap<String, RegistrationBackoffEntry>>,
+}
+
+impl ScheduleRegistrationBackoff {
+    /// A backoff registry with no recorded failures.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, RegistrationBackoffEntry>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether `key` may be attempted at `now`.
+    #[must_use]
+    pub fn should_attempt(&self, key: &str, now: DateTime<Utc>) -> bool {
+        self.lock()
+            .get(key)
+            .is_none_or(|entry| now >= entry.retry_at)
+    }
+
+    /// Record a failed registration for `key`, escalating its delay.
+    pub fn record_failure(&self, key: &str, now: DateTime<Utc>) {
+        let mut entries = self.lock();
+        let entry = entries
+            .entry(key.to_string())
+            .or_insert(RegistrationBackoffEntry {
+                failures: 0,
+                retry_at: now,
+            });
+        entry.failures = entry.failures.saturating_add(1);
+        let delay = chrono::Duration::from_std(registration_backoff_delay(entry.failures))
+            .unwrap_or_else(|_| chrono::Duration::seconds(300));
+        entry.retry_at = now
+            .checked_add_signed(delay)
+            .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
+        drop(entries);
+    }
+
+    /// Clear any penalty on `key` — the schedule converged.
+    pub fn record_success(&self, key: &str) {
+        self.lock().remove(key);
+    }
+
+    /// Number of consecutive failures recorded for `key`.
+    #[must_use]
+    pub fn failure_count(&self, key: &str) -> u32 {
+        self.lock().get(key).map_or(0, |entry| entry.failures)
+    }
+}
+
 /// The scheduler tick interval (issue #696).
 ///
 /// Re-exported so the overdue-schedule read/sampler callers pass the identical
@@ -307,15 +440,19 @@ impl SchedulerRuntime {
         let total = dags.len() + workflow_schedules.len();
         let monitor = SchedulerMonitor::new(total);
         let monitor_for_task = monitor.clone();
+        // Issue #1157, defect 2: per-schedule registration backoff state must
+        // span ticks, so the loop owns it rather than the (stateless) tick fn.
+        let backoff = ScheduleRegistrationBackoff::new();
         let handle = tokio::spawn(async move {
             while !shutdown_for_task.is_cancelled() {
-                if let Err(error) = tick_once_sharded(
+                if let Err(error) = tick_once_sharded_with_backoff(
                     pool.clone(),
                     router.clone(),
                     Arc::clone(&registry),
                     Arc::clone(&dags),
                     Arc::clone(&workflow_schedules),
                     monitor_for_task.clone(),
+                    &backoff,
                 )
                 .await
                 {
@@ -445,25 +582,276 @@ pub async fn register_schedules(
     Ok(())
 }
 
+/// Try to take the fleet-wide schedule-registration advisory lock on `conn`
+/// (issue #1157, defect 4).
+///
+/// Every process running with `scheduler_enabled` reconciles, so N processes
+/// against one database issued N× the registration writes and could race each
+/// other on the same rows. This transaction-scoped `try_` lock lets exactly one
+/// process reconcile a shard at a time; a process that does not get it simply
+/// skips (its peer is doing the work) and retries on the next tick.
+///
+/// Must be called inside a transaction — a `pg_*_advisory_xact_lock` taken in
+/// autocommit mode is released the instant the statement ends.
+async fn try_take_registration_lock(conn: &mut AsyncPgConnection) -> HarvestResult<bool> {
+    #[derive(diesel::QueryableByName)]
+    struct AcquiredRow {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        acquired: bool,
+    }
+
+    let row: AcquiredRow = diesel::sql_query(registration_lock_stmt())
+        .bind::<diesel::sql_types::Text, _>(REGISTRATION_LOCK_KEY)
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(row.acquired)
+}
+
+/// Log a per-schedule registration failure once, naming the schedule.
+///
+/// Issue #1157, defect 2: the pre-fix reconciler propagated the first error
+/// with `?`, so a tick raised exactly one error however many schedules were
+/// broken, and re-issued the identical failing write every second. Each failing
+/// schedule now gets its own WARN, emitted only on an attempt the backoff
+/// actually permitted.
+fn warn_registration_failure(kind: &str, name: &str, shard: ShardId, error: &HarvestError) {
+    tracing::warn!(
+        error = %error,
+        schedule_kind = kind,
+        schedule_name = name,
+        shard_id = shard.as_i32(),
+        "harvest: schedule registration failed; backing off this schedule \
+         (other schedules are unaffected)"
+    );
+}
+
 async fn register_schedules_for_shard(
     conn: &mut AsyncPgConnection,
     dags: &DagCatalog,
     router: &ShardRouter,
     shard: ShardId,
+    backoff: &ScheduleRegistrationBackoff,
 ) -> HarvestResult<()> {
     #[cfg(not(feature = "unified-dag-execution"))]
     reject_classic_dags_without_unified_execution(dags)?;
+    let now = Utc::now();
     for dag in dags.values() {
         if router.pick_for_dag(&dag.name) != shard {
             continue;
         }
-        if let Some(schedule) = &dag.schedule {
-            crate::policy::validate_schedule(schedule)
-                .map_err(crate::error::HarvestError::Config)?;
+        let key = registration_backoff_key("dag", &dag.name, shard);
+        if !backoff.should_attempt(&key, now) {
+            continue;
         }
-        upsert_schedule(conn, dag).await?;
+        // Collect rather than `?`: one unconvergeable DAG must not prevent
+        // every DAG after it in the iteration order from being registered.
+        let outcome = register_one_dag_schedule(conn, dag).await;
+        record_registration_outcome(backoff, &key, "dag", &dag.name, shard, outcome, now);
     }
     Ok(())
+}
+
+/// The backoff key for one schedule on one shard.
+///
+/// Not part of the stable public API — the format is an internal detail,
+/// exposed only so a cross-crate test can look a schedule up in a registry it
+/// owns. `kind` is `"dag"` or `"workflow"`.
+#[doc(hidden)]
+#[must_use]
+pub fn registration_backoff_key(kind: &str, name: &str, shard: ShardId) -> String {
+    format!("{}:{kind}:{name}", shard.as_i32())
+}
+
+/// What one schedule's registration attempt actually did.
+///
+/// The `Skipped` case is why this is not a bare `Result`. A process that loses
+/// the fleet-wide registration lock did **not** reconcile anything, so treating
+/// it as a success would call [`ScheduleRegistrationBackoff::record_success`]
+/// and *clear* the schedule's accumulated penalty. On a multi-process fleet —
+/// exactly the deployment shape the lock exists for — a permanently-broken
+/// schedule would then alternate lose-lock (penalty reset) / win-lock (fail,
+/// penalty = 1) and never escalate past the first backoff step, so the storm
+/// this fix suppresses would persist at roughly full rate, merely spread across
+/// processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationOutcome {
+    /// The row was reconciled, or was already converged. Clears any penalty.
+    Settled,
+    /// A peer held the registration lock. Leaves any penalty untouched.
+    Skipped,
+}
+
+/// Fold one attempt's outcome into the backoff registry.
+fn record_registration_outcome(
+    backoff: &ScheduleRegistrationBackoff,
+    key: &str,
+    kind: &str,
+    name: &str,
+    shard: ShardId,
+    outcome: HarvestResult<RegistrationOutcome>,
+    now: DateTime<Utc>,
+) {
+    match outcome {
+        Ok(RegistrationOutcome::Settled) => backoff.record_success(key),
+        // Deliberately neither success nor failure: nothing was attempted.
+        Ok(RegistrationOutcome::Skipped) => {}
+        Err(error) => {
+            warn_registration_failure(kind, name, shard, &error);
+            backoff.record_failure(key, now);
+        }
+    }
+}
+
+/// Validate + upsert a single classic DAG schedule row on the tick path.
+///
+/// Issue #1157 (defects 3 + 4): a converged row short-circuits before any
+/// transaction or lock is taken, and a row that *does* need a write is written
+/// under the fleet-wide registration lock so N scheduler processes perform 1×
+/// the write volume rather than N×.
+async fn register_one_dag_schedule(
+    conn: &mut AsyncPgConnection,
+    dag: &RegisteredDag,
+) -> HarvestResult<RegistrationOutcome> {
+    if let Some(schedule) = &dag.schedule {
+        crate::policy::validate_schedule(schedule).map_err(crate::error::HarvestError::Config)?;
+    }
+    if dag_registration_is_converged(conn, dag).await? {
+        return Ok(RegistrationOutcome::Settled);
+    }
+    // READ COMMITTED is pinned rather than inherited, matching the convention
+    // documented at `queue.rs`'s claim transaction: leaving it to
+    // `default_transaction_isolation` would let an operator set REPEATABLE READ
+    // on the database or role and turn every concurrent row touch (the
+    // fire-claim UPDATE, the PATCH route) into a 40001 serialization abort,
+    // which this path would then misread as a registration failure and back the
+    // healthy schedule off for up to five minutes.
+    let mut tx = conn.build_transaction().read_committed();
+    Box::pin(tx.run(async |c| {
+        if !try_take_registration_lock(c).await? {
+            // A peer scheduler process is reconciling right now. Skipping is
+            // not a failure -- and, critically, not a success either: see
+            // `RegistrationOutcome::Skipped`.
+            return Ok(RegistrationOutcome::Skipped);
+        }
+        upsert_schedule(c, dag).await?;
+        Ok(RegistrationOutcome::Settled)
+    }))
+    .await
+}
+
+/// Validate + upsert a single workflow schedule row on the tick path.
+///
+/// See [`register_one_dag_schedule`] for the converged-fast-path / advisory-lock
+/// contract (issue #1157).
+async fn register_one_workflow_schedule_locked(
+    conn: &mut AsyncPgConnection,
+    ws: &WorkflowSchedule,
+) -> HarvestResult<RegistrationOutcome> {
+    crate::policy::validate_schedule(&ws.schedule).map_err(crate::error::HarvestError::Config)?;
+    if workflow_registration_is_converged(conn, ws).await? {
+        return Ok(RegistrationOutcome::Settled);
+    }
+    // See `register_one_dag_schedule` for why the isolation level is pinned.
+    let mut tx = conn.build_transaction().read_committed();
+    Box::pin(tx.run(async |c| {
+        if !try_take_registration_lock(c).await? {
+            return Ok(RegistrationOutcome::Skipped);
+        }
+        upsert_workflow_schedule(c, ws).await?;
+        Ok(RegistrationOutcome::Settled)
+    }))
+    .await
+}
+
+/// Read-only probe: is this DAG's schedule row already exactly what
+/// registration would write? (issue #1157, defect 3.)
+///
+/// Deliberately conservative — any shape that is not the plain, fully-converged
+/// one (missing row, a foreign holder of the name, any drifted column) returns
+/// `false` and falls through to the full reconciling path, so skipping a write
+/// can never cost self-healing.
+async fn dag_registration_is_converged(
+    conn: &mut AsyncPgConnection,
+    dag: &RegisteredDag,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_schedules::dsl;
+
+    let existing = dsl::harvest_schedules
+        .filter(dsl::dag_name.eq(&dag.name))
+        .select(HarvestSchedule::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    let Some(existing) = existing else {
+        return Ok(false);
+    };
+
+    // A legacy workflow-only row for the same name still needs merging.
+    let legacy_holder: Option<uuid::Uuid> = dsl::harvest_schedules
+        .filter(dsl::workflow_name.eq(&dag.name))
+        .filter(dsl::dag_name.is_null())
+        .select(dsl::id)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    if legacy_holder.is_some() {
+        return Ok(false);
+    }
+
+    Ok(dag_schedule_row_is_converged(&existing, dag, Utc::now()))
+}
+
+/// Read-only probe: is this workflow schedule's row already exactly what
+/// registration would write? (issue #1157, defect 3.)
+///
+/// Conservative in the same way as [`dag_registration_is_converged`].
+async fn workflow_registration_is_converged(
+    conn: &mut AsyncPgConnection,
+    ws: &WorkflowSchedule,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_schedules::dsl;
+
+    // The row registration would land on.
+    let existing = match ws.dag_name.as_deref() {
+        Some(dag_name) => dsl::harvest_schedules
+            .filter(dsl::dag_name.eq(dag_name))
+            .select(HarvestSchedule::as_select())
+            .first(conn)
+            .await
+            .optional(),
+        None => dsl::harvest_schedules
+            .filter(dsl::workflow_name.eq(&ws.workflow_name))
+            .select(HarvestSchedule::as_select())
+            .first(conn)
+            .await
+            .optional(),
+    }
+    .map_err(crate::error::database_error)?;
+    let Some(existing) = existing else {
+        return Ok(false);
+    };
+
+    // Any other row holding this `workflow_name` — a legacy workflow-only row
+    // or an issue #1157 squatter — is reconciliation work, not convergence.
+    let holder: Option<uuid::Uuid> = dsl::harvest_schedules
+        .filter(dsl::workflow_name.eq(&ws.workflow_name))
+        .select(dsl::id)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    if holder != Some(existing.id) {
+        return Ok(false);
+    }
+
+    Ok(workflow_schedule_row_is_converged(
+        &existing,
+        ws,
+        Utc::now(),
+    ))
 }
 
 /// Upsert the durable schedule rows for the provided workflow schedules.
@@ -489,15 +877,36 @@ async fn register_workflow_schedules_for_shard(
     schedules: &[WorkflowSchedule],
     router: &ShardRouter,
     shard: ShardId,
+    backoff: &ScheduleRegistrationBackoff,
 ) -> HarvestResult<()> {
+    let now = Utc::now();
     for ws in schedules {
-        if schedule_targets_shard(ws, router, shard) {
-            crate::policy::validate_schedule(&ws.schedule)
-                .map_err(crate::error::HarvestError::Config)?;
-            upsert_workflow_schedule(conn, ws).await?;
-        } else if ws.dag_name.is_some() {
-            delete_stale_dag_workflow_schedule(conn, ws).await?;
+        let key = registration_backoff_key("workflow", &ws.workflow_name, shard);
+        if !backoff.should_attempt(&key, now) {
+            continue;
         }
+        // Collect rather than `?`: pre-#1157 the first failing schedule aborted
+        // the whole pass, so a tick raised exactly one error however many
+        // schedules were broken and every schedule after it in iteration order
+        // was never registered at all.
+        let outcome = if schedule_targets_shard(ws, router, shard) {
+            register_one_workflow_schedule_locked(conn, ws).await
+        } else if ws.dag_name.is_some() {
+            delete_stale_dag_workflow_schedule(conn, ws)
+                .await
+                .map(|()| RegistrationOutcome::Settled)
+        } else {
+            Ok(RegistrationOutcome::Settled)
+        };
+        record_registration_outcome(
+            backoff,
+            &key,
+            "workflow",
+            &ws.workflow_name,
+            shard,
+            outcome,
+            now,
+        );
     }
     Ok(())
 }
@@ -619,8 +1028,15 @@ pub async fn tick_once(
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError`] if a shard connection or schedule registration
-/// fails.
+/// Returns [`HarvestError`] if a shard connection cannot be acquired, or if
+/// firing a due schedule fails.
+///
+/// **A per-schedule registration failure is NOT returned** (changed in #1157).
+/// One unconvergeable schedule used to abort the whole pass with `?`, which
+/// both hid every other schedule's registration and re-issued the identical
+/// failing write every tick. Such a failure is now logged at `WARN` naming the
+/// schedule and backed off per-schedule; the tick still reports `Ok`. Drive
+/// alerting off those logs rather than off this return value.
 pub async fn tick_once_sharded(
     pool: ShardedDbPool,
     router: ShardRouter,
@@ -628,6 +1044,43 @@ pub async fn tick_once_sharded(
     dags: Arc<DagCatalog>,
     workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     monitor: SchedulerMonitor,
+) -> HarvestResult<()> {
+    // A fresh backoff registry: one-shot callers get the pre-#1157 "always
+    // attempt" behaviour. The long-running loop passes its own instance so the
+    // per-schedule penalty spans ticks.
+    tick_once_sharded_with_backoff(
+        pool,
+        router,
+        registry,
+        dags,
+        workflow_schedules,
+        monitor,
+        &ScheduleRegistrationBackoff::new(),
+    )
+    .await
+}
+
+/// [`tick_once_sharded`], with a caller-owned per-schedule registration backoff
+/// (issue #1157, defect 2).
+///
+/// Not part of the stable public API — exposed only so the long-running loop
+/// and a cross-crate test can carry a registry across ticks. Use
+/// [`tick_once_sharded`].
+///
+/// # Errors
+///
+/// Same contract as [`tick_once_sharded`]: a shard connection or a due-schedule
+/// fire can fail; a per-schedule *registration* failure is logged and backed
+/// off, not returned.
+#[doc(hidden)]
+pub async fn tick_once_sharded_with_backoff(
+    pool: ShardedDbPool,
+    router: ShardRouter,
+    registry: Arc<HandlerRegistry>,
+    dags: Arc<DagCatalog>,
+    workflow_schedules: Arc<Vec<WorkflowSchedule>>,
+    monitor: SchedulerMonitor,
+    backoff: &ScheduleRegistrationBackoff,
 ) -> HarvestResult<()> {
     #[cfg(not(feature = "unified-dag-execution"))]
     reject_classic_dags_without_unified_execution(dags.as_ref())?;
@@ -680,12 +1133,18 @@ pub async fn tick_once_sharded(
             .await
             .map_err(|error| HarvestError::Database(error.to_string()))?;
 
-        register_schedules_for_shard(&mut conn, dags.as_ref(), &router, shard).await?;
+        // Issue #1157: on a converged shard this pass is read-only — no
+        // transaction, no advisory lock, no UPDATE. Only a schedule that
+        // genuinely needs a write opens a transaction and contends for the
+        // fleet-wide registration lock, and a per-schedule failure is collected
+        // and backed off rather than aborting the rest of the pass.
+        register_schedules_for_shard(&mut conn, dags.as_ref(), &router, shard, backoff).await?;
         register_workflow_schedules_for_shard(
             &mut conn,
             workflow_schedules.as_ref(),
             &router,
             shard,
+            backoff,
         )
         .await?;
 
@@ -995,6 +1454,7 @@ async fn find_reusable_dag_schedule(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn upsert_schedule(
     conn: &mut AsyncPgConnection,
     dag: &RegisteredDag,
@@ -1006,6 +1466,10 @@ async fn upsert_schedule(
     let expr = schedule_expr(dag.schedule.as_ref());
 
     if let Some(existing) = existing {
+        // Issue #1157, defect 3: skip the write when the row already matches.
+        if dag_schedule_row_is_converged(&existing, dag, Utc::now()) {
+            return Ok(existing);
+        }
         let schedule_changed = existing.schedule_expr != expr;
         let next_run_at = if schedule_changed {
             next_run_after(dag.schedule.as_ref(), now)
@@ -1117,6 +1581,148 @@ async fn upsert_schedule(
     }
 }
 
+/// What the row currently holding a `workflow_name` means for the registration
+/// that wants to claim it (issue #1157, defect 1/1b).
+///
+/// The reconciler used to look for a holder only among rows with
+/// `dag_name IS NULL`. A holder with a non-NULL, non-matching `dag_name`
+/// matched nothing, so the resolver handed back the `dag_name = D` row and the
+/// subsequent `UPDATE ... SET workflow_name = D` ran while another row still
+/// held `D` — a `harvest_schedules_workflow_name_unique` violation re-issued
+/// once per second, forever.
+///
+/// The classification rests on one invariant:
+/// [`DagInfo::as_workflow_schedule`](crate::info::DagInfo::as_workflow_schedule)
+/// **always** sets `workflow_name == dag_name`, so a persisted row carrying a
+/// non-NULL `dag_name` that differs from the `workflow_name` it holds cannot
+/// have been produced by any registration path. It is corrupt, and whichever
+/// side of the comparison breaks the invariant is the side that is wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowNameHolder {
+    /// Nothing holds the name — the write is unobstructed.
+    Vacant,
+    /// A legacy workflow-only row (`dag_name IS NULL`). This is the documented
+    /// upgrade shape: merge its pause metadata into the DAG row and drop it, or
+    /// adopt it outright when no DAG row exists yet. Behaviour predates #1157.
+    WorkflowOnly,
+    /// An internally inconsistent row: non-NULL `dag_name` that differs from
+    /// the `workflow_name` it holds. Unreachable through registration, so it is
+    /// corrupt — release the name it squats (the row keeps its own identity,
+    /// pause state and counters, and its rightful owner re-stamps it).
+    Squatter,
+    /// A *well-formed* row owned by a different DAG holds the name. Two
+    /// schedules genuinely claiming one `workflow_name` is a configuration
+    /// collision: refuse to write rather than flap the name between them at
+    /// 1 Hz.
+    Conflict,
+    /// This *registration* breaks the invariant: its `dag_name` differs from
+    /// its `workflow_name`.
+    ///
+    /// Refused unconditionally — including when the name is free. That is what
+    /// makes [`Self::Squatter`]'s premise true: if registration were allowed to
+    /// persist a decoupled row whenever the name happened to be vacant, it
+    /// would create *exactly* the shape a later registration of a DAG by that
+    /// name classifies as corrupt and strips. The victim row would stop firing
+    /// (the due list requires `workflow_name IS NOT NULL`) and its own
+    /// registration would then fail forever — a silent, permanent outage
+    /// manufactured by the repair path itself.
+    ///
+    /// Refusing up front converts that latent landmine into an immediate,
+    /// named error at the point the malformed schedule is registered.
+    SelfInconsistent,
+}
+
+/// The `dag_name` of the row currently holding a `workflow_name`, if any.
+///
+/// The caller resolves "the holder *is* the row we are about to write" by id
+/// before classifying, so [`Self::OwnedBy`]/[`Self::Unowned`] here always
+/// describe a *different* row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameHolder<'a> {
+    /// No row holds the name.
+    Absent,
+    /// A row holds it with `dag_name IS NULL` (a legacy workflow-only row).
+    Unowned,
+    /// A row holds it and carries this non-NULL `dag_name`.
+    OwnedBy(&'a str),
+}
+
+/// Classify the row holding `registering_workflow`, if any.
+const fn classify_workflow_name_holder(
+    registering_dag: &str,
+    registering_workflow: &str,
+    holder: NameHolder<'_>,
+) -> WorkflowNameHolder {
+    // Checked FIRST -- before the holder is even inspected, and in particular
+    // before the vacant-name fast path. See `SelfInconsistent`: allowing a
+    // decoupled registration through on a free name is what would persist the
+    // very shape `Squatter` strips, so the two branches must agree or the
+    // repair path manufactures its own victims.
+    if !const_str_eq(registering_dag, registering_workflow) {
+        return WorkflowNameHolder::SelfInconsistent;
+    }
+
+    match holder {
+        NameHolder::Absent => WorkflowNameHolder::Vacant,
+        NameHolder::Unowned => WorkflowNameHolder::WorkflowOnly,
+        // The holder's own `dag_name` disagrees with the `workflow_name` it
+        // holds (which is `registering_workflow`): corrupt, release it.
+        NameHolder::OwnedBy(dag) if !const_str_eq(dag, registering_workflow) => {
+            WorkflowNameHolder::Squatter
+        }
+        // A well-formed row for another DAG that legitimately answers to this
+        // name. Genuine collision.
+        NameHolder::OwnedBy(_) => WorkflowNameHolder::Conflict,
+    }
+}
+
+/// `const`-callable string equality (`str::eq` is not `const` on this MSRV).
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Release a corrupt row's squat on `workflow_name` (issue #1157).
+///
+/// Sets `workflow_name = NULL` rather than deleting the row: the row's identity
+/// is its `dag_name`, and nulling preserves its pause state, buffered runs,
+/// `runs_started` and `next_run_at` so its rightful owner's own registration
+/// re-stamps it in the same pass. `harvest_schedules_kind_check` still holds
+/// because the row's `dag_name` is non-NULL by construction here.
+async fn release_squatted_workflow_name(
+    conn: &mut AsyncPgConnection,
+    row: &HarvestSchedule,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_schedules::dsl;
+
+    tracing::warn!(
+        schedule_id = %row.id,
+        dag_name = ?row.dag_name,
+        workflow_name = ?row.workflow_name,
+        "harvest: releasing a workflow_name squatted by a schedule row whose \
+         dag_name disagrees with it; the row keeps its own identity"
+    );
+    diesel::update(dsl::harvest_schedules.find(row.id))
+        .set((
+            dsl::workflow_name.eq(Option::<String>::None),
+            dsl::updated_at.eq(Utc::now()),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
 /// Upsert a `harvest_schedules` row for a [`WorkflowSchedule`].
 ///
 /// Unified DAG schedules first reuse any existing classic DAG row keyed by
@@ -1124,6 +1730,11 @@ async fn upsert_schedule(
 /// use `ON CONFLICT (workflow_name) DO NOTHING` so concurrent scheduler instances
 /// cannot produce duplicate rows. A subsequent `UPDATE` refreshes all mutable
 /// fields, preserving `is_paused` (managed independently via pause/resume).
+///
+/// The `workflow_name` holder is looked up **without** a `dag_name` predicate
+/// (issue #1157): restricting it to `dag_name IS NULL` left a third row shape —
+/// a non-NULL, non-matching `dag_name` — invisible, and the resulting write was
+/// a permanent unique violation. See [`WorkflowNameHolder`].
 async fn find_reusable_dag_workflow_schedule(
     conn: &mut AsyncPgConnection,
     dag_name: &str,
@@ -1139,28 +1750,66 @@ async fn find_reusable_dag_workflow_schedule(
         .optional()
         .map_err(crate::error::database_error)?;
 
-    let workflow_only_row = dsl::harvest_schedules
+    let name_row = dsl::harvest_schedules
         .filter(dsl::workflow_name.eq(workflow_name))
-        .filter(dsl::dag_name.is_null())
         .select(HarvestSchedule::as_select())
         .first(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?;
 
-    match (dag_row, workflow_only_row) {
-        (Some(dag_row), Some(workflow_only_row)) if dag_row.id != workflow_only_row.id => {
-            let dag_row =
-                merge_pause_metadata_into_schedule(conn, &dag_row, &workflow_only_row).await?;
-            diesel::delete(dsl::harvest_schedules.find(workflow_only_row.id))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-            Ok(Some(dag_row))
+    // The holder being the DAG row itself is not a conflict at all.
+    let foreign_holder = match (&dag_row, &name_row) {
+        (Some(dag), Some(holder)) if dag.id == holder.id => None,
+        _ => name_row.as_ref(),
+    };
+
+    let holder_shape = foreign_holder.map_or(NameHolder::Absent, |row| {
+        row.dag_name
+            .as_deref()
+            .map_or(NameHolder::Unowned, NameHolder::OwnedBy)
+    });
+
+    match classify_workflow_name_holder(dag_name, workflow_name, holder_shape) {
+        WorkflowNameHolder::Vacant => Ok(dag_row),
+        WorkflowNameHolder::WorkflowOnly => {
+            let workflow_only_row = foreign_holder.expect("classified from a present holder");
+            match dag_row {
+                Some(dag_row) => {
+                    let dag_row =
+                        merge_pause_metadata_into_schedule(conn, &dag_row, workflow_only_row)
+                            .await?;
+                    diesel::delete(dsl::harvest_schedules.find(workflow_only_row.id))
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                    Ok(Some(dag_row))
+                }
+                None => Ok(Some(workflow_only_row.clone())),
+            }
         }
-        (Some(dag_row), _) => Ok(Some(dag_row)),
-        (None, Some(workflow_only_row)) => Ok(Some(workflow_only_row)),
-        (None, None) => Ok(None),
+        WorkflowNameHolder::Squatter => {
+            let squatter = foreign_holder.expect("classified from a present holder");
+            release_squatted_workflow_name(conn, squatter).await?;
+            // `dag_row` may be None; the caller then inserts, now unobstructed.
+            Ok(dag_row)
+        }
+        WorkflowNameHolder::SelfInconsistent => Err(HarvestError::Config(format!(
+            "schedule registration is inconsistent: dag '{dag_name}' registers \
+             workflow_name '{workflow_name}'. A DAG-backed schedule must use one name for \
+             both. Persisting a decoupled row would make it indistinguishable from a \
+             corrupt row and a later DAG named '{workflow_name}' would strip its \
+             workflow_name, silently stopping it. Rename so the two agree."
+        ))),
+        WorkflowNameHolder::Conflict => {
+            let holder = foreign_holder.expect("classified from a present holder");
+            Err(HarvestError::Config(format!(
+                "schedule registration conflict: workflow_name '{workflow_name}' requested by \
+                 dag '{dag_name}' is already owned by schedule {} (dag_name {:?}); \
+                 refusing to reassign it. Rename one of the two schedules.",
+                holder.id, holder.dag_name
+            )))
+        }
     }
 }
 
@@ -1190,10 +1839,16 @@ async fn insert_dag_workflow_schedule_if_missing(
         calendar_name: ws.calendar.as_deref(),
         skip_policy: ws.skip_policy.as_str(),
     };
+    // Issue #1157, defect 1b: this row carries BOTH `dag_name` and
+    // `workflow_name`, so an `ON CONFLICT (dag_name)` arbiter offers no
+    // protection against `harvest_schedules_workflow_name_unique`. The bare
+    // (arbiter-less) `DO NOTHING` covers every unique index on the table, so a
+    // concurrent writer that claimed either key is absorbed instead of raising.
+    // `find_reusable_dag_workflow_schedule` has already released any *corrupt*
+    // squatter, so reaching a suppressed insert here means a genuine race.
     diesel::insert_into(harvest_schedules::table)
         .values(&row)
-        .on_conflict(dsl::dag_name)
-        .do_nothing()
+        .on_conflict_do_nothing()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -1203,7 +1858,19 @@ async fn insert_dag_workflow_schedule_if_missing(
         .select(HarvestSchedule::as_select())
         .first(conn)
         .await
-        .map_err(crate::error::database_error)
+        .optional()
+        .map_err(crate::error::database_error)?
+        .ok_or_else(|| {
+            // The insert was suppressed and no `dag_name` row exists: another
+            // writer holds `workflow_name` right now. Surface it as a named
+            // configuration error rather than an opaque unique violation; the
+            // per-schedule backoff quiesces the retry.
+            HarvestError::Config(format!(
+                "schedule registration for dag '{dag_name}' could not insert its row: \
+                 workflow_name '{}' is concurrently held by another schedule",
+                ws.workflow_name
+            ))
+        })
 }
 
 async fn insert_workflow_schedule_if_missing(
@@ -1274,6 +1941,232 @@ async fn find_or_insert_workflow_schedule(
     }
 }
 
+/// Would the registration UPDATE for `ws` be a no-op against `existing`?
+/// (Issue #1157, defect 3.)
+///
+/// Compares **every column** [`apply_workflow_schedule_update`] writes — the
+/// changeset, the post-update exhaustion reconciliation (#478), *and* the
+/// post-update auto-pause clear (#360) — against the values that update would
+/// compute. `updated_at` is excluded: it is bumped by the write itself, so
+/// comparing it would make convergence unreachable and reinstate the 1 Hz
+/// storm. `is_paused` and its metadata are excluded because the changeset
+/// deliberately never writes them (pause/resume owns them).
+///
+/// Note the contract is "*would the write be a no-op*", which is **broader than
+/// the changeset**: the two conditional post-update statements count as writes
+/// too. `auto_paused_at` is the one that lives outside the changeset entirely.
+///
+/// The dangerous direction here is the false positive: a drifted row reported
+/// converged would never be reconciled again. Every branch therefore fails
+/// closed — anything not provably equal returns `false`. The unit test
+/// `every_written_column_is_compared` mutates each column in turn and asserts
+/// convergence flips, so a column added to the changeset without being added
+/// here is caught.
+fn workflow_schedule_row_is_converged(
+    existing: &HarvestSchedule,
+    ws: &WorkflowSchedule,
+    now: DateTime<Utc>,
+) -> bool {
+    let expr = schedule_expr(Some(&ws.schedule));
+    // A cadence change forces a `next_run_at` recompute, which is by definition
+    // a write.
+    let schedule_changed = existing.schedule_expr != expr;
+    if schedule_changed {
+        return false;
+    }
+    // The update writes `existing.next_run_at.or_else(|| next_run_after(..))`,
+    // so a NULL column is only a write when the fallback would actually fill
+    // it. `Schedule::Manual` (and an unscheduled DAG) yield `None`, leaving the
+    // column permanently NULL — comparing `is_none()` alone would mean those
+    // schedules could NEVER converge and would rewrite on every 1 Hz tick,
+    // which is exactly the storm this check exists to stop.
+    if existing.next_run_at.is_none() && next_run_after(Some(&ws.schedule), now).is_some() {
+        return false;
+    }
+
+    // buffered_runs: the update preserves-and-trims under a buffering policy
+    // and clears otherwise. `!schedule_changed` mirrors the changeset's own
+    // guard verbatim; it is a tautology after the early return above, and is
+    // kept so the two blocks stay textually identical if that return is ever
+    // relaxed.
+    let is_buffering_policy = !schedule_changed
+        && matches!(
+            ws.overlap_policy,
+            OverlapPolicy::BufferOne | OverlapPolicy::BufferAll
+        );
+    let desired_buffered = if is_buffering_policy {
+        let cap = if ws.overlap_policy == OverlapPolicy::BufferOne {
+            1usize
+        } else {
+            usize::try_from(ws.buffer_all_max.max(1)).unwrap_or(usize::MAX)
+        };
+        let mut existing_buffered = parse_buffered_runs(&existing.buffered_runs);
+        existing_buffered.truncate(cap);
+        buffered_runs_to_json(&existing_buffered)
+    } else {
+        serde_json::json!([])
+    };
+    if existing.buffered_runs != desired_buffered {
+        return false;
+    }
+
+    // `dag_name` is `ws.dag_name.or(existing.dag_name)`, so a workflow-only
+    // registration adopting a row that already carries a dag_name is converged.
+    let desired_dag_name = ws.dag_name.as_deref().or(existing.dag_name.as_deref());
+    if existing.dag_name.as_deref() != desired_dag_name {
+        return false;
+    }
+
+    let desired_catchup = ws
+        .catchup_policy
+        .map_or(ws.catchup, crate::policy::CatchupPolicy::is_catchup_enabled);
+    let (desired_catchup_policy, desired_catchup_window) = ws
+        .catchup_policy
+        .map_or((None, None), |p| (p.to_db_columns().0, p.to_db_columns().1));
+    let desired_retry_policy = ws
+        .retry_policy
+        .as_ref()
+        .and_then(|p| serde_json::to_value(p).ok());
+
+    // #360's post-update clear: when the failure limit is disabled, the update
+    // NULLs `auto_paused_at`. That statement lives OUTSIDE the changeset, so it
+    // is invisible to a changeset-shaped comparison — and it is the one write
+    // whose omission is a genuine false positive: a row left
+    // `(consecutive_failure_limit = NULL, auto_paused_at = Some(_))` (reachable
+    // when the two autocommit statements are torn by a crash on the
+    // non-transactional `register_workflow_schedules` path) would be reported
+    // converged forever, so the auto-pause would never lift and the schedule
+    // would stay silently disabled with no log and no metric.
+    let limit_disabled = ws.consecutive_failure_limit.is_none_or(|n| n == 0);
+    if limit_disabled && existing.auto_paused_at.is_some() {
+        return false;
+    }
+
+    let converged = existing.timezone == ws.schedule.timezone_str()
+        && existing.catchup == desired_catchup
+        && existing.max_active_runs == i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)
+        && existing.workflow_name.as_deref() == Some(ws.workflow_name.as_str())
+        && existing.workflow_input.as_ref() == Some(&ws.input)
+        && existing.queue_name.as_deref() == Some(ws.queue_name.as_str())
+        && existing.jitter_secs == i64::try_from(ws.jitter.as_secs()).unwrap_or(i64::MAX)
+        && existing.overlap_policy == ws.overlap_policy.as_str()
+        && existing.buffer_all_max == i32::try_from(ws.buffer_all_max).unwrap_or(i32::MAX)
+        && existing.calendar_name.as_deref() == ws.calendar.as_deref()
+        && existing.skip_policy == ws.skip_policy.as_str()
+        && existing.consecutive_failure_limit
+            == ws
+                .consecutive_failure_limit
+                .map(|n| i32::try_from(n).unwrap_or(i32::MAX))
+        && existing.end_at == ws.end_at
+        && existing.max_runs == ws.max_runs.map(|n| i32::try_from(n).unwrap_or(i32::MAX))
+        && existing.catchup_policy.as_deref() == desired_catchup_policy
+        && existing.catchup_window_secs == desired_catchup_window
+        && existing.retry_policy == desired_retry_policy;
+    if !converged {
+        return false;
+    }
+
+    // The registration pass also reconciles #478 exhaustion after the UPDATE.
+    // A row still needing that reconciliation is not converged.
+    exhaustion_reconciliation_is_noop(existing, ws, now)
+}
+
+/// Would the #478 exhaustion reconciliation that follows the registration
+/// UPDATE write anything? Mirrors the branch structure of the block in
+/// [`apply_workflow_schedule_update`] and errs toward "would write".
+fn exhaustion_reconciliation_is_noop(
+    existing: &HarvestSchedule,
+    ws: &WorkflowSchedule,
+    now: DateTime<Utc>,
+) -> bool {
+    if existing.exhausted_at.is_some() {
+        let end_at_ok = ws.end_at.is_none_or(|new_end| {
+            if matches!(ws.schedule, crate::policy::Schedule::Manual) {
+                return now < new_end;
+            }
+            next_run_after(Some(&ws.schedule), now).is_some_and(|next| next < new_end)
+        });
+        let max_runs_ok = ws.max_runs.is_none_or(|max| {
+            i64::from(existing.runs_started) < i64::from(i32::try_from(max).unwrap_or(i32::MAX))
+        });
+        // Would clear exhaustion → a write.
+        !(end_at_ok && max_runs_ok)
+    } else {
+        let max_runs_now_violated = ws.max_runs.is_some_and(|max| {
+            let max_i32 = i32::try_from(max).unwrap_or(i32::MAX);
+            max_i32 > 0 && existing.runs_started >= max_i32
+        });
+        let end_at_now_violated = ws.end_at.is_some_and(|new_end| {
+            if matches!(ws.schedule, crate::policy::Schedule::Manual) {
+                return now >= new_end;
+            }
+            if existing.next_run_at.is_some_and(|t| t < new_end) {
+                return false;
+            }
+            next_run_after(Some(&ws.schedule), now).is_none_or(|next| next >= new_end)
+        });
+        // Would transition to exhausted → a write.
+        !(max_runs_now_violated || end_at_now_violated)
+    }
+}
+
+/// Would the classic-DAG registration UPDATE be a no-op against `existing`?
+/// (Issue #1157, defect 3.)
+///
+/// Mirrors the changeset in [`upsert_schedule`]. With `unified-dag-execution`
+/// on, every DAG is reconciled by *both* this pass and the workflow-schedule
+/// pass, so skipping converged writes here removes half the no-op UPDATE volume.
+fn dag_schedule_row_is_converged(
+    existing: &HarvestSchedule,
+    dag: &RegisteredDag,
+    now: DateTime<Utc>,
+) -> bool {
+    let expr = schedule_expr(dag.schedule.as_ref());
+    let schedule_changed = existing.schedule_expr != expr;
+    if schedule_changed {
+        return false;
+    }
+    // See the sibling note in `workflow_schedule_row_is_converged`: an
+    // *unscheduled* DAG (`schedule: None`) has `next_run_at` permanently NULL,
+    // and `register_schedules_for_shard` iterates every DAG in the catalog —
+    // so an `is_none()` guard alone would leave trigger-only DAGs (often most
+    // of a catalog) rewriting on every tick, gutting the fix.
+    if existing.next_run_at.is_none() && next_run_after(dag.schedule.as_ref(), now).is_some() {
+        return false;
+    }
+
+    // `!schedule_changed` mirrors the changeset's guard verbatim; see the
+    // sibling note in `workflow_schedule_row_is_converged`.
+    let is_buffering_policy = !schedule_changed
+        && matches!(
+            dag.overlap_policy,
+            OverlapPolicy::BufferOne | OverlapPolicy::BufferAll
+        );
+    let desired_buffered = if is_buffering_policy {
+        let cap = if dag.overlap_policy == OverlapPolicy::BufferOne {
+            1usize
+        } else {
+            usize::try_from(dag.buffer_all_max.max(1)).unwrap_or(usize::MAX)
+        };
+        let mut existing_buffered = parse_buffered_runs(&existing.buffered_runs);
+        existing_buffered.truncate(cap);
+        buffered_runs_to_json(&existing_buffered)
+    } else {
+        serde_json::json!([])
+    };
+
+    existing.timezone == dag.schedule.as_ref().map_or("UTC", Schedule::timezone_str)
+        && existing.catchup == dag.catchup
+        && existing.catchup_policy.is_none()
+        && existing.catchup_window_secs.is_none()
+        && existing.max_active_runs == i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX)
+        && existing.dag_name.as_deref() == Some(dag.name.as_str())
+        && existing.jitter_secs == i64::try_from(dag.jitter.as_secs()).unwrap_or(i64::MAX)
+        && existing.overlap_policy == dag.overlap_policy.as_str()
+        && existing.buffer_all_max == i32::try_from(dag.buffer_all_max).unwrap_or(i32::MAX)
+        && existing.buffered_runs == desired_buffered
+}
+
 #[allow(clippy::too_many_lines)]
 async fn upsert_workflow_schedule(
     conn: &mut AsyncPgConnection,
@@ -1281,6 +2174,12 @@ async fn upsert_workflow_schedule(
 ) -> HarvestResult<HarvestSchedule> {
     let expr = schedule_expr(Some(&ws.schedule));
     let existing = find_or_insert_workflow_schedule(conn, ws, expr.as_deref()).await?;
+    // Issue #1157, defect 3: a row that already says exactly what registration
+    // would write needs no write. This also covers the public/API entry points
+    // (`register_workflow_schedules`), not just the tick.
+    if workflow_schedule_row_is_converged(&existing, ws, Utc::now()) {
+        return Ok(existing);
+    }
     match apply_workflow_schedule_update(conn, ws, &existing, false).await? {
         AppliedScheduleUpdate::Updated(row) => Ok(*row),
         // Unreachable: the unguarded (guard_live_fire_claim = false) path never
@@ -7149,5 +8048,537 @@ mod tests {
             false
         ));
         assert!(!scheduled_fire_encodes_shard("nightly_report", false));
+    }
+
+    // ── Schedule-registration reconciler (issue #1157) ──────────────────────
+    //
+    // Pure (no-DB) coverage for the three decision cores the reconciler fix
+    // introduces:
+    //
+    // * `classify_workflow_name_holder` — defect 1/1b: which row legitimately
+    //   owns a `workflow_name`, and what to do about a row that does not.
+    // * `registration_backoff_delay` / `ScheduleRegistrationBackoff` —
+    //   defect 2: per-schedule capped exponential backoff.
+    // * `workflow_schedule_row_is_converged` — defect 3: skip the write when
+    //   the resolved row already matches the desired state.
+
+    #[test]
+    fn holder_classification_truth_table() {
+        use WorkflowNameHolder as H;
+
+        // No other row holds the name: nothing to reconcile.
+        assert_eq!(
+            classify_workflow_name_holder("my_dag", "my_dag", NameHolder::Absent),
+            H::Vacant
+        );
+
+        // A legacy workflow-only row (dag_name IS NULL) is the pre-existing
+        // upgrade shape: merge/adopt, exactly as before this fix.
+        assert_eq!(
+            classify_workflow_name_holder("my_dag", "my_dag", NameHolder::Unowned),
+            H::WorkflowOnly
+        );
+
+        // THE ISSUE #1157 SHAPE: a row whose dag_name is non-NULL and differs
+        // from the workflow_name it holds. `DagInfo::as_workflow_schedule`
+        // always sets workflow_name == dag_name, so this row is unreachable
+        // through any registration path — it is corrupt and must release the
+        // name it squats.
+        assert_eq!(
+            classify_workflow_name_holder(
+                "my_dag",
+                "my_dag",
+                NameHolder::OwnedBy("some_other_dag")
+            ),
+            H::Squatter
+        );
+
+        // A CONSISTENT row owned by another DAG is not corrupt: refuse to write
+        // rather than flap the name between them.
+        //
+        // Note this arm is DEFENSIVE — it is unreachable in practice. Reaching
+        // it needs a foreign holder whose `dag_name` equals the name we are
+        // registering, but `harvest_schedules.dag_name` is UNIQUE and the
+        // caller resolves "the holder is our own dag row" by id first, so the
+        // only row that could carry it is the one already excluded. It is kept
+        // so the classifier stays total if that constraint is ever relaxed.
+        assert_eq!(
+            classify_workflow_name_holder("shared", "shared", NameHolder::OwnedBy("shared")),
+            H::Conflict
+        );
+
+        // Our OWN registration violating the invariant (dag_name !=
+        // workflow_name) is checked first, so we never steal another row on
+        // the strength of a claim we should not be making.
+        assert_eq!(
+            classify_workflow_name_holder("my_dag", "other_name", NameHolder::Unowned),
+            H::SelfInconsistent
+        );
+        assert_eq!(
+            classify_workflow_name_holder("my_dag", "other_name", NameHolder::OwnedBy("third_dag")),
+            H::SelfInconsistent
+        );
+    }
+
+    /// A decoupled registration must be refused **even when the name is free**.
+    ///
+    /// This is the one that matters. Classifying a free name as `Vacant`
+    /// regardless of self-consistency looks harmless in isolation — nothing to
+    /// collide with — but it persists a row with
+    /// `dag_name = "X", workflow_name = "A"`, which is byte-for-byte the shape
+    /// `Squatter` treats as corrupt. Registering a DAG named `A` later would
+    /// strip that row's `workflow_name`; the due list requires it to be
+    /// non-NULL, so `X` would stop firing silently, and `X`'s own registration
+    /// would then fail forever. The repair path would have manufactured its own
+    /// victim.
+    ///
+    /// `Squatter`'s premise ("unreachable through registration ⇒ corrupt") is
+    /// only true because this case is refused.
+    #[test]
+    fn a_decoupled_registration_is_refused_even_when_the_name_is_free() {
+        assert_eq!(
+            classify_workflow_name_holder("my_dag", "other_name", NameHolder::Absent),
+            WorkflowNameHolder::SelfInconsistent,
+            "a free name must not license persisting the very shape Squatter strips"
+        );
+
+        // The consistent case is untouched: still the plain happy path.
+        assert_eq!(
+            classify_workflow_name_holder("my_dag", "my_dag", NameHolder::Absent),
+            WorkflowNameHolder::Vacant
+        );
+    }
+
+    #[test]
+    fn registration_backoff_delay_grows_and_caps() {
+        // First failure waits the base delay; each subsequent failure doubles.
+        assert_eq!(registration_backoff_delay(1), REGISTRATION_BACKOFF_BASE);
+        assert_eq!(registration_backoff_delay(2), REGISTRATION_BACKOFF_BASE * 2);
+        assert_eq!(registration_backoff_delay(3), REGISTRATION_BACKOFF_BASE * 4);
+        // Saturates at the cap rather than overflowing.
+        assert_eq!(registration_backoff_delay(1_000), REGISTRATION_BACKOFF_CAP);
+        assert_eq!(
+            registration_backoff_delay(u32::MAX),
+            REGISTRATION_BACKOFF_CAP
+        );
+        // A zero-failure key is not backed off at all.
+        assert_eq!(registration_backoff_delay(0), Duration::ZERO);
+    }
+
+    #[test]
+    fn backoff_suppresses_retries_until_the_delay_elapses() {
+        let t0 = Utc::now();
+        let backoff = ScheduleRegistrationBackoff::new();
+
+        // A never-failed key always attempts.
+        assert!(backoff.should_attempt("my_dag", t0));
+
+        backoff.record_failure("my_dag", t0);
+        // Immediately after a failure the schedule is suppressed — this is
+        // what stops the 1 Hz re-issue of an identical failing write.
+        assert!(!backoff.should_attempt("my_dag", t0));
+        assert!(!backoff.should_attempt("my_dag", t0 + chrono::Duration::milliseconds(500)));
+        // Once the delay elapses the schedule is retried.
+        let base = chrono::Duration::from_std(REGISTRATION_BACKOFF_BASE).unwrap();
+        assert!(backoff.should_attempt("my_dag", t0 + base));
+    }
+
+    #[test]
+    fn backoff_is_per_schedule_and_clears_on_success() {
+        let t0 = Utc::now();
+        let backoff = ScheduleRegistrationBackoff::new();
+
+        backoff.record_failure("broken_dag", t0);
+        // Defect 2: one unconvergeable schedule must not suppress its peers.
+        assert!(!backoff.should_attempt("broken_dag", t0));
+        assert!(backoff.should_attempt("healthy_dag", t0));
+
+        // A success clears the penalty immediately so an operator repair is
+        // picked up on the very next tick, not after the cap.
+        backoff.record_success("broken_dag");
+        assert!(backoff.should_attempt("broken_dag", t0));
+    }
+
+    #[test]
+    fn backoff_escalates_on_repeated_failures() {
+        let t0 = Utc::now();
+        let backoff = ScheduleRegistrationBackoff::new();
+        let base = chrono::Duration::from_std(REGISTRATION_BACKOFF_BASE).unwrap();
+
+        backoff.record_failure("k", t0);
+        // Second failure recorded after the first delay elapsed: the next wait
+        // is twice as long, so a permanently broken schedule quiesces instead
+        // of re-issuing the identical write every tick forever.
+        let t1 = t0 + base;
+        backoff.record_failure("k", t1);
+        assert!(!backoff.should_attempt("k", t1 + base));
+        assert!(backoff.should_attempt("k", t1 + base * 2));
+    }
+
+    /// A converged (existing, desired) pair built from one `WorkflowSchedule`.
+    fn converged_pair() -> (HarvestSchedule, WorkflowSchedule) {
+        let mut ws = WorkflowSchedule::new(
+            "nightly_report",
+            Schedule::Interval(Duration::from_secs(60)),
+        );
+        ws.queue_name = "reports".to_string();
+        let mut row = merge_base_row();
+        row.workflow_name = Some("nightly_report".to_string());
+        row.dag_name = None;
+        row.schedule_expr = schedule_expr(Some(&ws.schedule));
+        row.timezone = ws.schedule.timezone_str().to_string();
+        row.catchup = ws.catchup;
+        row.max_active_runs = i32::try_from(ws.max_active_runs).unwrap();
+        row.workflow_input = Some(ws.input.clone());
+        row.queue_name = Some(ws.queue_name.clone());
+        row.jitter_secs = i64::try_from(ws.jitter.as_secs()).unwrap();
+        row.overlap_policy = ws.overlap_policy.as_str().to_string();
+        row.buffer_all_max = i32::try_from(ws.buffer_all_max).unwrap();
+        row.buffered_runs = serde_json::json!([]);
+        row.calendar_name = None;
+        row.skip_policy = ws.skip_policy.as_str().to_string();
+        row.consecutive_failure_limit = None;
+        row.end_at = None;
+        row.max_runs = None;
+        row.catchup_policy = None;
+        row.catchup_window_secs = None;
+        row.retry_policy = None;
+        row.next_run_at = Some(Utc::now() + chrono::Duration::seconds(60));
+        row.exhausted_at = None;
+        (row, ws)
+    }
+
+    #[test]
+    fn a_converged_row_needs_no_write() {
+        let (row, ws) = converged_pair();
+        let now = Utc::now();
+        // Defect 3: this is the fast path that removes ~2M no-op UPDATEs/day
+        // on a healthy deployment.
+        assert!(workflow_schedule_row_is_converged(&row, &ws, now));
+    }
+
+    /// A single-column drift injector for `every_written_column_is_compared`.
+    type Mutator = fn(&mut HarvestSchedule);
+
+    #[test]
+    fn every_written_column_is_compared() {
+        // The danger of the defect-3 fast path is the FALSE POSITIVE: a row
+        // that has drifted but is reported converged would never be repaired
+        // again. Mutate each column the registration UPDATE writes and assert
+        // convergence flips to false, so a column added to the changeset
+        // without being added to the comparison is caught here.
+        let now = Utc::now();
+        let mutators: Vec<(&str, Mutator)> = vec![
+            ("schedule_expr", |r| {
+                r.schedule_expr = Some("interval:999".to_string());
+            }),
+            ("timezone", |r| r.timezone = "America/New_York".to_string()),
+            ("catchup", |r| r.catchup = !r.catchup),
+            ("max_active_runs", |r| r.max_active_runs += 1),
+            // `dag_name` is covered by its own two tests below: the changeset
+            // writes `ws.dag_name.or(existing.dag_name)`, so its drift
+            // semantics differ between workflow-only and DAG-backed schedules.
+            ("workflow_name", |r| {
+                r.workflow_name = Some("someone_else".to_string());
+            }),
+            ("workflow_input", |r| {
+                r.workflow_input = Some(serde_json::json!({"drift": true}));
+            }),
+            ("queue_name", |r| r.queue_name = Some("other".to_string())),
+            ("next_run_at", |r| r.next_run_at = None),
+            ("jitter_secs", |r| r.jitter_secs += 7),
+            ("overlap_policy", |r| {
+                r.overlap_policy = OverlapPolicy::BufferAll.as_str().to_string();
+            }),
+            ("buffer_all_max", |r| r.buffer_all_max += 1),
+            ("buffered_runs", |r| {
+                r.buffered_runs = serde_json::json!(["2026-01-01T00:00:00Z"]);
+            }),
+            ("calendar_name", |r| {
+                r.calendar_name = Some("us_holidays".to_string());
+            }),
+            ("skip_policy", |r| {
+                r.skip_policy = crate::policy::SkipPolicy::RunNextBusinessDay
+                    .as_str()
+                    .to_string();
+            }),
+            ("consecutive_failure_limit", |r| {
+                r.consecutive_failure_limit = Some(3);
+            }),
+            ("end_at", |r| r.end_at = Some(Utc::now())),
+            ("max_runs", |r| r.max_runs = Some(5)),
+            ("catchup_policy", |r| {
+                r.catchup_policy = Some("window".to_string());
+            }),
+            ("catchup_window_secs", |r| r.catchup_window_secs = Some(60)),
+            ("retry_policy", |r| {
+                r.retry_policy = Some(serde_json::json!({"max_attempts": 3}));
+            }),
+            // Not a changeset column, but the registration pass also performs
+            // exhaustion reconciliation (#478) after the UPDATE. A row that
+            // still needs that reconciliation is NOT converged.
+            ("exhausted_at", |r| r.exhausted_at = Some(Utc::now())),
+            // Likewise #360's auto-pause clear: the registration UPDATE NULLs
+            // `auto_paused_at` when the failure limit is disabled (which
+            // `converged_pair` leaves it as). This is the one write that lives
+            // outside the changeset AND does not bump `updated_at`, so a
+            // changeset-shaped comparison misses it entirely and a row left
+            // auto-paused would stay silently disabled forever.
+            ("auto_paused_at", |r| r.auto_paused_at = Some(Utc::now())),
+        ];
+
+        for (column, mutate) in mutators {
+            let (mut row, ws) = converged_pair();
+            mutate(&mut row);
+            assert!(
+                !workflow_schedule_row_is_converged(&row, &ws, now),
+                "drift in `{column}` must force a repairing write, otherwise the \
+                 row can never be reconciled again"
+            );
+        }
+    }
+
+    #[test]
+    fn dag_name_drift_is_absorbed_for_a_workflow_only_schedule() {
+        // The registration changeset writes `ws.dag_name.or(existing.dag_name)`,
+        // so a workflow-only schedule deliberately PRESERVES a dag_name already
+        // on the row (that is how a unified DAG row keeps its identity when the
+        // workflow-schedule pass reconciles it). The update would therefore
+        // write the same value back — genuinely converged, not a missed repair.
+        let (mut row, ws) = converged_pair();
+        assert!(ws.dag_name.is_none());
+        row.dag_name = Some("adopted".to_string());
+        assert!(workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+    }
+
+    #[test]
+    fn dag_name_drift_forces_a_write_for_a_dag_backed_schedule() {
+        // A DAG-backed schedule DOES assert its own dag_name, so drift there
+        // must be repaired.
+        let (mut row, mut ws) = converged_pair();
+        ws.dag_name = Some("nightly_report".to_string());
+        row.dag_name = Some("nightly_report".to_string());
+        assert!(workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+
+        row.dag_name = Some("someone_elses_dag".to_string());
+        assert!(!workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+    }
+
+    #[test]
+    fn updated_at_alone_never_forces_a_write() {
+        // `updated_at` is bumped by the write itself; comparing it would make
+        // convergence impossible and reinstate the 1 Hz storm.
+        let (mut row, ws) = converged_pair();
+        row.updated_at = Utc::now() - chrono::Duration::days(30);
+        assert!(workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+    }
+
+    #[test]
+    fn pause_state_is_not_a_convergence_input() {
+        // `is_paused` is operator-managed and deliberately excluded from the
+        // registration changeset; a paused schedule must stay converged so
+        // registration does not fight pause/resume.
+        let (mut row, ws) = converged_pair();
+        row.is_paused = true;
+        row.paused_at = Some(Utc::now());
+        row.paused_by = Some("operator".to_string());
+        assert!(workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+    }
+
+    /// A `Manual` schedule's `next_run_at` is permanently NULL, so a bare
+    /// `is_none()` guard would mean it can *never* converge — it would rewrite
+    /// on every 1 Hz tick forever, which is precisely the storm defect 3 is
+    /// supposed to end.
+    #[test]
+    fn a_manual_schedule_converges_despite_a_null_next_run_at() {
+        // Start from the known-converged fixture and change only the cadence,
+        // so the assertion isolates the `next_run_at` rule.
+        let (mut row, mut ws) = converged_pair();
+        ws.schedule = Schedule::Manual;
+        row.schedule_expr = schedule_expr(Some(&Schedule::Manual));
+        // The registration UPDATE would write `None.or_else(|| None)` == None.
+        row.next_run_at = None;
+
+        assert!(
+            workflow_schedule_row_is_converged(&row, &ws, Utc::now()),
+            "a manual schedule with a NULL next_run_at is already what the write \
+             would produce; reporting it un-converged reinstates the 1 Hz storm"
+        );
+    }
+
+    /// The inverse: a *real* cadence whose `next_run_at` is genuinely missing
+    /// must still be repaired. This is what keeps the fix above from becoming a
+    /// false positive.
+    #[test]
+    fn a_scheduled_row_with_a_null_next_run_at_is_still_repaired() {
+        let (mut row, ws) = converged_pair();
+        row.next_run_at = None;
+        assert!(
+            !workflow_schedule_row_is_converged(&row, &ws, Utc::now()),
+            "an interval schedule CAN compute a next_run_at, so a NULL column is drift"
+        );
+    }
+
+    /// A `RegisteredDag` with everything `dag_schedule_row_is_converged` reads.
+    fn dag_with_schedule(name: &str, schedule: Option<Schedule>) -> RegisteredDag {
+        RegisteredDag {
+            name: name.to_string(),
+            module: "tests".to_string(),
+            schedule,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            is_unified: true,
+            definition: crate::dag::DagBuilder::new()
+                .build()
+                .expect("an empty DAG is a valid graph"),
+            jitter: Duration::ZERO,
+            overlap_policy: OverlapPolicy::Skip,
+            buffer_all_max: 0,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+        }
+    }
+
+    /// A converged (row, dag) pair for the classic-DAG registration path.
+    fn converged_dag_pair() -> (HarvestSchedule, RegisteredDag) {
+        let dag = dag_with_schedule(
+            "nightly_dag",
+            Some(Schedule::Interval(Duration::from_secs(60))),
+        );
+        let mut row = merge_base_row();
+        row.dag_name = Some("nightly_dag".to_string());
+        row.schedule_expr = schedule_expr(dag.schedule.as_ref());
+        row.timezone = "UTC".to_string();
+        row.catchup = false;
+        row.catchup_policy = None;
+        row.catchup_window_secs = None;
+        row.max_active_runs = 1;
+        row.jitter_secs = 0;
+        row.overlap_policy = OverlapPolicy::Skip.as_str().to_string();
+        row.buffer_all_max = 0;
+        row.buffered_runs = serde_json::json!([]);
+        row.next_run_at = Some(Utc::now() + chrono::Duration::seconds(60));
+        (row, dag)
+    }
+
+    #[test]
+    fn a_converged_dag_row_needs_no_write() {
+        let (row, dag) = converged_dag_pair();
+        assert!(dag_schedule_row_is_converged(&row, &dag, Utc::now()));
+    }
+
+    /// The DAG-side twin of `every_written_column_is_compared`. The classic-DAG
+    /// upsert has its own, smaller changeset and carries the identical
+    /// false-positive hazard, so it needs its own drift injector — otherwise a
+    /// column added to `upsert_schedule` is guarded by nothing at all.
+    #[test]
+    fn every_dag_written_column_is_compared() {
+        let mutators: Vec<(&str, Mutator)> = vec![
+            ("schedule_expr", |r| {
+                r.schedule_expr = Some("interval:999".to_string());
+            }),
+            ("timezone", |r| r.timezone = "America/New_York".to_string()),
+            ("catchup", |r| r.catchup = !r.catchup),
+            ("catchup_policy", |r| {
+                r.catchup_policy = Some("window".to_string());
+            }),
+            ("catchup_window_secs", |r| r.catchup_window_secs = Some(60)),
+            ("max_active_runs", |r| r.max_active_runs += 1),
+            ("dag_name", |r| r.dag_name = Some("other_dag".to_string())),
+            ("next_run_at", |r| r.next_run_at = None),
+            ("jitter_secs", |r| r.jitter_secs += 7),
+            ("overlap_policy", |r| {
+                r.overlap_policy = OverlapPolicy::BufferAll.as_str().to_string();
+            }),
+            ("buffer_all_max", |r| r.buffer_all_max += 1),
+            ("buffered_runs", |r| {
+                r.buffered_runs = serde_json::json!(["2026-01-01T00:00:00Z"]);
+            }),
+        ];
+
+        for (column, mutate) in mutators {
+            let (mut row, dag) = converged_dag_pair();
+            mutate(&mut row);
+            assert!(
+                !dag_schedule_row_is_converged(&row, &dag, Utc::now()),
+                "drift in `{column}` must force a write, otherwise the classic-DAG \
+                 fast path silently suppresses reconciliation of that column forever"
+            );
+        }
+    }
+
+    /// An *unscheduled* DAG (`schedule: None`) also has a permanently-NULL
+    /// `next_run_at`, and `register_schedules_for_shard` iterates every DAG in
+    /// the catalog. Trigger-only DAGs are often most of a catalog, so an
+    /// `is_none()` guard here would leave the bulk of the cited write volume
+    /// untouched.
+    #[test]
+    fn an_unscheduled_dag_converges_despite_a_null_next_run_at() {
+        // Start from the known-converged DAG fixture and drop only the cadence.
+        let (mut row, mut dag) = converged_dag_pair();
+        dag.schedule = None;
+        row.schedule_expr = None;
+        row.next_run_at = None;
+
+        assert!(
+            dag_schedule_row_is_converged(&row, &dag, Utc::now()),
+            "a trigger-only DAG needs no write; rewriting it every tick is the storm"
+        );
+    }
+
+    /// A lock-skip must be neither a success nor a failure. Recording it as a
+    /// success would clear the penalty, so on a multi-process fleet a broken
+    /// schedule would alternate lose-lock (reset) / win-lock (fail, count = 1)
+    /// and never escalate — the storm would persist at ~full rate.
+    #[test]
+    fn a_lock_skip_preserves_the_accumulated_backoff() {
+        let t0 = Utc::now();
+        let backoff = ScheduleRegistrationBackoff::new();
+        let shard = ShardId::new(0);
+        let key = registration_backoff_key("dag", "broken", shard);
+
+        record_registration_outcome(
+            &backoff,
+            &key,
+            "dag",
+            "broken",
+            shard,
+            Err(HarvestError::Config("boom".to_string())),
+            t0,
+        );
+        assert_eq!(backoff.failure_count(&key), 1);
+
+        // A peer held the lock: nothing was attempted, so nothing changes.
+        record_registration_outcome(
+            &backoff,
+            &key,
+            "dag",
+            "broken",
+            shard,
+            Ok(RegistrationOutcome::Skipped),
+            t0,
+        );
+        assert_eq!(
+            backoff.failure_count(&key),
+            1,
+            "a lock skip must not clear the penalty -- that is what lets a broken \
+             schedule keep retrying at full rate across a fleet"
+        );
+        assert!(!backoff.should_attempt(&key, t0));
+
+        // A genuine reconcile does clear it.
+        record_registration_outcome(
+            &backoff,
+            &key,
+            "dag",
+            "broken",
+            shard,
+            Ok(RegistrationOutcome::Settled),
+            t0,
+        );
+        assert_eq!(backoff.failure_count(&key), 0);
+        assert!(backoff.should_attempt(&key, t0));
     }
 }
