@@ -872,43 +872,92 @@ pub async fn register_workflow_schedules(
     Ok(())
 }
 
-async fn register_workflow_schedules_for_shard(
+/// Whether a shard may fire schedules after its registration pass.
+///
+/// Issue #1157: both firing passes — `tick_workflow_schedules` and
+/// `drain_buffered_schedule_runs` — select due rows with *no* target-shard
+/// predicate, so each fires whatever happens to be in its own shard's database.
+/// That is only sound while the registration pass upholds its end of the
+/// bargain: every row a routing change stranded on a non-owning shard has been
+/// collected. If a stale row survives the pass, this shard and the row's new
+/// owner both hold a due copy and both fire it — the duplicate-run storm this
+/// issue reports.
+///
+/// Not part of the stable public API — exposed only so the integration suite can
+/// assert the decision a registration pass reaches.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardFiringDecision {
+    /// No uncollected stale rows remain; firing is sound.
+    Allowed,
+    /// At least one stale row could not be collected. Firing is suppressed for
+    /// this shard's tick only — every other shard is unaffected, and the row's
+    /// owning shard still fires it exactly once.
+    SuppressedUncollectedStaleRows,
+}
+
+/// Reconcile this shard's workflow-schedule rows and report whether firing is
+/// sound afterwards.
+///
+/// Not part of the stable public API — exposed only so the integration suite can
+/// drive one registration pass directly.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the shard's rows cannot be read.
+/// Per-schedule failures are collected rather than propagated; see the body.
+#[doc(hidden)]
+pub async fn register_workflow_schedules_for_shard(
     conn: &mut AsyncPgConnection,
     schedules: &[WorkflowSchedule],
     router: &ShardRouter,
     shard: ShardId,
     backoff: &ScheduleRegistrationBackoff,
-) -> HarvestResult<()> {
+) -> HarvestResult<ShardFiringDecision> {
     let now = Utc::now();
+    let mut decision = ShardFiringDecision::Allowed;
     for ws in schedules {
-        let key = registration_backoff_key("workflow", &ws.workflow_name, shard);
-        if !backoff.should_attempt(&key, now) {
-            continue;
-        }
-        // Collect rather than `?`: pre-#1157 the first failing schedule aborted
-        // the whole pass, so a tick raised exactly one error however many
-        // schedules were broken and every schedule after it in iteration order
-        // was never registered at all.
-        let outcome = if schedule_targets_shard(ws, router, shard) {
-            register_one_workflow_schedule_locked(conn, ws).await
+        if schedule_targets_shard(ws, router, shard) {
+            let key = registration_backoff_key("workflow", &ws.workflow_name, shard);
+            if !backoff.should_attempt(&key, now) {
+                continue;
+            }
+            // Collect rather than `?`: pre-#1157 the first failing schedule
+            // aborted the whole pass, so a tick raised exactly one error however
+            // many schedules were broken and every schedule after it in
+            // iteration order was never registered at all. A failed *upsert*
+            // costs a missed fire on the owning shard, never a duplicate — the
+            // row's previous owner still collects its stale copy — so it is
+            // backed off and the pass keeps going.
+            let outcome = register_one_workflow_schedule_locked(conn, ws).await;
+            record_registration_outcome(
+                backoff,
+                &key,
+                "workflow",
+                &ws.workflow_name,
+                shard,
+                outcome,
+                now,
+            );
         } else if ws.dag_name.is_some() {
-            collect_stale_dag_workflow_schedule(conn, ws)
-                .await
-                .map(|_| RegistrationOutcome::Settled)
-        } else {
-            Ok(RegistrationOutcome::Settled)
-        };
-        record_registration_outcome(
-            backoff,
-            &key,
-            "workflow",
-            &ws.workflow_name,
-            shard,
-            outcome,
-            now,
-        );
+            // Deliberately *not* backoff-gated, unlike the upsert above, and
+            // deliberately not collected into one either. A failed collection
+            // leaves a due row on a shard that no longer owns it, so unlike a
+            // failed upsert it costs a duplicate run rather than a missed one —
+            // firing has to stand down until it succeeds.
+            //
+            // Backing it off would defeat that: a skipped attempt never fails,
+            // so the shard would read as clean and resume firing the stale row
+            // for the whole backoff window. The probe inside makes the converged
+            // case a single cheap indexed read, so re-attempting every tick
+            // costs nothing until something is genuinely wrong.
+            if let Err(error) = collect_stale_dag_workflow_schedule(conn, ws).await {
+                warn_registration_failure("workflow-cleanup", &ws.workflow_name, shard, &error);
+                decision = ShardFiringDecision::SuppressedUncollectedStaleRows;
+            }
+        }
     }
-    Ok(())
+    Ok(decision)
 }
 
 /// The rows a non-owning shard considers stale for `ws`.
@@ -1230,7 +1279,7 @@ pub async fn tick_once_sharded_with_backoff(
         // fleet-wide registration lock, and a per-schedule failure is collected
         // and backed off rather than aborting the rest of the pass.
         register_schedules_for_shard(&mut conn, dags.as_ref(), &router, shard, backoff).await?;
-        register_workflow_schedules_for_shard(
+        let firing = register_workflow_schedules_for_shard(
             &mut conn,
             workflow_schedules.as_ref(),
             &router,
@@ -1238,6 +1287,21 @@ pub async fn tick_once_sharded_with_backoff(
             backoff,
         )
         .await?;
+
+        // Issue #1157: neither firing pass below filters by target shard, so a
+        // stale row this pass could not collect would be fired here *and* by the
+        // shard that now owns it. Stand this shard down for the tick rather than
+        // duplicate the run; the owning shard is unaffected and still fires it
+        // exactly once, and the next tick re-attempts the collection.
+        if firing == ShardFiringDecision::SuppressedUncollectedStaleRows {
+            tracing::warn!(
+                shard_id = shard.as_i32(),
+                "harvest: suppressing schedule firing on this shard for this tick; \
+                 stale schedule rows left behind by a routing change could not be \
+                 collected, and firing them here would duplicate the owning shard's run"
+            );
+            continue;
+        }
 
         // Drain buffered slots BEFORE evaluating newly-due firings so that
         // capacity freed by a just-completed run is consumed by the oldest

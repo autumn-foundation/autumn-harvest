@@ -995,3 +995,207 @@ async fn a_release_still_frees_an_unchanged_squat() {
         "release, not delete: the row keeps its own dag_name identity"
     );
 }
+
+// ── Defect 3, integrity — a failed collection must stand firing down ─────────
+
+/// Make every `DELETE` on `harvest_schedules` fail, the way a missing `DELETE`
+/// grant or a misbehaving trigger would in the field.
+async fn block_deletes(conn: &mut AsyncPgConnection) {
+    conn.batch_execute(
+        "CREATE OR REPLACE FUNCTION harvest_test_block_delete() RETURNS trigger AS $$
+         BEGIN RAISE EXCEPTION 'delete blocked by test'; END $$ LANGUAGE plpgsql;
+         CREATE TRIGGER harvest_test_block_delete_trg
+             BEFORE DELETE ON harvest_schedules
+             FOR EACH ROW EXECUTE FUNCTION harvest_test_block_delete();",
+    )
+    .await
+    .expect("install delete-blocking trigger");
+}
+
+async fn unblock_deletes(conn: &mut AsyncPgConnection) {
+    conn.batch_execute(
+        "DROP TRIGGER IF EXISTS harvest_test_block_delete_trg ON harvest_schedules;
+         DROP FUNCTION IF EXISTS harvest_test_block_delete();",
+    )
+    .await
+    .expect("remove delete-blocking trigger");
+}
+
+/// Seed a stale row for `name` that is already due, and return the router/shard
+/// pair for which this shard does *not* own it.
+async fn seed_due_stale_row(conn: &mut AsyncPgConnection, name: &str) -> Uuid {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    let id = insert_raw_row(conn, Some(name), Some(name), "cron:0 1 * * *").await;
+    diesel::update(dsl::harvest_schedules.find(id))
+        .set(dsl::next_run_at.eq(Some(Utc::now() - chrono::Duration::minutes(5))))
+        .execute(conn)
+        .await
+        .expect("make the stale row due");
+    id
+}
+
+/// A shard that owns nothing, so every schedule handed to it takes the
+/// stale-row cleanup branch.
+fn non_owning_shard() -> (autumn_harvest::shard::ShardRouter, autumn_harvest::ShardId) {
+    use autumn_harvest::ShardId;
+    use autumn_harvest::shard::ShardRouter;
+    // Two shards, and we register against the one rendezvous hashing does not
+    // pick for the DAG under test.
+    let shards = vec![ShardId::new(0), ShardId::new(1)];
+    let router = ShardRouter::new(shards.clone(), shards, ShardId::new(0));
+    let owner = router.pick_for_dag("nightly");
+    let other = if owner == ShardId::new(0) {
+        ShardId::new(1)
+    } else {
+        ShardId::new(0)
+    };
+    (router, other)
+}
+
+#[tokio::test]
+async fn a_failed_collection_suppresses_this_shards_firing() {
+    use autumn_harvest::scheduler::{
+        ScheduleRegistrationBackoff, ShardFiringDecision, register_workflow_schedules_for_shard,
+    };
+
+    let (mut conn, _db) = setup_db().await;
+    let stale = seed_due_stale_row(&mut conn, "nightly").await;
+    let (router, shard) = non_owning_shard();
+
+    block_deletes(&mut conn).await;
+    let decision = register_workflow_schedules_for_shard(
+        &mut conn,
+        &[dag_schedule("nightly")],
+        &router,
+        shard,
+        &ScheduleRegistrationBackoff::new(),
+    )
+    .await;
+    // Drop the trigger before asserting so a failure cannot leak it into the
+    // next test in this serially-run suite.
+    unblock_deletes(&mut conn).await;
+
+    assert_eq!(
+        decision.expect("a per-schedule cleanup failure is collected, not propagated"),
+        ShardFiringDecision::SuppressedUncollectedStaleRows,
+        "a stale row that could not be collected must stand this shard's \
+         firing down; the tick otherwise fires it here AND on the owning \
+         shard, which is the duplicate-run storm this issue reports"
+    );
+    assert_eq!(
+        schedule_count(&mut conn).await,
+        1,
+        "the row genuinely survived -- this is not a vacuous assertion"
+    );
+    assert_eq!(
+        due_rows(&mut conn).await,
+        1,
+        "and it is due, so the ungated firing pass would have claimed it"
+    );
+    let _ = stale;
+}
+
+#[tokio::test]
+async fn a_successful_collection_leaves_firing_enabled() {
+    use autumn_harvest::scheduler::{
+        ScheduleRegistrationBackoff, ShardFiringDecision, register_workflow_schedules_for_shard,
+    };
+
+    let (mut conn, _db) = setup_db().await;
+    seed_due_stale_row(&mut conn, "nightly").await;
+    let (router, shard) = non_owning_shard();
+
+    let decision = register_workflow_schedules_for_shard(
+        &mut conn,
+        &[dag_schedule("nightly")],
+        &router,
+        shard,
+        &ScheduleRegistrationBackoff::new(),
+    )
+    .await
+    .expect("collection");
+
+    assert_eq!(
+        decision,
+        ShardFiringDecision::Allowed,
+        "suppression must be reserved for a genuine failure; standing a shard \
+         down whenever it collects a row would stall every schedule it owns"
+    );
+    assert_eq!(schedule_count(&mut conn).await, 0, "the row was collected");
+}
+
+#[tokio::test]
+async fn a_failed_upsert_does_not_suppress_firing() {
+    use autumn_harvest::ShardId;
+    use autumn_harvest::scheduler::{
+        ScheduleRegistrationBackoff, ShardFiringDecision, register_workflow_schedules_for_shard,
+    };
+    use autumn_harvest::shard::ShardRouter;
+
+    let (mut conn, _db) = setup_db().await;
+
+    // An unparseable cron makes the *owning* branch fail before it writes.
+    let mut broken = WorkflowSchedule::new("nightly", Schedule::Cron("not a cron".to_string()));
+    broken.dag_name = Some("nightly".to_string());
+
+    let router = ShardRouter::single();
+    let decision = register_workflow_schedules_for_shard(
+        &mut conn,
+        &[broken],
+        &router,
+        ShardId::new(0),
+        &ScheduleRegistrationBackoff::new(),
+    )
+    .await
+    .expect("a per-schedule upsert failure is collected, not propagated");
+
+    assert_eq!(
+        decision,
+        ShardFiringDecision::Allowed,
+        "a failed upsert costs a missed fire on this shard, never a duplicate \
+         -- suppressing firing for it would stall every healthy schedule on \
+         the shard, which is the starvation defect 2 exists to remove"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_failed_collection_stays_suppressed_across_ticks() {
+    use autumn_harvest::scheduler::{
+        ScheduleRegistrationBackoff, ShardFiringDecision, register_workflow_schedules_for_shard,
+    };
+
+    let (mut conn, _db) = setup_db().await;
+    seed_due_stale_row(&mut conn, "nightly").await;
+    let (router, shard) = non_owning_shard();
+
+    // One backoff registry shared across both passes, exactly as the tick loop
+    // shares it across ticks.
+    let backoff = ScheduleRegistrationBackoff::new();
+    let schedules = [dag_schedule("nightly")];
+
+    block_deletes(&mut conn).await;
+    let first =
+        register_workflow_schedules_for_shard(&mut conn, &schedules, &router, shard, &backoff)
+            .await;
+    let second =
+        register_workflow_schedules_for_shard(&mut conn, &schedules, &router, shard, &backoff)
+            .await;
+    unblock_deletes(&mut conn).await;
+
+    assert_eq!(
+        first.expect("first pass"),
+        ShardFiringDecision::SuppressedUncollectedStaleRows,
+    );
+    assert_eq!(
+        second.expect("second pass"),
+        ShardFiringDecision::SuppressedUncollectedStaleRows,
+        "a backed-off cleanup never runs, so it never fails, so the shard \
+         would read as clean and resume firing the still-present stale row \
+         for the whole backoff window -- the cleanup path must not be gated"
+    );
+    assert_eq!(
+        schedule_count(&mut conn).await,
+        1,
+        "the stale row is still there across both passes"
+    );
+}
