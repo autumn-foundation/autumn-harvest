@@ -659,29 +659,64 @@ impl HarvestPlugin {
 /// Panics when a binding is invalid or when its adapter's `stream()` does not
 /// match the binding's declared `stream` — both are startup misconfigurations
 /// that would otherwise surface as a silently idle consumer.
-/// Whether a binding's coordinate dedupe is left bounded by the *default*
-/// start-idempotency window (issue #944, Codex review).
+/// What actually bounds a coordinate-dedupe binding's guarantee, when that
+/// bound is left somewhere the operator has probably not weighed (issue #944,
+/// Codex review).
 ///
-/// A `BrokerCoordinates` binding feeds its derived key to harvest's
-/// start-idempotency machinery (#808), whose claim is **purged** after
-/// `HarvestBuilder::start_idempotency_window` (default 24 h). So the dedupe
-/// guarantee is bounded by that window, not unconditional: a Kafka offset can
-/// be replayed arbitrarily later (a consumer-group reset, a topic replay), and
-/// an SQS message can be redelivered past 24 h across repeated receives. A
-/// redelivery arriving after the claim is purged reserves the key as *fresh*
-/// and starts a second execution once the first run is terminal.
-///
-/// Returns true only when the operator has not tuned the window at all, which
-/// is the case worth telling them about; an explicitly configured window means
-/// they have already weighed it. Pure so the decision is unit-testable without
-/// capturing `tracing` output, mirroring [`mcp_tools_unprotected`].
+/// The two connector targets persist the derived key in *different tables* with
+/// *different lifetimes*, so one knob cannot cover both.
 #[cfg(feature = "connectors")]
-const fn coordinate_dedupe_window_untuned(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UntunedDedupeBound {
+    /// A `Starts` binding reserves a `harvest_start_idempotency` row (#808),
+    /// purged after `HarvestBuilder::start_idempotency_window` (default 24 h).
+    StartIdempotencyWindow,
+    /// A `SignalsWithStart` binding persists its key *only* on
+    /// `harvest_signals`, which is `ON DELETE CASCADE` on its execution. It
+    /// never reserves a start-idempotency claim, so `start_idempotency_window`
+    /// does nothing for it: the real bound is how long the execution row
+    /// survives, i.e. the effective retention age for the target workflow.
+    ExecutionRetention {
+        /// The effective retention age that bounds the claim.
+        max_age: std::time::Duration,
+    },
+}
+
+/// Resolve which bound — if any — is worth naming at startup for one binding.
+///
+/// Returns `None` when the guarantee needs no caveat:
+///
+/// * `WorkflowId` dedupe rides neither claim table.
+/// * A `Starts` binding with an explicitly configured window: an explicit value
+///   is a considered one.
+/// * A `SignalsWithStart` binding with retention **off** (harvest's default):
+///   the execution row — and with it the signal claim — is never deleted, so
+///   the dedupe is *unbounded*, which is stronger than the `Starts` case rather
+///   than weaker.
+///
+/// A `SignalsWithStart` binding under active retention always reports its
+/// bound, deliberately: tuning `start_idempotency_window` must not silence it,
+/// because that knob does not govern this path at all. Naming the wrong remedy
+/// is the failure mode this exists to prevent.
+///
+/// Pure so the decision is unit-testable without capturing `tracing` output.
+#[cfg(feature = "connectors")]
+fn untuned_coordinate_dedupe_bound(
     mode: crate::connector::IdempotencyMode,
+    target: crate::connector::ConnectorTarget,
     configured_window: Option<std::time::Duration>,
-) -> bool {
-    matches!(mode, crate::connector::IdempotencyMode::BrokerCoordinates)
-        && configured_window.is_none()
+    execution_retention_age: Option<std::time::Duration>,
+) -> Option<UntunedDedupeBound> {
+    if !matches!(mode, crate::connector::IdempotencyMode::BrokerCoordinates) {
+        return None;
+    }
+    match target {
+        crate::connector::ConnectorTarget::Starts { .. } => configured_window
+            .is_none()
+            .then_some(UntunedDedupeBound::StartIdempotencyWindow),
+        crate::connector::ConnectorTarget::SignalsWithStart { .. } => execution_retention_age
+            .map(|max_age| UntunedDedupeBound::ExecutionRetention { max_age }),
+    }
 }
 
 /// The first pair of registrations that share one event source, if any
@@ -942,8 +977,9 @@ impl Plugin for HarvestPlugin {
                 // Not fatal: a bounded dedupe guarantee is correct for most
                 // deployments, and only the operator knows how far back their
                 // broker can replay. But the bound is invisible otherwise, so
-                // say it out loud once at startup.
-                if coordinate_dedupe_window_untuned(
+                // say it out loud once at startup -- naming the knob that
+                // actually governs THIS binding's claim.
+                match untuned_coordinate_dedupe_bound(
                     crate::connector::resolve_idempotency_mode(
                         registration.binding.target,
                         registration.binding.idempotency_mode,
@@ -952,18 +988,41 @@ impl Plugin for HarvestPlugin {
                             .iter()
                             .find(|w| w.name == registration.binding.target.workflow()),
                     ),
+                    registration.binding.target,
                     builder.start_idempotency_window_config(),
+                    builder
+                        .retention_config()
+                        .effective_max_age(registration.binding.target.workflow()),
                 ) {
-                    tracing::warn!(
-                        binding = registration.binding.name,
-                        stream = registration.binding.stream,
-                        "harvest connector dedupes on broker coordinates, but \
-                         `start_idempotency_window` is the 24h default: a redelivery \
-                         arriving after the claim is purged would start a SECOND \
-                         execution. Size the window to how far back your broker can \
-                         replay (Kafka retention / SQS message retention) via \
-                         `HarvestBuilder::start_idempotency_window`"
-                    );
+                    Some(UntunedDedupeBound::StartIdempotencyWindow) => {
+                        tracing::warn!(
+                            binding = registration.binding.name,
+                            stream = registration.binding.stream,
+                            "harvest connector dedupes on broker coordinates, but \
+                             `start_idempotency_window` is the 24h default: a redelivery \
+                             arriving after the claim is purged would start a SECOND \
+                             execution. Size the window to how far back your broker can \
+                             replay (Kafka retention / SQS message retention) via \
+                             `HarvestBuilder::start_idempotency_window`"
+                        );
+                    }
+                    Some(UntunedDedupeBound::ExecutionRetention { max_age }) => {
+                        tracing::warn!(
+                            binding = registration.binding.name,
+                            stream = registration.binding.stream,
+                            workflow = registration.binding.target.workflow(),
+                            retention_secs = max_age.as_secs(),
+                            "harvest connector `signals_with_start` binding persists its \
+                             dedupe claim only on `harvest_signals`, which cascade-deletes \
+                             with its execution: retention is the bound here, NOT \
+                             `start_idempotency_window` (which this path never reserves). \
+                             A redelivery arriving after the run is collected would start a \
+                             SECOND execution and re-deliver the signal. Size \
+                             `RetentionConfig` for this workflow to at least how far back \
+                             your broker can replay"
+                        );
+                    }
+                    None => {}
                 }
                 assert!(
                     broker_native_dead_letter_is_supported(
@@ -3001,35 +3060,96 @@ mod tests {
 
     #[cfg(feature = "connectors")]
     #[test]
-    fn coordinate_dedupe_warns_only_when_the_window_is_left_at_its_default() {
-        use crate::connector::IdempotencyMode;
+    fn a_signals_with_start_binding_is_bounded_by_retention_not_the_window() {
+        use crate::connector::{ConnectorTarget, IdempotencyMode};
         use std::time::Duration;
 
-        // The connector's dedupe claim lives in harvest's start-idempotency
-        // table, which PURGES after the window -- so "idempotent by
-        // construction" is really "idempotent for the window's lifetime". A
-        // broker that can replay older than that gets a second execution.
-        assert!(
-            coordinate_dedupe_window_untuned(IdempotencyMode::BrokerCoordinates, None),
-            "an untuned window leaves the dedupe bound invisible; say it once",
+        const STARTS: ConnectorTarget = ConnectorTarget::Starts {
+            workflow: "order_flow",
+        };
+        const SIGNALS: ConnectorTarget = ConnectorTarget::SignalsWithStart {
+            workflow: "cart",
+            signal_name: "add_item",
+        };
+        let week = Duration::from_secs(7 * 24 * 60 * 60);
+
+        // `Starts` reserves a `harvest_start_idempotency` row, so the window IS
+        // the bound and an untuned one is the thing worth saying.
+        assert_eq!(
+            untuned_coordinate_dedupe_bound(IdempotencyMode::BrokerCoordinates, STARTS, None, None),
+            Some(UntunedDedupeBound::StartIdempotencyWindow),
         );
-        // Explicitly configured: the operator has already weighed it, so do
-        // not nag on every boot.
-        assert!(!coordinate_dedupe_window_untuned(
-            IdempotencyMode::BrokerCoordinates,
-            Some(Duration::from_secs(14 * 24 * 60 * 60)),
-        ));
-        // Even a *shorter* explicit window is a deliberate choice.
-        assert!(!coordinate_dedupe_window_untuned(
-            IdempotencyMode::BrokerCoordinates,
-            Some(Duration::from_secs(60)),
-        ));
-        // WorkflowId mode does not use the start-idempotency claim at all, so
-        // the window is irrelevant to it.
-        assert!(!coordinate_dedupe_window_untuned(
-            IdempotencyMode::WorkflowId,
+        assert_eq!(
+            untuned_coordinate_dedupe_bound(
+                IdempotencyMode::BrokerCoordinates,
+                STARTS,
+                Some(week),
+                None
+            ),
             None,
-        ));
+            "an explicit window is a considered one",
+        );
+        // Even a *shorter* explicit window is a deliberate choice.
+        assert_eq!(
+            untuned_coordinate_dedupe_bound(
+                IdempotencyMode::BrokerCoordinates,
+                STARTS,
+                Some(Duration::from_secs(60)),
+                None,
+            ),
+            None,
+        );
+        // Retention is irrelevant to a `Starts` binding: its claim is its own
+        // `harvest_start_idempotency` row, which outlives the execution.
+        assert_eq!(
+            untuned_coordinate_dedupe_bound(
+                IdempotencyMode::BrokerCoordinates,
+                STARTS,
+                Some(week),
+                Some(Duration::from_secs(60)),
+            ),
+            None,
+        );
+
+        // `SignalsWithStart` persists its key ONLY on `harvest_signals`, which
+        // is ON DELETE CASCADE on its execution. So retention deleting the run
+        // deletes the claim, and the window does nothing for this path -- which
+        // is exactly why tuning it must NOT silence the warning.
+        assert_eq!(
+            untuned_coordinate_dedupe_bound(
+                IdempotencyMode::BrokerCoordinates,
+                SIGNALS,
+                Some(week),
+                Some(Duration::from_secs(3 * 24 * 60 * 60)),
+            ),
+            Some(UntunedDedupeBound::ExecutionRetention {
+                max_age: Duration::from_secs(3 * 24 * 60 * 60),
+            }),
+            "a tuned window must not silence the retention bound it does not govern",
+        );
+
+        // Retention is OFF by default, and then the signal row -- and with it
+        // the claim -- outlives every window. Nothing to warn about.
+        assert_eq!(
+            untuned_coordinate_dedupe_bound(
+                IdempotencyMode::BrokerCoordinates,
+                SIGNALS,
+                None,
+                None
+            ),
+            None,
+            "with retention off the claim is unbounded, which is stronger, not weaker",
+        );
+
+        // WorkflowId dedupe rides neither claim.
+        assert_eq!(
+            untuned_coordinate_dedupe_bound(IdempotencyMode::WorkflowId, SIGNALS, None, Some(week)),
+            None,
+        );
+        assert_eq!(
+            untuned_coordinate_dedupe_bound(IdempotencyMode::WorkflowId, STARTS, None, None),
+            None,
+        );
     }
 
     #[cfg(feature = "connectors")]

@@ -22,8 +22,11 @@
 //! gate (see `HarvestMetricsRecorder::is_enabled`, which reports `true`
 //! unconditionally so the nine required metrics are actually sampled), so
 //! leaving them unimplemented would mean the sampler's DB queries still ran
-//! on every tick with their results silently discarded. Every other
-//! `MetricsRecorder` method keeps the trait's no-op default — an embedder
+//! on every tick with their results silently discarded. It also aggregates the
+//! four broker-connector families (issue #944), which are not sampler-adjacent
+//! but do back shipped dashboard panels — leaving those to the no-op default
+//! would make a dropped metric indistinguishable from an idle consumer. Every
+//! other `MetricsRecorder` method keeps the trait's no-op default — an embedder
 //! who needs the full metric surface (e.g. `harvest.workflow.terminal`,
 //! `harvest.activity.attempts`/`.retries`, `harvest.schedule.fire_attempts`,
 //! and the rest of the starter alert pack in `docs/alerts/`) or OTLP export
@@ -38,9 +41,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use autumn_harvest::telemetry::{
-    ActivityStatus, METRIC_LABEL_ACTIVITY, METRIC_LABEL_KIND, METRIC_LABEL_NAME,
-    METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE,
-    METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW, MetricsRecorder, SlotType, WorkflowStatus,
+    ActivityStatus, ConnectorOutcome, METRIC_LABEL_ACTIVITY, METRIC_LABEL_KIND, METRIC_LABEL_NAME,
+    METRIC_LABEL_OUTCOME, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_SHARD,
+    METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW,
+    MetricsRecorder, PoisonReason, SlotType, WorkflowStatus,
 };
 use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource};
 
@@ -155,6 +159,16 @@ struct Inner {
     // render its primary gauge here so the recommended built-in scrape path (not
     // just the metrics-rs adapter) exposes `harvest_schedule_overdue`.
     schedule_overdue: Gauge,
+    // Broker connectors (issue #944). Not sampler-adjacent -- these are emitted
+    // straight from the connector receive loop -- but this recorder is
+    // per-metric hand-maintained, so leaving them to the trait no-op would make
+    // `.with_metrics_scrape()` silently discard every connector sample while
+    // the shipped dashboard panels stayed flat. An idle consumer and a dropped
+    // metric would then look identical.
+    connector_received: Counter,
+    connector_dispatched: Counter,
+    connector_poisoned: Counter,
+    connector_lag: Gauge,
 }
 
 /// In-process aggregator for the built-in Prometheus scrape endpoint
@@ -325,6 +339,32 @@ impl MetricsRecorder for HarvestMetricsRecorder {
             vec![kind.to_owned(), name.to_owned()],
             f64::from(u8::from(overdue)),
         );
+    }
+
+    fn record_connector_received(&self, source: &str) {
+        self.0.connector_received.incr(vec![source.to_owned()], 1);
+    }
+
+    fn record_connector_dispatched(&self, source: &str, outcome: ConnectorOutcome) {
+        self.0
+            .connector_dispatched
+            .incr(vec![source.to_owned(), outcome.as_str().to_owned()], 1);
+    }
+
+    fn record_connector_poisoned(&self, source: &str, reason: PoisonReason) {
+        self.0
+            .connector_poisoned
+            .incr(vec![source.to_owned(), reason.as_str().to_owned()], 1);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_connector_lag(&self, source: &str, lag: i64) {
+        // A level, not an accumulation: last-write-wins per source, so a
+        // partition draining to zero reads zero instead of the sum of every
+        // sample the poll loop ever took.
+        self.0
+            .connector_lag
+            .set(vec![source.to_owned()], lag as f64);
     }
 }
 
@@ -545,11 +585,49 @@ fn push_sampler_adjacent_metrics(families: &mut Vec<MetricFamily>, inner: &Inner
     );
 }
 
+/// Broker-connector families (issue #944).
+///
+/// Rendered here so the recommended `.with_metrics_scrape()` path exposes the
+/// same four families the `metrics-rs` adapter does — the shipped dashboard
+/// panels read these, and a missing family is indistinguishable from an idle
+/// consumer.
+fn push_connector_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
+    push_counter(
+        families,
+        "harvest_connector_received_total",
+        "Total number of broker messages received by a connector, per binding",
+        &[METRIC_LABEL_SOURCE],
+        inner.connector_received.snapshot(),
+    );
+    push_counter(
+        families,
+        "harvest_connector_dispatched_total",
+        "Total number of broker messages that reached a terminal disposition, per binding and outcome",
+        &[METRIC_LABEL_SOURCE, METRIC_LABEL_OUTCOME],
+        inner.connector_dispatched.snapshot(),
+    );
+    push_counter(
+        families,
+        "harvest_connector_poisoned_total",
+        "Total number of broker messages dead-lettered, per binding and reason",
+        &[METRIC_LABEL_SOURCE, METRIC_LABEL_REASON],
+        inner.connector_poisoned.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_connector_lag",
+        "Broker-reported work this connector still owes, per binding",
+        &[METRIC_LABEL_SOURCE],
+        inner.connector_lag.snapshot(),
+    );
+}
+
 impl MetricsSource for HarvestMetricsRecorder {
     fn collect(&self) -> Vec<MetricFamily> {
         let mut families = Vec::new();
         push_catalogue_metrics(&mut families, &self.0);
         push_sampler_adjacent_metrics(&mut families, &self.0);
+        push_connector_metrics(&mut families, &self.0);
         families
     }
 }
@@ -817,6 +895,82 @@ mod tests {
             sample_value(f, &[("kind", "workflow"), ("name", "foo")]),
             0.0
         );
+    }
+
+    #[test]
+    fn connector_metrics_reach_the_built_in_scrape_endpoint() {
+        // Issue #944 (Codex round E): this recorder is per-metric
+        // hand-maintained, so a new family that is not overridden here falls
+        // through to the trait no-op and `.with_metrics_scrape()` DISCARDS every
+        // sample. The connector work shipped dashboard panels, which makes that
+        // silence indistinguishable from a healthy, idle consumer.
+        use autumn_harvest::telemetry::{ConnectorOutcome, PoisonReason};
+
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_connector_received("orders");
+        recorder.record_connector_received("orders");
+        recorder.record_connector_dispatched("orders", ConnectorOutcome::Dispatched);
+        recorder.record_connector_dispatched("orders", ConnectorOutcome::IdempotentReplay);
+        recorder.record_connector_poisoned("orders", PoisonReason::MappingRejected);
+        recorder.record_connector_lag("orders", 42);
+
+        let families = recorder.collect();
+
+        let received = family(&families, "harvest_connector_received_total");
+        assert_eq!(received.kind, MetricKind::Counter);
+        assert_eq!(sample_value(received, &[("source", "orders")]), 2.0);
+
+        let dispatched = family(&families, "harvest_connector_dispatched_total");
+        assert_eq!(dispatched.kind, MetricKind::Counter);
+        assert_eq!(
+            sample_value(
+                dispatched,
+                &[("source", "orders"), ("outcome", "dispatched")]
+            ),
+            1.0
+        );
+        assert_eq!(
+            sample_value(
+                dispatched,
+                &[("source", "orders"), ("outcome", "idempotent_replay")]
+            ),
+            1.0
+        );
+
+        let poisoned = family(&families, "harvest_connector_poisoned_total");
+        assert_eq!(poisoned.kind, MetricKind::Counter);
+        assert_eq!(
+            sample_value(
+                poisoned,
+                &[("source", "orders"), ("reason", "mapping_rejected")]
+            ),
+            1.0
+        );
+
+        let lag = family(&families, "harvest_connector_lag");
+        assert_eq!(lag.kind, MetricKind::Gauge);
+        assert_eq!(sample_value(lag, &[("source", "orders")]), 42.0);
+    }
+
+    #[test]
+    fn connector_lag_is_a_last_write_wins_gauge() {
+        // Lag is a level, not an accumulation: a partition draining from 500 to
+        // 0 must read 0, and a wedged one must keep reporting its backlog
+        // rather than summing every sample the poll loop ever took.
+        use autumn_harvest::telemetry::ConnectorOutcome;
+
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_connector_lag("orders", 500);
+        recorder.record_connector_lag("orders", 0);
+        // A second source keeps its own level.
+        recorder.record_connector_lag("audit", 7);
+        // Unrelated families must not be perturbed.
+        recorder.record_connector_dispatched("audit", ConnectorOutcome::Dispatched);
+
+        let families = recorder.collect();
+        let lag = family(&families, "harvest_connector_lag");
+        assert_eq!(sample_value(lag, &[("source", "orders")]), 0.0);
+        assert_eq!(sample_value(lag, &[("source", "audit")]), 7.0);
     }
 
     #[test]

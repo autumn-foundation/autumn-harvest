@@ -58,7 +58,11 @@ metrics named in issue #355 (`harvest.workflow.started`,
 `harvest.shard.stranded_pending` — the engine's own background samplers
 already compute these under the same `is_enabled()` gate the nine required
 metrics live behind, so they're implemented too rather than sampled and
-discarded. **It does not back the full starter alert pack**
+discarded. It also covers the four broker-connector families
+(`harvest.connector.received`, `harvest.connector.dispatched`,
+`harvest.connector.poisoned`, `harvest.connector.lag`), which back the shipped
+connector dashboard panels — without them a dropped metric would be
+indistinguishable from an idle consumer. **It does not back the full starter alert pack**
 (`docs/alerts/starter-pack-v0.1.0.json`), which also references metrics this
 endpoint never emits (e.g. `harvest_workflow_terminal_total`,
 `harvest_activity_attempts_total`/`retries_total`,

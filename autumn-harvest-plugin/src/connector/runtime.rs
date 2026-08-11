@@ -122,7 +122,7 @@ pub struct ConnectorRuntimeConfig {
     /// poison_threshold)` — because expiring mid-redrive restarts the strike
     /// countdown, which is the churn keeping the strikes avoids. Expiring
     /// *late* costs only memory, so the default is deliberately generous.
-    /// [`MAX_TERMINAL_POISON_ENTRIES`] is the hard backstop.
+    /// [`MAX_POISON_ENTRIES`] is the hard backstop.
     pub poison_retention: std::time::Duration,
 }
 
@@ -378,7 +378,7 @@ impl ConnectorRuntime {
         self.poison
             .lock()
             .await
-            .expire_terminal_as_of(std::time::Instant::now(), self.config.poison_retention);
+            .expire_stale_as_of(std::time::Instant::now(), self.config.poison_retention);
 
         let batch = self
             .source
@@ -627,7 +627,10 @@ impl ConnectorRuntime {
         let strikes = if self.binding.poison_threshold > 0
             && matches!(outcome, DispatchOutcome::MappingRejected(_))
         {
-            self.poison.lock().await.strike(&key)
+            self.poison
+                .lock()
+                .await
+                .strike(&key, std::time::Instant::now())
         } else {
             0
         };

@@ -217,20 +217,29 @@ pub struct PoisonTracker {
     expiry: std::collections::VecDeque<(std::time::Instant, String)>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct StrikeState {
     count: u32,
     /// When this key was last handed to the broker's own redrive, if ever.
     terminal_at: Option<std::time::Instant>,
+    /// When this key was last touched — by a strike or a terminal mark.
+    ///
+    /// The ordering key for *both* the hard cap and retention expiry, so a
+    /// non-terminal entry is bounded on the same footing as a terminal one.
+    /// Without this, a key that never reaches its threshold (every first
+    /// rejection of a large backlog, when the threshold is > 1) would be
+    /// retained forever: `Retry` never clears it and only a terminal mark
+    /// used to queue it for expiry.
+    last_seen: std::time::Instant,
 }
 
-/// Hard ceiling on retained broker-native terminal strikes.
+/// Hard ceiling on retained poison strikes, terminal or not.
 ///
 /// Time-based retention alone is still unbounded against a sustained stream
 /// of *distinct* poison messages arriving faster than the window; this is what
 /// makes the bound hard. Evicting early only costs the evicted message one
 /// extra retry lap before it re-reaches the threshold — never correctness.
-pub const MAX_TERMINAL_POISON_ENTRIES: usize = 10_000;
+pub const MAX_POISON_ENTRIES: usize = 10_000;
 
 impl PoisonTracker {
     /// A tracker with no recorded strikes.
@@ -239,12 +248,28 @@ impl PoisonTracker {
         Self::default()
     }
 
-    /// Record one more consecutive rejection for `key` and return the new
-    /// count (saturating, so a pathological message cannot overflow).
-    pub fn strike(&mut self, key: &str) -> u32 {
-        let entry = self.strikes.entry(key.to_string()).or_default();
+    /// Record one more consecutive rejection for `key` at `now` and return the
+    /// new count (saturating, so a pathological message cannot overflow).
+    ///
+    /// Takes `now` so the entry joins the same bounded expiry order terminal
+    /// marks use: a rejected message that never reaches its threshold is still
+    /// capped and still ages out, rather than being retained until the process
+    /// restarts.
+    pub fn strike(&mut self, key: &str, now: std::time::Instant) -> u32 {
+        let entry = self
+            .strikes
+            .entry(key.to_string())
+            .or_insert_with(|| StrikeState {
+                count: 0,
+                terminal_at: None,
+                last_seen: now,
+            });
         entry.count = entry.count.saturating_add(1);
-        entry.count
+        entry.last_seen = now;
+        let count = entry.count;
+        self.expiry.push_back((now, key.to_string()));
+        self.enforce_cap();
+        count
     }
 
     /// Forget `key`'s strikes — called once a message reaches a terminal
@@ -262,23 +287,41 @@ impl PoisonTracker {
     pub fn mark_terminal_as_of(&mut self, key: &str, now: std::time::Instant) {
         if let Some(state) = self.strikes.get_mut(key) {
             state.terminal_at = Some(now);
+            state.last_seen = now;
         } else {
             // Marking a key with no strike recorded would otherwise queue an
             // expiry entry for nothing.
             return;
         }
         self.expiry.push_back((now, key.to_string()));
-        // Applied at mark time, not at expiry time: a burst between passes
-        // must not be able to outrun the bound.
-        while self.expiry.len() > MAX_TERMINAL_POISON_ENTRIES {
-            self.pop_oldest_terminal();
+        self.enforce_cap();
+    }
+
+    /// Evict oldest-first until the tracker is back inside its hard ceiling.
+    ///
+    /// Applied at touch time, not at expiry time: a burst arriving between two
+    /// passes must not be able to outrun the bound.
+    ///
+    /// Terminates because every live key has exactly one queued entry matching
+    /// its `last_seen`, so each pop either retires a key or discards a stale
+    /// entry, and the queue is finite.
+    fn enforce_cap(&mut self) {
+        while self.strikes.len() > MAX_POISON_ENTRIES {
+            if !self.pop_oldest() && self.expiry.is_empty() {
+                break;
+            }
         }
     }
 
-    /// Retire terminal entries whose retention window has elapsed.
+    /// Retire entries — terminal or not — untouched for the retention window.
     ///
     /// Returns how many keys were retired, for diagnostics.
-    pub fn expire_terminal_as_of(
+    ///
+    /// Non-terminal entries age out on the same clock because a strike streak
+    /// is *consecutive* by definition: a key nothing has rejected in an hour
+    /// is not mid-streak, it is a leak. Retiring one only costs that message
+    /// an extra lap if it does come back.
+    pub fn expire_stale_as_of(
         &mut self,
         now: std::time::Instant,
         retention: std::time::Duration,
@@ -288,7 +331,7 @@ impl PoisonTracker {
             if now.saturating_duration_since(*at) < retention {
                 break;
             }
-            if self.pop_oldest_terminal() {
+            if self.pop_oldest() {
                 retired += 1;
             }
         }
@@ -296,16 +339,16 @@ impl PoisonTracker {
     }
 
     /// Pop the oldest queued expiry entry, retiring its key when that entry is
-    /// still the key's current terminal mark.
+    /// still the key's most recent touch.
     ///
     /// Returns whether a key was actually retired: a stale entry (the key was
-    /// re-marked later, or `clear`ed and re-struck) must be a no-op rather
-    /// than disturbing live state.
-    fn pop_oldest_terminal(&mut self) -> bool {
+    /// struck or re-marked later, or `clear`ed and re-struck) must be a no-op
+    /// rather than disturbing live state.
+    fn pop_oldest(&mut self) -> bool {
         let Some((at, key)) = self.expiry.pop_front() else {
             return false;
         };
-        if self.strikes.get(&key).and_then(|s| s.terminal_at) == Some(at) {
+        if self.strikes.get(&key).map(|s| s.last_seen) == Some(at) {
             self.strikes.remove(&key);
             return true;
         }
@@ -328,7 +371,15 @@ impl PoisonTracker {
     /// without calling `strike` four billion times.
     #[cfg(test)]
     fn set_strikes_for_test(&mut self, key: &str, count: u32) {
-        self.strikes.entry(key.to_string()).or_default().count = count;
+        let now = std::time::Instant::now();
+        self.strikes
+            .entry(key.to_string())
+            .or_insert_with(|| StrikeState {
+                count: 0,
+                terminal_at: None,
+                last_seen: now,
+            })
+            .count = count;
     }
 }
 
@@ -997,10 +1048,11 @@ mod tests {
     #[test]
     fn poison_tracker_counts_consecutive_strikes_and_clears() {
         let mut t = PoisonTracker::new();
-        assert_eq!(t.strike("k"), 1);
-        assert_eq!(t.strike("k"), 2);
+        let t0 = std::time::Instant::now();
+        assert_eq!(t.strike("k", t0), 1);
+        assert_eq!(t.strike("k", t0), 2);
         assert_eq!(t.strikes("k"), 2);
-        assert_eq!(t.strike("other"), 1, "keys are independent");
+        assert_eq!(t.strike("other", t0), 1, "keys are independent");
         assert_eq!(t.tracked(), 2);
         t.clear("k");
         assert_eq!(t.strikes("k"), 0);
@@ -1010,9 +1062,10 @@ mod tests {
     #[test]
     fn poison_tracker_saturates_rather_than_overflowing() {
         let mut t = PoisonTracker::new();
-        t.strike("k");
+        let t0 = std::time::Instant::now();
+        t.strike("k", t0);
         t.set_strikes_for_test("k", u32::MAX);
-        assert_eq!(t.strike("k"), u32::MAX);
+        assert_eq!(t.strike("k", t0), u32::MAX);
     }
 
     #[test]
@@ -1028,16 +1081,16 @@ mod tests {
         let t0 = std::time::Instant::now();
         let retention = std::time::Duration::from_secs(60);
 
-        t.strike("m-1");
+        t.strike("m-1", t0);
         t.mark_terminal_as_of("m-1", t0);
 
         // Inside the window the strikes survive, so a redelivery re-nacks on
         // sight instead of crawling back through the strike countdown.
-        t.expire_terminal_as_of(t0 + std::time::Duration::from_secs(59), retention);
+        t.expire_stale_as_of(t0 + std::time::Duration::from_secs(59), retention);
         assert_eq!(t.strikes("m-1"), 1, "the redrive is still in progress");
 
         // Past it the entry retires: nothing else will ever clear this key.
-        t.expire_terminal_as_of(t0 + std::time::Duration::from_secs(61), retention);
+        t.expire_stale_as_of(t0 + std::time::Duration::from_secs(61), retention);
         assert_eq!(t.tracked(), 0, "a terminal strike must not leak forever");
     }
 
@@ -1052,20 +1105,20 @@ mod tests {
         let t0 = std::time::Instant::now();
         let retention = std::time::Duration::from_secs(60);
 
-        t.strike("m-1");
+        t.strike("m-1", t0);
         t.mark_terminal_as_of("m-1", t0);
         // Redelivered at +50s and re-nacked.
-        t.strike("m-1");
+        t.strike("m-1", t0 + std::time::Duration::from_secs(50));
         t.mark_terminal_as_of("m-1", t0 + std::time::Duration::from_secs(50));
 
-        t.expire_terminal_as_of(t0 + std::time::Duration::from_secs(70), retention);
+        t.expire_stale_as_of(t0 + std::time::Duration::from_secs(70), retention);
         assert_eq!(
             t.strikes("m-1"),
             2,
             "the window runs from the last delivery, not the first"
         );
 
-        t.expire_terminal_as_of(t0 + std::time::Duration::from_secs(111), retention);
+        t.expire_stale_as_of(t0 + std::time::Duration::from_secs(111), retention);
         assert_eq!(t.tracked(), 0, "and it does expire once redrive is done");
     }
 
@@ -1076,13 +1129,13 @@ mod tests {
         // The cap is what makes the bound hard.
         let mut t = PoisonTracker::new();
         let t0 = std::time::Instant::now();
-        for i in 0..(MAX_TERMINAL_POISON_ENTRIES + 500) {
+        for i in 0..(MAX_POISON_ENTRIES + 500) {
             let key = format!("m-{i}");
-            t.strike(&key);
+            t.strike(&key, t0);
             t.mark_terminal_as_of(&key, t0);
         }
         assert!(
-            t.tracked() <= MAX_TERMINAL_POISON_ENTRIES,
+            t.tracked() <= MAX_POISON_ENTRIES,
             "terminal strikes must be hard-capped; saw {}",
             t.tracked()
         );
@@ -1092,7 +1145,7 @@ mod tests {
             "the cap evicts oldest-first, so the earliest entry is gone"
         );
         assert_eq!(
-            t.strikes(&format!("m-{}", MAX_TERMINAL_POISON_ENTRIES + 499)),
+            t.strikes(&format!("m-{}", MAX_POISON_ENTRIES + 499)),
             1,
             "and the newest is the one retained"
         );
@@ -1107,17 +1160,57 @@ mod tests {
         let t0 = std::time::Instant::now();
         let retention = std::time::Duration::from_secs(60);
 
-        t.strike("k");
+        t.strike("k", t0);
         t.mark_terminal_as_of("k", t0);
         t.clear("k");
         // The same coordinate comes back as a genuinely new strike run.
-        t.strike("k");
+        t.strike("k", t0 + std::time::Duration::from_secs(30));
 
-        t.expire_terminal_as_of(t0 + std::time::Duration::from_secs(61), retention);
+        t.expire_stale_as_of(t0 + std::time::Duration::from_secs(61), retention);
         assert_eq!(
             t.strikes("k"),
             1,
             "the stale expiry entry must not drop the fresh, non-terminal count"
+        );
+    }
+
+    #[test]
+    fn non_terminal_strikes_are_bounded_too() {
+        // A mapping rejection BELOW a nonzero threshold resolves to `Retry`,
+        // which deliberately never clears the key -- and only a terminal mark
+        // used to queue one for expiry. So every FIRST attempt of a large
+        // rejected backlog was retained with no cap and no expiry at all,
+        // which is the half the threshold-0 gate did not cover.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        for i in 0..(MAX_POISON_ENTRIES + 500) {
+            t.strike(&format!("m-{i}"), t0);
+        }
+        assert!(
+            t.tracked() <= MAX_POISON_ENTRIES,
+            "non-terminal strikes must be capped too; saw {}",
+            t.tracked()
+        );
+    }
+
+    #[test]
+    fn a_stale_non_terminal_strike_run_ages_out() {
+        // A strike streak is CONSECUTIVE by definition, so a key nothing has
+        // rejected for a whole retention window is not mid-streak -- it is a
+        // leak. Retiring it costs that message one extra lap if it returns.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+        let retention = std::time::Duration::from_secs(60);
+
+        t.strike("k", t0);
+        t.expire_stale_as_of(t0 + std::time::Duration::from_secs(59), retention);
+        assert_eq!(t.strikes("k"), 1, "still inside the window");
+
+        t.expire_stale_as_of(t0 + std::time::Duration::from_secs(61), retention);
+        assert_eq!(
+            t.tracked(),
+            0,
+            "a non-terminal strike must not leak forever"
         );
     }
 

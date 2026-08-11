@@ -566,6 +566,57 @@ coordinates, so a run traces back to the exact message.
   re-push now rely on the real thing — and reverting the fix fails **five**
   tests, which is the measure of what was being missed.
 
+- **Every poison strike is bounded, not just the terminal ones.** The
+  previous round bounded broker-native terminal strikes with a hard cap and a
+  retention sweep, and fixed a threshold-zero leak by skipping `strike()`
+  entirely when the counter is off. That closed one half and left the other:
+  at a *nonzero* threshold a first rejection stays in `Retry`, which never
+  clears the key, and only a terminal mark queued the key for expiry. So the
+  whole rejected backlog below the threshold was resident uncapped — the
+  common case. `StrikeState` now carries `last_seen`, refreshed by a strike as
+  well as a terminal mark, and it is the ordering key for *both* the hard cap
+  and the retention sweep. Aging out a non-terminal streak is correct on its
+  own terms: a strike run is *consecutive* by definition, so a key idle past
+  the retention window has already broken its streak.
+
+- **`signals_with_start` dedupe is bounded by retention, not the window.** The
+  startup warning and the docs both told operators to size
+  `start_idempotency_window` — but only a `starts` binding reserves a
+  `harvest_start_idempotency` row. A `signals_with_start` binding persists its
+  coordinate key *only* on `harvest_signals`, which is `ON DELETE CASCADE` on
+  its execution, so retention deleting the run deletes the claim and a later
+  replay starts a second execution and re-delivers the signal. Naming a knob
+  that does nothing for half the bindings is worse than naming none. The
+  decision is now `untuned_coordinate_dedupe_bound`, which resolves *which*
+  bound applies per target: an untuned window for `starts`, the effective
+  retention age for `signals_with_start`. The latter is deliberately **not**
+  silenceable by tuning the window, precisely because the window is the wrong
+  remedy. With retention off (harvest's default) the signal claim outlives
+  every window, so that case warns about nothing — it is stronger than the
+  `starts` case, not weaker. The docs table now states both lifetimes
+  side by side.
+
+- **Connector metrics never reached the built-in scrape endpoint.**
+  `HarvestMetricsRecorder` is per-metric hand-maintained, so the four new
+  `record_connector_*` methods fell through to the trait's no-op default and
+  `.with_metrics_scrape()` discarded every sample. There is precedent for a
+  family being adapter-only, but this slice shipped dashboard panels reading
+  those families, which made silence indistinguishable from a healthy idle
+  consumer. All four are now stored and rendered
+  (`harvest_connector_received_total`, `..._dispatched_total`,
+  `..._poisoned_total`, `harvest_connector_lag`), with lag as a
+  last-write-wins gauge so a partition draining to zero reads zero instead of
+  the sum of every sample the poll loop took.
+
+- **The documented lag semantics described the pre-fix behaviour.** After both
+  adapters were changed to report work still owed, the docs still said Kafka
+  measured against the read position and SQS counted only visible messages,
+  and carried an "under-reports" callout that was by then exactly backwards.
+  Replaced with a per-adapter table stating what each reports and why the
+  cheaper number each broker offers first is the wrong one, plus the operational
+  consequence: the gauge stays *high* while a partition is wedged, so alert on a
+  lag that is not falling.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

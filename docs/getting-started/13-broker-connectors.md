@@ -344,12 +344,16 @@ on coordinates as usual, and the batch only ever sees one admission per message.
 `signals_with_start` bindings always use broker coordinates: the signal path's
 key is a body field with no such mutual exclusion.
 
-### The dedupe guarantee has a lifetime — size it to your broker
+### The dedupe guarantee has a lifetime — and the knob differs by target
 
-Coordinate dedupe rides harvest's start-idempotency claim, and that claim is
-**purged** after `start_idempotency_window` (default **24 hours**). So the
-guarantee is *"one execution per message for the window's lifetime"*, not
-unconditionally forever.
+Coordinate dedupe is *"one execution per message for as long as the claim
+survives"*, not unconditionally forever. The two targets persist that claim in
+**different tables with different lifetimes**, so there is no single knob:
+
+| Binding | Where the claim lives | What purges it | Default bound |
+|---|---|---|---|
+| `starts` | `harvest_start_idempotency` (#808) | `start_idempotency_window` | **24 hours** |
+| `signals_with_start` | `harvest_signals.idempotency_key` | execution retention — the row is `ON DELETE CASCADE` on its execution | **unbounded** (retention is off by default) |
 
 That matters because brokers can replay far older than a day:
 
@@ -358,9 +362,12 @@ That matters because brokers can replay far older than a day:
 * **SQS** — message retention runs up to 14 days, and a message that keeps
   failing can be redelivered across many receives, well past 24 hours.
 
-A redelivery that lands *after* the claim is purged reserves the key as fresh,
-so if the first run has already reached a terminal state you get a **second
-execution**. Set the window to at least how far back your broker can replay:
+A redelivery that lands *after* the claim is gone reserves the key as fresh, so
+if the first run has already reached a terminal state you get a **second
+execution** (and, for `signals_with_start`, the signal delivered again).
+
+**For a `starts` binding**, set the window to at least how far back your broker
+can replay:
 
 ```rust
 HarvestPlugin::new()
@@ -368,14 +375,34 @@ HarvestPlugin::new()
     .start_idempotency_window(std::time::Duration::from_secs(7 * 24 * 60 * 60))
 ```
 
-Harvest logs a warning at startup for any coordinate-dedupe binding when the
-window is left at its default, naming the binding. Setting the window
+Harvest logs a warning at startup for any coordinate-dedupe `starts` binding
+when the window is left at its default, naming the binding. Setting the window
 explicitly — to any value — silences it, on the assumption that an explicit
 value is a considered one.
 
 The cost of a longer window is retained rows in `harvest_start_idempotency`
 (one small row per keyed start until it is purged), so size it to the replay
 lifetime you actually need rather than the largest number you can think of.
+
+**For a `signals_with_start` binding**, `start_idempotency_window` does nothing
+— that path never reserves a start-idempotency claim. Its dedupe lasts exactly
+as long as the target execution row does. With retention off (the default) that
+is forever, which is *stronger* than the `starts` case. Once you turn retention
+on, the claim dies with the run:
+
+```rust
+HarvestPlugin::new()
+    // Deleting a cart's history at 3 days also deletes the dedupe claims for
+    // every broker message that fed it -- a replay older than that re-delivers.
+    .retention(RetentionConfig::default().with_max_age(Duration::from_secs(3 * 24 * 60 * 60)))
+```
+
+Harvest warns at startup for every coordinate-dedupe `signals_with_start`
+binding whose target workflow has active retention, reporting the effective
+age. That warning is **not** silenceable by tuning the window, precisely
+because the window is the wrong remedy here — size retention (globally or via a
+per-workflow-type override) to at least your broker's replay horizon, or accept
+the bound knowingly.
 
 ## Poison messages
 
@@ -531,12 +558,20 @@ the message key, offset and execution id are **never** labels:
 | `harvest.connector.received` | counter | `source` (binding name) |
 | `harvest.connector.dispatched` | counter | `source`, `outcome` ∈ `dispatched` / `idempotent_replay` / `deferred` / `dead_lettered` / `retried` |
 | `harvest.connector.poisoned` | counter | `source`, `reason` ∈ `malformed` / `mapping_rejected` / `target_rejected` |
-| `harvest.connector.lag` | gauge | `source` — where the broker client exposes it (Kafka high-watermark minus the consumer's current *read position*; SQS `ApproximateNumberOfMessages`). Sampled at most once per `lag_sample_interval` (default 15s), since it is a billed broker round-trip. |
+| `harvest.connector.lag` | gauge | `source` — where the broker client exposes it. Sampled at most once per `lag_sample_interval` (default 15s), since it is a billed broker round-trip. See below for exactly what each adapter reports. |
 
-> Kafka lag is measured against the read position, not the committed offset.
-> Because the connector deliberately withholds commits for an in-flight
-> contiguous prefix, position ≥ committed, so this gauge slightly
-> **under**-reports the backlog an un-acked crash would replay.
+Both adapters report **work this connector still owes**, which is the quantity
+a restart would have to redo — not the cheaper number each broker offers first:
+
+| Adapter | Reports | Why not the obvious one |
+|---|---|---|
+| Kafka | high-watermark minus the durable **committed group offset**, per assigned partition | The consumer's *read position* advances the moment a record is fetched, regardless of whether it was dispatched, is being retried, or is stuck behind a blocked commit prefix. Reading against it makes a wedged consumer report its lag falling to **zero** while a restart would replay the whole uncommitted span — inverting the gauge in exactly the case it exists to expose. A partition with nothing committed yet falls back to the low watermark, which is honest because the consumer is pinned to `auto.offset.reset = earliest`. |
+| SQS | `ApproximateNumberOfMessages` **plus** `ApproximateNumberOfMessagesNotVisible` | A message abandoned for visibility-timeout retry becomes *not visible*, so the visible count alone drains toward zero during a downstream outage while the outstanding population is unchanged. Both attributes ride the single `GetQueueAttributes` call, so this costs no extra round-trip. `ApproximateNumberOfMessagesDelayed` is excluded: a `DelaySeconds` message has not been delivered to anyone and is not work this connector currently owes. |
+
+> Because the gauge counts uncommitted and in-flight work, it stays **high**
+> while a partition is wedged or a backlog is being retried. That is the point:
+> pair it with an alert on a lag that is not falling, rather than one that only
+> fires on a large visible queue.
 
 A broker-triggered execution also records `start_source = 'broker'` with
 `start_source_ref` set to the rendered coordinates, so a run traces back to the
