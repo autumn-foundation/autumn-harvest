@@ -52,7 +52,7 @@ use super::claim_bench_support::{
     BUDGET_ENV_VAR, BudgetVerdict, ClaimGate, HEADLINE_P50_BUDGET_MS, LatencyStats,
     MIN_MEANINGFUL_SAMPLES, SCENARIO_BUDGET_ENV_VAR, Scenario, budget_from_env, budget_verdict,
     db_name_from_url, headline_scenario, measured_claims_for, scenario_time_budget,
-    sweep_probe_decoy_name, with_db_name,
+    sweep_probe_decoy_name, with_db_name, with_setup_deadline,
 };
 
 // The published budget lives in the shared harness as
@@ -1317,4 +1317,51 @@ async fn a_dbname_query_parameter_cannot_redirect_the_connection() {
          the harness would migrate and TRUNCATE there, not in the database \
          the rewritten URL names",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Setup-deadline bound (issue #786, round 19).
+//
+// These need no database, but they are async: a `#[tokio::test]` in
+// `claim_bench_support.rs` would reclassify that shared harness as a suite
+// (`ci_run_coverage::claim_bench_support_is_classified_as_a_harness_not_a_suite`),
+// and the guard's own remedy is to put the test in a file that already has a
+// manifest row. This is that file.
+// ---------------------------------------------------------------------------
+
+/// A server that stops answering must not park the bench forever.
+///
+/// `connect` and `seed` run before the measured phase's deadline exists, so
+/// nothing bounded them: a stalled server would hold the CI gate until the
+/// outer workflow timeout while the page advertises a per-scenario cap. The
+/// clock is paused, so a future that never resolves is decided by the
+/// deadline rather than by waiting out four real minutes.
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "benchmark setup stalled")]
+async fn setup_deadline_refuses_to_wait_out_a_stalled_server() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    let () = with_setup_deadline("seed", deadline, std::future::pending::<()>()).await;
+}
+
+/// The bound is a ceiling, not a delay: a step that finishes passes through.
+#[tokio::test(start_paused = true)]
+async fn setup_deadline_returns_a_step_that_finishes_in_time() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    let value = with_setup_deadline("connect", deadline, async { 7_u32 }).await;
+    assert_eq!(value, 7, "a completed step must return its own value");
+}
+
+/// An already-elapsed deadline is a *failure*, not "no deadline".
+///
+/// The remaining budget clamps to zero, and a zero timeout has to trip rather
+/// than be read as unbounded — the failure mode this whole change exists to
+/// remove. (It does not distinguish `saturating_duration_since` from plain
+/// `Instant` subtraction: both saturate to zero since Rust 1.60.)
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "benchmark setup stalled")]
+async fn setup_deadline_in_the_past_trips_immediately() {
+    let deadline = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .expect("the process has been up for at least a second");
+    let () = with_setup_deadline("connect", deadline, std::future::pending::<()>()).await;
 }

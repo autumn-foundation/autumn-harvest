@@ -50,9 +50,9 @@ this page says nothing about what they cost; see
   predicate costs the same (+1314%). The anti-join is free; the rows sitting in
   the table are what you pay for. See
   [the control that changed the conclusion](#the-control-that-changed-the-conclusion).
-* **Enqueue is not the problem.** ~4 700 rows/s sustained at p50 ~1.5 ms, flat
+* **Enqueue is not the problem.** ~4 800 rows/s sustained at p50 ~1.5 ms, flat
   from 1k to 100k backlog (inside run-to-run noise). At 100k the write side
-  sustains ~5 300 rows/s while the read side manages ~3 claims/s — **a queue
+  sustains ~4 600 rows/s while the read side manages ~3 claims/s — **a queue
   that deep does not drain.**
 * Issue #786 deliberately **measures without tuning**: the claim query is
   byte-for-byte unchanged by this work.
@@ -165,9 +165,9 @@ Baseline gate (no build policy, no concurrency key, no rate limit, no pauses),
 
 | backlog | n | p50 ms | p99 ms | max ms | claims/s |
 |--:|--:|--:|--:|--:|--:|
-| 1 000 | 184 | 8.70 | 17.76 | 22.62 | 784 |
-| 10 000 | 720 | 204.03 | 273.85 | 428.62 | 34 |
-| 100 000 ⚠ | 430 | 3 023.99 | 3 332.37 | 3 519.64 | 3 |
+| 1 000 | 184 | 10.44 | 23.49 | 26.53 | 640 |
+| 10 000 | 720 | 200.03 | 239.90 | 283.73 | 29 |
+| 100 000 ⚠ | 583 | 2 919.99 | 3 516.16 | 3 658.11 | 3 |
 
 ⚠ Cut short by the per-scenario wall-clock budget (180 s for this run; the
 default is 240 s, override with `HARVEST_BENCH_SCENARIO_SECS`). The percentiles
@@ -208,14 +208,14 @@ named in `vs what` — which is not always `baseline`. See
 
 | gate | seeded rows | claimable | n | p50 ms | p50 vs | vs what |
 |:--|--:|--:|--:|--:|--:|:--|
-| `circuit_breaker_set` | 10 000 | 10 000 | 720 | 95.11 | −1% | `baseline` |
-| `baseline` | 10 000 | 10 000 | 720 | 95.95 | — | |
-| `rate_limited` | 10 000 | 10 000 | 720 | 98.77 | +3% | `baseline` |
-| `build_policy` | 10 000 | 10 000 | 720 | 107.16 | +12% | `baseline` |
-| `concurrency_key` ⚠ | 10 000 | 10 000 | 513 | 606.11 | **+532%** | `baseline` |
-| `paused_rows` ⚠ | 20 000 | 10 000 | 240 | 1 344.76 | **−1%** | `double_backlog` |
-| `double_backlog` ⚠ | 20 000 | 20 000 | 240 | 1 356.92 | **+1314%** | `baseline` |
-| `all_gates` ⚠ | 20 000 | 10 000 | 194 | 1 693.44 | **+1665%** | `baseline` |
+| `baseline` | 10 000 | 10 000 | 720 | 89.32 | — | |
+| `rate_limited` | 10 000 | 10 000 | 720 | 90.68 | +2% | `baseline` |
+| `circuit_breaker_set` | 10 000 | 10 000 | 720 | 92.97 | +4% | `baseline` |
+| `build_policy` | 10 000 | 10 000 | 720 | 100.65 | +13% | `baseline` |
+| `concurrency_key` ⚠ | 10 000 | 10 000 | 657 | 664.49 | **+644%** | `baseline` |
+| `double_backlog` ⚠ | 20 000 | 20 000 | 325 | 1 324.88 | **+1383%** | `baseline` |
+| `paused_rows` ⚠ | 20 000 | 10 000 | 322 | 1 342.69 | **+1%** | `double_backlog` |
+| `all_gates` ⚠ | 20 000 | 10 000 | 257 | 1 694.20 | **+1797%** | `baseline` |
 
 ⚠ Cut short by the per-scenario wall-clock budget; the percentiles describe the
 `n` samples shown. A scenario that cannot finish 800 claims in three minutes is
@@ -223,25 +223,26 @@ itself a finding.
 
 `double_backlog` is a **control, not a gate** — it seeds no predicate at all.
 
-**How much of this reproduces.** Across five independent runs on the reference
+**How much of this reproduces.** Across six independent runs on the reference
 machine, `build_policy` is the only row that repeats to the point: +15%, +13%,
-+15%, +13%, +12%. `rate_limited` and `circuit_breaker_set` each land within a
-few points of zero and have **swapped rank with each other** between runs (one
-run put `rate_limited` at −3%, two put `circuit_breaker_set` at −1% — i.e. below
-`baseline`), so read them as "free", not as an ordering: the gap between them is
-smaller than the noise, and either can measure faster than a claim path that
-does strictly less work. `concurrency_key` was +306%, +283%, +590%, +518% and
-+532%; `paused_rows` vs `baseline` was +1319%, +1346%, +1321%, +1343% and
-+1301%. So: the
++15%, +13%, +12%, +13%. `rate_limited` and `circuit_breaker_set` each land
+within a few points of zero and have **swapped rank with each other** between
+runs (one run put `rate_limited` at −3%, two put `circuit_breaker_set` at −1% —
+i.e. below `baseline`; the sixth reversed them again, +2% against +4%), so read
+them as "free", not as an ordering: the gap between them is smaller than the
+noise, and either can measure faster than a claim path that does strictly less
+work. `concurrency_key` was +306%, +283%, +590%, +518%, +532% and +644%;
+`paused_rows` vs `baseline` was +1319%, +1346%, +1321%, +1343%, +1301% and
++1403%. So: the
 *classification* into free / modest / expensive is stable, and the expensive
 rows are reproducibly expensive, but only `build_policy` and the paused-vs-
 baseline figure are reproducible to better than a factor of two. Treat every
 percentage here as one significant figure.
 
 The table above is one representative run, not an average — averaging truncated
-scenarios with different `n` would be worse than quoting one honestly. The
-fourth run's every row fell inside the ranges quoted here, which is the property
-that matters: the table is representative, not lucky.
+scenarios with different `n` would be worse than quoting one honestly. Every row
+of the fourth and sixth runs fell inside the ranges quoted here, which is the
+property that matters: the table is representative, not lucky.
 
 ### The control that changed the conclusion
 
@@ -265,8 +266,8 @@ So there are two different questions and two different numbers:
 
 | comparison | question it answers | answer |
 |:--|:--|--:|
-| `paused_rows` vs `baseline` | what does a paused population cost an operator? | **+1301%** |
-| `paused_rows` vs `double_backlog` | is the PAUSED anti-join predicate expensive? | **−1%** |
+| `paused_rows` vs `baseline` | what does a paused population cost an operator? | **+1403%** |
+| `paused_rows` vs `double_backlog` | is the PAUSED anti-join predicate expensive? | **+1%** |
 
 **The operational finding survives; the attribution does not.** Pausing
 executions still does not take their work out of the claim path — the rows stay
@@ -366,8 +367,8 @@ Three things to read here:
    paid per row.
 
 One number in the full output is deliberately **not** comparable to the tables
-above: this plan's `Execution Time` was 1 243 ms, against a measured p50 of
-96 ms for the same scenario. The `EXPLAIN` is a single *cold* claim on a fresh
+above: this plan's `Execution Time` was 1 287 ms, against a measured p50 of
+89 ms for the same scenario. The `EXPLAIN` is a single *cold* claim on a fresh
 connection against a freshly-seeded table — precisely the plan-cache and
 buffer-cache cost the warmup trim exists to exclude. Read the plan for its
 *shape*; read the tables for timing.
@@ -394,9 +395,9 @@ of work, and tuning without a published baseline is how you get an unfalsifiable
 
 | backlog | rows | n | p50 ms | p99 ms | max ms | rows/s |
 |--:|--:|--:|--:|--:|--:|--:|
-| 1 000 | 800 | 720 | 1.54 | 2.76 | 5.15 | 4 693 |
-| 10 000 | 800 | 720 | 1.57 | 3.99 | 9.73 | 4 235 |
-| 100 000 | 800 | 720 | 1.33 | 2.52 | 3.40 | 5 326 |
+| 1 000 | 800 | 720 | 1.61 | 3.32 | 3.86 | 4 540 |
+| 10 000 | 800 | 720 | 1.39 | 3.46 | 4.22 | 5 122 |
+| 100 000 | 800 | 720 | 1.58 | 3.14 | 5.42 | 4 647 |
 
 Enqueue is **flat in backlog depth** — a 100x deeper queue moves p50 by 0.2 ms,
 and the throughput spread across the sweep is inside this box's run-to-run

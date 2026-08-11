@@ -1276,6 +1276,46 @@ fn is_run_token(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Run one pre-measurement setup step under its own wall-clock ceiling.
+///
+/// `connect` and `seed` run *before* the measured phase and therefore before
+/// its deadline exists, so neither was bounded by anything: a server that
+/// accepted the TCP connection and then stopped answering would park the
+/// bench — and the CI gate that calls it — until the outer workflow timeout,
+/// while the page advertises a per-scenario cap. Every other await in these
+/// runners is already bounded; these two were the hole.
+///
+/// Setup gets its *own* deadline rather than sharing the measured phase's.
+/// A single ceiling spanning both would let a slow seed eat the measurement
+/// window and report `truncated`, which says "the claim path is slow" about
+/// a run whose claim path was never the problem. Two phases, two ceilings:
+/// the worst case is bounded at twice the budget instead of unbounded, and
+/// each number means what it says. The same [`scenario_time_budget`] value
+/// is reused so that raising `HARVEST_BENCH_SCENARIO_SECS` for a slow
+/// machine widens setup with it.
+///
+/// # Panics
+///
+/// Panics when the step does not finish in time. That is the same contract
+/// the step already had — `connect` and `seed` both `expect` on failure —
+/// and the right one here: with no seeded backlog there is nothing to
+/// measure, so continuing would publish a number describing an empty table.
+pub async fn with_setup_deadline<T>(
+    what: &str,
+    deadline: std::time::Instant,
+    fut: impl std::future::Future<Output = T> + Send,
+) -> T {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    (tokio::time::timeout(remaining, fut).await).unwrap_or_else(|_| {
+        panic!(
+            "benchmark setup stalled: {what} did not finish within {remaining:?}. \
+             The database accepted the connection but stopped answering, so no \
+             measurement is possible; the scenario is abandoned rather than \
+             reporting a number taken against an unseeded table."
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Pure unit tests (run on every OS, no Docker, no `db` feature).
 // ---------------------------------------------------------------------------
@@ -1295,7 +1335,7 @@ mod pure_tests {
         HEADLINE_P50_BUDGET_MS, LatencyStats, SweepStep, budget_from_str, budget_verdict,
         claims_for_claimer, db_name_from_url, headline_scenario, measured_claims_for,
         measured_window, percentile_ms, redact_url, sweep_probe_decoy_name, sweep_step,
-        warmup_claims_for, with_db_name,
+        warmup_claims_for, with_db_name, with_setup_deadline,
     };
 
     #[test]
@@ -1681,12 +1721,14 @@ mod pure_tests {
 
     /// The same misclassification corrupts a rewritten target.
     ///
-    /// Read as a URL, the keyword string is spliced into `.../bench` and stops
-    /// being a connection string at all; read as keyword form, `dbname` is
-    /// replaced and every other pair is preserved.
+    /// Split at the `://` inside `password=http://hunter2`, everything before
+    /// it becomes an opaque "prefix" that is re-emitted untouched — so the real
+    /// `dbname=admin` survives and `/bench` is appended to the password,
+    /// producing a string that is no longer a connection string in either form.
+    /// Read as keyword form, `dbname` is replaced and every other pair is kept.
     #[test]
     fn with_db_name_treats_a_scheme_inside_a_value_as_keyword_form() {
-        let rewritten = with_db_name("host=db dbname=admin sslmode=require", "bench");
+        let rewritten = with_db_name("host=db dbname=admin password=http://hunter2", "bench");
         assert!(
             rewritten.contains("dbname=bench"),
             "target not rewritten: {rewritten}"
@@ -1696,7 +1738,7 @@ mod pure_tests {
             "old dbname survived: {rewritten}"
         );
         assert!(
-            rewritten.contains("host=db") && rewritten.contains("sslmode=require"),
+            rewritten.contains("host=db") && rewritten.contains("password=http://hunter2"),
             "sibling parameters lost: {rewritten}"
         );
     }
@@ -3299,6 +3341,25 @@ pub mod db {
         Instant::now()
     }
 
+    /// Connect and seed under a setup ceiling, then hand back the connection.
+    ///
+    /// Both runners share this so the bound cannot exist on one path and not the
+    /// other — the same reason their budgets are passed the same way. The
+    /// connection is dropped here rather than returned: neither runner uses it
+    /// past seeding, and holding it open would keep a session the pool then has
+    /// to work around.
+    async fn connect_and_seed(
+        db: &BenchDb,
+        scenario: Scenario,
+        budget: std::time::Duration,
+    ) -> SeedOutcome {
+        let deadline = Instant::now() + budget;
+        let mut conn = super::with_setup_deadline("connect", deadline, connect(&db.url)).await;
+        let outcome = super::with_setup_deadline("seed", deadline, seed(&mut conn, scenario)).await;
+        drop(conn);
+        outcome
+    }
+
     /// [`run_claim_scenario`] with the wall-clock ceiling supplied directly.
     ///
     /// The budget is a *parameter* rather than something this function reads
@@ -3323,9 +3384,9 @@ pub mod db {
         scenario: Scenario,
         budget: std::time::Duration,
     ) -> ClaimReport {
-        let mut conn = connect(&db.url).await;
-        let seed_outcome = seed(&mut conn, scenario).await;
-        drop(conn);
+        // Setup runs before the measured phase and so before its deadline; it
+        // carries its own. See `with_setup_deadline`.
+        let seed_outcome = connect_and_seed(db, scenario, budget).await;
 
         let pool = build_pool(&db.url, scenario.claimers);
         let queues = Arc::new(queue_names(scenario));
@@ -3614,9 +3675,8 @@ pub mod db {
             queues: headline_queue_count(),
             gate: ClaimGate::Baseline,
         };
-        let mut conn = connect(&db.url).await;
-        seed(&mut conn, scenario).await;
-        drop(conn);
+        // Same two-phase ceiling as the claim path — see `with_setup_deadline`.
+        let _ = connect_and_seed(db, scenario, budget).await;
 
         let pool = build_pool(&db.url, writers);
         let queues = Arc::new(queue_names(scenario));
