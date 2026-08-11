@@ -235,6 +235,11 @@ impl Default for ConnectorRuntimeConfig {
 }
 
 /// Drives one event source against one binding.
+///
+/// **Single-use.** A runtime that has hard-stopped is spent: [`Self::run`]
+/// refuses to start again and returns immediately (see the guard there for
+/// why the flag cannot simply be reset). Build a fresh `ConnectorRuntime` to
+/// resume consuming.
 pub struct ConnectorRuntime {
     binding: Arc<SourceBinding>,
     source: Arc<dyn EventSource>,
@@ -405,6 +410,22 @@ impl ConnectorRuntime {
     /// Consume until `cancel` fires or the source closes.
     pub async fn run(&self, cancel: CancellationToken) {
         let source_name = self.binding.name;
+        // A runtime is single-use, and `hard_stop` is what records that it has
+        // been spent. It is never reset — it is an `Arc` shared with every
+        // dispatch already handed out, so clearing it would un-cancel
+        // stragglers still unwinding. Running on top of a fired one would
+        // consume messages and hand every single one straight back at its
+        // first await point: a hot receive-and-abandon loop that presents as a
+        // healthy consumer while making no progress, and spends a billed API's
+        // request budget doing it. Build a fresh runtime instead.
+        if self.hard_stop.is_cancelled() {
+            tracing::error!(
+                source = source_name,
+                "refusing to start a connector whose runtime was already hard-stopped; \
+                 a `ConnectorRuntime` is single-use — build a new one to resume consuming"
+            );
+            return;
+        }
         tracing::info!(
             source = source_name,
             stream = %self.binding.stream,
@@ -451,7 +472,21 @@ impl ConnectorRuntime {
                         // shared backoff below and is retried on the next
                         // pass, which is what lets consumption resume once the
                         // broker comes back.
-                        if self.recover_from_stall(partition).await == StallRecovery::Unsupported {
+                        // Recovery must race cancellation, not merely be
+                        // *reached* from a `select!` that already resolved: a
+                        // rebuild is a network operation against the same
+                        // broker whose outage usually caused the stall, so it
+                        // can block indefinitely. Awaiting it bare would park
+                        // `run` *before* it reaches the bounded
+                        // `drain_in_flight` below, outside the reach of the
+                        // very deadline that exists to guarantee shutdown
+                        // terminates -- and `stop_harvest_runtime` awaits this
+                        // handle with none of its own.
+                        let recovery = tokio::select! {
+                            () = cancel.cancelled() => break,
+                            recovery = self.recover_from_stall(partition) => recovery,
+                        };
+                        if recovery == StallRecovery::Unsupported {
                             tracing::error!(
                                 source = source_name,
                                 partition,
@@ -989,6 +1024,9 @@ impl ConnectorRuntime {
         // Once a message reaches a terminal disposition its strike history is
         // no longer needed; dropping it keeps the tracker bounded. A message
         // left for redelivery keeps its strikes so the threshold still bites.
+        // "Terminal" here means *the message will not come back* — which is
+        // true of a successful dispatch and, as the two paragraphs below
+        // explain, of neither dead-letter handoff.
         //
         // `AbandonToBrokerDeadLetter` is terminal for *harvest* but not for
         // the broker: it resets visibility so the message comes back and the
@@ -1013,6 +1051,19 @@ impl ConnectorRuntime {
         // not one per redrive lap: the retained strikes above make every later
         // redelivery re-nack on sight, so this arm is reached repeatedly for
         // the same message until the broker's own count ends it.
+        //
+        // The harvest-sink handoff needs the same treatment for a different
+        // reason. Its record is durable before the message is acked, and `ack`
+        // is deliberately best-effort — a failed commit is warned about, never
+        // escalated, precisely so a broker hiccup cannot lose a message. So
+        // the broker redelivers something harvest has already quarantined, and
+        // the redelivery is the same physical poison message. Marking it
+        // terminal stops the second sample. It deliberately does NOT retain
+        // the strikes the way the broker-native arm does: there, re-nacking on
+        // sight is the mechanism that lets the queue's own count end the
+        // message, whereas here the record is already durable and a return
+        // means only that the commit failed. So the countdown restarts exactly
+        // as the pre-dedupe `clear` made it — only the *counting* was wrong.
         let mut count_poison = true;
         if matches!(effective, MessageDisposition::AbandonToBrokerDeadLetter(_)) {
             count_poison = self
@@ -1020,6 +1071,12 @@ impl ConnectorRuntime {
                 .lock()
                 .await
                 .mark_terminal_as_of(&key, std::time::Instant::now());
+        } else if matches!(effective, MessageDisposition::DeadLetter(_)) {
+            count_poison = self
+                .poison
+                .lock()
+                .await
+                .mark_sink_terminal_as_of(&key, std::time::Instant::now());
         } else if matches!(effective, MessageDisposition::Retry) {
             // A `Retry` reaches here for three different reasons, and only two
             // of them may keep the strikes:
@@ -1254,6 +1311,13 @@ impl ConnectorRuntime {
         }
     }
 
+    // The held guard below is the entire point of this function, and the lint's
+    // suggested remedy — collapse it into the `complete` call so it drops
+    // immediately — is precisely the ordering bug the comment there describes.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the guard is deliberately held across the commit submission to keep it monotonic"
+    )]
     async fn ack(&self, handle: &MessageHandle) {
         // For a positionally-ordered broker (Kafka), only advance the
         // high-water mark to the contiguous completed prefix — committing past
@@ -1266,21 +1330,36 @@ impl ConnectorRuntime {
         // and re-read on a crash. Kafka's `ack` addresses the commit purely by
         // `(partition, position)` (the token is unused), so a synthesized
         // handle at the mark is the correct thing to hand it.
-        let mut owned;
-        let mut handle = handle;
-        if let (Some(partition), Some(position)) = (handle.partition, handle.position) {
-            let Some(advanced) = self.offsets.lock().await.complete(partition, position) else {
+        //
+        // The lock is held across the *submission*, not merely across the
+        // computation of the mark. Concurrent settlements race otherwise: two
+        // dispatches finishing together compute marks 5 then 6 under the lock,
+        // then submit in whichever order the runtime happens to schedule them.
+        // Submitting 5 after 6 moves the committed offset BACKWARD, and offset
+        // 6 — durably settled — is re-read on the next crash. Only a
+        // positional broker reaches this branch (an SQS handle carries no
+        // partition and skips it entirely), and Kafka's commit is a local
+        // enqueue rather than a broker round-trip, so serializing here costs
+        // the ordering it buys and nothing more.
+        let result = if let (Some(partition), Some(position)) = (handle.partition, handle.position)
+        {
+            let mut offsets = self.offsets.lock().await;
+            let Some(advanced) = offsets.complete(partition, position) else {
                 // Earlier offsets are still in flight; this one will be
                 // committed as part of a later contiguous advance.
                 return;
             };
-            if advanced != position {
-                owned = handle.clone();
-                owned.position = Some(advanced);
-                handle = &owned;
-            }
-        }
-        if let Err(e) = self.source.ack(handle).await {
+            // The token is unused by a positional adapter's commit, which
+            // addresses it purely by `(partition, position)` — so synthesizing
+            // at the mark is correct even when it is not this handle's own
+            // offset.
+            let mut at_mark = handle.clone();
+            at_mark.position = Some(advanced);
+            self.source.ack(&at_mark).await
+        } else {
+            self.source.ack(handle).await
+        };
+        if let Err(e) = result {
             // A failed ack is safe: the message is redelivered and dedupes as
             // an idempotent replay. Never escalate it into a lost message.
             tracing::warn!(
@@ -1822,6 +1901,48 @@ mod tests {
             sink.entries().is_empty(),
             "broker-native dead-lettering never writes to the harvest sink"
         );
+    }
+
+    #[tokio::test]
+    async fn a_harvest_sink_poison_is_counted_once_when_its_ack_fails() {
+        // The harvest-sink terminal path acks after writing the record, and
+        // `ack` is deliberately best-effort — a failed commit is logged, not
+        // escalated, precisely so a broker hiccup cannot lose a message. The
+        // consequence is a redelivery of a message harvest has already
+        // quarantined, which must not contribute a SECOND `poisoned` sample:
+        // it is the same physical poison message, exactly as in the
+        // broker-native redrive case above.
+        let source = Arc::new(MockSource::new("orders"));
+        let metrics = Arc::new(RecordingMetrics::default());
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let rt = runtime_with_metrics(
+            malformed_binding(),
+            Arc::clone(&source),
+            Arc::clone(&sink),
+            Arc::clone(&metrics),
+        );
+
+        // A deterministic poison is quarantined on sight, so both deliveries
+        // reach the terminal handoff — no strike countdown to hide behind.
+        source.push_kafka(0, 1, b"not json");
+        rt.run_once().await.unwrap();
+        source.push_kafka(0, 1, b"not json");
+        rt.run_once().await.unwrap();
+
+        assert_eq!(
+            metrics.poisoned().len(),
+            1,
+            "a redelivery caused by a failed ack is the same physical poison \
+             message and must not be counted twice"
+        );
+        // Unchanged by the dedupe: every received message still settles once.
+        assert_eq!(metrics.dispatched().len(), metrics.received().len());
+        assert_eq!(metrics.dispatched().len(), 2);
+
+        // A genuinely different poison message still counts.
+        source.push_kafka(0, 2, b"not json");
+        rt.run_once().await.unwrap();
+        assert_eq!(metrics.poisoned().len(), 2);
     }
 
     #[tokio::test]
@@ -2587,6 +2708,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hard_stopped_runtime_refuses_to_run_again() {
+        // `hard_stop` is terminal, and it is deliberately never reset: it is
+        // an `Arc` shared with every dispatch this runtime has already handed
+        // out, so clearing it would un-cancel stragglers still unwinding.
+        // Running again on top of it would consume messages and hand every one
+        // straight back at its first await point — a hot receive-and-abandon
+        // loop that reports itself as a healthy consumer while making no
+        // progress at all, and burns a billed API's request budget doing it.
+        let source = Arc::new(MockSource::new("orders"));
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let rt = runtime(malformed_binding(), Arc::clone(&source), sink);
+        source.push_kafka(0, 1, b"{}");
+
+        rt.hard_stop.cancel();
+
+        // An *uncancelled* token: nothing but the guard can end this.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rt.run(CancellationToken::new()),
+        )
+        .await
+        .expect("a hard-stopped runtime must refuse to start, not spin");
+
+        assert!(
+            source.acked().is_empty() && source.abandoned().is_empty(),
+            "refusing means consuming nothing at all, not consuming and \
+             abandoning in a loop"
+        );
+    }
+
+    #[tokio::test]
     async fn ack_waits_for_the_contiguous_offset_prefix() {
         // AC4's Kafka-specific hazard: committing offset 5 while 4 is still in
         // flight would silently skip 4 on a crash. The runtime must hold the
@@ -2617,6 +2769,92 @@ mod tests {
             Some(5),
             "the commit must be at the advanced high-water mark, not the \
              triggering handle's own offset"
+        );
+    }
+
+    /// A source whose commit submission is slow for one chosen offset.
+    ///
+    /// Stands in for the real asymmetry between two concurrent commits: they
+    /// do not reach the adapter in the order their marks were computed unless
+    /// something makes them.
+    #[derive(Debug)]
+    struct SlowAckSource {
+        inner: MockSource,
+        slow_position: i64,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl EventSource for SlowAckSource {
+        fn stream(&self) -> &str {
+            self.inner.stream()
+        }
+        async fn receive(
+            &self,
+            max: usize,
+            timeout: std::time::Duration,
+        ) -> Result<Vec<InboundMessage>, ConnectorError> {
+            self.inner.receive(max, timeout).await
+        }
+        async fn ack(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            if handle.position == Some(self.slow_position) {
+                tokio::time::sleep(self.delay).await;
+            }
+            self.inner.ack(handle).await
+        }
+        async fn abandon(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            self.inner.abandon(handle).await
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_acks_never_submit_a_commit_out_of_order() {
+        // Computing the marks under the lock is not enough: released before
+        // the submission, two settlements that finish together can compute 0
+        // then 1 and *submit* 1 then 0, moving the committed offset backward
+        // and re-reading a durably settled message on the next crash.
+        let source = Arc::new(SlowAckSource {
+            inner: MockSource::new("orders"),
+            slow_position: 0,
+            delay: std::time::Duration::from_millis(200),
+        });
+        let rt = Arc::new(
+            ConnectorRuntime::new(
+                malformed_binding(),
+                Arc::clone(&source) as Arc<dyn EventSource>,
+                HarvestApiState::new(),
+                Arc::new(NoOpMetrics),
+                IdempotencyMode::BrokerCoordinates,
+            )
+            .with_dead_letter_sink(Arc::new(RecordingDeadLetterSink::new())),
+        );
+
+        rt.offsets.lock().await.observe(0, 0);
+        rt.offsets.lock().await.observe(0, 1);
+
+        // Offset 0 settles first and computes the lower mark, but its
+        // submission is the slow one.
+        let first = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { rt.ack(&MessageHandle::positioned("orders:0:0", 0, 0)).await }
+        });
+        // Long enough for `first` to be inside its submission, short enough to
+        // be well clear of it finishing.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { rt.ack(&MessageHandle::positioned("orders:0:1", 0, 1)).await }
+        });
+
+        first.await.expect("first ack task");
+        second.await.expect("second ack task");
+
+        let positions: Vec<Option<i64>> = source.inner.acked().iter().map(|h| h.position).collect();
+        assert_eq!(
+            positions,
+            vec![Some(0), Some(1)],
+            "commits must reach the adapter in mark order; submitting the lower \
+             mark after the higher one rewinds the committed offset"
         );
     }
 
@@ -3589,6 +3827,110 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(true)
         }
+    }
+
+    /// A source that wedges and whose rebuild never returns.
+    ///
+    /// The realistic shape: a Kafka consumer rebuild waiting on a broker that
+    /// is unreachable — which is *the usual state* when a stall happens, since
+    /// the outage that blocked the prefix is generally the outage that blocks
+    /// the rebuild.
+    #[derive(Debug)]
+    struct RebuildHangsSource {
+        inner: MockSource,
+        next_offset: std::sync::atomic::AtomicI64,
+    }
+
+    impl RebuildHangsSource {
+        fn new(stream: &str) -> Self {
+            Self {
+                inner: MockSource::new(stream).without_redelivery(),
+                next_offset: std::sync::atomic::AtomicI64::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventSource for RebuildHangsSource {
+        fn stream(&self) -> &str {
+            self.inner.stream()
+        }
+        async fn receive(
+            &self,
+            max: usize,
+            timeout: std::time::Duration,
+        ) -> Result<Vec<InboundMessage>, ConnectorError> {
+            let offset = self
+                .next_offset
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.push_kafka(0, offset, b"{{{");
+            self.inner.receive(max, timeout).await
+        }
+        async fn ack(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            self.inner.ack(handle).await
+        }
+        async fn abandon(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+            self.inner.abandon(handle).await
+        }
+        fn abandon_redelivers(&self) -> bool {
+            false
+        }
+        async fn recover(&self) -> Result<bool, ConnectorError> {
+            std::future::pending().await
+        }
+    }
+
+    /// A rebuild that never returns must not hang the whole application.
+    ///
+    /// The stall arm awaits `recover_from_stall` inside the *body* of a
+    /// `select!` arm that has already resolved, so the cancellation branch is
+    /// no longer racing it. A rebuild blocked on its broker therefore parks
+    /// `run` before it ever reaches `drain_in_flight` — bypassing the bounded
+    /// drain entirely — while `stop_harvest_runtime` awaits the connector
+    /// handle with no deadline of its own. That is a permanently hung
+    /// shutdown, and the outage that wedged the prefix is usually the same one
+    /// that wedges the rebuild, so the two coincide by default rather than by
+    /// coincidence.
+    #[tokio::test]
+    async fn a_wedged_rebuild_cannot_hang_shutdown() {
+        let source = Arc::new(RebuildHangsSource::new("orders"));
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        // Every message ends up `Retry`, which on this source wedges the head.
+        sink.fail_writes(true);
+        let rt = Arc::new(
+            ConnectorRuntime::new(
+                malformed_binding(),
+                Arc::clone(&source) as Arc<dyn EventSource>,
+                HarvestApiState::new(),
+                Arc::new(NoOpMetrics),
+                IdempotencyMode::BrokerCoordinates,
+            )
+            .with_dead_letter_sink(sink)
+            .with_config(ConnectorRuntimeConfig {
+                error_backoff: std::time::Duration::from_millis(10),
+                poll_timeout: std::time::Duration::from_millis(1),
+                idle_backoff: std::time::Duration::from_millis(1),
+                ..ConnectorRuntimeConfig::default()
+            }),
+        );
+
+        let cancel = CancellationToken::new();
+        let handle = {
+            let rt = Arc::clone(&rt);
+            let cancel = cancel.clone();
+            tokio::spawn(async move { rt.run(cancel).await })
+        };
+        // Long enough for the pass to wedge the head and enter the rebuild.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        cancel.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect(
+                "cancellation must reach a connector parked in a rebuild, or shutdown hangs \
+                 forever outside the reach of the bounded drain",
+            )
+            .expect("run task must not panic");
     }
 
     /// Rebuilding a Kafka consumer is not a free local operation: it triggers

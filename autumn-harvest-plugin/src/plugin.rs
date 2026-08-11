@@ -191,6 +191,39 @@ struct ConnectorRuntimeHandle {
     handle: JoinHandle<()>,
 }
 
+/// Stop every connector consumer loop, cancelling *all* of them before
+/// awaiting *any*.
+///
+/// Cancelling and awaiting one at a time would serialize the drains:
+/// connector *N* keeps consuming — and therefore keeps accruing more in-flight
+/// work of its own to drain — for as long as connectors *1..N* take to finish.
+/// Each drain is individually bounded
+/// ([`ConnectorRuntime::drain_in_flight`](crate::connector::ConnectorRuntime)),
+/// but serialized those bounds *sum*, so a fleet of bindings turns a
+/// per-connector deadline into an N-times-longer shutdown — and the messages
+/// the late connectors consumed in the meantime are the ones most likely to be
+/// hard-stopped when their own turn finally comes. Cancelling first starts
+/// every drain deadline at the same instant, so the total is the slowest
+/// connector rather than their sum.
+#[cfg(feature = "connectors")]
+async fn stop_connectors(connectors: Vec<ConnectorRuntimeHandle>) {
+    let draining: Vec<JoinHandle<()>> = connectors
+        .into_iter()
+        .map(|connector| {
+            connector.shutdown.cancel();
+            connector.handle
+        })
+        .collect();
+
+    for handle in draining {
+        if let Err(error) = handle.await
+            && !error.is_cancelled()
+        {
+            tracing::warn!(error = %error, "harvest connector failed during shutdown");
+        }
+    }
+}
+
 impl Default for HarvestPlugin {
     fn default() -> Self {
         Self::new()
@@ -2252,14 +2285,7 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
     // returning, so a message whose dispatch already committed still gets
     // acknowledged rather than being redelivered after the restart.
     #[cfg(feature = "connectors")]
-    for connector in runtime.connectors {
-        connector.shutdown.cancel();
-        if let Err(error) = connector.handle.await
-            && !error.is_cancelled()
-        {
-            tracing::warn!(error = %error, "harvest connector failed during shutdown");
-        }
-    }
+    stop_connectors(runtime.connectors).await;
 
     if let Some(gate_refresh) = runtime.gate_refresh {
         gate_refresh.shutdown.cancel();
@@ -2596,6 +2622,53 @@ mod tests {
     use autumn_harvest::dag::DagBuilder;
     use autumn_harvest::policy::Schedule;
     use autumn_web::config::DatabaseConfig;
+
+    /// Shutting a fleet of connectors down must not serialize their drains.
+    ///
+    /// Deliberately *not* a wall-clock threshold: the first connector's drain
+    /// is made to genuinely depend on the second having been cancelled. Under
+    /// a cancel-then-await-one-at-a-time shutdown that dependency can never be
+    /// satisfied — the second connector's cancellation is still queued behind
+    /// the first connector's `await` — so the shutdown deadlocks and the
+    /// timeout below fires. It is exactly the deadlock a real fleet risks in
+    /// slow motion, and it either happens or it does not.
+    #[cfg(feature = "connectors")]
+    #[tokio::test]
+    async fn every_connector_is_cancelled_before_any_drain_is_awaited() {
+        let (second_cancelled_tx, second_cancelled_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let first_shutdown = CancellationToken::new();
+        let first = ConnectorRuntimeHandle {
+            shutdown: first_shutdown.clone(),
+            handle: tokio::spawn(async move {
+                first_shutdown.cancelled().await;
+                // Stand-in for "this drain outlives the next connector's
+                // cancellation" — true of any real drain that is still
+                // finishing when the next connector is asked to stop.
+                let _ = second_cancelled_rx.await;
+            }),
+        };
+
+        let second_shutdown = CancellationToken::new();
+        let second = ConnectorRuntimeHandle {
+            shutdown: second_shutdown.clone(),
+            handle: tokio::spawn(async move {
+                second_shutdown.cancelled().await;
+                let _ = second_cancelled_tx.send(());
+            }),
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stop_connectors(vec![first, second]),
+        )
+        .await
+        .expect(
+            "shutdown must cancel every connector before awaiting any of their drains; \
+             awaiting one at a time leaves later connectors running — and consuming — \
+             for the whole of the earlier ones' bounded drains",
+        );
+    }
 
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {

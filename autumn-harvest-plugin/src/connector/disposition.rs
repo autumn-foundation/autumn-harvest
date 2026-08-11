@@ -410,6 +410,33 @@ impl PoisonTracker {
         first
     }
 
+    /// Note that `key` was quarantined into harvest's *own* dead-letter sink
+    /// at `now`, restarting its strike countdown.
+    ///
+    /// Shares [`Self::mark_terminal_as_of`]'s dedupe contract — one physical
+    /// poison message contributes one `harvest.connector.poisoned` sample
+    /// however many times it comes back — and differs in exactly one respect:
+    /// the strikes do **not** survive.
+    ///
+    /// The broker-native handoff keeps them because re-nacking on sight is the
+    /// whole mechanism that lets the queue's own `maxReceiveCount` end the
+    /// message. Nothing analogous applies here: the record is already durable
+    /// and the message already acked, so it only returns when that ack failed
+    /// — rare, and no reason to treat a fresh delivery as though it were mid-
+    /// streak. Restarting the countdown is what the pre-dedupe `clear` did,
+    /// and it is still the right strike behaviour; only the *counting* needed
+    /// fixing.
+    ///
+    /// The entry is bounded exactly like any other: same expiry order, same
+    /// retention deadline.
+    pub fn mark_sink_terminal_as_of(&mut self, key: &str, now: std::time::Instant) -> bool {
+        let first = self.mark_terminal_as_of(key, now);
+        if let Some(state) = self.strikes.get_mut(key) {
+            state.count = 0;
+        }
+        first
+    }
+
     /// Evict oldest-first until *both* the live map and the expiry queue are
     /// back inside the hard ceiling.
     ///
@@ -1315,6 +1342,48 @@ mod tests {
         // A key with no strikes recorded is the DETERMINISTIC poison case and
         // has its own contract -- see
         // `a_deterministic_poison_counts_on_its_first_handoff_and_not_after`.
+    }
+
+    #[test]
+    fn a_sink_quarantine_dedupes_the_sample_but_restarts_the_countdown() {
+        // The harvest-sink handoff shares the broker-native one's dedupe
+        // contract and differs in exactly one respect: it does NOT retain the
+        // strikes. Both halves matter, so both are asserted here.
+        let mut t = PoisonTracker::new();
+        let t0 = std::time::Instant::now();
+
+        assert_eq!(t.strike("m-1", t0), 1);
+        assert_eq!(t.strike("m-1", t0), 2);
+        assert!(
+            t.mark_sink_terminal_as_of("m-1", t0),
+            "the first quarantine is the one that counts"
+        );
+
+        // Restarted, not retained: a message that comes back because its ack
+        // failed begins a fresh countdown, exactly as the pre-dedupe `clear`
+        // made it. Retaining them would make it re-quarantine on sight and
+        // re-write the sink record on every lap.
+        assert_eq!(
+            t.strike("m-1", t0),
+            1,
+            "the countdown must restart, not resume mid-streak"
+        );
+
+        // ...but the sample is still deduped across that return.
+        assert!(
+            !t.mark_sink_terminal_as_of("m-1", t0 + std::time::Duration::from_secs(5)),
+            "a redelivery caused by a failed ack is the same physical message"
+        );
+
+        // A genuinely different message counts.
+        assert!(t.mark_sink_terminal_as_of("m-2", t0));
+
+        // Bounded like any other terminal entry — nothing downstream clears it.
+        t.expire_stale_as_of(
+            t0 + std::time::Duration::from_secs(70),
+            std::time::Duration::from_secs(60),
+        );
+        assert_eq!(t.tracked(), 0);
     }
 
     #[test]

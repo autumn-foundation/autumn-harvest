@@ -1226,6 +1226,55 @@ coordinates, so a run traces back to the exact message.
   literal), and `the_binding_incarnation_reaches_the_derived_key` end-to-end
   through a pass, because a rotation knob nothing threads is worse than none.
   The cutover procedure is documented in the connector guide.
+- **A wedged rebuild hung shutdown forever, outside the bounded drain.** A
+  stall is recovered by rebuilding the consumer, and that rebuild is a network
+  operation against the same broker whose outage usually caused the stall. It
+  was awaited bare from the *body* of a `select!` arm that had already
+  resolved, so cancellation was no longer racing it: `run` parked in the
+  rebuild **before** reaching the bounded drain, and `stop_harvest_runtime`
+  awaits the connector handle with no deadline of its own. The recovery now
+  races cancellation. RED: `a_wedged_rebuild_cannot_hang_shutdown` (a source
+  whose `recover` is `pending()`) timed out at 10s and now returns in 0.3s.
+- **Connector shutdown serialized every drain.** Cancelling and awaiting one
+  connector at a time left connector *N* running — and consuming, and so
+  accruing more of its own work to drain — for the whole of connectors
+  *1..N*'s bounded drains, summing the per-connector deadlines into an
+  N-times-longer shutdown and making the late connectors' messages the ones
+  most likely to be hard-stopped. `stop_connectors` now cancels all before
+  awaiting any. RED: `every_connector_is_cancelled_before_any_drain_is_awaited`
+  makes the first drain genuinely depend on the second's cancellation, so the
+  old shape deadlocks rather than merely running slowly.
+- **Concurrent acks could rewind a Kafka commit.** The offsets guard was
+  dropped at the end of the `let ... else` that computed the mark, so two
+  settlements finishing together computed marks 5 then 6 under the lock and
+  submitted them in scheduling order — submitting 5 after 6 moves the
+  committed offset backward and re-reads a durably settled message on the next
+  crash. The guard is now held across the submission. Only a positional broker
+  reaches that branch (an SQS handle carries no partition) and Kafka's commit
+  is a local enqueue, so the serialization costs the ordering it buys and
+  nothing more. RED: `concurrent_acks_never_submit_a_commit_out_of_order`.
+- **A harvest-sink poison counted twice when its ack failed.** `ack` is
+  deliberately best-effort so a broker hiccup cannot lose a message, which
+  means the broker redelivers something harvest has already quarantined — and
+  that redelivery contributed a second `harvest.connector.poisoned` sample for
+  one physical message, the same inflation the broker-native redrive path
+  already deduped. Now deduped symmetrically via the new
+  `PoisonTracker::mark_sink_terminal_as_of`, which shares the first-handoff
+  contract but deliberately does **not** retain the strikes: re-nacking on
+  sight is load-bearing for the broker-native handoff and meaningless here, so
+  the countdown restarts exactly as the pre-dedupe `clear` made it. RED:
+  `a_harvest_sink_poison_is_counted_once_when_its_ack_fails`, plus
+  `a_sink_quarantine_dedupes_the_sample_but_restarts_the_countdown` pinning
+  both halves of the new method's contract.
+- **A hard-stopped runtime could be run again.** `hard_stop` is terminal and is
+  never reset — it is an `Arc` shared with every dispatch already handed out,
+  so clearing it would un-cancel stragglers still unwinding. Running on top of
+  a fired one consumed messages and handed every one straight back at its
+  first await point: a hot receive-and-abandon loop presenting as a healthy
+  consumer while making no progress, and spending a billed API's request
+  budget doing it. `run` now refuses, and `ConnectorRuntime` documents itself
+  as single-use. RED: `a_hard_stopped_runtime_refuses_to_run_again` spun for
+  the full 5s bound and now returns having consumed nothing.
 
 ### Success metric
 
