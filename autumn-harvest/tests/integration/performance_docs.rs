@@ -28,9 +28,23 @@ fn performance_doc_path() -> PathBuf {
         .join("docs/performance.md")
 }
 
+/// Read a file with line endings normalised to `\n`.
+///
+/// Every structural helper below locates boundaries with `\n`-anchored needles
+/// (`"\n}\n"` for a top-level item's closing brace, `"\n\n"` for a paragraph
+/// break, `"\n### "` for a section break). A Windows checkout hands those
+/// helpers `\r\n`, so each needle silently misses and the test fails with a
+/// "file must define X" panic that has nothing to do with the file's contents.
+/// Normalising once here keeps the helpers platform-agnostic rather than
+/// spreading `\r?` handling across each of them.
+fn read_normalized(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
+}
+
 fn read_performance_doc() -> String {
-    let path = performance_doc_path();
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    read_normalized(&performance_doc_path())
 }
 
 /// One row of the per-gate attribution table.
@@ -288,9 +302,7 @@ fn doc_section<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
 /// adding a statement to `claim_task` would otherwise disturb this page.
 #[test]
 fn claim_transaction_statements_are_all_named_in_the_docs() {
-    let queue_src =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/queue.rs"))
-            .expect("read src/queue.rs");
+    let queue_src = read_normalized(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/queue.rs"));
     let body = top_level_fn_body(&queue_src, "claim_task")
         .expect("queue.rs must define `pub async fn claim_task(`");
 
@@ -362,6 +374,78 @@ fn enqueue_throughput_caveat_defers_to_the_authoritative_window_definition() {
              denominator. Sentence:\n{sentence}"
         );
     }
+}
+
+/// The structural helpers must survive a CRLF checkout.
+///
+/// Every helper above locates boundaries with `\n`-anchored needles. Git checks
+/// this repository out with CRLF on Windows, so reading a file raw hands those
+/// helpers `\r\n` and each needle silently misses — surfacing as a bogus "file
+/// must define X" panic. That is exactly what happened: the guards passed on
+/// Linux and macOS and failed only on `Test (windows-latest)`.
+///
+/// This test reproduces the platform difference *on every platform* by writing
+/// a fixture with explicit CRLF. If `read_normalized` is ever simplified back to
+/// a plain `read_to_string`, this fails in the ordinary Linux test run rather
+/// than waiting for Windows CI to notice.
+#[test]
+fn structural_helpers_survive_crlf_line_endings() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+
+    // A Rust source fixture whose closing brace is preceded by CRLF.
+    let src_path = dir.path().join("crlf_queue.rs");
+    std::fs::write(
+        &src_path,
+        "use std::fmt;\r\n\r\npub async fn claim_task(x: i32) -> i32 {\r\n    \
+         crate::queue_pause::try_lock_queue_for_claim(x);\r\n    \
+         crate::queue_pause::release_claim_if_queue_paused(x)\r\n}\r\n\r\nfn other() {}\r\n",
+    )
+    .expect("write CRLF source fixture");
+
+    let src = read_normalized(&src_path);
+    let body = top_level_fn_body(&src, "claim_task")
+        .expect("top_level_fn_body must find a CRLF-checked-out function body");
+    assert!(
+        mentions_identifier(body, "try_lock_queue_for_claim"),
+        "the extracted body must contain the function's own call sites: {body}"
+    );
+    assert!(
+        !body.contains("fn other"),
+        "the body must stop at the closing brace, not run into the next item: {body}"
+    );
+
+    // A Markdown fixture with CRLF paragraph and section breaks.
+    let doc_path = dir.path().join("crlf_doc.md");
+    std::fs::write(
+        &doc_path,
+        "### What is actually timed\r\n\r\nOpener paragraph.\r\n\r\n\
+         Two caveats on this table. First one.\r\nSecond line.\r\n\r\n\
+         ### Next section\r\n\r\nUnrelated.\r\n",
+    )
+    .expect("write CRLF doc fixture");
+
+    let doc = read_normalized(&doc_path);
+    let caveat = paragraph_starting_with(&doc, "Two caveats on this table.")
+        .expect("paragraph_starting_with must find a CRLF-delimited paragraph");
+    assert!(
+        caveat.contains("Second line."),
+        "the paragraph must span its wrapped lines: {caveat}"
+    );
+    assert!(
+        !caveat.contains("Next section"),
+        "the paragraph must stop at the blank line: {caveat}"
+    );
+
+    let section = doc_section(&doc, "### What is actually timed")
+        .expect("doc_section must find a CRLF-delimited section");
+    assert!(
+        section.contains("Opener paragraph."),
+        "the section must contain its own body: {section}"
+    );
+    assert!(
+        !section.contains("Unrelated."),
+        "the section must stop at the next `### ` heading: {section}"
+    );
 }
 
 /// The truncated rows must describe the sample count they actually published.
