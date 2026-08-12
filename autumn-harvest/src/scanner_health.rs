@@ -168,6 +168,35 @@ pub enum ScannerLivenessVerdict {
     Wedged,
 }
 
+impl ScannerLivenessVerdict {
+    /// Severity order, for folding several instances of one [`Scanner`] down
+    /// to the worst. Deliberately not a derived `Ord` on the public enum: the
+    /// ordering is a severity policy, not an inherent property of the values.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Healthy => 0,
+            Self::Stale => 1,
+            Self::Wedged => 2,
+        }
+    }
+}
+
+/// The one staleness policy, applied to a single instance's own reading.
+///
+/// Shared by [`classify_scanner`] and the per-instance fold in
+/// [`ScannerLiveness::snapshot_as_of`], so a folded status and the public
+/// classifier can never disagree about the same numbers.
+fn classify_reading(age: Duration, poll_interval: Duration) -> ScannerLivenessVerdict {
+    let threshold = staleness_threshold(poll_interval);
+    if age >= threshold.saturating_mul(2) {
+        ScannerLivenessVerdict::Wedged
+    } else if age >= threshold {
+        ScannerLivenessVerdict::Stale
+    } else {
+        ScannerLivenessVerdict::Healthy
+    }
+}
+
 /// A point-in-time liveness reading for one scanner.
 ///
 /// `age` is resolved from a **monotonic** clock at snapshot time (immune to
@@ -199,14 +228,7 @@ pub struct ScannerStatus {
 /// registry.
 #[must_use]
 pub fn classify_scanner(status: &ScannerStatus) -> ScannerLivenessVerdict {
-    let threshold = staleness_threshold(status.poll_interval);
-    if status.age >= threshold.saturating_mul(2) {
-        ScannerLivenessVerdict::Wedged
-    } else if status.age >= threshold {
-        ScannerLivenessVerdict::Stale
-    } else {
-        ScannerLivenessVerdict::Healthy
-    }
+    classify_reading(status.age, status.poll_interval)
 }
 
 /// Opaque identity of one *registered loop instance*.
@@ -420,16 +442,29 @@ impl ScannerLiveness {
     /// Readings for every registered scanner, ordered by [`Scanner`].
     ///
     /// One reading per scanner, folded across its live instances so the
-    /// existing single-status-per-scanner health-check payload is unchanged:
+    /// existing single-status-per-scanner health-check payload is unchanged.
     ///
-    /// - `age` comes from the **worst** (oldest-referenced) instance, so one
-    ///   wedged shard is reported even while its peers tick happily;
-    /// - `poll_interval` is the **most lenient** across instances, so the
-    ///   slowest poller is never falsely called stale;
-    /// - `tick_count` is the **sum**, matching the counter metric.
+    /// The fold classifies **each instance against its own registered poll
+    /// interval** and then keeps the instance with the **worst verdict** —
+    /// rather than folding `age` and `poll_interval` independently and
+    /// classifying once. That distinction is load-bearing: two `Worker`s (or
+    /// two `RetentionRuntime`s) in one process may register the same
+    /// [`Scanner`] with *different* intervals, and taking `age` from the worst
+    /// instance while taking `poll_interval` from the most lenient one would
+    /// judge the wedged instance against a threshold it never agreed to — a
+    /// 30 s loop silent for 200 s would read `Healthy` next to an hourly
+    /// sibling. Every field below therefore describes **one** instance, so
+    /// `classify_scanner(&status)` reproduces the folded verdict exactly.
     ///
-    /// `last_tick_at` and `has_ticked` describe the same worst instance the
-    /// `age` came from — the one an operator needs to look at.
+    /// - `poll_interval`, `age`, `last_tick_at`, `has_ticked` — the worst
+    ///   instance's own values, which is the configuration an operator needs
+    ///   to look at;
+    /// - `tick_count` — the **sum** across instances, matching the counter
+    ///   metric (which likewise carries no per-instance label).
+    ///
+    /// Ties are broken by how far past its *own* threshold an instance has
+    /// drifted, then by raw age, so the reported instance is the most
+    /// meaningfully-worst rather than merely the oldest.
     #[must_use]
     pub fn snapshot(&self) -> Vec<ScannerStatus> {
         self.snapshot_as_of(Instant::now())
@@ -443,19 +478,25 @@ impl ScannerLiveness {
         self.read()
             .iter()
             .filter_map(|(scanner, owners)| {
-                let worst = owners.values().min_by_key(|state| state.reference())?;
+                let tick_count = owners
+                    .values()
+                    .fold(0_u64, |acc, state| acc.saturating_add(state.tick_count));
+                let (worst, age) = owners
+                    .values()
+                    .map(|state| (state, now.saturating_duration_since(state.reference())))
+                    .max_by_key(|(state, age)| {
+                        (
+                            classify_reading(*age, state.poll_interval).rank(),
+                            age.saturating_sub(staleness_threshold(state.poll_interval)),
+                            *age,
+                        )
+                    })?;
                 Some(ScannerStatus {
                     scanner: *scanner,
-                    poll_interval: owners
-                        .values()
-                        .map(|state| state.poll_interval)
-                        .max()
-                        .unwrap_or_default(),
-                    tick_count: owners
-                        .values()
-                        .fold(0_u64, |acc, state| acc.saturating_add(state.tick_count)),
+                    poll_interval: worst.poll_interval,
+                    tick_count,
                     last_tick_at: worst.last_tick_at,
-                    age: now.saturating_duration_since(worst.reference()),
+                    age,
                     has_ticked: worst.last_tick.is_some(),
                 })
             })

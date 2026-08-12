@@ -374,21 +374,95 @@ fn a_clean_restart_regrants_grace_without_losing_tick_history() {
 }
 
 #[test]
-fn the_threshold_widens_to_the_most_lenient_instance_interval() {
+fn a_slow_healthy_poller_is_not_falsely_stale_next_to_a_fast_sibling() {
     // Two workers in one process may poll the same scanner class at different
-    // cadences. Taking the MAX interval keeps the slower one from being
-    // falsely reported stale.
+    // cadences. The slow one must be judged against ITS OWN threshold: 100s of
+    // silence is stale for a 1s poller but perfectly healthy for a 300s one.
     let liveness = ScannerLiveness::new();
     let t0 = std::time::Instant::now();
-    let _fast = liveness.register_at(Scanner::Timeout, Duration::from_secs(1), t0);
-    let _slow = liveness.register_at(Scanner::Timeout, Duration::from_secs(300), t0);
+    let fast = liveness.register_at(Scanner::Timeout, Duration::from_secs(1), t0);
+    let slow = liveness.register_at(Scanner::Timeout, Duration::from_secs(300), t0);
+    liveness.tick_at(slow, t0);
+    // The fast poller is up to date; only the slow one carries any age.
+    liveness.tick_at(fast, t0 + Duration::from_secs(100));
 
-    let status = &liveness.snapshot_as_of(t0)[0];
-    assert_eq!(status.poll_interval, Duration::from_secs(300));
+    let status = &liveness.snapshot_as_of(t0 + Duration::from_secs(100))[0];
     assert_eq!(
-        staleness_threshold(status.poll_interval),
-        Duration::from_secs(600)
+        classify_scanner(status),
+        ScannerLivenessVerdict::Healthy,
+        "a 300s poller silent for 100s is well inside its own 600s threshold"
     );
+}
+
+/// A wedged instance must be judged against **its own** poll interval, never a
+/// lenient sibling's.
+///
+/// The fold reports one `ScannerStatus` per `Scanner`, but the verdict inputs
+/// (`age` and `poll_interval`) must come from the **same** instance. Sourcing
+/// `age` from the worst instance while sourcing `poll_interval` from the most
+/// lenient one silently launders a genuine outage: a 30s loop silent for 200s
+/// is `Wedged` by its own configuration, yet reads `Healthy` when measured
+/// against an hourly sibling's 7200s threshold — and `scanner_liveness`
+/// reports `pass` on a dead loop, the exact failure this feature exists to
+/// catch.
+#[test]
+fn a_wedged_instance_is_not_laundered_by_a_lenient_siblings_interval() {
+    let liveness = ScannerLiveness::new();
+    let t0 = std::time::Instant::now();
+    // A: 30s cadence => 60s threshold => wedged at >= 120s. Silent for 200s.
+    let wedged = liveness.register_at(Scanner::Timeout, Duration::from_secs(30), t0);
+    liveness.tick_at(wedged, t0);
+    // B: hourly cadence => 7200s threshold. Ticking normally.
+    let lenient = liveness.register_at(Scanner::Timeout, Duration::from_secs(60 * 60), t0);
+
+    let now = t0 + Duration::from_secs(200);
+    liveness.tick_at(lenient, now);
+
+    let status = &liveness.snapshot_as_of(now)[0];
+    assert_eq!(
+        classify_scanner(status),
+        ScannerLivenessVerdict::Wedged,
+        "the 30s instance is 200s silent — past 2x its own 60s threshold — so \
+         the fold must not measure it against the hourly sibling's threshold"
+    );
+    assert_eq!(
+        status.poll_interval,
+        Duration::from_secs(30),
+        "the reported interval must be the worst instance's own, so an \
+         operator sees the configuration that was actually violated"
+    );
+    assert_eq!(status.age, Duration::from_secs(200));
+}
+
+/// Every folded `ScannerStatus` must be internally consistent: re-classifying
+/// it reproduces the worst per-instance verdict. This is what lets the
+/// preflight check call `classify_scanner` on the folded status and trust the
+/// answer.
+#[test]
+fn a_folded_status_reclassifies_to_the_worst_per_instance_verdict() {
+    let liveness = ScannerLiveness::new();
+    let t0 = std::time::Instant::now();
+
+    // Healthy (1s cadence, just ticked), Stale (30s => 60s threshold, 90s
+    // silent), Wedged (30s => 60s threshold, 200s silent).
+    let healthy = liveness.register_at(Scanner::Timeout, Duration::from_secs(1), t0);
+    let stale = liveness.register_at(Scanner::Timeout, Duration::from_secs(30), t0);
+    let wedged = liveness.register_at(Scanner::Timeout, Duration::from_secs(30), t0);
+    let now = t0 + Duration::from_secs(200);
+    liveness.tick_at(healthy, now);
+    liveness.tick_at(stale, t0 + Duration::from_secs(110));
+    liveness.tick_at(wedged, t0);
+
+    let status = &liveness.snapshot_as_of(now)[0];
+    assert_eq!(classify_scanner(status), ScannerLivenessVerdict::Wedged);
+    assert_eq!(
+        status.tick_count, 3,
+        "tick_count still sums across every instance, matching the counter"
+    );
+    // Self-consistency: the reported (age, poll_interval) pair belongs to one
+    // real instance, so the classifier's inputs are never mixed.
+    assert_eq!(status.age, Duration::from_secs(200));
+    assert_eq!(status.poll_interval, Duration::from_secs(30));
 }
 
 #[test]
