@@ -1535,6 +1535,39 @@ coordinates, so a run traces back to the exact message.
   merge commit precisely because neither compiles test targets — the
   documented "trunk adds a required field, a branch test literal breaks" class.
 
+- **Scoped the `BrokerCoordinates` dedupe promise to a single shard, honestly**
+  (Codex P1, `dispatch.rs:71`). The rustdoc promised dedupe *"independent of
+  whatever `workflow_id` the mapping function chose"* — unqualified. That is
+  true on a single-shard deployment (the default) and false on a multi-shard
+  one, by a mechanical chain: dispatch always passes an **explicit**
+  `workflow_id`; issue #808 routes a keyed start by the idempotency key **only
+  when `workflow_id` was omitted**, so an explicit id picks the shard; and
+  `harvest_start_idempotency` claims are per-shard. A redelivery whose mapper
+  produces a *different* id therefore routes elsewhere, misses the claim, and
+  double-starts — exactly the case `BrokerCoordinates` exists to prevent. The
+  integration test asserting the promise
+  (`broker_coordinate_dedupe_survives_a_mapper_whose_workflow_id_drifts`) is
+  single-shard, which is why it passes. Fixed by narrowing the documented scope
+  rather than the mechanism: the rustdoc and a new
+  ["The dedupe guarantee is shard-local"](../getting-started/13-broker-connectors.md)
+  docs section state the exact boundary and the (cheap, already-recommended)
+  remedy — a deterministic mapper id — and `ConnectorRuntime::run` now logs a
+  warning at startup naming the binding and the shard count when it detects the
+  combination, so an operator cannot reach it silently. Pinned by
+  `known_limitation_coordinate_dedupe_scope_is_shard_local` over the new pure
+  `coordinate_dedupe_is_shard_local_only`, which also pins that `WorkflowId`
+  mode is *not* warned about (it never made the stronger promise, so a warning
+  there would be pure noise). This is the same shard-local scope every sibling
+  dedupe primitive carries (#808, #521, #247, #607, #691) — cross-shard
+  coordination is out of scope engine-wide, and the connector deliberately does
+  not attempt it: probing every shard would put a fan-out on the dispatch hot
+  path, and unilaterally pinning the start to a key-derived shard would trip
+  the #697 "be consistent — always pin or never pin" duplicate-`workflow_id`
+  hazard against every other producer of the same id. **A warning, not a
+  refusal**: a deterministic mapper is both the common case and perfectly safe,
+  so failing closed would break working deployments to guard against a mapper
+  bug.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

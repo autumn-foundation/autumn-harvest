@@ -435,6 +435,58 @@ because the window is the wrong remedy here — size retention (globally or via 
 per-workflow-type override) to at least your broker's replay horizon, or accept
 the bound knowingly.
 
+### The dedupe guarantee is shard-local
+
+Coordinate dedupe holds **unconditionally on a single-shard deployment** — the
+default, and what most deployments are. On a [multi-shard](../sharding.md)
+deployment it narrows to *"holds while the mapping function's `workflow_id` is
+deterministic"*, for a mechanical reason worth understanding:
+
+* The connector always dispatches with the `workflow_id` your mapper returned.
+* [Issue #808](06-idempotency.md) routes a keyed start by the **idempotency
+  key** only when `workflow_id` was *omitted*; with an explicit id it routes by
+  the **id**, so the id picks the shard.
+* `harvest_start_idempotency` claims are **per-shard**.
+
+So if a redelivery of the same message maps to a *different* `workflow_id` —
+because the mapping function is non-deterministic, or because its id derivation
+changed between deployments while the broker still holds the old message — the
+redelivery routes to a different shard, cannot see the claim the first delivery
+wrote, and starts a **second execution**. On a single shard there is nowhere
+else to route, so the claim is always found and the promise holds regardless of
+what the mapper did.
+
+This is the same shard-local scope every sibling dedupe primitive in the engine
+carries — start idempotency (#808), signal idempotency (#521), per-key
+concurrency (#247), the start throttle (#607), the durable mutex (#691). Cross-
+shard coordination is out of scope engine-wide, so the connector does not
+attempt it either: probing every shard on the dispatch hot path would fan a
+query out per message, and unilaterally pinning the start to a key-derived
+shard would trip the ["be consistent — always pin or never pin"](../sharding.md)
+hazard against every *other* producer that starts the same `workflow_id`.
+
+The remedy is the one the `WorkflowId` mode already documents, and it is cheap:
+**make the mapping function's `workflow_id` a deterministic function of the
+message**. Derive it from a business key in the payload or from the broker
+coordinate itself — never from a clock, a counter, or a random value:
+
+```rust
+// Deterministic: the same message always maps to the same id, on any replica,
+// in any deployment, across a redeploy.
+fn map_order(ctx: &MessageCtx, body: Order) -> Result<MappedMessage, MappingError> {
+    Ok(MappedMessage {
+        workflow_id: WorkflowId::new(format!("order-{}", body.order_id)),
+        payload: serde_json::to_value(body).map_err(|e| MappingError::Deserialize(e.to_string()))?,
+    })
+}
+```
+
+Harvest logs a warning at startup for every coordinate-dedupe binding when it
+detects more than one readable shard, naming the binding and the shard count,
+so you cannot land in this combination without being told. It is a warning
+rather than a refusal because a deterministic mapper is both the common case
+and perfectly safe here.
+
 ### Cutting a binding over to a new cluster or a recreated topic
 
 Broker coordinates are unique only within one **incarnation** of the stream

@@ -153,8 +153,24 @@ impl ConnectorTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdempotencyMode {
     /// Pass the derived broker-coordinate key as the start's idempotency key
-    /// (issue #808). Strongest: dedupe is independent of whatever
-    /// `workflow_id` the mapping function chose.
+    /// (issue #808). The stronger of the two: the key is derived from stable
+    /// broker coordinates rather than from whatever the mapping function
+    /// computed.
+    ///
+    /// **Scope: shard-local.** The claim this writes
+    /// (`harvest_start_idempotency`) is per-shard, and the connector always
+    /// dispatches with an explicit `workflow_id`, which issue #808 routes by
+    /// (a keyed start routes by the *key* only when `workflow_id` was
+    /// omitted). So on a **single-shard deployment — the default — dedupe is
+    /// fully independent of the mapper's id**, but on a **multi-shard**
+    /// deployment a redelivery whose mapper produces a *different*
+    /// `workflow_id` routes to a different shard, cannot see the original
+    /// claim, and starts a second execution. Keep the mapping function's id
+    /// deterministic on a multi-shard deployment; the connector logs a warning
+    /// at startup when it detects that combination. This is the same
+    /// shard-local scope every sibling dedupe primitive carries (#808 start
+    /// idempotency, #521 signal idempotency, #247 concurrency, #607 throttle,
+    /// #691 mutex) — cross-shard coordination is out of scope engine-wide.
     ///
     /// **Mutually exclusive** with a target carrying a throttle, debounce or
     /// batch policy — the start route rejects that combination with `400`,
@@ -166,6 +182,25 @@ pub enum IdempotencyMode {
     /// mapping function deriving a stable id — but it composes with
     /// throttle/debounce/batch admission.
     WorkflowId,
+}
+
+/// Whether this binding's dedupe promise is narrowed on this deployment.
+///
+/// [`IdempotencyMode::BrokerCoordinates`] advertises dedupe independent of the
+/// mapper's `workflow_id`. That holds unconditionally on a single-shard
+/// deployment, but the claim it writes is shard-local while the dispatch is
+/// routed by the explicit `workflow_id` (issue #808), so on a multi-shard
+/// deployment the promise degrades to "holds while the mapper's id is stable"
+/// — i.e. to what [`IdempotencyMode::WorkflowId`] already documents.
+///
+/// `true` means the operator should be told; the runtime logs it once at
+/// startup rather than failing, because a stable mapper (the overwhelmingly
+/// common case, and what every example ships) is perfectly safe.
+pub(crate) const fn coordinate_dedupe_is_shard_local_only(
+    mode: IdempotencyMode,
+    readable_shards: usize,
+) -> bool {
+    matches!(mode, IdempotencyMode::BrokerCoordinates) && readable_shards > 1
 }
 
 /// One declarative topic/queue → workflow binding.
@@ -914,6 +949,40 @@ mod tests {
         assert_eq!(
             resolve_idempotency_mode(target, Some(IdempotencyMode::WorkflowId), Some(&wf("wf"))),
             IdempotencyMode::WorkflowId,
+        );
+    }
+
+    #[test]
+    fn known_limitation_coordinate_dedupe_scope_is_shard_local() {
+        // Issue #944 / Codex P1. `BrokerCoordinates` derives the dedupe key
+        // from stable broker coordinates, but the CLAIM it writes
+        // (`harvest_start_idempotency`) is shard-local, and the connector
+        // always dispatches with an explicit `workflow_id`, so issue #808
+        // routes the start by `workflow_id` rather than by the key. On a
+        // MULTI-SHARD deployment a mapper whose id drifts therefore lands the
+        // redelivery on a different shard, where the original claim is not
+        // visible -- so it starts a second execution.
+        //
+        // This pins the honest scope: the dedupe promise holds
+        // unconditionally on a single-shard deployment (the default), and on a
+        // multi-shard one only while the mapper's id is stable. It is the same
+        // shard-local scope every sibling dedupe primitive carries (#808 start
+        // idempotency, #521 signal idempotency, #247 concurrency, #607
+        // throttle, #691 mutex).
+        assert!(
+            !coordinate_dedupe_is_shard_local_only(IdempotencyMode::BrokerCoordinates, 1),
+            "a single-shard deployment (the default) carries the full promise",
+        );
+        assert!(
+            coordinate_dedupe_is_shard_local_only(IdempotencyMode::BrokerCoordinates, 4),
+            "a multi-shard deployment narrows the promise to a stable mapper id",
+        );
+        // `WorkflowId` mode never made the stronger promise, so a multi-shard
+        // deployment does not narrow anything for it -- warning there would be
+        // pure noise.
+        assert!(
+            !coordinate_dedupe_is_shard_local_only(IdempotencyMode::WorkflowId, 4),
+            "WorkflowId mode already documents that it relies on a stable id",
         );
     }
 

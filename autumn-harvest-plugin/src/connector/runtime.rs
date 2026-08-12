@@ -437,6 +437,41 @@ impl ConnectorRuntime {
         self.idempotency_mode
     }
 
+    /// Tell the operator, once at startup, when this deployment narrows the
+    /// `BrokerCoordinates` dedupe promise.
+    ///
+    /// The claim `BrokerCoordinates` writes is shard-local while the dispatch
+    /// is routed by the explicit `workflow_id` (issue #808), so on a
+    /// multi-shard deployment a mapper whose id drifts across a redelivery
+    /// lands on a different shard and double-starts. A warning rather than a
+    /// hard failure: a deterministic mapper — the common case, and what every
+    /// example ships — is perfectly safe, so refusing to start would break
+    /// working deployments to guard against a mapper bug.
+    ///
+    /// Silent when the runtime is not installed yet: this is advisory, and the
+    /// dispatch path already fails loudly on its own if storage is missing.
+    fn warn_if_coordinate_dedupe_is_shard_local_only(&self) {
+        let Ok(runtime) = self.api_state.runtime() else {
+            return;
+        };
+        let shards = runtime.router().readable_shards().len();
+        if !super::binding::coordinate_dedupe_is_shard_local_only(self.idempotency_mode, shards) {
+            return;
+        }
+        tracing::warn!(
+            source = self.binding.name,
+            stream = %self.binding.stream,
+            workflow = self.binding.target.workflow(),
+            readable_shards = shards,
+            "connector binding dedupes on broker coordinates, but this deployment has more than \
+             one shard: the start-idempotency claim is shard-local and the dispatch routes by the \
+             mapped workflow_id, so a redelivery whose mapping function produces a DIFFERENT \
+             workflow_id would route to another shard, miss the claim, and start a second \
+             execution. Make the mapping function's workflow_id deterministic for a given message \
+             (the usual case), or run this binding on a single-shard deployment"
+        );
+    }
+
     /// Consume until `cancel` fires or the source closes.
     pub async fn run(&self, cancel: CancellationToken) {
         let source_name = self.binding.name;
@@ -463,6 +498,7 @@ impl ConnectorRuntime {
             max_in_flight = self.binding.max_in_flight,
             "harvest connector started"
         );
+        self.warn_if_coordinate_dedupe_is_shard_local_only();
 
         loop {
             if cancel.is_cancelled() {
