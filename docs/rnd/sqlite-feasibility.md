@@ -49,13 +49,14 @@ was built.**
 
 ## Coupling mechanisms
 
-Seven distinct Postgres-coupled mechanisms appear in core. The counts are
+Eight distinct Postgres-coupled mechanisms appear in core. The counts are
 module counts at the audited revision, recomputed by CI:
 
 | Mechanism | Reach | Portable? |
 |---|---|---|
 | `diesel` query layer | 42 modules | Query construction is mechanical; the *type* layer is not. |
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 13 modules | Only by dropping multi-worker concurrency. |
+| `row-lock` blocking row lock (Diesel `.for_update()`) | 15 modules | Subsumed by the single write lock. |
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 8 modules | Yes — integer epoch milliseconds. |
 | `advisory-lock` (`pg_advisory_xact_lock`) | 7 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 6 modules | Yes — `sqlite_master` lookup. |
@@ -107,53 +108,67 @@ Classification rule:
 | `batch` | diesel | (a) | Plain CRUD. |
 | `build_routing` | diesel, interval-sql | (b) | Integer epoch ms for the interval arithmetic. |
 | `calendar` | diesel | (a) | Plain CRUD. |
-| `completion_callback` | diesel, skip-locked, to_regclass | (c) | Two-transaction claim scanner; multi-worker delivery dropped. |
+| `completion_callback` | diesel, skip-locked, row-lock, to_regclass | (c) | Two-transaction claim scanner; multi-worker delivery dropped. |
 | `completion_trigger` | diesel, skip-locked, advisory-lock | (c) | Terminal-commit fan-out; claim semantics dropped. |
 | `concurrency` | skip-locked | (c) | **Consumer of the claim invariant, issues no SQL.** Per-key fleet limits are meaningless single-writer. |
 | `context` | diesel, listen/notify | (c) | Wakeup path; no push primitive exists. |
 | `debounce` | diesel, skip-locked, to_regclass | (c) | Scanner claim; `sqlite_master` probe for the table check. |
-| `dlq` | diesel | (a) | Plain CRUD. |
-| `erase` | diesel | (a) | In-place field scrub. |
+| `dlq` | diesel, row-lock | (b) | Row lock on replay/redrive; subsumed by the single write lock. |
+| `erase` | diesel, row-lock | (b) | Scrub holds a row lock; subsumed by the single write lock. |
 | `error` | diesel | (a) | `From<diesel::result::Error>` only — swap the error type. |
 | `event_batch` | diesel, skip-locked, to_regclass | (c) | Scanner claim. |
-| `execution` | diesel, skip-locked, interval-sql | (c) | Start/reuse matrix under `FOR UPDATE`; row-lock ordering is load-bearing. |
-| `external_task` | diesel | (a) | Token-addressed CRUD. |
+| `execution` | diesel, skip-locked, row-lock, interval-sql | (c) | Start/reuse matrix under `FOR UPDATE`; row-lock ordering is load-bearing. |
+| `external_task` | diesel, row-lock | (b) | `find_by_token_locked` serialises completion/failure; subsumed. |
 | `handle` | diesel | (a) | Read paths. |
 | `heartbeat` | diesel | (a) | Batched last-write-wins update. |
 | `lib` | diesel | (a) | `embed_migrations!()` only. |
 | `models` | diesel | (c) | Postgres type layer (`Jsonb`/`Timestamptz`/`Interval`/`Uuid`); reimplemented wholesale. |
 | `mutex` | diesel, advisory-lock, to_regclass, interval-sql | (b) | Advisory lock subsumed by the write lock; lease TTL as epoch ms. |
 | `notify` | diesel, listen/notify | (c) | **The one mechanism with no SQLite equivalent at all.** Polling replaces it. |
-| `poison_pill` | diesel, skip-locked, interval-sql | (c) | Crash reclaim keyed on *peer* worker liveness — no peers single-writer. |
-| `queue` | diesel, skip-locked, listen/notify, interval-sql | (c) | The claim path itself. Reimplemented on `BEGIN IMMEDIATE`. |
+| `poison_pill` | diesel, skip-locked, row-lock, interval-sql | (c) | Crash reclaim keyed on *peer* worker liveness — no peers single-writer. |
+| `queue` | diesel, skip-locked, row-lock, listen/notify, interval-sql | (c) | The claim path itself. Reimplemented on `BEGIN IMMEDIATE`. |
 | `queue_pause` | diesel, skip-locked, advisory-lock | (c) | Claim-time gate. |
-| `reset` | diesel | (a) | Fork bookkeeping. |
-| `retention` | diesel, skip-locked | (c) | Batched delete scanner with claim. |
+| `reset` | diesel, row-lock | (b) | Fork takes a row lock before appending; subsumed. |
+| `retention` | diesel, skip-locked, row-lock | (c) | Batched delete scanner with claim. |
 | `schedule_decision` | diesel | (a) | Append-only decision log. |
-| `scheduler` | diesel, interval-sql | (b) | Cron/interval arithmetic as epoch ms. |
+| `scheduler` | diesel, row-lock, interval-sql | (b) | Cron/interval arithmetic as epoch ms. |
 | `schema` | diesel | (c) | Diesel `table!` definitions; reimplemented wholesale. |
-| `sessions` | diesel, interval-sql | (b) | Lease expiry as epoch ms. |
-| `signal` | diesel | (a) | Insert + dedupe index. |
+| `sessions` | diesel, row-lock, interval-sql | (b) | Lease expiry as epoch ms. |
+| `signal` | diesel, row-lock | (b) | Insert under a row lock; subsumed by the single write lock. |
 | `start_idempotency` | diesel, to_regclass, interval-sql | (b) | `ON CONFLICT` upsert has a direct SQLite form. |
-| `store` | diesel, skip-locked | (c) | **Consumer of the claim invariant, issues no SQL.** Event append itself is (a); its TOCTOU assumption is not. |
+| `store` | diesel, skip-locked, row-lock | (c) | **Consumer of the claim invariant — issues no `SKIP LOCKED` SQL of its own.** Event append itself is (a); its TOCTOU assumption is not. |
 | `testing` | diesel | (a) | Test-only helpers. |
 | `throttle` | diesel, skip-locked, to_regclass, gen_random_uuid | (c) | Token-bucket scanner claim. |
-| `timeout` | diesel, skip-locked, advisory-lock | (c) | The scanner family; lock ordering vs the claim path is load-bearing. |
+| `timeout` | diesel, skip-locked, row-lock, advisory-lock | (c) | The scanner family; lock ordering vs the claim path is load-bearing. |
 | `usage` | diesel | (a) | Aggregate reads. |
 | `version_gate_retirement` | diesel | (a) | Marker scan. |
 | `version_usage` | diesel | (a) | Marker scan. |
 | `wasm_store` | diesel, advisory-lock | (b) | Content-hash upsert; advisory lock subsumed. |
-| `worker` | diesel, listen/notify, advisory-lock | (c) | The dispatch loop; wakeups and persistence are interleaved. |
+| `worker` | diesel, listen/notify, advisory-lock, row-lock | (c) | The dispatch loop; wakeups and persistence are interleaved. |
 | `workers` | diesel | (a) | Fleet registry rows. |
 
-**Totals: (a) 18 · (b) 7 · (c) 18.**
+**Totals: (a) 13 · (b) 12 · (c) 18.**
 
-The shape matters more than the totals. The (a) column is broad but shallow —
-mechanical CRUD. The (c) column is narrow but load-bearing: it contains the
-claim path, the wakeup path, the scanner family, the start/reuse matrix, and
-the type layer. **Those are precisely the modules a `StorageBackend` trait
-would have to abstract, and precisely the ones whose semantics do not survive
-abstraction.**
+The shape matters more than the totals. The (a) column is genuinely
+mechanical CRUD. The (b) column is dominated by **pessimistic row locking**:
+15 modules take a blocking `.for_update()` lock, and every one of them is
+portable only because the single-writer model subsumes the lock — the same
+argument that carries the advisory locks. The (c) column is narrow but
+load-bearing: it contains the claim path, the wakeup path, the scanner family,
+the start/reuse matrix, and the type layer. **Those are precisely the modules a
+`StorageBackend` trait would have to abstract, and precisely the ones whose
+semantics do not survive abstraction.**
+
+Row locking deserves its own line because it is the mechanism most likely to
+be mistaken for plain CRUD. A first cut of this inventory classified `dlq`,
+`erase`, `external_task`, `reset` and `signal` as (a) — they *look* like
+straightforward inserts and updates, and their Diesel coupling is
+unremarkable. All five in fact hold a `SELECT … FOR UPDATE` row lock to
+serialise concurrent writers (`external_task::find_by_token_locked` is the
+clearest case: it exists solely to serialise completion against failure).
+Under a single writer that lock is free; under any multi-writer substitute it
+is load-bearing. Misreading it as CRUD is exactly the error that would make a
+port look cheaper than it is.
 
 ---
 
@@ -175,15 +190,17 @@ A trait that genuinely allowed a second backend would need, at minimum:
    claimers hold". SKIP LOCKED is that contract. Single-writer SQLite satisfies
    it vacuously. There is no shared contract that is meaningfully testable
    against both.
-3. **The scanner family** — timeout, retention, poison-pill, debounce,
-   throttle, completion-callback, event-batch. Each is a claim-batch-mutate
-   loop; each currently relies on `FOR UPDATE SKIP LOCKED` for its concurrency
-   safety. ~13 modules.
+3. **The scanner family** — `timeout`, `retention`, `poison_pill`, `debounce`,
+   `throttle`, `completion_callback`, `event_batch`: seven claim-batch-mutate
+   loops, each relying on `FOR UPDATE SKIP LOCKED` for its concurrency safety.
+   (Those seven are part of the 13 `skip-locked` modules in the table above;
+   the rest are `queue`/`queue_pause`/`execution`/`completion_trigger` plus the
+   two comment-only consumers below.)
 4. **Coordination primitives** — advisory locks with a *defined lock ordering*
    (documented in `timeout.rs` and the mutex work) and the notification
    channel.
-5. **The type layer** — `models.rs`/`schema.rs`, ~185 combined KB of Diesel
-   definitions bound to Postgres column types.
+5. **The type layer** — `models.rs`/`schema.rs`, ~2 500 combined lines (~100 KB)
+   of Diesel definitions bound to Postgres column types.
 6. **Migrations** — 83, in Postgres DDL.
 
 ### Why the seam is the wrong shape
@@ -256,13 +273,30 @@ byte-unaffected. This is asserted by
 ## Test-suite portability
 
 **No-DB suite: 100% passes, unchanged.** At the audited revision the core no-DB
-set is 1849 lib tests plus 1176 integration tests, green with
+set is 1849 lib tests plus 1188 integration tests, green with
 `--no-default-features`. The SQLite work required no change to any of them —
 which is the strongest single piece of evidence that the determinism core was
 already backend-neutral.
 
-**SQLite crate: 163 tests green** (43 unit + 119 integration + 1 doc), no
+**SQLite crate: 164 tests green** (43 unit + 120 integration + 1 doc), no
 Docker required (`rusqlite` `bundled`).
+
+### The four durability scenarios, and the tests that prove them
+
+Deliverable 2 named four scenarios. Each maps to a named test in
+`autumn-harvest-sqlite/tests/integration/durability.rs`, so the "4/4" claim in
+the decision summary is checkable rather than asserted:
+
+| Scenario (as worded in the issue) | Test |
+|---|---|
+| One workflow with two activities and a retry | `two_activities_with_retry` (plus `activity_retry_then_success` for the single-activity retry) |
+| One durable timer firing across a process restart | `timer_fires_across_restart` |
+| One signal delivery | `signal_delivery_unblocks_workflow` |
+| Deterministic replay after a simulated crash | `deterministic_replay_after_crash_does_not_reexecute_activity` |
+
+`orphaned_running_task_is_reclaimed_and_body_reruns` covers the fifth case the
+prototype surfaced but the issue did not ask for: a crash *mid-activity*, where
+the at-least-once boundary is visible.
 
 Of the Postgres-gated suites, portability splits three ways:
 
@@ -400,11 +434,27 @@ moment the direction was green-lit. For the next R&D spike, the written
 deliverable should gate the productization issue, not trail it.
 
 **Method.** The inventory was produced by grepping `autumn-harvest/src/*.rs`
-for seven precise mechanism tokens, then classified by hand. The detector is
-deliberately narrow: a bare `INTERVAL` matches Rust constants such as
-`DEFAULT_WORKER_POLL_INTERVAL`, and a bare `diesel` matches the guardrail
-lint's own prose listing forbidden crates. Four modules
-(`effective_config`, `guardrail`, `history_export`, `wasm_activities`) matched
-the loose detector and are correctly excluded by the precise one. The exact
-tokens live in `MECHANISMS` in the guard test and are the executable
-definition of "Postgres-coupled" for this audit.
+for eight precise mechanism tokens, then classified by hand. The detector is
+deliberately narrow, because an inventory padded with false positives would
+discredit the report as badly as one with holes:
+
+- A bare `INTERVAL` matches Rust constants such as
+  `DEFAULT_WORKER_POLL_INTERVAL`; a bare `diesel` matches the guardrail lint's
+  own prose listing forbidden crates. Four modules (`effective_config`,
+  `guardrail`, `history_export`, `wasm_activities`) match the loose detector
+  and are correctly excluded by the precise one.
+- Row locking is detected through the Diesel DSL (`.for_update()`) rather than
+  the raw `FOR UPDATE` text. Matching the text would flag `mutex` twice — once
+  for a doc comment reading "No `FOR UPDATE`" and once for a unit test
+  asserting `!expr.contains("FOR UPDATE")` — i.e. it would report a module as
+  coupled *because it documents that it is not*. The DSL set is also a
+  superset of the modules issuing genuine raw-SQL row locks (`queue` and
+  `timeout`, both of which also use the DSL), and it sidesteps
+  `FOR UPDATE OF t SKIP LOCKED`, which a naive "`FOR UPDATE` not followed by
+  `SKIP LOCKED`" rule misreads as a blocking lock.
+
+The exact tokens live in `MECHANISMS` in the guard test and are the executable
+definition of "Postgres-coupled" for this audit. The row-lock mechanism was
+added after review; it is the reason five modules moved from (a) to (b), and
+a worked example of why the guard re-derives the inventory from source instead
+of trusting the prose.

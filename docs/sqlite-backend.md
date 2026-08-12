@@ -11,6 +11,10 @@ runtime from an empty project to a crash-recoverable, signal-driven workflow. Th
 canonical API/contract reference is the crate-level rustdoc
 (`cargo doc --open -p autumn-harvest-sqlite`); this guide shows how to use it.
 
+For *why* this is a separate crate rather than a `StorageBackend` trait in core
+— and which capabilities the single-writer model deliberately gives up — see the
+R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md).
+
 ## Contents
 
 1. [What it is, and when to reach for it](#1-what-it-is-and-when-to-reach-for-it)
