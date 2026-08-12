@@ -49,7 +49,7 @@ was built.**
 
 ## Coupling mechanisms
 
-Nine distinct Postgres-coupled mechanisms appear in core. The counts are
+Ten distinct Postgres-coupled mechanisms appear in core. The counts are
 module counts at the audited revision, recomputed by CI:
 
 | Mechanism | Reach | Portable? |
@@ -58,7 +58,8 @@ module counts at the audited revision, recomputed by CI:
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 13 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 15 modules | Subsumed by the single write lock. |
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 8 modules | Yes — integer epoch milliseconds. |
-| `raw-pg-sql` — Postgres-only SQL Diesel does not abstract (JSONB `#>>`, `::TYPE` casts, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 6 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
+| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 26 modules | Case by case — the SQL must be read, not inferred from the ORM. |
+| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 8 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
 | `advisory-lock` (`pg_advisory_xact_lock`) | 7 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 6 modules | Yes — `sqlite_master` lookup. |
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
@@ -73,6 +74,29 @@ its own schema.
 half. That ratio is the headline finding, and it cuts *both* ways: the
 determinism core really is clean, and the persistence layer really is
 saturated.
+
+### Two of these rows are different in kind — read them differently
+
+`raw-sql` is a **closed** rule and `raw-pg-sql` is an **open** one, and the
+distinction matters more than either count.
+
+`raw-pg-sql` enumerates Postgres-only syntax. An enumeration cannot be
+complete: three review rounds of this document each found another construct the
+list had missed — first the blocking row lock, then JSONB `#>>`/`LATERAL`/`~`,
+then JSONB `@>`/`||` and `NOW()`. Each miss silently understated the port,
+always in the same direction. **Treat that count as a lower bound.**
+
+`raw-sql` instead detects the *escape hatch* — any module reaching for
+`sql::<…>` or `sql_query`. It cannot miss a construct, because it does not
+enumerate constructs. It is a weaker claim (raw SQL may be portable ANSI), so
+it is not evidence of coupling by itself. What it does establish is that such a
+module's portability **cannot be read off its Diesel usage** — which is exactly
+what class (a) asserts. CI enforces the consequence: a module using raw SQL may
+never be classified (a).
+
+That 26 of the 43 coupled modules hand-write SQL is the more decision-relevant
+number than any dialect tally. It is the volume of query text a second backend
+must re-author by hand, and it is knowable exactly.
 
 ### The finding a SQL-only grep would have missed
 
@@ -104,51 +128,51 @@ Classification rule:
 
 | Module | Coupling | Class | Substitute on SQLite / note |
 |---|---|---|---|
-| `admission_gate` | diesel, advisory-lock | (b) | Advisory lock subsumed by the single write lock. |
+| `admission_gate` | diesel, advisory-lock, raw-sql | (b) | Advisory lock subsumed by the single write lock. |
 | `audit` | diesel | (a) | Append-only row writes. |
-| `batch` | diesel | (a) | Plain CRUD. |
-| `build_routing` | diesel, interval-sql | (b) | Integer epoch ms for the interval arithmetic. |
+| `batch` | diesel, raw-pg-sql, raw-sql | (b) | JSONB `\|\|` concatenation and `search_attrs @> $jsonb` containment. SQLite JSON1 has neither — rewrite with `json_patch`/`json_extract`. |
+| `build_routing` | diesel, interval-sql, raw-sql | (b) | Integer epoch ms for the interval arithmetic. |
 | `calendar` | diesel | (a) | Plain CRUD. |
-| `completion_callback` | diesel, skip-locked, row-lock, to_regclass | (c) | Two-transaction claim scanner; multi-worker delivery dropped. |
-| `completion_trigger` | diesel, skip-locked, advisory-lock | (c) | Terminal-commit fan-out; claim semantics dropped. |
+| `completion_callback` | diesel, skip-locked, row-lock, to_regclass, raw-sql | (c) | Two-transaction claim scanner; multi-worker delivery dropped. |
+| `completion_trigger` | diesel, skip-locked, advisory-lock, raw-sql | (c) | Terminal-commit fan-out; claim semantics dropped. |
 | `concurrency` | skip-locked | (c) | **Consumer of the claim invariant, issues no SQL.** Per-key fleet limits are meaningless single-writer. |
 | `context` | diesel, listen/notify | (c) | Wakeup path; no push primitive exists. |
-| `debounce` | diesel, skip-locked, to_regclass | (c) | Scanner claim; `sqlite_master` probe for the table check. |
-| `dlq` | diesel, row-lock | (b) | Row lock on replay/redrive; subsumed by the single write lock. |
+| `debounce` | diesel, skip-locked, to_regclass, raw-sql | (c) | Scanner claim; `sqlite_master` probe for the table check. |
+| `dlq` | diesel, row-lock, raw-sql | (b) | Row lock on replay/redrive; subsumed by the single write lock. |
 | `erase` | diesel, row-lock | (b) | Scrub holds a row lock; subsumed by the single write lock. |
 | `error` | diesel | (a) | `From<diesel::result::Error>` only — swap the error type. |
-| `event_batch` | diesel, skip-locked, to_regclass | (c) | Scanner claim. |
-| `execution` | diesel, skip-locked, row-lock, interval-sql, raw-pg-sql | (c) | Start/reuse matrix under `FOR UPDATE`; row-lock ordering is load-bearing. |
+| `event_batch` | diesel, skip-locked, to_regclass, raw-sql | (c) | Scanner claim. |
+| `execution` | diesel, skip-locked, row-lock, interval-sql, raw-pg-sql, raw-sql | (c) | Start/reuse matrix under `FOR UPDATE`; row-lock ordering is load-bearing. |
 | `external_task` | diesel, row-lock | (b) | `find_by_token_locked` serialises completion/failure; subsumed. |
 | `handle` | diesel | (a) | Read paths. |
 | `heartbeat` | diesel | (a) | Batched last-write-wins update. |
 | `lib` | diesel | (a) | `embed_migrations!()` only. |
 | `models` | diesel | (c) | Postgres type layer (`Jsonb`/`Timestamptz`/`Interval`/`Uuid`); reimplemented wholesale. |
-| `mutex` | diesel, advisory-lock, to_regclass, interval-sql | (b) | Advisory lock subsumed by the write lock; lease TTL as epoch ms. |
-| `notify` | diesel, listen/notify | (c) | **The one mechanism with no SQLite equivalent at all.** Polling replaces it. |
-| `poison_pill` | diesel, skip-locked, row-lock, interval-sql | (c) | Crash reclaim keyed on *peer* worker liveness — no peers single-writer. |
-| `queue` | diesel, skip-locked, row-lock, listen/notify, interval-sql, raw-pg-sql | (c) | The claim path itself. Reimplemented on `BEGIN IMMEDIATE`. |
-| `queue_pause` | diesel, skip-locked, advisory-lock | (c) | Claim-time gate. |
+| `mutex` | diesel, advisory-lock, to_regclass, interval-sql, raw-sql | (b) | Advisory lock subsumed by the write lock; lease TTL as epoch ms. |
+| `notify` | diesel, listen/notify, raw-sql | (c) | **The one mechanism with no SQLite equivalent at all.** Polling replaces it. |
+| `poison_pill` | diesel, skip-locked, row-lock, interval-sql, raw-sql | (c) | Crash reclaim keyed on *peer* worker liveness — no peers single-writer. |
+| `queue` | diesel, skip-locked, row-lock, listen/notify, interval-sql, raw-pg-sql, raw-sql | (c) | The claim path itself. Reimplemented on `BEGIN IMMEDIATE`. |
+| `queue_pause` | diesel, skip-locked, advisory-lock, raw-sql | (c) | Claim-time gate. |
 | `reset` | diesel, row-lock | (b) | Fork takes a row lock before appending; subsumed. |
-| `retention` | diesel, skip-locked, row-lock | (c) | Batched delete scanner with claim. |
+| `retention` | diesel, skip-locked, row-lock, raw-pg-sql, raw-sql | (c) | Batched delete scanner with claim. |
 | `schedule_decision` | diesel | (a) | Append-only decision log. |
-| `scheduler` | diesel, row-lock, interval-sql | (b) | Cron/interval arithmetic as epoch ms. |
+| `scheduler` | diesel, row-lock, interval-sql, raw-sql | (b) | Cron/interval arithmetic as epoch ms. |
 | `schema` | diesel | (c) | Diesel `table!` definitions; reimplemented wholesale. |
-| `sessions` | diesel, row-lock, interval-sql | (b) | Lease expiry as epoch ms. |
+| `sessions` | diesel, row-lock, interval-sql, raw-sql | (b) | Lease expiry as epoch ms. |
 | `signal` | diesel, row-lock | (b) | Insert under a row lock; subsumed by the single write lock. |
-| `start_idempotency` | diesel, to_regclass, interval-sql | (b) | `ON CONFLICT` upsert has a direct SQLite form. |
+| `start_idempotency` | diesel, to_regclass, interval-sql, raw-sql | (b) | `ON CONFLICT` upsert has a direct SQLite form. |
 | `store` | diesel, skip-locked, row-lock | (c) | **Consumer of the claim invariant — issues no `SKIP LOCKED` SQL of its own.** Event append itself is (a); its TOCTOU assumption is not. |
 | `testing` | diesel | (a) | Test-only helpers. |
-| `throttle` | diesel, skip-locked, to_regclass, gen_random_uuid, raw-pg-sql | (c) | Token-bucket scanner claim. |
-| `timeout` | diesel, skip-locked, row-lock, advisory-lock | (c) | The scanner family; lock ordering vs the claim path is load-bearing. |
-| `usage` | diesel, raw-pg-sql | (b) | Aggregate reads, but through `JOIN LATERAL`, `EXTRACT(EPOCH …)` and `::` casts. Rewrite as a correlated subquery + `strftime`/`CAST`. |
-| `version_gate_retirement` | diesel, raw-pg-sql | (b) | Marker scan over JSONB `#>>` with a `~ '^[0-9]{1,19}$'` guard. SQLite has no regex — substitute `GLOB`/`CAST`. |
-| `version_usage` | diesel, raw-pg-sql | (b) | Same JSONB-path + POSIX-regex shape as `version_gate_retirement`. |
-| `wasm_store` | diesel, advisory-lock | (b) | Content-hash upsert; advisory lock subsumed. |
-| `worker` | diesel, listen/notify, advisory-lock, row-lock | (c) | The dispatch loop; wakeups and persistence are interleaved. |
-| `workers` | diesel | (a) | Fleet registry rows. |
+| `throttle` | diesel, skip-locked, to_regclass, gen_random_uuid, raw-pg-sql, raw-sql | (c) | Token-bucket scanner claim. |
+| `timeout` | diesel, skip-locked, row-lock, advisory-lock, raw-sql | (c) | The scanner family; lock ordering vs the claim path is load-bearing. |
+| `usage` | diesel, raw-pg-sql, raw-sql | (b) | Aggregate reads, but through `JOIN LATERAL`, `EXTRACT(EPOCH …)` and `::` casts. Rewrite as a correlated subquery + `strftime`/`CAST`. |
+| `version_gate_retirement` | diesel, raw-pg-sql, raw-sql | (b) | Marker scan over JSONB `#>>` with a `~ '^[0-9]{1,19}$'` guard. SQLite has no regex — substitute `GLOB`/`CAST`. |
+| `version_usage` | diesel, raw-pg-sql, raw-sql | (b) | Same JSONB-path + POSIX-regex shape as `version_gate_retirement`. |
+| `wasm_store` | diesel, advisory-lock, raw-sql | (b) | Content-hash upsert; advisory lock subsumed. |
+| `worker` | diesel, listen/notify, advisory-lock, row-lock, raw-sql | (c) | The dispatch loop; wakeups and persistence are interleaved. |
+| `workers` | diesel, raw-sql | (b) | Fleet registry rows, but the sticky-lease filter embeds `NOW()`. SQLite: `CURRENT_TIMESTAMP`/epoch ms. |
 
-**Totals: (a) 10 · (b) 15 · (c) 18.**
+**Totals: (a) 8 · (b) 17 · (c) 18.**
 
 The shape matters more than the totals. The (a) column is genuinely
 mechanical CRUD. The (b) column is dominated by **pessimistic row locking**:
@@ -242,13 +266,33 @@ Against a companion crate, which touched **zero** core modules.
 
 The seam's cost to the shipped product was the decisive factor.
 
-**Performance.** The claim path is the hot path and is already benchmarked with
-a CI-gated contract (`docs/performance.md`). Routing it through a trait object
-introduces dynamic dispatch on the per-task path and, more importantly,
-forecloses Postgres-specific query shapes — the current claim query fuses the
-rate-limit gate, the concurrency gate, the pause gate, and the debit into a
-single statement with CTEs. A generic interface cannot express that fusion; it
-would decompose into multiple round trips.
+**Performance — and what it does *not* depend on.** An earlier draft of this
+report asserted that a `StorageBackend` trait would impose dynamic dispatch on
+the claim path and force the fused claim query to decompose into multiple round
+trips. Both claims were **design-specific, not inherent**, and stating them as
+inherent overstated the case. They are corrected here rather than quietly
+dropped, because the conclusion should not rest on the weakest argument
+available for it.
+
+Two trait designs are possible, and they trade off differently:
+
+| | Fine-grained + `dyn` | Coarse-grained + generic (`<B: StorageBackend>`) |
+|---|---|---|
+| Dispatch | Virtual call per operation on the hot path | **None** — monomorphised |
+| Fused claim CTE | Foreclosed; decomposes into round trips | **Retained** — the whole claim is one trait method, and the Postgres impl keeps its CTE inside it |
+| Cost paid instead | Runtime | **Viral type parameters**: `Worker<B>`, the registry, and every function touching storage become generic, plus monomorphisation and compile-time cost |
+
+So the honest position is that a coarse-grained generic seam **avoids both
+performance objections**. If performance were the deciding factor, the trait
+would be buildable.
+
+It is not the deciding factor. The decisive argument is the one in *Why the
+seam is the wrong shape* below, and it is **invariant to this choice**: a
+`claim_task` method must document a contract, that contract is "no concurrent
+claimer can also get this task, without blocking on rows other claimers hold",
+and a single-writer backend satisfies it vacuously. Monomorphisation does not
+make a vacuous guarantee meaningful. The trait would be cheap to call and still
+wrong to define.
 
 **Code complexity.** Harvest's correctness work is overwhelmingly about
 concurrency edges — lock ordering, claim-vs-scanner races, the wake-request

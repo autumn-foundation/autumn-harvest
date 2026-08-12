@@ -115,6 +115,7 @@ const MECHANISMS: &[(&str, &[&str])] = &[
         "raw-pg-sql",
         &[
             "#>>",
+            "@>",
             "EXTRACT(EPOCH",
             "JOIN LATERAL",
             "~ '",
@@ -125,6 +126,30 @@ const MECHANISMS: &[(&str, &[&str])] = &[
             "::UUID",
             "::TIMESTAMPTZ",
             "::DOUBLE PRECISION",
+        ],
+    ),
+    // Reaches for Diesel's raw-SQL escape hatch at all.
+    //
+    // This is the *closed* rule, and it exists because the list above is not
+    // one. Three review rounds each found another dialect construct the token
+    // list missed (the blocking row lock, then JSONB/`LATERAL`/regex, then
+    // JSONB `@>`/`||` and `NOW()`), which is the tell that enumerating dialect
+    // features cannot terminate: the set of Postgres-only syntax is open, and
+    // every miss silently understates the port.
+    //
+    // Detecting the escape hatch instead cannot miss a construct, because it
+    // does not enumerate constructs. It is a weaker claim — raw SQL *may* be
+    // portable ANSI — so it is deliberately not evidence of coupling on its
+    // own. What it does establish is that the module's portability cannot be
+    // read off its Diesel usage, which is precisely what class (a) asserts.
+    // `raw_sql_modules_are_never_classified_trivially_traitable` enforces that.
+    (
+        "raw-sql",
+        &[
+            "sql::<",
+            "sql_query(",
+            "define_sql_function",
+            "sql_function!",
         ],
     ),
     ("listen/notify", &["pg_notify", "LISTEN "]),
@@ -516,6 +541,49 @@ fn mechanism_counts_quoted_in_the_report_are_current() {
         report.contains(&format!("**{total} of the")),
         "the report should state the headline coupling figure as \"**{total} of the \
          N core modules**\"; a live audit currently finds {total} coupled modules"
+    );
+}
+
+/// A module that hand-writes SQL cannot be "plain CRUD through Diesel".
+///
+/// This is the guard that ends the whack-a-mole. Class (a) is *defined* in the
+/// report as "plain query/CRUD through Diesel with no Postgres-specific
+/// semantics" — a claim that is false by construction the moment a module
+/// reaches for `sql::<…>` or `sql_query`, because that SQL is not going
+/// through Diesel's abstraction at all and its portability has to be read by a
+/// human.
+///
+/// Unlike the `raw-pg-sql` token list, this rule is **closed**: it cannot miss
+/// a dialect construct, because it does not enumerate constructs. Three review
+/// rounds each found one the token list had missed; this rule independently
+/// catches all three classes at once, and would have caught them the first
+/// time.
+///
+/// It deliberately does *not* force a class — raw SQL may be portable ANSI, so
+/// (b) is often right. It only forbids the one classification that asserts the
+/// module was never hand-written in the first place.
+#[test]
+fn raw_sql_modules_are_never_classified_trivially_traitable() {
+    let report = read_report();
+    let detected = detect_coupled_modules();
+    let rows = inventory_rows(&report);
+
+    let mislabelled: Vec<&String> = detected
+        .iter()
+        .filter(|(_, mechanisms)| mechanisms.contains("raw-sql"))
+        .filter_map(|(module, _)| rows.get(module).map(|row| (module, row)))
+        .filter(|(_, row)| row.class == "(a)")
+        .map(|(module, _)| module)
+        .collect();
+
+    assert!(
+        mislabelled.is_empty(),
+        "these modules hand-write SQL through Diesel's escape hatch, so they \
+         cannot be class (a) \"plain query/CRUD through Diesel with no \
+         Postgres-specific semantics\" — that classification asserts the SQL \
+         was never hand-written: {mislabelled:?}\n\
+         Read the raw SQL and classify (b) if it is a mechanical rewrite on \
+         SQLite, or (c) if porting it drops a capability."
     );
 }
 
