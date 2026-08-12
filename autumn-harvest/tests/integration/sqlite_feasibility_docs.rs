@@ -105,12 +105,30 @@ const MECHANISMS: &[(&str, &[&str])] = &[
     //   `JOIN LATERAL`   (SQLite has no LATERAL)
     //   `~ '`            POSIX regex (SQLite has no REGEXP without a UDF)
     //   `::TYPE`         Postgres cast syntax (SQLite uses `CAST(x AS t)`)
-    // The cast tokens name concrete SQL types rather than matching bare `::`,
-    // which would hit every Rust path (`Self::Variant`, `std::fmt`) in the
-    // crate. `JOIN LATERAL` rather than bare `LATERAL` for the same reason the
-    // row lock is matched through the DSL: `queue` and `execution` both *talk
+    // `JOIN LATERAL` rather than bare `LATERAL` for the same reason the row
+    // lock is matched through the DSL: `queue` and `execution` both *talk
     // about* `LATERAL` in doc comments, and a module must not be reported as
     // coupled because it documents a construct.
+    //
+    // On the cast tokens: an earlier revision listed only UPPERCASE type names
+    // and so missed every lowercase spelling of the *same* construct
+    // (`'[]'::jsonb`, `$1::bigint`, `payloads::text`). That is a different
+    // defect from the open-enumeration problem below — case is a *bounded*
+    // dimension, so it is closable, and it is closed here.
+    //
+    // The first two tokens close it structurally rather than by listing types:
+    // a Postgres cast is `<expr>::<type>`, and `'::` / `)::` match on the
+    // *cast position* (after a literal or a closing paren) regardless of the
+    // type named or its case. Neither is valid Rust syntax, so both are
+    // SQL-only by construction. The remaining lowercase type names cover the
+    // `$1::bigint` and `ident::text` forms, which have no such anchor.
+    //
+    // Deliberately NOT matched, because each has a real Rust false positive:
+    // bare `::` (every path — `Self::Variant`, `std::fmt`); `::uuid` (the
+    // re-exported `autumn_harvest::uuid`, named in a doc comment and in
+    // `lib.rs`); `::interval` (`tokio::time::interval`). Case-insensitive
+    // matching is likewise rejected: it would flag `diesel::sql_types::Text`
+    // and its siblings as Postgres casts.
     (
         "raw-pg-sql",
         &[
@@ -119,6 +137,10 @@ const MECHANISMS: &[(&str, &[&str])] = &[
             "EXTRACT(EPOCH",
             "JOIN LATERAL",
             "~ '",
+            // Cast position — case- and type-agnostic, SQL-only by syntax.
+            "'::",
+            ")::",
+            // Explicit spellings for casts with no positional anchor.
             "::TEXT",
             "::BIGINT",
             "::INT4",
@@ -126,6 +148,10 @@ const MECHANISMS: &[(&str, &[&str])] = &[
             "::UUID",
             "::TIMESTAMPTZ",
             "::DOUBLE PRECISION",
+            "::text",
+            "::jsonb",
+            "::int8",
+            "::bigint",
         ],
     ),
     // Reaches for Diesel's raw-SQL escape hatch at all.
@@ -153,7 +179,18 @@ const MECHANISMS: &[(&str, &[&str])] = &[
         ],
     ),
     ("listen/notify", &["pg_notify", "LISTEN "]),
-    ("advisory-lock", &["pg_advisory"]),
+    // Both prefixes are required and, together, are exhaustive: every one of
+    // Postgres's ten advisory-lock functions is named `pg_advisory_*` or
+    // `pg_try_advisory_*` (session/transaction x shared/exclusive x try/block,
+    // plus the two unlocks). An earlier revision matched only `pg_advisory`,
+    // which does not substring-match `pg_try_advisory_xact_lock` — `try_` is
+    // infixed — and so missed the concurrency-cap claim in `queue` and the
+    // fleet-wide registration lock in `scheduler`.
+    //
+    // Unlike the dialect list above, this family is *closed*: it is a fixed,
+    // documented set of Postgres functions, so a prefix pair can cover it
+    // exhaustively rather than approximately.
+    ("advisory-lock", &["pg_advisory", "pg_try_advisory"]),
     ("to_regclass", &["to_regclass"]),
     ("gen_random_uuid", &["gen_random_uuid"]),
     (
