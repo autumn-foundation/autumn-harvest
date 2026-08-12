@@ -97,6 +97,36 @@ const MECHANISMS: &[(&str, &[&str])] = &[
     // test asserting `!expr.contains("FOR UPDATE")`, and it cannot separate
     // `FOR UPDATE OF t SKIP LOCKED` from a blocking lock.
     ("row-lock", &[".for_update()"]),
+    // Postgres-only raw SQL that Diesel does not abstract: a module can look
+    // like plain CRUD through the ORM and still be unportable because of the
+    // SQL it embeds. Every token here is genuinely Postgres-only:
+    //   `#>>`            JSONB path extract (SQLite JSON1 has no equivalent operator)
+    //   `EXTRACT(EPOCH`  (SQLite uses `strftime('%s', …)`)
+    //   `JOIN LATERAL`   (SQLite has no LATERAL)
+    //   `~ '`            POSIX regex (SQLite has no REGEXP without a UDF)
+    //   `::TYPE`         Postgres cast syntax (SQLite uses `CAST(x AS t)`)
+    // The cast tokens name concrete SQL types rather than matching bare `::`,
+    // which would hit every Rust path (`Self::Variant`, `std::fmt`) in the
+    // crate. `JOIN LATERAL` rather than bare `LATERAL` for the same reason the
+    // row lock is matched through the DSL: `queue` and `execution` both *talk
+    // about* `LATERAL` in doc comments, and a module must not be reported as
+    // coupled because it documents a construct.
+    (
+        "raw-pg-sql",
+        &[
+            "#>>",
+            "EXTRACT(EPOCH",
+            "JOIN LATERAL",
+            "~ '",
+            "::TEXT",
+            "::BIGINT",
+            "::INT4",
+            "::NUMERIC",
+            "::UUID",
+            "::TIMESTAMPTZ",
+            "::DOUBLE PRECISION",
+        ],
+    ),
     ("listen/notify", &["pg_notify", "LISTEN "]),
     ("advisory-lock", &["pg_advisory"]),
     ("to_regclass", &["to_regclass"]),

@@ -49,7 +49,7 @@ was built.**
 
 ## Coupling mechanisms
 
-Eight distinct Postgres-coupled mechanisms appear in core. The counts are
+Nine distinct Postgres-coupled mechanisms appear in core. The counts are
 module counts at the audited revision, recomputed by CI:
 
 | Mechanism | Reach | Portable? |
@@ -58,6 +58,7 @@ module counts at the audited revision, recomputed by CI:
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 13 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 15 modules | Subsumed by the single write lock. |
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 8 modules | Yes — integer epoch milliseconds. |
+| `raw-pg-sql` — Postgres-only SQL Diesel does not abstract (JSONB `#>>`, `::TYPE` casts, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 6 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
 | `advisory-lock` (`pg_advisory_xact_lock`) | 7 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 6 modules | Yes — `sqlite_master` lookup. |
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
@@ -117,7 +118,7 @@ Classification rule:
 | `erase` | diesel, row-lock | (b) | Scrub holds a row lock; subsumed by the single write lock. |
 | `error` | diesel | (a) | `From<diesel::result::Error>` only — swap the error type. |
 | `event_batch` | diesel, skip-locked, to_regclass | (c) | Scanner claim. |
-| `execution` | diesel, skip-locked, row-lock, interval-sql | (c) | Start/reuse matrix under `FOR UPDATE`; row-lock ordering is load-bearing. |
+| `execution` | diesel, skip-locked, row-lock, interval-sql, raw-pg-sql | (c) | Start/reuse matrix under `FOR UPDATE`; row-lock ordering is load-bearing. |
 | `external_task` | diesel, row-lock | (b) | `find_by_token_locked` serialises completion/failure; subsumed. |
 | `handle` | diesel | (a) | Read paths. |
 | `heartbeat` | diesel | (a) | Batched last-write-wins update. |
@@ -126,7 +127,7 @@ Classification rule:
 | `mutex` | diesel, advisory-lock, to_regclass, interval-sql | (b) | Advisory lock subsumed by the write lock; lease TTL as epoch ms. |
 | `notify` | diesel, listen/notify | (c) | **The one mechanism with no SQLite equivalent at all.** Polling replaces it. |
 | `poison_pill` | diesel, skip-locked, row-lock, interval-sql | (c) | Crash reclaim keyed on *peer* worker liveness — no peers single-writer. |
-| `queue` | diesel, skip-locked, row-lock, listen/notify, interval-sql | (c) | The claim path itself. Reimplemented on `BEGIN IMMEDIATE`. |
+| `queue` | diesel, skip-locked, row-lock, listen/notify, interval-sql, raw-pg-sql | (c) | The claim path itself. Reimplemented on `BEGIN IMMEDIATE`. |
 | `queue_pause` | diesel, skip-locked, advisory-lock | (c) | Claim-time gate. |
 | `reset` | diesel, row-lock | (b) | Fork takes a row lock before appending; subsumed. |
 | `retention` | diesel, skip-locked, row-lock | (c) | Batched delete scanner with claim. |
@@ -138,16 +139,16 @@ Classification rule:
 | `start_idempotency` | diesel, to_regclass, interval-sql | (b) | `ON CONFLICT` upsert has a direct SQLite form. |
 | `store` | diesel, skip-locked, row-lock | (c) | **Consumer of the claim invariant — issues no `SKIP LOCKED` SQL of its own.** Event append itself is (a); its TOCTOU assumption is not. |
 | `testing` | diesel | (a) | Test-only helpers. |
-| `throttle` | diesel, skip-locked, to_regclass, gen_random_uuid | (c) | Token-bucket scanner claim. |
+| `throttle` | diesel, skip-locked, to_regclass, gen_random_uuid, raw-pg-sql | (c) | Token-bucket scanner claim. |
 | `timeout` | diesel, skip-locked, row-lock, advisory-lock | (c) | The scanner family; lock ordering vs the claim path is load-bearing. |
-| `usage` | diesel | (a) | Aggregate reads. |
-| `version_gate_retirement` | diesel | (a) | Marker scan. |
-| `version_usage` | diesel | (a) | Marker scan. |
+| `usage` | diesel, raw-pg-sql | (b) | Aggregate reads, but through `JOIN LATERAL`, `EXTRACT(EPOCH …)` and `::` casts. Rewrite as a correlated subquery + `strftime`/`CAST`. |
+| `version_gate_retirement` | diesel, raw-pg-sql | (b) | Marker scan over JSONB `#>>` with a `~ '^[0-9]{1,19}$'` guard. SQLite has no regex — substitute `GLOB`/`CAST`. |
+| `version_usage` | diesel, raw-pg-sql | (b) | Same JSONB-path + POSIX-regex shape as `version_gate_retirement`. |
 | `wasm_store` | diesel, advisory-lock | (b) | Content-hash upsert; advisory lock subsumed. |
 | `worker` | diesel, listen/notify, advisory-lock, row-lock | (c) | The dispatch loop; wakeups and persistence are interleaved. |
 | `workers` | diesel | (a) | Fleet registry rows. |
 
-**Totals: (a) 13 · (b) 12 · (c) 18.**
+**Totals: (a) 10 · (b) 15 · (c) 18.**
 
 The shape matters more than the totals. The (a) column is genuinely
 mechanical CRUD. The (b) column is dominated by **pessimistic row locking**:
