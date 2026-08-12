@@ -6,7 +6,10 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use autumn_harvest::{DetCheckReport, DetSeverity, check_paths};
+use autumn_harvest::{
+    DetCheckReport, DetSeverity, SchemaContractDiff, SchemaRole, WorkflowSchemaContract,
+    check_paths, diff_schema_contracts,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Map, Value, json};
@@ -96,6 +99,20 @@ pub enum DetCheckFormat {
     #[default]
     Text,
     /// Machine-readable `DetCheckReport` JSON for CI consumption.
+    Json,
+}
+
+/// Output format for the `schema check` subcommand (issue #794).
+///
+/// This is a **local** flag (`--format`); it is deliberately distinct from the
+/// global `--output` used for API responses.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum SchemaCheckFormat {
+    /// Human-readable `workflow.role: <field_path> — <verdict> — <reason>`
+    /// lines (default).
+    #[default]
+    Text,
+    /// Machine-readable diff JSON for CI consumption.
     Json,
 }
 
@@ -380,6 +397,22 @@ pub enum CliError {
         errors: usize,
         /// Number of `Warning`-severity findings.
         warnings: usize,
+    },
+
+    /// `schema check` found a backward-incompatible payload-schema change
+    /// (issue #794).
+    ///
+    /// The diff itself is already printed to stdout; this only carries the
+    /// count so `main` can exit with the right code. Exit code is `1`, per the
+    /// issue's exit-code contract.
+    #[error(
+        "schema check: {breaking} breaking schema change(s) would break replay of in-flight \
+         executions. Acknowledge a deliberate migration with `harvest schema update \
+         --acknowledge \"<why this is safe>\"`."
+    )]
+    SchemaContractBreaking {
+        /// Number of breaking deltas.
+        breaking: usize,
     },
 }
 
@@ -668,6 +701,15 @@ enum Commands {
         list_suppressions: bool,
     },
 
+    /// Gate backward-incompatible workflow payload-schema changes (issue #794).
+    ///
+    /// Read-only file comparison: no database, no network.
+    Schema {
+        /// `check` (gate) or `update` (regenerate the baseline).
+        #[command(subcommand)]
+        command: SchemaCommand,
+    },
+
     /// Scaffold a new, runnable autumn-harvest project (issue #692).
     ///
     /// Emits a complete crate — a `Cargo.toml` with crates.io deps and the `db`
@@ -692,6 +734,56 @@ enum Commands {
         /// Template to emit. Currently only `minimal` ships.
         #[arg(long, value_enum, default_value_t)]
         template: ScaffoldTemplate,
+    },
+}
+
+/// Workflow payload-schema contract subcommands (issue #794).
+///
+/// Both are pure local file comparison — no database, no network. `--current`
+/// is the schema set your app publishes *right now*; generate it with a
+/// three-line binary in your own crate (the only place the registry is in
+/// scope), or pipe `GET /workflows/registered` straight in.
+#[derive(Debug, Subcommand)]
+enum SchemaCommand {
+    /// Compare the current published schemas against the checked-in baseline
+    /// and fail on any backward-incompatible change.
+    ///
+    /// Exits `0` when every delta is compatible, `1` when any delta is
+    /// breaking from the replay-read perspective.
+    Check {
+        /// Checked-in baseline artifact.
+        #[arg(long, value_name = "PATH", default_value = autumn_harvest::DEFAULT_SCHEMA_CONTRACT_PATH)]
+        baseline: PathBuf,
+        /// Currently published schemas: a generated contract, or a raw
+        /// `GET /workflows/registered` response body.
+        #[arg(long, value_name = "PATH")]
+        current: PathBuf,
+        /// Output format: human-readable `text` (default) or machine-readable
+        /// `json` (per-type, per-field verdict and reason).
+        #[arg(long, value_enum, default_value_t)]
+        format: SchemaCheckFormat,
+    },
+
+    /// Regenerate the checked-in baseline from the current schemas.
+    ///
+    /// A breaking delta is **refused** unless `--acknowledge` records why it is
+    /// safe; the justification is written into the artifact, so the
+    /// acknowledgement is visible in the checked-in diff and never silent.
+    Update {
+        /// Baseline artifact to rewrite in place.
+        #[arg(long, value_name = "PATH", default_value = autumn_harvest::DEFAULT_SCHEMA_CONTRACT_PATH)]
+        baseline: PathBuf,
+        /// Currently published schemas (see `check --current`).
+        #[arg(long, value_name = "PATH")]
+        current: PathBuf,
+        /// Why each breaking change is safe (e.g. "in-flight runs drained;
+        /// pinned by build routing #171"). Required when any delta is breaking.
+        #[arg(long, value_name = "REASON")]
+        acknowledge: Option<String>,
+        /// Where the migration is written up — a changelog fragment, PR, or
+        /// runbook. Recorded alongside the justification.
+        #[arg(long, value_name = "REF")]
+        recorded_in: Option<String>,
     },
 }
 
@@ -2288,6 +2380,9 @@ impl Cli {
             Commands::DetCheck { .. } => {
                 unreachable!("DetCheck handles its own execution locally")
             }
+            Commands::Schema { .. } => {
+                unreachable!("Schema handles its own execution locally")
+            }
             Commands::New { .. } => {
                 unreachable!("New handles its own execution locally")
             }
@@ -2355,7 +2450,8 @@ pub mod tui;
 /// Returns an error if request construction, HTTP transport, response parsing,
 /// or response formatting fails.
 // A dispatcher: a sequence of `if let ... return` guards for locally-handled
-// commands (det-check, tui, events, worker-drain-wait, token bootstrap) followed
+// commands (det-check, schema, new, tui, events, worker-drain-wait, token
+// bootstrap) followed
 // by the shared execute/render path. Splitting it would only scatter the guards.
 #[allow(clippy::too_many_lines)]
 pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
@@ -2369,6 +2465,29 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     } = &cli.command
     {
         return run_det_check(paths, *format, *deny_warnings, *list_suppressions);
+    }
+
+    // `schema` is read-only local file comparison: no HTTP, no DB (mirrors
+    // DetCheck).
+    if let Commands::Schema { command } = &cli.command {
+        return match command {
+            SchemaCommand::Check {
+                baseline,
+                current,
+                format,
+            } => run_schema_check(baseline, current, *format),
+            SchemaCommand::Update {
+                baseline,
+                current,
+                acknowledge,
+                recorded_in,
+            } => run_schema_update(
+                baseline,
+                current,
+                acknowledge.as_deref(),
+                recorded_in.as_deref(),
+            ),
+        };
     }
 
     // `new` is pure local file generation: no HTTP, no DB (mirrors DetCheck).
@@ -2728,6 +2847,248 @@ pub fn run_det_check(
     if let Some(err) = det_check_gate(&report, deny_warnings) {
         return Err(err);
     }
+    Ok(())
+}
+
+// ── harvest schema: payload-schema contract gate (issue #794) ───────────────
+
+/// Reads and parses a schema-contract document, naming the path on failure.
+fn read_schema_contract(path: &Path) -> Result<WorkflowSchemaContract, CliError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        CliError::InvalidInput(format!(
+            "failed to read schema contract `{}`: {e}",
+            path.display()
+        ))
+    })?;
+    WorkflowSchemaContract::parse(&raw)
+        .map_err(|e| CliError::InvalidInput(format!("`{}` is not usable: {e}", path.display())))
+}
+
+/// Renders a schema diff as `workflow.role: <field> — <verdict> — <reason>`
+/// lines, one per delta, plus a summary line.
+#[must_use]
+pub fn format_schema_diff_text(diff: &SchemaContractDiff) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    for d in &diff.deltas {
+        let role = d.role.map_or("*", SchemaRole::as_str);
+        let field = if d.field_path.is_empty() {
+            "(root)"
+        } else {
+            d.field_path.as_str()
+        };
+        // Writing into a String is infallible.
+        let _ = writeln!(
+            out,
+            "{}.{}: {} — {} — {}",
+            d.workflow,
+            role,
+            field,
+            d.verdict.as_str(),
+            d.reason
+        );
+    }
+
+    // `breaking_count` rather than a count of the stored deltas: the tally
+    // keeps counting past the storage cap, so a truncated report still states
+    // the true number.
+    let breaking = diff.breaking_count;
+    let total = diff.breaking_count + diff.compatible_count;
+    if breaking == 0 {
+        let _ = write!(
+            out,
+            "schema check: no breaking changes ({} compatible delta(s))",
+            diff.compatible_count
+        );
+    } else {
+        let _ = write!(
+            out,
+            "schema check: {breaking} breaking change(s) of {total} delta(s)"
+        );
+    }
+    if diff.truncated {
+        let _ = write!(
+            out,
+            "\nschema check: report TRUNCATED at {} delta(s) — the listing above is incomplete",
+            diff.deltas.len()
+        );
+    }
+    out
+}
+
+/// Serialises a schema diff as machine-readable JSON for CI.
+///
+/// # Errors
+/// Returns [`CliError::SerializeResponse`] if serialisation fails. The input
+/// parsed fine — nothing about it was invalid — so this is an output failure,
+/// matching `det_check_json`.
+pub fn schema_diff_json(diff: &SchemaContractDiff) -> Result<String, CliError> {
+    serde_json::to_string_pretty(diff).map_err(CliError::SerializeResponse)
+}
+
+/// Runs `harvest schema check`: diffs `current` against `baseline`, prints the
+/// result, and gates the exit code.
+///
+/// # Errors
+/// Returns [`CliError::SchemaContractBreaking`] when any delta is breaking (the
+/// diff is already on stdout), or an [`CliError::InvalidInput`] read/parse
+/// error naming the offending path.
+///
+/// A **truncated** diff also fails: once the delta cap is hit the report no
+/// longer enumerates every difference, so passing it would be a claim the tool
+/// cannot support. Failing closed keeps "exit `0`" meaning "nothing breaking",
+/// never "nothing breaking *that fit*".
+pub fn run_schema_check(
+    baseline: &Path,
+    current: &Path,
+    format: SchemaCheckFormat,
+) -> Result<(), CliError> {
+    let base = read_schema_contract(baseline)?;
+    let cur = read_schema_contract(current)?;
+    guard_empty_current(&base, &cur, current)?;
+    let diff = diff_schema_contracts(&base, &cur);
+
+    match format {
+        SchemaCheckFormat::Text => println!("{}", format_schema_diff_text(&diff)),
+        SchemaCheckFormat::Json => println!("{}", schema_diff_json(&diff)?),
+    }
+
+    if diff.truncated {
+        return Err(CliError::InvalidInput(format!(
+            "schema diff truncated at {} delta(s): the report is incomplete, so it \
+             cannot certify that nothing is breaking. Split the change into smaller \
+             steps, or regenerate the baseline with `harvest schema update`.",
+            diff.deltas.len()
+        )));
+    }
+
+    // `breaking_count` is the authoritative tally kept by the differ, not a
+    // count of the *stored* deltas: it stays correct even where storage is
+    // capped, so a breaking change can never be dropped on the floor.
+    if diff.has_breaking() {
+        return Err(CliError::SchemaContractBreaking {
+            breaking: diff.breaking_count,
+        });
+    }
+    Ok(())
+}
+
+/// Refuses a `--current` that publishes nothing against a non-empty baseline.
+///
+/// An empty contract is almost always a broken *producer*, not a deliberate
+/// mass deletion: a `dump-schema-contract` binary that forgot `.workflows(…)`,
+/// a `curl` that captured an error body, or a truncated redirect. Diffed
+/// literally it is technically correct — every workflow "removed", every schema
+/// "unpublished" — but it buries the real cause under N breaking deltas and
+/// invites the author to reach for `--acknowledge`, which would overwrite the
+/// baseline with nothing and disarm the gate permanently.
+///
+/// Deleting every workflow at once is legitimate but vanishingly rare, so this
+/// trades that case (regenerate the baseline directly) for a clear diagnosis of
+/// the common one.
+fn guard_empty_current(
+    base: &WorkflowSchemaContract,
+    cur: &WorkflowSchemaContract,
+    current: &Path,
+) -> Result<(), CliError> {
+    if cur.workflows.is_empty() && !base.workflows.is_empty() {
+        return Err(CliError::InvalidInput(format!(
+            "`{}` publishes no workflows at all, but the baseline has {}. This is almost always \
+             a broken schema dump (a producer that registered no workflows, or a captured error \
+             body) rather than a deliberate deletion of every workflow — refusing to diff it so \
+             the real cause is not buried under {} `removed` verdicts. Check the producer, or \
+             regenerate the baseline directly if the emptiness is intended.",
+            current.display(),
+            base.workflows.len(),
+            base.workflows.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Writes the regenerated baseline without ever leaving a truncated file behind.
+///
+/// `fs::write` truncates the target *before* writing, so an interrupted run (a
+/// full disk, a killed CI step, a `^C`) can destroy a checked-in baseline and
+/// leave a half-written one in the working tree — and the next `schema check`
+/// would then diff against garbage. Writing a sibling temp file and `rename`ing
+/// it over the target makes the replacement atomic on POSIX: the baseline is
+/// either the old bytes or the new bytes, never a prefix of the new ones.
+///
+/// The temp file is a sibling (not `/tmp`) so the rename stays within one
+/// filesystem, and is removed on any failure path.
+fn write_baseline_atomically(baseline: &Path, contents: &str) -> Result<(), CliError> {
+    let wrap = |e: std::io::Error| {
+        CliError::InvalidInput(format!(
+            "failed to write schema contract `{}`: {e}",
+            baseline.display()
+        ))
+    };
+
+    let dir = baseline.parent().unwrap_or_else(|| Path::new("."));
+    let stem = baseline
+        .file_name()
+        .map_or_else(|| "schema-contract".into(), |n| n.to_string_lossy());
+    let tmp = dir.join(format!(".{stem}.tmp-{}", std::process::id()));
+
+    if let Err(e) = fs::write(&tmp, contents) {
+        drop(fs::remove_file(&tmp));
+        return Err(wrap(e));
+    }
+    if let Err(e) = fs::rename(&tmp, baseline) {
+        drop(fs::remove_file(&tmp));
+        return Err(wrap(e));
+    }
+    Ok(())
+}
+
+/// Runs `harvest schema update`: rewrites `baseline` from `current`.
+///
+/// A breaking delta is refused unless `acknowledge` records why it is safe; the
+/// justification is written into the artifact so it is visible in the
+/// checked-in diff and never silent.
+///
+/// # Errors
+/// Returns [`CliError::InvalidInput`] when a read, parse, refusal or write
+/// fails. Refusal messages name `--acknowledge` explicitly.
+pub fn run_schema_update(
+    baseline: &Path,
+    current: &Path,
+    acknowledge: Option<&str>,
+    recorded_in: Option<&str>,
+) -> Result<(), CliError> {
+    let base = read_schema_contract(baseline)?;
+    let cur = read_schema_contract(current)?;
+    // Refuse here too: `update` is the path that would OVERWRITE the baseline
+    // with the empty document and disarm the gate for every later run.
+    guard_empty_current(&base, &cur, current)?;
+    let diff = diff_schema_contracts(&base, &cur);
+
+    // The core recomputes the diff internally rather than accepting ours: it is
+    // a pure function of the same two inputs, so it cannot disagree, and the
+    // API cannot be fed a diff computed from *different* contracts — which
+    // would write acknowledgement records for deltas that were never inspected.
+    let updated = acknowledge
+        .map_or_else(
+            || base.compatible_update(&cur),
+            |reason| base.acknowledged_update(&cur, reason, recorded_in),
+        )
+        .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+
+    let json = updated
+        .to_json_pretty()
+        .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+    write_baseline_atomically(baseline, &json)?;
+
+    // The true tallies, not `deltas.len()`: the stored listing is capped at
+    // `MAX_DELTAS` but the counts keep counting, so a large update still
+    // reports honestly.
+    let breaking = diff.breaking_count;
+    let total = diff.breaking_count + diff.compatible_count;
+    println!(
+        "schema baseline updated: {total} delta(s) recorded, {breaking} acknowledged as breaking"
+    );
     Ok(())
 }
 
@@ -10627,6 +10988,137 @@ fn bad_helper() -> i64 {
             result.is_ok(),
             "--list-suppressions --format json must exit Ok, got: {result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod schema_contract_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    //    // These live inline rather than in `tests/integration/schema_check_cli.rs`
+    // because `Commands` and `SchemaCommand` are private: an external test can
+    // only assert that parsing *succeeded*, which would pass just as happily
+    // with a wrong default baked in. Destructuring is what actually pins the
+    // defaults. Mirrors the det-check tests directly above.
+
+    #[test]
+    fn schema_check_parses_paths_and_format() {
+        let cli = parse(&[
+            "schema",
+            "check",
+            "--baseline",
+            "base.json",
+            "--current",
+            "cur.json",
+            "--format",
+            "json",
+        ]);
+        match cli.command {
+            Commands::Schema {
+                command:
+                    SchemaCommand::Check {
+                        baseline,
+                        current,
+                        format,
+                    },
+            } => {
+                assert_eq!(baseline, PathBuf::from("base.json"));
+                assert_eq!(current, PathBuf::from("cur.json"));
+                assert_eq!(format, SchemaCheckFormat::Json);
+            }
+            other => panic!("expected Schema::Check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_check_baseline_defaults_to_the_documented_path() {
+        let cli = parse(&["schema", "check", "--current", "cur.json"]);
+        match cli.command {
+            Commands::Schema {
+                command:
+                    SchemaCommand::Check {
+                        baseline, format, ..
+                    },
+            } => {
+                // The default is what makes the documented one-liner short; if
+                // it drifts from the constant the guide and CI recipe rot.
+                assert_eq!(
+                    baseline,
+                    PathBuf::from(autumn_harvest::DEFAULT_SCHEMA_CONTRACT_PATH)
+                );
+                assert_eq!(format, SchemaCheckFormat::Text);
+            }
+            other => panic!("expected Schema::Check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_update_parses_acknowledge_and_recorded_in() {
+        let cli = parse(&[
+            "schema",
+            "update",
+            "--current",
+            "cur.json",
+            "--acknowledge",
+            "drained via reset",
+            "--recorded-in",
+            "docs/changelog.d/pr-794-schema-contract-gate.md",
+        ]);
+        match cli.command {
+            Commands::Schema {
+                command:
+                    SchemaCommand::Update {
+                        baseline,
+                        current,
+                        acknowledge,
+                        recorded_in,
+                    },
+            } => {
+                assert_eq!(
+                    baseline,
+                    PathBuf::from(autumn_harvest::DEFAULT_SCHEMA_CONTRACT_PATH)
+                );
+                assert_eq!(current, PathBuf::from("cur.json"));
+                assert_eq!(acknowledge.as_deref(), Some("drained via reset"));
+                assert_eq!(
+                    recorded_in.as_deref(),
+                    Some("docs/changelog.d/pr-794-schema-contract-gate.md")
+                );
+            }
+            other => panic!("expected Schema::Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_update_acknowledge_is_optional_at_parse_time() {
+        // The refusal is a *runtime* decision made only when a delta is
+        // breaking, not a clap requirement — a purely compatible regeneration
+        // must not need a justification.
+        let cli = parse(&["schema", "update", "--current", "cur.json"]);
+        match cli.command {
+            Commands::Schema {
+                command:
+                    SchemaCommand::Update {
+                        acknowledge,
+                        recorded_in,
+                        ..
+                    },
+            } => {
+                assert!(acknowledge.is_none());
+                assert!(recorded_in.is_none());
+            }
+            other => panic!("expected Schema::Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_check_format_default_is_text() {
+        assert_eq!(SchemaCheckFormat::default(), SchemaCheckFormat::Text);
     }
 }
 

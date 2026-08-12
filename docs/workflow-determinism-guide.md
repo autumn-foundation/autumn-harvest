@@ -610,17 +610,53 @@ The shipped tree passes the check: a bare `harvest det-check` at the repo root r
 
 ---
 
+## Gating payload-schema changes in CI
+
+`det-check` covers non-deterministic **code**. The sibling hazard is a
+non-deterministic **payload**: renaming, retyping, or adding a required field to
+a workflow's input/output/error type compiles green but silently breaks every
+in-flight execution, whose recorded `harvest_events` JSON no longer deserializes.
+
+That is gated by **`harvest schema check`**
+([issue #794](https://github.com/autumn-foundation/autumn-harvest/issues/794)),
+which diffs the schemas your app publishes ([issue #373](https://github.com/autumn-foundation/autumn-harvest/issues/373))
+against the checked-in baseline `docs/workflow-schema-contract.json` and fails
+the build on any change that would break replay:
+
+```console
+$ cargo run --quiet --bin dump-schema-contract > /tmp/current.json
+$ harvest schema check --current /tmp/current.json
+```
+
+`dump-schema-contract` is a **three-line binary you add to your own crate** —
+Harvest is a library, so only your process can enumerate the workflow registry.
+[The schema-contract guide](workflow-schema-contract-guide.md#generating---current)
+has the snippet; `autumn-harvest/examples/schema_workflow.rs --emit-contract` is
+a working reference.
+
+Exit `0` when every delta is compatible, `1` when any is breaking. A deliberate
+migration is acknowledged — never suppressed — with `harvest schema update
+--acknowledge "<why this is safe>"`, which records the justification in the
+artifact so it lands in the same reviewable diff.
+
+Like `det-check`, it needs no database and no services, so it belongs in the
+same cheap lint job. See **[the schema-contract guide](workflow-schema-contract-guide.md)**
+for the full ruleset, the generator, the escape hatch, and CI/pre-commit recipes.
+
+---
+
 ## Composing with the release playbook
 
 The determinism rule catalog is an early-stage guardrail, not the final proof of replay safety. The recommended release sequence:
 
 1. **Determinism check** (this catalog): catch obvious footguns before any workflow has history.
-2. **History export** ([issue #169](https://github.com/autumn-foundation/autumn-harvest/issues/169)): export event histories from staging as replay fixtures.
-3. **WorkflowReplayer** (`autumn_harvest::testing::WorkflowReplayer`): verify the new code replays all exported fixtures without divergence.
-4. **Patch gate** (`ctx.patched()` / `ctx.deprecate_patch()`, with `ctx.version()` as the multi-version escape hatch): fence intentional non-determinism across deploys behind `ctx.patched(id)` for the common two-state change, deprecate the gate with `ctx.deprecate_patch(id)` once pre-patch runs have drained, and delete it after the marker-bearing runs drain too. Reach for `ctx.version()` only when a gate needs more than two concurrent versions.
-5. **Build-id routing** (`WorkerConfig::with_build_id`): gate new executions on the new build until compatibility is declared.
+2. **Schema-contract check** ([issue #794](https://github.com/autumn-foundation/autumn-harvest/issues/794)): catch backward-incompatible *payload* changes — the sibling hazard to non-deterministic code — before they DLQ in-flight runs. See [the guide](workflow-schema-contract-guide.md).
+3. **History export** ([issue #169](https://github.com/autumn-foundation/autumn-harvest/issues/169)): export event histories from staging as replay fixtures.
+4. **WorkflowReplayer** (`autumn_harvest::testing::WorkflowReplayer`): verify the new code replays all exported fixtures without divergence.
+5. **Patch gate** (`ctx.patched()` / `ctx.deprecate_patch()`, with `ctx.version()` as the multi-version escape hatch): fence intentional non-determinism across deploys behind `ctx.patched(id)` for the common two-state change, deprecate the gate with `ctx.deprecate_patch(id)` once pre-patch runs have drained, and delete it after the marker-bearing runs drain too. Reach for `ctx.version()` only when a gate needs more than two concurrent versions.
+6. **Build-id routing** (`WorkerConfig::with_build_id`): gate new executions on the new build until compatibility is declared.
 
-Each layer catches a different class of problem. All five together provide defence-in-depth for safe rolling deploys.
+Each layer catches a different class of problem. All six together provide defence-in-depth for safe rolling deploys.
 
 ---
 

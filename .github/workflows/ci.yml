@@ -257,6 +257,25 @@ jobs:
       - name: Run fanout_batch example tests (issue #750)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example fanout_batch
+      # Issue #794: the schema-contract gate, end to end. Generates the
+      # currently-published schemas from the example registry, then diffs them
+      # against the checked-in baseline. This is simultaneously the drift guard
+      # for `docs/workflow-schema-contract.json` and the proof that the
+      # documented CI recipe actually works. No database, no services.
+      #
+      # Linux-only, matching the benchmark bit-rot guard above: schema drift is
+      # a property of the checked-in artifact, not of the OS, so one leg proves
+      # it. The step builds twice (`--features schema` pulls schemars; the CLI
+      # links the whole `harvest` binary), so restricting it saves two legs'
+      # worth of minutes for zero added coverage.
+      - name: "Gate workflow payload-schema changes (issue #794)"
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          cargo run --quiet -p autumn-harvest --no-default-features --features schema \
+            --example schema_workflow -- --emit-contract > "${RUNNER_TEMP}/schema-current.json"
+          cargo run --quiet -p autumn-harvest-cli --bin harvest -- \
+            schema check --current "${RUNNER_TEMP}/schema-current.json"
       # ── Manifest-driven integration suites ──────────────────────────────
       # The per-suite `cargo test` steps that used to live here are now data in
       # `.github/ci/integration-suites.txt`, executed by `.github/ci/run-suites.sh`.
