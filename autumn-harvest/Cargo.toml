@@ -170,6 +170,9 @@ required-features = ["db"]
 name = "wasm_activity"
 required-features = ["wasm-activities"]
 
+[[example]]
+name = "entity_phase_transition"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }

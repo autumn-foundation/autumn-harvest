@@ -35,6 +35,8 @@ mod claim_budget_tests;
 mod completion_callback_tests;
 mod concurrency_key_tests;
 mod context_headers_tests;
+#[cfg(feature = "db")]
+mod cross_type_continue_as_new_tests;
 mod cross_workflow_await_tests;
 mod cross_workflow_cancel_tests;
 #[cfg(feature = "db")]

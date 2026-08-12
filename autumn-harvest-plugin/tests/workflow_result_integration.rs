@@ -190,6 +190,7 @@ async fn mark_continued_as_new(
     let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id: new_id,
         input: json!({"n": 2}),
+        new_workflow_type: None,
     }];
     store::append_events(conn, exec_id, &events, history.next_event_id)
         .await

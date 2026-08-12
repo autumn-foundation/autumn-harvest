@@ -482,6 +482,9 @@ pub enum WorkflowCommand {
     ContinueAsNew {
         /// Input passed to the next iteration of the workflow.
         input: Value,
+        /// Registered workflow type the successor runs as (issue #803).
+        /// `None` = same type as the predecessor (today's behavior).
+        new_workflow_type: Option<String>,
     },
     /// Run a local activity inline on the workflow worker (never enqueued).
     ///
@@ -863,9 +866,13 @@ impl std::fmt::Debug for WorkflowCommand {
                 f.debug_struct("Complete").field("output", output).finish()
             }
             Self::Fail { error } => f.debug_struct("Fail").field("error", error).finish(),
-            Self::ContinueAsNew { input } => f
+            Self::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => f
                 .debug_struct("ContinueAsNew")
                 .field("input", input)
+                .field("new_workflow_type", new_workflow_type)
                 .finish(),
             Self::RunLocalActivity {
                 activity_id,
@@ -2537,6 +2544,14 @@ impl WorkflowContext {
     pub(crate) fn is_timer_started_next(&self, timer_id: &str) -> bool {
         let matcher = self.matcher.lock().expect("matcher lock poisoned");
         matcher.is_timer_started_next(timer_id)
+    }
+
+    /// Backs the `debug_assert!` on `continue_as_new_impl`'s `Matched` arm
+    /// (issue #803): the successor type pushed there comes from the live
+    /// argument, and this pins that it still equals what history recorded.
+    pub(crate) fn recorded_continue_as_new_type_matches(&self, expected: Option<&str>) -> bool {
+        let matcher = self.matcher.lock().expect("matcher lock poisoned");
+        matcher.recorded_continue_as_new_type_matches(expected)
     }
 
     // ── Constructors ──────────────────────────────────────────────────
@@ -10248,13 +10263,194 @@ impl WorkflowContext {
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
     pub async fn continue_as_new(&self, input: Value) -> HarvestResult<()> {
-        let history_match = self.match_history(|m| m.match_continue_as_new(&input));
+        self.continue_as_new_impl(None, input).await
+    }
+
+    /// Continue as a **different** registered workflow type, keeping the same
+    /// logical `WorkflowId` (issue #803).
+    ///
+    /// This is the entity / state-machine phase-transition primitive: an
+    /// entity whose behavior genuinely changes across lifecycle phases
+    /// (`trial_subscription → paid_subscription → churned`,
+    /// `cart → checkout → fulfillment`) gets one focused, replay-safe handler
+    /// per phase instead of a single ever-branching function, while its
+    /// stable `workflow_id`, shard, and queue carry across every transition.
+    ///
+    /// Everything [`continue_as_new`](Self::continue_as_new) does still
+    /// applies: the current execution is sealed `CONTINUED_AS_NEW`, a fresh
+    /// execution with an empty history is started in its place, unconsumed
+    /// signals are reassigned to it, and the returned future never resolves.
+    ///
+    /// # Successor defaults
+    ///
+    /// The successor's **lifecycle defaults are resolved from
+    /// `workflow_type`'s own [`WorkflowInfo`]** — not the predecessor's:
+    /// `execution_timeout` (#243), `sla` (#487, clamped to at most the
+    /// execution timeout exactly as at start), the `concurrency` key/limit
+    /// (#247), the workflow-level `retry_policy` (#523), and the
+    /// `owner`/`runbook_url`/`severity` ops metadata (#372). This mirrors how
+    /// a spawned child resolves its own type's defaults, and means an alert
+    /// on the new phase pages the team that owns *that* phase.
+    ///
+    /// Carried forward verbatim (identical to a same-type continuation):
+    /// `workflow_id`, shard, `queue_name`, `memo`, search attributes, context
+    /// headers, build id, schedule lineage (#488/#534), completion callbacks
+    /// (#605), the run-chain back-links (#701), and — deliberately — the
+    /// chain-scoped lifetime cap `chain_execution_timeout`/`chain_deadline_at`
+    /// (#617). The chain cap is anchored at the *first* run of the chain, so
+    /// changing type must not reset it: cross-type continuation is not an
+    /// escape hatch from a runaway-loop budget.
+    ///
+    /// The fleet-wide `max_workflow_execution_timeout` ceiling is applied to
+    /// the target's declared timeout exactly as at every other registry-aware
+    /// start path, so a type change is not an escape hatch from that either.
+    ///
+    /// **Not consulted on this path**: the target type's `throttle` (#607),
+    /// `debounce` (#499), `batch` (#518) and `max_input_bytes` (#252). Those
+    /// are *admission* policies, and continue-as-new is in-flight continuation
+    /// rather than a start — so a cross-type transition does not pass through
+    /// the target type's admission gates, and the payload cap enforced is the
+    /// predecessor's. If a phase must be paced or rate-limited on entry, gate
+    /// it at the caller instead.
+    ///
+    /// # Addressing consequence (read this)
+    ///
+    /// Harvest's active-run identity is `(workflow_name, workflow_id)`, so
+    /// after a cross-type transition an external `signal_with_start` /
+    /// `update_with_start` must name the **new** type to attach to the live
+    /// successor. Naming the old type instead starts a *fresh* run of the old
+    /// type — which can legitimately coexist with the live successor, since
+    /// the two occupy different uniqueness slots. Address the entity by its
+    /// current phase type, or keep a stable front-door type that transitions
+    /// only internally.
+    ///
+    /// The inverse is the hazard: because the successor must *take*
+    /// `(workflow_type, workflow_id)`, a **live** run someone already started
+    /// under that pair blocks the transition, and this execution is failed
+    /// terminally rather than displacing it (see *Errors*). Starting the next
+    /// phase out-of-band while the current phase is still running is therefore
+    /// not benign — let the entity transition itself.
+    ///
+    /// A cross-type successor also leaves its schedule's overlap controls
+    /// behind: `max_active_runs` counting and `OverlapPolicy::CancelOther` /
+    /// `TerminateOther` both select on the *schedule's* `workflow_name`, so
+    /// they no longer see the run even though `schedule_id`/`scheduled_for`
+    /// are carried.
+    ///
+    /// # Rollout ordering
+    ///
+    /// The target type must be registered on the worker that runs the
+    /// transition. Continuing into an unregistered type fails the execution
+    /// terminally (see *Errors*) rather than creating a successor no worker
+    /// can dispatch — so **deploy the new phase's handler to the whole fleet
+    /// before** deploying code that continues into it.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`continue_as_new`](Self::continue_as_new). Additionally, the
+    /// worker fails the execution terminally (a `WorkflowFailed` event, no
+    /// successor created, no retry offered) in four cases:
+    ///
+    /// 1. `workflow_type` is empty or blank.
+    /// 2. `workflow_type` is not registered on the worker running the
+    ///    transition (see *Rollout ordering*).
+    /// 3. `workflow_type` names a registered **unified DAG** rather than a
+    ///    plain workflow type — a DAG successor would run the level walker
+    ///    while bypassing the admission gates `POST /dags/{name}/trigger`
+    ///    enforces, so it is rejected with a pointer to that route.
+    /// 4. A **live** (`RUNNING`/`PAUSED`) run already occupies
+    ///    `(workflow_type, workflow_id)`. Harvest admits exactly one active
+    ///    run per pair, and this path never displaces a bystander. Recovery is
+    ///    to resolve that run, then restart or reset (#148) the entity.
+    ///
+    /// Naming the *current* type is **not** an error — it is a supported
+    /// request for that type's declared defaults (which plain
+    /// [`continue_as_new`](Self::continue_as_new) deliberately does not
+    /// re-resolve), and the predecessor's own seal frees the slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn continue_as_new_as_type(
+        &self,
+        workflow_type: &str,
+        input: Value,
+    ) -> HarvestResult<()> {
+        self.continue_as_new_impl(Some(workflow_type.to_string()), input)
+            .await
+    }
+
+    /// Typed sibling of
+    /// [`continue_as_new_as_type`](Self::continue_as_new_as_type): continue as
+    /// the workflow described by `info`, serializing `input` for you (issue
+    /// #803).
+    ///
+    /// Prefer this over the raw string form — the target type name comes from
+    /// the `#[workflow]`-generated companion function, so a renamed or deleted
+    /// phase handler is a compile error rather than a runtime failure:
+    ///
+    /// ```ignore
+    /// ctx.continue_as_new_as(&paid_subscription_info(), PaidInput { plan }).await?;
+    /// ```
+    ///
+    /// See [`continue_as_new_as_type`](Self::continue_as_new_as_type) for the
+    /// successor-default, addressing, and rollout-ordering semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `input` cannot be encoded to
+    /// JSON; otherwise as
+    /// [`continue_as_new_as_type`](Self::continue_as_new_as_type).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn continue_as_new_as<I: serde::Serialize>(
+        &self,
+        info: &crate::info::WorkflowInfo,
+        input: I,
+    ) -> HarvestResult<()> {
+        let payload = serde_json::to_value(input).map_err(HarvestError::Serialization)?;
+        self.continue_as_new_as_type(info.name, payload).await
+    }
+
+    /// Shared implementation behind [`continue_as_new`](Self::continue_as_new)
+    /// and its cross-type siblings.
+    ///
+    /// `new_workflow_type` is `None` for a same-type continuation — the legacy
+    /// path, byte-identical to pre-#803 — and `Some(type)` for a cross-type
+    /// one. **Presence decides**: the field is never normalized away when the
+    /// named type happens to equal the current one, because naming a type is
+    /// an explicit request for *that type's* declared defaults.
+    async fn continue_as_new_impl(
+        &self,
+        new_workflow_type: Option<String>,
+        input: Value,
+    ) -> HarvestResult<()> {
+        let history_match =
+            self.match_history(|m| m.match_continue_as_new(&input, new_workflow_type.as_deref()));
 
         match history_match {
             HistoryMatch::Matched { output } => {
                 // Replay still emits the terminal command so the worker can
                 // observe the recorded intent while draining commands.
-                self.push_command(WorkflowCommand::ContinueAsNew { input: output });
+                //
+                // `input` echoes the recorded value (`output`) while
+                // `new_workflow_type` is the live argument — an asymmetry that
+                // is only sound because `match_continue_as_new` compares the
+                // recorded target type FIRST and returns `Diverged` on any
+                // mismatch, so reaching this arm proves the two are equal. The
+                // assert pins that coupling: if the guard is ever loosened,
+                // this fires in debug/test rather than silently forking the
+                // chain into a type history never recorded.
+                debug_assert!(
+                    self.recorded_continue_as_new_type_matches(new_workflow_type.as_deref()),
+                    "reaching Matched must imply the recorded target type equals the live one"
+                );
+                self.push_command(WorkflowCommand::ContinueAsNew {
+                    input: output,
+                    new_workflow_type,
+                });
                 park_until_dropped().await
             }
             HistoryMatch::Diverged {
@@ -10299,11 +10495,21 @@ impl WorkflowContext {
                         kind: crate::error::PayloadKind::WorkflowInput,
                         observed_bytes: observed,
                         cap_bytes: self.payload_max_workflow_input,
-                        workflow_type: self.workflow_name.clone(),
+                        // Name the run this input is destined for: the target
+                        // type for a cross-type continuation (#803), else our
+                        // own. The cap value itself is still the *current*
+                        // type's — the context cannot see the target's
+                        // `max_input_bytes` override.
+                        workflow_type: new_workflow_type
+                            .clone()
+                            .unwrap_or_else(|| self.workflow_name.clone()),
                         activity_name: None,
                     });
                 }
-                self.push_command(WorkflowCommand::ContinueAsNew { input });
+                self.push_command(WorkflowCommand::ContinueAsNew {
+                    input,
+                    new_workflow_type,
+                });
                 park_until_dropped().await
             }
         }
@@ -14975,10 +15181,226 @@ mod tests {
         let drained = ctx.drain_commands();
         assert_eq!(drained.len(), 1);
         match &drained[0] {
-            WorkflowCommand::ContinueAsNew { input } => {
+            WorkflowCommand::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => {
                 assert_eq!(input, &payload);
+                assert!(
+                    new_workflow_type.is_none(),
+                    "the legacy same-type call must record no target type (issue #803 AC1)"
+                );
             }
             other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    // ── Cross-type continue-as-new (issue #803) ─────────────────────────
+
+    /// Drive a never-resolving continue-as-new future far enough to queue its
+    /// command, then hand back whatever was drained.
+    async fn drain_parked_continue_as_new(
+        ctx: &WorkflowContext,
+        fut: impl std::future::Future<Output = HarvestResult<()>>,
+    ) -> Vec<WorkflowCommand> {
+        tokio::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => panic!("continue_as_new must not resolve"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+        ctx.drain_commands()
+    }
+
+    /// AC1/AC2: the untyped cross-type call records the named target type.
+    #[tokio::test]
+    async fn continue_as_new_as_type_records_the_target_type() {
+        let ctx = WorkflowContext::new_test();
+        let payload = serde_json::json!({"tier": "paid"});
+
+        let drained = drain_parked_continue_as_new(
+            &ctx,
+            ctx.continue_as_new_as_type("paid_subscription", payload.clone()),
+        )
+        .await;
+
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => {
+                assert_eq!(input, &payload);
+                assert_eq!(new_workflow_type.as_deref(), Some("paid_subscription"));
+            }
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    /// AC1: the typed entry point takes the target name from the
+    /// `#[workflow]`-generated `WorkflowInfo` and serializes the input.
+    #[tokio::test]
+    async fn continue_as_new_as_takes_the_type_from_workflow_info() {
+        let ctx = WorkflowContext::new_test();
+        let info = crate::info::WorkflowInfo {
+            mcp: false,
+            name: "paid_subscription",
+            module: "app::phases",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        };
+
+        let drained =
+            drain_parked_continue_as_new(&ctx, ctx.continue_as_new_as(&info, vec![1_u8, 2])).await;
+
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => {
+                assert_eq!(input, &serde_json::json!([1, 2]));
+                assert_eq!(new_workflow_type.as_deref(), Some("paid_subscription"));
+            }
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    /// **Presence decides** (documented rule): naming the *current* type is
+    /// still a cross-type request, so it is recorded rather than normalized
+    /// away — the author explicitly asked for that type's declared defaults.
+    #[tokio::test]
+    async fn continue_as_new_as_type_naming_the_current_type_is_still_recorded() {
+        let ctx = WorkflowContext::new_test();
+        let own = ctx.workflow_type().to_string();
+
+        let drained = drain_parked_continue_as_new(
+            &ctx,
+            ctx.continue_as_new_as_type(&own, serde_json::json!({})),
+        )
+        .await;
+
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew {
+                new_workflow_type, ..
+            } => assert_eq!(new_workflow_type.as_deref(), Some(own.as_str())),
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    /// AC6: replaying a recorded cross-type history re-emits the same target
+    /// type, and the future still never resolves.
+    #[tokio::test]
+    async fn continue_as_new_as_type_replays_the_recorded_target_type() {
+        let payload = serde_json::json!({"tier": "paid"});
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: crate::types::ExecutionId::new(),
+                input: payload.clone(),
+                new_workflow_type: Some("paid_subscription".to_string()),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(crate::types::ExecutionId::new(), history);
+
+        let drained = drain_parked_continue_as_new(
+            &ctx,
+            ctx.continue_as_new_as_type("paid_subscription", payload.clone()),
+        )
+        .await;
+
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => {
+                assert_eq!(input, &payload);
+                assert_eq!(new_workflow_type.as_deref(), Some("paid_subscription"));
+            }
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    /// AC6: redirecting a recorded continuation to a different type is
+    /// non-determinism, not a silent re-route.
+    #[tokio::test]
+    async fn continue_as_new_target_type_change_is_nondeterministic() {
+        let payload = serde_json::json!({"tier": "paid"});
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: crate::types::ExecutionId::new(),
+                input: payload.clone(),
+                new_workflow_type: Some("paid_subscription".to_string()),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(crate::types::ExecutionId::new(), history);
+
+        // Bounded deliberately: if the type guard ever regresses, the call
+        // resolves `Matched` and parks forever (`park_until_dropped`), which
+        // would turn a regression into a multi-hour CI timeout instead of a
+        // red test. The sibling `drain_parked_continue_as_new` helper exists
+        // for the same reason.
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.continue_as_new_as_type("churned", payload),
+        )
+        .await
+        .expect("a redirected target must diverge, not park forever")
+        .expect_err("a redirected target type must be non-deterministic");
+        assert!(
+            matches!(err, HarvestError::NonDeterministic { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "a divergence must queue no command"
+        );
+    }
+
+    /// The payload-cap rejection names the run the input is destined for —
+    /// the *target* type on a cross-type continuation.
+    #[tokio::test]
+    async fn continue_as_new_as_type_payload_cap_names_the_target_type() {
+        let ctx = WorkflowContext::new_test().with_payload_caps(1, 1, 1, 1);
+        let big = serde_json::json!({"blob": "x".repeat(256)});
+
+        let err = ctx
+            .continue_as_new_as_type("paid_subscription", big)
+            .await
+            .expect_err("an oversized input must be rejected");
+        match err {
+            HarvestError::PayloadTooLarge { workflow_type, .. } => {
+                assert_eq!(workflow_type, "paid_subscription");
+            }
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
         }
     }
 
@@ -14996,6 +15418,7 @@ mod tests {
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),
                 input: payload.clone(),
+                new_workflow_type: None,
             },
         ];
 
@@ -15010,7 +15433,7 @@ mod tests {
         let drained = ctx.drain_commands();
         assert_eq!(drained.len(), 1);
         match &drained[0] {
-            WorkflowCommand::ContinueAsNew { input } => assert_eq!(input, &payload),
+            WorkflowCommand::ContinueAsNew { input, .. } => assert_eq!(input, &payload),
             other => panic!("expected ContinueAsNew, got {other:?}"),
         }
         assert!(!ctx.is_replaying());
@@ -15058,6 +15481,7 @@ mod tests {
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),
                 input: serde_json::json!({"cycle": 3}),
+                new_workflow_type: None,
             },
         ];
 
