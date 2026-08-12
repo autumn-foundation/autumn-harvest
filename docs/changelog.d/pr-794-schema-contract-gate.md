@@ -230,3 +230,33 @@ when the fix is reverted:
 - **The baseline is written atomically** (sibling temp file + `rename`), so an
   interrupted `update` cannot leave a half-written artifact that the next
   `check` would diff against.
+
+A second round (automated review on the PR) found four more of the same class:
+
+- **Bounds were compared through `f64` with an absolute `f64::EPSILON`
+  tolerance.** `f64::EPSILON` (~2.2e-16) is machine epsilon *at 1.0*, so it
+  swallowed any smaller change — `minimum: 1e-20` → `2e-20` is a real narrowing
+  reported as no delta — and `f64`'s 53-bit mantissa collapsed distinct integers
+  above 2^53, so a bound on an `i64` field could move unnoticed. Integers now
+  compare exactly through `i128`; only a genuine float falls back to `f64`,
+  where `f64` *is* the value's own representation.
+- **The branch container keyword was not compared.** Only the *current* keyword
+  was kept, so `anyOf` → `oneOf` compared equal branch-for-branch and emitted
+  nothing — while narrowing: `anyOf` accepts a value matching two or more
+  branches, `oneOf` requires exactly one, so a recorded integer matching both an
+  `integer` and a `number` branch is now rejected. `oneOf` → `anyOf` is the
+  compatible direction. A node carrying *both* keywords now fails closed, since
+  only one is analysed as the container.
+- **`anyOf` branch order was erased by the match map.** `anyOf` is what
+  `schemars` emits for `#[serde(untagged)]`, and serde binds the **first**
+  matching variant in declaration order — so reordering `Int(i64)` and
+  `Float(f64)` silently rebinds a recorded integer to the float variant. It
+  still deserializes; it no longer means the same thing, which is exactly what
+  this gate exists to catch. Reported without attempting to prove the branches
+  overlap (disjointness is not something the differ models); disjoint variants
+  can be acknowledged. `oneOf` order is not checked — exactly-one matching means
+  order cannot affect binding.
+- **A truncated diff could be acknowledged.** Audit records were generated from
+  the capped delta listing while the rebase took the whole contract, so breaking
+  changes past the cap were absorbed with nothing naming them — contradicting
+  the artifact's promise of a record per absorbed delta. Now refused.

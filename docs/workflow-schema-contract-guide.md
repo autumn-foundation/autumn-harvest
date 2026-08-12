@@ -150,6 +150,9 @@ travels with the file.
 | Adding a `oneOf`/`anyOf` variant that is **not disjoint** from an existing one | Recorded data that matched exactly one branch may now match two — `oneOf` requires exactly one |
 | Adding **or removing** an `allOf` conjunct | `allOf` is an AND: adding narrows. Removing is *also* breaking — draft-07 `additionalProperties` does not see into subschemas, so dropping a member that declared `properties` turns those keys into "additional" and **tightens** the schema |
 | Two `oneOf`/`anyOf` branches the differ cannot tell apart | Branches are matched across revisions by identity; ambiguous keying means a removal could pass unnoticed, so the comparison fails closed |
+| Changing the branch container `anyOf` → `oneOf` | `anyOf` accepts a value matching two or more branches; `oneOf` requires exactly one. With `integer` and `number` branches a recorded integer matches both — accepted before, rejected now — even though no branch changed |
+| **Reordering** `anyOf` branches | `anyOf` is `#[serde(untagged)]`, and serde binds the **first** matching variant in declaration order. Swapping `Int(i64)` and `Float(f64)` rebinds a recorded integer to the float variant: it still deserializes, but it no longer means the same thing. (`oneOf` requires exactly one match, so order cannot affect binding — reordering it is not a delta.) Reported without proving the branches overlap; acknowledge it if they are disjoint |
+| A node carrying **both** `oneOf` and `anyOf` | Only one is analysed as the branch container, so a change to the other cannot be classified |
 | Changing an **unresolvable** `$ref` (external, dangling, cyclic) | The target cannot be read, so the change cannot be classified |
 | A bound that is present but **not a JSON number** | It cannot be placed on the tighten/relax lattice; treating it as absent would report a malformed value as "removed" → compatible |
 | A checked-in acknowledgement whose reason is **blank** | A rubber stamp is not an acknowledgement; the artifact is rejected |
@@ -166,6 +169,7 @@ travels with the file.
 | Adding an `enum` value, or a **disjoint** `oneOf`/`anyOf` variant | Nothing recorded matches it |
 | Relaxing `additionalProperties` or a bound | Strictly more is accepted |
 | Adding a workflow type, or publishing a schema for the first time | Nothing was recorded under a contract that did not exist |
+| Changing the branch container `oneOf` → `anyOf` | `oneOf` required exactly one match; `anyOf` accepts at least one, so strictly more is accepted |
 | **Removing** a workflow type | Gated more accurately elsewhere — see below |
 | Editing any annotation (`title`, `description`, `examples`, …) | Not a constraint; produces **zero** deltas |
 
@@ -253,6 +257,13 @@ first two rows).
 
 The diff is printed to stdout **before** the non-zero exit whenever one exists,
 so CI logs are self-explanatory. A read/parse failure has no diff to print.
+
+Bounds are compared **exactly**, never through `f64` with a tolerance:
+`f64::EPSILON` is machine epsilon *at 1.0*, so as an absolute tolerance it
+swallows a real narrowing like `minimum: 1e-20` → `2e-20`; and `f64`'s 53-bit
+mantissa collapses distinct integers above 2^53, so a bound on an `i64` field
+could move with no delta. Integers compare through `i128`; only a genuine float
+falls back to `f64`, where `f64` *is* the value's own representation.
 
 ### Why truncation fails
 
@@ -358,6 +369,10 @@ Guardrails:
 - A blank or whitespace-only `--acknowledge` is refused: a rubber stamp is not
   an acknowledgement.
 - On refusal the baseline is left **untouched**.
+- A **truncated** diff cannot be acknowledged. The artifact promises an audit
+  record for every absorbed breaking delta, but the stored listing is capped
+  while the rebase takes the whole contract — so the excess would be absorbed
+  with nothing naming it. Split the change into smaller steps.
 - A purely compatible change needs no acknowledgement — just re-run `update`.
 - The audit log is **append-only**: prior acknowledgements are carried forward,
   so the record of past migrations is never quietly erased.

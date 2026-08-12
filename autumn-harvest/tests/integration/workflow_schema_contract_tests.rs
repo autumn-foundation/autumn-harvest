@@ -10,8 +10,9 @@
 
 use autumn_harvest::info::validate_against_schema;
 use autumn_harvest::schema_contract::{
-    AcknowledgedBreakingChange, ChangeKind, SCHEMA_CONTRACT_VERSION, SchemaContractDiff,
-    SchemaRole, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry, canonicalize_schema,
+    AcknowledgedBreakingChange, ChangeKind, MAX_DELTAS, SCHEMA_CONTRACT_VERSION,
+    SchemaContractDiff, SchemaRole, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
+    canonicalize_schema,
 };
 use serde_json::{Value, json};
 
@@ -1850,4 +1851,183 @@ fn the_current_contract_version_still_parses() {
         .to_json_pretty()
         .unwrap();
     WorkflowSchemaContract::parse(&json).expect("the current version must parse");
+}
+
+// ── Codex review: exact bounds, container keyword, anyOf order, truncated ack ─
+
+/// A bound change smaller than `f64::EPSILON` is still a narrowing.
+///
+/// `f64::EPSILON` (~2.2e-16) is machine epsilon **at 1.0**; used as an absolute
+/// tolerance it swallows every smaller change. `minimum: 1e-20` → `2e-20`
+/// rejects values the baseline accepted.
+#[test]
+fn a_sub_epsilon_bound_tightening_is_still_breaking() {
+    assert_breaking(
+        json!({"type": "number", "minimum": 1e-20}),
+        json!({"type": "number", "minimum": 2e-20}),
+        ChangeKind::BoundTightened,
+    );
+}
+
+/// ...and the relaxation in the same range is still reported.
+#[test]
+fn a_sub_epsilon_bound_relaxation_is_reported_compatible() {
+    assert_compatible_delta(
+        json!({"type": "number", "minimum": 2e-20}),
+        json!({"type": "number", "minimum": 1e-20}),
+        ChangeKind::BoundRelaxed,
+    );
+}
+
+/// Distinct integers above 2^53 must not collapse through `f64`.
+///
+/// `f64` has a 53-bit mantissa, so `9007199254740993` and `9007199254740992`
+/// become the same value — a bound on an `i64` field could move with no delta.
+#[test]
+fn a_bound_change_above_the_f64_mantissa_is_not_collapsed() {
+    assert_breaking(
+        json!({"type": "integer", "format": "int64", "minimum": 9_007_199_254_740_992_i64}),
+        json!({"type": "integer", "format": "int64", "minimum": 9_007_199_254_740_993_i64}),
+        ChangeKind::BoundTightened,
+    );
+}
+
+/// An identical bound is still not a delta (the exact path did not over-report).
+#[test]
+fn an_unchanged_large_integer_bound_is_not_reported() {
+    assert_compatible(
+        json!({"type": "integer", "minimum": 9_007_199_254_740_993_i64}),
+        json!({"type": "integer", "minimum": 9_007_199_254_740_993_i64}),
+    );
+}
+
+/// `anyOf` → `oneOf` narrows even when every branch is untouched.
+///
+/// `anyOf` accepts a value matching two or more branches; `oneOf` requires
+/// exactly one. A recorded integer matches both an `integer` and a `number`
+/// branch, so it is accepted under `anyOf` and rejected under `oneOf`.
+#[test]
+fn changing_anyof_to_oneof_is_breaking_even_with_identical_branches() {
+    let branches = json!([{"type": "integer"}, {"type": "number"}]);
+    assert_breaking(
+        json!({"anyOf": branches}),
+        json!({"oneOf": branches}),
+        ChangeKind::BoundTightened,
+    );
+}
+
+/// `oneOf` → `anyOf` is the widening direction.
+#[test]
+fn changing_oneof_to_anyof_is_reported_compatible() {
+    let branches = json!([{"type": "integer"}, {"type": "number"}]);
+    assert_compatible_delta(
+        json!({"oneOf": branches}),
+        json!({"anyOf": branches}),
+        ChangeKind::BoundRelaxed,
+    );
+}
+
+/// A node carrying BOTH keywords is outside what the branch model covers.
+///
+/// `branch_set` selects `oneOf` first, so the `anyOf` sibling is ignored — and
+/// `anyOf` is in the analysed set, so the fail-closed sweep skips it too.
+#[test]
+fn a_node_with_both_oneof_and_anyof_fails_closed_on_change() {
+    assert_breaking(
+        json!({
+            "oneOf": [{"type": "object", "required": ["A"], "properties": {"A": {"type": "string"}}}],
+            "anyOf": [{"type": "string"}],
+        }),
+        json!({
+            "oneOf": [{"type": "object", "required": ["A"], "properties": {"A": {"type": "string"}}}],
+            "anyOf": [{"type": "integer"}],
+        }),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// Reordering `anyOf` branches silently rebinds recorded data.
+///
+/// For `#[serde(untagged)]`, serde binds the FIRST matching variant in
+/// declaration order. Swapping `Int(i64)` and `Float(f64)` means a recorded
+/// integer — which matches both — now deserializes as the float variant. It
+/// still parses; it no longer means the same thing.
+#[test]
+fn reordering_untagged_anyof_variants_is_breaking() {
+    assert_breaking(
+        json!({"anyOf": [
+            {"type": "integer", "format": "int64"},
+            {"type": "number", "format": "double"},
+        ]}),
+        json!({"anyOf": [
+            {"type": "number", "format": "double"},
+            {"type": "integer", "format": "int64"},
+        ]}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// `oneOf` requires exactly one match, so order cannot affect binding there.
+#[test]
+fn reordering_oneof_branches_is_not_a_delta() {
+    let a = json!({"type": "object", "required": ["A"], "properties": {"A": {"type": "string"}}});
+    let b = json!({"type": "object", "required": ["B"], "properties": {"B": {"type": "string"}}});
+    assert_compatible(json!({"oneOf": [a, b]}), json!({"oneOf": [b, a]}));
+}
+
+/// Appending an `anyOf` branch is not a reorder — `T` → `Option<T>` appends a
+/// `null` branch and must stay compatible.
+#[test]
+fn appending_an_anyof_branch_is_not_reported_as_a_reorder() {
+    let obj = json!({"type": "object", "required": ["A"], "properties": {"A": {"type": "string"}}});
+    assert_compatible(
+        json!({"anyOf": [obj]}),
+        json!({"anyOf": [obj, {"type": "null"}]}),
+    );
+}
+
+/// A truncated diff cannot be acknowledged.
+///
+/// The artifact promises an audit record for every absorbed breaking delta, but
+/// the stored listing is capped while the rebase takes the whole contract — so
+/// the excess would be absorbed with no record of it.
+#[test]
+fn acknowledging_a_truncated_diff_is_refused() {
+    // One property per workflow, renamed — two breaking deltas each — enough
+    // workflows to push the tally past the cap.
+    let entries = |suffix: &str| {
+        (0..(MAX_DELTAS / 2 + 10))
+            .map(|i| WorkflowSchemaEntry {
+                name: format!("wf{i:05}"),
+                description: None,
+                input_schema: Some(json!({
+                    "type": "object",
+                    "properties": {format!("f{suffix}"): {"type": "string"}},
+                    "required": [format!("f{suffix}")],
+                })),
+                output_schema: None,
+                error_schema: None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let base = WorkflowSchemaContract::from_entries("0.0.0-test", entries("a"));
+    let cur = WorkflowSchemaContract::from_entries("0.0.0-test", entries("b"));
+
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&base, &cur);
+    assert!(diff.truncated, "fixture must exceed the delta cap");
+    assert!(
+        diff.breaking_count > diff.deltas.len(),
+        "the tally must exceed the stored listing: {} vs {}",
+        diff.breaking_count,
+        diff.deltas.len()
+    );
+
+    let err = base
+        .acknowledged_update(&cur, "drained", None)
+        .expect_err("a truncated diff must not be acknowledgeable");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("truncated"),
+        "the refusal must name truncation as the cause: {msg}"
+    );
 }

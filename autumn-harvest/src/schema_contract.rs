@@ -37,6 +37,7 @@
 //! Pure `serde_json` analysis: no new `WorkflowEvent` variant, no event-schema
 //! change, no migration, no database, no network. It is read-only.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -541,6 +542,19 @@ pub enum SchemaContractError {
     /// An acknowledgement was supplied but carried no justification.
     #[error("an acknowledgement must record WHY the break is safe; the reason was blank")]
     BlankAcknowledgement,
+    /// The diff was truncated, so an audit record cannot be written for every
+    /// absorbed breaking delta.
+    #[error(
+        "refusing to acknowledge a truncated diff: {breaking} breaking change(s) were found but \
+         only {recorded} delta(s) were recorded, so the audit log would not name every change \
+         being absorbed. Split the change into smaller steps."
+    )]
+    TruncatedAcknowledgement {
+        /// How many deltas the capped report actually stored.
+        recorded: usize,
+        /// The true breaking tally, which keeps counting past the cap.
+        breaking: usize,
+    },
     /// The contract could not be serialised.
     #[error("failed to serialize the workflow schema contract: {0}")]
     Serialize(#[from] serde_json::Error),
@@ -708,6 +722,17 @@ impl WorkflowSchemaContract {
             return Err(SchemaContractError::BlankAcknowledgement);
         }
         let diff = diff_schema_contracts(self, current);
+        // The artifact promises an audit record for EVERY absorbed breaking
+        // delta, but the stored listing is capped at `MAX_DELTAS` while the
+        // rebase takes the whole current contract — so a truncated diff would
+        // silently absorb the excess with no record of it. Refuse rather than
+        // write an audit log that under-reports what was acknowledged.
+        if diff.truncated {
+            return Err(SchemaContractError::TruncatedAcknowledgement {
+                recorded: diff.deltas.len(),
+                breaking: diff.breaking_count,
+            });
+        }
         let acks: Vec<AcknowledgedBreakingChange> = diff
             .breaking()
             .map(|d| AcknowledgedBreakingChange {
@@ -1700,9 +1725,7 @@ fn diff_bounds(
                 }
                 continue;
             }
-            let b = b_raw.and_then(Value::as_f64);
-            let c = c_raw.and_then(Value::as_f64);
-            match (b, c) {
+            match (b_raw, c_raw) {
                 (None, Some(cv)) => diff.push(ctx.delta(
                     path,
                     ChangeKind::BoundTightened,
@@ -1718,8 +1741,34 @@ fn diff_bounds(
                     Verdict::Compatible,
                     format!("`{key}` was removed"),
                 )),
-                (Some(bv), Some(cv)) if (bv - cv).abs() > f64::EPSILON => {
-                    let tightened = if tighter_is_greater { cv > bv } else { cv < bv };
+                (Some(bv), Some(cv)) => {
+                    // Compared EXACTLY, not through `f64` with an absolute
+                    // tolerance. See `cmp_json_numbers`: both a sub-epsilon
+                    // change and a >2^53 integer change are real narrowings
+                    // that an `f64::EPSILON` guard reports as no delta.
+                    let Some(ord) = cmp_json_numbers(bv, cv) else {
+                        diff.push(ctx.delta(
+                            path,
+                            ChangeKind::UnanalysedConstraintChanged,
+                            Verdict::Breaking,
+                            format!(
+                                "`{key}` changed from {bv} to {cv} but the two values are not \
+                                 comparable (NaN); the change cannot be placed on the \
+                                 tighten/relax lattice and is reported breaking (fail closed)"
+                            ),
+                        ));
+                        continue;
+                    };
+                    if ord == Ordering::Equal {
+                        continue;
+                    }
+                    // `ord` is `bv.cmp(cv)`: for a LOWER bound, tightening
+                    // means the value went UP, i.e. `bv < cv`.
+                    let tightened = if tighter_is_greater {
+                        ord == Ordering::Less
+                    } else {
+                        ord == Ordering::Greater
+                    };
                     if tightened {
                         diff.push(ctx.delta(
                             path,
@@ -1739,10 +1788,40 @@ fn diff_bounds(
                         ));
                     }
                 }
-                _ => {}
+                (None, None) => {}
             }
         }
     }
+}
+
+/// Compare two JSON numbers **without** losing precision to `f64`.
+///
+/// Reading a bound through `as_f64` and testing `(b - c).abs() > f64::EPSILON`
+/// is lossy in both directions that matter:
+///
+/// * `f64::EPSILON` (~2.2e-16) is machine epsilon **at 1.0**, so used as an
+///   absolute tolerance it swallows any smaller change. `minimum: 1e-20` →
+///   `2e-20` is a genuine narrowing — it rejects values the baseline accepted —
+///   yet compares "equal".
+/// * `f64` has a 53-bit mantissa, so distinct integers above 2^53 collapse:
+///   `9007199254740993` and `9007199254740992` become the same `f64`. A bound
+///   on an `i64` field can move without producing a delta.
+///
+/// Integers are therefore compared exactly through `i128` (every JSON integer
+/// `serde_json` produces fits in `i64` or `u64`). Only a genuine float falls
+/// back to `f64`, where `f64` *is* the value's own representation and nothing
+/// JSON preserved is lost. `None` means incomparable (NaN), which callers
+/// report fail-closed rather than treating as unchanged.
+fn cmp_json_numbers(a: &Value, b: &Value) -> Option<Ordering> {
+    let exact = |v: &Value| {
+        v.as_i64()
+            .map(i128::from)
+            .or_else(|| v.as_u64().map(i128::from))
+    };
+    if let (Some(x), Some(y)) = (exact(a), exact(b)) {
+        return Some(x.cmp(&y));
+    }
+    a.as_f64()?.partial_cmp(&b.as_f64()?)
 }
 
 fn required_set(obj: &Map<String, Value>) -> BTreeSet<String> {
@@ -2102,6 +2181,175 @@ fn branch_set(obj: &Map<String, Value>) -> Option<(&'static str, Vec<Value>)> {
     None
 }
 
+/// Compare the branch **container keyword** itself, which is a constraint.
+///
+/// `anyOf` means "at least one branch matches"; `oneOf` means "exactly one".
+/// Switching `anyOf` → `oneOf` therefore **narrows** even when every branch is
+/// untouched: with `integer` and `number` branches, a recorded integer matches
+/// both, which `anyOf` accepts and `oneOf` rejects. Only the *current* keyword
+/// is carried into the branch comparison, so without this the branch maps
+/// compare equal and the change emits nothing at all.
+///
+/// Also guards the both-present case: [`branch_set`] selects `oneOf` first, so
+/// an `anyOf` sibling on the same node is ignored — and `anyOf` sits in
+/// [`ANALYSED_KEYWORDS`], so [`diff_unanalysed`]'s fail-closed sweep skips it
+/// too. A change to the ignored sibling would otherwise be invisible.
+fn diff_branch_container_keyword(
+    ctx: &DiffCtx<'_>,
+    bo: &Map<String, Value>,
+    co: &Map<String, Value>,
+    bb: Option<&(&'static str, Vec<Value>)>,
+    cb: Option<&(&'static str, Vec<Value>)>,
+    path: &str,
+    diff: &mut SchemaContractDiff,
+) {
+    // A node carrying BOTH keywords is outside what `branch_set` models.
+    let both = |o: &Map<String, Value>| o.contains_key("oneOf") && o.contains_key("anyOf");
+    if (both(bo) || both(co))
+        && (bo.get("oneOf") != co.get("oneOf") || bo.get("anyOf") != co.get("anyOf"))
+    {
+        diff.push(
+            ctx.delta(
+                path,
+                ChangeKind::UnanalysedConstraintChanged,
+                Verdict::Breaking,
+                "this node carries BOTH `oneOf` and `anyOf`; only one is analysed as the branch \
+             container, so a change to the other cannot be classified and is reported breaking \
+             (fail closed). Acknowledge it if it is safe"
+                    .to_string(),
+            ),
+        );
+        return;
+    }
+
+    let (Some((bk, _)), Some((ck, _))) = (bb, cb) else {
+        // One side is a flat node lifted into a one-element branch set; there
+        // is no baseline keyword to compare against.
+        return;
+    };
+    if bk == ck {
+        return;
+    }
+    let (change, verdict, why) = if *ck == "oneOf" {
+        (
+            ChangeKind::BoundTightened,
+            Verdict::Breaking,
+            "`anyOf` accepts a value that matches two or more branches; `oneOf` requires exactly \
+             one, so recorded data matching several branches is now rejected",
+        )
+    } else {
+        (
+            ChangeKind::BoundRelaxed,
+            Verdict::Compatible,
+            "`oneOf` required exactly one match; `anyOf` accepts at least one, so strictly more \
+             is accepted",
+        )
+    };
+    diff.push(ctx.delta(
+        path,
+        change,
+        verdict,
+        format!("the branch container changed from `{bk}` to `{ck}`: {why}"),
+    ));
+}
+
+/// Report a reordering of `anyOf` branches.
+///
+/// `anyOf` is what `schemars` emits for `#[serde(untagged)]`, and serde binds
+/// the **first** matching variant in declaration order. Reordering two
+/// overlapping variants (`Int(i64), Float(f64)` → `Float(f64), Int(i64)`)
+/// therefore silently rebinds recorded data to a *different* variant: it still
+/// deserializes, but it no longer means the same thing — precisely the failure
+/// this gate exists to catch. Branches are matched by key in a `BTreeMap`,
+/// which erases order, so the reorder must be detected separately.
+///
+/// `oneOf` requires exactly one match, so declaration order cannot affect
+/// binding there and is not checked.
+///
+/// Only branches present on **both** sides are compared: an addition
+/// legitimately shifts positions (`T` → `Option<T>` appends a `null` branch)
+/// and is judged by the add/remove rules instead.
+///
+/// Reported breaking without attempting to prove the branches overlap —
+/// deciding schema disjointness in general is not something this differ models,
+/// and reordering variants of an untagged enum is a deliberate act. Disjoint
+/// variants can be acknowledged.
+fn diff_anyof_branch_order(
+    ctx: &DiffCtx<'_>,
+    base_keys: &[String],
+    cur_keys: &[String],
+    path: &str,
+    diff: &mut SchemaContractDiff,
+) {
+    let common: BTreeSet<&String> = base_keys.iter().filter(|k| cur_keys.contains(k)).collect();
+    let seq = |keys: &[String]| -> Vec<String> {
+        keys.iter()
+            .filter(|k| common.contains(k))
+            .cloned()
+            .collect()
+    };
+    let (b_seq, c_seq) = (seq(base_keys), seq(cur_keys));
+    if b_seq == c_seq {
+        return;
+    }
+    diff.push(ctx.delta(
+        path,
+        ChangeKind::UnanalysedConstraintChanged,
+        Verdict::Breaking,
+        format!(
+            "`anyOf` branches were reordered ({} -> {}). For `#[serde(untagged)]`, serde binds \
+             the FIRST matching variant in declaration order, so recorded data that matched an \
+             earlier variant may now bind to a different one — it still deserializes, but it no \
+             longer means the same thing. Acknowledge it if the variants are disjoint",
+            b_seq.join(", "),
+            c_seq.join(", ")
+        ),
+    ));
+}
+
+/// Key both sides' branches, checking `anyOf` declaration order on the way.
+///
+/// Each side is keyed against *its own* document root, so `$ref` targets are
+/// resolved before comparison and a branch does not appear to move merely
+/// because it was inlined on one side and referenced on the other.
+///
+/// Keys are computed in DECLARATION ORDER first because the returned maps erase
+/// that order — and for `anyOf`, order *is* serde's untagged binding rule (see
+/// [`diff_anyof_branch_order`]).
+fn key_branches(
+    ctx: &DiffCtx<'_>,
+    base_branches: &[Value],
+    cur_branches: &[Value],
+    both_anyof: bool,
+    path: &str,
+    diff: &mut SchemaContractDiff,
+) -> (BTreeMap<String, Value>, BTreeMap<String, (Value, bool)>) {
+    let base_keys: Vec<String> = base_branches
+        .iter()
+        .map(|b| branch_key(b, ctx.base_root).0)
+        .collect();
+    let cur_keyed: Vec<(String, bool)> = cur_branches
+        .iter()
+        .map(|b| branch_key(b, ctx.cur_root))
+        .collect();
+
+    if both_anyof {
+        let cur_keys: Vec<String> = cur_keyed.iter().map(|(k, _)| k.clone()).collect();
+        diff_anyof_branch_order(ctx, &base_keys, &cur_keys, path, diff);
+    }
+
+    let base_by_key: BTreeMap<String, Value> = base_keys
+        .into_iter()
+        .zip(base_branches.iter().cloned())
+        .collect();
+    let cur_by_key: BTreeMap<String, (Value, bool)> = cur_keyed
+        .into_iter()
+        .zip(cur_branches.iter().cloned())
+        .map(|((k, d), b)| (k, (b, d)))
+        .collect();
+    (base_by_key, cur_by_key)
+}
+
 fn diff_branches(
     ctx: &mut DiffCtx<'_>,
     bo: &Map<String, Value>,
@@ -2115,6 +2363,7 @@ fn diff_branches(
     if bb.is_none() && cb.is_none() {
         return;
     }
+    diff_branch_container_keyword(ctx, bo, co, bb.as_ref(), cb.as_ref(), path, diff);
     let base_branches = bb.as_ref().map_or_else(
         || vec![Value::Object(strip_branch_keywords(bo))],
         |(_, v)| v.clone(),
@@ -2125,20 +2374,9 @@ fn diff_branches(
         |(_, v)| v.clone(),
     );
 
-    // Each side is keyed against *its own* document root, so `$ref` targets are
-    // resolved before comparison and a branch does not appear to move merely
-    // because it was inlined on one side and referenced on the other.
-    let base_by_key: BTreeMap<String, Value> = base_branches
-        .iter()
-        .map(|b| (branch_key(b, ctx.base_root).0, b.clone()))
-        .collect();
-    let cur_by_key: BTreeMap<String, (Value, bool)> = cur_branches
-        .iter()
-        .map(|b| {
-            let (k, d) = branch_key(b, ctx.cur_root);
-            (k, (b.clone(), d))
-        })
-        .collect();
+    let both_anyof = cur_kw == "anyOf" && bb.as_ref().is_some_and(|(k, _)| *k == "anyOf");
+    let (base_by_key, cur_by_key) =
+        key_branches(ctx, &base_branches, &cur_branches, both_anyof, path, diff);
 
     // Branches are matched across the two sides BY KEY, so two branches sharing
     // a key collapse in the map and one is silently dropped — which would hide
