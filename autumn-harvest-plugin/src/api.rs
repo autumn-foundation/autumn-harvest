@@ -2355,6 +2355,17 @@ pub(crate) struct StartWorkflowRequest {
     /// [`Self::from_webhook`] so a webhook-delegated start records `webhook`
     /// provenance instead of the default `api`. `#[serde(skip)]` so it is
     /// never part of the public JSON request body.
+    /// Internal opt-in marking `idempotency_key` as **engine-derived**, so the
+    /// reserved-namespace guard admits it (issue #944 review).
+    ///
+    /// A broker connector derives its dedupe key from stable broker
+    /// coordinates and delegates through this very handler, so the guard that
+    /// stops a *caller* squatting that key would otherwise refuse the
+    /// connector's own dispatch. `#[serde(skip)]` so it is never part of the
+    /// public JSON request body — a caller cannot claim the exemption, which is
+    /// the whole point. Mirrors `WorkflowResetRequest::allow_terminal_source`.
+    #[serde(default, skip)]
+    engine_derived_idempotency_key: bool,
     #[serde(default, skip)]
     start_source_override: Option<autumn_harvest::StartSource>,
     /// Internal provenance correlation ref override (issue #740), paired with
@@ -2394,6 +2405,7 @@ impl StartWorkflowRequest {
             idempotency_key: None,
             shard_id: None,
             residency_key: None,
+            engine_derived_idempotency_key: false,
             start_source_override: None,
             start_source_ref_override: None,
         }
@@ -2439,6 +2451,7 @@ impl StartWorkflowRequest {
             shard_id: None,
             residency_key: None,
             // Webhook-delegated starts record `webhook` provenance (#740/#344).
+            engine_derived_idempotency_key: false,
             start_source_override: Some(autumn_harvest::StartSource::Webhook),
             start_source_ref_override: None,
         }
@@ -2494,6 +2507,7 @@ impl StartWorkflowRequest {
             shard_id: None,
             residency_key: None,
             // Broker-delegated starts record `broker` provenance (#740/#944).
+            engine_derived_idempotency_key: true,
             start_source_override: Some(autumn_harvest::StartSource::Broker),
             start_source_ref_override: coordinates,
         }
@@ -2538,6 +2552,17 @@ pub(crate) struct SignalWithStartRequest {
     /// [`Self::from_webhook`] so a webhook-delegated `SignalsWithStart` fresh
     /// run records `webhook` instead of the default `signal_with_start`.
     /// `#[serde(skip)]` so it is never part of the public JSON body.
+    /// Internal opt-in marking `idempotency_key` as **engine-derived**, so the
+    /// reserved-namespace guard admits it (issue #944 review).
+    ///
+    /// A broker connector derives its dedupe key from stable broker
+    /// coordinates and delegates through this very handler, so the guard that
+    /// stops a *caller* squatting that key would otherwise refuse the
+    /// connector's own dispatch. `#[serde(skip)]` so it is never part of the
+    /// public JSON request body — a caller cannot claim the exemption, which is
+    /// the whole point. Mirrors `WorkflowResetRequest::allow_terminal_source`.
+    #[serde(default, skip)]
+    engine_derived_idempotency_key: bool,
     #[serde(default, skip)]
     start_source_override: Option<autumn_harvest::StartSource>,
     /// Internal workflow-start provenance *reference* override (issue #740).
@@ -2582,6 +2607,7 @@ impl SignalWithStartRequest {
             idempotency_key,
             // Webhook-delegated signal-with-start records `webhook` provenance
             // on a fresh run (#740/#344).
+            engine_derived_idempotency_key: false,
             start_source_override: Some(autumn_harvest::StartSource::Webhook),
             // Unchanged for webhooks: the core's default (the idempotency key,
             // i.e. the verified delivery id) is already the right reference.
@@ -2622,6 +2648,7 @@ impl SignalWithStartRequest {
             idempotency_key,
             // Broker-delegated signal-with-start records `broker` provenance on
             // a fresh run (#740/#944).
+            engine_derived_idempotency_key: true,
             start_source_override: Some(autumn_harvest::StartSource::Broker),
             // ...and the rendered coordinates, so the documented provenance
             // query returns the same shape for BOTH binding kinds. Without
@@ -12717,6 +12744,7 @@ const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
 #[allow(clippy::result_large_err)]
 fn validate_start_idempotency_key(
     raw: Option<String>,
+    allow_engine_derived: bool,
 ) -> Result<Option<String>, axum::response::Response> {
     use axum::response::IntoResponse as _;
     match raw {
@@ -12742,10 +12770,43 @@ fn validate_start_idempotency_key(
                 )
                     .into_response());
             }
+            if !allow_engine_derived && let Some(resp) = reject_reserved_idempotency_key(trimmed) {
+                return Err(resp);
+            }
             Ok(Some(trimmed.to_string()))
         }
         None => Ok(None),
     }
+}
+
+/// Refuse an engine-reserved idempotency key from a caller (issue #944 review).
+///
+/// A broker connector derives its dedupe key from stable broker coordinates
+/// and needs that key to be unclaimable from outside: the derived keys share a
+/// durable uniqueness scope with caller-supplied ones — `(workflow_name,
+/// idempotency_key)` on `harvest_start_idempotency`, `(workflow_exec_id,
+/// idempotency_key)` on `harvest_signals` — and they are *predictable* (Kafka
+/// coordinates are `{topic}:{partition}:{offset}`). A caller who landed one
+/// first would make the broker's own delivery read as an idempotent replay,
+/// acknowledged without ever dispatching its payload.
+///
+/// Returns `Some(400)` when the key is reserved, `None` when it is fine. Uses
+/// the core predicate and message so every path refuses identically.
+#[must_use]
+fn reject_reserved_idempotency_key(key: &str) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    if !autumn_harvest::start_idempotency::is_reserved_key(key) {
+        return None;
+    }
+    Some(
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": autumn_harvest::start_idempotency::reserved_key_message()
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// Extract the `Idempotency-Key` HEADER value (issue #808), applying the same
@@ -12773,7 +12834,9 @@ fn extract_start_idempotency_header_key(
         },
         None => None,
     };
-    validate_start_idempotency_key(raw)
+    // The HEADER is always caller-supplied: a connector strips it before
+    // delegating, so it can never carry an engine-derived key.
+    validate_start_idempotency_key(raw, false)
 }
 
 /// Read-only committed-replay dedup probe (issue #808). On `shard`, look up a
@@ -13333,7 +13396,10 @@ pub(crate) async fn start_workflow(
         // Header wins when present and valid.
         Ok(Some(k)) => Some(k),
         // Header absent → fall back to the body field, same validation.
-        Ok(None) => match validate_start_idempotency_key(request.idempotency_key.clone()) {
+        Ok(None) => match validate_start_idempotency_key(
+            request.idempotency_key.clone(),
+            request.engine_derived_idempotency_key,
+        ) {
             Err(resp) => return resp,
             Ok(k) => k,
         },
@@ -17393,6 +17459,17 @@ pub(crate) async fn signal_with_start_workflow(
         .into_response();
     }
 
+    // A connector's `SignalsWithStart` binding derives its key into this same
+    // `(workflow_exec_id, idempotency_key)` scope on `harvest_signals`, so a
+    // caller must not be able to claim one (issue #944 review). Placed before
+    // the committed-replay probe below — the first thing that consumes the key.
+    if !request.engine_derived_idempotency_key
+        && let Some(key) = request.idempotency_key.as_deref()
+        && let Some(resp) = reject_reserved_idempotency_key(key)
+    {
+        return resp;
+    }
+
     let reuse_policy = match parse_reuse_policy(request.id_reuse_policy.as_deref()) {
         Ok(p) => p,
         Err(e) => {
@@ -21215,6 +21292,15 @@ pub(crate) async fn signal_workflow(
     } else {
         query.idempotency_key.filter(|s| !s.is_empty())
     };
+
+    // A connector's `SignalsWithStart` binding derives its key into this same
+    // `(workflow_exec_id, idempotency_key)` scope on `harvest_signals`, so a
+    // caller must not be able to claim one (issue #944 review).
+    if let Some(key) = idempotency_key.as_deref()
+        && let Some(resp) = reject_reserved_idempotency_key(key)
+    {
+        return resp;
+    }
 
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,
@@ -38599,6 +38685,101 @@ mod eligibility_reason_tests {
         // A queue hold alone is not a draining fleet.
         assert!(!super::is_worker_draining_only(&owned(&["queue_paused"])));
         assert!(!super::is_worker_draining_only(&[]));
+    }
+}
+
+#[cfg(test)]
+mod reserved_idempotency_key_tests {
+    use super::*;
+
+    /// The plugin's HTTP-shaped validator must refuse an engine-derived key,
+    /// or a caller can squat it and the broker's own delivery is acked as an
+    /// idempotent replay without ever dispatching (issue #944 review).
+    #[test]
+    fn the_start_route_validator_refuses_a_derived_key() {
+        let derived = "conn:L6:orders:L0::L10:orders:0:7".to_string();
+        let resp = validate_start_idempotency_key(Some(derived), false)
+            .expect_err("a caller must not be able to claim an engine-derived key");
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// One predicate, one message: the HTTP paths and the core validator must
+    /// refuse identically, so a caller cannot find a path that still accepts.
+    #[test]
+    fn the_reject_helper_agrees_with_the_core_predicate() {
+        for key in [
+            "conn:",
+            "conn:L6:orders:L0::L10:orders:0:7",
+            "  conn:leading-space-is-trimmed",
+        ] {
+            assert!(
+                autumn_harvest::start_idempotency::is_reserved_key(key),
+                "{key} must read as reserved"
+            );
+            let resp = reject_reserved_idempotency_key(key.trim())
+                .expect("a reserved key must be refused");
+            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+        // And must not over-reject: these cannot alias a derived key.
+        for ok in ["CONN:x", "conn", "connector", "xconn:y", "normal-key"] {
+            assert!(
+                reject_reserved_idempotency_key(ok).is_none(),
+                "{ok} must be accepted"
+            );
+        }
+    }
+
+    /// The exemption exists only so the connector's own dispatch — which
+    /// delegates through this same handler — is not refused by the guard that
+    /// stops a caller squatting its key. It must be unreachable from a request
+    /// body: `engine_derived_idempotency_key` is `#[serde(skip)]`, so JSON
+    /// carrying it still deserializes to `false` and the key is refused.
+    #[test]
+    fn the_engine_exemption_cannot_be_claimed_from_the_request_body() {
+        let derived = "conn:L6:orders:L0::L10:orders:0:7";
+        let body = serde_json::json!({
+            "workflow_id": "wf-1",
+            "input": {},
+            "idempotency_key": derived,
+            // A caller trying to opt itself into the exemption.
+            "engine_derived_idempotency_key": true,
+        });
+        let request: StartWorkflowRequest =
+            serde_json::from_value(body).expect("body must still deserialize");
+        assert!(
+            !request.engine_derived_idempotency_key,
+            "a caller must not be able to set the engine exemption"
+        );
+        assert!(
+            validate_start_idempotency_key(
+                request.idempotency_key.clone(),
+                request.engine_derived_idempotency_key,
+            )
+            .is_err(),
+            "the derived key must still be refused for this caller"
+        );
+        // And the exemption does admit the key when the engine sets it.
+        assert!(
+            validate_start_idempotency_key(Some(derived.to_string()), true).is_ok(),
+            "the connector's own dispatch must not be refused"
+        );
+    }
+
+    /// The length cap must still win where it applies, so this guard did not
+    /// reorder the existing rejections.
+    #[test]
+    fn the_existing_empty_and_length_rejections_still_apply() {
+        assert!(validate_start_idempotency_key(Some("   ".to_string()), false).is_err());
+        assert!(validate_start_idempotency_key(Some("x".repeat(513)), false).is_err());
+        assert_eq!(
+            validate_start_idempotency_key(Some("  fine  ".to_string()), false)
+                .expect("a normal key is accepted"),
+            Some("fine".to_string()),
+        );
+        assert_eq!(
+            validate_start_idempotency_key(None, false).expect("no key"),
+            None
+        );
     }
 }
 

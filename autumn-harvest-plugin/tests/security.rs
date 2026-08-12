@@ -1625,3 +1625,75 @@ async fn embedder_only_router_has_no_token_layer() {
     assert_ne!(res.status(), StatusCode::FORBIDDEN);
     assert_ne!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
+
+/// Issue #944 review: the connector's derived idempotency keys must be
+/// unclaimable from outside.
+///
+/// A `SignalsWithStart` binding derives its key into the same
+/// `(workflow_exec_id, idempotency_key)` scope on `harvest_signals` that this
+/// route writes, and derived keys are *predictable* — Kafka coordinates are
+/// `{topic}:{partition}:{offset}`. A caller who landed one first would make
+/// the broker's own delivery read as an idempotent replay and be acknowledged
+/// without ever dispatching its payload: silent loss.
+///
+/// Driven through the real router with no storage configured, which is exactly
+/// what proves the guard runs at the request boundary rather than somewhere
+/// behind a database read. The body is asserted, not just the status, so this
+/// cannot pass for an unrelated 400.
+#[tokio::test]
+async fn eris_a_reserved_connector_idempotency_key_is_refused_on_the_signal_route() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/workflows/00000000-0000-0000-0000-000000000001/signal/order_event")
+                .header("Content-Type", "application/json")
+                .header("Idempotency-Key", "conn:L6:orders:L0::L10:orders:0:7")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = autumn_web::reexports::axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("reserved"),
+        "the refusal must name the reservation, not some other 400: {text}"
+    );
+}
+
+/// The guard must not over-reject: a key that merely resembles the reserved
+/// prefix cannot alias a derived one, so it has to get past the boundary.
+/// `CONN:` differs from `conn:` under the Postgres text comparison backing the
+/// uniqueness scope, so refusing it would reject a legitimate caller key.
+#[tokio::test]
+async fn eris_a_near_miss_idempotency_key_is_not_refused_as_reserved() {
+    for key in ["CONN:x", "conn", "connector-key", "xconn:y"] {
+        let app = unauthenticated_app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/workflows/00000000-0000-0000-0000-000000000001/signal/order_event")
+                    .header("Content-Type", "application/json")
+                    .header("Idempotency-Key", key)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = autumn_web::reexports::axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("reserved"),
+            "{key} must not be refused as reserved (status {status}): {text}"
+        );
+    }
+}

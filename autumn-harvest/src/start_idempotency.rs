@@ -86,6 +86,52 @@ pub const START_IDEMPOTENCY_PURGE_BATCH: i64 = 1000;
 /// that limit.
 pub const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
 
+/// Key prefix **reserved for engine-derived keys**, refused on every
+/// caller-facing path (issue #944 review).
+///
+/// # Why a reservation, and not just a convention
+///
+/// A broker event-source connector cannot trust a producer to send an
+/// idempotency key, so it *derives* one from stable broker coordinates
+/// (`autumn-harvest-plugin::connector::idempotency`). Those derived keys share
+/// a durable uniqueness scope with caller-supplied ones — `(workflow_name,
+/// idempotency_key)` on `harvest_start_idempotency`, and `(workflow_exec_id,
+/// idempotency_key)` on `harvest_signals`.
+///
+/// The prefix alone does not separate them. Derived keys are *predictable*:
+/// Kafka coordinates are `{topic}:{partition}:{offset}`, so anyone who knows a
+/// topic name can enumerate them. A caller who lands the derived key first
+/// claims that row, and the broker's own delivery then reads as an idempotent
+/// replay and is acknowledged **without ever dispatching its payload** — silent
+/// loss, precisely the failure the derived key exists to prevent.
+///
+/// Refusing the prefix at the caller boundary is what actually makes the two
+/// namespaces disjoint, so an engine-derived key can never be squatted.
+///
+/// # Scope
+///
+/// Applied to every caller-facing key that reaches one of those two scopes:
+/// the plain start route (header and body), the in-process transactional-start
+/// client, signal-with-start, and the standalone signal route. Deliberately
+/// **not** applied to `update-with-start` or batch operations: their keys live
+/// in different uniqueness scopes that no connector key can reach, so refusing
+/// there would reject a caller's key for no protective gain. A connector target
+/// that ever dispatches into one of those scopes must extend this guard.
+///
+/// # Case sensitivity
+///
+/// The comparison is case-**sensitive**, matching the Postgres text comparison
+/// that backs both uniqueness scopes: `CONN:` is a genuinely different key that
+/// cannot alias a derived one, so rejecting it would be over-broad.
+pub const RESERVED_KEY_PREFIX: &str = "conn:";
+
+/// Whether `key` is in the engine-reserved namespace and must be refused from
+/// a caller. See [`RESERVED_KEY_PREFIX`].
+#[must_use]
+pub fn is_reserved_key(key: &str) -> bool {
+    key.trim().starts_with(RESERVED_KEY_PREFIX)
+}
+
 /// Shared trim + empty-rejection + length-cap validation for a request-scoped
 /// `idempotency_key`.
 ///
@@ -97,13 +143,14 @@ pub const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
 /// unrelated start for that workflow against each other.
 ///
 /// `Ok(None)` = no key supplied; `Ok(Some(trimmed))` = a valid, trimmed key;
-/// `Err(_)` = the key is present but empty/whitespace-only, or exceeds
-/// [`MAX_START_IDEMPOTENCY_KEY_LEN`] bytes after trimming.
+/// `Err(_)` = the key is present but empty/whitespace-only, exceeds
+/// [`MAX_START_IDEMPOTENCY_KEY_LEN`] bytes after trimming, or is in the
+/// engine-reserved [`RESERVED_KEY_PREFIX`] namespace.
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Config`] naming the specific
-/// violation (empty vs. too long).
+/// violation (empty vs. too long vs. reserved).
 pub fn validate_start_idempotency_key(
     raw: Option<&str>,
 ) -> crate::error::HarvestResult<Option<String>> {
@@ -118,11 +165,24 @@ pub fn validate_start_idempotency_key(
                 Err(crate::error::HarvestError::Config(format!(
                     "idempotency_key too long (max {MAX_START_IDEMPOTENCY_KEY_LEN} bytes)"
                 )))
+            } else if is_reserved_key(trimmed) {
+                Err(crate::error::HarvestError::Config(
+                    reserved_key_message().to_string(),
+                ))
             } else {
                 Ok(Some(trimmed.to_string()))
             }
         }
     }
+}
+
+/// The one rejection message every caller-facing path uses for a reserved key,
+/// so the plugin's HTTP routes and this validator can never describe the same
+/// refusal differently.
+#[must_use]
+pub const fn reserved_key_message() -> &'static str {
+    "idempotency_key must not start with the reserved prefix 'conn:' \
+     (it is reserved for engine-derived keys)"
 }
 
 /// The default retention window expressed as `f64` seconds, for the const
@@ -240,6 +300,46 @@ pub(crate) static PURGE_WINDOW_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mute
 #[cfg(test)]
 mod pure_tests {
     use super::*;
+
+    /// A caller must not be able to squat an engine-derived key.
+    ///
+    /// The connector derives predictable keys from broker coordinates and
+    /// relies on them being unclaimable from outside; if a caller lands one
+    /// first, the broker's delivery reads as a replay and is acked without
+    /// dispatching.
+    #[test]
+    fn a_reserved_prefix_key_is_refused() {
+        let derived = "conn:L6:orders:L0::L10:orders:0:7";
+        assert!(is_reserved_key(derived));
+        let err = validate_start_idempotency_key(Some(derived))
+            .expect_err("a caller must not be able to claim an engine-derived key");
+        assert!(
+            err.to_string().contains("reserved"),
+            "the rejection must name the reservation: {err}"
+        );
+        // Surrounding whitespace must not smuggle it past: the validator
+        // trims, so the *trimmed* value is what lands in the durable scope.
+        assert!(is_reserved_key("  conn:L6:orders:L0::L10:orders:0:7  "));
+        assert!(validate_start_idempotency_key(Some("  conn:anything  ")).is_err());
+    }
+
+    /// Case-sensitive on purpose: `CONN:` is a different Postgres text value
+    /// and cannot alias a derived key, so refusing it would be over-broad.
+    #[test]
+    fn a_near_miss_of_the_reserved_prefix_is_still_accepted() {
+        for ok in [
+            "CONN:x",          // different case -> different durable key
+            "conn",            // no separator -> never a derived key
+            "connector-thing", // merely starts with the letters
+            "xconn:y",
+        ] {
+            assert!(!is_reserved_key(ok), "{ok} must not read as reserved");
+            assert_eq!(
+                validate_start_idempotency_key(Some(ok)).expect("must be accepted"),
+                Some(ok.to_string()),
+            );
+        }
+    }
 
     #[test]
     fn reserve_stmt_is_a_conflict_guarded_upsert_returning_exec_id() {

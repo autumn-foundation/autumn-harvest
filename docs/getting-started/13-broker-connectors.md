@@ -323,6 +323,19 @@ Namespacing by binding means two bindings consuming the same topic never alias
 each other. The key is bounded and injectively encoded, so a pathological
 coordinate cannot collide with another message's key or blow the column limit.
 
+Derived keys carry a **reserved `conn:` prefix**, and that reservation is
+enforced rather than conventional: every caller-facing route that writes into a
+scope a derived key reaches — the plain start route (header and body), the
+in-process transactional-start client, signal-with-start, and the standalone
+signal route — rejects a caller-supplied key beginning with `conn:` with a
+`400`. That matters because derived keys are *predictable*: anyone who knows a
+topic name can enumerate `topic:partition:offset`. Without the reservation a
+caller could claim the key first, and the broker's own delivery of that message
+would then read as an idempotent replay and be acknowledged **without ever
+dispatching its payload**. The check is case-sensitive, matching the Postgres
+text comparison behind the uniqueness scope — `CONN:` is a different key that
+cannot alias a derived one, so it is still accepted.
+
 A coordinate identifies a **message**, not a logical event. A genuine
 *re-publish* of the same event is a different message, so it dispatches again.
 On a FIFO queue it is tempting to reach for the producer-controlled

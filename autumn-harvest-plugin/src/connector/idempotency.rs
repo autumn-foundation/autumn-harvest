@@ -50,12 +50,21 @@
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
-/// Prefix marking a key as connector-derived.
+/// Prefix marking a key as connector-derived, **including** its separator.
 ///
-/// Reserved: it keeps the connector's dedupe namespace provably disjoint from
-/// an idempotency key an application supplies through the plain HTTP start
-/// route, so the two can never alias.
-pub const CONNECTOR_KEY_PREFIX: &str = "conn";
+/// Reserved, and *enforced* rather than merely conventional: derived keys share
+/// a durable uniqueness scope with caller-supplied ones — `(workflow_name,
+/// idempotency_key)` on `harvest_start_idempotency` for a `Starts` binding, and
+/// `(workflow_exec_id, idempotency_key)` on `harvest_signals` for a
+/// `SignalsWithStart` one — and they are *predictable* (Kafka coordinates are
+/// `{topic}:{partition}:{offset}`). A caller who landed a derived key first
+/// would make the broker's own delivery read as an idempotent replay, acked
+/// without ever dispatching its payload.
+///
+/// So the caller-facing routes refuse this prefix outright; see
+/// [`autumn_harvest::start_idempotency::RESERVED_KEY_PREFIX`], which this
+/// aliases so the deriving and the refusing side can never drift apart.
+pub const CONNECTOR_KEY_PREFIX: &str = autumn_harvest::start_idempotency::RESERVED_KEY_PREFIX;
 
 /// Longest component encoded literally; anything longer is SHA-256 hashed.
 ///
@@ -134,7 +143,7 @@ pub fn message_idempotency_key_in(
     incarnation: Option<&str>,
 ) -> String {
     let base = format!(
-        "{CONNECTOR_KEY_PREFIX}:{}:{}:{}",
+        "{CONNECTOR_KEY_PREFIX}{}:{}:{}",
         bound_key_component(binding),
         bound_key_component(signal_name.unwrap_or("")),
         bound_key_component(coordinates_render),
@@ -293,6 +302,47 @@ mod tests {
         // And distinct over-length components still derive distinct keys.
         let other = "y".repeat(64 * 1024);
         assert_ne!(key, message_idempotency_key(&other, Some(&huge), &huge));
+    }
+
+    /// The namespaces must be disjoint *by enforcement*, not by convention.
+    ///
+    /// Derived keys are predictable — Kafka coordinates are
+    /// `{topic}:{partition}:{offset}` — so a caller who could claim one first
+    /// would make the broker's own delivery read as an idempotent replay and
+    /// be acked without dispatching. Asserted behaviourally rather than as a
+    /// string-equality pin on the two constants, so it still holds however
+    /// either is spelled.
+    #[test]
+    fn every_derived_key_is_refused_from_a_caller() {
+        for key in [
+            message_idempotency_key("orders", None, &kafka("orders", 0, 7)),
+            message_idempotency_key("orders", Some("order_event"), &kafka("orders", 3, 91)),
+            message_idempotency_key_in("orders", None, &kafka("orders", 0, 7), Some("cutover")),
+            // Pathological components take the hashed encoding; still reserved.
+            message_idempotency_key(&"z".repeat(64 * 1024), Some("s"), "c"),
+        ] {
+            assert!(
+                autumn_harvest::start_idempotency::is_reserved_key(&key),
+                "derived key must be in the reserved namespace: {key}"
+            );
+            assert!(
+                autumn_harvest::start_idempotency::validate_start_idempotency_key(Some(&key))
+                    .is_err(),
+                "a caller must not be able to squat the derived key: {key}"
+            );
+        }
+    }
+
+    /// Adding the separator to the prefix must not have changed the derived
+    /// key's bytes: it is persisted, so a format change would invalidate every
+    /// live claim on upgrade.
+    #[test]
+    fn the_prefix_carries_its_own_separator_and_the_key_is_unchanged() {
+        assert_eq!(CONNECTOR_KEY_PREFIX, "conn:");
+        assert_eq!(
+            message_idempotency_key("orders", None, &kafka("orders", 0, 7)),
+            "conn:L6:orders:L0::L10:orders:0:7",
+        );
     }
 
     #[test]
