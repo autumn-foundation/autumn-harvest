@@ -714,8 +714,54 @@ impl KafkaSource {
     /// rebalance took its partition away must not speak for the group. The
     /// assignment read is a local librdkafka call, not a broker round-trip, so
     /// it costs a list walk per settled prefix advance rather than a request.
+    ///
+    /// # Residual: the check is a snapshot, and the commit is asynchronous
+    ///
+    /// The guard narrows the window; it does not close it. A rebalance can
+    /// revoke the partition after the assignment is read and before
+    /// librdkafka's background thread actually builds the `OffsetCommit`
+    /// request, and that request carries whatever generation is current when
+    /// it is built — the classic protocol validates a committing member's
+    /// generation, not its assignment, so the stale offset can be accepted
+    /// under the *new* generation and rewind the group.
+    ///
+    /// It is left as a residual rather than fenced, for three reasons.
+    ///
+    /// 1. **Generation fencing is not expressible here.** `Consumer::commit`
+    ///    takes `(&TopicPartitionList, CommitMode)` and no generation;
+    ///    librdkafka fills that field in itself. There is no "commit only if
+    ///    generation == N" API to reach for.
+    /// 2. **A lock against the rebalance callbacks would not cover the send.**
+    ///    Serialising the check and the *enqueue* against a `ConsumerContext`
+    ///    `pre_rebalance` still leaves the actual transmission on librdkafka's
+    ///    thread, outside anything this side holds. Closing it properly means
+    ///    `CommitMode::Sync` — a broker round-trip per settlement, on the
+    ///    dispatch hot path.
+    /// 3. **The blast radius is small and self-limiting.** The records a
+    ///    rewind replays are ones this replica settled moments earlier, so
+    ///    their idempotency claims are seconds old and well inside any window
+    ///    — they dedupe. And the rewind is only durable if the stale commit
+    ///    lands after the new owner's *final* commit for the partition;
+    ///    otherwise its next commit re-advances past it immediately. That is
+    ///    materially narrower than the unguarded case this guard replaced,
+    ///    where a dispatch routinely outlived its rebalance and the new owner
+    ///    had long since advanced.
+    ///
+    /// What is controllable is done: the commit payload is built *before* the
+    /// ownership check, so no fallible FFI work sits between the check and the
+    /// commit.
     fn commit_settled_offset(&self, partition: i32, offset: i64) -> Result<(), ConnectorError> {
         let consumer = self.consumer();
+        // Built first, deliberately: this is the only fallible/allocating work
+        // in the function, and leaving it between the ownership check and the
+        // commit would widen the window described above for no reason.
+        let mut tpl = TopicPartitionList::new();
+        // Kafka's committed offset is the NEXT offset to read, so commit
+        // `offset + 1`. The runtime has already established that every lower
+        // offset in this partition is settled.
+        tpl.add_partition_offset(&self.topic, partition, Offset::Offset(offset + 1))
+            .map_err(|e| ConnectorError::Broker(format!("kafka offset list: {e}")))?;
+
         let assigned: Vec<i32> = consumer
             .assignment()
             .map_err(|e| ConnectorError::Broker(format!("kafka assignment: {e}")))?
@@ -739,12 +785,6 @@ impl KafkaSource {
             return Ok(());
         }
 
-        let mut tpl = TopicPartitionList::new();
-        // Kafka's committed offset is the NEXT offset to read, so commit
-        // `offset + 1`. The runtime has already established that every lower
-        // offset in this partition is settled.
-        tpl.add_partition_offset(&self.topic, partition, Offset::Offset(offset + 1))
-            .map_err(|e| ConnectorError::Broker(format!("kafka offset list: {e}")))?;
         // The SAME consumer the assignment was read from, deliberately. A
         // rebuild between the two would commit against a consumer whose
         // assignment was never checked, which is precisely the guard above

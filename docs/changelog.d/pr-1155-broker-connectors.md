@@ -1568,6 +1568,34 @@ coordinates, so a run traces back to the exact message.
   so failing closed would break working deployments to guard against a mapper
   bug.
 
+- **The settled-commit ownership check is a snapshot, and that residual is now
+  stated where it lives** (Codex P2, `kafka.rs:753` — a follow-on to the
+  `may_commit_settled` guard above, correctly observing that the guard *narrows*
+  the window rather than closing it). A rebalance can revoke the partition
+  after the assignment is read and before librdkafka's background thread builds
+  the `OffsetCommit`, and that request carries whatever generation is current
+  when it is built — the classic protocol validates a committing member's
+  generation, not its assignment — so a stale offset can be accepted under the
+  new generation and rewind the group. Left as a documented residual rather
+  than fenced: `Consumer::commit` takes `(&TopicPartitionList, CommitMode)` and
+  **no generation** (verified against rdkafka 0.38's source), so generation
+  fencing has no API to reach for; a lock against `ConsumerContext`
+  `pre_rebalance` would serialise the *enqueue* but not the transmission, which
+  happens on librdkafka's thread, so closing it properly means
+  `CommitMode::Sync` — a broker round-trip per settlement on the dispatch hot
+  path. The blast radius is also materially smaller than the case the guard
+  replaced: the records a rewind replays are ones this replica settled *moments
+  earlier*, so their idempotency claims are seconds old and dedupe cleanly,
+  and the rewind is only durable if the stale commit lands after the new
+  owner's **final** commit — otherwise its next commit re-advances past it. The
+  one controllable part is fixed: the commit payload is now built **before**
+  the ownership check, so the only fallible/allocating FFI work no longer sits
+  inside the window. No test accompanies the reordering — it is a pure
+  statement-order change with no observable behaviour a broker-free test can
+  assert, and the Kafka broker suite is Docker-gated; `may_commit_settled`'s
+  own predicate stays covered by
+  `a_settled_commit_is_suppressed_for_a_partition_this_replica_lost`.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of
