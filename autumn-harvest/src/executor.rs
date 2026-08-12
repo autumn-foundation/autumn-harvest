@@ -80,6 +80,9 @@ pub enum WorkflowOutcome {
     ContinuedAsNew {
         /// JSON payload to pass to the next iteration of the workflow.
         input: Value,
+        /// Registered workflow type the successor runs as (issue #803).
+        /// `None` = same type as the predecessor (today's behavior).
+        new_workflow_type: Option<String>,
     },
 }
 
@@ -1045,9 +1048,15 @@ async fn run_strict_with_ctx(
                 if let Some(idx) = commands
                     .iter()
                     .rposition(|cmd| matches!(cmd, WorkflowCommand::ContinueAsNew { .. }))
-                    && let WorkflowCommand::ContinueAsNew { input } = commands.swap_remove(idx)
+                    && let WorkflowCommand::ContinueAsNew {
+                        input,
+                        new_workflow_type,
+                    } = commands.swap_remove(idx)
                 {
-                    return WorkflowOutcome::ContinuedAsNew { input };
+                    return WorkflowOutcome::ContinuedAsNew {
+                        input,
+                        new_workflow_type,
+                    };
                 }
                 WorkflowOutcome::Suspended { commands }
             }
@@ -1252,9 +1261,15 @@ pub(crate) async fn run_workflow_canary(
                 if let Some(idx) = commands
                     .iter()
                     .rposition(|cmd| matches!(cmd, WorkflowCommand::ContinueAsNew { .. }))
-                    && let WorkflowCommand::ContinueAsNew { input } = commands.swap_remove(idx)
+                    && let WorkflowCommand::ContinueAsNew {
+                        input,
+                        new_workflow_type,
+                    } = commands.swap_remove(idx)
                 {
-                    return WorkflowOutcome::ContinuedAsNew { input };
+                    return WorkflowOutcome::ContinuedAsNew {
+                        input,
+                        new_workflow_type,
+                    };
                 }
                 WorkflowOutcome::Suspended { commands }
             }
@@ -1642,9 +1657,18 @@ async fn drive_workflow(
                 if let Some(idx) = commands
                     .iter()
                     .rposition(|cmd| matches!(cmd, WorkflowCommand::ContinueAsNew { .. }))
-                    && let WorkflowCommand::ContinueAsNew { input } = commands.swap_remove(idx)
+                    && let WorkflowCommand::ContinueAsNew {
+                        input,
+                        new_workflow_type,
+                    } = commands.swap_remove(idx)
                 {
-                    return (WorkflowOutcome::ContinuedAsNew { input }, commands);
+                    return (
+                        WorkflowOutcome::ContinuedAsNew {
+                            input,
+                            new_workflow_type,
+                        },
+                        commands,
+                    );
                 }
                 (WorkflowOutcome::Suspended { commands }, vec![])
             }
@@ -2140,7 +2164,7 @@ mod tests {
         .await;
 
         match outcome {
-            WorkflowOutcome::ContinuedAsNew { input } => {
+            WorkflowOutcome::ContinuedAsNew { input, .. } => {
                 assert_eq!(input, serde_json::json!({"prev": "v1"}));
             }
             other => panic!("expected ContinuedAsNew, got {other:?}"),

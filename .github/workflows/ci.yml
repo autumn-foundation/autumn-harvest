@@ -245,6 +245,9 @@ jobs:
       - name: Run interface_schema_workflow example tests (issue #610)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing,schema --example interface_schema_workflow
+      - name: Run entity_phase_transition example tests (issue #803)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example entity_phase_transition
       - name: Run mutex_ledger example tests (issue #691)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example mutex_ledger

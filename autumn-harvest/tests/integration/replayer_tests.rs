@@ -2924,6 +2924,7 @@ fn deadline_can_history(t0_millis: i64, consumed_secs: i64) -> Vec<WorkflowEvent
     events.push(WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id: ExecutionId::new(),
         input: serde_json::json!({ "cycle": 1 }),
+        new_workflow_type: None,
     });
     events
 }
@@ -10037,4 +10038,294 @@ async fn replayer_windowed_fail_fast_history_reproduces_failure_deterministicall
         }
         other => panic!("expected WorkflowFailed (clean reproduction), got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-type continue-as-new (issue #803)
+//
+// An entity that changes workflow type across lifecycle phases must replay to
+// the *identical* successor type every time, and a code change that redirects
+// the transition must surface as non-determinism rather than silently forking
+// the chain into a different phase.
+// ---------------------------------------------------------------------------
+
+/// Phase 1 of a two-phase entity: does one unit of work, then graduates the run
+/// into the `paid_subscription` type under the same `workflow_id`.
+fn trial_subscription_phase<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("collect_card", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.continue_as_new_as_type("paid_subscription", serde_json::json!({"plan": "pro"}))
+            .await
+            .map_err(|e| e.to_string())?;
+        unreachable!("continue_as_new_as_type never resolves")
+    })
+}
+
+/// The same phase 1 body, redirected to a *different* target type — models the
+/// code change that must be rejected against a recorded history.
+fn trial_subscription_phase_redirected<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("collect_card", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.continue_as_new_as_type("churned", serde_json::json!({"plan": "pro"}))
+            .await
+            .map_err(|e| e.to_string())?;
+        unreachable!("continue_as_new_as_type never resolves")
+    })
+}
+
+/// The same phase 1 body targeting a third type, so the success-metric sweep
+/// below can vary the recorded target instead of replaying one fixture 100×.
+fn trial_subscription_phase_to_dunning<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("collect_card", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.continue_as_new_as_type("dunning", serde_json::json!({"plan": "pro"}))
+            .await
+            .map_err(|e| e.to_string())?;
+        unreachable!("continue_as_new_as_type never resolves")
+    })
+}
+
+/// Recorded history of a run that graduated `trial_subscription` → `target`.
+fn cross_type_can_history_targeting(target: &str) -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "collect_card".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: Value::Null,
+        },
+        WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: ExecutionId::new(),
+            input: serde_json::json!({"plan": "pro"}),
+            new_workflow_type: Some(target.to_string()),
+        },
+    ]
+}
+
+/// Recorded history of a run that graduated `trial_subscription` →
+/// `paid_subscription`.
+fn cross_type_can_history() -> Vec<WorkflowEvent> {
+    cross_type_can_history_targeting("paid_subscription")
+}
+
+/// **Success metric (issue #803).** A type-changing history round-trips to the
+/// **identical** successor type on 100% of runs.
+///
+/// "Identical" is asserted by *exclusion*, which is the strongest available
+/// formulation: on replay the successor type is not readable off the report
+/// (the context re-emits it from the caller), so instead each run pairs the
+/// recorded target with its two alternatives and requires that **exactly one**
+/// of the three handlers replays clean while both others are rejected as
+/// non-determinism. A guard that ignored the recorded type would let all three
+/// pass and fail this test immediately.
+///
+/// The sweep also *varies* the recorded target across the three types rather
+/// than replaying one fixture 100 times, so the runs carry independent signal.
+#[tokio::test]
+async fn cross_type_continue_as_new_replays_to_the_same_successor_type_every_run() {
+    const TARGETS: [(&str, WorkflowHandlerFn); 3] = [
+        ("paid_subscription", trial_subscription_phase),
+        ("churned", trial_subscription_phase_redirected),
+        ("dunning", trial_subscription_phase_to_dunning),
+    ];
+
+    for run in 0..100 {
+        let (recorded_target, matching_handler) = TARGETS[run % TARGETS.len()];
+        let history = cross_type_can_history_targeting(recorded_target);
+
+        // Positive: the handler naming the recorded target replays clean.
+        let report = WorkflowReplayer::new()
+            .register_fn("trial_subscription", matching_handler)
+            .replay_from_snapshot(make_snapshot(
+                "trial_subscription",
+                ExecutionId::new(),
+                history.clone(),
+            ))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "run {run}: the recorded target {recorded_target} must replay clean: {report}"
+        );
+
+        // Negative: EVERY other target is rejected. This is what pins the
+        // successor type to history rather than to live code.
+        for (other_target, other_handler) in TARGETS {
+            if other_target == recorded_target {
+                continue;
+            }
+            let report = WorkflowReplayer::new()
+                .register_fn("trial_subscription", other_handler)
+                .replay_from_snapshot(make_snapshot(
+                    "trial_subscription",
+                    ExecutionId::new(),
+                    history.clone(),
+                ))
+                .await;
+            assert!(
+                matches!(
+                    report.status,
+                    ReplayStatus::NonDeterminismDetected {
+                        kind: NonDeterminismKind::ContinueAsNewMismatch,
+                        ..
+                    }
+                ),
+                "run {run}: a {recorded_target} history must reject a {other_target} \
+                 handler, got: {report}"
+            );
+        }
+    }
+}
+
+/// The successor type is genuinely pinned by history: the *same* fixture
+/// replayed against a handler that redirects the transition elsewhere is
+/// rejected as non-determinism (this is what makes the 100-run test above
+/// non-vacuous).
+#[tokio::test]
+async fn cross_type_continue_as_new_redirect_is_detected_as_nondeterminism() {
+    let report = WorkflowReplayer::new()
+        .register_fn("trial_subscription", trial_subscription_phase_redirected)
+        .replay_from_snapshot(make_snapshot(
+            "trial_subscription",
+            ExecutionId::new(),
+            cross_type_can_history(),
+        ))
+        .await;
+
+    match &report.status {
+        ReplayStatus::NonDeterminismDetected { kind, .. } => {
+            assert_eq!(
+                *kind,
+                NonDeterminismKind::ContinueAsNewMismatch,
+                "a redirected continuation must classify as a continue-as-new \
+                 mismatch, got: {report}"
+            );
+        }
+        other => panic!("expected non-determinism, got {other:?}: {report}"),
+    }
+}
+
+/// Removing the cross-type call (reverting to a same-type continuation) over a
+/// recorded cross-type history is likewise a detected divergence — `None` and
+/// `Some(t)` are distinct recorded intents.
+#[tokio::test]
+async fn reverting_to_same_type_over_a_cross_type_history_is_nondeterminism() {
+    fn same_type_phase<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.execute_activity_raw("collect_card", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            ctx.continue_as_new(serde_json::json!({"plan": "pro"}))
+                .await
+                .map_err(|e| e.to_string())?;
+            unreachable!("continue_as_new never resolves")
+        })
+    }
+
+    let report = WorkflowReplayer::new()
+        .register_fn("trial_subscription", same_type_phase)
+        .replay_from_snapshot(make_snapshot(
+            "trial_subscription",
+            ExecutionId::new(),
+            cross_type_can_history(),
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "dropping the target type must diverge, got: {report}"
+    );
+}
+
+/// AC3 (append-only): the JSON snapshot path carries the additive field, so an
+/// exported fixture of a type-changing run replays through
+/// `replay_from_json` unchanged.
+#[tokio::test]
+async fn cross_type_continue_as_new_round_trips_through_json() -> Result<(), serde_json::Error> {
+    let snapshot = make_snapshot(
+        "trial_subscription",
+        ExecutionId::new(),
+        cross_type_can_history(),
+    );
+    let json = serde_json::to_string(&snapshot)?;
+    assert!(
+        json.contains("paid_subscription"),
+        "the exported fixture must carry the target type, got {json}"
+    );
+
+    let report = WorkflowReplayer::new()
+        .register_fn("trial_subscription", trial_subscription_phase)
+        .replay_from_json(&json)
+        .await?;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a JSON-exported type-changing history must replay, got: {report}"
+    );
+    Ok(())
+}
+
+/// AC3 (append-only): a history written by a **pre-#803** build carries no
+/// `new_workflow_type` key at all and must still replay identically against a
+/// same-type handler, so in-flight executions survive the upgrade.
+#[tokio::test]
+async fn pre_803_same_type_history_json_still_replays() -> Result<(), serde_json::Error> {
+    fn same_type_only<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.continue_as_new(serde_json::json!({"cycle": 2}))
+                .await
+                .map_err(|e| e.to_string())?;
+            unreachable!("continue_as_new never resolves")
+        })
+    }
+
+    // Hand-authored the way a pre-#803 exporter would have written it.
+    let exec = ExecutionId::new();
+    let json = format!(
+        r#"{{"workflow_name":"legacy_loop","execution_id":"{exec}","events":[
+            {{"type":"WorkflowStarted","data":{{"input":null,"timestamp":"2026-01-01T00:00:00Z"}}}},
+            {{"type":"WorkflowContinuedAsNew","data":{{"new_exec_id":"{exec}","input":{{"cycle":2}}}}}}
+        ]}}"#
+    );
+    assert!(!json.contains("new_workflow_type"));
+
+    let report = WorkflowReplayer::new()
+        .register_fn("legacy_loop", same_type_only)
+        .replay_from_json(&json)
+        .await?;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a pre-#803 history must replay unchanged, got: {report}"
+    );
+    Ok(())
 }

@@ -1111,6 +1111,15 @@ impl BuiltHarvest {
         // buffered-drain, and manual DAG trigger paths -- which have no
         // `api_state` -- apply the SAME ceiling manual/HTTP starts already do.
         .with_max_workflow_execution_timeout(self.max_workflow_execution_timeout)
+        // Issue #803: name the auto-registered unified DAGs so the core
+        // continue-as-new path can reject a cross-type continuation into one
+        // (the plugin's `is_registered_dag` is unavailable to the worker).
+        .with_dag_workflow_names(
+            self.dags
+                .iter()
+                .filter(|d| d.workflow_handler.is_some())
+                .map(|d| d.name.to_string()),
+        )
         .with_payload_offloader(self.payload_offloader.clone())
         .with_activity_interceptors(self.activity_interceptors.clone())
         .with_activity_defaults(
@@ -1184,6 +1193,15 @@ impl BuiltHarvest {
         // buffered-drain, and manual DAG trigger paths -- which have no
         // `api_state` -- apply the SAME ceiling manual/HTTP starts already do.
         .with_max_workflow_execution_timeout(self.max_workflow_execution_timeout)
+        // Issue #803: name the auto-registered unified DAGs so the core
+        // continue-as-new path can reject a cross-type continuation into one
+        // (the plugin's `is_registered_dag` is unavailable to the worker).
+        .with_dag_workflow_names(
+            self.dags
+                .iter()
+                .filter(|d| d.workflow_handler.is_some())
+                .map(|d| d.name.to_string()),
+        )
         .with_payload_offloader(self.payload_offloader.clone())
         .with_activity_interceptors(self.activity_interceptors.clone())
         .with_activity_defaults(
