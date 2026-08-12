@@ -1232,6 +1232,7 @@ impl ActivityInfo {
         queue: Option<&'static str>,
         retry: Option<RetryPolicy>,
         start_to_close: Option<Duration>,
+        schedule_to_close: Option<Duration>,
     ) -> Self {
         Self {
             name,
@@ -1243,7 +1244,7 @@ impl ActivityInfo {
             default_queue: queue,
             max_concurrent: None,
             concurrency_key: None,
-            default_schedule_to_close: None,
+            default_schedule_to_close: schedule_to_close,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,

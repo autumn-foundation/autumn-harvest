@@ -8908,10 +8908,19 @@ async fn process_activity_task(
                         // whole pre-guest interval — resolution (this checkout +
                         // active-hash lookup + cold-cache byte fetch) plus compile
                         // — against the guest deadline, not just compile (issue
-                        // #965 review round 7). `attempt_clock_start` was captured above,
-                        // just before this dispatch resolution began, so it
-                        // aligns with the start-to-close clock that started when
-                        // `ActivityStarted` was recorded.
+                        // #965 review round 7). `attempt_clock_start` was captured
+                        // above, just before this dispatch resolution began, so it
+                        // APPROXIMATES the start-to-close anchor (issue #965
+                        // review round 10 — it does not equal it). The
+                        // authoritative anchor is `task.started_at`, set at claim,
+                        // and `ActivityStarted` is appended earlier still, so the
+                        // setup between them is not charged to the guest. Under
+                        // pool contention the guest's budget therefore starts
+                        // slightly later than the timeout scanner's. That is
+                        // safe-direction — the scanner fires first, the guest's own
+                        // epoch ceiling still bounds it, and a late result lands on
+                        // an already-terminal task — and it matches native
+                        // activities, which are equally unaware of `started_at`.
                         attempt_clock_start,
                     )
                     .await
