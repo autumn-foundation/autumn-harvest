@@ -133,6 +133,8 @@ mod scheduler_catchup_tests;
 mod scheduler_ha_tests;
 #[cfg(feature = "db")]
 mod scheduler_overdue_tests;
+#[cfg(feature = "db")]
+mod scheduler_registration_tests;
 mod security;
 mod sharding_unit;
 mod signal_tests;
