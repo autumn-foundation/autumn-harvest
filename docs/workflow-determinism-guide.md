@@ -319,6 +319,16 @@ Every event emitted by `ctx.logger()` carries:
 
 These match the Temporal / Cadence / DBOS convention so existing log dashboards need no changes.
 
+#### Reading a run's lines back without a log aggregator
+
+`ctx.logger()` emits to the host app's `tracing` subscriber, so reading a
+specific run's lines back normally means correlating by `execution_id` in
+Loki/Elastic/OTel. Opt in to the **durable per-execution sink** (issue #790) and
+the same `ctx.log_*` calls are also persisted per execution, readable in one
+call — `GET /api/harvest/workflows/{id}/logs`, `harvest workflow logs <id>`, or
+the Vantage execution-detail **Logs** panel. The workflow body does not change;
+see [`docs/workflow-logs.md`](workflow-logs.md).
+
 #### Guardrail severity
 
 HVG009 is a **Warning** (not a HardBlocker): bare tracing calls do not break determinism or corrupt workflow state — they only amplify log volume. The rule is surfaced so authors can fix it without CI being blocked by a false positive.

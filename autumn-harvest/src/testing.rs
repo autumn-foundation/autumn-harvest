@@ -2685,9 +2685,56 @@ const TEST_SESSION_HOST_WORKER_ID: &str = "test-worker";
 /// Type alias for the mock closure stored in `WorkflowTestEnv`.
 type MockFn = Arc<dyn Fn(Value) -> Result<Value, String> + Send + Sync>;
 
+/// Accumulate a cycle's [`WorkflowCommand::RecordLog`] commands into the
+/// run-wide durable-log view (issue #790).
+///
+/// Keyed by `seq` with **first-write-wins**, mirroring the store's
+/// `UNIQUE (workflow_exec_id, seq)` + `ON CONFLICT DO NOTHING`: a cycle that is
+/// re-driven at an unchanged history position re-mints the same `seq`, and the
+/// re-emitted line collapses onto the one already recorded rather than
+/// duplicating. The `BTreeMap` also gives emission (`seq`) ordering for free.
+fn accumulate_recorded_logs(
+    commands: &[WorkflowCommand],
+    acc: &mut std::collections::BTreeMap<u64, RecordedLogLine>,
+) {
+    for cmd in commands {
+        if let WorkflowCommand::RecordLog {
+            seq,
+            level,
+            message,
+        } = cmd
+        {
+            acc.entry(*seq).or_insert_with(|| RecordedLogLine {
+                seq: *seq,
+                level: *level,
+                message: message.clone(),
+            });
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+/// One durable workflow log line a test run would have persisted (issue #790).
+///
+/// This is the harness-side view of what the worker writes to
+/// `harvest_workflow_logs`, surfaced by [`TestRunOutcome::recorded_logs`] so a
+/// no-DB test can assert on an author's `ctx.log_*` output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedLogLine {
+    /// Deterministic logical-position identity and total emission order — the
+    /// same value that becomes the `seq` column (and the exactly-once dedup
+    /// key) in production. **Not** a 0-based counter.
+    pub seq: u64,
+    /// Severity, as emitted through the `ctx.log_*` entry point.
+    pub level: crate::context::WorkflowLogLevel,
+    /// The author's message, already truncated to the policy's per-line byte
+    /// cap on a UTF-8 character boundary (the context applies that cap, so the
+    /// harness models it for free).
+    pub message: String,
+}
 
 /// The outcome of a [`WorkflowTestEnv::run`] call.
 ///
@@ -2740,6 +2787,11 @@ pub struct TestRunOutcome {
     /// self-checks deterministically instead of false-flagging on the live value
     /// vs the replay's empty default. Defaults to `""` (matching the live run).
     workflow_id: String,
+    /// The durable log lines this run would have persisted (issue #790), in
+    /// `seq` order and de-duplicated by `seq` — exactly the shape the store's
+    /// `UNIQUE (workflow_exec_id, seq)` + `ON CONFLICT DO NOTHING` produces.
+    /// Empty unless the env opted in via [`WorkflowTestEnv::with_log_policy`].
+    recorded_logs: Vec<RecordedLogLine>,
 }
 
 /// Reconstruct the final virtual-clock elapsed (in seconds) from the durable
@@ -2811,6 +2863,26 @@ impl TestRunOutcome {
     #[must_use]
     pub fn events(&self) -> &[WorkflowEvent] {
         &self.events
+    }
+
+    /// The durable workflow log lines this run would have persisted, in
+    /// emission (`seq`) order (issue #790).
+    ///
+    /// Empty unless the producing env opted in via
+    /// [`WorkflowTestEnv::with_log_policy`] — which is exactly the sink-disabled
+    /// contract (AC6): `ctx.log_*` still works and still reaches `tracing`, it
+    /// simply records nothing durable.
+    ///
+    /// **Fidelity.** The harness models the two properties an author's test can
+    /// meaningfully assert on: per-message byte truncation (applied by the
+    /// context) and exactly-once-per-`seq` de-duplication (the store's
+    /// `UNIQUE (workflow_exec_id, seq)` + `ON CONFLICT DO NOTHING`, reproduced
+    /// here as first-write-wins). It deliberately does **not** model the
+    /// per-execution line cap or its truncation marker — those are store-layer
+    /// behaviours covered by the database-backed tests.
+    #[must_use]
+    pub fn recorded_logs(&self) -> &[RecordedLogLine] {
+        &self.recorded_logs
     }
 
     /// The virtual "now" at the end of the run (issue #526).
@@ -3005,6 +3077,11 @@ pub struct WorkflowTestEnv {
     /// (issue #772) so a run can exercise deadline-aware `should_continue_as_new`.
     /// `None` (the default) matches a workflow with no execution timeout.
     execution_timeout: Option<chrono::Duration>,
+    /// Durable per-execution log policy (issue #790) threaded into the
+    /// `WorkflowContext` this env builds. `None` (the default) reproduces a
+    /// deployment with the durable sink DISABLED, so `ctx.log_*` records
+    /// nothing durable -- exactly today's behaviour.
+    workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
     /// Spawning parent's execution id threaded into the `WorkflowContext`
     /// (issue #698) so a no-DB test can prove `ctx.info().parent_execution_id` /
     /// `ctx.parent_execution_id()`. `None` (the default) models a top-level run.
@@ -3066,6 +3143,7 @@ impl WorkflowTestEnv {
             workflow_id: String::new(),
             queue_name: String::new(),
             execution_timeout: None,
+            workflow_log_policy: None,
             parent_execution_id: None,
             external_await_results: HashMap::new(),
             external_await_failures: HashMap::new(),
@@ -3359,6 +3437,24 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// Enable the **durable per-execution log sink** (issue #790) for the
+    /// contexts this env builds, so `ctx.log_info` / `log_warn` / `log_error`
+    /// produce the bookkeeping commands the worker persists -- readable back
+    /// via [`TestRunOutcome::recorded_logs`].
+    ///
+    /// `None` (the default) reproduces a deployment with the sink DISABLED:
+    /// `ctx.log_*` still works and still reaches `tracing`, but records
+    /// nothing durable. That is the opt-in boundary, so a test can assert both
+    /// halves without a database.
+    #[must_use]
+    pub const fn with_log_policy(
+        mut self,
+        policy: Option<crate::context::WorkflowLogPolicy>,
+    ) -> Self {
+        self.workflow_log_policy = policy;
+        self
+    }
+
     /// Inject typed shared state accessible via `ctx.state::<T>()` inside the
     /// workflow function.
     ///
@@ -3423,6 +3519,11 @@ impl WorkflowTestEnv {
         let mut call_counts: HashMap<String, u32> = HashMap::new();
         let mut remaining_signals = self.queued_signals.clone();
         let mut retry_sequences = self.retry_sequences.clone();
+        // Issue #790: the durable log lines this run would have persisted,
+        // accumulated across every decision cycle and de-duplicated by `seq`
+        // exactly the way the store's unique index does.
+        let mut recorded_logs: std::collections::BTreeMap<u64, RecordedLogLine> =
+            std::collections::BTreeMap::new();
 
         let start_time = self.simulated_now;
 
@@ -3489,8 +3590,21 @@ impl WorkflowTestEnv {
                 self.state.clone(),
                 span_meta.as_ref(),
                 self.metrics.clone(),
+                // Issue #790: the durable-log policy this env was configured
+                // with (`None` = the sink disabled, the default).
+                self.workflow_log_policy,
             )
             .await;
+
+            // Issue #790: harvest this cycle's durable-log commands before the
+            // outcome is consumed. A suspension carries them on
+            // `outcome.commands`; a terminal cycle carries them on
+            // `pending_cmds` (the executor returns an empty `pending_cmds` for
+            // a suspension), so collecting from both covers every cycle shape.
+            if let WorkflowOutcome::Suspended { commands } = &outcome {
+                accumulate_recorded_logs(commands, &mut recorded_logs);
+            }
+            accumulate_recorded_logs(&pending_cmds, &mut recorded_logs);
 
             match outcome {
                 WorkflowOutcome::Suspended { commands } => {
@@ -3515,6 +3629,7 @@ impl WorkflowTestEnv {
                                 // workflow type / business id for replay_check.
                                 workflow_name: self.workflow_name.clone(),
                                 workflow_id: self.workflow_id.clone(),
+                                recorded_logs: recorded_logs.into_values().collect(),
                             };
                         }
                     };
@@ -3535,6 +3650,7 @@ impl WorkflowTestEnv {
                             // type / business id for replay_check.
                             workflow_name: self.workflow_name.clone(),
                             workflow_id: self.workflow_id.clone(),
+                            recorded_logs: recorded_logs.into_values().collect(),
                         };
                     }
                 }
@@ -3545,6 +3661,7 @@ impl WorkflowTestEnv {
                         history,
                         exec_id,
                         start_time,
+                        recorded_logs.into_values().collect(),
                     );
                 }
             }
@@ -3566,6 +3683,7 @@ impl WorkflowTestEnv {
             // business id for replay_check.
             workflow_name: self.workflow_name.clone(),
             workflow_id: self.workflow_id.clone(),
+            recorded_logs: recorded_logs.into_values().collect(),
         }
     }
 
@@ -3576,6 +3694,7 @@ impl WorkflowTestEnv {
         mut history: Vec<WorkflowEvent>,
         exec_id: ExecutionId,
         start_time: DateTime<Utc>,
+        recorded_logs: Vec<RecordedLogLine>,
     ) -> TestRunOutcome {
         Self::record_terminal_pending_commands(pending_cmds, &mut history);
         let should_record_cascades = matches!(
@@ -3634,6 +3753,7 @@ impl WorkflowTestEnv {
             // business id for replay_check.
             workflow_name: self.workflow_name.clone(),
             workflow_id: self.workflow_id.clone(),
+            recorded_logs,
         }
     }
 
@@ -4244,6 +4364,11 @@ impl WorkflowTestEnv {
             // Ephemeral progress (issue #791): a bookkeeping no-op in the test
             // harness — appends no event, changes no history, drives no wait.
             | WorkflowCommand::PublishProgress { .. }
+            // Durable per-execution logs (issue #790): event-less bookkeeping
+            // (mirrors `SetCurrentDetails`). The worker persists it to
+            // `harvest_workflow_logs` in production; the harness has no DB, so
+            // nothing is recorded here and no progress is made.
+            | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::ScheduleExternalActivity { .. }
             // Release is EVENT-LESS bookkeeping (mirrors `SetCurrentDetails`,
             // issue #691): the worker frees the lock in production, but the

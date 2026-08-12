@@ -278,6 +278,26 @@ fn workflow_timeline_is_covered() {
 }
 
 #[test]
+fn workflow_logs_is_covered() {
+    // Issue #790. `assert_covered` strips the query string, so the flags'
+    // wire shape is pinned by the `request_mapping.rs` tests instead.
+    assert_covered(&["workflow", "logs", "00000000-0000-0000-0000-000000000001"]);
+}
+
+#[test]
+fn workflow_logs_with_filters_is_covered() {
+    assert_covered(&[
+        "workflow",
+        "logs",
+        "00000000-0000-0000-0000-000000000001",
+        "--level",
+        "error",
+        "--limit",
+        "50",
+    ]);
+}
+
+#[test]
 fn workflow_awaitables_is_covered() {
     assert_covered(&[
         "workflow",

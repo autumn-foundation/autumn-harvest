@@ -171,6 +171,10 @@ name = "wasm_activity"
 required-features = ["wasm-activities"]
 
 [[example]]
+name = "workflow_logs"
+required-features = ["testing"]
+
+[[example]]
 name = "entity_phase_transition"
 
 [dev-dependencies]

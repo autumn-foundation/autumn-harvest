@@ -370,6 +370,19 @@ async fn eris_unauthenticated_queue_resume_is_blocked() {
 }
 
 #[tokio::test]
+async fn eris_unauthenticated_workflow_logs_is_blocked() {
+    // Durable per-execution author log lines (issue #790): admin-only read —
+    // a log message is free-form author text that routinely carries business
+    // detail, so it takes the /awaitables posture, not the execution-row one.
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(get("/workflows/00000000-0000-0000-0000-000000000001/logs"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn eris_unauthenticated_awaitables_is_blocked() {
     // Open-awaitables diagnostic (issue #615): admin-only read (the
     // eligibility endpoints' posture).

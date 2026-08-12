@@ -128,6 +128,8 @@ pub struct HarvestBuilder {
     /// `ctx.set_current_details(...)` (issue #473).
     /// Default: 1 KiB.
     max_current_details_bytes: usize,
+    /// Opt-in durable workflow-log sink policy (issue #790). `None` = disabled.
+    workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
     /// Server-side ceiling on workflow start delay (issue #322).
     /// Default: 365 days.
     max_workflow_start_delay: Option<Duration>,
@@ -198,6 +200,7 @@ impl Default for HarvestBuilder {
             max_signal_payload_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             max_workflow_input_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             max_current_details_bytes: crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+            workflow_log_policy: None,
             max_workflow_start_delay: None,
             unknown_target_grace_window: None,
             batch_start_config: BatchStartConfig::default(),
@@ -316,6 +319,8 @@ pub struct BuiltHarvest {
     /// Maximum byte length for `current_details` strings (issue #473).
     /// Default: 1 KiB.
     pub max_current_details_bytes: usize,
+    /// Opt-in durable workflow-log sink policy (issue #790). `None` = disabled.
+    pub workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
     /// Server-side ceiling on workflow start delay (issue #322).
     /// Default: 365 days.
     pub max_workflow_start_delay: Duration,
@@ -388,6 +393,7 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .field("max_current_details_bytes", &self.max_current_details_bytes)
+            .field("workflow_log_policy", &self.workflow_log_policy)
             .field("max_workflow_start_delay", &self.max_workflow_start_delay)
             .field(
                 "unknown_target_grace_window",
@@ -1097,6 +1103,7 @@ impl BuiltHarvest {
             self.max_signal_payload_bytes,
         )
         .with_current_details_cap(self.max_current_details_bytes)
+        .with_workflow_log_policy(self.workflow_log_policy)
         .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
         .with_max_workflow_chain_timeout(self.max_workflow_chain_timeout)
         // Issue #743 review (PR #1141, Finding #3): thread the fleet-wide
@@ -1178,6 +1185,7 @@ impl BuiltHarvest {
             self.max_signal_payload_bytes,
         )
         .with_current_details_cap(self.max_current_details_bytes)
+        .with_workflow_log_policy(self.workflow_log_policy)
         .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
         .with_max_workflow_chain_timeout(self.max_workflow_chain_timeout)
         // Issue #743 review (PR #1141, Finding #3): thread the fleet-wide
@@ -1944,6 +1952,42 @@ impl HarvestBuilder {
         self
     }
 
+    /// Enable the **opt-in** durable per-execution workflow-log sink (issue #790).
+    ///
+    /// With a policy installed, the lines a workflow emits through the existing
+    /// [`ctx.logger()`](crate::context::WorkflowContext::logger) /
+    /// `ctx.log_info` / `ctx.log_warn` / `ctx.log_error` entry points (issue
+    /// #379) are additionally persisted to the per-execution
+    /// `harvest_workflow_logs` table and readable via
+    /// `GET /api/harvest/workflows/{id}/logs` and the Vantage UI Logs panel —
+    /// so triaging a failed run no longer requires pivoting to external log
+    /// aggregation and correlating by execution id.
+    ///
+    /// **Off by default, and additive.** Without this call `ctx.logger()`
+    /// behaves exactly as before: `tracing`-only, no command pushed, no write.
+    /// The `tracing` sink is unchanged either way — this *adds* a sink, it does
+    /// not replace one.
+    ///
+    /// Log lines are **observational only**: they are not part of the event
+    /// history, carry no determinism guarantee, and must never be read back
+    /// into workflow logic.
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::builder::HarvestBuilder;
+    /// # use autumn_harvest::context::WorkflowLogPolicy;
+    /// # let builder = HarvestBuilder::new();
+    /// // Defaults: 1,000 lines per execution, 4 KiB per line.
+    /// let builder = builder.workflow_log_persistence(WorkflowLogPolicy::new());
+    /// ```
+    #[must_use]
+    pub const fn workflow_log_persistence(
+        mut self,
+        policy: crate::context::WorkflowLogPolicy,
+    ) -> Self {
+        self.workflow_log_policy = Some(policy);
+        self
+    }
+
     /// Set the global maximum allowed start delay for a workflow (issue #322).
     ///
     /// Default: 365 days.
@@ -2127,6 +2171,7 @@ impl HarvestBuilder {
             max_signal_payload_bytes: self.max_signal_payload_bytes,
             max_workflow_input_bytes: self.max_workflow_input_bytes,
             max_current_details_bytes: self.max_current_details_bytes,
+            workflow_log_policy: self.workflow_log_policy,
             max_workflow_start_delay,
             unknown_target_grace_window,
             batch_start_config: self.batch_start_config,
@@ -4271,6 +4316,62 @@ mod tests {
 
         assert_eq!(registry.state::<String>(), Some(&String::from("haunted")));
         assert!(worker_config.queues.contains(&"default".to_string()));
+    }
+
+    /// Both worker-parts hops must thread the configured durable-log policy
+    /// into the `HandlerRegistry` (issue #790).
+    ///
+    /// The registry's `workflow_log_policy` is the ONLY thing the executor
+    /// consults to decide whether `ctx.log_*` pushes a `RecordLog` command, so a
+    /// dropped hop turns the whole feature into a silent no-op for every
+    /// deployment that configured it — the worker would run, the workflow would
+    /// log to `tracing` exactly as before, and nothing would ever be persisted.
+    /// Deleting either `.with_workflow_log_policy(...)` line must fail here.
+    ///
+    /// `into_worker_parts_with_extra_state` is covered too because it is the hop
+    /// the plugin (and any app registering extra shared state) actually takes.
+    #[cfg(feature = "db")]
+    #[test]
+    fn both_worker_parts_hops_thread_the_workflow_log_policy() {
+        // Distinct from the defaults (1_000 / 4_096) so a hop that silently
+        // substitutes `WorkflowLogPolicy::default()` also fails.
+        let policy = crate::context::WorkflowLogPolicy::default()
+            .with_max_lines(7)
+            .with_max_message_bytes(64);
+
+        let built = HarvestBuilder::new()
+            .workflow_log_persistence(policy)
+            .build();
+        let (registry, _dags, _ws, _wc) = built.into_worker_parts();
+        let threaded = registry
+            .workflow_log_policy
+            .expect("into_worker_parts must thread the configured log policy");
+        assert_eq!(threaded.max_lines(), 7);
+        assert_eq!(threaded.max_message_bytes(), 64);
+
+        let built = HarvestBuilder::new()
+            .workflow_log_persistence(policy)
+            .build();
+        let (registry, _dags, _ws, _wc) =
+            built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
+        let threaded = registry
+            .workflow_log_policy
+            .expect("into_worker_parts_with_extra_state must thread the configured log policy");
+        assert_eq!(threaded.max_lines(), 7);
+        assert_eq!(threaded.max_message_bytes(), 64);
+    }
+
+    /// AC6: with no policy configured the registry carries `None`, so the
+    /// executor never even constructs the durable sink and `ctx.logger()` is
+    /// byte-for-byte pre-#790.
+    #[cfg(feature = "db")]
+    #[test]
+    fn worker_parts_carry_no_log_policy_unless_it_is_configured() {
+        let (registry, _dags, _ws, _wc) = HarvestBuilder::new().build().into_worker_parts();
+        assert!(
+            registry.workflow_log_policy.is_none(),
+            "the durable log sink must be OFF unless explicitly configured"
+        );
     }
 
     /// The core worker build path (`into_worker_parts`) — which the standalone

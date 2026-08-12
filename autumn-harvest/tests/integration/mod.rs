@@ -171,6 +171,7 @@ mod workflow_handle_tests;
 #[cfg(feature = "db")]
 mod workflow_id_targeted_tests;
 mod workflow_logger_tests;
+mod workflow_logs_tests;
 mod workflow_mutation_tests;
 #[cfg(feature = "db")]
 mod workflow_reachability_samples_tests;

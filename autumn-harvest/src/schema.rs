@@ -918,6 +918,29 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Durable per-execution workflow log lines (issue #790). One row per
+    /// author-emitted `ctx.logger()` / `ctx.log_*` line, written only during
+    /// LIVE execution (the logger no-ops on replay) by the opt-in durable sink.
+    ///
+    /// Observational only: these rows are NOT part of `harvest_events`, carry no
+    /// determinism guarantee, and are never read back into workflow logic.
+    /// `seq` is the deterministic logical-position identity that both orders the
+    /// lines and dedups a re-driven decision cycle.
+    harvest_workflow_logs (id) {
+        id               -> Int8,
+        workflow_exec_id -> Uuid,
+        seq              -> Int8,
+        level            -> Text,
+        message          -> Text,
+        occurred_at      -> Timestamptz,
+    }
+}
+
+diesel::joinable!(harvest_workflow_logs -> harvest_workflow_executions (workflow_exec_id));
+
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
     harvest_events,
@@ -952,4 +975,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_wasm_modules,
     harvest_mutex_locks,
     harvest_mutex_waiters,
+    harvest_workflow_logs,
 );
