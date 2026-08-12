@@ -1496,6 +1496,45 @@ coordinates, so a run traces back to the exact message.
 
 - **Enforced the reserved connector key namespace** (Codex P1, `idempotency.rs:58`). The derived-key prefix was documented as making the connector's dedupe namespace "provably disjoint" from caller-supplied keys, but nothing enforced it — `validate_start_idempotency_key` only trimmed, rejected empty, and length-capped. Derived keys share a durable uniqueness scope with caller-supplied ones (`(workflow_name, idempotency_key)` on `harvest_start_idempotency` for a `Starts` binding, `(workflow_exec_id, idempotency_key)` on `harvest_signals` for a `SignalsWithStart` one) and are **predictable** — Kafka coordinates are `{topic}:{partition}:{offset}`, so anyone who knows a topic name can enumerate them. A caller who landed the derived key first claimed that row, and the broker's own delivery then read as an idempotent replay and was acknowledged **without ever dispatching its payload**: silent loss, precisely the failure the derived key exists to prevent. Closed by making the reservation real. Core gains `start_idempotency::RESERVED_KEY_PREFIX` (`"conn:"`, now carrying its own separator), the pure predicate `is_reserved_key`, and the single rejection message `reserved_key_message()`; `validate_start_idempotency_key` refuses a reserved key, which covers the plain start route (header and body share it) and the in-process transactional-start client. The plugin gains `reject_reserved_idempotency_key`, wired into signal-with-start and the standalone signal route ahead of the first thing that consumes the key. **The connector delegates through those same public handlers, so the guard would have refused its own dispatch** — caught immediately by the connector integration suite going 11-green-to-7-red on the first run. Resolved with an engine-only exemption rather than a carve-out in the guard: `StartWorkflowRequest`/`SignalWithStartRequest` gain `engine_derived_idempotency_key`, `#[serde(default, skip)]` so it is *never part of the public JSON body*, set only by `from_broker` (the same mechanism `start_source_override` already uses in these structs, and `WorkflowResetRequest::allow_terminal_source` uses for the reset endpoint). The `Idempotency-Key` **header** path is always strict — a connector strips the inbound header before delegating, so a header can never carry an engine-derived key. Pinned by `the_engine_exemption_cannot_be_claimed_from_the_request_body`, which deserializes a body that explicitly sets the flag `true` alongside a derived key and asserts it still lands `false` and the key is still refused. The connector's `CONNECTOR_KEY_PREFIX` now *aliases* the core constant, so the deriving and the refusing side cannot drift, and the derived key's bytes are unchanged (pinned against a literal — the key is persisted, so a format change would invalidate every live claim on upgrade). **Sized to where a connector key can actually land**: deliberately *not* applied to update-with-start or batch operations, whose keys live in uniqueness scopes no connector key reaches, so refusing there would reject a caller's key for no protective gain — a connector target that ever dispatches into one of those scopes must extend the guard, which the rustdoc says. Case-**sensitive** on purpose, matching the Postgres text comparison backing both scopes: `CONN:` cannot alias a derived key, so rejecting it would be over-broad. No new `WorkflowEvent` variant, no migration. Tests, TDD red→green (core RED confirmed as the validator accepting a derived key; the HTTP test mutation-verified by removing the signal-route guard): core `a_reserved_prefix_key_is_refused` and the over-rejection guard `a_near_miss_of_the_reserved_prefix_is_still_accepted`; the connector-side behavioural invariant `every_derived_key_is_refused_from_a_caller` (asserts every derived key — including the hashed-component and rotated-incarnation forms — is refused by the caller validator, so it holds however either constant is spelled) plus `the_prefix_carries_its_own_separator_and_the_key_is_unchanged`; three plugin unit tests in `reserved_idempotency_key_tests`; and two end-to-end HTTP tests in `security.rs` driven through the real router with no storage configured (which is what proves the guard runs at the request boundary, not behind a database read), asserting the *body* names the reservation so they cannot pass for an unrelated `400`.
 
+- **Renumbered the connector migration off a version core now claims** (Codex P1,
+  `20260719000000_harvest_connector_dead_letters/up.sql:1`). Merging `trunk-dev`
+  into this branch brought in core's
+  `autumn-harvest/migrations/20260719000000_harvest_workflow_logs` (issue #790),
+  which took the **same version** as this PR's plugin-owned connector migration.
+  That is fatal rather than cosmetic: `ensure_runtime_migrations` applies
+  `HARVEST_MIGRATIONS` (core) and then `PLUGIN_HARVEST_MIGRATIONS` against the
+  **same** `harvest_database_url`, both through Diesel's standard runner, and
+  Diesel keys `__diesel_schema_migrations` on the **version alone**. Core runs
+  first, records `20260719000000`, and the connector migration is then skipped
+  as already-applied — so `harvest_connector_dead_letters` is never created,
+  every default Harvest-sink poison write fails, and the message never leaves
+  the retry/stall cycle. Renamed to `20260719900000`. The `900000` time
+  component is deliberate and documented in the migration header: core allocates
+  `<date>000000`/`000001`/`000002`, so a `9xxxxx` slot is unreachable by its
+  convention — this migration had already been renumbered once for the same
+  reason, and picking the next sequential date would just queue up a third
+  collision. The three `include_str!` paths in the connector, SQS, and Kafka
+  broker suites were updated with it. **The guard for this already existed and
+  was already correct** — `plugin_and_core_migrations_never_share_a_version` in
+  `migration_hygiene.rs` names both the problem and the remedy — it simply never
+  ran, because `Lint` failed on `fmt` and the `Test` matrix `needs: [lint]`. It
+  was used as the RED phase here (it failed naming the exact directory) and is
+  green after the rename.
+
+- **Repaired the trunk merge.** Two defects, neither of which CI could report
+  because `Lint` died on its first step and skipped everything downstream.
+  `cargo fmt --check` failed on a trailing-whitespace blank line at
+  `plugin.rs:335`, exactly where this branch's `start_idempotency_window` block
+  abuts trunk's newly merged `workflow_logs` block. And the merge was a **clean
+  textual merge that does not compile**: trunk's new
+  `cross_type_continue_as_new_tests.rs` (issue #803) constructs
+  `SignalWithStartParams` without `start_source_ref_override`, the field this
+  branch adds, so `cargo clippy -p autumn-harvest --all-features --tests` failed
+  with `E0063`. Fixed with `None`, matching the convention this branch already
+  swept across four sibling test literals. MSRV and Quickstart passed on the
+  merge commit precisely because neither compiles test targets — the
+  documented "trunk adds a required field, a branch test literal breaks" class.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of

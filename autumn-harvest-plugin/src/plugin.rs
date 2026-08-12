@@ -335,7 +335,7 @@ impl HarvestPlugin {
         self.builder = self.builder.start_idempotency_window(window);
         self
     }
-  
+
     /// Enable the **opt-in durable per-execution workflow log sink** (issue
     /// #790).
     ///

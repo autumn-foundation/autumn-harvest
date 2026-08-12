@@ -1,5 +1,15 @@
 -- Broker connector poison-message dead letters (issue #944).
 --
+-- VERSION `20260719900000` -- the `900000` time component is deliberate.
+-- Plugin-harvest migrations run against the SAME database as core migrations
+-- and share `__diesel_schema_migrations`, which Diesel keys on the version
+-- ALONE; core runs first, so a version core also claims makes this migration
+-- silently "already applied" and this table is never created. Core allocates
+-- `<date>000000`/`000001`/`000002`, so a `9xxxxx` slot is unreachable by its
+-- convention. `plugin_and_core_migrations_never_share_a_version` in
+-- `autumn-harvest/tests/integration/migration_hygiene.rs` fails CI if a future
+-- version ever collides anyway.
+--
 -- Deliberately a PLUGIN-owned table, not the engine's `harvest_dead_letters`:
 -- that table is keyed to a task (`original_task_id` is NOT NULL and
 -- `task_type` carries a CHECK constraint on 'workflow'/'activity'). A poison
