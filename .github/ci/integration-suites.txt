@@ -59,7 +59,9 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          canary_tests
 linux        autumn-harvest         integration                      -                          chain_timeout_tests
 linux        autumn-harvest         integration                      -                          child_timeout_tests
+linux        autumn-harvest         integration                      -                          claim_budget_tests
 linux        autumn-harvest         integration                      -                          completion_callback_tests
+linux        autumn-harvest         integration                      -                          cross_type_continue_as_new_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_await_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_signal_tests
 linux        autumn-harvest         integration                      -                          dag_execution_timeout_tests
@@ -78,12 +80,14 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          retry_after_tests
 linux        autumn-harvest         integration                      -                          schedule_runs_tests
 linux        autumn-harvest         integration                      -                          scheduler_overdue_tests
+linux        autumn-harvest         integration                      -                          scheduler_registration_tests
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
 linux        autumn-harvest         integration                      -                          start_source_tests
 linux        autumn-harvest         integration                      -                          transactional_start_tests
 linux        autumn-harvest         integration                      -                          triage_tests
 linux        autumn-harvest         integration                      -                          typed_workflow_failure_tests
 linux        autumn-harvest         integration                      -                          workflow_id_targeted_tests
+linux        autumn-harvest         integration                      -                          workflow_logs_tests
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
 linux        autumn-harvest         integration                      testing                    dag_compensation
@@ -131,6 +135,7 @@ linux        autumn-harvest-plugin  token_auth_integration           -          
 linux        autumn-harvest-plugin  triage_integration               -                          -
 linux        autumn-harvest-plugin  ui_integration                   -                          -
 linux        autumn-harvest-plugin  webhook_receiver_integration     webhooks                   -
+linux        autumn-harvest-plugin  workflow_logs_integration        -                          -
 linux        autumn-harvest-plugin  workflow_reachability_integration  -                          -
 linux        autumn-harvest-plugin  workflow_rerun_integration       -                          -
 linux        autumn-harvest-plugin  workflow_summaries_integration   -                          -

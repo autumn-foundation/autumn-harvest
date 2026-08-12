@@ -1051,6 +1051,62 @@ async fn checkout(ctx: &WorkflowContext, cart: Cart) -> Result<(), String> {
 
 **Guarantees:** every field derives from already-recorded state (the `WorkflowStarted` event + the execution row the executor already loads), so `info()` is **replay-deterministic** (byte-identical on every worker and every replay pass) and **leaves zero footprint** — it appends no `harvest_events` and emits no `WorkflowCommand`, the same leave-no-trace property as a query handler. Usable from any `#[workflow]` body with **no feature flag**. **No new `WorkflowEvent` variant, no migration.** One exception to the byte-identical/branch-safe claim: `is_replaying` is **observability-only** — it intentionally differs live-vs-replay (it *is* the replay indicator), so do not branch command-affecting logic on it or include it in an activity input (doing so records different commands live vs replay → non-determinism). See `autumn-harvest/examples/ctx_info.rs`. The activity-side counterpart is `ActivityContext::info()` — see "Activity run metadata and deadline" below (issue #783).
 
+### Cross-type continue-as-new — multi-phase entities (issue #803)
+
+`ctx.continue_as_new(input)` resets history but always resurrects the run as the **same** workflow type. For a long-lived entity that does genuinely different work per lifecycle phase (`trial_subscription` → `paid_subscription` → `churned`), that forces either one ever-branching monolith or breaking the stable `workflow_id` that `signal_with_start` (#244) / `update_with_start` (#479) depend on. Two new methods continue the *same logical entity* as a *different registered type*:
+
+| Method | Form |
+|---|---|
+| `ctx.continue_as_new_as::<I>(&paid_subscription_info(), input)` | Typed — resolves the name from the target's companion `WorkflowInfo`, no magic string |
+| `ctx.continue_as_new_as_type("paid_subscription", json!(input))` | Untyped — for a dynamically-chosen target |
+
+```rust
+#[workflow]
+async fn trial_subscription(ctx: &WorkflowContext, sub: Subscription) -> Result<Value, String> {
+    let converted: bool = ctx.receive_signal("conversion_decision").await.map_err(|e| e.to_string())?;
+    if converted {
+        ctx.continue_as_new_as::<Subscription>(&paid_subscription_info(), sub).await.map_err(|e| e.to_string())?;
+    } else {
+        ctx.continue_as_new_as_type("churned", json!(sub)).await.map_err(|e| e.to_string())?;
+    }
+    unreachable!("continue_as_new_as* suspends the run and never resolves");
+}
+```
+
+**What carries, what re-resolves.** The successor keeps the entity's `workflow_id`, shard and queue, and its history starts clean:
+
+| Property | Behaviour |
+|---|---|
+| `workflow_id`, shard, queue | **Kept** |
+| Event history | **Reset** (the point of continue-as-new) |
+| `execution_timeout` (#243), `sla` (#487) | **Re-resolved from the new type's `WorkflowInfo`**; per-run deadlines re-anchored to the successor's start. `sla` is clamped to `execution_timeout`, mirroring the start path |
+| Concurrency key/limit (#247) | **Re-resolved from the new type's policy**, against the new input |
+| `owner` / `runbook_url` / `severity` (#372) | **Re-resolved from the new type** — alerts page the team owning *this* phase |
+| Workflow-level retry policy (#523) | **Re-resolved from the new type**, then clamped by the fleet-wide `max_workflow_attempts_ceiling` — a type change is not an escape hatch from an operator's retry cap |
+| Chain lifetime cap (#617) — `chain_execution_timeout` / `chain_deadline_at` | **Carried verbatim.** Deliberate: changing type must not be an escape hatch from a runaway-loop budget |
+| Unconsumed signals, `last_completion_result` (#488), schedule lineage (#534), `context_headers`, `origin`, `memo`, search attributes, `assigned_build_id` (#171), completion callbacks (#605), run-chain back-links (#701) | **Carried** — that carryover code never consults the workflow type |
+| `throttle` (#607), `debounce` (#499), `batch` (#518), `max_input_bytes` (#252) | **Not consulted.** These are *admission* policies and continue-as-new is in-flight continuation, not a start — so a cross-type transition does not pass the target type's admission gates, and the payload cap enforced is the predecessor's |
+
+**Single-shard only, enforced.** Rendezvous routing hashes the **pair** `(workflow_name, workflow_id)`, so changing the type re-routes the key — measured at ~75% of ids on a 4-shard router. The successor cannot follow it: the predecessor's seal and the successor's insert are one transaction, and there is no cross-shard transaction to relocate the row with. Left unguarded that would make the successor unreachable by `workflow_id`-addressed signal/cancel/await (#751) — the very addressing this feature exists to preserve — and would hide a live run of the target type on the routed shard, admitting two live runs under one key. So a transition whose target key routes to a different shard is **rejected terminally**, naming both shards. Naming the run's **own** type is exempt — it changes no key, so a run pinned off its hash-derived shard by explicit placement (#697) can still re-resolve its own declared defaults. Single-shard deployments never hit this (one shard, so the key can only resolve to it), and `HarvestPlugin` rejects multi-shard upstream, so the restriction binds only standalone-runner embedders. Relocation or a routing directory is the follow-up that would lift it.
+
+The fleet-wide `max_workflow_execution_timeout` ceiling is applied to the target's declared timeout, so a type change is not an escape hatch from that either. A declared timeout the ceiling does **not** bound and that cannot be resolved to an absolute deadline (an out-of-range duration) **rejects the transition** rather than persisting a run whose `execution_timeout` claims a hard cap the timeout scanner — which only enforces a non-NULL `deadline_at` — can never fire. An out-of-range **`sla`** instead maps to "no SLA" (both fields cleared), matching the #487 start-path rule: the SLA is observational, so degrading it is benign, whereas silently dropping a runaway cap is not.
+
+**Presence decides.** `new_workflow_type: None` (a plain `ctx.continue_as_new`) takes the byte-identical legacy path: every lifecycle column is carried verbatim, including a per-start override the *type* never declared. Only `Some(target)` re-resolves from a `WorkflowInfo`. A target declaring no default therefore **clears** the column rather than silently inheriting the predecessor's.
+
+**Addressing consequence — read before adopting.** Harvest's active-run identity is the **pair** `(workflow_name, workflow_id)`, not `workflow_id` alone (Temporal differs — it keys on `workflowId`). After a transition an external caller must name the **current phase type**; naming the old type does not error, it silently starts a *separate* run of that old type (the transition released its uniqueness slot) which coexists with the live successor. If external callers cannot track the current phase, keep the entity on one type and branch internally.
+
+The **inverse of that coexistence is a hazard, not a convenience**: because the successor must *take* `(target, workflow_id)`, a **live** run someone already started under that pair blocks the transition, and the transitioning execution is failed terminally rather than displacing the bystander. Do not start the next phase out-of-band while the current phase is still running — let the entity transition itself. A *terminal* prior run of the target phase **also blocks it**: harvest's uniqueness counts a terminal run as occupying the key, and releasing it would rewrite that run's recorded outcome — breaking `await`/`/result` for anyone holding its id, and rolling a scheduled carryover cursor backward — so win-back loops (`churned → trial → churned`) need the old run reset/erased first, or a different `workflow_id`. Naming the run's **own** current type is fine — it is a supported request for that type's declared defaults, and the predecessor's own seal frees the slot.
+
+**Schedule overlap controls do not follow a type change.** `schedule_id`/`scheduled_for` are carried (the successor is still the same logical scheduled run), but `max_active_runs` counting and `OverlapPolicy::CancelOther`/`TerminateOther` all select on the *schedule's* `workflow_name` — so a cross-type successor stops counting toward the cap and cannot be cancelled by the next fire. A schedule with `OverlapPolicy::Skip` will fire again while the previous fire's successor is still live under the other type.
+
+**Handler-removal reachability.** `GET /admin/workflow-types/reachability` (#520) reports `safe_to_remove` from *non-terminal executions of that type* only; it cannot see that a live run of a **different** type is about to `continue_as_new_as` into it. Grep for `continue_as_new_as`/`continue_as_new_as_type` targets before deleting a handler — see `docs/runbooks/safe-handler-removal.md`.
+
+**Rollout ordering.** The target must be registered on the worker running the transition — deploy the new phase's handler **fleet-wide first**. Four cases fail the predecessor terminally with an operator message naming the type, creating **no** successor (never a silent no-op, never an undispatchable row): a blank target, an unregistered target, a target naming a registered **unified DAG** (a DAG successor would bypass the admission gates `POST /dags/{name}/trigger` enforces), and a target whose `(type, workflow_id)` slot is held by a **live** run.
+
+**Scope.** Root-only, exactly as before (`reject_child_continue_as_new` is unchanged — a child cannot cross-type continue either). Out of scope per the issue: cross-shard relocation, DAG continue-as-new, and re-validating the successor input against the target's `input_schema` (#373).
+
+**Invariants.** The transition rides the **existing** `WorkflowContinuedAsNew` event via one additive optional field `new_workflow_type: Option<String>` (`#[serde(default, skip_serializing_if = "Option::is_none")]`) — **no new `WorkflowEvent` variant, no migration**; pre-#803 histories deserialize to `None` and replay identically. `HistoryMatcher::match_continue_as_new` compares the recorded target type **before** the input, so a code change that redirects an already-recorded transition surfaces as `HarvestError::NonDeterministic` / `NonDeterminismKind::ContinueAsNewMismatch` rather than silently retargeting a live entity. See `autumn-harvest/examples/entity_phase_transition.rs`.
+
 ### Patched / Code Evolution (issue #687)
 
 `ctx.patched(id)` / `ctx.deprecate_patch(id)` are the recommended default for evolving in-flight workflow logic — a boolean two-state gate over the same `MarkerRecorded` event `ctx.version()` uses (`patch:{id}`, no new event variant, no migration).

@@ -169,6 +169,9 @@ td code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;c
 .view-toggle a{color:#93c5fd;text-decoration:none}
 .view-toggle a:hover{background:#1e293b}
 .view-toggle span.active{background:#2563eb;color:#fff;font-weight:600}
+.log-filters a{color:#93c5fd;text-decoration:none;padding:2px 8px;border-radius:4px}
+.log-filters a:hover{background:#1e293b}
+.log-filters a.active{background:#2563eb;color:#fff;font-weight:600}
 .summary-stats{display:flex;gap:18px;flex-wrap:wrap;margin:0 0 16px;font-size:13px;color:#94a3b8}
 .summary-stats strong{color:#e2e8f0}
 .summary-stats .note{color:#fbbf24}
@@ -267,6 +270,10 @@ pub(crate) struct WorkflowDetailParams {
     /// Jump to the page containing this 1-based event number.
     #[serde(default)]
     jump_event: Option<i64>,
+    /// Level filter for the durable workflow-logs panel (issue #790):
+    /// `info` | `warn` | `error`. Absent or unrecognised means "all levels".
+    #[serde(default)]
+    log_level: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1350,6 +1357,79 @@ async fn workflow_detail_ui(
     // with a warn so a persistent failure is diagnosable. The pooled
     // connection is dropped first so the report's own connection checkout
     // never overlaps ours (pool-size-1 safety).
+    // Durable per-execution author log lines (issue #790, AC5). Admin-gated to
+    // mirror `GET /workflows/{id}/logs`'s `require_admin` posture — a non-admin
+    // principal must not read through the UI what the API would deny them.
+    // Loaded on the page's own connection before it is dropped. Best-effort: a
+    // failure hides the panel rather than failing the page (logs are
+    // observational, AC7), with a warn so a persistent failure is diagnosable.
+    let logs_admin = crate::api::has_harvest_admin_access(&api_state, session.clone()).await;
+    let log_level_filter =
+        autumn_harvest::WorkflowLogLevel::from_wire(params.log_level.as_deref().unwrap_or(""));
+    let mut log_read_failed = false;
+    let mut log_truncated = false;
+    let log_lines: Vec<autumn_harvest::models::HarvestWorkflowLog> = if logs_admin {
+        let level_refs: Vec<&str> = log_level_filter
+            .map(autumn_harvest::WorkflowLogLevel::as_str)
+            .into_iter()
+            .collect();
+        // Probe for the cap marker DIRECTLY rather than scanning the page. The
+        // marker sits at `seq = i64::MAX` so it sorts last, and this panel loads
+        // only the first `WORKFLOW_LOG_PANEL_LIMIT` rows -- under the default
+        // 1,000-line cap a truncated run's marker can never land in a 200-row
+        // page, so a scan would report "not truncated" for exactly the runs that
+        // dropped the most. Mirrors the API route's own filter-independent probe.
+        match autumn_harvest::store::load_workflow_logs(
+            &mut conn,
+            exec_id,
+            &autumn_harvest::store::WorkflowLogQuery {
+                after_seq: Some(autumn_harvest::store::WORKFLOW_LOG_TRUNCATION_SEQ - 1),
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(rows) => log_truncated = !rows.is_empty(),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %exec_id,
+                    error = ?err,
+                    "workflow detail: durable log truncation probe failed"
+                );
+                log_read_failed = true;
+            }
+        }
+        match autumn_harvest::store::load_workflow_logs(
+            &mut conn,
+            exec_id,
+            &autumn_harvest::store::WorkflowLogQuery {
+                levels: &level_refs,
+                limit: WORKFLOW_LOG_PANEL_LIMIT,
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                // Best-effort: never fail the page over an observational read.
+                // But surface it AS a failure -- the empty state otherwise
+                // affirmatively claims the sink is disabled, which during an
+                // incident is the opposite of what happened.
+                tracing::warn!(
+                    execution_id = %exec_id,
+                    error = ?err,
+                    "workflow detail: durable log read failed"
+                );
+                log_read_failed = true;
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     drop(conn);
     if !is_terminal_workflow_state(&execution.state)
         && crate::api::has_harvest_admin_access(&api_state, session).await
@@ -1380,6 +1460,13 @@ async fn workflow_detail_ui(
         &blocked_on,
         params.flash.as_deref(),
         continue_as_new_threshold,
+        &WorkflowLogsPanelData {
+            lines: &log_lines,
+            level_filter: log_level_filter,
+            admin: logs_admin,
+            truncated: log_truncated,
+            read_failed: log_read_failed,
+        },
     ))
 }
 
@@ -4292,6 +4379,11 @@ const SIGNAL_UPDATE_TYPES: &[&str] = &[
     "UpdateFailed",
 ];
 const SIGNAL_UPDATE_PANEL_LIMIT: usize = 20;
+/// Maximum durable workflow-log lines rendered on the detail page (issue #790).
+/// The API route (`GET /workflows/{id}/logs`) paginates the full set; the panel
+/// shows the FIRST window (oldest-first, matching the store's `seq` order) and
+/// links out for the rest.
+const WORKFLOW_LOG_PANEL_LIMIT: i64 = 200;
 const ACTIVITY_PANEL_EVENT_TYPES: &[&str] = &[
     "ActivityScheduled",
     "ActivityStarted",
@@ -4484,6 +4576,7 @@ fn render_workflow_detail(
     blocked_on: &BlockedOnData,
     flash: Option<&str>,
     continue_as_new_threshold: Option<u64>,
+    logs: &WorkflowLogsPanelData<'_>,
 ) -> Markup {
     let exec_id_str = execution.id.to_string();
     let title = format!("{} · Vantage", execution.workflow_name);
@@ -4515,6 +4608,11 @@ fn render_workflow_detail(
     // Pagination arithmetic based on the DB-level total.
     let total_events_usize = usize::try_from(total_events).unwrap_or(usize::MAX);
     let page_size = usize::try_from(DETAIL_EVENT_PAGE_SIZE).unwrap_or(100);
+    // Preserved across every event-pagination link so paging the timeline does
+    // not silently reset the log-level filter (and vice-versa).
+    let selected_log_level = logs
+        .level_filter
+        .map(autumn_harvest::WorkflowLogLevel::as_str);
     let event_page_idx = usize::try_from(event_page).unwrap_or(0);
     let page_start = event_page_idx
         .saturating_mul(page_size)
@@ -4811,6 +4909,11 @@ fn render_workflow_detail(
             }
         }
 
+        // Durable workflow logs panel (issue #790, AC5)
+        @if logs.admin {
+            (render_workflow_logs_panel(&exec_id_str, logs, event_page))
+        }
+
         // Event timeline
         div.card {
             h3 { "Event history (" (total_events) " events)" }
@@ -4821,7 +4924,7 @@ fn render_workflow_detail(
                 @if total_events > DETAIL_EVENT_PAGE_SIZE {
                     div.pagination style="margin-bottom:12px" {
                         @if has_prev_page {
-                            a href={ "?event_page=" (event_page - 1) } {
+                            a href=(workflow_detail_href(event_page - 1, selected_log_level)) {
                                 (PreEscaped("&larr;")) " Previous"
                             }
                         } @else {
@@ -4829,13 +4932,13 @@ fn render_workflow_detail(
                         }
                         span { " Events " (page_start + 1) "–" (page_end) " of " (total_events) " " }
                         @if has_next_page {
-                            a href={ "?event_page=" (event_page + 1) } {
+                            a href=(workflow_detail_href(event_page + 1, selected_log_level)) {
                                 "Next " (PreEscaped("&rarr;"))
                             }
                         } @else {
                             span.disabled { "Next " (PreEscaped("&rarr;")) }
                         }
-                        a href={ "?event_page=" (last_page) } { "Jump to latest" }
+                        a href=(workflow_detail_href(last_page, selected_log_level)) { "Jump to latest" }
                     }
                 }
                 table {
@@ -4875,7 +4978,7 @@ fn render_workflow_detail(
                 @if total_events > DETAIL_EVENT_PAGE_SIZE {
                     div.pagination style="margin-top:12px" {
                         @if has_prev_page {
-                            a href={ "?event_page=" (event_page - 1) } {
+                            a href=(workflow_detail_href(event_page - 1, selected_log_level)) {
                                 (PreEscaped("&larr;")) " Previous"
                             }
                         } @else {
@@ -4883,13 +4986,13 @@ fn render_workflow_detail(
                         }
                         span { "Page " (event_page + 1) }
                         @if has_next_page {
-                            a href={ "?event_page=" (event_page + 1) } {
+                            a href=(workflow_detail_href(event_page + 1, selected_log_level)) {
                                 "Next " (PreEscaped("&rarr;"))
                             }
                         } @else {
                             span.disabled { "Next " (PreEscaped("&rarr;")) }
                         }
-                        a href={ "?event_page=" (last_page) } { "Jump to latest" }
+                        a href=(workflow_detail_href(last_page, selected_log_level)) { "Jump to latest" }
                         form method="get" style="display:inline-flex;gap:6px;align-items:center;margin-left:8px" {
                             label style="font-size:12px;color:#94a3b8" { "Jump to event:" }
                             input type="number" name="jump_event" min="1" max=(total_events) placeholder="N"
@@ -5000,6 +5103,159 @@ fn render_heartbeat_checkpoint_cell(item: &TaskQueueItem, state: CheckpointCellS
 /// Render the "Pending activities" table, including each activity's latest
 /// heartbeat checkpoint judged against its effective (per-activity) cap and the
 /// cumulative per-page checkpoint budget (#503).
+/// Build a workflow-detail URL that preserves BOTH view dimensions.
+///
+/// The detail page now has two independent filters -- the event-history page
+/// and the log-level filter (issue #790) -- and a bare `?log_level=` /
+/// `?event_page=` link silently resets the other one. Every link that changes
+/// one dimension goes through here so it carries the other.
+///
+/// `jump_event` is deliberately NOT preserved: it is a one-shot "take me to
+/// event N" action that `event_page` already resolves to a concrete page, so
+/// carrying it would re-trigger the jump on every subsequent click.
+fn workflow_detail_href(event_page: i64, log_level: Option<&str>) -> String {
+    let mut url = format!("?event_page={event_page}");
+    if let Some(level) = log_level {
+        url.push_str("&log_level=");
+        url.push_str(level);
+    }
+    url
+}
+
+/// Inputs for the durable workflow-logs panel (issue #790, AC5).
+///
+/// Bundled rather than passed as three more positional parameters:
+/// `render_workflow_detail` already takes eleven.
+#[derive(Debug, Default)]
+pub(crate) struct WorkflowLogsPanelData<'a> {
+    /// The page of log lines, in emission order (`seq`).
+    pub lines: &'a [autumn_harvest::models::HarvestWorkflowLog],
+    /// The active `?log_level=` filter; `None` means "all levels".
+    pub level_filter: Option<autumn_harvest::WorkflowLogLevel>,
+    /// Whether the viewing principal has harvest-admin access. The panel is
+    /// rendered only when `true`, mirroring the API route's `require_admin`.
+    pub admin: bool,
+    /// Whether this execution hit its per-execution log cap.
+    ///
+    /// Resolved by the caller with a direct probe for the marker row, NOT by
+    /// scanning `lines`: the marker sits at `seq = i64::MAX` so it sorts last,
+    /// and the panel only loads the FIRST `WORKFLOW_LOG_PANEL_LIMIT` rows. With
+    /// the default cap (1,000) a truncated run's marker can never appear in a
+    /// 200-row page, so a scan-based check would render `false` for exactly the
+    /// runs that dropped the most -- silently, which is the one failure mode
+    /// the marker exists to prevent.
+    pub truncated: bool,
+    /// Whether the log read itself failed (as opposed to returning no rows).
+    ///
+    /// Without this the empty state affirmatively tells the operator "the sink
+    /// is disabled" during an incident where the read actually errored -- e.g.
+    /// a node that has not yet run the migration, where every detail page would
+    /// claim every run logged nothing.
+    pub read_failed: bool,
+}
+
+/// Renders the durable per-execution author-log panel (issue #790, AC5).
+///
+/// Sourced from the SAME `harvest_workflow_logs` rows `GET /workflows/{id}/logs`
+/// serves, in the same emission order (`seq`), so the UI and the API can never
+/// disagree about what a run logged. Level filtering is a plain link-based
+/// filter (`?log_level=`) — no JS, matching the Workers/DLQ page precedent.
+///
+/// The panel is rendered only for a harvest-admin principal (the caller gates
+/// it), mirroring the API route's `require_admin`.
+///
+/// Logs are observational only (AC7): a run that never logged, or a deployment
+/// with the durable sink disabled, shows the empty state rather than an error —
+/// there is nothing wrong with either.
+fn render_workflow_logs_panel(
+    exec_id_str: &str,
+    logs: &WorkflowLogsPanelData<'_>,
+    event_page: i64,
+) -> Markup {
+    use autumn_harvest::WorkflowLogLevel;
+
+    let WorkflowLogsPanelData {
+        lines,
+        level_filter,
+        admin: _,
+        truncated,
+        read_failed,
+    } = *logs;
+
+    let capped = i64::try_from(lines.len()).unwrap_or(i64::MAX) >= WORKFLOW_LOG_PANEL_LIMIT;
+    let selected = level_filter.map(WorkflowLogLevel::as_str);
+
+    html! {
+        div.card {
+            h3 { "Logs" }
+            div.log-filters style="margin-bottom:12px" {
+                @let all_class = if selected.is_none() { "active" } else { "" };
+                a class=(all_class) href=(workflow_detail_href(event_page, None)) { "All" }
+                @for level in [WorkflowLogLevel::Info, WorkflowLogLevel::Warn, WorkflowLogLevel::Error] {
+                    @let wire = level.as_str();
+                    @let class = if selected == Some(wire) { "active" } else { "" };
+                    " "
+                    a class=(class) href=(workflow_detail_href(event_page, Some(wire))) { (wire) }
+                }
+            }
+            @if truncated {
+                div.empty {
+                    "This execution reached its per-execution log cap; later lines were dropped."
+                }
+            }
+            @if read_failed {
+                div.empty {
+                    "Could not read this execution's durable log lines. This is a read "
+                    "failure, not an empty log \u{2014} see the server logs. If this node has "
+                    "not yet run the "
+                    code { "20260719000000_harvest_workflow_logs" }
+                    " migration, apply it."
+                }
+            } @else if lines.is_empty() {
+                div.empty {
+                    @if selected.is_some() {
+                        "No log lines at this level."
+                    } @else {
+                        "No durable log lines recorded. "
+                        "Author lines are persisted only when the opt-in sink is enabled "
+                        "(HarvestPlugin/HarvestBuilder::workflow_log_persistence)."
+                    }
+                }
+            } @else {
+                table {
+                    thead {
+                        tr {
+                            th { "Level" }
+                            th { "Time" }
+                            th { "Message" }
+                        }
+                    }
+                    tbody {
+                        @for line in lines {
+                            tr {
+                                td { code { (&line.level) } }
+                                td { (format_timestamp(Some(line.occurred_at))) }
+                                td { (&line.message) }
+                            }
+                        }
+                    }
+                }
+                @if capped {
+                    div.empty style="margin-top:8px" {
+                        "Showing the first " (WORKFLOW_LOG_PANEL_LIMIT) " lines. "
+                        "Page the rest via "
+                        code {
+                            "GET /api/harvest/workflows/" (exec_id_str) "/logs"
+                            @if let Some(wire) = selected { "?level=" (wire) }
+                        }
+                        "."
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn render_pending_activities_table(blocked_on: &BlockedOnData) -> Markup {
     let cell_states = plan_checkpoint_cells(blocked_on);
     html! {
@@ -10340,6 +10596,7 @@ mod tests {
             &blocked,
             None,
             Some(10_000),
+            &WorkflowLogsPanelData::default(),
         )
         .into_string();
 
@@ -10373,6 +10630,7 @@ mod tests {
             &blocked,
             None,
             None,
+            &WorkflowLogsPanelData::default(),
         )
         .into_string();
 
@@ -10402,6 +10660,7 @@ mod tests {
             &blocked,
             None,
             Some(500),
+            &WorkflowLogsPanelData::default(),
         )
         .into_string();
 
@@ -11839,6 +12098,242 @@ mod tests {
         assert!(
             html[anchor..anchor + group_end].contains("BIGGEST"),
             "the #slowest anchor wraps the actual slowest (child) step"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Durable workflow-logs panel (issue #790, AC5)
+    // -----------------------------------------------------------------------
+
+    fn stub_log_line(
+        seq: i64,
+        level: &str,
+        message: &str,
+    ) -> autumn_harvest::models::HarvestWorkflowLog {
+        autumn_harvest::models::HarvestWorkflowLog {
+            id: seq,
+            workflow_exec_id: uuid::Uuid::nil(),
+            seq,
+            level: level.to_string(),
+            message: message.to_string(),
+            occurred_at: chrono::Utc::now(),
+        }
+    }
+
+    fn render_logs_detail(logs: &WorkflowLogsPanelData<'_>) -> String {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+            logs,
+        )
+        .into_string()
+    }
+
+    #[test]
+    fn logs_panel_is_not_rendered_for_a_non_admin() {
+        // Mirrors the API route's `require_admin`: a log message is free-form
+        // author text, so a non-admin must not read through the UI what the
+        // API would deny. `admin: false` is the `Default`, which is also what
+        // every non-log detail test passes.
+        let lines = [stub_log_line(0, "info", "SENSITIVE-BUSINESS-DETAIL")];
+        let html = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &lines,
+            admin: false,
+            ..Default::default()
+        });
+        assert!(!html.contains("SENSITIVE-BUSINESS-DETAIL"));
+        assert!(
+            !html.contains(">Logs<"),
+            "the panel heading must not render for a non-admin"
+        );
+    }
+
+    #[test]
+    fn logs_panel_renders_lines_in_order_for_an_admin() {
+        let lines = [
+            stub_log_line(0, "info", "first-line"),
+            stub_log_line(1, "warn", "second-line"),
+            stub_log_line(2, "error", "third-line"),
+        ];
+        let html = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &lines,
+            admin: true,
+            ..Default::default()
+        });
+        assert!(html.contains(">Logs<"), "the panel heading must render");
+        let first = html.find("first-line").expect("first line rendered");
+        let second = html.find("second-line").expect("second line rendered");
+        let third = html.find("third-line").expect("third line rendered");
+        assert!(
+            first < second && second < third,
+            "lines must render in emission (seq) order"
+        );
+        for level in ["info", "warn", "error"] {
+            assert!(html.contains(level), "level {level} must be shown");
+        }
+    }
+
+    #[test]
+    fn logs_panel_escapes_a_hostile_author_message() {
+        // A log message is arbitrary author text and can embed anything a
+        // workflow formats into it -- including attacker-controlled input.
+        let lines = [stub_log_line(0, "info", "<script>alert('xss')</script>")];
+        let html = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &lines,
+            admin: true,
+            ..Default::default()
+        });
+        assert!(
+            !html.contains("<script>alert"),
+            "a log message must never render as live markup"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "the message must still be visible, escaped"
+        );
+    }
+
+    #[test]
+    fn logs_panel_marks_the_active_level_filter() {
+        // AC5's "with level filtering". The active link must be visually
+        // distinguishable -- `class="active"` under a rule that actually
+        // matches, or the operator has no feedback about what is applied.
+        let html = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &[],
+            level_filter: Some(autumn_harvest::WorkflowLogLevel::Warn),
+            admin: true,
+            ..Default::default()
+        });
+        assert!(
+            html.contains("log-filters"),
+            "the filter row must carry the scoped class its CSS rule targets"
+        );
+        assert!(
+            html.contains(".log-filters a.active"),
+            "a scoped stylesheet rule must exist for the active filter link, \
+             or `class=\"active\"` renders identically to the others"
+        );
+        let warn_link = html
+            .find("log_level=warn")
+            .expect("the warn filter link must render");
+        let link_start = html[..warn_link].rfind("<a").expect("anchor open tag");
+        assert!(
+            html[link_start..warn_link].contains("active"),
+            "the selected level's link must be marked active"
+        );
+    }
+
+    #[test]
+    fn logs_panel_filter_links_preserve_the_event_page() {
+        // The detail page has two independent view dimensions; a bare
+        // `?log_level=` link would silently reset the event pager.
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            3, // event_page
+            &blocked,
+            None,
+            None,
+            &WorkflowLogsPanelData {
+                lines: &[],
+                admin: true,
+                ..Default::default()
+            },
+        )
+        .into_string();
+        // maud escapes `&` inside an attribute value, which is the correct
+        // HTML -- assert the escaped form rather than weakening the check.
+        assert!(
+            html.contains("?event_page=3&amp;log_level=warn"),
+            "a level-filter link must carry the current event page"
+        );
+    }
+
+    #[test]
+    fn logs_panel_shows_the_truncation_banner_from_the_caller_probe() {
+        // The marker sits at `seq = i64::MAX` and sorts LAST, while the panel
+        // loads only the first `WORKFLOW_LOG_PANEL_LIMIT` rows -- so under the
+        // default 1,000-line cap it can never appear in the page. The flag must
+        // therefore come from the caller's direct probe, not from scanning
+        // `lines`; this fixture has a full page with NO marker in it.
+        let lines: Vec<_> = (0..3).map(|i| stub_log_line(i, "info", "l")).collect();
+        let html = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &lines,
+            admin: true,
+            truncated: true,
+            ..Default::default()
+        });
+        assert!(
+            html.contains("reached its per-execution log cap"),
+            "a truncated run must show the banner even though the marker row is \
+             not in this page"
+        );
+    }
+
+    #[test]
+    fn logs_panel_distinguishes_a_read_failure_from_an_empty_log() {
+        // During an incident -- e.g. a node that has not run the migration --
+        // the empty state would otherwise affirmatively claim the sink is
+        // disabled, which is the opposite of what happened.
+        let failed = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &[],
+            admin: true,
+            read_failed: true,
+            ..Default::default()
+        });
+        assert!(failed.contains("read failure, not an empty log"));
+        assert!(
+            !failed.contains("opt-in sink is enabled"),
+            "a read failure must not be reported as a disabled sink"
+        );
+
+        let empty = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &[],
+            admin: true,
+            ..Default::default()
+        });
+        assert!(empty.contains("opt-in sink is enabled"));
+        assert!(!empty.contains("read failure, not an empty log"));
+    }
+
+    #[test]
+    fn logs_panel_empty_state_names_the_active_filter() {
+        let html = render_logs_detail(&WorkflowLogsPanelData {
+            lines: &[],
+            level_filter: Some(autumn_harvest::WorkflowLogLevel::Error),
+            admin: true,
+            ..Default::default()
+        });
+        assert!(
+            html.contains("No log lines at this level."),
+            "an empty FILTERED view must not claim the run logged nothing"
+        );
+    }
+
+    #[test]
+    fn workflow_detail_href_preserves_both_dimensions() {
+        assert_eq!(workflow_detail_href(0, None), "?event_page=0");
+        assert_eq!(
+            workflow_detail_href(2, Some("error")),
+            "?event_page=2&log_level=error"
         );
     }
 }

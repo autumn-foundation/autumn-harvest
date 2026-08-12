@@ -29,9 +29,14 @@ mod child_policy_tests;
 mod child_timeout_tests;
 mod ci_run_coverage;
 mod circuit_breaker_wiring_tests;
+mod claim_bench_support;
+#[cfg(feature = "db")]
+mod claim_budget_tests;
 mod completion_callback_tests;
 mod concurrency_key_tests;
 mod context_headers_tests;
+#[cfg(feature = "db")]
+mod cross_type_continue_as_new_tests;
 mod cross_workflow_await_tests;
 mod cross_workflow_cancel_tests;
 #[cfg(feature = "db")]
@@ -88,6 +93,7 @@ mod payload_cap_tests;
 mod payload_offload_db_tests;
 #[cfg(feature = "testing")]
 mod payload_offload_replay_tests;
+mod performance_docs;
 mod poison_pill_tests;
 mod priority_tests;
 #[cfg(feature = "testing")]
@@ -129,6 +135,8 @@ mod scheduler_catchup_tests;
 mod scheduler_ha_tests;
 #[cfg(feature = "db")]
 mod scheduler_overdue_tests;
+#[cfg(feature = "db")]
+mod scheduler_registration_tests;
 mod security;
 mod sharding_unit;
 mod signal_tests;
@@ -163,6 +171,7 @@ mod workflow_handle_tests;
 #[cfg(feature = "db")]
 mod workflow_id_targeted_tests;
 mod workflow_logger_tests;
+mod workflow_logs_tests;
 mod workflow_mutation_tests;
 #[cfg(feature = "db")]
 mod workflow_reachability_samples_tests;

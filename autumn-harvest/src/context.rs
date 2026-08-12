@@ -482,6 +482,9 @@ pub enum WorkflowCommand {
     ContinueAsNew {
         /// Input passed to the next iteration of the workflow.
         input: Value,
+        /// Registered workflow type the successor runs as (issue #803).
+        /// `None` = same type as the predecessor (today's behavior).
+        new_workflow_type: Option<String>,
     },
     /// Run a local activity inline on the workflow worker (never enqueued).
     ///
@@ -585,6 +588,33 @@ pub enum WorkflowCommand {
         /// oversize chunk is a `{"_harvest_progress_truncated": true, ..}`
         /// marker).
         chunk: Value,
+    },
+    /// Persist one author-emitted log line to the durable per-execution log
+    /// store (issue #790).
+    ///
+    /// Emitted by [`WorkflowLogger`] during live execution only (suppressed
+    /// during replay, exactly like the `tracing` sink it accompanies) and only
+    /// when a [`WorkflowLogPolicy`] is configured — the sink is opt-in, so with
+    /// it disabled this command is never pushed at all.
+    ///
+    /// Pure **bookkeeping**: no result channel, never drives a suspension
+    /// shape, and appends **nothing** to `harvest_events`. The worker writes it
+    /// to the separate `harvest_workflow_logs` table at persist time.
+    ///
+    /// Logs are **observational only**: they carry no determinism guarantee and
+    /// must never be read back into workflow logic.
+    RecordLog {
+        /// Deterministic logical-position identity (see
+        /// [`encode_progress_seq`]), doubling as the total emission order and
+        /// the exactly-once dedup key: a re-driven position re-mints the same
+        /// `seq`, which the durable INSERT resolves with `ON CONFLICT DO
+        /// NOTHING`.
+        seq: u64,
+        /// Severity, as emitted through the `ctx.log_*` entry point.
+        level: WorkflowLogLevel,
+        /// The author's message, already truncated to the policy's per-line
+        /// byte cap on a UTF-8 character boundary.
+        message: String,
     },
     /// Spawn a child workflow in detached mode and return its `ExecutionId`
     /// immediately without suspending the parent.
@@ -863,9 +893,13 @@ impl std::fmt::Debug for WorkflowCommand {
                 f.debug_struct("Complete").field("output", output).finish()
             }
             Self::Fail { error } => f.debug_struct("Fail").field("error", error).finish(),
-            Self::ContinueAsNew { input } => f
+            Self::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => f
                 .debug_struct("ContinueAsNew")
                 .field("input", input)
+                .field("new_workflow_type", new_workflow_type)
                 .finish(),
             Self::RunLocalActivity {
                 activity_id,
@@ -894,6 +928,16 @@ impl std::fmt::Debug for WorkflowCommand {
                 .debug_struct("PublishProgress")
                 .field("seq", seq)
                 .field("chunk", chunk)
+                .finish(),
+            Self::RecordLog {
+                seq,
+                level,
+                message,
+            } => f
+                .debug_struct("RecordLog")
+                .field("seq", seq)
+                .field("level", level)
+                .field("message", message)
                 .finish(),
             Self::RecordUpdateResult { update_id, result } => f
                 .debug_struct("RecordUpdateResult")
@@ -1673,6 +1717,138 @@ fn validate_search_attr_value(value: &Value) -> HarvestResult<()> {
 // WorkflowLogger  (issue #379)
 // ---------------------------------------------------------------------------
 
+/// Severity of a workflow log line (issue #379 levels; issue #790 wire form).
+///
+/// Deliberately exactly the three levels the [`WorkflowLogger`] entry points
+/// already expose — #790 reuses them as-is and adds none.
+///
+/// [`as_str`](Self::as_str) is the **wire form**: it is what the durable sink
+/// stores in `harvest_workflow_logs.level` and what the read route's `?level=`
+/// filter matches, so it is a stability contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowLogLevel {
+    /// Informational progress.
+    Info,
+    /// A recoverable anomaly worth an operator's attention.
+    Warn,
+    /// A failure the author wants surfaced during triage.
+    Error,
+}
+
+impl WorkflowLogLevel {
+    /// The stored/wire representation (`"info"` / `"warn"` / `"error"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+
+    /// Parse a wire/query-parameter level, case-insensitively.
+    ///
+    /// Returns `None` for an unrecognized level so a caller can reject it
+    /// explicitly (a `400`) rather than silently coercing to a default and
+    /// returning the wrong rows.
+    #[must_use]
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "info" => Some(Self::Info),
+            "warn" => Some(Self::Warn),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+/// Default per-execution durable log-line cap (issue #790).
+///
+/// Chosen to match the issue's own read-latency target ("≤ 1,000 lines"), so a
+/// run that stays inside the documented budget is never truncated.
+pub const DEFAULT_WORKFLOW_LOG_MAX_LINES: u32 = 1_000;
+
+/// Default per-line message byte cap (issue #790).
+pub const DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES: usize = 4_096;
+
+/// Opt-in durable-log-sink policy (issue #790).
+///
+/// Attach one with [`HarvestBuilder::workflow_log_persistence`] to persist the
+/// lines a workflow emits through [`WorkflowContext::logger`] /
+/// [`WorkflowContext::log_info`] & friends into the per-execution
+/// `harvest_workflow_logs` table, readable via
+/// `GET /api/harvest/workflows/{id}/logs`.
+///
+/// **The sink is off by default.** With no policy configured the logger is
+/// tracing-only and pushes no command at all, so existing workflows are
+/// byte-for-byte unaffected.
+///
+/// [`HarvestBuilder::workflow_log_persistence`]: crate::builder::HarvestBuilder::workflow_log_persistence
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowLogPolicy {
+    max_lines: u32,
+    max_message_bytes: usize,
+}
+
+impl Default for WorkflowLogPolicy {
+    fn default() -> Self {
+        Self {
+            max_lines: DEFAULT_WORKFLOW_LOG_MAX_LINES,
+            max_message_bytes: DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES,
+        }
+    }
+}
+
+impl WorkflowLogPolicy {
+    /// A policy with the documented defaults (1,000 lines, 4 KiB per line).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override the per-execution line cap.
+    ///
+    /// Once an execution reaches this many stored lines, further lines are
+    /// **dropped (drop-newest)** and a single terminal truncation marker is
+    /// recorded so the loss is visible rather than silent. A cap of `0` is
+    /// clamped to `1` so the truncation marker itself always has room.
+    #[must_use]
+    pub const fn with_max_lines(mut self, max_lines: u32) -> Self {
+        self.max_lines = if max_lines == 0 { 1 } else { max_lines };
+        self
+    }
+
+    /// Override the per-line message byte cap (UTF-8-boundary truncation).
+    ///
+    /// A cap of `0` is clamped to `1`, mirroring [`Self::with_max_lines`]: it
+    /// would otherwise store every line as an empty string — silent loss that
+    /// still burns the per-execution budget — and it is a plausible spelling of
+    /// "unlimited". Disabling the sink is what *omitting*
+    /// `workflow_log_persistence` already means.
+    #[must_use]
+    pub const fn with_max_message_bytes(mut self, max_message_bytes: usize) -> Self {
+        self.max_message_bytes = if max_message_bytes == 0 {
+            1
+        } else {
+            max_message_bytes
+        };
+        self
+    }
+
+    /// The per-execution line cap.
+    #[must_use]
+    pub const fn max_lines(self) -> u32 {
+        self.max_lines
+    }
+
+    /// The per-line message byte cap.
+    #[must_use]
+    pub const fn max_message_bytes(self) -> usize {
+        self.max_message_bytes
+    }
+}
+
 /// Replay-aware logger scoped to a single workflow execution.
 ///
 /// Obtained via [`WorkflowContext::logger`]. Suppresses all `tracing` events
@@ -1692,45 +1868,142 @@ pub struct WorkflowLogger<'ctx> {
 impl WorkflowLogger<'_> {
     /// Emit an INFO-level event. No-op when `ctx.is_replaying()` is `true`.
     pub fn info(&self, message: &str) {
-        if !self.ctx.is_replaying() {
-            tracing::info!(
-                target: "autumn_harvest::context",
-                workflow_id = self.ctx.workflow_id(),
-                execution_id = %self.ctx.execution_id(),
-                workflow_type = self.ctx.workflow_type(),
-                replay = false,
-                "{message}"
-            );
-        }
+        self.emit(WorkflowLogLevel::Info, message);
     }
 
     /// Emit a WARN-level event. No-op when `ctx.is_replaying()` is `true`.
     pub fn warn(&self, message: &str) {
-        if !self.ctx.is_replaying() {
-            tracing::warn!(
-                target: "autumn_harvest::context",
-                workflow_id = self.ctx.workflow_id(),
-                execution_id = %self.ctx.execution_id(),
-                workflow_type = self.ctx.workflow_type(),
-                replay = false,
-                "{message}"
-            );
-        }
+        self.emit(WorkflowLogLevel::Warn, message);
     }
 
     /// Emit an ERROR-level event. No-op when `ctx.is_replaying()` is `true`.
     pub fn error(&self, message: &str) {
-        if !self.ctx.is_replaying() {
-            tracing::error!(
+        self.emit(WorkflowLogLevel::Error, message);
+    }
+
+    /// Shared emission path for all three levels.
+    ///
+    /// Two independent sinks, in order:
+    ///
+    /// 1. **`tracing`** (issue #379) — always, and byte-for-byte as before:
+    ///    same target, same four structured fields, same message rendering.
+    /// 2. **The durable per-execution sink** (issue #790) — *only* when a
+    ///    [`WorkflowLogPolicy`] is configured. It pushes a replay-suppressed
+    ///    bookkeeping [`WorkflowCommand::RecordLog`] that the worker writes to
+    ///    `harvest_workflow_logs` at persist time. With no policy, nothing is
+    ///    pushed and the command stream is unchanged from pre-#790.
+    ///
+    /// Replay suppression covers both sinks: the early return below is the
+    /// *only* emission gate, so the durable write inherits the #379 property
+    /// that a line reaches `tracing` at most once per execution.
+    ///
+    /// The durable `seq` is claimed *before* that gate, on every call including
+    /// a suppressed one — see [`log_call_ordinal`](WorkflowContext::log_call_ordinal)
+    /// for why the ordinal, not the history epoch, is what makes AC2's
+    /// exactly-once dedup an identity.
+    fn emit(&self, level: WorkflowLogLevel, message: &str) {
+        // Claim this call's ordinal FIRST, unconditionally. A replay-suppressed
+        // call must still consume its slot, or every later line in the cycle
+        // would shift down and collide with a different line's stored row.
+        let ordinal = self
+            .ctx
+            .log_call_ordinal
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // We lock the matcher directly — NOT via `match_history` — so this read
+        // never triggers the `pump_signal_handlers` post-hook (mirroring
+        // `publish_progress` and `info()`; `is_replaying()` locks the same way,
+        // so this is behaviourally identical to the pre-#790 guard).
+        {
+            let matcher = self.ctx.matcher.lock().expect("matcher lock poisoned");
+            if matcher.is_replaying() {
+                return;
+            }
+        }
+
+        // Sink 1: tracing (unchanged from issue #379).
+        match level {
+            WorkflowLogLevel::Info => tracing::info!(
                 target: "autumn_harvest::context",
                 workflow_id = self.ctx.workflow_id(),
                 execution_id = %self.ctx.execution_id(),
                 workflow_type = self.ctx.workflow_type(),
                 replay = false,
                 "{message}"
-            );
+            ),
+            WorkflowLogLevel::Warn => tracing::warn!(
+                target: "autumn_harvest::context",
+                workflow_id = self.ctx.workflow_id(),
+                execution_id = %self.ctx.execution_id(),
+                workflow_type = self.ctx.workflow_type(),
+                replay = false,
+                "{message}"
+            ),
+            WorkflowLogLevel::Error => tracing::error!(
+                target: "autumn_harvest::context",
+                workflow_id = self.ctx.workflow_id(),
+                execution_id = %self.ctx.execution_id(),
+                workflow_type = self.ctx.workflow_type(),
+                replay = false,
+                "{message}"
+            ),
         }
+
+        // Sink 2: the durable per-execution store (issue #790) — opt-in.
+        let Some(policy) = self.ctx.log_policy else {
+            return;
+        };
+
+        // Bound the in-memory queue at `max_lines + 1` (issue #790 review
+        // round 2). `max_lines` is otherwise enforced only at the database
+        // write, so a workflow logging in a large loop without suspending would
+        // retain one capped `String` per call for the whole decision cycle —
+        // hundreds of thousands of them — despite advertising a 1,000-line cap.
+        // Checked BEFORE the truncate below so the allocation is genuinely
+        // avoided, not merely dropped later.
+        //
+        // The `+ 1` is load-bearing: see `log_commands_queued`. Queuing exactly
+        // `max_lines` would make the store's `admit == lines.len()` and the
+        // truncation marker would never fire, turning AC4's visible overflow
+        // into silent loss.
+        let queued = self
+            .ctx
+            .log_commands_queued
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if queued > u64::from(policy.max_lines()) {
+            return;
+        }
+
+        let capped = truncate_on_char_boundary(message, policy.max_message_bytes);
+        // `seq` IS the call ordinal: a deterministic identity for this logical
+        // line. A re-drive (spurious wake, rolled-back cycle, pause/resume)
+        // re-executes the body from the top, so the same line claims the same
+        // ordinal and the durable INSERT dedups it on `(workflow_exec_id, seq)`
+        // instead of duplicating. This is what makes AC2 hold where
+        // replay-suppression alone cannot — a re-drive is not a replay.
+        self.ctx.push_command(WorkflowCommand::RecordLog {
+            seq: ordinal,
+            level,
+            message: capped,
+        });
     }
+}
+
+/// Truncate `input` to at most `max_bytes`, landing on a UTF-8 character
+/// boundary (never splitting a codepoint).
+///
+/// Shared by the durable log sink; mirrors the inline walk in
+/// [`WorkflowContext::set_current_details`] (`floor_char_boundary` is still
+/// unstable, tracking rust#93743).
+fn truncate_on_char_boundary(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !input.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    input[..boundary].to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -2137,6 +2410,49 @@ pub struct WorkflowContext {
     /// epoch (in the high bits) is what carries monotonicity across cycles.
     /// Not part of replay state: `publish_progress` is a no-op during replay.
     progress_local_index: std::sync::atomic::AtomicU64,
+    /// 0-based **call ordinal** for durable-log `seq` generation (issue #790):
+    /// the count of `ctx.log_*` calls made so far by *this run of the workflow
+    /// body*.
+    ///
+    /// Deliberately **not** the `progress_local_index` + epoch encoding its
+    /// sibling `publish_progress` uses. That encoding keys a line to the
+    /// loaded-history length at cycle start, which is only stable when a
+    /// re-drive happens at an unchanged history length — a cycle that appends
+    /// *any* event before a later log (a side effect, a marker, a version
+    /// gate), or a pause/resume that inserts replay-transparent events, moves
+    /// the epoch and re-mints a *different* `seq` for the same logical line,
+    /// duplicating it in the store. Progress is an ephemeral stream where a
+    /// repeated `seq` is harmless; a durable log row is not.
+    ///
+    /// The ordinal is incremented on **every** call, including
+    /// replay-suppressed ones, so the Nth `ctx.log_*` call of a deterministic
+    /// workflow body always carries `seq == N` no matter which cycle finally
+    /// emits it live. That is what makes the store's
+    /// `UNIQUE (workflow_exec_id, seq)` dedup a genuine identity rather than a
+    /// coincidence. The context is rebuilt per decision cycle, so this resets
+    /// to 0 each cycle — which is exactly right, because replay re-executes the
+    /// body from the top.
+    log_call_ordinal: std::sync::atomic::AtomicU64,
+    /// Count of [`WorkflowCommand::RecordLog`] commands **queued** so far this
+    /// decision cycle (issue #790 review round 2).
+    ///
+    /// Deliberately a *second* counter rather than a reuse of
+    /// [`log_call_ordinal`](WorkflowContext::log_call_ordinal): the ordinal
+    /// counts every `ctx.log_*` call including replay-suppressed ones (that is
+    /// what makes it a stable identity), whereas this counts only the commands
+    /// actually retained in memory. Bounding on the ordinal would shrink the
+    /// queue by however many lines the cycle happened to replay.
+    ///
+    /// The bound is `max_lines + 1`, not `max_lines`: the store admits at most
+    /// `max_lines` rows from any one batch, so a batch of exactly `max_lines`
+    /// would satisfy `admit == lines.len()` and never trip the truncation
+    /// marker — converting AC4's *visible* overflow into silent loss. One extra
+    /// queued command guarantees `admit < lines.len()` so the marker fires.
+    log_commands_queued: std::sync::atomic::AtomicU64,
+    /// Opt-in durable-log-sink policy (issue #790). `None` (the default) means
+    /// the sink is disabled: [`WorkflowLogger`] stays tracing-only and pushes
+    /// no [`WorkflowCommand::RecordLog`] at all.
+    log_policy: Option<WorkflowLogPolicy>,
     /// Monotonically increasing counter for naming saga compensation dedup
     /// markers (issue #801). Each non-empty `Saga` unwind increments this
     /// once so each compensation sequence has stable, unique
@@ -2539,6 +2855,14 @@ impl WorkflowContext {
         matcher.is_timer_started_next(timer_id)
     }
 
+    /// Backs the `debug_assert!` on `continue_as_new_impl`'s `Matched` arm
+    /// (issue #803): the successor type pushed there comes from the live
+    /// argument, and this pins that it still equals what history recorded.
+    pub(crate) fn recorded_continue_as_new_type_matches(&self, expected: Option<&str>) -> bool {
+        let matcher = self.matcher.lock().expect("matcher lock poisoned");
+        matcher.recorded_continue_as_new_type_matches(expected)
+    }
+
     // ── Constructors ──────────────────────────────────────────────────
 
     /// Create a context for replaying a workflow from its event history.
@@ -2628,6 +2952,9 @@ impl WorkflowContext {
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
+            log_commands_queued: std::sync::atomic::AtomicU64::new(0),
+            log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
@@ -2775,6 +3102,9 @@ impl WorkflowContext {
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
+            log_commands_queued: std::sync::atomic::AtomicU64::new(0),
+            log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
@@ -2837,6 +3167,9 @@ impl WorkflowContext {
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
+            log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
+            log_commands_queued: std::sync::atomic::AtomicU64::new(0),
+            log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
@@ -2950,6 +3283,18 @@ impl WorkflowContext {
     #[must_use]
     pub const fn with_payload_offload_threshold(mut self, threshold: Option<u64>) -> Self {
         self.payload_offload_threshold = threshold;
+        self
+    }
+
+    /// Install the opt-in durable workflow-log policy (issue #790).
+    ///
+    /// `None` (the default) disables the durable sink entirely:
+    /// [`WorkflowLogger`] stays tracing-only and pushes no
+    /// [`WorkflowCommand::RecordLog`], so the drained command stream is
+    /// byte-for-byte identical to a pre-#790 build.
+    #[must_use]
+    pub const fn with_log_policy(mut self, policy: Option<WorkflowLogPolicy>) -> Self {
+        self.log_policy = policy;
         self
     }
 
@@ -10248,13 +10593,194 @@ impl WorkflowContext {
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
     pub async fn continue_as_new(&self, input: Value) -> HarvestResult<()> {
-        let history_match = self.match_history(|m| m.match_continue_as_new(&input));
+        self.continue_as_new_impl(None, input).await
+    }
+
+    /// Continue as a **different** registered workflow type, keeping the same
+    /// logical `WorkflowId` (issue #803).
+    ///
+    /// This is the entity / state-machine phase-transition primitive: an
+    /// entity whose behavior genuinely changes across lifecycle phases
+    /// (`trial_subscription → paid_subscription → churned`,
+    /// `cart → checkout → fulfillment`) gets one focused, replay-safe handler
+    /// per phase instead of a single ever-branching function, while its
+    /// stable `workflow_id`, shard, and queue carry across every transition.
+    ///
+    /// Everything [`continue_as_new`](Self::continue_as_new) does still
+    /// applies: the current execution is sealed `CONTINUED_AS_NEW`, a fresh
+    /// execution with an empty history is started in its place, unconsumed
+    /// signals are reassigned to it, and the returned future never resolves.
+    ///
+    /// # Successor defaults
+    ///
+    /// The successor's **lifecycle defaults are resolved from
+    /// `workflow_type`'s own [`WorkflowInfo`]** — not the predecessor's:
+    /// `execution_timeout` (#243), `sla` (#487, clamped to at most the
+    /// execution timeout exactly as at start), the `concurrency` key/limit
+    /// (#247), the workflow-level `retry_policy` (#523), and the
+    /// `owner`/`runbook_url`/`severity` ops metadata (#372). This mirrors how
+    /// a spawned child resolves its own type's defaults, and means an alert
+    /// on the new phase pages the team that owns *that* phase.
+    ///
+    /// Carried forward verbatim (identical to a same-type continuation):
+    /// `workflow_id`, shard, `queue_name`, `memo`, search attributes, context
+    /// headers, build id, schedule lineage (#488/#534), completion callbacks
+    /// (#605), the run-chain back-links (#701), and — deliberately — the
+    /// chain-scoped lifetime cap `chain_execution_timeout`/`chain_deadline_at`
+    /// (#617). The chain cap is anchored at the *first* run of the chain, so
+    /// changing type must not reset it: cross-type continuation is not an
+    /// escape hatch from a runaway-loop budget.
+    ///
+    /// The fleet-wide `max_workflow_execution_timeout` ceiling is applied to
+    /// the target's declared timeout exactly as at every other registry-aware
+    /// start path, so a type change is not an escape hatch from that either.
+    ///
+    /// **Not consulted on this path**: the target type's `throttle` (#607),
+    /// `debounce` (#499), `batch` (#518) and `max_input_bytes` (#252). Those
+    /// are *admission* policies, and continue-as-new is in-flight continuation
+    /// rather than a start — so a cross-type transition does not pass through
+    /// the target type's admission gates, and the payload cap enforced is the
+    /// predecessor's. If a phase must be paced or rate-limited on entry, gate
+    /// it at the caller instead.
+    ///
+    /// # Addressing consequence (read this)
+    ///
+    /// Harvest's active-run identity is `(workflow_name, workflow_id)`, so
+    /// after a cross-type transition an external `signal_with_start` /
+    /// `update_with_start` must name the **new** type to attach to the live
+    /// successor. Naming the old type instead starts a *fresh* run of the old
+    /// type — which can legitimately coexist with the live successor, since
+    /// the two occupy different uniqueness slots. Address the entity by its
+    /// current phase type, or keep a stable front-door type that transitions
+    /// only internally.
+    ///
+    /// The inverse is the hazard: because the successor must *take*
+    /// `(workflow_type, workflow_id)`, a **live** run someone already started
+    /// under that pair blocks the transition, and this execution is failed
+    /// terminally rather than displacing it (see *Errors*). Starting the next
+    /// phase out-of-band while the current phase is still running is therefore
+    /// not benign — let the entity transition itself.
+    ///
+    /// A cross-type successor also leaves its schedule's overlap controls
+    /// behind: `max_active_runs` counting and `OverlapPolicy::CancelOther` /
+    /// `TerminateOther` both select on the *schedule's* `workflow_name`, so
+    /// they no longer see the run even though `schedule_id`/`scheduled_for`
+    /// are carried.
+    ///
+    /// # Rollout ordering
+    ///
+    /// The target type must be registered on the worker that runs the
+    /// transition. Continuing into an unregistered type fails the execution
+    /// terminally (see *Errors*) rather than creating a successor no worker
+    /// can dispatch — so **deploy the new phase's handler to the whole fleet
+    /// before** deploying code that continues into it.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`continue_as_new`](Self::continue_as_new). Additionally, the
+    /// worker fails the execution terminally (a `WorkflowFailed` event, no
+    /// successor created, no retry offered) in four cases:
+    ///
+    /// 1. `workflow_type` is empty or blank.
+    /// 2. `workflow_type` is not registered on the worker running the
+    ///    transition (see *Rollout ordering*).
+    /// 3. `workflow_type` names a registered **unified DAG** rather than a
+    ///    plain workflow type — a DAG successor would run the level walker
+    ///    while bypassing the admission gates `POST /dags/{name}/trigger`
+    ///    enforces, so it is rejected with a pointer to that route.
+    /// 4. A **live** (`RUNNING`/`PAUSED`) run already occupies
+    ///    `(workflow_type, workflow_id)`. Harvest admits exactly one active
+    ///    run per pair, and this path never displaces a bystander. Recovery is
+    ///    to resolve that run, then restart or reset (#148) the entity.
+    ///
+    /// Naming the *current* type is **not** an error — it is a supported
+    /// request for that type's declared defaults (which plain
+    /// [`continue_as_new`](Self::continue_as_new) deliberately does not
+    /// re-resolve), and the predecessor's own seal frees the slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn continue_as_new_as_type(
+        &self,
+        workflow_type: &str,
+        input: Value,
+    ) -> HarvestResult<()> {
+        self.continue_as_new_impl(Some(workflow_type.to_string()), input)
+            .await
+    }
+
+    /// Typed sibling of
+    /// [`continue_as_new_as_type`](Self::continue_as_new_as_type): continue as
+    /// the workflow described by `info`, serializing `input` for you (issue
+    /// #803).
+    ///
+    /// Prefer this over the raw string form — the target type name comes from
+    /// the `#[workflow]`-generated companion function, so a renamed or deleted
+    /// phase handler is a compile error rather than a runtime failure:
+    ///
+    /// ```ignore
+    /// ctx.continue_as_new_as(&paid_subscription_info(), PaidInput { plan }).await?;
+    /// ```
+    ///
+    /// See [`continue_as_new_as_type`](Self::continue_as_new_as_type) for the
+    /// successor-default, addressing, and rollout-ordering semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `input` cannot be encoded to
+    /// JSON; otherwise as
+    /// [`continue_as_new_as_type`](Self::continue_as_new_as_type).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn continue_as_new_as<I: serde::Serialize>(
+        &self,
+        info: &crate::info::WorkflowInfo,
+        input: I,
+    ) -> HarvestResult<()> {
+        let payload = serde_json::to_value(input).map_err(HarvestError::Serialization)?;
+        self.continue_as_new_as_type(info.name, payload).await
+    }
+
+    /// Shared implementation behind [`continue_as_new`](Self::continue_as_new)
+    /// and its cross-type siblings.
+    ///
+    /// `new_workflow_type` is `None` for a same-type continuation — the legacy
+    /// path, byte-identical to pre-#803 — and `Some(type)` for a cross-type
+    /// one. **Presence decides**: the field is never normalized away when the
+    /// named type happens to equal the current one, because naming a type is
+    /// an explicit request for *that type's* declared defaults.
+    async fn continue_as_new_impl(
+        &self,
+        new_workflow_type: Option<String>,
+        input: Value,
+    ) -> HarvestResult<()> {
+        let history_match =
+            self.match_history(|m| m.match_continue_as_new(&input, new_workflow_type.as_deref()));
 
         match history_match {
             HistoryMatch::Matched { output } => {
                 // Replay still emits the terminal command so the worker can
                 // observe the recorded intent while draining commands.
-                self.push_command(WorkflowCommand::ContinueAsNew { input: output });
+                //
+                // `input` echoes the recorded value (`output`) while
+                // `new_workflow_type` is the live argument — an asymmetry that
+                // is only sound because `match_continue_as_new` compares the
+                // recorded target type FIRST and returns `Diverged` on any
+                // mismatch, so reaching this arm proves the two are equal. The
+                // assert pins that coupling: if the guard is ever loosened,
+                // this fires in debug/test rather than silently forking the
+                // chain into a type history never recorded.
+                debug_assert!(
+                    self.recorded_continue_as_new_type_matches(new_workflow_type.as_deref()),
+                    "reaching Matched must imply the recorded target type equals the live one"
+                );
+                self.push_command(WorkflowCommand::ContinueAsNew {
+                    input: output,
+                    new_workflow_type,
+                });
                 park_until_dropped().await
             }
             HistoryMatch::Diverged {
@@ -10299,11 +10825,21 @@ impl WorkflowContext {
                         kind: crate::error::PayloadKind::WorkflowInput,
                         observed_bytes: observed,
                         cap_bytes: self.payload_max_workflow_input,
-                        workflow_type: self.workflow_name.clone(),
+                        // Name the run this input is destined for: the target
+                        // type for a cross-type continuation (#803), else our
+                        // own. The cap value itself is still the *current*
+                        // type's — the context cannot see the target's
+                        // `max_input_bytes` override.
+                        workflow_type: new_workflow_type
+                            .clone()
+                            .unwrap_or_else(|| self.workflow_name.clone()),
                         activity_name: None,
                     });
                 }
-                self.push_command(WorkflowCommand::ContinueAsNew { input });
+                self.push_command(WorkflowCommand::ContinueAsNew {
+                    input,
+                    new_workflow_type,
+                });
                 park_until_dropped().await
             }
         }
@@ -14975,10 +15511,226 @@ mod tests {
         let drained = ctx.drain_commands();
         assert_eq!(drained.len(), 1);
         match &drained[0] {
-            WorkflowCommand::ContinueAsNew { input } => {
+            WorkflowCommand::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => {
                 assert_eq!(input, &payload);
+                assert!(
+                    new_workflow_type.is_none(),
+                    "the legacy same-type call must record no target type (issue #803 AC1)"
+                );
             }
             other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    // ── Cross-type continue-as-new (issue #803) ─────────────────────────
+
+    /// Drive a never-resolving continue-as-new future far enough to queue its
+    /// command, then hand back whatever was drained.
+    async fn drain_parked_continue_as_new(
+        ctx: &WorkflowContext,
+        fut: impl std::future::Future<Output = HarvestResult<()>>,
+    ) -> Vec<WorkflowCommand> {
+        tokio::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => panic!("continue_as_new must not resolve"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+        ctx.drain_commands()
+    }
+
+    /// AC1/AC2: the untyped cross-type call records the named target type.
+    #[tokio::test]
+    async fn continue_as_new_as_type_records_the_target_type() {
+        let ctx = WorkflowContext::new_test();
+        let payload = serde_json::json!({"tier": "paid"});
+
+        let drained = drain_parked_continue_as_new(
+            &ctx,
+            ctx.continue_as_new_as_type("paid_subscription", payload.clone()),
+        )
+        .await;
+
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => {
+                assert_eq!(input, &payload);
+                assert_eq!(new_workflow_type.as_deref(), Some("paid_subscription"));
+            }
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    /// AC1: the typed entry point takes the target name from the
+    /// `#[workflow]`-generated `WorkflowInfo` and serializes the input.
+    #[tokio::test]
+    async fn continue_as_new_as_takes_the_type_from_workflow_info() {
+        let ctx = WorkflowContext::new_test();
+        let info = crate::info::WorkflowInfo {
+            mcp: false,
+            name: "paid_subscription",
+            module: "app::phases",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        };
+
+        let drained =
+            drain_parked_continue_as_new(&ctx, ctx.continue_as_new_as(&info, vec![1_u8, 2])).await;
+
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => {
+                assert_eq!(input, &serde_json::json!([1, 2]));
+                assert_eq!(new_workflow_type.as_deref(), Some("paid_subscription"));
+            }
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    /// **Presence decides** (documented rule): naming the *current* type is
+    /// still a cross-type request, so it is recorded rather than normalized
+    /// away — the author explicitly asked for that type's declared defaults.
+    #[tokio::test]
+    async fn continue_as_new_as_type_naming_the_current_type_is_still_recorded() {
+        let ctx = WorkflowContext::new_test();
+        let own = ctx.workflow_type().to_string();
+
+        let drained = drain_parked_continue_as_new(
+            &ctx,
+            ctx.continue_as_new_as_type(&own, serde_json::json!({})),
+        )
+        .await;
+
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew {
+                new_workflow_type, ..
+            } => assert_eq!(new_workflow_type.as_deref(), Some(own.as_str())),
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    /// AC6: replaying a recorded cross-type history re-emits the same target
+    /// type, and the future still never resolves.
+    #[tokio::test]
+    async fn continue_as_new_as_type_replays_the_recorded_target_type() {
+        let payload = serde_json::json!({"tier": "paid"});
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: crate::types::ExecutionId::new(),
+                input: payload.clone(),
+                new_workflow_type: Some("paid_subscription".to_string()),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(crate::types::ExecutionId::new(), history);
+
+        let drained = drain_parked_continue_as_new(
+            &ctx,
+            ctx.continue_as_new_as_type("paid_subscription", payload.clone()),
+        )
+        .await;
+
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            WorkflowCommand::ContinueAsNew {
+                input,
+                new_workflow_type,
+            } => {
+                assert_eq!(input, &payload);
+                assert_eq!(new_workflow_type.as_deref(), Some("paid_subscription"));
+            }
+            other => panic!("expected ContinueAsNew, got {other:?}"),
+        }
+    }
+
+    /// AC6: redirecting a recorded continuation to a different type is
+    /// non-determinism, not a silent re-route.
+    #[tokio::test]
+    async fn continue_as_new_target_type_change_is_nondeterministic() {
+        let payload = serde_json::json!({"tier": "paid"});
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: crate::types::ExecutionId::new(),
+                input: payload.clone(),
+                new_workflow_type: Some("paid_subscription".to_string()),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(crate::types::ExecutionId::new(), history);
+
+        // Bounded deliberately: if the type guard ever regresses, the call
+        // resolves `Matched` and parks forever (`park_until_dropped`), which
+        // would turn a regression into a multi-hour CI timeout instead of a
+        // red test. The sibling `drain_parked_continue_as_new` helper exists
+        // for the same reason.
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.continue_as_new_as_type("churned", payload),
+        )
+        .await
+        .expect("a redirected target must diverge, not park forever")
+        .expect_err("a redirected target type must be non-deterministic");
+        assert!(
+            matches!(err, HarvestError::NonDeterministic { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "a divergence must queue no command"
+        );
+    }
+
+    /// The payload-cap rejection names the run the input is destined for —
+    /// the *target* type on a cross-type continuation.
+    #[tokio::test]
+    async fn continue_as_new_as_type_payload_cap_names_the_target_type() {
+        let ctx = WorkflowContext::new_test().with_payload_caps(1, 1, 1, 1);
+        let big = serde_json::json!({"blob": "x".repeat(256)});
+
+        let err = ctx
+            .continue_as_new_as_type("paid_subscription", big)
+            .await
+            .expect_err("an oversized input must be rejected");
+        match err {
+            HarvestError::PayloadTooLarge { workflow_type, .. } => {
+                assert_eq!(workflow_type, "paid_subscription");
+            }
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
         }
     }
 
@@ -14996,6 +15748,7 @@ mod tests {
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),
                 input: payload.clone(),
+                new_workflow_type: None,
             },
         ];
 
@@ -15010,7 +15763,7 @@ mod tests {
         let drained = ctx.drain_commands();
         assert_eq!(drained.len(), 1);
         match &drained[0] {
-            WorkflowCommand::ContinueAsNew { input } => assert_eq!(input, &payload),
+            WorkflowCommand::ContinueAsNew { input, .. } => assert_eq!(input, &payload),
             other => panic!("expected ContinueAsNew, got {other:?}"),
         }
         assert!(!ctx.is_replaying());
@@ -15058,6 +15811,7 @@ mod tests {
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),
                 input: serde_json::json!({"cycle": 3}),
+                new_workflow_type: None,
             },
         ];
 
@@ -21730,6 +22484,457 @@ mod tests {
         assert!(encode_progress_seq(5, 1) > encode_progress_seq(5, 0));
         // Deterministic on a crash-retry of the same cycle: same inputs → same seq.
         assert_eq!(encode_progress_seq(7, 3), encode_progress_seq(7, 3));
+    }
+
+    // ── Durable workflow logs (issue #790) ────────────────────────────
+    //
+    // The durable sink is OPT-IN: with no `WorkflowLogPolicy` threaded in,
+    // `ctx.logger()` must behave exactly as it did before #790 (tracing-only,
+    // zero commands). These tests pin both halves of that contract plus the
+    // exactly-once dedup identity the durable write depends on.
+
+    /// Collect every `RecordLog` command as `(seq, level, message)` triples.
+    fn recorded_logs(cmds: &[WorkflowCommand]) -> Vec<(u64, WorkflowLogLevel, String)> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                WorkflowCommand::RecordLog {
+                    seq,
+                    level,
+                    message,
+                } => Some((*seq, *level, message.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn logger_pushes_no_command_when_persistence_is_disabled() {
+        // AC6 (opt-in / additive): with the sink disabled — the DEFAULT — the
+        // logger is tracing-only and emits ZERO commands, so an existing
+        // workflow's drained command stream is byte-for-byte unchanged.
+        let ctx = WorkflowContext::new_test();
+        ctx.log_info("starting");
+        ctx.logger().warn("careful");
+        ctx.log_error("boom");
+        assert!(
+            recorded_logs(&ctx.drain_commands()).is_empty(),
+            "with no WorkflowLogPolicy configured the logger must push no \
+             RecordLog command at all (opt-in, additive)"
+        );
+    }
+
+    #[test]
+    fn logger_pushes_record_log_command_when_persistence_is_enabled() {
+        // AC1: the durable sink persists lines emitted through the EXISTING
+        // ctx.logger()/ctx.log_* entry points, keyed by level + message + a
+        // deterministic ordering key.
+        let ctx = WorkflowContext::new_test().with_log_policy(Some(WorkflowLogPolicy::default()));
+        ctx.log_info("one");
+        ctx.logger().warn("two");
+        ctx.log_error("three");
+        let logs = recorded_logs(&ctx.drain_commands());
+        assert_eq!(logs.len(), 3, "one RecordLog command per log call");
+        assert_eq!(logs[0].1, WorkflowLogLevel::Info);
+        assert_eq!(logs[0].2, "one");
+        assert_eq!(logs[1].1, WorkflowLogLevel::Warn);
+        assert_eq!(logs[1].2, "two");
+        assert_eq!(logs[2].1, WorkflowLogLevel::Error);
+        assert_eq!(logs[2].2, "three");
+    }
+
+    #[test]
+    fn logger_is_suppressed_during_replay_even_when_persistence_is_enabled() {
+        // AC2: emission already no-ops during replay (issue #379) and the
+        // durable write INHERITS that property — so a workflow replayed N
+        // times yields one copy of each line.
+        let events = vec![
+            WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now()),
+            WorkflowEvent::MarkerRecorded {
+                name: "m".to_string(),
+                details: serde_json::json!(null),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events)
+            .with_log_policy(Some(WorkflowLogPolicy::default()));
+        assert!(ctx.is_replaying(), "context must be in replay mode");
+        ctx.log_info("replayed line");
+        assert!(
+            recorded_logs(&ctx.drain_commands()).is_empty(),
+            "a log emitted during replay must push NO RecordLog command"
+        );
+    }
+
+    #[test]
+    fn record_log_seq_strictly_increases_within_a_cycle() {
+        // Ordering key: lines are read back in emission order (AC3), so the
+        // seq must strictly increase within one decision cycle.
+        let ctx = WorkflowContext::new_test().with_log_policy(Some(WorkflowLogPolicy::default()));
+        ctx.log_info("a");
+        ctx.log_info("b");
+        ctx.log_info("c");
+        let logs = recorded_logs(&ctx.drain_commands());
+        assert!(
+            logs[0].0 < logs[1].0 && logs[1].0 < logs[2].0,
+            "seq must strictly increase within a cycle, got {:?}",
+            logs.iter().map(|l| l.0).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn record_log_seq_is_deterministic_for_a_re_driven_position() {
+        // THE exactly-once mechanism (AC2). Replay-suppression alone is NOT
+        // enough: a cycle that logs and then parks can be re-driven by a
+        // spurious wake with the history UNCHANGED, so `is_replaying()` is
+        // still false and the line is emitted again. Two contexts over the
+        // SAME recorded history must therefore mint the SAME seq, so the
+        // durable INSERT can dedup on it.
+        let history = vec![WorkflowEvent::workflow_started(
+            serde_json::json!(null),
+            Utc::now(),
+        )];
+        let seqs_for = |events: Vec<WorkflowEvent>| {
+            let ctx = WorkflowContext::for_replay(ExecutionId::new(), events)
+                .with_log_policy(Some(WorkflowLogPolicy::default()));
+            ctx.log_info("first");
+            ctx.log_warn("second");
+            recorded_logs(&ctx.drain_commands())
+                .into_iter()
+                .map(|l| l.0)
+                .collect::<Vec<_>>()
+        };
+        let first = seqs_for(history.clone());
+        // Non-vacuity guard: `WorkflowStarted` is auto-consumed, so this
+        // context IS at the live frontier and MUST have emitted. Without this
+        // the equality below would pass trivially on two empty vecs.
+        assert_eq!(first.len(), 2, "both lines must actually be emitted live");
+        assert_eq!(
+            first,
+            seqs_for(history),
+            "a re-driven position must deterministically re-mint the SAME seq \
+             so the durable write dedups instead of duplicating"
+        );
+    }
+
+    #[test]
+    fn record_log_seq_is_stable_when_the_cycle_appends_an_event_before_a_later_log() {
+        // Regression (issue #790 review, P1). The FIRST design keyed `seq` to
+        // the loaded-history length at cycle start. That is not an identity: a
+        // cycle that appends ANY event between two log calls -- here a
+        // deterministic side effect, but equally a marker or a version gate --
+        // comes back on the next cycle with a longer history, so the second
+        // line re-minted a DIFFERENT seq and was stored TWICE.
+        //
+        //   cycle 1: history=[Started]                  "A"@0  side-effect  "B"@1
+        //   cycle 2: history=[Started, SideEffect]  "A" replayed (suppressed), "B" live
+        //
+        // "B" is the SAME logical line in both cycles and must carry the same
+        // seq so the store's UNIQUE(exec, seq) collapses the re-emission.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+
+        let cycle1 = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()])
+            .with_log_policy(Some(WorkflowLogPolicy::default()));
+        cycle1.log_info("A");
+        let _ = cycle1.new_uuid(); // appends SideEffectRecorded when persisted
+        cycle1.log_info("B");
+        let first = recorded_logs(&cycle1.drain_commands());
+        assert_eq!(first.len(), 2, "both lines must be emitted live in cycle 1");
+        let b_seq_cycle1 = first[1].0;
+
+        // Cycle 2 loads the history cycle 1 persisted.
+        let side_effect = WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::json!("00000000-0000-7000-8000-000000000000"),
+        };
+        let cycle2 = WorkflowContext::for_replay(ExecutionId::new(), vec![started, side_effect])
+            .with_log_policy(Some(WorkflowLogPolicy::default()));
+        cycle2.log_info("A"); // replaying -> suppressed, but still claims its ordinal
+        let _ = cycle2.new_uuid(); // consumes the recorded side effect
+        assert!(
+            !cycle2.is_replaying(),
+            "after consuming the recorded side effect the cycle is at the frontier"
+        );
+        cycle2.log_info("B");
+        let second = recorded_logs(&cycle2.drain_commands());
+        assert_eq!(
+            second.len(),
+            1,
+            "only the frontier line re-emits; the replayed one stays suppressed"
+        );
+        assert_eq!(second[0].2, "B", "the re-emitted line is B");
+        assert_eq!(
+            second[0].0, b_seq_cycle1,
+            "the same logical line must re-mint the SAME seq across cycles, or \
+             the store cannot dedup it and B is written twice"
+        );
+    }
+
+    #[test]
+    fn record_log_seq_is_stable_across_a_pause_resume() {
+        // Regression (issue #790 review, P1), the second reachable shape.
+        // `WorkflowExecutionPaused`/`Resumed` are pre-marked replay-transparent
+        // by `HistoryMatcher::new`, so after a resume the workflow is at the
+        // very same logical position -- but the loaded history is two events
+        // LONGER. Under the history-length model that re-minted a different
+        // seq and duplicated the line; the call ordinal is unmoved by events
+        // the workflow never consumes.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let before = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()])
+            .with_log_policy(Some(WorkflowLogPolicy::default()));
+        before.log_info("awaiting approval");
+        let before_logs = recorded_logs(&before.drain_commands());
+        assert_eq!(before_logs.len(), 1, "the line must be emitted live");
+
+        let now = Utc::now();
+        let after = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started,
+                WorkflowEvent::WorkflowExecutionPaused {
+                    paused_at: now,
+                    reason: None,
+                    actor: "operator".to_string(),
+                },
+                WorkflowEvent::WorkflowExecutionResumed {
+                    resumed_at: now,
+                    actor: "operator".to_string(),
+                },
+            ],
+        )
+        .with_log_policy(Some(WorkflowLogPolicy::default()));
+        assert!(
+            !after.is_replaying(),
+            "pause/resume events are replay-transparent, so the resumed cycle \
+             is still at the frontier"
+        );
+        after.log_info("awaiting approval");
+        let after_logs = recorded_logs(&after.drain_commands());
+        assert_eq!(after_logs.len(), 1, "the line re-emits after the resume");
+        assert_eq!(
+            after_logs[0].0, before_logs[0].0,
+            "a pause/resume must not shift a line's seq, or resuming a parked \
+             workflow duplicates every line it logged before parking"
+        );
+    }
+
+    #[test]
+    fn record_log_seq_advances_for_a_genuinely_new_line_in_a_later_cycle() {
+        // The complement of the two regressions above: the ordinal MUST still
+        // distinguish a genuinely new line. Cycle 2 replays (and suppresses)
+        // the first line, then emits a second -- which must NOT collide with
+        // the first line's stored row.
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let cycle1 = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()])
+            .with_log_policy(Some(WorkflowLogPolicy::default()));
+        cycle1.log_info("first");
+        let first_seq = recorded_logs(&cycle1.drain_commands())[0].0;
+
+        let side_effect = WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::json!("00000000-0000-7000-8000-000000000000"),
+        };
+        let cycle2 = WorkflowContext::for_replay(ExecutionId::new(), vec![started, side_effect])
+            .with_log_policy(Some(WorkflowLogPolicy::default()));
+        cycle2.log_info("first"); // suppressed, claims ordinal 0
+        let _ = cycle2.new_uuid();
+        cycle2.log_info("second"); // live, ordinal 1
+        let logs = recorded_logs(&cycle2.drain_commands());
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].2, "second");
+        assert_ne!(
+            logs[0].0, first_seq,
+            "a genuinely new line must not collide with an earlier line's seq"
+        );
+        assert!(logs[0].0 > first_seq, "and it must sort after it");
+    }
+
+    #[test]
+    fn record_log_message_is_capped_on_utf8_boundary() {
+        // Bounded volume applies per line as well as per execution: an
+        // unbounded message must be truncated, never rejected, and never split
+        // mid-codepoint.
+        let policy = WorkflowLogPolicy::default().with_max_message_bytes(8);
+        let ctx = WorkflowContext::new_test().with_log_policy(Some(policy));
+        ctx.log_info("😀😀😀😀");
+        let logs = recorded_logs(&ctx.drain_commands());
+        assert_eq!(logs.len(), 1, "an oversize message is capped, not dropped");
+        assert_eq!(
+            logs[0].2, "😀😀",
+            "truncation must land on a UTF-8 character boundary"
+        );
+    }
+
+    #[test]
+    fn queued_log_commands_are_bounded_by_the_line_cap() {
+        // Regression (issue #790 review round 2, P2). `max_lines` was enforced
+        // ONLY at the database write, so a workflow that logs in a large loop
+        // without suspending retained one capped `String` per call — hundreds of
+        // thousands of them — in the in-memory command queue for the whole
+        // decision cycle, despite advertising a 1,000-line cap. The bound must
+        // bite at ENQUEUE, before the message is even cloned.
+        //
+        // The bound is `max_lines + 1`, not `max_lines`: the store admits at
+        // most `max_lines` rows from any batch, so queuing exactly `max_lines`
+        // would make `admit == lines.len()` and the truncation marker would
+        // never fire — turning AC4's *visible* overflow into silent loss. One
+        // extra command guarantees `admit < lines.len()` and a visible marker.
+        let policy = WorkflowLogPolicy::default().with_max_lines(3);
+        let ctx = WorkflowContext::new_test().with_log_policy(Some(policy));
+        for i in 0..8 {
+            ctx.log_info(&format!("line {i}"));
+        }
+        let logs = recorded_logs(&ctx.drain_commands());
+        assert_eq!(
+            logs.len(),
+            4,
+            "a cycle must queue at most max_lines + 1 RecordLog commands, got {}",
+            logs.len()
+        );
+        // The queued lines are the OLDEST ones (drop-newest, matching the
+        // store's own admission rule) and their seqs are a contiguous prefix.
+        assert_eq!(
+            logs.iter().map(|l| l.2.as_str()).collect::<Vec<_>>(),
+            vec!["line 0", "line 1", "line 2", "line 3"],
+            "drop-newest: the first lines of a run are the ones that explain it"
+        );
+        assert_eq!(
+            logs.iter().map(|l| l.0).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn a_dropped_log_call_still_consumes_its_seq_ordinal() {
+        // The enqueue bound must NOT disturb the call-ordinal identity that AC2
+        // depends on. A call dropped by the bound still claims its slot, so if a
+        // later re-drive takes a shorter path (fewer early lines) the surviving
+        // lines keep the seqs they would have had — the ordinal counts CALLS,
+        // never queued commands.
+        let policy = WorkflowLogPolicy::default().with_max_lines(2);
+        let ctx = WorkflowContext::new_test().with_log_policy(Some(policy));
+        for i in 0..5 {
+            ctx.log_info(&format!("line {i}"));
+        }
+        // Non-vacuity: the bound must actually have dropped calls here, or the
+        // assertion below would hold trivially.
+        assert_eq!(
+            recorded_logs(&ctx.drain_commands()).len(),
+            3,
+            "max_lines(2) bounds the queue at 3, so 2 of the 5 calls were dropped"
+        );
+        // 5 calls were made, so the ordinal advanced 5 times even though only
+        // 3 commands were queued. Assert on the counter itself, since the
+        // dropped calls leave no command to inspect.
+        assert_eq!(
+            ctx.log_call_ordinal
+                .load(std::sync::atomic::Ordering::Relaxed),
+            5,
+            "every ctx.log_* call must consume an ordinal, queued or not"
+        );
+    }
+
+    #[test]
+    fn queued_log_commands_are_unbounded_when_persistence_is_disabled() {
+        // AC6 guard: the bound is a property of the durable sink. With the sink
+        // off there is nothing to bound and nothing is queued at all, so the
+        // new counter must never change the disabled path.
+        let ctx = WorkflowContext::new_test();
+        for i in 0..5_000 {
+            ctx.log_info(&format!("line {i}"));
+        }
+        assert!(
+            recorded_logs(&ctx.drain_commands()).is_empty(),
+            "the disabled sink queues nothing, bound or no bound"
+        );
+    }
+
+    #[test]
+    fn workflow_log_policy_defaults_are_the_documented_values() {
+        // `docs/workflow-logs.md` publishes 1,000 lines / 4 KiB per message as
+        // THE documented defaults, and AC4 requires the default be documented.
+        // Pin them here so a silent change to either breaks the docs contract
+        // loudly rather than only surfacing as a behaviour drift in production.
+        let policy = WorkflowLogPolicy::default();
+        assert_eq!(
+            policy.max_lines(),
+            DEFAULT_WORKFLOW_LOG_MAX_LINES,
+            "the default per-execution line cap is a documented value"
+        );
+        assert_eq!(
+            policy.max_lines(),
+            1_000,
+            "docs/workflow-logs.md documents 1,000 lines"
+        );
+        assert_eq!(
+            policy.max_message_bytes(),
+            DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES,
+            "the default per-message byte cap is a documented value"
+        );
+        assert_eq!(
+            policy.max_message_bytes(),
+            4_096,
+            "docs/workflow-logs.md documents 4 KiB per message"
+        );
+    }
+
+    #[test]
+    fn workflow_log_policy_clamps_degenerate_caps_to_one() {
+        // A zero cap is a footgun, not a feature: `max_lines(0)` would store
+        // nothing at all (silent total loss, the exact failure AC4's visible
+        // truncation marker exists to prevent) and `max_message_bytes(0)` would
+        // truncate every message to the empty string. Both clamp UP to 1 so the
+        // sink always stores *something* an operator can see.
+        assert_eq!(
+            WorkflowLogPolicy::default().with_max_lines(0).max_lines(),
+            1,
+            "a zero line cap must clamp to 1, never store nothing"
+        );
+        assert_eq!(
+            WorkflowLogPolicy::default()
+                .with_max_message_bytes(0)
+                .max_message_bytes(),
+            1,
+            "a zero message cap must clamp to 1, never empty every message"
+        );
+        // A legitimate value is passed through untouched.
+        assert_eq!(
+            WorkflowLogPolicy::default().with_max_lines(7).max_lines(),
+            7
+        );
+        assert_eq!(
+            WorkflowLogPolicy::default()
+                .with_max_message_bytes(64)
+                .max_message_bytes(),
+            64
+        );
+    }
+
+    #[test]
+    fn workflow_log_level_round_trips_through_its_wire_form() {
+        // The level is stored as TEXT and filtered on by the read route
+        // (`?level=`), so the string form is a wire contract.
+        for level in [
+            WorkflowLogLevel::Info,
+            WorkflowLogLevel::Warn,
+            WorkflowLogLevel::Error,
+        ] {
+            assert_eq!(
+                WorkflowLogLevel::from_wire(level.as_str()),
+                Some(level),
+                "{level:?} must round-trip through its wire form"
+            );
+        }
+        assert_eq!(
+            WorkflowLogLevel::from_wire("INFO"),
+            Some(WorkflowLogLevel::Info),
+            "level parsing is case-insensitive for operator ergonomics"
+        );
+        assert_eq!(
+            WorkflowLogLevel::from_wire("debug"),
+            None,
+            "an unknown level must be rejected, not silently coerced"
+        );
     }
 
     #[test]

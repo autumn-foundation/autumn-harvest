@@ -650,6 +650,7 @@ async fn ac2_continued_as_new_answers_200_with_internal_state() {
     events.push(WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id: ExecutionId::new(),
         input: json!({ "carry": 2 }),
+        new_workflow_type: None,
     });
     let exec_id = seed_execution(
         &pool,

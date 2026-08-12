@@ -137,6 +137,24 @@ fn file_requires_testing(source: &str) -> bool {
 /// be misclassified as needing a live DB.
 const SELF_EXCLUDE: &[&str] = &["ci_run_coverage", "migration_hygiene"];
 
+/// True when a file carries live-DB machinery but declares no test that could
+/// execute it — i.e. it is a shared **harness** consumed by a real suite, not a
+/// suite itself.
+///
+/// Every DB-backed suite in this tree drives its database from an async test
+/// (`#[tokio::test]`) or an explicit `block_on`. A file with neither cannot run
+/// a DB test no matter how it is invoked, so requiring a manifest row for it
+/// would demand a CI step that executes nothing — the inverse of what this
+/// guard exists to prevent. Its DB code is covered transitively by whichever
+/// suite consumes it (which does need, and has, its own row).
+///
+/// Deliberately narrow: the moment such a file gains a `#[tokio::test]` or a
+/// `block_on` it stops being a harness and the guard demands coverage again.
+fn is_db_harness_only(source: &str) -> bool {
+    let code = strip_line_comments(source);
+    !code.contains("#[tokio::test") && !code.contains("block_on")
+}
+
 // ── Allowlist: DB-gated tests without a covering manifest row (technical debt) ─
 //
 // Keyed `core:<module>` / `plugin:<file-stem>`. Every entry carries a reason.
@@ -649,6 +667,57 @@ fn env_gated_and_no_db_http_tests_are_not_classified() {
 }
 
 #[test]
+fn db_harness_without_async_tests_is_not_treated_as_a_suite() {
+    // A shared harness: real DB machinery, but nothing that could execute it.
+    let harness = "use testcontainers_modules::postgres::Postgres;\npub async fn setup() { Postgres::default(); }\n#[cfg(test)]\nmod t { #[test] fn pure_math() { assert!(true); } }";
+    assert!(
+        needs_live_db(harness),
+        "the harness genuinely carries live-DB machinery"
+    );
+    assert!(
+        is_db_harness_only(harness),
+        "no #[tokio::test] and no block_on ⇒ it cannot run a DB test itself"
+    );
+
+    // The moment it gains an async test it IS a suite and must be covered.
+    let suite = format!("{harness}\n#[tokio::test] async fn real_db_test() {{}}");
+    assert!(
+        !is_db_harness_only(&suite),
+        "a #[tokio::test] makes it a suite again — the guard must demand a row"
+    );
+
+    // ...and likewise for a sync test that drives the runtime explicitly.
+    let block_on_suite = format!("{harness}\n#[test] fn t() {{ rt.block_on(async {{}}); }}");
+    assert!(
+        !is_db_harness_only(&block_on_suite),
+        "an explicit block_on makes it a suite again"
+    );
+}
+
+#[test]
+fn claim_bench_support_is_classified_as_a_harness_not_a_suite() {
+    // The concrete case this rule exists for (issue #786): the claim/enqueue
+    // benchmark harness is shared by `benches/claim_bench.rs` and the wired
+    // `claim_budget_tests` suite. Its DB code is covered transitively.
+    let src = read_source(&core_integration_dir().join("claim_bench_support.rs"));
+    assert!(needs_live_db(&src), "it does carry live-DB machinery");
+    assert!(
+        is_db_harness_only(&src),
+        "claim_bench_support must declare no async/DB-driving test of its own —          if it grows one, give it a manifest row instead of relaxing this"
+    );
+}
+
+#[test]
+fn claim_budget_gate_has_a_covering_manifest_row() {
+    // The gate is the whole point of issue #786; it must actually run in CI.
+    let rows = parse_manifest();
+    assert!(
+        core_covers(&rows, "claim_budget_tests", false),
+        "the claim-path budget gate must have a covering `linux` manifest row —          a performance gate that never runs is not a gate"
+    );
+}
+
+#[test]
 fn strip_line_comments_drops_prose_container_tokens() {
     let src = "//! see the testcontainers suite\nlet x = 1; // TestDb reference in prose\ncode();";
     let code = strip_line_comments(src);
@@ -751,6 +820,12 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
         if !needs_live_db(&src) {
             continue;
         }
+        // A shared harness (DB machinery, no test that could run it) is covered
+        // transitively by the suite that consumes it; demanding its own manifest
+        // row would add a CI step that executes nothing.
+        if is_db_harness_only(&src) {
+            continue;
+        }
         let key = format!("core:{}", m.name);
         live_db_keys.insert(key.clone());
         // The covering-run `--features testing` requirement is the UNION of the
@@ -787,6 +862,9 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
     for path in plugin_files {
         let src = read_source(&path);
         if !needs_live_db(&src) {
+            continue;
+        }
+        if is_db_harness_only(&src) {
             continue;
         }
         let stem = path.file_stem().unwrap().to_string_lossy().to_string();

@@ -290,15 +290,23 @@ impl WorkflowSimulator {
                         history,
                     };
                 }
-                WorkflowOutcome::ContinuedAsNew { input: cont_input } => {
+                WorkflowOutcome::ContinuedAsNew {
+                    input: cont_input,
+                    new_workflow_type,
+                } => {
                     // Sim-stop: simulate the seal-and-restart by recording the
                     // terminal marker and feeding the new input back into the
                     // top of the loop. The simulator runs in-process, so this
                     // is a tail call rather than a fresh queue task.
+                    //
+                    // A cross-type continuation (issue #803) is recorded
+                    // faithfully; the simulator stops here either way, so it
+                    // never has to resolve the target type's handler.
                     Self::record_terminal_timer_commands(&pending, &mut history);
                     history.push(WorkflowEvent::WorkflowContinuedAsNew {
                         new_exec_id: ExecutionId::new(),
                         input: cont_input.clone(),
+                        new_workflow_type,
                     });
                     return SimulatorResult {
                         final_output: Ok(cont_input),

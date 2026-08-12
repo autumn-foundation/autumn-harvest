@@ -602,7 +602,10 @@ pub(crate) fn build_test_pool(database_url: &str) -> DbPool {
         .expect("failed to build test pool")
 }
 
-async fn load_execution_from_url(database_url: &str, exec_id: ExecutionId) -> WorkflowExecution {
+pub(crate) async fn load_execution_from_url(
+    database_url: &str,
+    exec_id: ExecutionId,
+) -> WorkflowExecution {
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
         .await
         .expect("failed to connect fresh Postgres client for execution query");

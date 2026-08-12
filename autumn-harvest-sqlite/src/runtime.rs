@@ -1128,6 +1128,10 @@ impl SqliteRuntime {
             DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+            // Issue #790: the durable per-execution log sink is a Postgres-only
+            // table this backend does not have, so it is always disabled here.
+            // `ctx.logger()` still emits to `tracing` exactly as before.
+            None,
             std::collections::HashMap::new(), // context headers (none)
             None,                             // payload offload threshold (none)
             std::sync::Arc::new(NoOpMetrics),
@@ -1385,7 +1389,15 @@ impl SqliteRuntime {
                 // for — so it is a benign NO-OP here (streaming is Postgres-only).
                 WorkflowCommand::WaitForActivity { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
-                | WorkflowCommand::PublishProgress { .. } => {}
+                | WorkflowCommand::PublishProgress { .. }
+                // `RecordLog` (issue #790) is the OPT-IN durable per-execution
+                // log sink, backed by a Postgres-only `harvest_workflow_logs`
+                // table this backend does not have. A benign NO-OP here: the
+                // line still reaches `tracing` (the core emits that
+                // unconditionally), only the durable copy is skipped. It
+                // appends no event and gates no control flow, so dropping it
+                // cannot affect replay.
+                | WorkflowCommand::RecordLog { .. } => {}
                 // Bookkeeping commands that carry an event MUST be persisted, even
                 // when they ride in the same batch as a suspending command: a
                 // dropped `SideEffectRecorded`/`MarkerRecorded` would make the next
@@ -1927,7 +1939,10 @@ fn persist_terminal_pending_commands(
             // LISTEN/NOTIFY side channel — a benign NO-OP on this backend.
             WorkflowCommand::WaitForActivity { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
-            | WorkflowCommand::PublishProgress { .. } => {}
+            | WorkflowCommand::PublishProgress { .. }
+            // Durable workflow logs (issue #790) — Postgres-only sink; a benign
+            // NO-OP here for the same reason as `PublishProgress`.
+            | WorkflowCommand::RecordLog { .. } => {}
             // Cancellable durable timers (issue #768) — a v0.1 non-goal — can also
             // be drained in the terminal cycle (e.g. `ctx.start_timer(...)` right
             // before `Ok(..)`). Reject by NAME with the same actionable message as
@@ -2087,6 +2102,7 @@ const fn command_name(cmd: &WorkflowCommand) -> &'static str {
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
         WorkflowCommand::PublishProgress { .. } => "PublishProgress",
+        WorkflowCommand::RecordLog { .. } => "RecordLog",
         WorkflowCommand::CancelRaceLosers { .. } => "CancelRaceLosers",
         WorkflowCommand::ArmTimer { .. } => "ArmTimer",
         WorkflowCommand::CancelTimer { .. } => "CancelTimer",

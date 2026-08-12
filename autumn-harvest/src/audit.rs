@@ -330,6 +330,9 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /workflows/{id}/tree", RouteClass::ReadOnly),
     ("GET /workflows/{id}/stack", RouteClass::ReadOnly),
     ("GET /workflows/{id}/timeline", RouteClass::ReadOnly),
+    // Durable per-execution author log lines (issue #790): admin-gated,
+    // read-only projection of `harvest_workflow_logs`. Appends nothing.
+    ("GET /workflows/{id}/logs", RouteClass::ReadOnly),
     // Open-awaitables diagnostic (issue #615): read-only replay projection of
     // what an execution is parked on; appends no events, performs no writes.
     ("GET /workflows/{id}/awaitables", RouteClass::ReadOnly),
@@ -774,6 +777,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /workflows/{id}/tree",
     "GET /workflows/{id}/stack",
     "GET /workflows/{id}/timeline",
+    "GET /workflows/{id}/logs",
     "GET /workflows/{id}/awaitables",
     "GET /workflows/{id}/run-chain",
     "POST /workflows/{id}/replay-diagnosis",
@@ -903,6 +907,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workflows/{id}/tree", None),
     ("GET /workflows/{id}/stack", None),
     ("GET /workflows/{id}/timeline", None),
+    ("GET /workflows/{id}/logs", None),
     // Issue #615: read-only, no audit operation.
     ("GET /workflows/{id}/awaitables", None),
     ("GET /workflows/{id}/run-chain", None),

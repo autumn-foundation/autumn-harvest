@@ -18,7 +18,7 @@ use crate::schema::{
     harvest_mutex_waiters, harvest_payload_refs, harvest_rate_limit_buckets,
     harvest_schedule_decisions, harvest_schedules, harvest_sessions, harvest_signals,
     harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
-    harvest_workflow_executions,
+    harvest_workflow_executions, harvest_workflow_logs,
 };
 
 // ── Calendar ──────────────────────────────────────────────────────────────────
@@ -1521,4 +1521,36 @@ pub struct HarvestMutexWaiter {
 pub struct NewHarvestMutexWaiter {
     pub lock_key: String,
     pub waiter_exec_id: Uuid,
+}
+
+/// One durable workflow log line from `harvest_workflow_logs` (issue #790).
+///
+/// Observational only — never part of `harvest_events`, never replayed.
+#[derive(
+    Debug, Clone, Queryable, QueryableByName, Selectable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_workflow_logs)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestWorkflowLog {
+    pub id: i64,
+    pub workflow_exec_id: Uuid,
+    pub seq: i64,
+    pub level: String,
+    pub message: String,
+    pub occurred_at: DateTime<Utc>,
+}
+
+/// Insert struct for one durable workflow log line (issue #790).
+///
+/// `id` (BIGSERIAL) and `occurred_at` (`DEFAULT NOW()`) are omitted so Postgres
+/// fills them. `seq` is supplied by the workflow context and is the
+/// exactly-once dedup key against the partial unique index on
+/// `(workflow_exec_id, seq)`.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_workflow_logs)]
+pub struct NewHarvestWorkflowLog {
+    pub workflow_exec_id: Uuid,
+    pub seq: i64,
+    pub level: String,
+    pub message: String,
 }
