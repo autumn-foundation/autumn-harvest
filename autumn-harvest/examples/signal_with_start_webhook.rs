@@ -124,6 +124,7 @@ async fn handle_webhook_after(
             // Fresh-start provenance (issue #740); default records
             // StartSource::SignalWithStart.
             start_source_override: None,
+            start_source_ref_override: None,
         },
     )
     .await?;

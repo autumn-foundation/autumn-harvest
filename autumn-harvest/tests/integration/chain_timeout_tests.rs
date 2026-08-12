@@ -874,6 +874,7 @@ async fn signal_with_start_applies_fleet_wide_chain_ceiling() {
             max_workflow_attempts_ceiling: None,
             workflow_info: None,
             start_source_override: None,
+            start_source_ref_override: None,
         },
         None,
         None,

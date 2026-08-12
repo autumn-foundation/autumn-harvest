@@ -88,6 +88,7 @@ fn params<'a>(
         reject_fresh_if_debounced: false,
         workflow_info: None,
         start_source_override: None,
+        start_source_ref_override: None,
     }
 }
 

@@ -1225,6 +1225,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // `validate_input` call site being in the HTTP handlers.
                         workflow_info: None,
                         start_source_override: None,
+                        start_source_ref_override: None,
                     };
 
                     let outcome = ::autumn_harvest::execution::signal_with_start_workflow_execution(conn, params).await?;

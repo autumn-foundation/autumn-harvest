@@ -1,0 +1,1667 @@
+## Phase 3.x — Broker event-source connectors: Kafka and SQS as workflow triggers (issue #944)
+
+**Implemented.** A Kafka topic or an SQS queue can now trigger a durable
+workflow, with idempotent redelivery, correct ack ordering, poison isolation
+and backpressure — none of which the embedder writes. Before this, the only
+first-class inbound triggers were HTTP starts and verified webhooks (#344), so
+every event-driven deployment hand-rolled a consumer loop and got at least one
+of dedupe, ack ordering, or poison handling wrong.
+
+**The core engine gains ZERO broker dependencies.** This is the load-bearing
+architectural invariant and the reason the connector lives in
+`autumn-harvest-plugin` behind Cargo features rather than in `autumn-harvest`.
+The engine stays Postgres-only: `cargo tree -p autumn-harvest --all-features`
+never shows `rdkafka`, `aws-sdk-sqs`, or any other broker client. Everything the
+engine contributes is dependency-free — four `harvest.connector.*` metric
+constants with no-op `MetricsRecorder` defaults, and the additive
+`StartSource::Broker` provenance variant. The invariant is enforced
+**mechanically**, not by convention:
+`autumn-harvest-plugin/tests/connector_dependency_graph.rs` shells out to
+`cargo tree` and fails the build if a broker client ever reaches the engine's
+graph, plus a falsifiability test proving the guard genuinely *sees*
+`rdkafka`/`aws_sdk_sqs` when they are present (so a typo'd crate name or a
+broken parse can never make the negative guard pass vacuously). Same seam shape
+the engine already uses for `PayloadStore` (#524),
+`CompletionCallbackDeliverer` (#605) and `HistoryArchiver` (#345).
+
+**No new `WorkflowEvent` variant, no core migration.** A broker-triggered start
+is an ordinary start landing the same `WorkflowStarted` event an HTTP caller
+produces. The only durable state the connector owns is
+`harvest_connector_dead_letters`, a **plugin**-owned table (alongside
+`harvest_workflow_outbox`, migration `20260719000000`) for poison messages that
+never became executions — the engine's `harvest_dead_letters` is task-keyed
+(`original_task_id NOT NULL` + a `task_type` CHECK), so holding one would have
+required relaxing a *core* schema constraint, which the issue forbids for the
+trigger path.
+
+### Features and layering
+
+| Feature | Brings |
+|---|---|
+| `connectors` | The broker-**agnostic** layer: bindings, idempotency, ack ordering, poison isolation, backpressure, and `MockSource`. No broker client at all — enough to unit-test a mapping function and the whole dispatch path with no Docker. |
+| `kafka` | `connectors` + `rdkafka`. |
+| `sqs` | `connectors` + `aws-config` / `aws-sdk-sqs`. |
+
+Only `EventSource` is broker-specific, so NATS / RabbitMQ / Pub-Sub / Kinesis
+adapters are follow-ups rather than rewrites. New module tree
+`autumn-harvest-plugin/src/connector/`: `binding.rs` (the descriptor),
+`idempotency.rs` (the injective bounded dedupe key), `disposition.rs` (the
+**pure** ack/retry/dead-letter decision core), `dispatch.rs` (delegates to the
+plugin's own start handlers), `runtime.rs`, `dead_letter.rs`, `message.rs`,
+`source.rs`, `mock.rs`, plus the feature-gated `kafka.rs` / `sqs.rs`.
+
+### Declarative binding (AC2)
+
+`SourceBinding::starts(name, stream, workflow)` /
+`::signals_with_start(name, stream, workflow, signal_name)` mirror
+`WebhookTriggerInfo`'s shape: a **synchronous** mapping function returning a
+`MappedMessage` (workflow id + JSON payload), with `MappingError::Deserialize`
+vs `::Rejected` classification exactly as the `#[webhook]` dispatch shim does.
+`SignalsWithStart` reuses `signal_with_start_workflow_execution` (#244).
+`HarvestPlugin::connector(binding, source)` wires it; `HarvestPlugin::build`
+**fails fast** on an unregistered target, a DAG target, a duplicate binding
+name, a missing mapping function, an adapter/binding stream mismatch, or a
+`BrokerCoordinates` dedupe mode explicitly forced onto a deferred-admission
+workflow.
+
+### Idempotency by construction (AC3)
+
+The dedupe key is derived from stable broker coordinates — Kafka
+`topic:partition:offset`, SQS `MessageId` (stable across every redelivery of a
+message and distinct for every distinct message; a FIFO
+`MessageDeduplicationId` is only a last-resort fallback, see the review-fix
+list below) — namespaced by the binding exactly as
+the webhook receiver namespaces `{path}:{signal_name}:{delivery_id}`, and fed
+to harvest's own `idempotency_key` machinery (#808). The encoding is the
+injective, length-bounded `L{len}:{value}` / `H{64hex}` scheme from #699, so a
+pathological coordinate can neither collide with another message's key nor blow
+the column limit.
+
+**AC3 × AC5 conflict, resolved:** a broker-coordinate-keyed start is mutually
+exclusive with a throttle/debounce/batch admission policy (the start route
+returns `400`, since a deferred start has no execution id to key). The
+connector therefore resolves an `IdempotencyMode` **once at build time**: a
+target with a deferred-admission policy falls back to `WorkflowId` dedupe (the
+mapping function's id is the dedupe unit, resolved through the normal id-reuse
+policy), everything else uses `BrokerCoordinates`. `.idempotency_mode(...)`
+forces one explicitly; forcing the incompatible combination is a build-time
+panic, not a first-message surprise. `SignalsWithStart` always uses broker
+coordinates — the signal path's key is a body field with no such exclusion.
+
+### At-least-once with correct ack ordering (AC4)
+
+Ack/commit/delete happens **only** after the dispatch durably committed, was
+recognised as an idempotent replay, or was deferred by the throttle. A
+harvest-side failure leaves the message unacked. For Kafka there is one extra
+rule, because an offset commit is a **high-water mark**: committing `N` asserts
+everything below `N` is done, so the runtime commits only the **contiguous
+completed prefix** via `OffsetTracker` — if 11 and 12 finish while 10 is still
+in flight, nothing commits until 10 lands, then all three commit at once. The
+tracker distinguishes *in flight* (delivered to us, not yet settled — blocks the
+prefix) from *never delivered* (a hole below the highest offset actually seen —
+stepped over), because a partition's delivered offsets are **not** contiguous:
+Kafka reserves offsets for transaction control records, filters
+aborted-transaction records under `read_committed`, and compaction can remove a
+record entirely. Waiting on a hole that will never arrive would stall that
+partition's commit permanently — every message processed, but the mark frozen,
+so every restart replays all of them. A hole is only stepped over strictly
+*below* the highest delivered offset, so the mark can never run ahead into
+offsets the broker may still hand us. Kafka
+auto-commit is force-disabled *last* in `to_client_config()` so a caller-supplied
+`extra` property can never re-enable it and silently break the contract.
+
+### Backpressure composes with the throttle (AC5)
+
+`max_in_flight` (default `16`, per binding) bounds concurrent dispatches. A
+throttle-deferred start (`202`, no execution id) counts as a **successful**
+dispatch and is acked — busy-retrying it would defeat the throttle and stampede
+the admission path.
+
+### Poison isolation (AC6)
+
+Deterministic failures (undecodable body, a `4xx` target rejection) dead-letter
+immediately; a mapping-function *rejection* is retried until
+`poison_threshold` consecutive strikes (default `3`, mirroring
+`poison_pill_threshold` #367) then dead-letters. `poison_threshold(0)` disables
+the strike counter but **not** deterministic dead-lettering, because retrying an
+undecodable body forever is exactly the partition wedge this prevents. A
+transient harvest failure (`5xx`, pool exhausted) is **never** dead-lettered no
+matter how often it recurs. Destination is either the harvest-side table (with
+the raw payload, so an operator can replay by hand after a fix; `idempotency_key`
+is `UNIQUE`, so dead-lettering is itself idempotent) or —
+`.broker_native_dead_letter()` — the broker's own machinery (SQS redrive: the
+visibility timeout is reset to `0`, so SQS re-delivers, counts the receive, and
+moves the message to the queue's DLQ once `maxReceiveCount` is hit).
+
+`EventSource` therefore has **two** distinct negative-acknowledgement verbs,
+because the two intents are opposite: `abandon` is the gentle return of a
+message that hit a *transient* harvest failure (SQS lets the visibility timeout
+expire naturally, which is also the backoff), while `nack_for_dead_letter` asks
+for the *fastest possible* redelivery so the broker's own redrive claims the
+message (SQS resets visibility to `0`). Conflating them made the docs' "the
+visibility timeout expires" claim false for the transient path. An adapter with
+no real nack keeps the default, which routes both to `abandon`; a binding that
+asks for `.broker_native_dead_letter()` on such an adapter is **rejected at
+build time** (`broker_native_dead_letter_is_supported`), because abandoning
+there never terminates — the poison message would be re-read forever and reach
+no dead-letter destination at all.
+
+### Ordering caveat, documented honestly (AC7)
+
+The runtime dispatches up to `max_in_flight` messages concurrently and does
+**not** preserve broker partition ordering. Per-key ordering is the entity
+pattern: a `signals_with_start` binding whose mapping function derives a stable
+`workflow_id` from the partition key routes every message for that key into the
+same execution, and a workflow processes its own signals in recorded order.
+Global total ordering across a topic is out of scope.
+
+### Observability (AC8)
+
+Four metrics via the three-touchpoint recipe, all with **bounded** labels —
+per ADR-0001 §7 the message key, offset and execution id are never labels:
+`harvest.connector.received{source}`,
+`harvest.connector.dispatched{source, outcome}` (`dispatched` /
+`idempotent_replay` / `deferred` / `dead_lettered` / `retried`),
+`harvest.connector.poisoned{source, reason}` (`malformed` /
+`mapping_rejected` / `target_rejected`), and `harvest.connector.lag{source}`
+— note `dispatched` is the **settlement breakdown**, one sample per received
+message, so the series sums to `received` and a dashboard can show the full
+disposition mix rather than only the successes —
+where the client exposes it (Kafka high-watermark minus committed offset; SQS
+`ApproximateNumberOfMessages` **plus** `ApproximateNumberOfMessagesNotVisible`,
+so a message abandoned for retry still counts as outstanding rather than
+vanishing from the gauge until its visibility timeout lapses). A
+broker-triggered execution also records
+`start_source = 'broker'` with `start_source_ref` set to the rendered
+coordinates, so a run traces back to the exact message.
+
+### Two bugs the new tests found
+
+* A dead-letter **sink write failure** was counted as a poisoned message even
+  though the message was actually abandoned for redelivery. `settle` now
+  returns the *effective* disposition (downgrading `DeadLetter` → `Retry`) and
+  both the metrics emission and the poison-strike clear follow it, so the
+  counters can never over-report a quarantine that did not happen.
+* `OffsetTracker::complete` withheld the ack for a **redelivered offset at or
+  below** the committed high-water mark (the naive prefix advance returns
+  `None` for it), so a replayed message would be redelivered forever. It now
+  reports the existing mark — a commit is idempotent — without ever advancing
+  past an in-flight gap.
+
+### Further defects the code review found
+
+* **The prefix stalled forever on an offset the broker never delivers.** Kafka
+  control records, filtered aborted-transaction records, and compacted-away
+  keys all leave holes in a partition's delivered offsets. The tracker waited
+  on them, freezing that partition's commit permanently. Fixed by tracking
+  in-flight offsets explicitly, so a hole below the highest delivered offset is
+  stepped over while a genuinely in-flight offset still blocks.
+* **A panicking mapping function was retried forever.** `(binding.mapper)` is
+  embedder-supplied code; an `unwrap()` in it unwound the dispatch task, which
+  the runtime correctly declined to ack — and then re-read the same message on
+  every pass. It is now caught (`catch_unwind`) and classified as `Malformed`,
+  which is deterministic and therefore dead-lettered on sight.
+* **`ack` committed the message's own offset rather than the advanced mark.**
+  The contiguous-prefix computation was correct but its result was discarded,
+  so a batch that completed out of order committed a *lower* mark than it had
+  earned and re-read the gap on restart.
+* **The dead-letter record under-reported its strike count.** `settle` recorded
+  a hard-coded attempt count rather than the real consecutive-strike total, so
+  an operator triaging a quarantined message could not see how many times it
+  had actually been tried.
+* **`start_source_ref` recorded the wrong shape on the signal-with-start path.**
+  The core resolved it from the idempotency key, which for a
+  `signals_with_start` binding is the *namespaced* key rather than the raw
+  broker coordinates — so provenance was inconsistent between the two binding
+  kinds. `SignalWithStartParams` gained an explicit
+  `start_source_ref_override` so both paths record the rendered coordinates
+  uniformly.
+* **Three docs sites documented the wrong `outcome` label values.** They
+  claimed **4** values named `started`/`idempotent_replay`/`deferred`/`retry`;
+  the shipped enum has **5**, named `dispatched`/`idempotent_replay`/
+  `deferred`/`dead_lettered`/`retried`. Caught by a test that asserts the
+  emitted label rather than merely that emission did not panic.
+* **SQS coordinated on the wrong id, silently dropping valid events.** The
+  adapter preferred a FIFO `MessageDeduplicationId` over the broker-assigned
+  `MessageId`, on the reasoning that a producer-controlled id also survives a
+  *re-publish*. It is wrong in both directions. Inside SQS's five-minute
+  deduplication interval SQS already collapses the re-publish itself, so the
+  second message never reaches a consumer and the preference buys nothing.
+  Outside it, a legitimately reused dedup id (a nightly job keyed on a business
+  id) is a genuinely **new** message with a new `MessageId` — and keying on the
+  dedup id collapsed it onto the earlier message's key, so it was acked as an
+  idempotent replay and its event dropped. `MessageId` is now the coordinate;
+  the dedup id is a last-resort fallback for the case where the broker supplied
+  no message id at all.
+* **`broker_native_dead_letter()` was accepted on SQS queues with no redrive
+  policy.** The adapter reported an unconditional native dead-letter
+  destination, but SQS only *has* one when the queue carries a redrive policy.
+  Without one, abandoning a poison message redelivers it forever — precisely
+  the failure the mode exists to prevent, and now silent rather than caught at
+  build time. `SqsSource::connect` now probes `RedrivePolicy` and the answer
+  **fails closed**: an undeclared, unprobed, or probe-denied queue reports no
+  destination, so the binding is rejected at build time with a message naming
+  the two fixes (add a redrive policy, or declare it with
+  `SqsSourceConfig::has_redrive_policy(true)` when using the sync
+  `SqsSource::new` or when IAM denies `GetQueueAttributes`).
+* **A partition reassigned *behind* the mark committed a stale higher offset.**
+  An operator resetting the group offset, or a rebalance returning a partition
+  another consumer had moved, left the tracker's in-memory mark ahead of the
+  broker's position — so completing one low offset reported the old mark and
+  committed straight over everything in between. A *fresh* delivery at or below
+  the mark is now treated as the reposition it is: the partition's state is
+  reset and the prefix rebuilt from the new position. A redelivery of an offset
+  still in flight (or completed and held) is not a reposition and leaves the
+  live prefix alone.
+* **The dead-letter migration would never have run.** Its directory used
+  version `20260716000000`, already taken by the core
+  `20260716000000_harvest_workflow_history_bloat_warn`. Diesel identifies an
+  applied migration by **version alone**, in one `__diesel_schema_migrations`
+  table, and `ensure_runtime_migrations` applies the core migrations to the
+  harvest database *before* the plugin's — so the core one records the version
+  and the plugin's `CREATE TABLE` is treated as already applied and skipped.
+  `harvest_connector_dead_letters` would simply not exist, every poison
+  message's dead-letter write would fail, and each would be downgraded to a
+  retry and redelivered forever: exactly the failure the poison path exists to
+  prevent, surfacing far from its cause. Renamed to `20260719000000`.
+
+  Every test passed anyway, because each DB suite creates the table itself
+  (`reset()` runs the migration's SQL directly) — so the harness could never
+  observe the migration being skipped. The durable fix is therefore a guard,
+  not a test of this one table: `migration_hygiene` gained
+  `plugin_and_core_migrations_never_share_a_version`, which cross-checks the
+  plugin's harvest tree against the core tree. The pre-existing
+  `real_migrations_have_unique_version_prefixes` could not catch this — it only
+  ever saw the core tree. Verified red against the colliding name.
+* **A permanently blocked commit prefix was silent.** The contiguous-prefix
+  rule means a message that is retried rather than settled blocks its
+  partition's commit. On SQS the visibility timeout resolves that; on Kafka it
+  cannot, because `abandon` is a no-op there (not committing is not a nack), so
+  nothing hands the message back until the consumer is recreated. The connector
+  meanwhile looked healthy — messages flowing, all dispatching, only the commit
+  frozen. New `ConnectorRuntimeConfig::stall_threshold`: when a
+  partition holds that many completed offsets behind an unsettled head, the
+  pass fails with a distinct `ConnectorError::Stalled` carrying the partition,
+  the depth and the bound. Checked *before* each receive, both because a
+  stalled partition usually goes quiet (so a check that only ran when messages
+  arrived would miss the stalls that matter most) and because pulling a batch
+  only to drop it on the error is pure churn that advances a positional
+  consumer past undispatched messages. **On by default** — a stall nobody
+  configured a detector for is exactly the one that goes unnoticed — with the
+  bound derived from the binding's `max_in_flight` (×4, floored at 32), which
+  is what bounds *healthy* out-of-order settlement. `Some(0)` opts out.
+
+  The first cut only *signalled* the stall: `run`'s generic error arm caught it,
+  slept, and re-polled the same wedged consumer forever, and nothing in-tree
+  supervises the connector task, so the promised "a supervisor recreates the
+  consumer" never happened. Detection without recovery is not a fix, so the
+  runtime now performs the retry itself. New defaulted `EventSource::recover()`
+  returns whether the source rebuilt its own client; `run` handles `Stalled`
+  as its own case (re-polling a wedged consumer accomplishes nothing) by
+  calling it and then clearing that partition's tracker state — without which
+  the redelivered offsets arrive below the stale mark and the prefix stays
+  blocked. Poison strikes are deliberately not cleared, so a repeatedly-rejected
+  message still reaches its threshold instead of restarting its count on every
+  recovery. `KafkaSource` implements `recover` by rebuilding its consumer
+  (held behind a short-lived `Mutex`, never locked across an `.await`), which
+  rejoins the group from the last committed offset — genuinely redelivering the
+  blocked message. The default is `Ok(false)`, correct for SQS, whose
+  visibility timeout already redelivers so its prefix cannot wedge this way; a
+  source that both stalls and cannot rebuild itself stops the binding with an
+  error rather than spinning.
+
+- **A directly-built runtime silently discarded every poison message.**
+  `ConnectorRuntime::new` / `for_binding` are both public, and both installed
+  `NoopDeadLetterSink` — while a `SourceBinding` defaults to
+  `DeadLetterMode::HarvestSink`. So an embedder wiring the runtime themselves
+  (a test harness, a custom supervisor) got "record this poison message" paired
+  with a sink that records nothing: the write "succeeded", the runtime
+  acknowledged the message, and it was gone with no row in any table and no
+  copy on any broker — the one outcome a dead-letter path must never produce.
+  `HarvestPlugin` always installs the Postgres sink, so the shipped path was
+  never affected. Fixed by making the default sink *fail* rather than silently
+  succeed: the new `UnconfiguredDeadLetterSink` returns a `Config` error naming
+  both remedies (`with_dead_letter_sink(...)`, or
+  `broker_native_dead_letter()`), which drops straight into the runtime's
+  existing — and already-tested — ack-only-after-a-durable-write branch, so the
+  message is abandoned for redelivery and logged loudly instead of lost. No
+  public signature changed. `NoopDeadLetterSink` stays exported for the
+  broker-native and test cases, where the sink is genuinely never consulted,
+  with its doc updated to say it is no longer the default and why.
+
+- **A `max_batch` of `0` stopped a binding consuming, forever and silently.**
+  The value went straight to the source: Kafka's `while batch.len() < max`
+  loop never ran and `MockSource` drained nothing, so every pass looked *idle*
+  rather than broken — no error, no metric, no log, just a binding that never
+  moves again. (SQS happened to survive it, clamping internally.) Floored at
+  the runtime's single `receive` call site rather than per adapter, so an
+  embedder's own `EventSource` is covered too — new pure
+  `effective_max_batch`, mutation-verified: reverting it to the identity makes
+  both new tests report `received: 0`.
+
+- **A backward reposition before the first commit skipped every offset in
+  between.** `OffsetTracker::observe`'s reset guard was anchored on the
+  committed mark, so it was disabled precisely while `committed` was `None` —
+  which is the *normal* state of a partition whose head never settles, since
+  the prefix cannot advance. Stale `floor`/`ceiling` therefore survived a
+  reposition, and `ceiling` is what licenses stepping over an undelivered
+  offset as a "broker hole". With offset 10 held in flight and 11 completed, a
+  rebalance delivering offset 5 alone would commit through **9** — offsets
+  6..=9 were never delivered in that generation and are still to come, so
+  committing past them loses them outright. Anchored on `committed.or(floor)`
+  instead. Mutation-verified: reverting the anchor makes the new test report
+  `Some(9)` where `Some(5)` is required — the loss, exactly.
+
+- **The stall detector could not see a retry at the tail of a quiet
+  partition.** `stalled()` fired only once `threshold`-many *later* offsets
+  had settled behind the blocked head, so the one case with nothing behind it
+  — a transient failure on the last message of an idle partition — was never
+  detected, and on Kafka that message is simply dropped (`abandon` is a no-op
+  and the read position has already advanced past it). The volume bound was
+  always the wrong primary signal; it is now a *backstop* for a head blocked
+  without going through the retry path, and the primary signal is the retried
+  head itself, recorded on the tracker (`OffsetTracker::retried`) and reported
+  immediately.
+
+  Gated on a new `EventSource::abandon_redelivers()` (default `true`, Kafka
+  overrides to `false`) rather than on "any retry": SQS's visibility timeout
+  genuinely does hand the message back, so firing there would recycle the
+  consumer on every transient blip. The capability is explicit because it
+  cannot be inferred — both brokers carry partition/offset coordinates, and
+  the difference is only in whether `abandon` means anything. `Some(0)` now
+  disables **only** the backlog heuristic; the retried head is a correctness
+  signal, not a tunable. Mutation-verified in both directions: neutering the
+  retried signal makes the tail case report `None` where a stall is required,
+  and ignoring the capability makes eight redelivering-source tests fail.
+
+- **Two of the three documented poison `reason` labels matched no series.**
+  `docs/telemetry.md` and ADR-0001 advertised `deserialize_failed` /
+  `permanent_failure`, but `PoisonReason::as_str()` emits `malformed` /
+  `target_rejected`. An operator copying a selector out of those tables would
+  build an alert that silently never fires — which reads as "this never
+  happens" rather than "you typed the wrong label". Corrected, and pinned by a
+  new anti-drift test that enumerates the enum and asserts every emitted value
+  appears on each doc surface *and* that neither stale value does, so a future
+  variant fails the build until it is documented.
+
+- **A `starts` binding onto a *batched* workflow could deliver one message
+  twice.** For a deferred-admission target a keyed start is a `400`, so dedupe
+  falls back to workflow-id reuse — and reuse only arbitrates when an execution
+  is *created*. Batch admission mutates a pending aggregate long before that:
+  `admit_batched_start` upserts `buffered_payloads = existing || EXCLUDED`, so a
+  broker redelivery appends the same message a second time and the collapsed run
+  sees it twice; it also counts toward `max_size`, so it can flush the batch
+  early. Rejected at build time now, with the error naming the remedy (bind to
+  an unbatched workflow that starts the batched one, so the connector dedupes on
+  coordinates as usual and the batch only ever sees one admission per message).
+  The other two deferred policies were checked rather than assumed, and both are
+  genuinely safe, so both stay allowed and are documented instead of rejected:
+  **debounce** collapses on `(workflow_name, debounce_key)`, so a redelivery
+  lands on the same pending row and still yields exactly one run — it costs a
+  trailing-edge deadline extension bounded by `max_wait`, and a `pending_count`
+  that counts admissions rather than distinct messages; **throttle** keeps one
+  row per admission, but each fires through `start_or_load_workflow_execution`,
+  where reuse collapses the duplicate and refunds its token.
+
+- **The ordering section promised order the connector does not provide.** The
+  entity-pattern paragraph said a workflow "processes its own signals in the
+  order they were recorded", which the caveat twenty lines below it already
+  contradicted. Two same-key records in one batch are dispatched concurrently
+  (`for message in batch { … tokio::spawn(…) }`), so the later offset can
+  persist its signal first and the recorded order is not broker order. The
+  paragraph now claims **affinity, not ordering**, and the caveat states the
+  race explicitly. The one remedy it offers — `.max_in_flight(1)` — is no longer
+  taken on faith: `max_in_flight_one_dispatches_in_broker_order` drives twelve
+  staggered records through a real dispatch and asserts the observed order, and
+  raising the bound to 4 makes it fail (`[1, 2, 0, …]`), so the test measures
+  the bound rather than the mock's insertion order.
+
+- **Two bindings could share one event source, losing Kafka messages.**
+  `spawn_connectors` builds a `ConnectorRuntime` per registration, so each gets
+  its own `OffsetTracker` — handing the same `Arc<dyn EventSource>` to two
+  registrations started two receive loops over **one client** with two
+  independent views of what is durable. The validator only rejected duplicate
+  `(stream, target)` pairs, so same-stream-different-target passed. On Kafka the
+  loops split the stream nondeterministically and one tracker could commit a
+  contiguous mark covering offsets the *other* loop was still dispatching, which
+  a crash then skips permanently; on SQS each message goes to exactly one loop,
+  so neither target sees the whole queue. Rejected at build time now, naming
+  both bindings and the two remedies that actually fan a stream out (two Kafka
+  consumers with distinct group ids, or two SQS queues behind an SNS topic). The
+  decision is the pure `first_shared_source`, unit-tested without constructing
+  sources — matching `binding_stream_matches_adapter` — and it reports the first
+  offending pair so the panic names a stable one rather than whichever the
+  iteration order reached.
+
+- **The runnable SQS example still promised per-key ordering.** Its doc comment
+  claimed the entity pattern "is also how you get per-key ordering" while
+  configuring `.max_in_flight(16)` — the same defect just corrected in the
+  guide, left behind in the example an embedder is most likely to copy. It now
+  says **affinity, not ordering**, states the same-device race, and points at
+  `.max_in_flight(1)` as the explicit throughput trade.
+
+- **A panicked dispatch task left its Kafka offset unmarked.** The normal
+  `Retry` path marks a retried head so recovery fires on the head itself, but a
+  task lost to a `JoinError` never reaches `settle`, so that marking never ran —
+  and the message handle had already moved into the spawned task, so the join
+  arm could not reach it. On a source whose `abandon` cannot force a redelivery
+  the local position has already advanced past the record, so nothing hands it
+  back: the offset became a permanently blocked prefix head, and at the tail of
+  a quiet partition the backlog heuristic never fires because nothing settles
+  behind it. The positional pair is now captured alongside the join handle and
+  the arm marks the head, so the pass fails `Stalled` and the consumer is
+  rebuilt. The reproduction is a genuine engine-side panic through the real
+  `run_once`: the dead-letter sink is the one injectable seam that panics
+  *outside* the mapper's `catch_unwind`. Its assertion uses `threshold == 0`,
+  which disables the backlog heuristic, so `held: 0` proves the marked head is
+  the only signal that could have fired. A mirror test pins the other
+  direction — a redelivering source (SQS's visibility timeout) is not wedged
+  and must not recycle the consumer on every engine-side panic.
+
+- **Broker-native dead-lettering restarted its own strike countdown.**
+  `AbandonToBrokerDeadLetter` is terminal for harvest but not for the broker: it
+  resets visibility so the message returns and the broker counts the receive
+  toward its own `maxReceiveCount`. Whenever that ceiling sits above the
+  binding's `poison_threshold` — the normal configuration, since the binding
+  wants to nack well before the queue gives up — the message comes back one or
+  more times before the broker quarantines it, and clearing the strike history
+  on the way out sent each redelivery back through ordinary
+  visibility-timeout retries and emitted a fresh `dead_lettered` sample per lap.
+  The strikes are now kept for that disposition alone, so every later delivery
+  re-nacks on sight and the broker's own count is what ends it. Such an entry
+  outlives harvest's view of the message, which is what the retention window
+  below exists to bound.
+
+- **Consumer lag was measured from the fetch position, not the committed
+  offset.** `lag()` subtracted `consumer.position()` from the high watermark,
+  but `position()` is the local next-fetch cursor: it advances the instant a
+  record is fetched, regardless of whether that record has been dispatched, is
+  being retried, or is stuck behind a blocked commit prefix. So a consumer
+  wedged with a large uncommitted backlog — precisely the condition
+  `harvest.connector.lag` exists to expose — reported its lag collapsing to
+  zero while a restart would replay everything from the last commit. It now
+  reads the durable committed group offset, falling back to the **low**
+  watermark for a partition with nothing committed yet (the consumer is pinned
+  to `auto.offset.reset = earliest`, so that is genuinely its outstanding
+  backlog; skipping the partition would report zero lag for a consumer that has
+  processed nothing). Covered by a broker-suite test that drives the source
+  directly so records are fetched but never acked — the honest reproduction of
+  a blocked prefix, which read zero under the old computation.
+
+- **A recovered stall rebuilt the consumer with no backoff at all.** The
+  `Stalled` arm called `recover_from_stall` and looped straight back, bypassing
+  the `error_backoff` every other failure honours. But rebuilding a Kafka
+  consumer is not a free local operation: it triggers a **group rebalance**,
+  revoking and reassigning partitions across every consumer in the group. A
+  stall is almost always caused by a downstream outage (Postgres, an admission
+  gate), so the redelivered head fails again immediately — turning one
+  binding's outage into a rebalance storm that disrupts unrelated partitions
+  and every other consumer in the group, for as long as the outage lasts. The
+  arm now applies the same cancellation-aware `error_backoff` the transient
+  arm does. The RED measurement is not subtle: a fixture that wedges on every
+  pass drove **13,968 consumer rebuilds in 300 ms** (≈ 46 per millisecond)
+  before the fix, against a post-fix ceiling of 12 for a 50 ms backoff.
+
+- **Broker-native poison strikes could never be released.** The fix above kept
+  a message's strike history through `AbandonToBrokerDeadLetter`, justified at
+  the time by "the redrive policy is what bounds it". That reasoning was
+  wrong, and the review was right to challenge it: SQS moves the message to its
+  DLQ **without notifying this process**, so there is no later delivery and no
+  terminal path that can ever clear the key — and a redrive policy bounds
+  *deliveries of one message*, not the size of an in-process `HashMap` across a
+  sustained stream of *distinct* poison messages. `PoisonTracker` now carries a
+  bounded retention for terminal entries: a monotonic-`Instant` FIFO makes
+  expiry O(expired) rather than a scan, the window runs from the message's
+  **last** delivery (expiring mid-redrive would restart the very countdown
+  keeping the strikes avoids), and `MAX_TERMINAL_POISON_ENTRIES` (10 000) is a
+  hard cap applied at mark time so a burst between passes cannot outrun the
+  bound. Time-based retention alone is still unbounded against a fast enough
+  stream; the cap is what makes it hard. Window configurable via
+  `ConnectorRuntimeConfig::poison_retention`, defaulting to one hour —
+  deliberately generous, because expiring late costs only memory while
+  expiring early costs a redelivered poison message a full strike countdown.
+
+- **Recovery cleared one partition when the rebuild is whole-client.** A
+  downstream outage wedges *every* partition in a batch, but `stalled` reports
+  them one at a time (the lowest wedged one), and `recover_from_stall` forgot
+  only that one — while `EventSource::recover` rebuilds the whole consumer, so
+  every assigned partition re-reads from its own last commit. Partitions 2..N
+  therefore kept stale in-memory marks, and their redelivered offsets arrived
+  *below* those marks and were mistaken for already-settled redeliveries: the
+  exact failure `forget` exists to prevent, left in place for every partition
+  but the first. It also cost one extra rebuild — and one extra group
+  rebalance — per affected partition before consumption could resume. The
+  clear is now whole-tracker (`OffsetTracker::forget_all`), matching the scope
+  of the rebuild that triggers it.
+
+- **A disabled poison counter still recorded strikes.**
+  `poison_threshold(0)` documents the strike counter as off, and
+  `decide_disposition` never reads the count in that case (it short-circuits on
+  `threshold > 0`) — but the runtime struck anyway on every mapping rejection.
+  The resulting `Retry` is not a terminal disposition, so neither `clear` nor
+  the terminal-retention sweep covers it, and on a redelivering source a
+  sustained stream of distinct rejected messages grew the tracker without
+  bound for a counter the operator had explicitly turned off. The strike is now
+  skipped when the threshold is zero.
+
+- **SQS lag counted only visible messages.** The gauge requested
+  `ApproximateNumberOfMessages`, but a message this connector abandons for
+  retry is *invisible* until its visibility timeout lapses. During a downstream
+  outage — precisely when the gauge matters — successive polls drove the
+  reported lag toward zero while a large population was still in flight,
+  masking the backlog. The same inversion as the Kafka `position()`-vs-committed
+  bug above, on the other adapter. It now sums
+  `ApproximateNumberOfMessagesNotVisible` as well, so the number means "still
+  owed to harvest" rather than "immediately fetchable"; a missing or
+  unparseable attribute contributes zero rather than discarding the sample.
+
+- **The exported mock did not honour its own advertised redelivery.**
+  `MockSource::new` reports `abandon_redelivers() == true` (SQS's visibility
+  timeout), but `receive` had already removed the message and `abandon` only
+  recorded the handle — so an abandoned message vanished. `MockSource` is a
+  **supported, exported** adapter an embedder uses to unit-test a mapping
+  function without a broker, so this both broke its contract and let
+  retry-path tests silently miss the eventual successful delivery they exist
+  to prove. It now retains delivered-but-unsettled messages (the mock's
+  analogue of an invisible SQS message) and genuinely requeues on abandon;
+  `without_redelivery()` keeps the drop, which is the accurate Kafka
+  behaviour. Four existing tests that hand-simulated redelivery with a manual
+  re-push now rely on the real thing — and reverting the fix fails **five**
+  tests, which is the measure of what was being missed.
+
+- **Every poison strike is bounded, not just the terminal ones.** The
+  previous round bounded broker-native terminal strikes with a hard cap and a
+  retention sweep, and fixed a threshold-zero leak by skipping `strike()`
+  entirely when the counter is off. That closed one half and left the other:
+  at a *nonzero* threshold a first rejection stays in `Retry`, which never
+  clears the key, and only a terminal mark queued the key for expiry. So the
+  whole rejected backlog below the threshold was resident uncapped — the
+  common case. `StrikeState` now carries `last_seen`, refreshed by a strike as
+  well as a terminal mark, and it is the ordering key for *both* the hard cap
+  and the retention sweep. Aging out a non-terminal streak is correct on its
+  own terms: a strike run is *consecutive* by definition, so a key idle past
+  the retention window has already broken its streak.
+
+- **`signals_with_start` dedupe is bounded by retention, not the window.** The
+  startup warning and the docs both told operators to size
+  `start_idempotency_window` — but only a `starts` binding reserves a
+  `harvest_start_idempotency` row. A `signals_with_start` binding persists its
+  coordinate key *only* on `harvest_signals`, which is `ON DELETE CASCADE` on
+  its execution, so retention deleting the run deletes the claim and a later
+  replay starts a second execution and re-delivers the signal. Naming a knob
+  that does nothing for half the bindings is worse than naming none. The
+  decision is now `untuned_coordinate_dedupe_bound`, which resolves *which*
+  bound applies per target: an untuned window for `starts`, the effective
+  retention age for `signals_with_start`. The latter is deliberately **not**
+  silenceable by tuning the window, precisely because the window is the wrong
+  remedy. With retention off (harvest's default) the signal claim outlives
+  every window, so that case warns about nothing — it is stronger than the
+  `starts` case, not weaker. The docs table now states both lifetimes
+  side by side.
+
+- **Connector metrics never reached the built-in scrape endpoint.**
+  `HarvestMetricsRecorder` is per-metric hand-maintained, so the four new
+  `record_connector_*` methods fell through to the trait's no-op default and
+  `.with_metrics_scrape()` discarded every sample. There is precedent for a
+  family being adapter-only, but this slice shipped dashboard panels reading
+  those families, which made silence indistinguishable from a healthy idle
+  consumer. All four are now stored and rendered
+  (`harvest_connector_received_total`, `..._dispatched_total`,
+  `..._poisoned_total`, `harvest_connector_lag`), with lag as a
+  last-write-wins gauge so a partition draining to zero reads zero instead of
+  the sum of every sample the poll loop took.
+
+- **The documented lag semantics described the pre-fix behaviour.** After both
+  adapters were changed to report work still owed, the docs still said Kafka
+  measured against the read position and SQS counted only visible messages,
+  and carried an "under-reports" callout that was by then exactly backwards.
+  Replaced with a per-adapter table stating what each reports and why the
+  cheaper number each broker offers first is the wrong one, plus the operational
+  consequence: the gauge stays *high* while a partition is wedged, so alert on a
+  lag that is not falling.
+
+- **The poison cap bounded the map but not the queue behind it.** A direct
+  consequence of the previous round's own fix: `enforce_cap` gated on
+  `strikes.len()`, while `clear` — every harvest-owned terminal — retires a key
+  *without* retiring the expiry records naming it. A sustained stream of
+  distinct rejected messages is precisely the shape that holds the map near
+  empty, so the cap never fired while the queue grew one owned `String` per
+  strike until the retention window (an hour by default) drained it. Measured
+  before the fix: 31,500 records retained with `tracked() == 0`; at a few
+  thousand rejections a second that is millions of keys, so it is a
+  memory-exhaustion path rather than a slow leak. The ceiling now applies to
+  both structures independently. Draining to satisfy the queue's gate is cheap
+  when the excess is stale records — each pop is a no-op discard — and where it
+  does reach a live key it falls back on the same oldest-touched eviction the
+  map already used, which costs that message one extra lap and never
+  correctness.
+
+- **Kafka lag counted records retention had already deleted.** The gauge
+  subtracted the group's committed offset from the high watermark without
+  reference to the low one. When retention advances `low` past an old commit
+  those records are gone from the log, so a group at offset 0 against
+  watermarks `[1000, 1100)` reported 1,100 outstanding instead of the 100 it
+  can still read — a permanent overstatement on exactly the gauge operators
+  page on, and one the consumer can never work off. A valid committed offset is
+  now clamped to at least `low`, which is what the uncommitted arm had been
+  doing correctly all along. The arithmetic moved into a free `partition_lag`
+  so it is testable without a live consumer; its four cases (clamped,
+  uncommitted, in-window, caught-up) are now pinned.
+- **The unsupported dead-letter pairing was only refused at plugin build
+  time.** `ConnectorRuntime::new`/`for_binding` are exported, so an embedder
+  driving the runtime directly bypassed the guard entirely: a binding asking
+  for broker-native dead-lettering on an adapter with no dead-letter
+  destination reached `AbandonToBrokerDeadLetter`, whose nack falls through to
+  the no-op `abandon`, and reported a *terminal* disposition for a message that
+  was quarantined nowhere and never handed back in-session — at a quiet
+  partition tail, silently dropped. The predicate moved to `disposition.rs`
+  beside `DeadLetterMode` and is now asserted in the runtime constructor too,
+  so the two entry points cannot drift apart. Its rejection and both
+  acceptances (broker-native on a supporting adapter; the default harvest sink
+  on any adapter) are pinned, so the guard cannot over-reject either.
+- **A panicked dispatch stranded the message on a redelivering source.** The
+  join arm marked the offset only on a source whose `abandon` cannot force a
+  redelivery, and did nothing at all otherwise. But `abandon_redelivers()`
+  describes what `abandon` *does*, not a promise the message returns unaided:
+  `MockSource` — a supported, exported adapter — redelivers exclusively from
+  that call, so the panicked message stayed in `in_flight` where no later pass
+  could see it, and any custom adapter needing an explicit nack fails the same
+  way. This reverses an earlier decision in this review round, which reasoned
+  from SQS's visibility timeout and did not hold for the general case. The
+  message handle is now cloned out before `message` moves into the task, and
+  the arm abandons on a redelivering source while keeping the offset marking
+  for the positional one.
+- **A panicked dispatch was missing from the settlement breakdown.**
+  `harvest.connector.received` is counted before the task is spawned, but a
+  panicked task never reaches `record_metrics`, so it emitted no
+  `harvest.connector.dispatched` sample. Both ADR-0001 §7 and
+  `docs/telemetry.md` state that series is the breakdown of `received` — one
+  sample per message — so every panic permanently widened the gap and hid the
+  retry the runtime had just performed, on the dashboard that exists to show
+  it. The join arm now emits `ConnectorOutcome::Retried` itself, and the test
+  asserts the invariant directly (`dispatched().len() == received().len()`)
+  rather than only the sample's presence.
+- **Two operator-facing lag descriptions still documented pre-fix semantics.**
+  The connector guide's own table was corrected when the SQS gauge started
+  summing `ApproximateNumberOfMessagesNotVisible`, but the `docs/telemetry.md`
+  catalogue row and the dashboard panel still described the visible attribute
+  alone — so during an outage, the two places an operator is most likely to be
+  reading would have them interpret a gauge containing in-flight work as
+  visible backlog. Both now match the implementation. The **Kafka** half of the
+  same row was stale for the same reason (the retention clamp above is not
+  mentioned anywhere an operator reads), so it was corrected in the same pass,
+  including the one remaining incomplete sentence in the connector guide.
+- **Two separately-constructed sources over one physical subscription were
+  accepted.** The build-time clash check compared `Arc::as_ptr`, which catches
+  a *shared* source object but not two sources built independently over one SQS
+  queue or one Kafka consumer group — they have distinct pointers and still
+  compete for the same messages, so each binding sees an arbitrary **subset**
+  rather than the whole stream. Object identity cannot express this; the
+  adapter has to state it. `EventSource::subscription_identity` is the new seam
+  (defaulting to `None`, which never matches another `None`, so a custom
+  adapter keeps today's pointer-only check rather than being rejected on
+  sight). It is deliberately a *subscription* identity, not a *stream* one: two
+  Kafka consumers on one topic under **distinct group ids** each receive the
+  whole stream — the fan-out the existing panic message recommends — so Kafka
+  pairs the group with the topic while SQS, which has no group concept, uses
+  the queue URL alone.
+- **The startup dedupe warning read a workflow definition the engine will never
+  run.** `HandlerRegistry` collapses the builder's `Vec<WorkflowInfo>` into a
+  `HashMap`, so a name registered twice executes **last-wins**, and
+  `spawn_connectors` matched that — but the validation pass used a first-wins
+  `.find()`. A first *throttled* definition followed by a plain one therefore
+  made the runtime dedupe on broker coordinates while the validation pass
+  suppressed the 24-hour claim-lifetime warning, leaving the operator unaware
+  that a late replay can start a second execution. Both now go through one
+  `workflow_infos_by_name` helper, so they agree by construction rather than by
+  a comment — a comment that, until this fix, asserted an agreement that did
+  not exist.
+- **The exported `MappedMessage` rustdoc still promised in-order delivery.** The
+  guide and quickstart were corrected when the affinity-is-not-ordering caveat
+  landed, but the API doc a library author actually reads still said same-key
+  messages arrive "in order" — which is false whenever `max_in_flight > 1`,
+  precisely the default. Both it and the `ConnectorTarget::SignalsWithStart`
+  variant doc (which called itself "the *ordered* path") now promise affinity,
+  name concurrent dispatch as the reason, and point at `.max_in_flight(1)` as
+  the one knob that does buy order.
+
+- **The Kafka subscription identity read the declared group, not the effective
+  one.** `to_client_config` applies `extra` *after* the declared fields, so a
+  `.property("group.id", "shared")` override is what librdkafka actually joins
+  — but the identity read `config.group_id`. Two configs declaring different
+  groups and both overriding to one value therefore passed the
+  duplicate-subscription guard while landing in the same group, which splits
+  the partitions between them and starves both targets. The identity is now
+  read back **out of the built config**, so the precedence rule is
+  single-sourced and cannot drift. `bootstrap.servers` joined it for the
+  opposite reason: two independent clusters exposing one topic under one group
+  id are two subscriptions, and omitting the brokers would have *rejected* that
+  legitimate fan-in.
+- **A logical `(stream, target)` duplicate was rejected outright.** Two
+  independent brokers exposing the same stream name and feeding one workflow is
+  legitimate fan-in (active/active, or a cluster migration), and an operator
+  could not work around the rejection: a Kafka source's `stream()` *is* the
+  topic and the plugin separately requires the binding's stream to match it.
+  The hard error is replaced by the physical-subscription check, which sees
+  what a binding alone cannot. The genuine hazard the logical check also caught
+  — a duplicate pair on *distinct* subscriptions double-dispatching every
+  message, since the binding name namespaces each idempotency key — is now a
+  startup **warning**, matching the warn-rather-than-enforce precedent already
+  set twice on this PR for cases where only the operator knows the intent.
+- **One poison message was counted once per redrive lap.** With SQS's
+  `maxReceiveCount` above the binding's `poison_threshold` — the normal
+  configuration — the deliberately-retained strikes make every redelivery
+  resolve to `AbandonToBrokerDeadLetter` again, and the metric call was
+  unconditional, so a single physical message inflated
+  `harvest.connector.poisoned` by its lap count. `mark_terminal_as_of` now
+  reports whether the handoff was the **first**, and only that one counts. The
+  `dispatched` family is deliberately *not* deduped the same way: every
+  redelivery is a received message, and that family's documented invariant is
+  that it sums to `received` — asserted alongside the fix so the two rules
+  cannot be conflated later.
+- **Deterministic poison is counted on its first broker-native handoff.**
+  Completes the fix above, which gated the counter on `mark_terminal_as_of`
+  returning "first" but treated an *absent* key as "not first". `Malformed`
+  and `TargetRejected` are dead-lettered on sight and never strike-counted, so
+  no entry exists when they reach the handoff — `harvest.connector.poisoned`
+  was therefore never incremented at all for the two most obvious poison
+  classes in `BrokerNative` mode, a silent blind spot worse than the per-lap
+  inflation it replaced. `mark_terminal_as_of` now upserts a terminal entry
+  instead of returning early, so the first handoff counts and the entry it
+  creates is what makes the next redrive lap report false. The entry is
+  bounded exactly like a strike-bearing one (same expiry order, same retention
+  deadline). `HarvestSink` mode was unaffected — it never reaches this arm.
+- **A transient consumer-rebuild failure no longer stops the binding.**
+  `recover_from_stall` collapsed `Err(_)` from `EventSource::recover` onto the
+  same `false` as `Ok(false)`, and the caller reads `false` as "this source can
+  never rebuild itself" and `break`s out of the run loop. But the usual cause
+  of a stall is a downstream outage, and that same outage is what makes the
+  rebuild fail — so a blip at exactly the wrong moment permanently stopped an
+  unsupervised binding, and consumption never resumed even after the broker
+  came back. It now returns a three-state `StallRecovery`: `Unsupported`
+  (a property of the source *type*, so retrying cannot change the answer)
+  still stops the binding; `Failed` falls through to the same `error_backoff`
+  the transient-error arm uses and is retried on the next pass.
+- **The Kafka subscription identity canonicalizes the broker seed list.**
+  `bootstrap.servers` is a *seed* list — librdkafka contacts one entry and
+  learns the real membership from its metadata — so `broker-a,broker-b` and
+  `broker-b,broker-a` address the same cluster. Comparing the raw string made
+  them look independent, so the duplicate-subscription guard admitted both;
+  Kafka, which only cares about the group id, then split the partitions
+  between them and two bindings targeting different workflows each silently
+  received a fraction of the records. The identity now sorts, trims,
+  lowercases and dedupes the seeds. **Residual, deliberately open:** two
+  *disjoint* seed lists naming one cluster still compare as different. Only
+  the broker's cluster id settles that, and fetching it means a live metadata
+  round-trip during plugin *build* — trading a rare config-typo detection for
+  a startup that fails whenever the broker is briefly unreachable.
+- **A successful mapping breaks the consecutive-rejection streak.** The strike
+  counter is documented as *consecutive* rejections, and `MappingRejected` is
+  explicitly the possibly-transient refusal — so a delivery that maps
+  successfully ends the streak. But strikes were retained for every `Retry`,
+  which reaches that arm for three different reasons: a rejection below
+  threshold (must retain — that *is* the counter), a dead-letter whose sink
+  write failed (must retain, so the next delivery quarantines on sight), and a
+  transient dispatch failure after a *successful* mapping (must clear). The
+  third kept stale strikes, so a later rejection continued a streak that was
+  never consecutive and dead-lettered the message before `poison_threshold`
+  was genuinely reached. Now cleared when the outcome is `Transient`, gated on
+  the **outcome** rather than the disposition — the failed dead-letter write
+  also presents as `Retry` but carries a rejection outcome.
+- **Docs: the same-stream-same-target pair warns, it does not panic.** The
+  connector guide's rejection table still promised `HarvestPlugin::build`
+  panics on it, but since the multi-cluster fan-in fix that pair only warns —
+  what panics is a shared *physical subscription*. Operators reading the table
+  would have relied on startup validation that no longer fires. The table row
+  now names the physical-subscription rule, with the warning and the
+  deliberate independent-broker exception described alongside it.
+
+- **Kafka lag is group-wide, not per-replica.** `KafkaSource::lag` summed only
+  `consumer.assignment()`, so consumer lag — a property of the *group* — was
+  reported as a property of one replica. With N replicas each sample was roughly
+  `1/N` of the backlog, and because the starter dashboard aggregates with
+  `max by (source)` (correct for SQS, where every replica reads the same
+  whole-queue depth via `GetQueueAttributes`), the panel showed the largest
+  replica's subtotal and hid a partition stalled on any of the others — the exact
+  condition the gauge exists to expose. The sample now enumerates the topic's
+  partitions from `fetch_metadata` and reads the group's offsets with
+  `committed_offsets` (which takes an explicit partition list, unlike
+  `committed`, which is assignment-scoped), so every replica reports the same
+  group-wide number and one aggregation is correct for **both** adapters. Chosen
+  over adding an adapter-kind label and branching the PromQL: that would leave
+  the gauge meaning different things depending on which broker is behind it, a
+  trap for every future alert, and would need a new metric label. Cost: broker
+  calls per sample scale with replica count — bounded work on the
+  `lag_sample_interval`, never on the message path, and how consumer-group lag
+  exporters compute this. The summation is extracted as the pure `group_lag`,
+  which fails the whole sample (`None`) if any watermark is unavailable rather
+  than reporting a partial total, since a partial total is indistinguishable
+  from a genuine drop in backlog. `docs/telemetry.md`, the dashboard panel
+  description (whose "`max by` avoids double-counting" note was itself an
+  artifact of the bug) and the connector guide are corrected.
+
+- **Kafka lag honours the effective `auto.offset.reset`.** `to_client_config`
+  applies `extra` *after* its `earliest` default — deliberately, unlike
+  `enable.auto.commit`, which is forced last because auto-commit would break the
+  ack-after-commit contract — so a caller's
+  `.property("auto.offset.reset", "latest")` is what librdkafka actually uses.
+  `partition_lag` nonetheless baselined an uncommitted partition at the **low**
+  watermark, so a brand-new latest-starting group reported the topic's entire
+  retained history as outstanding, and on a quiet topic nothing ever commits, so
+  that false backlog never drained. New `OffsetReset` enum +
+  `KafkaSourceConfig::effective_offset_reset()` mirroring `to_client_config`'s
+  precedence exactly (default, then `extra`, last write wins, librdkafka's
+  `end`/`largest` aliases included), threaded into `partition_lag` so an
+  uncommitted partition is baselined where the consumer would actually resume.
+  The reset policy is **not** forced the way auto-commit is: it breaks no
+  invariant and a new binding on a huge existing topic may legitimately want
+  only new messages. Bounded residual, documented: for a `latest` group the
+  baseline is the *current* high watermark rather than the join-time one, so
+  between joining and the first commit the gauge can read low — but that is
+  exactly what a restart would replay (nothing), and it becomes exact the moment
+  the group commits.
+
+- **Prefetch is capped by dispatch capacity.** `run_once` pulled
+  `effective_max_batch(max_batch)` messages before acquiring any dispatch
+  permit, so a batch larger than `max_in_flight` left the surplus received but
+  un-started. On SQS the visibility timer runs from `ReceiveMessage`, not from
+  dispatch, so a message waiting behind the rest of the batch's dispatch latency
+  can have its visibility expire, be handed to another replica, and have its
+  receive count incremented toward the queue's redrive policy — a perfectly
+  processable message reaching the broker DLQ having never failed. Not exotic:
+  the **default** config (`max_batch: 32`, `max_in_flight: 16`) already
+  prefetched 16 past capacity, and it is worst exactly where the docs send
+  people — `.max_in_flight(1)`, the per-key ordering remedy, against SQS's
+  ten-message batch. `effective_max_batch` now takes `max_in_flight` and returns
+  the min (still floored at one, so a degenerate zero can never reach a source).
+  Kafka throughput is unaffected in practice — librdkafka prefetches into its
+  own local queue, so this bounds how many are handed to the runtime, not broker
+  round-trips; for SQS with `max_in_flight` below ten it trades a few more
+  `ReceiveMessage` calls for not losing messages to the redrive policy. Two
+  existing tests now drain across passes rather than in one, keeping their
+  intent (`in_flight_dispatch_is_bounded_by_max_in_flight` still observes real
+  concurrency, since a pass dispatches its whole capped batch concurrently).
+- **Sample consumer lag before receiving, never while holding a batch.** The
+  throttled `lag()` call sat between `receive()` and the dispatch loop, so a
+  slow or internally-retrying broker round-trip — SQS bills a
+  `GetQueueAttributes`, Kafka does a metadata + watermark fetch — ran with a
+  batch already in custody. On SQS the visibility timer starts at
+  `ReceiveMessage`, not at dispatch, so that spends the batch's visibility
+  budget: another replica receives the messages, their
+  `ApproximateReceiveCount` climbs toward `maxReceiveCount`, and a perfectly
+  processable message reaches the broker DLQ having never once failed. Same
+  hazard class as the prefetch cap above, from the opposite direction. The
+  sample now runs before `receive`, which costs nothing — the gauge is
+  throttled to a scrape cadence, so which side of the receive it lands on does
+  not affect its accuracy — and guarantees no message is ever in custody while
+  the call is outstanding. Pinned by an ordering test over a call-recording
+  source (`lag_is_sampled_before_any_message_is_in_custody`).
+- **State the honest bound on poison-strike eviction, and report the
+  degradation.** `MAX_POISON_ENTRIES` claimed evicting early "only costs the
+  evicted message one extra retry lap — never correctness". That is false past
+  the cap: with more than 10 000 distinct messages rejected in round-robin
+  order and a `poison_threshold` above 1, every key is evicted before its next
+  delivery, so every attempt is strike 1 and no message ever reaches the
+  threshold — the harvest sink never fires, silently. The limitation is
+  inherent (tracking N concurrent streaks costs O(N)), so it is now documented
+  as what it is rather than waved away, pinned by a test that drives the exact
+  10 001-key round-robin, and — the actual improvement — made **observable**:
+  `PoisonTracker::strike_progress_discarded()` counts every eviction that threw
+  away a live strike count, and the first one logs a warning naming the
+  mitigations. Durable per-strike storage was declined deliberately: it buys a
+  hot-path write and a table (which the AC forbids) for a case with three
+  cheaper answers, all now documented in the connector guide —
+  `poison_threshold(1)` (nothing needs to survive between deliveries, so the
+  cap stops mattering), an SQS redrive policy (`ApproximateReceiveCount` is
+  per-message, lives in the broker, and survives eviction *and* restarts), and
+  the fact that Kafka cannot reach the round-robin shape at all, since a
+  retried message blocks its partition prefix and trips the stall detector
+  first.
+- **Stop advertising Kafka broker-native dead-lettering.**
+  `SourceBindingBuilder::broker_native_dead_letter`'s rustdoc offered it for
+  "SQS redrive, a Kafka DLQ topic", but `KafkaSource` never overrides
+  `has_native_dead_letter()` — it inherits the trait's `false` default, and both
+  `ConnectorRuntime::new` and plugin validation reject that pairing at build
+  time. A Kafka user following the rustdoc got a startup panic. Kafka has no
+  per-message nack, so there is nothing for abandoning to hand the message to;
+  routing a DLQ topic is a *producer* action a consumer cannot perform. The doc
+  now scopes the mode to SQS-with-a-redrive-policy and custom adapters, and
+  points Kafka users at the default harvest sink — which is also what keeps the
+  partition moving, since a dead-lettered message is acked whereas one left to
+  retry blocks its prefix. The prose was the whole defect, so there is no RED
+  phase to claim; a drift guard
+  (`kafka_reports_no_native_dead_letter_so_the_pairing_is_rejected`) pins the
+  behaviour the doc has to describe, and was mutation-verified to genuinely
+  assert rather than skip when librdkafka is present.
+- **Anchored a `latest` Kafka group so recovery cannot skip the record it is
+  retrying, and the lag gauge cannot report an all-clear while it is stuck.**
+  `auto.offset.reset` applies only while a partition has no committed offset,
+  and for a group whose first message keeps failing that window has no bound —
+  during it, `latest` is not a position but a *moving* one, re-resolved against
+  whatever the high watermark happens to be. Two things followed that tail
+  rather than the group. Recovery rebuilds the consumer to re-read the blocked
+  record, but with nothing committed the rebuild re-resolved `latest` against a
+  tail the blocked record had itself advanced past, skipping it permanently
+  while the runtime reported a successful retry — message loss dressed as a
+  retry. And the gauge baselined an uncommitted partition at the live high
+  watermark, making every sample `high - high = 0`: a group stuck at offset 100
+  while producers pushed the topic to 1000 reported an all-clear for the 900
+  records it owed, masking the pre-first-commit outage the gauge exists to
+  expose. One fact closes both — the first offset the consumer reads from a
+  partition is *where `latest` resolved*, and that is fixed. The new
+  `PartitionAnchors` records it on receive, raises it on every commit, commits
+  it synchronously before any rebuild, and supplies it as the lag baseline;
+  committing it is not a loss, because "everything below where I started is not
+  mine" is exactly what `latest` means, and this only makes that decision
+  durable. A failed anchor commit fails the whole recovery rather than
+  rebuilding into a possible skip — the runtime's answer to a failed `recover`
+  is to back off and retry, which is right for a transient commit error and
+  infinitely better than a silent loss; as a side effect the sync commit also
+  makes an in-flight async ack-commit durable instead of racing the rebuild.
+  This supersedes an earlier claim in `effective_offset_reset`'s docs that an
+  offset-reset policy "breaks no invariant": `latest` genuinely did threaten
+  at-least-once, which is why it is now anchored rather than merely documented.
+  Anchoring was chosen over forbidding `latest` outright (the other remedy on
+  the table) because it keeps a legitimate capability *and* makes it correct,
+  for about forty lines. Two residuals stay, both deliberate and documented: a
+  partition owned by another replica has no local anchor and keeps the
+  reset-policy baseline, and a process that restarts before its group ever
+  commits genuinely has no anchor — which is what `latest` asks for. Neither
+  applies to the `earliest` default.
+- **Bounded the lag sample so it cannot starve message consumption.** Two
+  earlier fixes on this PR composed into a starvation loop, which is worth
+  naming plainly: making the Kafka sample group-wide meant walking *every*
+  partition of the topic serially, and moving the sample *before* `receive` (so
+  no message is in custody across a billed round-trip) meant that walk now sits
+  directly in front of consumption. The throttle stamped the sample instant on
+  the way IN, so a walk that outlasted `lag_sample_interval` was due again the
+  moment it returned — every pass sampling, a sliver of each consuming. And
+  because the failure is driven by broker latency, it struck hardest exactly
+  when it mattered most: a degraded broker makes the walk slow *and* the backlog
+  grow, so the gauge reported a number the operator could not act on because the
+  connector was too busy measuring it to consume. Three bounds, all needed. The
+  sample is now budgeted at `lag_sample_interval` (a sample that cannot finish
+  within its own cadence is by definition too expensive for it, and the remedy is
+  the knob the operator already has); an over-budget sample is abandoned and
+  warned rather than blocking, so the gauge goes stale instead of the connector
+  going quiet — the same honest failure mode the adapters already use for a
+  partial answer. The interval is measured from **completion**, guaranteeing a
+  full interval of polling between samples however expensive one turns out to be
+  (worst case half the wall clock, bounded, versus previously unbounded). And the
+  Kafka walk carries its own overall deadline, clamping each `fetch_watermarks`
+  to the budget left — not redundant with the runtime timeout, because abandoning
+  the outer future only drops the join handle while the blocking walk runs on, so
+  abandoned walks would otherwise pile up one per interval and *increase* load on
+  the struggling broker. Concurrent watermark fetches were considered and not
+  taken: they shrink the walk but do not bound it, and parallelising a blocking
+  librdkafka call means N blocking threads per sample — trading one resource
+  problem for another when the guarantee needed is a bound, not a speedup. Three
+  RED-first tests, each mutation-verified against its own fix in isolation.
+
+- **Anchor commits are filtered to what this replica may speak for.** A
+  `PartitionAnchors` floor is a fact about *this source instance's* read history,
+  but nothing evicts one when a rebalance moves that partition elsewhere — while
+  an offset commit is a statement about the whole **group**. A long-lived
+  consumer therefore accumulated floors for partitions another replica was
+  advancing, and `recover()` wrote every one of them back synchronously. Kafka's
+  coordinator accepts an `OffsetCommit` for any partition from a current group
+  member regardless of assignment, so that rewound the other replica's durable
+  offset; the replay it caused lands **after** the connector's idempotency claims
+  for those records have expired, so it creates duplicate executions rather than
+  deduplicated retries. New pure `committable_anchors` keeps only anchors for a
+  partition this consumer **still owns** *and* whose floor **strictly raises**
+  the group's committed offset. Both guards are needed: ownership alone leaves
+  the revoke-and-return case, where first-read-wins (correct within one
+  continuous ownership span) is stale across it — a partition read at 100, lost,
+  advanced to 5000 elsewhere, then handed back still carries a floor of 100. Both
+  pass trivially in the case the anchor exists for (a `latest` group that has
+  never committed anywhere), so the loss fix is unaffected. The **lag baseline**
+  deliberately keeps using unfiltered anchors: it is read-only and per-replica,
+  so a stale one skews at most a sample, whereas dropping anchors during a
+  rebalance (when `assignment()` is briefly empty) would re-open the `latest`
+  under-report and show a false all-clear — the failure direction that hurts.
+  Three RED-first tests, both guards mutation-verified in isolation.
+
+- **The SQS module doc described the wrong redelivery speed.** It claimed
+  `EventSource::abandon` "resets [the visibility timeout] to zero", which the
+  adapter deliberately stopped doing when `abandon` became a no-op — zeroing
+  visibility turns a transient failure into a tight redelivery loop against an
+  already-struggling system and burns `ApproximateReceiveCount` toward a redrive
+  policy's `maxReceiveCount` faster than the failure warrants. Only
+  `nack_for_dead_letter` zeroes it, where fast redelivery *is* the point. The
+  stale sentence hid the fact that **the visibility timeout is the retry
+  backoff**, so an operator diagnosing slow retries would have looked for a
+  bug rather than reaching for `visibility_timeout_secs`. Doc-only: the code,
+  the connector guide and `docs/telemetry.md` were all already correct, so this
+  was single-site drift rather than a misunderstanding of the design.
+- **A crash never ran the anchor commit, so `latest` could still skip a record
+  it had already accepted.** `PartitionAnchors` is in-process state, and only
+  `EventSource::recover` committed it — an *in-process* rebuild that a crash or
+  `SIGKILL` skips entirely. A replacement process therefore had neither a
+  committed offset nor the map, re-resolved `latest` against a tail the
+  in-flight record had already advanced past, and skipped it permanently. The
+  previously-documented residual conflated two different cases: records that
+  arrived *before this source existed* (skipping them **is** `latest`) with a
+  record the connector had **accepted and was retrying** (loss). Under `latest`
+  the floor is now committed **eagerly**, before the batch is dispatched, via
+  the new pure `anchors_needing_durability` and the same `committable_anchors`
+  ownership filter `recover` uses — so an eager commit is still monotonic and
+  local. It costs one synchronous commit per partition per process: a landed
+  commit marks the partition durable and it is never revisited. Committing the
+  *first-read* offset (not `offset + 1`) is what makes this safe to do eagerly —
+  it asserts only that records *below* it are not ours, which is precisely what
+  `latest` means, and leaves the record itself to be re-read. `earliest` pays
+  nothing and is byte-for-byte unchanged: its baseline is the low watermark,
+  which does not move backwards, so a restart re-reads rather than skips. A
+  failed commit warns and stays queued for the next receive rather than failing
+  the receive, which would discard drained records whose local consumer position
+  has already advanced past them — the same permanent-loss hazard
+  `defer_recv_error` exists to avoid.
+- **`WorkflowId` dedupe was reported as unbounded when it is retention-bounded.**
+  `untuned_coordinate_dedupe_bound` returned `None` for the whole mode on the
+  reasoning that it "rides neither claim table" — a non-sequitur: not riding a
+  claim table does not make a guarantee unbounded, it makes it bounded by
+  something else. The dispatcher passes `idempotency_key: None` in this mode, so
+  dedupe rests entirely on the `(workflow_name, workflow_id)` reuse-policy attach
+  against the **execution row**, exactly like `SignalsWithStart` — and retention
+  deleting that row deletes the only evidence a redelivery was already handled.
+  The startup warning that exists precisely to name the right knob was therefore
+  silent for this path. Renamed to `untuned_dedupe_bound` (it is no longer
+  coordinate-only) and restructured around the real rule: exactly one shape rides
+  the start-idempotency claim table — a coordinate-keyed `Starts` binding —
+  and everything else is execution-row-bound. The warning text was generalized
+  to name both mechanisms truthfully rather than only the `signals_with_start`
+  one.
+
+- **The eager anchor commit was bypassed on the partial-batch exit.** `receive`
+  had two ways to produce a batch — the normal loop exit and the
+  `defer_recv_error` early return that hands back what was already drained — and
+  the anchor step sat only on the first. A deferred `recv()` error therefore
+  shipped accepted records for dispatch with no durable floor, which is exactly
+  the crash-skip the eager commit exists to close. Fixed structurally rather
+  than by adding a second call site: the drain loop moved into `drain_batch`, so
+  `receive` has **one** exit that produces a batch and the bypass is impossible
+  to reintroduce.
+- **A partition no commit covered was retired as durable.** `make_anchors_durable`
+  marked every *owed* partition durable on a successful pass, but
+  `committable_anchors` filters on two conditions, and only one of them implies
+  durability. A partition filtered out because it is **no longer assigned** had
+  nothing speak for it — and `durable` is permanent process state, so if a
+  rebalance handed that partition back later the eager commit was suppressed
+  forever and a crash under an otherwise-uncommitted `latest` group re-resolved
+  at the tail. (A partition filtered out by the **raises** guard *is* covered:
+  the group is already committed at or above the floor.) So ownership, not the
+  commit list, is the right line — the new pure `covered_anchor_partitions`
+  returns it and the blocking pass hands it back, so only what it spoke for is
+  retired. The cost of not retiring an unassigned anchor is a `committed_offsets`
+  call on the next receive while it lingers: a rare failure-path cost (read,
+  commit failed, then revoked), not a steady-state one.
+- **`auto.offset.reset = "error"` was folded into the default.** librdkafka has
+  three policies, not two: `error` tells it to report an offset-reset error for
+  an uncommitted partition rather than pick a position. The `_ => Earliest`
+  fallback treated it as unrecognised, and its rustdoc justified that with
+  "librdkafka rejects a genuinely invalid value at client-create time" — true,
+  but `error` is *valid*, so it passes that validation and reaches a running
+  consumer. The lag gauge then baselined an uncommitted partition at the low
+  watermark and reported the whole retained log as consumable backlog for a
+  consumer that cannot start at all. Now its own `OffsetReset::Error` variant.
+  Baselines 1 (a commit) and 2 (an anchor) still resolve under it — the position
+  is known in both — so only the fall-through is unanswerable, and there
+  `partition_lag` returns `None` rather than choosing between a backlog the
+  consumer can never reach and a zero that reads as caught-up; `group_lag`
+  propagates it exactly as it already does for a missing watermark. The eager
+  anchor commit now keys **positively** on `Latest` instead of excluding
+  `Earliest`: `latest` is the only policy that resolves an uncommitted partition
+  *forward* past an accepted record, and keying positively stops a future fourth
+  policy from inheriting the commit by default.
+- **The exported `DeadLetterMode::BrokerNative` rustdoc still offered Kafka.**
+  The builder rustdoc and the connector guide were corrected earlier, but the
+  enum's own doc — the one a reader lands on from the API surface — still gave
+  "a Kafka DLQ topic wired by the operator" as an example of the mode, while
+  `broker_native_dead_letter_is_supported` **in the same file, immediately
+  below it** rejects that pairing and `ConnectorRuntime::new` fails it at
+  startup. It now names the two shapes that actually work (SQS *with a redrive
+  policy*, and custom adapters whose `abandon` genuinely nacks), states that
+  Kafka is excluded because abandoning is the quarantine mechanism and Kafka's
+  `abandon` is a no-op, and links the guard so a rename breaks the build. Prose
+  was the entire defect, so there is no RED phase to claim; the behaviour it
+  describes is already pinned by
+  `kafka_reports_no_native_dead_letter_so_the_pairing_is_rejected`.
+- **The changelog's own feature summary described SQS lag as visible-only.**
+  Line 171 still said the gauge reads `ApproximateNumberOfMessages`, which a
+  later entry in this same file records as a *fixed bug* — so the document
+  contradicted itself and the release-facing summary carried the pre-fix
+  semantics. It now names both attributes and why the in-flight one belongs.
+  (The two remaining visible-only mentions are past-tense descriptions of that
+  bug and are accurate as history.)
+- **A wedged dispatch could hang the whole application's shutdown forever.**
+  Cancelling `run` drops `run_once` mid-`select!`, and dropping a `JoinHandle`
+  *detaches* the task rather than aborting it — so every spawned dispatch kept
+  running and kept holding its `OwnedSemaphorePermit`. The drain that followed
+  (`self.permits.acquire_many(permits).await`) had no deadline, and
+  `stop_harvest_runtime` awaits every connector handle **before** it stops the
+  runner, so a single stuck dispatch parked the entire shutdown outside the
+  reach of the engine's own `worker_shutdown_timeout`. The drain is now bounded
+  by a new `ConnectorRuntimeConfig::shutdown_timeout` (30s, mirroring
+  `WorkerConfig::shutdown_timeout`); on elapse it warns with the in-flight count
+  and cancels a dedicated `hard_stop` token that each spawned dispatch selects
+  on, unwinding it at its next await point. Bounding it is safe **by
+  construction**: the drain is an optimisation (it spares a redelivery for work
+  that already committed), not an invariant — giving up early costs exactly that
+  redelivery, which at-least-once already permits and the idempotency key
+  already dedupes. The token is deliberately *not* the binding's own cancel
+  token, which fires at the *start* of shutdown and would abandon every
+  in-flight dispatch, turning every clean stop into needless redelivery. RED:
+  `a_wedged_dispatch_cannot_hang_shutdown_forever` (restoring the unbounded
+  drain hangs the suite outright rather than merely failing) and
+  `a_clean_drain_never_hard_stops`.
+
+- **The shutdown hard-stop gave up on a message without handing it back.**
+  Round X's `hard_stop` cut `process` short and returned `Retry` — but `settle`
+  is the only thing that releases the adapter's custody, so on a source whose
+  redelivery *is* an explicit nack (`MockSource`, SQS, any adapter needing a
+  real `abandon`) the message was stranded with nothing left to hand it back:
+  the process is shutting down, so there is no later pass. Returning `Retry`
+  did not help either — that value goes to a join loop a real shutdown has
+  already dropped along with `run_once`. New
+  `release_custody_after_hard_stop` performs the same two-step recovery the
+  panic arm does (`abandon` on a redelivering source, else mark the positional
+  head retried) plus the owed `Retried` settlement sample, **inside** the
+  spawned task. Bounded at 2s, unlike the panic arm's: this runs after the
+  drain already spent its full deadline, so an unbounded `abandon` against the
+  same wedged broker would reintroduce the hang the deadline exists to
+  prevent — one stranded message is cheaper than the process. RED:
+  `a_hard_stopped_dispatch_hands_the_message_back` (a dispatch parked in a
+  blocking sink; pre-fix `retried == 1` yet `abandoned()` is empty — the
+  summary claims redelivery the adapter never got).
+- **A short lag cadence let abandoned samples pile up.** `lag_sample_budget()`
+  was the sample *interval*, conflating two different concerns, while the Kafka
+  walk bounds itself at a fixed 10s. Configuring `lag_sample_interval` below
+  that made the runtime give up first — which stops nothing, because the walk
+  runs on `spawn_blocking` and a blocking task is never cancelled — so a new
+  walk was armed on top of the old one, several overlapping, each holding a
+  pool thread and hammering the very broker whose slowness caused the timeout.
+  The budget is now floored at the new `ADAPTER_LAG_SAMPLE_CEILING`, which
+  Kafka's bound is *defined as* rather than merely equal to, so the two cannot
+  drift; `EventSource::lag` documents it as a contract adapters must honour.
+  The floor raises and never caps, so the default and every generous cadence
+  are unchanged. Giving up earlier bought nothing anyway — the gauge is stale
+  either way and the work continues regardless. RED:
+  `a_short_cadence_never_shortens_the_budget_below_the_adapter_ceiling`. The
+  pre-existing `an_over_budget_lag_sample_is_abandoned_so_the_pass_still_polls`
+  moved to a paused clock (it had used a 30ms interval purely to keep the real
+  wait short) and was re-verified to still catch a genuinely unbounded sample.
+- **The drain gave up on stragglers without waiting for them to hand their
+  messages back.** Cancelling `hard_stop` only *wakes* a straggler; the
+  recovery that returns its message runs inside a task the shutdown has
+  already detached. `drain_in_flight` returned the instant it cancelled, so
+  `stop_harvest_runtime` could see the connector finished and the process exit
+  before any `abandon` reached the broker — trading a leaked task for a leaked
+  message, which is what the hard stop exists to prevent. It now re-acquires
+  the permits after cancelling, which joins exactly that cleanup (a straggler
+  releases its permit only once its recovery returns), bounded by the new
+  `HARD_STOP_CLEANUP_BUDGET` — defined *as* `HARD_STOP_ABANDON_BUDGET` plus
+  scheduling slack, so lengthening the per-message budget cannot silently
+  outrun the wait that joins it. RED:
+  `the_drain_waits_for_the_stragglers_it_hard_stopped` (a real dispatch
+  detached by aborting its pass, exactly as cancelling `run` does; pre-fix the
+  drain reports `hard_stop` cancelled while `abandoned()` is still empty).
+- **A broker cutover silently dropped messages.** Broker coordinates are
+  unique only within one *incarnation* of the stream they address: Kafka's
+  `{topic}:{partition}:{offset}` restarts at zero when a topic is deleted and
+  recreated, and means nothing across a cutover to another cluster. Pointing
+  an existing binding at either replayed coordinates whose claims were still
+  live, so genuinely new records were classified as replays and acked
+  **without dispatching**. Nothing can detect this — Kafka exposes no topic
+  incarnation to a consumer and a bootstrap list is not a cluster identity —
+  so it is now declarable: `SourceBinding::key_incarnation` rotates the dedupe
+  namespace, and `message_idempotency_key_in` appends it. Renaming the binding
+  already rotated the namespace, but the name is also the `source` metric
+  label, so that remedy cost every dashboard built on it; this separates the
+  two. The component is appended and *only* when set, so an unrotated binding
+  derives byte-identical keys — the key is persisted, and changing the
+  derivation would invalidate every live claim on upgrade. RED:
+  `a_rotated_incarnation_separates_a_recreated_topic_from_the_old_one`,
+  `an_unset_incarnation_leaves_the_key_byte_identical` (pinned against a
+  literal), and `the_binding_incarnation_reaches_the_derived_key` end-to-end
+  through a pass, because a rotation knob nothing threads is worse than none.
+  The cutover procedure is documented in the connector guide.
+- **A wedged rebuild hung shutdown forever, outside the bounded drain.** A
+  stall is recovered by rebuilding the consumer, and that rebuild is a network
+  operation against the same broker whose outage usually caused the stall. It
+  was awaited bare from the *body* of a `select!` arm that had already
+  resolved, so cancellation was no longer racing it: `run` parked in the
+  rebuild **before** reaching the bounded drain, and `stop_harvest_runtime`
+  awaits the connector handle with no deadline of its own. The recovery now
+  races cancellation. RED: `a_wedged_rebuild_cannot_hang_shutdown` (a source
+  whose `recover` is `pending()`) timed out at 10s and now returns in 0.3s.
+- **Connector shutdown serialized every drain.** Cancelling and awaiting one
+  connector at a time left connector *N* running — and consuming, and so
+  accruing more of its own work to drain — for the whole of connectors
+  *1..N*'s bounded drains, summing the per-connector deadlines into an
+  N-times-longer shutdown and making the late connectors' messages the ones
+  most likely to be hard-stopped. `stop_connectors` now cancels all before
+  awaiting any. RED: `every_connector_is_cancelled_before_any_drain_is_awaited`
+  makes the first drain genuinely depend on the second's cancellation, so the
+  old shape deadlocks rather than merely running slowly.
+- **Concurrent acks could rewind a Kafka commit.** The offsets guard was
+  dropped at the end of the `let ... else` that computed the mark, so two
+  settlements finishing together computed marks 5 then 6 under the lock and
+  submitted them in scheduling order — submitting 5 after 6 moves the
+  committed offset backward and re-reads a durably settled message on the next
+  crash. The guard is now held across the submission. Only a positional broker
+  reaches that branch (an SQS handle carries no partition) and Kafka's commit
+  is a local enqueue, so the serialization costs the ordering it buys and
+  nothing more. RED: `concurrent_acks_never_submit_a_commit_out_of_order`.
+- **A harvest-sink poison counted twice when its ack failed.** `ack` is
+  deliberately best-effort so a broker hiccup cannot lose a message, which
+  means the broker redelivers something harvest has already quarantined — and
+  that redelivery contributed a second `harvest.connector.poisoned` sample for
+  one physical message, the same inflation the broker-native redrive path
+  already deduped. Now deduped symmetrically via the new
+  `PoisonTracker::mark_sink_terminal_as_of`, which shares the first-handoff
+  contract but deliberately does **not** retain the strikes: re-nacking on
+  sight is load-bearing for the broker-native handoff and meaningless here, so
+  the countdown restarts exactly as the pre-dedupe `clear` made it. RED:
+  `a_harvest_sink_poison_is_counted_once_when_its_ack_fails`, plus
+  `a_sink_quarantine_dedupes_the_sample_but_restarts_the_countdown` pinning
+  both halves of the new method's contract.
+- **A hard-stopped runtime could be run again.** `hard_stop` is terminal and is
+  never reset — it is an `Arc` shared with every dispatch already handed out,
+  so clearing it would un-cancel stragglers still unwinding. Running on top of
+  a fired one consumed messages and handed every one straight back at its
+  first await point: a hot receive-and-abandon loop presenting as a healthy
+  consumer while making no progress, and spending a billed API's request
+  budget doing it. `run` now refuses, and `ConnectorRuntime` documents itself
+  as single-use. RED: `a_hard_stopped_runtime_refuses_to_run_again` spun for
+  the full 5s bound and now returns having consumed nothing.
+- **A long visibility timeout silently disabled strike-based quarantine.**
+  Expiry swept active strikes and terminal entries on the same
+  `poison_retention` clock, but the two are waiting for different things: a
+  terminal entry waits out a window the *operator* chose, while an active
+  streak is only ever advanced by a **redelivery**, whose interval belongs to
+  the broker. SQS may hide a nacked message for up to 12 hours and the default
+  retention is one, so every strike expired before its message came back —
+  every delivery was strike 1, nothing ever reached `poison_threshold`, and the
+  harvest dead-letter sink never fired. Silently: the tracker looked healthy and
+  each delivery looked freshly rejected. Active entries now hold for at least
+  `ACTIVE_STRIKE_RETENTION_FLOOR` (SQS's *maximum* visibility timeout, so no
+  legal configuration can redeliver later), as a floor and never a cap — a
+  longer configured retention still wins, for both kinds. Time was never the
+  hard bound (`MAX_POISON_ENTRIES` is, and its eviction stays kind-blind), so
+  this changes *which* mechanism retires a stale active entry under load, and
+  that one already reports itself via `strike_progress_discarded`. The cost is
+  pinned rather than left to be discovered: the queue is FIFO and breaks at its
+  front, so a not-yet-due active entry holds back the due terminal entries
+  behind it. RED:
+  `an_active_strike_survives_a_sweep_shorter_than_the_broker_retry_delay`, plus
+  `a_young_active_strike_holds_back_the_terminal_entries_behind_it` and
+  `a_longer_configured_retention_still_wins_for_active_strikes`.
+- **`harvest.connector.poisoned` gained a sample per restart-redelivery.** The
+  dedupe above is in-process, and a restart is exactly when the redelivery
+  happens — the process died between writing the dead-letter record and acking
+  the broker. The durable table already knew (`ON CONFLICT (idempotency_key) DO
+  NOTHING`), but `insert_dead_letter` discarded the affected-row count, so the
+  one authoritative answer to "is this a new poison message" was thrown away.
+  `DeadLetterSink::write` now returns `DeadLetterOutcome::{Recorded,
+  AlreadyRecorded}` and the runtime counts only when *both* the local mark and
+  the sink's verdict say new. A sink whose store cannot tell returns
+  `Recorded`, which is the status quo. `RecordingDeadLetterSink` became
+  idempotent by key to match the Postgres one — it stands in for it across the
+  whole no-database poison suite, so diverging there would let a double-record
+  bug pass every test that does not need Docker. The trait ships for the first
+  time in this PR, so the signature change breaks no implementor. RED:
+  `a_poison_already_in_the_dead_letter_table_is_not_recounted_after_a_restart`
+  (two runtimes, one sink — a restart), plus
+  `recording_sink_is_idempotent_by_key_and_says_so` and, against a real
+  Postgres, `a_second_dead_letter_for_one_key_is_reported_as_already_recorded`.
+
+- **Cross a partition-reassignment gap instead of walking it.** `OffsetTracker`'s
+  contiguous-prefix advance stepped one offset at a time over every hole below
+  the ceiling. `forget(partition)` has no production caller — only `forget_all()`
+  on a stall rebuild — so a Kafka partition that is revoked, advanced by another
+  replica, and handed back leaves a stale `committed` mark, and the numeric gap
+  between it and the resumed offsets satisfies the hole predicate for its whole
+  length. That walk runs under the offsets mutex, which `ack` now holds across
+  commit submission, so a reassignment across a busy partition could stall the
+  connector for the length of the gap. The advance now jumps straight to the
+  next *tracked* offset. This is semantics-preserving, not an approximation:
+  every offset in between satisfies the same hole predicate, so `committed`
+  lands exactly where the walk would have, and one jump suffices because the
+  loop can never advance past the first blocker. A blind "large forward jump →
+  reset" would instead be wrong — it would discard in-flight lower offsets and
+  commit past dispatched-but-not-durable messages, the exact loss the
+  contiguous prefix prevents. RED:
+  `a_reassignment_gap_is_crossed_without_walking_it` (a 1e9 gap, bounded at 5s).
+
+- **Give the active-strike retention floor slack beyond the visibility maximum.**
+  The floor that keeps a live poison strike alive across a broker's redelivery
+  delay was the maximum SQS visibility timeout exactly. `run_once` sweeps
+  strikes *before* it polls, so a floor equal to the broker's maximum
+  invisibility retires the strike in the very pass that then receives the
+  redelivery — the quarantine silently disables itself for exactly the slowest
+  redeliveries it exists for. Real redelivery is timeout + poll interval +
+  scheduling delay, and the two error directions are not symmetric: expiring
+  late costs bounded memory (`MAX_POISON_ENTRIES` still evicts), expiring early
+  costs the feature. The floor is now `2 × MAX_BROKER_INVISIBILITY`, derived
+  from a named constant so the two cannot drift. RED:
+  `an_active_strike_survives_the_maximum_visibility_timeout_with_slack`.
+
+- **Never pair one message's handle with another message's committed offset.**
+  A positional ack committed a contiguous-prefix high-water mark by cloning the
+  settling message's `MessageHandle` and overwriting its `position`. The mark's
+  message may already have settled and been released, so the token belonged to
+  a *different* message than the position — and `MessageHandle` documents the
+  token as opaque and handed straight back, which is exactly what a side-table
+  adapter keys on. A positional commit is a high-water *mark*, not a message
+  ack, so there is no honest handle to pass; passing the real token in the
+  in-order case and a mismatched one otherwise would be worse than either,
+  since an adapter cannot distinguish the cases. `EventSource` gains a
+  defaulted `commit_position(partition, position)` whose default delegates to
+  `ack` with an empty token — idiomatic for a trait that already defaults
+  `nack_for_dead_letter`/`recover`/`abandon_redelivers`, zero-churn for all ten
+  impls, and correct for Kafka, whose `ack` reads only the coordinates. RED:
+  `a_positional_commit_never_pairs_one_messages_token_with_anothers_position`
+  and `an_adapter_overriding_commit_position_receives_bare_coordinates`.
+
+- **Retry an owed Kafka anchor on every pass, not only when records arrive.**
+  `anchors_needing_durability` deliberately keeps a partition owed when its
+  synchronous anchor commit fails, so "the next receive retries" — and that
+  retry is the only thing bounding the crash window under an otherwise
+  uncommitted `latest` group. But the attempt was gated on `!batch.is_empty()`,
+  so a topic that went quiet right after the failure never drained again, the
+  owed anchor was never retried, and a window documented as one poll interval
+  stayed open for as long as the topic was idle. The guard is now the named
+  `retry_owed_anchors`, which is unconditionally true; nothing owed is a no-op,
+  so the quiet steady state costs one walk of the anchor map and no broker call.
+  Withholding the batch outright — the other reading of this hazard — is
+  rejected and now documented at the call site: discarding drained records
+  whose local consumer position has already advanced is the permanent-loss
+  hazard `defer_recv_error` exists to prevent, and it would fire on *every*
+  commit failure rather than only on a crash. The only correct form would
+  `seek()` back to each owed floor first, a blocking librdkafka call on a broker
+  already unhealthy enough to have failed a commit, whose own failure mode is
+  the loss it set out to prevent. RED:
+  `an_idle_pass_still_retries_an_anchor_commit_it_owes`.
+
+- **A settled Kafka commit could rewind a partition this replica had lost.**
+  `committable_anchors` filters the *anchor* commit down to partitions this
+  consumer still owns, precisely because a commit speaks for the whole group —
+  but `commit_settled_offset`, the path `ack`/`commit_position` take on every
+  settlement, committed unconditionally. A dispatch routinely outlives the
+  rebalance that revoked its partition: it settles afterwards and commits an
+  offset the new owner has long since advanced past, rewinding the group so
+  those records replay well after their idempotency claims expired — landing as
+  duplicate executions rather than deduplicated retries. Kafka does not stop
+  this: the classic rebalance protocol validates a committing member's
+  *generation*, not its assignment, so a live member may commit for a partition
+  it does not own. Guarded now by the named `may_commit_settled` — the
+  **assigned** half of `committable_anchors`, on the path that runs far more
+  often — reading the local (not round-tripped) assignment. A suppressed commit
+  returns `Ok` with a warning rather than an error, because the settlement was
+  real and only the group-wide statement is declined; the records are re-read by
+  whoever owns the partition now and dedupe on their key. Two things fell out of
+  writing it: the commit now uses the *same* consumer snapshot the assignment
+  was read from (a rebuild in between would have committed against a consumer
+  whose assignment was never checked — the guard bypassed), and the **raises**
+  half is documented as a deliberate residual, since it needs a
+  `committed_offsets` round-trip the anchor path can afford per pass and this
+  one cannot per settlement. The cheap alternative, generation fencing, has
+  nowhere to live: it needs the generation the message was *read* at carried
+  through to its commit, and a positional commit deliberately arrives without
+  the reading message's handle, because the mark it commits belongs to no single
+  message. So the residual narrows from "outlived one rebalance" to "outlived
+  two". RED: `a_settled_commit_is_suppressed_for_a_partition_this_replica_lost`
+  (the mutation *is* the RED — the predicate written as the previous
+  unconditional `true` fails exactly this test).
+
+- **Documented why the panic arm's recovery needs neither a bound nor a
+  permit.** `release_custody_after_hard_stop` advertises itself as "bounded,
+  unlike the panic arm's" without saying why the unbounded one is safe, which
+  invites the reasonable objection that it is not: the join loop holds no
+  permit, so `drain_in_flight` does not wait for it and an ordinary shutdown
+  drops it mid-await along with `run_once`. That would strand a message if the
+  call did broker I/O — and for both shipped adapters it does none. Kafka
+  overrides `abandon_redelivers()` to `false` and takes the mark-the-head
+  branch, a local mutex write; SQS's `abandon` is a deliberate no-op returning
+  `Ok(())` without touching the network, because its visibility timeout is what
+  redelivers. The residual is a *custom* adapter whose `abandon` both blocks on
+  the network and is its only redelivery mechanism, costing one message held
+  until that adapter's lease expires — the same cost the hard-stop path already
+  accepts, minus the warning. The complete fix and why the obvious one does not
+  work are both recorded: catch the dispatch panic *inside* the spawned task so
+  the recovery runs while its permit is still held (the reason the hard-stop arm
+  is inline rather than in the join loop), because re-acquiring a permit in the
+  join loop cannot help — a cancelled `run` drops `run_once` and its permit
+  before the drain starts.
+- **A post-sink strike was swept on the operator's clock, not the broker's.**
+  `mark_sink_terminal_as_of` restarts the countdown but leaves the terminal
+  mark set, so a message redelivered after a failed ack accumulated a **new**
+  streak on an entry the retention sweep still read as terminal — and retired
+  it on `poison_retention` rather than `ACTIVE_STRIKE_RETENTION_FLOOR`. With a
+  redelivery interval above that retention and a `poison_threshold > 1`, every
+  sweep discarded the progress before the next delivery, so each rejection was
+  strike one forever and the message never reached the sink path again. Root
+  cause was that `terminal_at` answered two questions that had diverged: *have
+  we already counted this as poisoned* (dedupe) and *is a redelivery what
+  advances this entry* (retention class). They are now separate: a
+  `sink_terminal` flag records which handoff set the mark, and the new
+  `StrikeState::is_active` classifies an entry as active when it is unmarked
+  **or** carries a re-struck sink mark. Deliberately **not** "any retained
+  count": a broker-native entry keeps its strikes at or above the threshold so
+  each redrive lap re-nacks on sight rather than accumulating, and those
+  entries are expired on the operator's window on purpose so a stream of
+  distinct poison messages cannot pin the map — widening that was tried and
+  broke three tests pinning exactly it. The dedupe mark itself is untouched,
+  which matters: an earlier attempt cleared it from `strike()` and regressed
+  the sink dedupe. RED: `a_post_sink_strike_is_retained_as_active_not_terminal`
+  (swept to 0 pre-fix), plus `a_broker_native_relap_strike_keeps_its_dedupe_mark`
+  guarding the half that must not change.
+- **`MockSource` never released positionally-committed messages.** Custody is
+  keyed by handle token, but the default `EventSource::commit_position` passes
+  a **token-less** handle by design — a positional commit is a high-water mark
+  over a prefix, not one message's ack — so `ack` looked up `""`, matched
+  nothing, and every `push_kafka` message stayed cloned in `in_flight` for the
+  life of the source, growing a long-running harness in proportion to all
+  messages ever processed. `MockSource` now overrides `commit_position` to
+  release the whole committed prefix (every retained copy for that partition at
+  or below the mark) while still recording the same bare positional handle in
+  `acked`, so tests observing acknowledgements are unaffected. RED:
+  `a_positional_commit_releases_the_prefix_from_custody` — three in flight, two
+  commits, and pre-fix nothing is released. The existing
+  `settling_releases_the_in_flight_copy` covered only the opaque (SQS) shape,
+  which is why the positional leak went unpinned.
+
+* **The AC6 poison test asserted a single-pass receive under a capped
+  prefetch.** The first CI run ever to reach the Test matrix on this branch
+  failed `one_poison_message_does_not_block_a_hundred_valid_ones` with
+  `received: 16` against an expected `101` — 16 being exactly the binding's
+  `max_in_flight`. The production code is right and the test was stale: a
+  *later* fix in this same PR ("cap prefetch at capacity") made `run_once`
+  receive at most `effective_max_batch(max_batch, max_in_flight)`, because
+  capping the prefetch at in-flight capacity **is** the AC5 backpressure
+  guarantee. The test predated that change, kept its one-pass assumption, and
+  nothing caught the contradiction because this suite needs Docker and had
+  never executed — not locally, and not in CI, since every push cancelled the
+  prior run before the matrix registered. Asserting a 101-message single pass
+  was asserting the cap is absent. Fixed by draining across passes, the same
+  loop the soak already uses, which also makes the test *stronger*: the poison
+  sits at offset 0, so it is in the first batch and every later batch has to
+  get past it — precisely the head-of-line blocking AC6 forbids — and only a
+  multi-pass drain exercises that. Bounded at 64 passes so a genuine block
+  fails on the counts rather than hanging CI, and `retried == 0` added so a
+  quarantined poison can never be silently recycled as a retry. RED reproduced
+  locally against a real Postgres 16, byte-identical to CI (`left: 16, right:
+  101`), then green — with the full 11-test suite, soak included, passing.
+
+- **Enforced the reserved connector key namespace** (Codex P1, `idempotency.rs:58`). The derived-key prefix was documented as making the connector's dedupe namespace "provably disjoint" from caller-supplied keys, but nothing enforced it — `validate_start_idempotency_key` only trimmed, rejected empty, and length-capped. Derived keys share a durable uniqueness scope with caller-supplied ones (`(workflow_name, idempotency_key)` on `harvest_start_idempotency` for a `Starts` binding, `(workflow_exec_id, idempotency_key)` on `harvest_signals` for a `SignalsWithStart` one) and are **predictable** — Kafka coordinates are `{topic}:{partition}:{offset}`, so anyone who knows a topic name can enumerate them. A caller who landed the derived key first claimed that row, and the broker's own delivery then read as an idempotent replay and was acknowledged **without ever dispatching its payload**: silent loss, precisely the failure the derived key exists to prevent. Closed by making the reservation real. Core gains `start_idempotency::RESERVED_KEY_PREFIX` (`"conn:"`, now carrying its own separator), the pure predicate `is_reserved_key`, and the single rejection message `reserved_key_message()`; `validate_start_idempotency_key` refuses a reserved key, which covers the plain start route (header and body share it) and the in-process transactional-start client. The plugin gains `reject_reserved_idempotency_key`, wired into signal-with-start and the standalone signal route ahead of the first thing that consumes the key. **The connector delegates through those same public handlers, so the guard would have refused its own dispatch** — caught immediately by the connector integration suite going 11-green-to-7-red on the first run. Resolved with an engine-only exemption rather than a carve-out in the guard: `StartWorkflowRequest`/`SignalWithStartRequest` gain `engine_derived_idempotency_key`, `#[serde(default, skip)]` so it is *never part of the public JSON body*, set only by `from_broker` (the same mechanism `start_source_override` already uses in these structs, and `WorkflowResetRequest::allow_terminal_source` uses for the reset endpoint). The `Idempotency-Key` **header** path is always strict — a connector strips the inbound header before delegating, so a header can never carry an engine-derived key. Pinned by `the_engine_exemption_cannot_be_claimed_from_the_request_body`, which deserializes a body that explicitly sets the flag `true` alongside a derived key and asserts it still lands `false` and the key is still refused. The connector's `CONNECTOR_KEY_PREFIX` now *aliases* the core constant, so the deriving and the refusing side cannot drift, and the derived key's bytes are unchanged (pinned against a literal — the key is persisted, so a format change would invalidate every live claim on upgrade). **Sized to where a connector key can actually land**: deliberately *not* applied to update-with-start or batch operations, whose keys live in uniqueness scopes no connector key reaches, so refusing there would reject a caller's key for no protective gain — a connector target that ever dispatches into one of those scopes must extend the guard, which the rustdoc says. Case-**sensitive** on purpose, matching the Postgres text comparison backing both scopes: `CONN:` cannot alias a derived key, so rejecting it would be over-broad. No new `WorkflowEvent` variant, no migration. Tests, TDD red→green (core RED confirmed as the validator accepting a derived key; the HTTP test mutation-verified by removing the signal-route guard): core `a_reserved_prefix_key_is_refused` and the over-rejection guard `a_near_miss_of_the_reserved_prefix_is_still_accepted`; the connector-side behavioural invariant `every_derived_key_is_refused_from_a_caller` (asserts every derived key — including the hashed-component and rotated-incarnation forms — is refused by the caller validator, so it holds however either constant is spelled) plus `the_prefix_carries_its_own_separator_and_the_key_is_unchanged`; three plugin unit tests in `reserved_idempotency_key_tests`; and two end-to-end HTTP tests in `security.rs` driven through the real router with no storage configured (which is what proves the guard runs at the request boundary, not behind a database read), asserting the *body* names the reservation so they cannot pass for an unrelated `400`.
+
+- **Renumbered the connector migration off a version core now claims** (Codex P1,
+  `20260719000000_harvest_connector_dead_letters/up.sql:1`). Merging `trunk-dev`
+  into this branch brought in core's
+  `autumn-harvest/migrations/20260719000000_harvest_workflow_logs` (issue #790),
+  which took the **same version** as this PR's plugin-owned connector migration.
+  That is fatal rather than cosmetic: `ensure_runtime_migrations` applies
+  `HARVEST_MIGRATIONS` (core) and then `PLUGIN_HARVEST_MIGRATIONS` against the
+  **same** `harvest_database_url`, both through Diesel's standard runner, and
+  Diesel keys `__diesel_schema_migrations` on the **version alone**. Core runs
+  first, records `20260719000000`, and the connector migration is then skipped
+  as already-applied — so `harvest_connector_dead_letters` is never created,
+  every default Harvest-sink poison write fails, and the message never leaves
+  the retry/stall cycle. Renamed to `20260719900000`. The `900000` time
+  component is deliberate and documented in the migration header: core allocates
+  `<date>000000`/`000001`/`000002`, so a `9xxxxx` slot is unreachable by its
+  convention — this migration had already been renumbered once for the same
+  reason, and picking the next sequential date would just queue up a third
+  collision. The three `include_str!` paths in the connector, SQS, and Kafka
+  broker suites were updated with it. **The guard for this already existed and
+  was already correct** — `plugin_and_core_migrations_never_share_a_version` in
+  `migration_hygiene.rs` names both the problem and the remedy — it simply never
+  ran, because `Lint` failed on `fmt` and the `Test` matrix `needs: [lint]`. It
+  was used as the RED phase here (it failed naming the exact directory) and is
+  green after the rename.
+
+- **Repaired the trunk merge.** Two defects, neither of which CI could report
+  because `Lint` died on its first step and skipped everything downstream.
+  `cargo fmt --check` failed on a trailing-whitespace blank line at
+  `plugin.rs:335`, exactly where this branch's `start_idempotency_window` block
+  abuts trunk's newly merged `workflow_logs` block. And the merge was a **clean
+  textual merge that does not compile**: trunk's new
+  `cross_type_continue_as_new_tests.rs` (issue #803) constructs
+  `SignalWithStartParams` without `start_source_ref_override`, the field this
+  branch adds, so `cargo clippy -p autumn-harvest --all-features --tests` failed
+  with `E0063`. Fixed with `None`, matching the convention this branch already
+  swept across four sibling test literals. MSRV and Quickstart passed on the
+  merge commit precisely because neither compiles test targets — the
+  documented "trunk adds a required field, a branch test literal breaks" class.
+
+- **Scoped the `BrokerCoordinates` dedupe promise to a single shard, honestly**
+  (Codex P1, `dispatch.rs:71`). The rustdoc promised dedupe *"independent of
+  whatever `workflow_id` the mapping function chose"* — unqualified. That is
+  true on a single-shard deployment (the default) and false on a multi-shard
+  one, by a mechanical chain: dispatch always passes an **explicit**
+  `workflow_id`; issue #808 routes a keyed start by the idempotency key **only
+  when `workflow_id` was omitted**, so an explicit id picks the shard; and
+  `harvest_start_idempotency` claims are per-shard. A redelivery whose mapper
+  produces a *different* id therefore routes elsewhere, misses the claim, and
+  double-starts — exactly the case `BrokerCoordinates` exists to prevent. The
+  integration test asserting the promise
+  (`broker_coordinate_dedupe_survives_a_mapper_whose_workflow_id_drifts`) is
+  single-shard, which is why it passes. Fixed by narrowing the documented scope
+  rather than the mechanism: the rustdoc and a new
+  ["The dedupe guarantee is shard-local"](../getting-started/13-broker-connectors.md)
+  docs section state the exact boundary and the (cheap, already-recommended)
+  remedy — a deterministic mapper id — and `ConnectorRuntime::run` now logs a
+  warning at startup naming the binding and the shard count when it detects the
+  combination, so an operator cannot reach it silently. Pinned by
+  `known_limitation_coordinate_dedupe_scope_is_shard_local` over the new pure
+  `coordinate_dedupe_is_shard_local_only`, which also pins that `WorkflowId`
+  mode is *not* warned about (it never made the stronger promise, so a warning
+  there would be pure noise). This is the same shard-local scope every sibling
+  dedupe primitive carries (#808, #521, #247, #607, #691) — cross-shard
+  coordination is out of scope engine-wide, and the connector deliberately does
+  not attempt it: probing every shard would put a fan-out on the dispatch hot
+  path, and unilaterally pinning the start to a key-derived shard would trip
+  the #697 "be consistent — always pin or never pin" duplicate-`workflow_id`
+  hazard against every other producer of the same id. **A warning, not a
+  refusal**: a deterministic mapper is both the common case and perfectly safe,
+  so failing closed would break working deployments to guard against a mapper
+  bug.
+
+- **The settled-commit ownership check is a snapshot, and that residual is now
+  stated where it lives** (Codex P2, `kafka.rs:753` — a follow-on to the
+  `may_commit_settled` guard above, correctly observing that the guard *narrows*
+  the window rather than closing it). A rebalance can revoke the partition
+  after the assignment is read and before librdkafka's background thread builds
+  the `OffsetCommit`, and that request carries whatever generation is current
+  when it is built — the classic protocol validates a committing member's
+  generation, not its assignment — so a stale offset can be accepted under the
+  new generation and rewind the group. Left as a documented residual rather
+  than fenced: `Consumer::commit` takes `(&TopicPartitionList, CommitMode)` and
+  **no generation** (verified against rdkafka 0.38's source), so generation
+  fencing has no API to reach for; a lock against `ConsumerContext`
+  `pre_rebalance` would serialise the *enqueue* but not the transmission, which
+  happens on librdkafka's thread, so closing it properly means
+  `CommitMode::Sync` — a broker round-trip per settlement on the dispatch hot
+  path. The blast radius is also materially smaller than the case the guard
+  replaced: the records a rewind replays are ones this replica settled *moments
+  earlier*, so their idempotency claims are seconds old and dedupe cleanly,
+  and the rewind is only durable if the stale commit lands after the new
+  owner's **final** commit — otherwise its next commit re-advances past it. The
+  one controllable part is fixed: the commit payload is now built **before**
+  the ownership check, so the only fallible/allocating FFI work no longer sits
+  inside the window. No test accompanies the reordering — it is a pure
+  statement-order change with no observable behaviour a broker-free test can
+  assert, and the Kafka broker suite is Docker-gated; `may_commit_settled`'s
+  own predicate stays covered by
+  `a_settled_commit_is_suppressed_for_a_partition_this_replica_lost`.
+
+### Success metric
+
+> an embedder wires a Kafka topic to a workflow in ≤ 30 lines of
+> configuration/mapping code, and a soak test delivering 10,000 messages with
+> 5% forced redeliveries and 10 poison messages yields exactly 10,000 − 10
+> dispatched outcomes, 0 duplicate executions, and 10 dead-lettered messages.
+
+Both halves are **falsifiable in CI**. The wiring budget is measured, not
+claimed: `tests/connector_example_budget.rs` reads the shipped
+`examples/kafka_connector_quickstart.rs` and counts the code between its
+`connector` markers (**17 lines**; the SQS example is 24), failing if the API ever grows enough
+boilerplate to exceed 30 — with a companion test asserting the marked block
+still contains a real binding, mapping function and source, so the budget
+cannot be met by an example that stopped demonstrating the thing. The soak is
+`connector_integration.rs::soak_ten_thousand_messages_with_redeliveries_and_poison`,
+run against a real Postgres: **10,500 deliveries settled in 21.6 s**, exactly
+9,990 executions, zero duplicates, 10 dead letters.
+
+### Tests
+
+* **88 unit tests** across the connector modules — the pure `disposition.rs`
+  decision core (ack ordering, throttle composition, poison isolation, the
+  contiguous-prefix `OffsetTracker` including the redelivery and
+  in-flight-gap cases), `idempotency.rs` (injectivity, separator-collision and
+  pathological-length cases), `binding.rs`, `runtime.rs`, `mock.rs`, `kafka.rs`,
+  `sqs.rs`.
+* **`connector_integration.rs`** — 7 AC-mapped tests plus the soak, driven
+  through the real `ConnectorRuntime` against a real Postgres so the ack
+  ordering, poison accounting and backpressure under test are production code
+  paths: redelivery dedupe (start and signal), crash-between-commit-and-ack,
+  rejected-dispatch-never-acked, throttle-deferral acked, poison isolation
+  (1 poison + 100 valid → all 100 dispatch), broker provenance.
+* **`connector_kafka_broker.rs` / `connector_sqs_broker.rs` (AC11)** — the
+  adapters against **real broker containers** (testcontainers Kafka;
+  ElasticMQ for SQS, which speaks the SQS query API and starts far faster than
+  LocalStack for a queue-only test). These prove the wire behaviour the
+  `MockSource` suite cannot: that an offset commit really commits (a fresh
+  consumer in the same group re-reads nothing — a no-op `ack` would re-read
+  everything), that an SQS ack really is a `DeleteMessage`, and that an
+  abandoned poison message is redelivered, quarantined, and never blocks its
+  valid sibling.
+* **`connector_dependency_graph.rs`** — the AC1 invariant guard described above.
+
+### CI
+
+Manifest rows for `connector_integration` (linux, `connectors`),
+`connector_sqs_broker` (linux, `sqs`), and the two feature-free guards (allos);
+clippy legs for `connectors` / `sqs` / `kafka`; and Linux-only steps for the
+Kafka broker suite and example (they need a `libcurl4-openssl-dev` install for
+vendored librdkafka's cmake build, and the manifest's compile mode would try to
+build it on macOS/Windows too — hence the single, reasoned `ALLOWLIST` entry
+pointing at those steps).
+
+### Docs
+
+`docs/getting-started/13-broker-connectors.md` — full Kafka and SQS examples,
+the ack-ordering contract, the idempotency table, the failure-mode table
+(redelivery, rebalance, poison, throttle-deferral, transient failure,
+dead-letter-write failure), the ordering caveat, the metric table, and how to
+test the whole thing with `MockSource` and no Docker. Runnable examples:
+`examples/kafka_connector_quickstart.rs` and
+`examples/sqs_connector_quickstart.rs`.
+
+### Out of scope (per the issue)
+
+NATS / RabbitMQ / Pub-Sub / Kinesis connectors; outbound event publishing;
+Kafka exactly-once / transactional semantics; ordering guarantees beyond the
+entity pattern; schema-registry (Avro / Protobuf) decoding — the mapping
+function receives raw bytes; and any change to core storage.

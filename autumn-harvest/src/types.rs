@@ -1002,6 +1002,10 @@ pub enum StartSource {
     CompletionTrigger,
     /// Started by an inbound webhook delivery.
     Webhook,
+    /// Started by a broker event-source connector consuming a message from a
+    /// topic/queue (issue #944) — Kafka, SQS, or any adapter built on the
+    /// same broker-agnostic binding layer.
+    Broker,
     /// Spawned as a child workflow (awaited or detached).
     Child,
     /// Started via the batch-start API.
@@ -1042,6 +1046,7 @@ impl StartSource {
             Self::UpdateWithStart => "update_with_start",
             Self::CompletionTrigger => "completion_trigger",
             Self::Webhook => "webhook",
+            Self::Broker => "broker",
             Self::Child => "child",
             Self::Batch => "batch",
             Self::ContinueAsNew => "continue_as_new",
@@ -1068,6 +1073,7 @@ impl StartSource {
             "update_with_start" => Self::UpdateWithStart,
             "completion_trigger" => Self::CompletionTrigger,
             "webhook" => Self::Webhook,
+            "broker" => Self::Broker,
             "child" => Self::Child,
             "batch" => Self::Batch,
             "continue_as_new" => Self::ContinueAsNew,

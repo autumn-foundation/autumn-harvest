@@ -4028,6 +4028,18 @@ pub struct SignalWithStartParams<'a> {
     /// `SignalsWithStart` delegation sets `Some(StartSource::Webhook)` so the
     /// fresh run records `webhook` provenance.
     pub start_source_override: Option<StartSource>,
+    /// Workflow-start provenance *reference* override for a fresh start
+    /// (issue #740).
+    ///
+    /// `None` keeps the default — the idempotency key, else the
+    /// `workflow_id`. A broker connector's `SignalsWithStart` binding sets the
+    /// rendered message coordinates here so a broker-triggered run records the
+    /// **same** `start_source_ref` shape whichever binding kind produced it
+    /// (issue #944): without it the signal-with-start path would record the
+    /// connector's *derived, bounded* idempotency key instead of the
+    /// coordinates, and the documented provenance query would return a
+    /// different string for the two binding kinds.
+    pub start_source_ref_override: Option<String>,
 }
 
 /// Result of a [`signal_with_start_workflow_execution`] call.
@@ -4319,8 +4331,9 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                         .start_source_override
                         .unwrap_or(crate::types::StartSource::SignalWithStart),
                     start_source_ref: request
-                        .idempotency_key
+                        .start_source_ref_override
                         .as_deref()
+                        .or(request.idempotency_key.as_deref())
                         .or(Some(request.workflow_id)),
                     started_by: None,
                 };

@@ -41,6 +41,8 @@
 allos        autumn-harvest         integration                      testing                    -
 allos        autumn-harvest         integration                      testing,metrics-rs         metrics_rs_adapter
 allos        autumn-harvest         property                         db                         -
+allos        autumn-harvest-plugin  connector_dependency_graph       -                          -
+allos        autumn-harvest-plugin  connector_example_budget         -                          -
 allos        autumn-harvest-plugin  contract_regression              -                          -
 allos        autumn-harvest-plugin  effective_config_http_tests      -                          -
 allos        autumn-harvest-plugin  gate_no_global_install           -                          -
@@ -102,6 +104,8 @@ linux        autumn-harvest-plugin  by_id_integration                -          
 linux        autumn-harvest-plugin  canary_integration               -                          -
 linux        autumn-harvest-plugin  completion_triggers_integration  -                          -
 linux        autumn-harvest-plugin  conflict_policy_integration      -                          -
+linux        autumn-harvest-plugin  connector_integration            connectors                 -
+linux        autumn-harvest-plugin  connector_sqs_broker             sqs                        -
 linux        autumn-harvest-plugin  dag_run_graph_integration        -                          -
 linux        autumn-harvest-plugin  dlq_aggregate_integration        -                          -
 linux        autumn-harvest-plugin  dlq_bulk_integration             -                          -

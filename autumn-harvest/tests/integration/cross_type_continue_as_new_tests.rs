@@ -239,6 +239,7 @@ async fn signal_with_start(
         max_workflow_attempts_ceiling: None,
         workflow_info: None,
         start_source_override: None,
+        start_source_ref_override: None,
     };
     signal_with_start_workflow_execution(conn, params)
         .await

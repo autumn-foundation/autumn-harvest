@@ -5003,6 +5003,216 @@
         }
       ],
       "description": "Alert: harvest_queue_paused_too_long (docs/runbooks/harvest-alerts.md#harvest_queue_paused_too_long) 1 while an operator hold is in effect on a queue, 0 otherwise (issue #619). max by (queue) avoids double-counting when several worker replicas sample the same fleet-wide pause. Pair with the queue-depth and oldest-pending-age panels: a rising backlog WITH this at 1 is a deliberate hold, not a capacity incident \u2014 the single most common false page during an outage freeze."
+    },
+    {
+      "id": 924,
+      "type": "row",
+      "title": "Broker connectors",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 106
+      },
+      "panels": [
+        {
+          "id": 920,
+          "type": "timeseries",
+          "title": "Connector messages received",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 107
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (source) (rate(harvest_connector_received_total[$__rate_interval]))",
+              "legendFormat": "{{source}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Messages pulled from each broker binding (issue #944). A flat line while lag climbs means the consumer is stuck, not idle."
+        },
+        {
+          "id": 921,
+          "type": "timeseries",
+          "title": "Connector dispatch outcomes",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 107
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (source, outcome) (rate(harvest_connector_dispatched_total[$__rate_interval]))",
+              "legendFormat": "{{source}} {{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Per-binding dispatch outcome (issue #944): dispatched / idempotent_replay / deferred / dead_lettered / retried. A rising `retried` share is harvest-side failure, not a bad message."
+        },
+        {
+          "id": 922,
+          "type": "timeseries",
+          "title": "Connector poison messages",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 115
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (source, reason) (increase(harvest_connector_poisoned_total[1h]))",
+              "legendFormat": "{{source}} {{reason}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Messages quarantined to a dead-letter destination (issue #944), by reason: malformed / mapping_rejected / target_rejected. Triage with `SELECT binding, reason, count(*) FROM harvest_connector_dead_letters GROUP BY 1,2`."
+        },
+        {
+          "id": 923,
+          "type": "timeseries",
+          "title": "Connector consumer lag",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 115
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max by (source) (harvest_connector_lag)",
+              "legendFormat": "{{source}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Unconsumed backlog per binding where the broker client exposes it (issue #944), measured as work still owed to the consumer rather than immediately fetchable: Kafka high watermark minus the committed offset (clamped up to the low watermark, so retention-deleted records are excluded); SQS ApproximateNumberOfMessages plus ApproximateNumberOfMessagesNotVisible (a message abandoned for retry is not visible, so the visible count alone drains toward zero during an outage). Every replica reports the same number -- SQS reads whole-queue depth, and the Kafka sample is group-wide across the topic's partitions rather than the replica's own assignment -- so `max by` deduplicates replicas without under-reporting either adapter."
+        }
+      ]
     }
   ]
 }
