@@ -5003,6 +5003,117 @@
         }
       ],
       "description": "Alert: harvest_queue_paused_too_long (docs/runbooks/harvest-alerts.md#harvest_queue_paused_too_long) 1 while an operator hold is in effect on a queue, 0 otherwise (issue #619). max by (queue) avoids double-counting when several worker replicas sample the same fleet-wide pause. Pair with the queue-depth and oldest-pending-age panels: a rising backlog WITH this at 1 is a deliberate hold, not a capacity incident \u2014 the single most common false page during an outage freeze."
+    },
+    {
+      "id": 920,
+      "type": "row",
+      "title": "Background control loops (scanner liveness)",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 91
+      },
+      "panels": [
+        {
+          "id": 921,
+          "type": "timeseries",
+          "title": "Scanner tick rate",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 92
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              },
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (scanner, instance) (rate(harvest_scanner_tick_total[$__rate_interval]))",
+              "legendFormat": "{{scanner}} @ {{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Liveness heartbeat rate of each background control loop (issue #797). Every loop ticks on EVERY iteration, including no-work iterations, so a series that flat-lines to zero means that loop is wedged (panicked, deadlocked, or stalled on a never-returning query) -- not merely idle. Kept per-instance deliberately: every replica runs its own copy of all seven loops, so summing across instances would let a healthy replica mask a wedged one. Note `retention` polls hourly by default, so at short rate intervals its line sits near zero when healthy -- judge it on the 30m panel beside this one. Alert: harvest_scanner_stalled. Bounded `scanner` label (7 values); execution.id is never a label (ADR-0001 SS7)."
+        },
+        {
+          "id": 922,
+          "type": "timeseries",
+          "title": "Scanner ticks (30m)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 92
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (scanner, instance) (increase(harvest_scanner_tick_total[30m]))",
+              "legendFormat": "{{scanner}} @ {{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Iterations completed per loop over 30m (issue #797) -- the low-frequency companion to the rate panel, sized so the hourly retention janitor and the sub-second timeout loop are both legible. A bar that drops to zero while the process is up is the wedge signal. Per-instance so one replica's wedged loop is not hidden by its healthy peers. A multi-shard worker runs one timeout/poison_pill/pause_auto_resume loop PER SHARD under one label, and the metric carries no shard label -- to catch a single-shard wedge use the scanner_liveness check in GET /admin/preflight, which reports the worst instance."
+        }
+      ]
     }
   ]
 }

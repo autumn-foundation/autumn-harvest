@@ -959,6 +959,47 @@
         "harvest queue resume <queue-name>"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_queue_paused_too_long"
+    },
+    {
+      "id": "harvest_scanner_stalled",
+      "status": "enforceable",
+      "signal_source": "ADR-0001/#797 counter harvest.scanner.tick, incremented unconditionally at the end of EVERY background control-loop iteration (label scanner). Companion in-process check: the scanner_liveness entry in GET /api/harvest/admin/preflight.",
+      "default_threshold": "Page when a scanner series stops incrementing for longer than its loop's cadence allows, while the process is up. The windows are per-cadence, NOT uniform: six of the seven loops poll sub-minute (timeout/sla/external_outbox 500ms, schedule 1s, poison_pill/pause_auto_resume 5s), so a 5m window is ~300x their interval and never flaps; the retention janitor polls hourly by default, so it gets a 3h window. A uniform 5m window would page continuously on a HEALTHY retention loop. Retune both windows if you have changed WorkerConfig::poll_interval or RetentionConfig's tick interval. These windows are the coarse fleet-wide signal; the scanner_liveness preflight check is the low-latency one (max(2 x poll_interval, 60s)).",
+      "severity": "page",
+      "owner_persona": "service on-call",
+      "description": "A background control loop has stopped completing iterations. Because the tick fires even on no-work iterations, a flat-lined series means the loop is wedged (panicked, deadlocked on a poisoned connection, or stalled on a never-returning query) rather than idle. Whichever enforcement it owns -- workflow/activity timeouts, SLA breaches, poison-pill reclaim, external signal/cancel outbox delivery, retention, schedule firing, or bounded-pause auto-resume -- is silently not running.",
+      "first_action": "harvest preflight --output json",
+      "dependencies": [
+        {
+          "ref": "#797",
+          "status": "shipped",
+          "surface": "METRIC_SCANNER_TICK / harvest.scanner.tick and the scanner_liveness preflight check"
+        },
+        {
+          "ref": "ADR-0001",
+          "status": "accepted",
+          "surface": "bounded metric label: scanner (7 values)"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "Alert on the RATE, never the value: the counter is monotonic, so a wedged loop holds its last value forever rather than dropping. `absent()` is deliberately not used -- a scanner that never runs in a given process (an API-only replica) legitimately exports no series, and a process that is entirely down is the `up` alert's job. The expressions deliberately do NOT `sum by (scanner)`: every replica runs its own copy of all seven loops, so summing across instances lets two healthy replicas mask a third's wedged loop. Keep the scrape target's own instance/pod labels so the alert names WHICH process stalled. A multi-shard worker spawns one timeout/poison_pill/pause_auto_resume loop per assigned shard and the metric carries no shard label, so the counter cannot say which shard stalled -- the scanner_liveness preflight check reports the worst instance and can.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "rate(harvest_scanner_tick_total{scanner!=\"retention\"}[5m]) == 0"
+          },
+          {
+            "kind": "promql",
+            "expr": "increase(harvest_scanner_tick_total{scanner=\"retention\"}[3h]) == 0"
+          }
+        ]
+      },
+      "management_checks": [
+        "harvest preflight --output json",
+        "GET /api/harvest/admin/preflight"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_scanner_stalled"
     }
   ]
 }

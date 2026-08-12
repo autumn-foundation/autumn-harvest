@@ -3348,6 +3348,27 @@ pub fn spawn_timeout_checker(
     max_workflow_history_events: Option<u64>,
     session_worker_stale_secs: i64,
 ) -> tokio::task::JoinHandle<()> {
+    // Issue #797: declare this loop (and the sub-passes it drives) before the
+    // first iteration, so the `scanner_liveness` health check knows they are
+    // expected in this process and grants them their boot grace window.
+    //
+    // `sla` and `external_outbox` are enforcement responsibilities of THIS
+    // loop, not separately spawned tasks, so they are registered and ticked
+    // here rather than inside `enforce_timeouts_once`. That keeps all three
+    // ticks genuinely unconditional (a tick inside the pass would sit behind
+    // a `?` and be skipped on a transient DB error — a wedge signal must have
+    // exactly one meaning: the code stopped reaching this point) and keeps
+    // scanner bookkeeping out of a `pub` primitive an embedder may drive by
+    // hand. The cost is that the three labels share one liveness fate; see
+    // `Scanner`'s docs.
+    let owners: Vec<crate::scanner_health::ScannerOwner> = [
+        crate::scanner_health::Scanner::Timeout,
+        crate::scanner_health::Scanner::Sla,
+        crate::scanner_health::Scanner::ExternalOutbox,
+    ]
+    .into_iter()
+    .map(|scanner| crate::scanner_health::register_scanner(scanner, interval))
+    .collect();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -3386,9 +3407,26 @@ pub fn spawn_timeout_checker(
                 }
             }
 
+            // Issue #797: unconditional end-of-iteration liveness tick — a
+            // no-work pass, an enforcement error, and a failed connection
+            // checkout all still prove the loop itself is alive. Only a
+            // panicked, deadlocked, or permanently hung loop stops ticking.
+            for owner in &owners {
+                crate::scanner_health::record_scanner_tick(&*telemetry.metrics, *owner);
+            }
+
             if cancel.is_cancelled() {
                 break;
             }
+        }
+
+        // Issue #797: a *graceful* stop retires this loop from the expected
+        // scanner set, so draining a worker while keeping the API up does not
+        // leave phantom scanners aging into `Wedged`. Deliberately after the
+        // loop rather than in a guard: a panic unwinds past this point, so a
+        // panicked loop stays registered and correctly goes stale.
+        for owner in owners {
+            crate::scanner_health::deregister_scanner(owner);
         }
     })
 }

@@ -195,6 +195,11 @@ count. Override them per environment with
 - **`/api/harvest/health`** is **liveness** — is the process up — not a rollup.
 - **`/api/harvest/admin/preflight`** is **startup validation** — is this
   deployment safe to promote — run at deploy time, not during an incident.
+  One exception, added by issue #797: its `scanner_liveness` check is a *live*
+  signal about the answering process's background control loops, so it is also
+  the fastest way to identify a wedged loop during an incident — but only for
+  the process you point it at (the registry is in-process). See
+  [`harvest_scanner_stalled`](#harvest_scanner_stalled).
 - **`/api/harvest/admin/config`** is the **effective-config introspection**
   surface (issue #695): what config is this fleet actually running with, right
   now? Pull the resolved effective runtime configuration (secret-free,
@@ -1720,3 +1725,168 @@ reason. Page if the held backlog is breaching a business SLA and the dependency
 has no ETA — at that point the decision is a business one (keep holding and
 accumulate, or resume and let the work fail into the DLQ where it can be
 redriven later).
+
+---
+
+## harvest_scanner_stalled
+
+**What to do when a background control loop stops ticking:** Harvest's
+correctness in production depends on a fleet of control loops that run as
+bare spawned Tokio tasks *inside the embedder's process* — timeout
+enforcement, the soft-SLA scanner, poison-pill orphan reclaim, the external
+signal/cancel/await outboxes, the retention janitor, the schedule ticker, and
+the bounded-pause auto-resumer. If one panics, deadlocks on a poisoned
+connection, or stalls on a never-returning query, it fails **silently**: the
+work it owns simply stops happening, and every other part of the process keeps
+running normally.
+
+`harvest.scanner.tick` (issue #797) closes that blind spot. It is incremented
+**unconditionally at the end of every iteration** — including iterations that
+found no work and iterations whose pass returned an error — under a bounded
+`scanner` label. That is what makes it different from every other loop metric
+in the catalogue (`harvest.retention.deleted`,
+`harvest.schedule.fire_attempts`, the timeout/SLA/quarantine counters): those
+only emit when there *is* work, so a healthy idle loop and a dead one both read
+zero. Here, **a flat-lined series is the wedge signal.**
+
+There are seven `scanner` label values but **five** spawned loops: `sla` and
+`external_outbox` are enforcement responsibilities *inside* the `timeout` loop,
+not tasks of their own. All three are ticked together by that loop, so they
+**share one liveness fate and cannot diverge** — `timeout` healthy implies `sla`
+and `external_outbox` healthy. They keep distinct labels because they name
+distinct responsibilities, not because a divergence between them is observable.
+To attribute a *partial* pass failure to a specific sub-pass, use that pass's
+own work counters and its `tracing::error!`, not this heartbeat.
+
+| `scanner` | Loop | What silently stops |
+| --- | --- | --- |
+| `timeout` | `spawn_timeout_checker` | Activity/workflow timeouts, plus every sub-pass below |
+| `sla` | `enforce_workflow_sla_breaches` (sub-pass) | Soft-SLA breach signals (#487) |
+| `external_outbox` | external signal/cancel/await outboxes (sub-pass) | Cross-shard signal, cancel, and await delivery |
+| `poison_pill` | `spawn_poison_pill_reclaimer` | Orphaned-task reclaim after a worker crash (#367) |
+| `retention` | `RetentionRuntime::spawn` | History/audit/summary GC (#737, #752) |
+| `schedule` | `Scheduler::spawn_sharded` | Every cron/interval schedule firing |
+| `pause_auto_resume` | `spawn_pause_auto_resumer` | Bounded-pause auto-resume (#383) |
+
+### Triage steps
+
+1. Identify the stale loop(s) without a metrics pipeline:
+   `harvest preflight --output json | jq '.checks[] | select(.name == "scanner_liveness")'`.
+   The `details.stale_scanners` array names them; `details.scanners[]` carries
+   per-loop `verdict`, `age_secs`, `tick_count`, and the
+   `staleness_threshold_secs` it was judged against.
+
+   **Point it at the right process.** The registry is in-process, so this check
+   only ever describes the process that answers it. In a split API/worker
+   topology, an API-only replica reports `scanners_registered: 0` and `pass` —
+   which is correct for *that* process and says nothing about the worker. Use
+   the metric (step 2) to find which replica went quiet, then run the check
+   there.
+2. With Prometheus, find the replica:
+   `rate(harvest_scanner_tick_total{scanner!="retention"}[5m])` — the wedged
+   loop reads `0` on the affected `instance` while its siblings and the other
+   replicas keep incrementing. Deliberately **not** `sum by (scanner)`: every
+   replica runs its own copy of all seven loops, so summing lets a healthy
+   replica mask a wedged one. Use a wider window for `retention`
+   (`increase(harvest_scanner_tick_total{scanner="retention"}[3h])`), which
+   polls hourly by default.
+3. Read the worker process logs around the time the series flat-lined. A
+   panicked loop leaves a panic backtrace; a stalled one leaves nothing at all,
+   which is itself diagnostic.
+4. Confirm the downstream symptom the loop owns, using the table above. For
+   `timeout`, look for `RUNNING` executions past their `deadline_at`; for
+   `schedule`, check `GET /admin/schedules` for overdue rows
+   (`harvest_schedule_missed_runs` usually fires alongside).
+
+### Likely causes
+
+- A panic inside the loop body that killed the spawned task while the process
+  survived.
+- A query that never returns (a lock wait with no `statement_timeout`, a
+  pathological plan on a large `harvest_events` table).
+- Deadpool connection exhaustion where the loop's `pool.get()` blocks
+  indefinitely — check the pool sizing (`harvest.pool` config) and whether a
+  hot-path caller is holding connections across an `.await`.
+- A `db` blip that poisoned the loop's connection in a way it does not recover
+  from.
+
+### False positives
+
+- **An API-only replica.** A process that runs no worker spawns no scanners.
+  It exports no `harvest_scanner_tick` series at all and its `scanner_liveness`
+  check reports `pass` with `scanners_registered: 0`. Alert on the *rate* of an
+  existing series; do **not** use `absent()`, which would fire on every
+  API-only pod.
+- **A loop polling slower than the alert window.** The loops do *not* share a
+  cadence: `timeout`/`sla`/`external_outbox` poll every 500 ms, `schedule`
+  every 1 s, `poison_pill`/`pause_auto_resume` every 5 s — but `retention`
+  polls **hourly** by default. That is why the shipped rule carries two
+  expressions with different windows; a single 5-minute window would page
+  continuously on a perfectly healthy retention janitor. Retune both if you
+  have changed `WorkerConfig::poll_interval` or the retention tick interval.
+  The preflight check needs no retuning — it derives its own threshold from
+  each loop's registered interval (`max(2 × poll_interval, 60s)`).
+- **The first minute after boot.** Most loops sleep one interval before their
+  first iteration (the schedule ticker is the exception: it runs a pass first,
+  then sleeps). The preflight check accounts for this with a grace window keyed
+  to registration time — note that for the hourly retention janitor that grace
+  is 2 hours, so a freshly booted process legitimately reports it as healthy
+  long before its first tick. A rate-based alert evaluated during startup can
+  transiently read zero.
+- **A missing series is not an alert.** `== 0` never fires on a series that
+  does not exist. If your metrics come from the plugin's built-in
+  `with_metrics_scrape()` endpoint rather than the `metrics-rs` adapter, no
+  `harvest_scanner_tick` series is exported at all (that endpoint bridges a
+  deliberately narrow subset and does not back the full starter pack), so the
+  alert is silently inert. Use the `metrics-rs` recorder, or rely on the
+  preflight check.
+- **Graceful shutdown.** A draining worker stops its loops on purpose. The
+  `scanner_liveness` check is not fooled — a clean stop deregisters each loop,
+  so a process that drains its worker while continuing to serve HTTP reports
+  `pass` with `scanners_registered: 0` rather than seven phantom wedged
+  scanners. (A loop that *panics* deliberately does **not** deregister, so it
+  still ages into `wedged` — that is the signal.) The rate-based alert has no
+  such context, so scope it to processes that are up, or accept a short flap
+  during rollout.
+- **Not a false positive: one wedged shard.** A multi-shard worker spawns a
+  `timeout`, `poison_pill`, and `pause_auto_resume` loop **per assigned shard**,
+  all under one `scanner` label. The preflight check tracks each instance
+  separately and reports the **worst**, so one wedged shard is flagged even
+  while its peers tick — but the *metric* carries no shard label, so its series
+  is the sum across the process's instances and keeps incrementing. On a
+  multi-shard worker, trust the preflight check to catch a single-shard wedge;
+  the counter will not.
+
+### Safe actions
+
+- Restart the worker process. This is the primary remediation: the loops are
+  spawned at worker start, and Harvest's durable state means a restart re-runs
+  the enforcement that was missed with no data loss. Every pass is idempotent
+  and driven off DB state.
+- While a `timeout`/`sla` loop is wedged, nothing is lost — the deadlines are
+  persisted columns (`deadline_at`, `sla_deadline_at`) and are enforced
+  whenever the loop next runs. The same is true for the outboxes and the
+  auto-resumer.
+- A wedged `schedule` loop **does** skip firings; after restart, use
+  `POST /admin/schedules/{id}/backfill` to replay the missed window if the
+  schedule's catchup policy did not already cover it.
+- Do **not** disable the alert to silence it. Detection here is the entire
+  point: the alternative is discovering the outage through a missed SLA. If it
+  is firing on a *healthy* loop, the window is mistuned for that loop's
+  cadence — retune the window (see *False positives*), do not delete the rule.
+
+**This check gates deploys.** `scanner_liveness` participates in the overall
+`harvest preflight` verdict, and the CLI exits `2` on `warn` and `1` on `fail`.
+A stale scanner will therefore **block a pipeline** that runs `harvest preflight`
+as a gate — which is intended (deploying onto a process whose enforcement loops
+are wedged is exactly what a preflight gate is for), but is worth knowing before
+you wire the gate. See `docs/runbooks/safe-deploy.md`.
+
+### Escalation criteria
+
+Page immediately: a wedged enforcement loop is an active, ongoing correctness
+outage for the work it owns, and its blast radius grows for as long as it lasts.
+Escalate to the team owning the embedding service if a restart does not restore
+ticking, or if the loop re-wedges after restart — that indicates a
+reproducible stall (a pathological query or a connection-pool deadlock) rather
+than a one-off panic, and needs a fix rather than a bounce.

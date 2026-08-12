@@ -187,6 +187,8 @@ pub mod retention;
 /// Continue-as-new run-chain assembly (issue #701).
 pub mod run_chain;
 pub mod saga;
+/// Background control-loop liveness heartbeats (issue #797).
+pub mod scanner_health;
 /// Worker session fleet-side registry and pure decision functions (issue #606).
 pub mod sessions;
 pub mod shard;

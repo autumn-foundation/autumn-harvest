@@ -823,6 +823,30 @@ pub const METRIC_WEBHOOK_REJECTED: &str = "harvest.webhook.rejected";
 /// is never a label -- a session's identity stays span-/log-only here.
 pub const METRIC_SESSION_ACQUISITION: &str = "harvest.session.acquisition";
 
+/// Counter: one background control-loop iteration completed (issue #797).
+///
+/// Incremented **unconditionally at the end of every iteration** of each
+/// background scanner — including iterations that found no work and
+/// iterations whose pass returned an error. That unconditional emission is
+/// the whole point: the pre-existing loop metrics
+/// ([`METRIC_RETENTION_DELETED`], [`METRIC_SCHEDULE_FIRE_ATTEMPTS`], the
+/// timeout/SLA/quarantine counters) only fire when there is work to do, so a
+/// healthy idle loop and a wedged one both read zero. Here a **flat-lined
+/// counter is itself the wedge signal**, and a wedged loop is detectable
+/// within `2 ×` its poll interval.
+///
+/// Labeled by `scanner` (= [`METRIC_LABEL_SCANNER`]) whose value set is
+/// bounded by construction to the seven
+/// [`Scanner`](crate::scanner_health::Scanner) variants. Per ADR-0001 §7,
+/// `execution.id` is never a label — these are process-level control loops
+/// and carry no execution identity at all.
+///
+/// Alert on the *rate*, not the value:
+/// `rate(harvest_scanner_tick_total[5m]) == 0`. The companion in-process
+/// last-tick registry is surfaced by the `scanner_liveness` check in
+/// `GET /admin/preflight` for deployments without a metrics pipeline.
+pub const METRIC_SCANNER_TICK: &str = "harvest.scanner.tick";
+
 /// Counter: a `SignalReceived` event was durably delivered into a workflow's
 /// history and promoted to a live workflow-task wake (issue #684).
 ///
@@ -1125,6 +1149,11 @@ pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
 /// Metric label: adaptive slot-tuner decision (`"grow"` / `"shrink"` / `"hold"`,
 /// issue #548).
 pub const METRIC_LABEL_DECISION: &str = "decision";
+/// Metric label: background control loop identity (issue #797).
+///
+/// Bounded by construction to the [`Scanner`](crate::scanner_health::Scanner)
+/// variants — a call site passes the enum's `as_str()`, never a free string.
+pub const METRIC_LABEL_SCANNER: &str = "scanner";
 
 // ---------------------------------------------------------------------------
 // Custom (user) metric constants and validation (issue #532)
@@ -1823,6 +1852,27 @@ pub trait MetricsRecorder: Send + Sync {
     /// queue is drained so stale gauge values do not linger.
     fn record_queue_oldest_pending_age(&self, queue_name: &str, age_secs: f64) {
         let _ = (queue_name, age_secs);
+    }
+
+    /// One background control-loop iteration completed (issue #797).
+    ///
+    /// Maps to the counter [`METRIC_SCANNER_TICK`], labeled `scanner` (=
+    /// [`METRIC_LABEL_SCANNER`]). `scanner` is always
+    /// [`Scanner::as_str`](crate::scanner_health::Scanner::as_str), so the
+    /// label's cardinality is bounded by construction.
+    ///
+    /// Called **unconditionally at the end of every iteration**, including
+    /// no-work iterations — that is what makes a flat-lined counter mean
+    /// "wedged" rather than merely "idle". Prefer the
+    /// [`record_scanner_tick`](crate::scanner_health::record_scanner_tick)
+    /// choke point over calling this directly: it also bumps the in-process
+    /// liveness registry that backs the `scanner_liveness` preflight check,
+    /// so the counter and the timestamp cannot drift apart.
+    ///
+    /// Additive with a no-op default: implementing it is optional and no
+    /// existing implementor breaks.
+    fn record_scanner_tick(&self, scanner: &str) {
+        let _ = scanner;
     }
 
     /// Results of one retention-janitor tick on a shard.

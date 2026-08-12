@@ -625,6 +625,12 @@ mod scanner {
         worker_stale_secs: i64,
         telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
     ) -> tokio::task::JoinHandle<()> {
+        // Issue #797: declare the loop before its first iteration so the
+        // `scanner_liveness` check expects it and grants it boot grace.
+        let owner = crate::scanner_health::register_scanner(
+            crate::scanner_health::Scanner::PoisonPill,
+            interval,
+        );
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -658,10 +664,16 @@ mod scanner {
                         tracing::error!(error = %e, "failed to acquire DB connection for poison-pill reclaim");
                     }
                 }
+                // Issue #797: unconditional end-of-iteration liveness tick.
+                crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
                 if cancel.is_cancelled() {
                     break;
                 }
             }
+            // Issue #797: a graceful stop retires this loop from the expected
+            // scanner set. A panic unwinds past here, so a panicked loop stays
+            // registered and correctly ages into `Wedged`.
+            crate::scanner_health::deregister_scanner(owner);
         })
     }
 }

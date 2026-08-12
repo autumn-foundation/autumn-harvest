@@ -86,6 +86,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_workflow_debounced_total",
     "harvest_workflow_debounce_fired_total",
     "harvest_workflow_start_throttled_total",
+    "harvest_scanner_tick_total",
     "harvest_saga_compensated_total",
     "harvest_saga_compensation_failed_total",
     "harvest_canary_success_total",
@@ -250,6 +251,9 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
         "harvest_update_duration",
         &["workflow", "name", "queue", "outcome"],
     ),
+    // Background control-loop liveness heartbeat (issue #797). Bounded
+    // `scanner` label; no execution/workflow identity exists at this layer.
+    ("harvest_scanner_tick", &["scanner"]),
     ("harvest_mutex_wait_duration", &["workflow"]),
     ("harvest_mutex_held_duration", &["workflow"]),
     ("harvest_mutex_contention_depth", &["workflow"]),

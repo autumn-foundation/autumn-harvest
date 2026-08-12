@@ -120,6 +120,8 @@ mod retention_summary_tests;
 mod retry_after_tests;
 mod retry_now_tests;
 mod saga_tests;
+mod scanner_liveness_tests;
+mod scanner_tick_db_tests;
 mod schedule_decisions;
 mod schedule_runs_tests;
 mod schedule_to_close_tests;

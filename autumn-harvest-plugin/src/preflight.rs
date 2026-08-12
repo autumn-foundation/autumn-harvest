@@ -4,6 +4,10 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use autumn_harvest::dlq;
 use autumn_harvest::models::HarvestSchedule;
+use autumn_harvest::scanner_health::{
+    ScannerLivenessVerdict, ScannerStatus, classify_scanner, global_scanner_liveness,
+    staleness_threshold,
+};
 use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
@@ -79,6 +83,7 @@ pub async fn build_preflight_report(api_state: &HarvestApiState) -> PreflightRep
     checks.push(check_retention_visibility(api_state));
     checks.push(check_admin_auth_boundary(api_state));
     checks.push(check_history_ceiling_config(api_state));
+    checks.push(check_scanner_liveness());
 
     let overall_status = checks
         .iter()
@@ -1259,6 +1264,99 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
     )
 }
 
+/// Liveness of the background control loops running in this process
+/// (issue #797).
+///
+/// Every loop registers itself at spawn time and ticks at the end of each
+/// iteration, so a loop that panicked, deadlocked, or stalled on a
+/// never-returning query stops advancing its timestamp while everything else
+/// in the process keeps working. A scanner that has not ticked within
+/// `max(2 × poll_interval, 60s)` is `warn`; past twice that it is `fail`.
+///
+/// Reads the in-process registry directly — deliberately **not** gated on a
+/// metrics recorder being configured, so the check works on a deployment with
+/// no telemetry pipeline at all.
+fn check_scanner_liveness() -> PreflightCheckResult {
+    scanner_liveness_check(&global_scanner_liveness().snapshot())
+}
+
+/// Pure classification half of [`check_scanner_liveness`], split out so the
+/// warn/fail policy is unit-testable without a live runtime or the
+/// process-global registry.
+fn scanner_liveness_check(statuses: &[ScannerStatus]) -> PreflightCheckResult {
+    let mut worst = PreflightStatus::Pass;
+    let mut stale_scanners = Vec::new();
+    let mut entries = Vec::with_capacity(statuses.len());
+
+    for status in statuses {
+        let verdict = classify_scanner(status);
+        let (verdict_label, verdict_status) = match verdict {
+            ScannerLivenessVerdict::Healthy => ("healthy", PreflightStatus::Pass),
+            ScannerLivenessVerdict::Stale => ("stale", PreflightStatus::Warn),
+            ScannerLivenessVerdict::Wedged => ("wedged", PreflightStatus::Fail),
+        };
+        if verdict_status.rank() > worst.rank() {
+            worst = verdict_status;
+        }
+        if verdict != ScannerLivenessVerdict::Healthy {
+            stale_scanners.push(status.scanner.as_str());
+        }
+        entries.push(json!({
+            "scanner": status.scanner.as_str(),
+            "verdict": verdict_label,
+            "tick_count": status.tick_count,
+            "has_ticked": status.has_ticked,
+            "age_secs": status.age.as_secs(),
+            "poll_interval_secs": status.poll_interval.as_secs(),
+            "staleness_threshold_secs": staleness_threshold(status.poll_interval).as_secs(),
+            "last_tick_at": status.last_tick_at,
+        }));
+    }
+
+    let summary = if statuses.is_empty() {
+        // Two legitimate shapes reach here: an API-only replica that spawns no
+        // control loops, and a process that gracefully drained its worker
+        // while continuing to serve HTTP (a clean stop deregisters). Reporting
+        // seven phantom wedged scanners in either case would be pure alarm
+        // noise, so an empty registry passes with an explanation.
+        "no background control loops are registered in this process".to_owned()
+    } else if stale_scanners.is_empty() {
+        format!(
+            "all {} background control loops ticked within their staleness threshold",
+            statuses.len()
+        )
+    } else {
+        format!(
+            "{} of {} background control loops are stale: {}",
+            stale_scanners.len(),
+            statuses.len(),
+            stale_scanners.join(", ")
+        )
+    };
+
+    check(
+        "scanner_liveness",
+        worst,
+        summary,
+        if stale_scanners.is_empty() {
+            None
+        } else {
+            Some(
+                "A background control loop has stopped ticking: enforcement, SLA, reclaim, \
+                 outbox, retention, schedule, or auto-resume work is silently not running. \
+                 Check the worker logs for a panic or a stalled query and restart the worker \
+                 process; see docs/runbooks/harvest-alerts.md#harvest_scanner_stalled.",
+            )
+        },
+        Vec::new(),
+        json!({
+            "scanners_registered": statuses.len(),
+            "stale_scanners": stale_scanners,
+            "scanners": entries,
+        }),
+    )
+}
+
 fn check_history_ceiling_config(api_state: &HarvestApiState) -> PreflightCheckResult {
     let ceiling = api_state.max_workflow_history_events();
     let soft_threshold = api_state
@@ -1320,6 +1418,10 @@ fn check_history_ceiling_config(api_state: &HarvestApiState) -> PreflightCheckRe
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use autumn_harvest::scanner_health::Scanner;
+
     use super::*;
 
     fn privilege_row(table_name: &str, privilege: &str, granted: bool) -> TablePrivilegeRow {
@@ -1340,6 +1442,123 @@ mod tests {
             privilege: privilege.to_string(),
             granted,
         }
+    }
+
+    // ── scanner_liveness (issue #797) ────────────────────────────────────
+
+    fn status(
+        scanner: Scanner,
+        poll_interval_secs: u64,
+        age_secs: u64,
+        tick_count: u64,
+    ) -> ScannerStatus {
+        ScannerStatus {
+            scanner,
+            poll_interval: Duration::from_secs(poll_interval_secs),
+            tick_count,
+            last_tick_at: (tick_count > 0).then(Utc::now),
+            age: Duration::from_secs(age_secs),
+            has_ticked: tick_count > 0,
+        }
+    }
+
+    #[test]
+    fn scanner_liveness_passes_when_every_loop_ticked_recently() {
+        let result = scanner_liveness_check(&[
+            status(Scanner::Timeout, 30, 5, 12),
+            status(Scanner::Retention, 30, 1, 3),
+        ]);
+
+        assert_eq!(result.name, "scanner_liveness");
+        assert_eq!(result.status, PreflightStatus::Pass);
+        assert_eq!(result.details["scanners_registered"], 2);
+        assert!(
+            result.details["stale_scanners"]
+                .as_array()
+                .expect("stale_scanners must be an array")
+                .is_empty()
+        );
+        assert!(result.remediation.is_none());
+    }
+
+    #[test]
+    fn scanner_liveness_passes_on_a_replica_that_runs_no_control_loops() {
+        // An API-only replica legitimately spawns no scanners. Reporting
+        // seven phantom wedged loops there would be pure alarm noise.
+        let result = scanner_liveness_check(&[]);
+
+        assert_eq!(result.status, PreflightStatus::Pass);
+        assert_eq!(result.details["scanners_registered"], 0);
+        assert!(
+            result.summary.contains("no background control loops"),
+            "summary must explain why zero scanners is not a failure: {}",
+            result.summary
+        );
+    }
+
+    #[test]
+    fn scanner_liveness_warns_and_names_a_stale_scanner() {
+        // 30s interval => 60s threshold; 90s is stale but not yet wedged.
+        let result = scanner_liveness_check(&[
+            status(Scanner::Timeout, 30, 90, 4),
+            status(Scanner::Retention, 30, 1, 9),
+        ]);
+
+        assert_eq!(result.status, PreflightStatus::Warn);
+        assert_eq!(
+            result.details["stale_scanners"]
+                .as_array()
+                .expect("stale_scanners must be an array"),
+            &vec![Value::from("timeout")],
+            "the stale scanner must be named in details"
+        );
+        assert!(result.summary.contains("timeout"));
+        assert!(result.remediation.is_some());
+    }
+
+    #[test]
+    fn scanner_liveness_fails_when_a_scanner_is_wedged() {
+        // 30s interval => 60s threshold; 200s is past 2x => wedged.
+        let result = scanner_liveness_check(&[
+            status(Scanner::Timeout, 30, 200, 4),
+            status(Scanner::Sla, 30, 90, 4),
+        ]);
+
+        assert_eq!(result.status, PreflightStatus::Fail);
+        let stale = result.details["stale_scanners"]
+            .as_array()
+            .expect("stale_scanners must be an array");
+        assert!(stale.contains(&Value::from("timeout")));
+        assert!(
+            stale.contains(&Value::from("sla")),
+            "a merely-stale scanner is still reported alongside a wedged one"
+        );
+    }
+
+    #[test]
+    fn scanner_liveness_details_carry_per_scanner_diagnostics() {
+        let result = scanner_liveness_check(&[status(Scanner::Schedule, 30, 7, 42)]);
+
+        let entry = &result.details["scanners"][0];
+        assert_eq!(entry["scanner"], "schedule");
+        assert_eq!(entry["verdict"], "healthy");
+        assert_eq!(entry["tick_count"], 42);
+        assert_eq!(entry["age_secs"], 7);
+        assert_eq!(entry["poll_interval_secs"], 30);
+        assert_eq!(
+            entry["staleness_threshold_secs"], 60,
+            "the threshold an operator is being judged against must be visible"
+        );
+        assert_eq!(entry["has_ticked"], true);
+    }
+
+    #[test]
+    fn scanner_liveness_reports_a_never_ticked_scanner_inside_its_grace_window() {
+        let result = scanner_liveness_check(&[status(Scanner::PoisonPill, 30, 3, 0)]);
+
+        assert_eq!(result.status, PreflightStatus::Pass);
+        assert_eq!(result.details["scanners"][0]["has_ticked"], false);
+        assert_eq!(result.details["scanners"][0]["tick_count"], 0);
     }
 
     #[test]

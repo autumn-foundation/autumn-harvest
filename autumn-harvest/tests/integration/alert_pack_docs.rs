@@ -24,6 +24,7 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_workflow_population_leak",
     "harvest_queue_paused_too_long",
     "harvest_workflow_history_bloat",
+    "harvest_scanner_stalled",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -76,6 +77,7 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_signal_unhandled_total",
     "harvest_workflow_active",
     "harvest_workflow_history_bloat_total",
+    "harvest_scanner_tick_total",
 ];
 
 #[test]
