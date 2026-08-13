@@ -1356,6 +1356,10 @@ fn check_scanner_liveness() -> PreflightCheckResult {
 fn scanner_liveness_check(statuses: &[ScannerStatus]) -> PreflightCheckResult {
     let mut worst = PreflightStatus::Pass;
     let mut stale_scanners = Vec::new();
+    // Human-facing labels for the summary line, carrying the wedged instance's
+    // shard when there is one. Kept separate from `stale_scanners` so that
+    // field stays a stable, machine-readable list of bare scanner names.
+    let mut stale_labels = Vec::new();
     let mut entries = Vec::with_capacity(statuses.len());
 
     for status in statuses {
@@ -1370,9 +1374,21 @@ fn scanner_liveness_check(statuses: &[ScannerStatus]) -> PreflightCheckResult {
         }
         if verdict != ScannerLivenessVerdict::Healthy {
             stale_scanners.push(status.scanner.as_str());
+            // Name the shard in the summary when the wedged instance is one of
+            // the per-shard loops (issue #797): a multi-shard worker runs N
+            // timeout checkers under one label, so "timeout is wedged" alone
+            // does not tell an operator which database is unprotected.
+            stale_labels.push(status.shard.map_or_else(
+                || status.scanner.as_str().to_owned(),
+                |shard| format!("{} (shard {})", status.scanner.as_str(), shard.as_i32()),
+            ));
         }
         entries.push(json!({
             "scanner": status.scanner.as_str(),
+            // The worst instance's shard, so an operator can go straight to the
+            // unprotected database. Absent for the process-wide loops
+            // (retention, schedule) and on single-shard deployments.
+            "shard": status.shard.map(ShardId::as_i32),
             "verdict": verdict_label,
             "tick_count": status.tick_count,
             "has_ticked": status.has_ticked,
@@ -1398,9 +1414,9 @@ fn scanner_liveness_check(statuses: &[ScannerStatus]) -> PreflightCheckResult {
     } else {
         format!(
             "{} of {} background control loops are stale: {}",
-            stale_scanners.len(),
+            stale_labels.len(),
             statuses.len(),
-            stale_scanners.join(", ")
+            stale_labels.join(", ")
         )
     };
 
@@ -1522,6 +1538,16 @@ mod tests {
         age_secs: u64,
         tick_count: u64,
     ) -> ScannerStatus {
+        status_on_shard(scanner, poll_interval_secs, age_secs, tick_count, None)
+    }
+
+    fn status_on_shard(
+        scanner: Scanner,
+        poll_interval_secs: u64,
+        age_secs: u64,
+        tick_count: u64,
+        shard: Option<ShardId>,
+    ) -> ScannerStatus {
         ScannerStatus {
             scanner,
             poll_interval: Duration::from_secs(poll_interval_secs),
@@ -1529,6 +1555,7 @@ mod tests {
             last_tick_at: (tick_count > 0).then(Utc::now),
             age: Duration::from_secs(age_secs),
             has_ticked: tick_count > 0,
+            shard,
         }
     }
 
@@ -1549,6 +1576,55 @@ mod tests {
                 .is_empty()
         );
         assert!(result.remediation.is_none());
+    }
+
+    /// Issue #797, Codex review: a multi-shard worker runs one timeout checker
+    /// per assigned shard, all under one `Scanner` label, and the tick counter
+    /// carries no shard label — the dashboard and the alert notes both send
+    /// operators here precisely because this check is the only surface that can
+    /// localize a single-shard wedge. It has to actually say which shard.
+    #[test]
+    fn scanner_liveness_names_the_shard_of_the_wedged_instance() {
+        let result = scanner_liveness_check(&[status_on_shard(
+            Scanner::Timeout,
+            30,
+            200,
+            4,
+            Some(ShardId::new(1)),
+        )]);
+
+        assert_eq!(result.status, PreflightStatus::Fail);
+        assert!(
+            result.summary.contains("timeout (shard 1)"),
+            "the summary must name the wedged shard so an operator knows which \
+             database is unprotected: {}",
+            result.summary
+        );
+        assert_eq!(
+            result.details["scanners"][0]["shard"], 1,
+            "the per-scanner entry must carry the wedged instance's shard"
+        );
+        // `stale_scanners` stays a stable, machine-readable list of bare
+        // scanner names — the shard rides the summary and the entry.
+        assert_eq!(result.details["stale_scanners"][0], "timeout");
+    }
+
+    /// A process-wide loop has no shard to report and must say so rather than
+    /// inventing one — the common single-shard case.
+    #[test]
+    fn scanner_liveness_omits_the_shard_for_a_process_wide_loop() {
+        let result = scanner_liveness_check(&[status(Scanner::Retention, 30, 200, 4)]);
+
+        assert_eq!(result.status, PreflightStatus::Fail);
+        assert!(
+            result.summary.contains("retention") && !result.summary.contains("shard"),
+            "a process-wide loop must not claim a shard: {}",
+            result.summary
+        );
+        assert!(
+            result.details["scanners"][0]["shard"].is_null(),
+            "a process-wide loop must report a null shard"
+        );
     }
 
     #[test]

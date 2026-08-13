@@ -55,7 +55,10 @@
 //!   a healthy shard cannot mask a wedged sibling. The *metric*, however,
 //!   carries no shard label — its series is the sum across a process's
 //!   instances, so on a multi-shard worker the counter alone cannot say
-//!   *which* shard stalled. The health check can.
+//!   *which* shard stalled. The health check can, and says so: the reported
+//!   instance carries its [`ShardId`] through to the check payload, so the
+//!   operator learns which database was left unprotected rather than only
+//!   that some timeout checker died.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,6 +68,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use crate::telemetry::MetricsRecorder;
+use crate::types::ShardId;
 
 /// Lower bound on the staleness threshold, regardless of how fast a loop
 /// polls. Keeps a sub-second poll interval from producing a hair-trigger
@@ -242,6 +246,16 @@ pub struct ScannerStatus {
     pub age: Duration,
     /// Whether this scanner has completed at least one iteration.
     pub has_ticked: bool,
+    /// Which shard the reported instance polls, when this loop is one of the
+    /// per-shard set a multi-shard worker spawns (timeout, poison-pill,
+    /// pause-auto-resume). `None` for the process-wide loops (retention,
+    /// schedule) and for single-shard deployments.
+    ///
+    /// This is the *worst* instance's shard, so it names the database that is
+    /// actually unprotected. It is deliberately absent from the tick metric —
+    /// localizing a single-shard wedge is precisely the job this in-process
+    /// check does that `harvest.scanner.tick` cannot.
+    pub shard: Option<ShardId>,
 }
 
 /// Classify one scanner's liveness reading.
@@ -283,6 +297,9 @@ struct OwnerState {
     last_tick: Option<Instant>,
     last_tick_at: Option<DateTime<Utc>>,
     tick_count: u64,
+    /// The shard this instance polls, for the per-shard loops. Recorded here
+    /// rather than derived, because the id is only knowable at the spawn site.
+    shard: Option<ShardId>,
 }
 
 impl OwnerState {
@@ -367,6 +384,23 @@ impl ScannerLiveness {
         self.register_at(scanner, poll_interval, Instant::now())
     }
 
+    /// [`register`](Self::register) for one of the **per-shard** loops.
+    ///
+    /// A multi-shard worker spawns one timeout checker, poison-pill reclaimer,
+    /// and pause auto-resumer per assigned shard, all sharing one [`Scanner`]
+    /// label. Recording which shard each instance polls is what lets the
+    /// liveness snapshot name the database left unprotected when one of them
+    /// wedges — the tick counter carries no shard label, so this check is the
+    /// only surface that can localize it.
+    pub fn register_for_shard(
+        &self,
+        scanner: Scanner,
+        poll_interval: Duration,
+        shard: Option<ShardId>,
+    ) -> ScannerOwner {
+        self.register_for_shard_at(scanner, poll_interval, shard, Instant::now())
+    }
+
     /// [`register`](Self::register) with an injected monotonic clock reading.
     ///
     /// Exposed so liveness policy can be tested deterministically without
@@ -376,6 +410,19 @@ impl ScannerLiveness {
         &self,
         scanner: Scanner,
         poll_interval: Duration,
+        now: Instant,
+    ) -> ScannerOwner {
+        self.register_for_shard_at(scanner, poll_interval, None, now)
+    }
+
+    /// [`register_for_shard`](Self::register_for_shard) with an injected
+    /// monotonic clock reading, for deterministic tests.
+    #[doc(hidden)]
+    pub fn register_for_shard_at(
+        &self,
+        scanner: Scanner,
+        poll_interval: Duration,
+        shard: Option<ShardId>,
         now: Instant,
     ) -> ScannerOwner {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -388,6 +435,7 @@ impl ScannerLiveness {
                 last_tick: None,
                 last_tick_at: None,
                 tick_count: 0,
+                shard,
             },
         );
         drop(entries);
@@ -521,6 +569,7 @@ impl ScannerLiveness {
                     last_tick_at: worst.last_tick_at,
                     age,
                     has_ticked: worst.last_tick.is_some(),
+                    shard: worst.shard,
                 })
             })
             .collect()
@@ -566,7 +615,36 @@ pub fn register_scanner(
     scanner: Scanner,
     poll_interval: Duration,
 ) -> ScannerOwner {
-    register_scanner_on(global_scanner_liveness(), metrics, scanner, poll_interval)
+    register_scanner_on(
+        global_scanner_liveness(),
+        metrics,
+        scanner,
+        poll_interval,
+        None,
+    )
+}
+
+/// [`register_scanner`] for one of the **per-shard** loops.
+///
+/// The timeout checker, poison-pill reclaimer, and pause auto-resumer are
+/// spawned one-per-assigned-shard, all under one [`Scanner`] label. Passing the
+/// shard here is what lets `scanner_liveness` name the unprotected database
+/// when one of them wedges; the tick counter deliberately carries no shard
+/// label, so this in-process check is the only surface that can localize it.
+#[must_use]
+pub fn register_scanner_for_shard(
+    metrics: &dyn MetricsRecorder,
+    scanner: Scanner,
+    poll_interval: Duration,
+    shard: Option<ShardId>,
+) -> ScannerOwner {
+    register_scanner_on(
+        global_scanner_liveness(),
+        metrics,
+        scanner,
+        poll_interval,
+        shard,
+    )
 }
 
 /// [`register_scanner`] against an explicit registry, for tests that must not
@@ -578,8 +656,9 @@ pub fn register_scanner_on(
     metrics: &dyn MetricsRecorder,
     scanner: Scanner,
     poll_interval: Duration,
+    shard: Option<ShardId>,
 ) -> ScannerOwner {
-    let owner = liveness.register(scanner, poll_interval);
+    let owner = liveness.register_for_shard(scanner, poll_interval, shard);
     metrics.record_scanner_registered(scanner.as_str());
     owner
 }

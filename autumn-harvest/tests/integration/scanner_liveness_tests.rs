@@ -21,6 +21,7 @@ use autumn_harvest::scanner_health::{
     classify_scanner, staleness_threshold,
 };
 use autumn_harvest::telemetry::{METRIC_LABEL_SCANNER, METRIC_SCANNER_TICK, MetricsRecorder};
+use autumn_harvest::types::ShardId;
 
 // ---------------------------------------------------------------------------
 // AC1: bounded `scanner` label value set
@@ -473,6 +474,68 @@ fn a_wedged_instance_is_not_laundered_by_a_lenient_siblings_interval() {
     assert_eq!(status.age, Duration::from_secs(200));
 }
 
+/// Issue #797, Codex review: the fold already reports the *worst* instance,
+/// but reporting only the `Scanner` type leaves an operator unable to act on a
+/// multi-shard worker — which spawns one timeout/poison-pill/pause-auto-resume
+/// loop **per assigned shard**, all under one label. Both the dashboard and the
+/// alert notes send operators to `scanner_liveness` precisely because the
+/// counter carries no shard label and so cannot localize a single-shard wedge;
+/// the check has to actually deliver that.
+///
+/// The `ShardId` is already in hand at the spawn site (`shard_pools_for_monitors`
+/// is built by mapping over `shard_assignments`), so this is pure plumbing.
+#[test]
+fn the_reported_instance_names_the_shard_that_is_wedged() {
+    let liveness = ScannerLiveness::new();
+    let t0 = std::time::Instant::now();
+    let interval = Duration::from_secs(30);
+
+    // Three per-shard timeout checkers, exactly as a multi-shard worker spawns
+    // them. Shards 0 and 2 keep ticking; shard 1's loop wedges.
+    let healthy_a =
+        liveness.register_for_shard_at(Scanner::Timeout, interval, Some(ShardId::new(0)), t0);
+    let wedged =
+        liveness.register_for_shard_at(Scanner::Timeout, interval, Some(ShardId::new(1)), t0);
+    let healthy_b =
+        liveness.register_for_shard_at(Scanner::Timeout, interval, Some(ShardId::new(2)), t0);
+    liveness.tick_at(wedged, t0);
+
+    let now = t0 + Duration::from_secs(200);
+    liveness.tick_at(healthy_a, now);
+    liveness.tick_at(healthy_b, now);
+
+    let status = &liveness.snapshot_as_of(now)[0];
+    assert_eq!(
+        classify_scanner(status),
+        ScannerLivenessVerdict::Wedged,
+        "shard 1's loop is 200s silent against its own 60s threshold"
+    );
+    assert_eq!(
+        status.shard,
+        Some(ShardId::new(1)),
+        "the folded status must name the shard whose loop is wedged, not just \
+         the scanner type -- otherwise an operator on a multi-shard worker \
+         knows a timeout checker died but not which database is unprotected"
+    );
+}
+
+/// A process-wide loop (retention, schedule) has no shard to report, and must
+/// say so rather than inventing one. Keeps the payload honest on the
+/// single-shard deployments that are the common case.
+#[test]
+fn a_process_wide_loop_reports_no_shard() {
+    let liveness = ScannerLiveness::new();
+    let t0 = std::time::Instant::now();
+    let owner = liveness.register_at(Scanner::Retention, Duration::from_secs(30), t0);
+    liveness.tick_at(owner, t0);
+
+    let status = &liveness.snapshot_as_of(t0)[0];
+    assert_eq!(
+        status.shard, None,
+        "a loop that is not per-shard must report no shard"
+    );
+}
+
 /// Every folded `ScannerStatus` must be internally consistent: re-classifying
 /// it reproduces the worst per-instance verdict. This is what lets the
 /// preflight check call `classify_scanner` on the folded status and trust the
@@ -760,6 +823,7 @@ fn registration_initializes_the_series_before_the_first_iteration() {
         &capture,
         Scanner::Retention,
         Duration::from_secs(3600),
+        None,
     );
 
     // A wedge on iteration one: registered, never ticked.
@@ -789,6 +853,7 @@ fn every_scanner_variant_initializes_its_own_series() {
             &capture,
             scanner,
             Duration::from_secs(30),
+            None,
         );
     }
 
@@ -812,6 +877,7 @@ fn record_scanner_registered_has_a_noop_default() {
         &Silent,
         Scanner::Timeout,
         Duration::from_secs(30),
+        None,
     );
 
     // Liveness is recorded regardless of whether telemetry is wired.

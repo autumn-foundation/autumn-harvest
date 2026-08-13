@@ -159,6 +159,7 @@ async fn spawned_timeout_checker_ticks_all_owned_scanners_with_no_work() {
         std::sync::Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
         None,
         60,
+        Some(ShardId::new(0)),
     );
 
     // Poll (bounded) rather than sleeping a fixed span: fast when the loop is
@@ -302,6 +303,7 @@ async fn the_loop_advances_liveness_without_a_metrics_recorder() {
         std::sync::Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
         None,
         60,
+        Some(ShardId::new(0)),
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -356,11 +358,24 @@ async fn spawned_poison_pill_reclaimer_registers_ticks_and_deregisters() {
         3,
         60,
         telemetry,
+        Some(ShardId::new(0)),
     );
     assert_eq!(
         global_scanner_liveness().registrations(Scanner::PoisonPill),
         before + 1,
         "the loop must register itself at spawn time, before its first iteration"
+    );
+    // Issue #797, Codex review: the shard the spawner was given must survive
+    // into the snapshot, so `scanner_liveness` can name the unprotected
+    // database on a multi-shard worker. Asserted through a REAL spawner rather
+    // than a hand-built registry, so the plumbing is covered end to end.
+    assert!(
+        global_scanner_liveness()
+            .snapshot()
+            .iter()
+            .any(|status| status.scanner == Scanner::PoisonPill
+                && status.shard == Some(ShardId::new(0))),
+        "the spawner's shard must reach the liveness snapshot"
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(20);

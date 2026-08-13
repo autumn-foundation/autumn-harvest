@@ -5273,12 +5273,12 @@
               }
             }
           ],
-          "description": "Liveness heartbeat rate of each background control loop (issue #797). Every loop ticks on EVERY iteration, including no-work iterations, so a series that flat-lines to zero means that loop is wedged (panicked, deadlocked, or stalled on a never-returning query) -- not merely idle. Kept per-instance deliberately: every replica runs its own copy of all seven loops, so summing across instances would let a healthy replica mask a wedged one. Note `retention` polls hourly by default, so at short rate intervals its line sits near zero when healthy -- judge it on the 30m panel beside this one. Alert: harvest_scanner_stalled. Bounded `scanner` label (7 values); execution.id is never a label (ADR-0001 SS7)."
+          "description": "Liveness heartbeat rate of each background control loop (issue #797). Every loop ticks on EVERY iteration, including no-work iterations, so a series that flat-lines to zero means that loop is wedged (panicked, deadlocked, or stalled on a never-returning query) -- not merely idle. Kept per-instance deliberately: every replica runs its own copy of all seven loops, so summing across instances would let a healthy replica mask a wedged one. Note `retention` polls hourly by default, so at short rate intervals its line sits indistinguishably near zero when healthy -- judge it on the 3h panel beside this one, whose window is longer than the janitor's cadence. Alert: harvest_scanner_stalled. Bounded `scanner` label (7 values); execution.id is never a label (ADR-0001 SS7)."
         },
         {
           "id": 927,
           "type": "timeseries",
-          "title": "Scanner ticks (30m)",
+          "title": "Scanner ticks (3h)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -5294,7 +5294,11 @@
               "custom": {
                 "fillOpacity": 10,
                 "showPoints": "never",
-                "lineWidth": 1
+                "lineWidth": 1,
+                "scaleDistribution": {
+                  "type": "log",
+                  "log": 10
+                }
               }
             },
             "overrides": []
@@ -5313,7 +5317,7 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "sum by (scanner, instance) (increase(harvest_scanner_tick_total[30m]))",
+              "expr": "sum by (scanner, instance) (increase(harvest_scanner_tick_total[3h]))",
               "legendFormat": "{{scanner}} @ {{instance}}",
               "datasource": {
                 "type": "prometheus",
@@ -5321,7 +5325,7 @@
               }
             }
           ],
-          "description": "Iterations completed per loop over 30m (issue #797) -- the low-frequency companion to the rate panel, sized so the hourly retention janitor and the sub-second timeout loop are both legible. A bar that drops to zero while the process is up is the wedge signal. Per-instance so one replica's wedged loop is not hidden by its healthy peers. A multi-shard worker runs one timeout/poison_pill/pause_auto_resume loop PER SHARD under one label, and the metric carries no shard label -- to catch a single-shard wedge use the scanner_liveness check in GET /admin/preflight, which reports the worst instance."
+          "description": "Iterations completed per loop over 3h (issue #797) -- the low-frequency companion to the rate panel, and the panel to judge `retention` on. The window is deliberately LONGER than the slowest loop's cadence: the janitor polls hourly by default, so any window under an hour legitimately contains zero increments for much of every healthy hour and the \"zero means wedged\" reading would be false exactly where it is supposed to be authoritative. At 3h a healthy janitor floors at ~3. A series that stops incrementing is the wedge signal -- note that on the log axis a zero reads as a BREAK in the line rather than a dip to the baseline. The axis is log because a sub-second loop contributes ~21,600 ticks over the same window against the janitor's ~3, and a linear scale would pin retention indistinguishably to zero -- the exact illegibility this panel exists to fix. Retune alongside the alert's 3h window if you have changed the retention tick interval. Per-instance so one replica's wedged loop is not hidden by its healthy peers. A multi-shard worker runs one timeout/poison_pill/pause_auto_resume loop PER SHARD under one label, and the metric carries no shard label -- to catch a single-shard wedge use the scanner_liveness check in GET /admin/preflight, which names the wedged instance's shard."
         }
       ]
     }

@@ -624,13 +624,17 @@ mod scanner {
         threshold: i32,
         worker_stale_secs: i64,
         telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
+        shard: Option<crate::types::ShardId>,
     ) -> tokio::task::JoinHandle<()> {
         // Issue #797: declare the loop before its first iteration so the
-        // `scanner_liveness` check expects it and grants it boot grace.
-        let owner = crate::scanner_health::register_scanner(
+        // `scanner_liveness` check expects it and grants it boot grace. The
+        // shard is carried so a multi-shard worker's snapshot can name WHICH
+        // shard's reclaimer wedged -- the tick counter carries no shard label.
+        let owner = crate::scanner_health::register_scanner_for_shard(
             &*telemetry.metrics,
             crate::scanner_health::Scanner::PoisonPill,
             interval,
+            shard,
         );
         tokio::spawn(async move {
             loop {

@@ -1897,6 +1897,27 @@ own work counters and its `tracing::error!`, not this heartbeat.
   multi-shard worker, trust the preflight check to catch a single-shard wedge;
   the counter will not.
 
+  The check also **names the shard**, in both the summary and the per-scanner
+  entry, so you can go straight to the unprotected database rather than
+  restarting the whole worker blind:
+
+  ```console
+  $ harvest preflight --output json | jq '.checks[] | select(.name == "scanner_liveness")'
+  {
+    "name": "scanner_liveness",
+    "status": "fail",
+    "summary": "1 of 5 background control loops are stale: timeout (shard 1)",
+    "details": {
+      "scanners": [
+        { "scanner": "timeout", "shard": 1, "verdict": "wedged", "age_secs": 214, ... }
+      ]
+    }
+  }
+  ```
+
+  `shard` is `null` for the process-wide loops (`retention`, `schedule`) and on
+  single-shard deployments, where there is no fan-out to disambiguate.
+
 ### Safe actions
 
 - Restart the worker process. This is the primary remediation: the loops are

@@ -1000,6 +1000,58 @@ fn runbook_cross_links_dashboard() {
     );
 }
 
+/// Issue #797, Codex review: the low-frequency scanner panel is the one an
+/// operator is told to judge `retention` on, because at a short `$__rate_interval`
+/// the hourly janitor's rate line sits indistinguishably near zero. That only
+/// works if the panel's window is longer than retention's **cadence** -- with a
+/// window shorter than one hour, a perfectly healthy janitor contributes zero
+/// increments to most evaluations, so the panel alternates to zero on its own
+/// and the "a bar at zero means wedged" reading is false exactly where it was
+/// supposed to be authoritative.
+///
+/// Pin that the window comfortably exceeds the default hourly cadence.
+#[test]
+fn low_frequency_scanner_panel_window_outlasts_the_retention_cadence() {
+    let dashboard = read_dashboard();
+    let panels = all_panels(&dashboard);
+    let low_frequency: Vec<&Value> = panels
+        .iter()
+        .copied()
+        .filter(|panel| {
+            panel_exprs(panel)
+                .iter()
+                .any(|expr| expr.contains("increase(harvest_scanner_tick_total"))
+        })
+        .collect();
+    assert!(
+        !low_frequency.is_empty(),
+        "the dashboard must carry a low-frequency scanner-tick panel"
+    );
+
+    for panel in low_frequency {
+        for expr in panel_exprs(panel) {
+            if !expr.contains("increase(harvest_scanner_tick_total") {
+                continue;
+            }
+            let window = expr
+                .split_once("harvest_scanner_tick_total[")
+                .and_then(|(_, tail)| tail.split_once(']'))
+                .map(|(window, _)| window)
+                .unwrap_or_else(|| {
+                    panic!("expected a bracketed range window in {expr}");
+                });
+            let hours = window.strip_suffix('h').and_then(|n| n.parse::<u32>().ok());
+            assert!(
+                hours.is_some_and(|hours| hours > 1),
+                "panel {} uses a [{window}] window, which is not longer than the default hourly \
+                 retention cadence -- a healthy janitor would read zero for most of every hour: \
+                 {expr}",
+                panel_name(panel)
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

@@ -3347,6 +3347,7 @@ pub fn spawn_timeout_checker(
     circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
     max_workflow_history_events: Option<u64>,
     session_worker_stale_secs: i64,
+    shard: Option<crate::types::ShardId>,
 ) -> tokio::task::JoinHandle<()> {
     // Issue #797: declare this loop (and the sub-passes it drives) before the
     // first iteration, so the `scanner_liveness` health check knows they are
@@ -3367,7 +3368,14 @@ pub fn spawn_timeout_checker(
         crate::scanner_health::Scanner::ExternalOutbox,
     ]
     .into_iter()
-    .map(|scanner| crate::scanner_health::register_scanner(&*telemetry.metrics, scanner, interval))
+    .map(|scanner| {
+        crate::scanner_health::register_scanner_for_shard(
+            &*telemetry.metrics,
+            scanner,
+            interval,
+            shard,
+        )
+    })
     .collect();
     tokio::spawn(async move {
         loop {

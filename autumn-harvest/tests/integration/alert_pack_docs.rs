@@ -338,6 +338,77 @@ fn retention_alert_uses_mounted_management_api_paths() {
     );
 }
 
+/// Issue #797, Codex review: the scanner tick series is initialized at **zero**
+/// when each loop registers, at spawn time. That is what lets a loop wedging on
+/// its first iteration still page — but it also means a fresh
+/// retention-enabled process exports `harvest_scanner_tick_total{scanner="retention"} = 0`
+/// for the whole first hour, while its hourly janitor sleeps toward its first
+/// pass. Prometheus does not wait for a full `[3h]` history before evaluating
+/// `increase(...)`; two scrapes are enough for it to return `0`, so a bare
+/// `increase(...[3h]) == 0` pages through every healthy startup.
+///
+/// The pack's schema carries no `for:` field (only `mode`/`notes`/`expressions`),
+/// so the hold has to live in the expression. Gating on the counter's **own
+/// value** is the portable form: it needs no `process_start_time_seconds` (which
+/// the metrics exporter does not emit) and no assumption about scrape interval.
+///
+/// Pin it textually — a future "simplify the expression" pass must not drop the
+/// gate and reintroduce a rule that pages on every deploy.
+#[test]
+fn scanner_stalled_retention_expression_cannot_fire_during_the_startup_hour() {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+    let stalled = rules
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some("harvest_scanner_stalled"))
+        .expect("scanner stalled alert must exist");
+    let exprs: Vec<&str> = stalled["prometheus"]["expressions"]
+        .as_array()
+        .expect("scanner stalled alert must carry PromQL expressions")
+        .iter()
+        .filter_map(|expr| expr["expr"].as_str())
+        .collect();
+    let retention = exprs
+        .iter()
+        .find(|expr| expr.contains("scanner=\"retention\""))
+        .expect("scanner stalled alert must carry a retention-specific expression");
+
+    assert!(
+        retention.contains("and max_over_time(harvest_scanner_tick_total{scanner=\"retention\"}"),
+        "the retention expression must gate on the counter having ticked at least once, so the \
+         registration-time zero cannot page through the healthy first hour: {retention}"
+    );
+
+    // The gate must be a FUNCTION result, not a bare selector. PromQL set
+    // operators match on the full label set INCLUDING `__name__`; `increase()`
+    // drops `__name__` while a bare selector keeps it, so
+    // `increase(...) == 0 and harvest_scanner_tick_total{...} > 0` matches
+    // nothing and silently disables the alert. Both sides being functions over
+    // the same selector keeps their label sets identical.
+    let (_, gate) = retention
+        .split_once(" and ")
+        .expect("the retention expression must carry an `and` gate");
+    assert!(
+        !gate.trim_start().starts_with("harvest_scanner_tick_total"),
+        "the gate must not be a bare selector -- it would carry __name__ while the increase() \
+         side does not, so the `and` would match no series and the alert would never fire: {gate}"
+    );
+
+    // The sub-minute loops must NOT carry the gate: they tick within seconds of
+    // registration, so there is no startup window to ride out -- and the gate
+    // would blind the alert to a loop that wedges on iteration one, which is
+    // exactly what initializing the series at zero exists to catch.
+    let sub_minute = exprs
+        .iter()
+        .find(|expr| expr.contains("scanner!=\"retention\""))
+        .expect("scanner stalled alert must carry a sub-minute expression");
+    assert!(
+        !sub_minute.contains("> 0"),
+        "the sub-minute expression must NOT gate on a prior tick -- that would hide a loop that \
+         wedges on its first iteration: {sub_minute}"
+    );
+}
+
 fn read_pack() -> Value {
     let contents = read_doc("docs/alerts/starter-pack-v0.1.0.json");
     serde_json::from_str(&contents).expect("starter alert pack must be valid JSON")

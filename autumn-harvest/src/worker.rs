@@ -15151,13 +15151,17 @@ fn spawn_pause_auto_resumer(
     interval: Duration,
     max_pause_duration: Duration,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    shard: Option<crate::types::ShardId>,
 ) -> tokio::task::JoinHandle<()> {
     // Issue #797: declare the loop before its first iteration so the
-    // `scanner_liveness` check expects it and grants it boot grace.
-    let owner = crate::scanner_health::register_scanner(
+    // `scanner_liveness` check expects it and grants it boot grace. The shard
+    // is carried so a multi-shard worker's snapshot can name WHICH shard's
+    // auto-resumer wedged -- the tick counter carries no shard label.
+    let owner = crate::scanner_health::register_scanner_for_shard(
         &*telemetry.metrics,
         crate::scanner_health::Scanner::PauseAutoResume,
         interval,
+        shard,
     );
     tokio::spawn(async move {
         loop {
@@ -16498,19 +16502,26 @@ impl Worker {
         // tasks/executions on every assigned shard are recovered (fix #3,
         // issue #522). When a ShardedDbPool is available each shard gets its own
         // instance; otherwise the single default pool is used.
+        //
+        // Each pool is paired with the `ShardId` it was resolved from (issue
+        // #797): all N per-shard instances share one `Scanner` label, so the
+        // liveness snapshot needs the id to name WHICH shard is unprotected
+        // when one of them wedges. `None` on the single-pool fallback, where
+        // there is no per-shard fan-out to disambiguate.
         #[cfg(feature = "db")]
-        let shard_pools_for_monitors: Vec<DbPool> = {
+        let shard_pools_for_monitors: Vec<(DbPool, Option<crate::types::ShardId>)> = {
             let assignments = &self.config.shard_assignments;
             match (assignments.is_empty(), self.config.sharded_pool.as_ref()) {
                 (false, Some(sp)) => assignments
                     .iter()
-                    .map(|s| sp.pool_for(*s).clone())
+                    .map(|s| (sp.pool_for(*s).clone(), Some(*s)))
                     .collect(),
-                _ => vec![pool.clone()],
+                _ => vec![(pool.clone(), None)],
             }
         };
         #[cfg(not(feature = "db"))]
-        let shard_pools_for_monitors: Vec<DbPool> = vec![pool.clone()];
+        let shard_pools_for_monitors: Vec<(DbPool, Option<crate::types::ShardId>)> =
+            vec![(pool.clone(), None)];
 
         // Worker-stale threshold mirrors the fleet-health classifier:
         // 2 × heartbeat interval, with a 1 s floor for sub-second intervals.
@@ -16537,7 +16548,7 @@ impl Worker {
         // peer-shard delivery is unchanged.
         let timeout_checkers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|shard_pool| {
+            .map(|(shard_pool, shard)| {
                 crate::timeout::spawn_timeout_checker(
                     shard_pool.clone(),
                     self.shutdown.clone(),
@@ -16549,13 +16560,14 @@ impl Worker {
                     self.registry.circuit_breakers(),
                     self.config.max_workflow_history_events,
                     worker_stale_secs,
+                    *shard,
                 )
             })
             .collect();
 
         let poison_pill_reclaimers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|shard_pool| {
+            .map(|(shard_pool, shard)| {
                 crate::poison_pill::spawn_poison_pill_reclaimer(
                     shard_pool.clone(),
                     self.shutdown.clone(),
@@ -16563,6 +16575,7 @@ impl Worker {
                     self.config.poison_pill_threshold,
                     worker_stale_secs,
                     self.registry.telemetry().clone(),
+                    *shard,
                 )
             })
             .collect();
@@ -16578,7 +16591,7 @@ impl Worker {
         // same interval via `enforce_timeouts_once`).
         let session_slot_reconcilers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|shard_pool| {
+            .map(|(shard_pool, _shard)| {
                 crate::sessions::spawn_session_slot_reconciler(
                     shard_pool.clone(),
                     Arc::clone(&self.session_slots_in_use),
@@ -16589,13 +16602,14 @@ impl Worker {
             .collect();
         let pause_auto_resumers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|shard_pool| {
+            .map(|(shard_pool, shard)| {
                 spawn_pause_auto_resumer(
                     shard_pool.clone(),
                     self.shutdown.clone(),
                     self.config.worker_heartbeat_interval,
                     self.config.max_workflow_pause_duration,
                     self.registry.telemetry().clone(),
+                    *shard,
                 )
             })
             .collect();
