@@ -3465,6 +3465,103 @@ fn adding_a_oneof_branch_keyed_on_a_closed_single_field_object_stays_compatible(
     );
 }
 
+/// A `type` name the engine does not enforce falls through `type_matches` to
+/// `_ => true`, so it accepts EVERY value — it is the universal set, and can be
+/// disjoint from nothing. Comparing the declared names as strings says the
+/// opposite, so the disjointness proof must refuse to read it.
+#[test]
+fn adding_a_branch_typed_with_an_unrecognised_name_is_breaking() {
+    let baseline = json!({"oneOf": [{"type": "string"}]});
+    let current = json!({"oneOf": [{"type": "string"}, {"type": "bogus"}]});
+    assert_breaking(baseline.clone(), current.clone(), ChangeKind::VariantAdded);
+    // The recorded string now matches BOTH branches, and `oneOf` requires
+    // exactly one.
+    assert_oracle_agrees_breaking(&baseline, &current, &json!("x"));
+}
+
+/// The same hole via a multi-name `type` array: one unreadable name is enough to
+/// make the whole set universal.
+#[test]
+fn adding_a_branch_whose_type_array_contains_an_unrecognised_name_is_breaking() {
+    assert_breaking(
+        json!({"oneOf": [{"type": "string"}]}),
+        json!({"oneOf": [{"type": "string"}, {"type": ["integer", "bogus"]}]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// The unreadable name is breaking on EITHER side of the pair, not only when it
+/// is the one being added.
+#[test]
+fn adding_a_branch_beside_an_existing_unrecognised_type_is_breaking() {
+    assert_breaking(
+        json!({"oneOf": [{"type": "bogus"}]}),
+        json!({"oneOf": [{"type": "bogus"}, {"type": "string"}]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// Over-firing guard: the proof must still work for recognised names, or every
+/// untagged enum that gains a variant would be blocked.
+#[test]
+fn adding_a_branch_typed_with_a_recognised_name_stays_compatible() {
+    assert_compatible(
+        json!({"oneOf": [{"type": "string"}]}),
+        json!({"oneOf": [{"type": "string"}, {"type": "integer"}]}),
+    );
+}
+
+/// Over-firing guard: every recognised name must remain provably disjoint from
+/// every other, so the guard reads as a whitelist rather than a blanket refusal.
+#[test]
+fn every_recognised_type_name_still_proves_disjointness() {
+    let names = ["array", "boolean", "integer", "null", "object", "string"];
+    for (i, a) in names.iter().enumerate() {
+        for b in &names[i + 1..] {
+            // `integer` is deliberately widened to cover `number`, so the pair
+            // below is the only one of these that is NOT disjoint; it has its
+            // own coverage elsewhere.
+            assert_compatible(
+                json!({"oneOf": [{"type": a}]}),
+                json!({"oneOf": [{"type": a}, {"type": b}]}),
+            );
+        }
+    }
+}
+
+/// The whitelist is pinned against the ENGINE, not against a copy of itself: a
+/// name the engine stops enforcing must not keep buying a compatible verdict.
+#[test]
+fn the_recognised_type_whitelist_matches_what_the_engine_enforces() {
+    // A value of the WRONG type for `t`: a string for every other name, and a
+    // number for `string` itself.
+    let sample = |t: &str| if t == "string" { json!(1) } else { json!("x") };
+    for t in [
+        "array", "boolean", "integer", "null", "number", "object", "string",
+    ] {
+        assert!(
+            validate_against_schema(&json!({"type": t}), &sample(t)).is_err(),
+            "the differ treats `{t}` as a constraint it can reason about, but the engine \
+             accepted a value of the wrong type for it — the whitelist is stale"
+        );
+    }
+    // And the premise of the fix: an unrecognised name constrains nothing.
+    for v in [
+        json!("x"),
+        json!(1),
+        json!(null),
+        json!({}),
+        json!([]),
+        json!(true),
+    ] {
+        assert!(
+            validate_against_schema(&json!({"type": "bogus"}), &v).is_ok(),
+            "an unrecognised type name must accept every value, which is why it can be \
+             disjoint from nothing"
+        );
+    }
+}
+
 // ── Codex review 9: oneOf overlap from widening an EXISTING branch ───────────
 
 /// `oneOf` requires exactly one match, so widening a branch until it overlaps a
@@ -3703,6 +3800,30 @@ fn declaring_a_property_disjoint_from_the_baselines_extras_is_breaking() {
                "additionalProperties": {"type": "integer"}}),
         ChangeKind::RequiredPropertyAdded,
     );
+}
+
+/// The same site, with an *unreadable* extras type — and the reason the
+/// recognised-name restriction is applied to the compatible-proving direction
+/// ONLY, not inside `type_sets_disjoint` itself.
+///
+/// A baseline `additionalProperties: {"type":"bogus"}` accepts extras of every
+/// type, so a recorded `{"a":"x","b":1}` is valid. Declaring `b` as a string
+/// therefore breaks it. Refusing the disjointness proof here — the way the
+/// compatible-proving direction must — would report this compatible and LOSE a
+/// true break.
+#[test]
+fn declaring_a_property_over_unreadable_baseline_extras_is_still_breaking() {
+    let baseline = json!({"type": "object", "properties": {"a": {"type": "string"}},
+                          "additionalProperties": {"type": "bogus"}});
+    let current = json!({"type": "object",
+                         "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+                         "additionalProperties": {"type": "bogus"}});
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::RequiredPropertyAdded,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"a": "x", "b": 1}));
 }
 
 /// When the new property's type OVERLAPS what the baseline allowed for extras,

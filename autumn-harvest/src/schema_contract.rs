@@ -2750,6 +2750,46 @@ fn type_sets_disjoint(a: &Value, a_root: &Value, b: &Value, b_root: &Value) -> b
     )
 }
 
+/// The `type` names the engine's `type_matches` actually enforces.
+///
+/// Anything else — a typo, a hand-written `"bogus"`, a draft-2020 name — falls
+/// through that match to `_ => true`, so the engine accepts EVERY value for it.
+/// Such a set is the universal set and is therefore disjoint from nothing.
+const RECOGNISED_JSON_TYPES: &[&str] = &[
+    "array", "boolean", "integer", "null", "number", "object", "string",
+];
+
+/// [`type_sets_disjoint`], but refusing the proof when either side names a type
+/// the engine does not enforce.
+///
+/// The distinction is the DIRECTION the proof is used in, and the two callers
+/// genuinely need opposite treatment of an unreadable name:
+///
+/// - Proving disjointness to justify a **compatible** verdict (this function):
+///   an unrecognised name must not qualify. `{"type":"bogus"}` and
+///   `{"type":"string"}` are disjoint as *strings*, but the engine accepts a
+///   recorded string under both, so it matches two `oneOf` branches and is
+///   rejected — a false COMPATIBLE.
+/// - Proving disjointness to justify a **breaking** verdict (the
+///   `additionalProperties` caller, which asks "can no recorded extra satisfy
+///   the newly declared property?"): there an unreadable name means the baseline
+///   accepted extras of every type, so a recorded one really can fail the new
+///   declaration. Refusing the proof there would LOSE a true break.
+///
+/// The unifying rule is that an unreadable type name never buys a COMPATIBLE
+/// verdict, which is why the restriction lives here rather than inside
+/// [`type_sets_disjoint`].
+fn types_disjoint_for_safety(a: &Value, b: &Value, root: &Value) -> bool {
+    let readable = |v: &Value| {
+        let (r, _) = resolve_ref(root, v);
+        r.as_object().and_then(type_set).is_some_and(|s| {
+            s.iter()
+                .all(|t| RECOGNISED_JSON_TYPES.contains(&t.as_str()))
+        })
+    };
+    readable(a) && readable(b) && type_sets_disjoint(a, root, b, root)
+}
+
 /// `true` when no single JSON value can satisfy both branches.
 ///
 /// Used to decide whether a change to an earlier `anyOf` branch can steal
@@ -2758,14 +2798,16 @@ fn type_sets_disjoint(a: &Value, a_root: &Value, b: &Value, b_root: &Value) -> b
 /// `false` and the caller fails closed.
 ///
 /// Two proofs are accepted:
-/// - **Type.** Disjoint `type` sets can share no instance. `integer` is widened
-///   to also cover `number` first, because a recorded integer satisfies both.
+/// - **Type.** Disjoint `type` sets can share no instance, provided every name
+///   in them is one the engine enforces — see [`types_disjoint_for_safety`].
+///   `integer` is widened to also cover `number` first, because a recorded
+///   integer satisfies both.
 /// - **Discriminator.** Two branches pinned at the SAME location to different
 ///   values, per [`discriminators_disjoint`]. Carrying a discriminator each is
 ///   not enough: an internal tag on `tag` beside one on `kind` are both real
 ///   discriminators, and `{"tag":"A","kind":"B"}` satisfies both.
 fn branches_provably_disjoint(a: &Value, b: &Value, root: &Value) -> bool {
-    if type_sets_disjoint(a, root, b, root) {
+    if types_disjoint_for_safety(a, b, root) {
         return true;
     }
     let (_, da) = branch_key(a, root);

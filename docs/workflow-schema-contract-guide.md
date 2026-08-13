@@ -267,6 +267,13 @@ Four are worth knowing before you rely on it:
   its own `oneOf` shape falls into that arm, or into the
   indistinguishable-branches handling below.
 
+  A `type` proof also requires every declared name to be one the engine actually
+  enforces — `array`, `boolean`, `integer`, `null`, `number`, `object`, `string`.
+  A name outside that set accepts *every* value rather than none, so it is
+  disjoint from nothing, and a branch declaring one is never proved disjoint.
+  `schemars` only ever emits the seven, so this can fire only on a hand-written
+  schema.
+
   The mirror-image hazard is covered too: **widening an existing `oneOf` branch**
   until it overlaps a sibling is breaking, because a payload that used to match
   one branch now matches two. Narrowing needs no such check — it cannot create an

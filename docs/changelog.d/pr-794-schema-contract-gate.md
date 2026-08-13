@@ -776,3 +776,36 @@ disabling the memo does not terminate at all. Three over-firing guards ship
 alongside — an unchanged cyclic schema, annotation churn inside one, and a
 recursive definition reached through `properties` from its own cycle landing
 node each stay silent.
+
+### Fifteenth review round
+
+One P2, and the interesting part is where the fix does *not* go.
+
+- **An unrecognised `type` name bought a disjointness proof it cannot support.**
+  The engine's `type_matches` falls through to `_ => true` for any name it does
+  not enforce, so `{"type":"bogus"}` accepts *every* value — it is the universal
+  set. The differ compared declared names as strings, so `bogus` and `string`
+  read as disjoint, and adding such a branch beside an existing string branch was
+  reported compatible; a recorded `"x"` then matches both branches and `oneOf`
+  rejects it.
+
+  The restriction is applied to `branches_provably_disjoint` only, **not** inside
+  `type_sets_disjoint`, because the two callers use the same predicate in
+  opposite directions. Proving disjointness to justify a *compatible* verdict
+  must refuse an unreadable name. Proving it to justify a *breaking* one — the
+  `additionalProperties` caller, asking "can no recorded extra satisfy the newly
+  declared property?" — must keep it: an unreadable extras type means the
+  baseline accepted extras of every type, so a recorded one really can fail the
+  new declaration, and refusing the proof there would lose a true break. The
+  unifying rule is that an unreadable type name never buys a COMPATIBLE verdict.
+
+Two mutants. Bypassing the readability guard fails the three detection tests.
+Moving it into `type_sets_disjoint` — the plausible "simpler" placement —
+initially survived, which showed the site choice was reasoned but unpinned;
+`declaring_a_property_over_unreadable_baseline_extras_is_still_breaking` now
+pins it, and the mutant fails against it. Three over-firing guards ship
+alongside, including one asserting every recognised name still proves
+disjointness against every other, so the change reads as a whitelist rather than
+a blanket refusal. The whitelist itself is pinned against the ENGINE rather than
+against a copy of itself: each name must actually reject a wrong-typed value,
+and `bogus` must accept every value — the premise the fix rests on.
