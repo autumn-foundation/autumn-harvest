@@ -1051,6 +1051,61 @@ fn low_frequency_scanner_panel_window_outlasts_the_retention_cadence() {
     }
 }
 
+/// A scanner panel that groups by `shard` must also *render* it (issue #797).
+///
+/// The `shard` dimension exists so a wedged shard's flat series is
+/// distinguishable from a healthy sibling's advancing one. Grouping by it while
+/// legending only `{{scanner}} @ {{instance}}` renders both series under the
+/// same name, so the legend and tooltip cannot tell them apart -- the series
+/// are separate, but the operator still cannot say which shard stalled.
+#[test]
+fn scanner_panel_legends_render_every_grouped_dimension() {
+    let dashboard = read_dashboard();
+    let panels = all_panels(&dashboard);
+    let mut checked = 0_usize;
+
+    for panel in panels {
+        let targets = panel
+            .get("targets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for target in &targets {
+            let Some(expr) = target.get("expr").and_then(Value::as_str) else {
+                continue;
+            };
+            if !expr.contains("harvest_scanner_tick_total") {
+                continue;
+            }
+            let legend = target
+                .get("legendFormat")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            for dimension in ["scanner", "shard", "instance"] {
+                let grouped = expr.contains(&format!("by ({dimension},"))
+                    || expr.contains(&format!(" {dimension},"))
+                    || expr.contains(&format!(" {dimension})"));
+                if !grouped {
+                    continue;
+                }
+                assert!(
+                    legend.contains(&format!("{{{{{dimension}}}}}")),
+                    "panel {} groups scanner ticks by `{dimension}` but its legend \
+                     `{legend}` does not render it, so two series differing only in \
+                     that dimension are indistinguishable: {expr}",
+                    panel_name(panel)
+                );
+            }
+            checked += 1;
+        }
+    }
+
+    assert!(
+        checked >= 2,
+        "expected both scanner-tick panels to be checked, saw {checked}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

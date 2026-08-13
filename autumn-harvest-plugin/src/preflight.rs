@@ -87,19 +87,20 @@ const DB_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Build a read-only deployment preflight report.
 ///
-/// The in-memory checks are evaluated first and are **always** present in the
-/// report; the database-dependent ones are bounded by [`DB_CHECK_BUDGET`] as a
-/// group. On the happy path the returned checks are identical, and in the same
-/// order, as if they had been awaited inline.
+/// The in-memory checks are **always** present in the report; the
+/// database-dependent ones are bounded by [`DB_CHECK_BUDGET`] as a group. On
+/// the happy path the returned checks are identical, and in the same order, as
+/// if they had been awaited inline.
 pub async fn build_preflight_report(api_state: &HarvestApiState) -> PreflightReport {
     // Evaluated up front, before anything can block: a wedged database must
-    // never be able to hide these.
+    // never be able to hide these. All five read configuration or registry
+    // state that does not age while the DB group runs, so sampling them here
+    // costs nothing in freshness.
     let api_reachability = check_api_reachability(api_state);
     let catalog_consistency = check_catalog_consistency(api_state);
     let retention_visibility = check_retention_visibility(api_state);
     let admin_auth_boundary = check_admin_auth_boundary(api_state);
     let history_ceiling_config = check_history_ceiling_config(api_state);
-    let scanner_liveness = check_scanner_liveness();
 
     let db_checks = tokio::time::timeout(DB_CHECK_BUDGET, async {
         (
@@ -111,6 +112,25 @@ pub async fn build_preflight_report(api_state: &HarvestApiState) -> PreflightRep
         )
     })
     .await;
+
+    // Sampled AFTER the bounded await, unlike the checks above (issue #797).
+    //
+    // Scanner liveness is the one in-memory check whose answer *ages*: it is a
+    // function of wall-clock time since each loop's last tick. Sampling it
+    // before a wait that can legitimately consume the full DB_CHECK_BUDGET
+    // would let a loop cross its staleness threshold *during* that wait and
+    // still be reported healthy in a report whose `observed_at` is stamped
+    // afterwards -- so the first report an operator pulls would omit the very
+    // loop that just stalled. That is most likely under pool exhaustion, which
+    // is both a listed cause of a wedged loop and the reason the DB group is
+    // slow, so the two conditions co-occur precisely when the answer matters.
+    //
+    // This does not weaken the anti-suppression guarantee that put the check
+    // outside the DB group in the first place: `check_scanner_liveness` is
+    // synchronous and touches no pool, and `tokio::time::timeout` always
+    // returns within the budget, so this line is reached whether the DB checks
+    // completed, errored, or timed out.
+    let scanner_liveness = check_scanner_liveness();
 
     let mut checks = Vec::new();
     checks.push(api_reachability);
@@ -1789,6 +1809,42 @@ mod tests {
             remediation.contains("scanner_liveness"),
             "a stalled-DB report must route the operator to the scanner \
              verdict in the same report: {remediation}"
+        );
+    }
+
+    /// Scanner liveness is the one in-memory check whose answer *ages*, so it
+    /// must be sampled **after** the bounded DB group — otherwise a loop that
+    /// crosses its staleness threshold during a slow (up to `DB_CHECK_BUDGET`)
+    /// wait is reported healthy in a report stamped afterwards.
+    ///
+    /// Asserted against the source rather than by driving the clock: the
+    /// staleness floor is 60 s and the registry reads `std::time::Instant`,
+    /// which `tokio`'s paused clock does not virtualize, so a timing test
+    /// would have to sleep for real. This mirrors the anti-drift source scan
+    /// in `scanner_liveness_tests.rs`, and fails if the call is moved back
+    /// above the await.
+    #[test]
+    fn scanner_liveness_is_sampled_after_the_bounded_db_group() {
+        const SOURCE: &str = include_str!("preflight.rs");
+
+        let body_start = SOURCE
+            .find("pub async fn build_preflight_report")
+            .expect("build_preflight_report must exist");
+        let body = &SOURCE[body_start..];
+
+        let db_await = body
+            .find("tokio::time::timeout(DB_CHECK_BUDGET")
+            .expect("the DB group must still be bounded by DB_CHECK_BUDGET");
+        let sample = body
+            .find("let scanner_liveness = check_scanner_liveness();")
+            .expect("the liveness sample must still be bound in this function");
+
+        assert!(
+            sample > db_await,
+            "check_scanner_liveness() must be called AFTER the bounded DB \
+             await so a loop that goes stale during the wait is reported; \
+             it is synchronous and touches no pool, and timeout() always \
+             returns, so moving it later cannot let the DB suppress it",
         );
     }
 

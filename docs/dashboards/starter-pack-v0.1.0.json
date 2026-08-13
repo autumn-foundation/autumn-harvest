@@ -5266,7 +5266,7 @@
             {
               "refId": "A",
               "expr": "sum by (scanner, instance, shard) (rate(harvest_scanner_tick_total[$__rate_interval]))",
-              "legendFormat": "{{scanner}} @ {{instance}}",
+              "legendFormat": "{{scanner}} shard={{shard}} @ {{instance}}",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"
@@ -5318,7 +5318,7 @@
             {
               "refId": "A",
               "expr": "sum by (scanner, instance, shard) (increase(harvest_scanner_tick_total[3h]))",
-              "legendFormat": "{{scanner}} @ {{instance}}",
+              "legendFormat": "{{scanner}} shard={{shard}} @ {{instance}}",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"
