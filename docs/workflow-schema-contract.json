@@ -46,7 +46,8 @@
       "minItems",
       "maxItems",
       "format",
-      "$ref"
+      "$ref",
+      "default"
     ],
     "ignored_annotations": [
       "title",
@@ -55,7 +56,6 @@
       "$schema",
       "$id",
       "examples",
-      "default",
       "deprecated",
       "readOnly",
       "writeOnly"

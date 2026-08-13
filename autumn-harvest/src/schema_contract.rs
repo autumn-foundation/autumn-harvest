@@ -157,6 +157,9 @@ pub enum ChangeKind {
     PropertyBecameRequired,
     /// A required property became optional.
     PropertyBecameOptional,
+    /// The value serde substitutes for an omitted optional key changed, so the
+    /// same recorded JSON now deserializes to a different value.
+    DefaultChanged,
     /// The accepted JSON type set shrank.
     TypeNarrowed,
     /// The accepted JSON type set grew.
@@ -213,6 +216,7 @@ impl ChangeKind {
             Self::PropertyRemoved => "property_removed",
             Self::PropertyBecameRequired => "property_became_required",
             Self::PropertyBecameOptional => "property_became_optional",
+            Self::DefaultChanged => "default_changed",
             Self::TypeNarrowed => "type_narrowed",
             Self::TypeWidened => "type_widened",
             Self::EnumValueRemoved => "enum_value_removed",
@@ -801,6 +805,10 @@ const ANALYSED_KEYWORDS: &[&str] = &[
     "maxItems",
     "format",
     "$ref",
+    // Handled by `diff_serde_default`, which needs the parent's `required` set
+    // to know whether the default is live. Listed here so the fail-closed
+    // sweep does not also flag it on a required field, where it is dead.
+    "default",
 ];
 
 /// Pure annotations: stripped before comparison because no value of theirs can
@@ -812,7 +820,6 @@ const ANNOTATION_KEYWORDS: &[&str] = &[
     "$schema",
     "$id",
     "examples",
-    "default",
     "deprecated",
     "readOnly",
     "writeOnly",
@@ -2040,27 +2047,8 @@ fn diff_properties(
     for name in names {
         let child = format!("{path}/{}", escape_pointer_token(name));
         match (bp.get(name), cp.get(name)) {
-            (None, Some(_)) => {
-                if creq.contains(name) {
-                    diff.push(ctx.delta(
-                        &child,
-                        ChangeKind::RequiredPropertyAdded,
-                        Verdict::Breaking,
-                        format!(
-                            "required property `{name}` added; JSON recorded before this change \
-                             has no such key and fails to deserialize (serde: `missing field \
-                             \\`{name}\\``). Make it `Option<T>` or add `#[serde(default)]` to \
-                             keep in-flight executions replayable"
-                        ),
-                    ));
-                } else {
-                    diff.push(ctx.delta(
-                        &child,
-                        ChangeKind::OptionalPropertyAdded,
-                        Verdict::Compatible,
-                        format!("optional property `{name}` added"),
-                    ));
-                }
+            (None, Some(added)) => {
+                diff_property_added(ctx, name, added, bo, creq.contains(name), &child, diff);
             }
             (Some(_), None) => {
                 let extra = if deny_unknown {
@@ -2099,6 +2087,15 @@ fn diff_properties(
                     )),
                     _ => {}
                 }
+                diff_serde_default(
+                    ctx,
+                    name,
+                    b,
+                    c,
+                    &child,
+                    !breq.contains(name) && !creq.contains(name),
+                    diff,
+                );
                 diff_node(ctx, b, c, &child, depth + 1, diff);
             }
             // Named only by `required`, with no `properties` entry on either
@@ -2106,6 +2103,115 @@ fn diff_properties(
             (None, None) => diff_bare_required(ctx, name, &child, &breq, &creq, diff),
         }
     }
+}
+
+/// Classify a property the baseline did not declare.
+///
+/// Required is the obvious break. The subtle one is the *optional* case: serde
+/// IGNORES an undeclared key but PARSES a declared one, so a recorded payload
+/// that carried this key as an extra now has it type-checked. That is only
+/// provable when the baseline declared what an extra had to be — see the
+/// "limits" section of `docs/workflow-schema-contract-guide.md` for why a
+/// fully open object stays compatible.
+fn diff_property_added(
+    ctx: &DiffCtx<'_>,
+    name: &str,
+    added: &Value,
+    bo: &Map<String, Value>,
+    now_required: bool,
+    child: &str,
+    diff: &mut SchemaContractDiff,
+) {
+    if now_required {
+        diff.push(ctx.delta(
+            child,
+            ChangeKind::RequiredPropertyAdded,
+            Verdict::Breaking,
+            format!(
+                "required property `{name}` added; JSON recorded before this change has no such \
+                 key and fails to deserialize (serde: `missing field \\`{name}\\``). Make it \
+                 `Option<T>` or add `#[serde(default)]` to keep in-flight executions replayable"
+            ),
+        ));
+        return;
+    }
+    if let Some(extras) = bo
+        .get("additionalProperties")
+        .filter(|v| v.is_object())
+        .filter(|extras| type_sets_disjoint(extras, ctx.base_root, added, ctx.cur_root))
+    {
+        diff.push(ctx.delta(
+            child,
+            ChangeKind::RequiredPropertyAdded,
+            Verdict::Breaking,
+            format!(
+                "optional property `{name}` added, but the baseline declared undeclared keys as \
+                 `{extras}` and the new type shares no JSON type with that. Serde ignores an \
+                 undeclared key and PARSES a declared one, so a recorded `{name}` that was \
+                 previously carried along as an extra now fails to deserialize"
+            ),
+        ));
+        return;
+    }
+    diff.push(ctx.delta(
+        child,
+        ChangeKind::OptionalPropertyAdded,
+        Verdict::Compatible,
+        format!("optional property `{name}` added"),
+    ));
+}
+
+/// Compare the `default` serde will substitute for an omitted key.
+///
+/// `default` is a pure annotation to a *validator* — no value of it changes
+/// whether a payload validates — which is why it used to be stripped outright.
+/// It is not an annotation to *serde*: `#[serde(default = "retries")]` leaves
+/// the field optional and records the computed fallback here (probed against
+/// `schemars` 0.8.22, which emits `"default": 3` for a `retries()` returning
+/// `3`). Change the function to return `5` and every recorded payload that
+/// omitted the key deserializes to a different value — the same JSON, a
+/// different meaning, and previously invisible because both revisions had the
+/// key stripped before comparison.
+///
+/// `live` is what keeps this from firing on documentation. serde consults the
+/// default only for a key a recorded payload could have omitted and the new
+/// type still accepts as absent, so the caller passes "optional on BOTH sides".
+/// A `default` beside a required key is dead — nothing omits it — and a key
+/// that only just became optional was required when the payloads were written,
+/// so none of them omitted it either.
+fn diff_serde_default(
+    ctx: &DiffCtx<'_>,
+    name: &str,
+    base: &Value,
+    cur: &Value,
+    path: &str,
+    live: bool,
+    diff: &mut SchemaContractDiff,
+) {
+    if !live {
+        return;
+    }
+    let (b, c) = (
+        base.as_object().and_then(|o| o.get("default")),
+        cur.as_object().and_then(|o| o.get("default")),
+    );
+    if b == c {
+        return;
+    }
+    let describe = |v: Option<&Value>| v.map_or_else(|| "absent".to_string(), Value::to_string);
+    diff.push(ctx.delta(
+        path,
+        ChangeKind::DefaultChanged,
+        Verdict::Breaking,
+        format!(
+            "the default substituted for an omitted `{name}` changed from {} to {}; recorded JSON \
+             that omitted the key still deserializes, but the workflow now observes a different \
+             value than it did when the payload was written. Acknowledge it if no in-flight \
+             execution can have omitted the key",
+            describe(b),
+            describe(c)
+        ),
+    ));
 }
 
 /// Compare a key named only by `required`, with no `properties` entry.
@@ -2143,11 +2249,19 @@ fn diff_bare_required(
 
 /// Rank on the `additionalProperties` lattice: `absent/true` (2) accepts more
 /// than a schema (1), which accepts more than `false` (0).
+///
+/// A value that is neither a boolean nor an object is not a schema, and a
+/// validator ignores it — so it constrains nothing and ranks with `true`, not
+/// with a real schema. Ranking it as a schema hid a genuine restriction:
+/// correcting `"additionalProperties": "oops"` to `{"type":"string"}` left both
+/// revisions at rank 1, so no delta was emitted even though every recorded
+/// non-string extra is newly rejected. The recursion below is already guarded
+/// on `is_object`, so it cannot descend into the malformed side either.
 fn additional_properties_rank(obj: &Map<String, Value>) -> u8 {
     match obj.get("additionalProperties") {
-        None | Some(Value::Bool(true)) => 2,
         Some(Value::Bool(false)) => 0,
-        Some(_) => 1,
+        Some(Value::Object(_)) => 1,
+        None | Some(_) => 2,
     }
 }
 
@@ -2261,12 +2375,69 @@ fn diff_items(
 /// the first unit variant shifts every existing branch and a positional diff
 /// reports a false-positive storm.
 ///
-/// Returns `(key, is_discriminated)`. A discriminated branch carries a variant
-/// tag, which proves it is disjoint from its siblings — the condition under
-/// which adding a `oneOf` branch is safe.
-/// Identity key for a `oneOf`/`anyOf` branch, plus whether the branch is
-/// provably *discriminated* (so adding a sibling cannot make previously-valid
-/// data ambiguous under `oneOf`'s exactly-one rule).
+/// What pins a `oneOf`/`anyOf` branch to a distinguishable shape.
+///
+/// Held structurally rather than as a boolean because disjointness is a
+/// property of a *pair* of branches, not of one branch alone: two branches can
+/// each carry a discriminator and still overlap. An internal tag on `tag` and
+/// an internal tag on `kind` are each a real discriminator, yet the recorded
+/// payload `{"tag":"A","kind":"B"}` satisfies both. Only [`Discriminator`]s
+/// that pin the **same** location to different values prove a value cannot
+/// satisfy both — see [`discriminators_disjoint`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Discriminator {
+    /// Internally tagged: required property `name` pinned to a single `value`.
+    Tag { name: String, value: Value },
+    /// A singleton `enum`, which pins the ENTIRE instance to one value.
+    Unit(Value),
+    /// serde's externally-tagged `{"Variant": payload}` shape: `name` is the
+    /// single required and single declared property, under
+    /// `additionalProperties: false`. The closed object is what makes the proof
+    /// hold — it is why each branch rejects every sibling's required key.
+    Variant(String),
+    /// Nothing readable pins this branch.
+    None,
+}
+
+/// `true` when no single JSON value can satisfy both discriminators.
+///
+/// Deliberately answers only for **same-kind** pairs. A cross-kind pair
+/// (an internal tag beside an externally-tagged variant, say) can overlap
+/// whenever the tag name coincides with the variant name, and a unit `enum`
+/// holding an object can coincide with either — so the proof is refused and
+/// the caller falls back to the type check or fails closed. Real serde enums
+/// are homogeneous in representation, and the mixed shape schemars *does*
+/// emit — unit variants beside struct variants in an externally-tagged enum —
+/// is already separated by the `type` check that runs first (`string` against
+/// `object`), so refusing here costs no derived schema.
+fn discriminators_disjoint(a: &Discriminator, b: &Discriminator) -> bool {
+    match (a, b) {
+        // Same tag location, different pinned value: no single value carries
+        // two values at one key. Different locations prove nothing — a payload
+        // can carry both keys. Probed against `schemars` 0.8.22: a real
+        // `#[serde(tag = "…")]` enum emits the SAME tag name on every branch,
+        // so demanding it costs no derived schema.
+        (
+            Discriminator::Tag {
+                name: na,
+                value: va,
+            },
+            Discriminator::Tag {
+                name: nb,
+                value: vb,
+            },
+        ) => na == nb && va != vb,
+        // A singleton `enum` pins the whole instance, so two different ones
+        // cannot share a value.
+        (Discriminator::Unit(x), Discriminator::Unit(y)) => x != y,
+        // Both branches are closed objects declaring exactly their own variant
+        // key, so each rejects the other's required key as undeclared.
+        (Discriminator::Variant(x), Discriminator::Variant(y)) => x != y,
+        _ => false,
+    }
+}
+
+/// Identity key for a `oneOf`/`anyOf` branch, plus what pins it.
 ///
 /// `root` is the document the branch came from: a branch is resolved through
 /// `$ref` **before** it is keyed, so a bare `{"$ref": "#/definitions/Inner"}`
@@ -2274,10 +2445,10 @@ fn diff_items(
 /// that, `T` -> `Option<T>` in schemars' non-primitive form
 /// (`{"anyOf":[{"$ref":…},{"type":"null"}]}`) would read as "the object variant
 /// was removed" — a false breaking verdict on the single most common widening.
-fn branch_key(branch: &Value, root: &Value) -> (String, bool) {
+fn branch_key(branch: &Value, root: &Value) -> (String, Discriminator) {
     let (branch, _) = resolve_ref(root, branch);
     let Some(obj) = branch.as_object() else {
-        return (branch.to_string(), false);
+        return (branch.to_string(), Discriminator::None);
     };
     let req = required_set(obj);
     // Internally tagged: a property pinned to a single `enum`/`const` value.
@@ -2297,7 +2468,15 @@ fn branch_key(branch: &Value, root: &Value) -> (String, bool) {
                 }
             });
             if let Some(t) = tag {
-                return (format!("tag:{name}={t}"), req.contains(name));
+                let d = if req.contains(name) {
+                    Discriminator::Tag {
+                        name: name.clone(),
+                        value: t.clone(),
+                    }
+                } else {
+                    Discriminator::None
+                };
+                return (format!("tag:{name}={t}"), d);
             }
         }
     }
@@ -2305,25 +2484,32 @@ fn branch_key(branch: &Value, root: &Value) -> (String, bool) {
     if let Some(vals) = obj.get("enum").and_then(Value::as_array)
         && vals.len() == 1
     {
-        return (format!("unit:{}", vals[0]), true);
+        return (
+            format!("unit:{}", vals[0]),
+            Discriminator::Unit(vals[0].clone()),
+        );
     }
-    // Externally tagged: `{"Variant": payload}` — exactly one required property
-    // AND exactly one declared property, which is what `serde` emits for this
-    // representation. Requiring both is what separates a real variant from an
-    // ordinary struct that merely happens to have a single mandatory field:
-    // two such structs are NOT disjoint (`{"id":…,"name":…}` satisfies both),
-    // so keying them as discriminated variants would call an added `oneOf`
-    // branch compatible when it can reject previously-valid data.
+    // Externally tagged: `{"Variant": payload}` — exactly one required property,
+    // exactly one declared property, and `additionalProperties: false`, which
+    // together are what `schemars` emits for this representation (probed
+    // against 0.8.22).
     //
-    // Disjointness here rests on `serde`'s own externally-tagged *serializer*
-    // emitting exactly one key, so a payload already in `harvest_events` cannot
-    // match two variant branches at once.
+    // All three are load-bearing for the disjointness proof, which is that each
+    // branch REJECTS every sibling's required key. Without the closed object an
+    // ordinary one-required-field struct qualifies, and two of those are not
+    // disjoint at all: `{"id":…,"name":…}` satisfies both `{required:["id"]}`
+    // and `{required:["name"]}` as an undeclared extra. Reading the closure
+    // from the schema replaces an earlier argument from serde's *serializer*
+    // emitting one key — true of data serde wrote, but the gate also accepts
+    // hand-written schemas (`with_input_schema_fn`) and JSON arriving over
+    // `POST /workflows/{name}/start`.
     let prop_count = obj
         .get("properties")
         .and_then(Value::as_object)
         .map_or(0, Map::len);
+    let closed = obj.get("additionalProperties").and_then(Value::as_bool) == Some(false);
     // The KEY is the single required property's name alone; only the
-    // *discriminated* flag also demands that it is the only declared property.
+    // *discriminator* also demands the object be closed around it.
     //
     // Folding `prop_count` into the key made the key unstable under a
     // compatible edit: a one-required-field struct behind `Option<T>` that
@@ -2333,17 +2519,46 @@ fn branch_key(branch: &Value, root: &Value) -> (String, bool) {
     if req.len() == 1
         && let Some(name) = req.iter().next()
     {
-        return (format!("variant:{name}"), prop_count == 1);
+        let d = if prop_count == 1 && closed {
+            Discriminator::Variant(name.clone())
+        } else {
+            Discriminator::None
+        };
+        return (format!("variant:{name}"), d);
     }
     // Only reachable for an *unresolvable* `$ref` (external, or a dangling
     // local pointer): `resolve_ref` above already inlined every resolvable one.
     if let Some(r) = obj.get("$ref").and_then(Value::as_str) {
-        return (format!("ref:{r}"), false);
+        return (format!("ref:{r}"), Discriminator::None);
     }
     if let Some(ts) = type_set(obj) {
-        return (format!("type:{}", join_sorted(&ts)), false);
+        return (format!("type:{}", join_sorted(&ts)), Discriminator::None);
     }
-    (branch.to_string(), false)
+    (branch.to_string(), Discriminator::None)
+}
+
+/// `true` when the two schemas' declared `type` sets cannot share an instance.
+///
+/// Each side is resolved against **its own** root, so a baseline node and a
+/// current node can be compared without a `$ref` in one accidentally resolving
+/// against the other's `definitions`. `integer` is widened to also cover
+/// `number`, because a recorded integer satisfies both.
+///
+/// Returns `false` — proves nothing — whenever either side has no readable
+/// `type`, which is what keeps every caller failing closed.
+fn type_sets_disjoint(a: &Value, a_root: &Value, b: &Value, b_root: &Value) -> bool {
+    let widened = |v: &Value, root: &Value| -> Option<BTreeSet<String>> {
+        let (r, _) = resolve_ref(root, v);
+        let mut set = type_set(r.as_object()?)?;
+        if set.contains("integer") {
+            set.insert("number".to_string());
+        }
+        Some(set)
+    };
+    matches!(
+        (widened(a, a_root), widened(b, b_root)),
+        (Some(x), Some(y)) if x.is_disjoint(&y)
+    )
 }
 
 /// `true` when no single JSON value can satisfy both branches.
@@ -2356,26 +2571,17 @@ fn branch_key(branch: &Value, root: &Value) -> (String, bool) {
 /// Two proofs are accepted:
 /// - **Type.** Disjoint `type` sets can share no instance. `integer` is widened
 ///   to also cover `number` first, because a recorded integer satisfies both.
-/// - **Variant tag.** Two branches that are each *discriminated* (a required
-///   internal tag, a unit `enum`, or serde's externally-tagged single-key
-///   shape) with different keys cannot both match one payload.
+/// - **Discriminator.** Two branches pinned at the SAME location to different
+///   values, per [`discriminators_disjoint`]. Carrying a discriminator each is
+///   not enough: an internal tag on `tag` beside one on `kind` are both real
+///   discriminators, and `{"tag":"A","kind":"B"}` satisfies both.
 fn branches_provably_disjoint(a: &Value, b: &Value, root: &Value) -> bool {
-    let widened = |v: &Value| -> Option<BTreeSet<String>> {
-        let (r, _) = resolve_ref(root, v);
-        let mut set = type_set(r.as_object()?)?;
-        if set.contains("integer") {
-            set.insert("number".to_string());
-        }
-        Some(set)
-    };
-    if let (Some(x), Some(y)) = (widened(a), widened(b))
-        && x.is_disjoint(&y)
-    {
+    if type_sets_disjoint(a, root, b, root) {
         return true;
     }
-    let (ka, da) = branch_key(a, root);
-    let (kb, db) = branch_key(b, root);
-    da && db && ka != kb
+    let (_, da) = branch_key(a, root);
+    let (_, db) = branch_key(b, root);
+    discriminators_disjoint(&da, &db)
 }
 
 /// A change kind that alters WHICH instances a schema matches.
@@ -2537,7 +2743,7 @@ fn diff_anyof_branch_order(
 /// depends on.
 struct KeyedBranches {
     base_by_key: BTreeMap<String, Value>,
-    cur_by_key: BTreeMap<String, (Value, bool)>,
+    cur_by_key: BTreeMap<String, (Value, Discriminator)>,
     cur_keys: Vec<String>,
 }
 
@@ -2562,7 +2768,7 @@ fn key_branches(
         .iter()
         .map(|b| branch_key(b, ctx.base_root).0)
         .collect();
-    let cur_keyed: Vec<(String, bool)> = cur_branches
+    let cur_keyed: Vec<(String, Discriminator)> = cur_branches
         .iter()
         .map(|b| branch_key(b, ctx.cur_root))
         .collect();
@@ -2576,7 +2782,7 @@ fn key_branches(
         .into_iter()
         .zip(base_branches.iter().cloned())
         .collect();
-    let cur_by_key: BTreeMap<String, (Value, bool)> = cur_keyed
+    let cur_by_key: BTreeMap<String, (Value, Discriminator)> = cur_keyed
         .into_iter()
         .zip(cur_branches.iter().cloned())
         .map(|((k, d), b)| (k, (b, d)))
@@ -2635,19 +2841,25 @@ fn diff_branches(
         return;
     }
 
-    // Branches that follow `key` in the CURRENT declaration order, for the
-    // first-match rebind guard below.
-    let later_than = |key: &str| -> Vec<Value> {
-        cur_keys
-            .iter()
-            .position(|k| k == key)
-            .map(|i| {
-                cur_keys[i + 1..]
-                    .iter()
-                    .filter_map(|k| cur_by_key.get(k).map(|(v, _)| v.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
+    // Which siblings a change to `key` has to be checked against.
+    //
+    // For `anyOf` the binding rule is FIRST match, so only the branches
+    // declared AFTER this one can lose data to it. For `oneOf` the rule is
+    // EXACTLY one match and order is irrelevant, so overlapping with any
+    // sibling in either direction rejects the payload.
+    let rivals_of = |key: &str| -> Vec<Value> {
+        let Some(i) = cur_keys.iter().position(|k| k == key) else {
+            return Vec::new();
+        };
+        let range: Vec<&String> = if cur_kw == "anyOf" {
+            cur_keys[i + 1..].iter().collect()
+        } else {
+            cur_keys.iter().filter(|k| *k != &cur_keys[i]).collect()
+        };
+        range
+            .into_iter()
+            .filter_map(|k| cur_by_key.get(k).map(|(v, _)| v.clone()))
+            .collect()
     };
 
     for (key, b) in &base_by_key {
@@ -2656,7 +2868,7 @@ fn diff_branches(
                 ctx,
                 b,
                 c,
-                &later_than(key),
+                &rivals_of(key),
                 cur_kw == "anyOf",
                 path,
                 &format!("{path}/<{}>", key.replace('/', "~1")),
@@ -2689,7 +2901,7 @@ fn diff_branches(
 fn diff_added_branches(
     ctx: &DiffCtx<'_>,
     base_by_key: &BTreeMap<String, Value>,
-    cur_by_key: &BTreeMap<String, (Value, bool)>,
+    cur_by_key: &BTreeMap<String, (Value, Discriminator)>,
     cur_keys: &[String],
     cur_kw: &str,
     path: &str,
@@ -2705,9 +2917,18 @@ fn diff_added_branches(
         .rposition(|k| base_by_key.contains_key(k))
         .unwrap_or(0);
     // Disjointness is a property of the WHOLE branch set, not of the added
-    // branch — see the comment on the compatible arm below.
-    let all_discriminated = cur_by_key.values().all(|(_, d)| *d);
-    for (key, (_, discriminated)) in cur_by_key {
+    // branch — see the comment on the compatible arm below. It is also a
+    // property of each PAIR: two branches can each carry a discriminator and
+    // still overlap (an internal tag on `tag` beside one on `kind`, where
+    // `{"tag":"A","kind":"B"}` matches both), so every pair is checked rather
+    // than reducing each branch to a boolean.
+    let branches: Vec<&Value> = cur_by_key.values().map(|(v, _)| v).collect();
+    let pairwise_disjoint = branches.iter().enumerate().all(|(i, x)| {
+        branches[i + 1..]
+            .iter()
+            .all(|y| branches_provably_disjoint(x, y, ctx.cur_root))
+    });
+    for (key, (branch, _)) in cur_by_key {
         if base_by_key.contains_key(key) {
             continue;
         }
@@ -2740,11 +2961,11 @@ fn diff_added_branches(
         // is narrow, not that the branches it now sits beside are. Adding the
         // singleton `{"enum":["x"]}` next to a broad `{"type":"string"}` makes
         // the recorded value `"x"` match two branches. Disjointness is only
-        // established when EVERY branch is discriminated — that is serde's
-        // externally-tagged shape, where the serializer emits exactly one
-        // variant key, so a recorded payload matches exactly one branch however
-        // many variants are added. `oneOf` binding does not depend on order.
-        if cur_kw == "anyOf" || all_discriminated {
+        // established when EVERY PAIR of branches is provably disjoint — that
+        // is serde's tagged shapes, where a recorded payload matches exactly
+        // one branch however many variants are added. `oneOf` binding does not
+        // depend on order.
+        if cur_kw == "anyOf" || pairwise_disjoint {
             diff.push(ctx.delta(
                 path,
                 ChangeKind::VariantAdded,
@@ -2752,12 +2973,17 @@ fn diff_added_branches(
                 format!("variant `{key}` added"),
             ));
         } else {
-            let why = if *discriminated {
-                "at least one EXISTING branch of this `oneOf` carries no variant tag, so the \
-                 added branch is not provably disjoint from it"
+            let added_overlaps = branches.iter().any(|o| {
+                !std::ptr::eq(*o, branch) && !branches_provably_disjoint(branch, o, ctx.cur_root)
+            });
+            let why = if added_overlaps {
+                "the added branch is not provably disjoint from an existing branch — either it \
+                 carries no variant tag, or its tag pins a DIFFERENT location than theirs (a \
+                 payload can carry both keys at once)"
             } else {
-                "the added branch carries no variant tag proving it is disjoint from the existing \
-                 branches"
+                "two EXISTING branches of this `oneOf` are not provably disjoint from each other, \
+                 so adding a branch cannot be shown to keep every recorded payload matching \
+                 exactly one"
             };
             diff.push(ctx.delta(
                 path,
@@ -2782,17 +3008,25 @@ fn diff_added_branches(
 /// `{"b": …}` that used to bind to variant B match branch 0 and bind to
 /// variant A: it still deserializes, it just means something else.
 ///
-/// `later` is the branches that follow this one in the CURRENT declaration
-/// order — the ones it can steal from. When this branch is provably disjoint
-/// from all of them, no instance can move either way and the change is judged
-/// on its own merits. Nothing is reported for `oneOf`, whose exactly-one rule
-/// makes binding order irrelevant, nor for the final branch.
+/// `oneOf` has the mirror-image hazard. Order is irrelevant there, but the
+/// rule is EXACTLY one match, so **widening** a branch until it overlaps a
+/// sibling turns a payload that used to match one branch into one that matches
+/// two — and is rejected. Baseline branches `{"maximum":0}` and `{"minimum":1}`
+/// accept a recorded `1` exactly once; relaxing the first to `{"maximum":2}` is
+/// a compatible-looking bound relaxation that makes `1` invalid. Narrowing
+/// needs no guard: it cannot create an overlap, and the payloads it drops are
+/// already reported by the narrowing itself.
+///
+/// `rivals` is whichever set applies — the branches declared after this one for
+/// `anyOf`, every other branch for `oneOf`. When this branch is provably
+/// disjoint from all of them, no instance can move either way and the change is
+/// judged on its own merits.
 #[allow(clippy::too_many_arguments)]
 fn diff_branch_guarding_rebind(
     ctx: &mut DiffCtx<'_>,
     base: &Value,
     cur: &Value,
-    later: &[Value],
+    rivals: &[Value],
     is_anyof: bool,
     path: &str,
     sub_path: &str,
@@ -2803,7 +3037,7 @@ fn diff_branch_guarding_rebind(
     let before_stored = diff.deltas.len();
     diff_node(ctx, base, cur, sub_path, depth + 1, diff);
 
-    if !is_anyof || later.is_empty() {
+    if rivals.is_empty() {
         return;
     }
     let emitted = (diff.breaking_count + diff.compatible_count) - before_total;
@@ -2832,22 +3066,36 @@ fn diff_branch_guarding_rebind(
     {
         return;
     }
-    if later
+    // Under `oneOf` only a WIDENING can create an overlap, and a branch that
+    // already reported a breaking narrowing needs no second verdict. A delta
+    // dropped by the storage cap is unreadable, so `all_stored` decides
+    // conservatively that the change might have widened.
+    if !is_anyof && all_stored && stored.iter().any(|d| d.verdict == Verdict::Breaking) {
+        return;
+    }
+    if rivals
         .iter()
         .all(|l| branches_provably_disjoint(cur, l, cur_root))
     {
         return;
     }
+    let why = if is_anyof {
+        "of this `anyOf` changed what it matches, and it is not provably disjoint from a branch \
+         declared after it. For `#[serde(untagged)]` serde binds the FIRST matching variant, so \
+         recorded data can be silently REBOUND to a different variant — it still deserializes, \
+         but it no longer means the same thing"
+    } else {
+        "of this `oneOf` widened what it matches, and it is not provably disjoint from a sibling \
+         branch. `oneOf` requires EXACTLY one match, so a recorded payload that used to match \
+         this branch alone can now match two and be rejected"
+    };
     diff.push(ctx.delta(
         path,
         ChangeKind::UnanalysedConstraintChanged,
         Verdict::Breaking,
         format!(
-            "branch `{sub_path}` of this `anyOf` changed what it matches, and it is not provably \
-             disjoint from a branch declared after it. For `#[serde(untagged)]` serde binds the \
-             FIRST matching variant, so recorded data can be silently REBOUND to a different \
-             variant — it still deserializes, but it no longer means the same thing. Acknowledge \
-             it if the branches are disjoint on grounds the differ cannot see"
+            "branch `{sub_path}` {why}. Acknowledge it if the branches are disjoint on grounds \
+             the differ cannot see"
         ),
     ));
 }
@@ -3036,20 +3284,70 @@ mod tests {
     }
 
     #[test]
-    fn branch_key_is_stable_and_marks_discriminated_branches() {
+    fn branch_key_is_stable_and_reads_the_discriminator() {
         let root = json!({});
         let (k, d) = branch_key(&json!({"type":"string","enum":["C"]}), &root);
         assert_eq!(k, "unit:\"C\"");
-        assert!(d);
+        assert_eq!(d, Discriminator::Unit(json!("C")));
+
+        // Serde's externally-tagged shape: the closed object is what makes each
+        // branch reject its siblings' key.
+        let (k, d) = branch_key(
+            &json!({"type":"object","required":["A"],"properties":{"A":{}},
+                    "additionalProperties":false}),
+            &root,
+        );
+        assert_eq!(k, "variant:A");
+        assert_eq!(d, Discriminator::Variant("A".to_string()));
+
+        // The same shape left OPEN keys identically — the key must stay stable
+        // under a compatible edit — but proves nothing: `{"A":…,"B":…}` also
+        // satisfies a sibling requiring `B`.
         let (k, d) = branch_key(
             &json!({"type":"object","required":["A"],"properties":{"A":{}}}),
             &root,
         );
         assert_eq!(k, "variant:A");
-        assert!(d);
+        assert_eq!(d, Discriminator::None);
+
         let (k, d) = branch_key(&json!({"type":"integer"}), &root);
         assert_eq!(k, "type:integer");
-        assert!(!d, "an untagged scalar branch is not provably disjoint");
+        assert_eq!(
+            d,
+            Discriminator::None,
+            "an untagged scalar branch is not provably disjoint"
+        );
+    }
+
+    #[test]
+    fn a_tag_proves_disjointness_only_at_the_same_key() {
+        let tag = |name: &str, v: &str| Discriminator::Tag {
+            name: name.to_string(),
+            value: json!(v),
+        };
+        assert!(
+            discriminators_disjoint(&tag("kind", "A"), &tag("kind", "B")),
+            "same key, different values: no payload carries both"
+        );
+        assert!(
+            !discriminators_disjoint(&tag("tag", "A"), &tag("kind", "B")),
+            "different keys prove nothing — `{{\"tag\":\"A\",\"kind\":\"B\"}}` satisfies both"
+        );
+        assert!(!discriminators_disjoint(
+            &tag("kind", "A"),
+            &tag("kind", "A")
+        ));
+        // Cross-kind pairs are refused: a tag key can coincide with a variant
+        // name. The `type` check runs first and covers the mixed shape
+        // `schemars` really emits (a unit variant beside a struct variant).
+        assert!(!discriminators_disjoint(
+            &tag("A", "x"),
+            &Discriminator::Variant("B".to_string())
+        ));
+        assert!(!discriminators_disjoint(
+            &Discriminator::None,
+            &Discriminator::Variant("B".to_string())
+        ));
     }
 
     #[test]

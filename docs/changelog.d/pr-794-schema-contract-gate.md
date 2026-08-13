@@ -487,3 +487,88 @@ reproduces the Windows condition on Unix with `ulimit -s 1024` (that bounds the
 main thread only, so it passes exactly when `main` sizes its own). Confirmed
 red before the fix with `thread 'main' has overflowed its stack / fatal runtime
 error: stack overflow, aborting`, and green after.
+
+### Eighth and ninth review rounds
+
+Five findings, all valid, all narrowing the gate (each removes a
+false-COMPATIBLE — a change that could break replay and merged clean). Two of
+them were only provable because `schemars` 0.8.22 was probed directly rather
+than assumed, and that probe is what kept the fixes from costing any derived
+schema.
+
+- **A `oneOf` branch tagged at a DIFFERENT key was treated as disjoint.**
+  Disjointness was decided by comparing branch *identity strings* and accepting
+  any difference, so an internal tag on `tag` beside one on `kind` read as
+  provably disjoint. They are not: `{"tag":"A","kind":"B"}` satisfies both, and
+  `oneOf` requires exactly one match, so that recorded payload — valid against
+  an open one-branch baseline — is newly rejected. A discriminator is now held
+  structurally (`Discriminator::{Tag, Unit, Variant, None}`) and a tag proves
+  disjointness only when both branches pin the **same** key to different
+  values. Probed: a real `#[serde(tag = "…")]` enum emits the same tag name on
+  every branch, so this costs no derived schema.
+- **An OPEN single-required-field object was treated as an externally-tagged
+  variant.** Two of those are not disjoint either — `{"A":…,"B":…}` satisfies
+  both, each treating the other's key as an undeclared extra. The proof now
+  requires `additionalProperties: false`, which the probe confirms `schemars`
+  emits for externally-tagged enums. This replaces an earlier argument from
+  serde's *serializer* emitting one key: true of data serde wrote, but the gate
+  also accepts hand-written schemas and JSON arriving over
+  `POST /workflows/{name}/start`. Three existing tests were correcting-not-
+  weakening casualties: their fixtures modelled the shape *without* the closure
+  and so asserted a verdict that was wrong; they now use a shared `variant()`
+  helper that emits what `schemars` actually does.
+- **Disjointness is a property of every PAIR, not of each branch.** The
+  all-branches-carry-a-tag boolean was replaced by a pairwise check, which is
+  what the first finding above actually requires.
+- **Widening an EXISTING `oneOf` branch skipped the overlap guard entirely.**
+  The guard returned early for anything that was not `anyOf`. Baseline branches
+  `{"maximum":0}` and `{"minimum":1}` accept a recorded `1` exactly once;
+  relaxing the first to `{"maximum":2}` reads as a compatible bound relaxation
+  in isolation while making `1` match both branches and be rejected. `oneOf`
+  now checks a widening against **every** sibling (order is irrelevant there,
+  unlike `anyOf`'s first-match rule, which still checks only later branches).
+  Narrowing is deliberately exempt: it cannot create an overlap, and the
+  payloads it drops are already reported by the narrowing itself.
+- **`default` was stripped as an annotation.** It is one to a *validator* — no
+  value of it changes whether a payload validates — but not to *serde*.
+  `#[serde(default = "retries")]` leaves the field optional and records the
+  computed fallback there (probed: `"default": 3`). Change the function to
+  return `5` and every recorded payload that omitted the key deserializes to a
+  different value: same JSON, different meaning, and invisible because both
+  revisions had the key stripped before comparison. `default` is now compared
+  where serde would actually substitute it — beside a key optional on **both**
+  sides. One beside a required key, or on a root or array-item schema, is never
+  substituted and stays silent, so documentation edits still produce no deltas.
+- **A malformed `additionalProperties` ranked as a real schema.** A value that
+  is neither a boolean nor an object is ignored by a validator, so it
+  constrains nothing and belongs with `true` on the lattice, not with a schema.
+  Ranking it as a schema meant correcting `"additionalProperties": "oops"` to
+  `{"type":"string"}` left both revisions at the same rank and emitted nothing,
+  while every recorded non-string extra became invalid. Same fail-closed family
+  as the round-7 malformed-`enum` fix.
+- **Declaring a key recorded payloads carried as an extra.** Serde *ignores* an
+  undeclared key but *parses* a declared one, so adding `b: Option<String>`
+  breaks any recorded payload whose `b` was not a string. This is reported only
+  where it is **provable** — when the baseline declared what an extra had to be
+  (`"additionalProperties": {"type":"integer"}`) and the new property's type
+  shares nothing with it. On a fully open object nothing is provable in either
+  direction, and reporting it would make *every* optional-field addition
+  breaking — the single most common compatible change, and the opposite of what
+  the gate is for — so it stays compatible. The residual and its
+  `#[serde(deny_unknown_fields)]` mitigation (which turns the unprovable case
+  into a provably safe one) are documented under "Limits the gate does not
+  cover".
+
+Nine mutants were run across the two rounds, one per fix, each reverted
+individually with the specific test confirmed failing before restoring. Every
+fix ships with its over-firing guard, because a guard's *carve-outs* are where
+a false-BREAKING would hide: the same-tag-key shape stays compatible, the
+closed-variant shape stays compatible, narrowing a `oneOf` branch reports only
+the narrowing, a single-branch `oneOf` has nothing to overlap, a `default`
+beside a required key or on a root schema emits nothing, two malformed values
+emit nothing, and adding an optional property to a fully open object is still
+compatible.
+
+The checked-in baseline was regenerated: it embeds the ruleset, and moving
+`default` from the ignored-annotation list to the analysed one changes it. The
+gate re-run reports zero deltas and the artifact is byte-current.

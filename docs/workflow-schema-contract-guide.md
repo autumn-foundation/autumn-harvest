@@ -151,7 +151,7 @@ travels with the file.
 | Adding **or removing** an `allOf` conjunct | `allOf` is an AND: adding narrows. Removing is *also* breaking — draft-07 `additionalProperties` does not see into subschemas, so dropping a member that declared `properties` turns those keys into "additional" and **tightens** the schema |
 | Two indistinguishable `oneOf`/`anyOf` branches, and the branch **count** changed | Branches are matched across revisions by identity; ambiguous keying means the differ cannot say *which* branch was added or removed, so it fails closed. (When the count is unchanged the branches are compared pairwise by position instead — see below.) |
 | Inserting an `anyOf` variant **ahead of** a pre-existing branch | `anyOf` is `#[serde(untagged)]` and serde binds the **first** matching variant. Prepending `Float(f64)` before `Int(i64)` captures every recorded integer — it still deserializes, but into a different variant. Appending after every existing branch is compatible (that is the `T` → `Option<T>` shape, which appends a `null` branch) |
-| Adding a `oneOf` branch when **any** branch in the set carries no variant tag | A tag on the *added* branch says it is narrow, not that its new neighbours are. Adding `{"enum":["x"]}` beside a broad `{"type":"string"}` makes the recorded value `"x"` match two branches, and `oneOf` requires exactly one. Disjointness is only established when **every** branch is tagged, and a tag counts only when its property is **required** — an optional `tag: "A"` still accepts `{}`, so a sibling with an optional `tag: "B"` accepts it too. Both hold for serde's tagged shapes, whose serializer emits exactly one variant key and marks the discriminant required |
+| Adding a `oneOf` branch when any **pair** of branches is not provably disjoint | A tag on the *added* branch says it is narrow, not that its new neighbours are. Adding `{"enum":["x"]}` beside a broad `{"type":"string"}` makes the recorded value `"x"` match two branches, and `oneOf` requires exactly one. Carrying *a* discriminator each is not enough either: an internal tag on `tag` beside one on `kind` are both real tags, yet `{"tag":"A","kind":"B"}` satisfies both. A tag proves disjointness only when both branches pin the **same** key to different values, and only when that key is **required** — an optional `tag: "A"` still accepts `{}`. serde's externally-tagged shape proves it through `additionalProperties: false`, which is what makes each branch reject its siblings' key; two *open* single-required-field objects both accept `{"A":…,"B":…}` and are not disjoint at all. All of these hold for what `schemars` emits |
 | **Duplicating** a `oneOf` branch pinned to a single value | `oneOf` requires exactly one match, so a value matching two identical branches is rejected. (Unit-only enum branches normally collapse into one flat `enum` array so annotation churn produces no delta; that collapse is skipped when it would dedupe a genuine duplicate away. `anyOf` is "at least one", where duplicates are harmless, so it still collapses) |
 | Changing a non-final `anyOf` branch that is not provably disjoint from a later one | `anyOf` is `#[serde(untagged)]` and serde binds the **first** matching variant. Making branch 0's `a` optional, while branch 1 requires `b`, lets a recorded `{"b": …}` that bound to variant B match branch 0 and bind to variant A instead — it still deserializes, but it means something else. Exempt when the branch is provably disjoint from every branch after it (disjoint `type` sets, or two differently-tagged variants), which is what keeps `Option<T>` — `anyOf: [{$ref: T}, {"type":"null"}]` — compatible. Adding an *optional* property is also exempt, but **only on a branch that tolerates unknown keys**: it already accepted that payload with the key undeclared, so declaring it changes nothing. Under `additionalProperties: false` (serde's `deny_unknown_fields`) the same edit genuinely widens — the branch rejected `{a,b}` before and accepts it now — so the exemption is withdrawn |
 | Changing the branch container `anyOf` → `oneOf` | `anyOf` accepts a value matching two or more branches; `oneOf` requires exactly one. With `integer` and `number` branches a recorded integer matches both — accepted before, rejected now — even though no branch changed |
@@ -160,6 +160,10 @@ travels with the file.
 | Changing an **unresolvable** `$ref` (external, dangling, cyclic) | The target cannot be read, so the change cannot be classified |
 | A bound that is present but **not a JSON number** | It cannot be placed on the tighten/relax lattice; treating it as absent would report a malformed value as "removed" → compatible |
 | An `enum` present in both revisions where **either side is not a JSON array** | A validator ignores the unreadable side and enforces the readable one, so `"enum": "x"` → `"enum": ["x"]` newly rejects every recorded value outside the set. `enum` is nominally analysed, so it never reaches the fail-closed sweep — it fails closed here instead. Two identical malformed values are not an edit and emit nothing |
+| Widening an existing `oneOf` branch until it overlaps a sibling | `oneOf` requires **exactly** one match. Baseline branches `{"maximum":0}` and `{"minimum":1}` accept a recorded `1` exactly once; relaxing the first to `{"maximum":2}` reads as a compatible bound relaxation in isolation, but `1` now satisfies both branches and is rejected. Narrowing needs no such check — it cannot create an overlap, and the payloads it drops are already reported by the narrowing itself |
+| Changing the `default` of a property that is optional on **both** sides | `default` is a pure annotation to a validator, but not to serde: `#[serde(default = "retries")]` records the computed fallback there. Change it from `3` to `5` and every recorded payload that omitted the key deserializes to a different value — the same JSON, a different meaning. Only compared where serde would actually substitute it; one beside a required key, or on a root or array-item schema, is never substituted and emits nothing |
+| Declaring a property whose type is **disjoint from what the baseline allowed as an extra** | Serde *ignores* an undeclared key but *parses* a declared one. If the baseline said `"additionalProperties": {"type":"integer"}`, a recorded `b: 1` was carried along as an extra; declaring `b: Option<String>` now fails to parse it. Only reported when provable — on a fully open object nothing is knowable in either direction, so it stays compatible (see the limits below) |
+| `additionalProperties` present but **neither a boolean nor a schema** | A validator ignores a non-schema value, so it constrains nothing and ranks with `true`. Correcting `"additionalProperties": "oops"` to `{"type":"string"}` therefore *restricts*, and newly rejects every recorded non-string extra. Two different malformed values are both ignored at runtime and emit nothing |
 | A checked-in acknowledgement whose reason is **blank** | A rubber stamp is not an acknowledgement; the artifact is rejected |
 | Any change to a constraint keyword **outside the analysed set** | Fail-closed — see below |
 
@@ -176,7 +180,7 @@ travels with the file.
 | Adding a workflow type, or publishing a schema for the first time | Nothing was recorded under a contract that did not exist |
 | Changing the branch container `oneOf` → `anyOf` | `oneOf` required exactly one match; `anyOf` accepts at least one, so strictly more is accepted |
 | **Removing** a workflow type | Gated more accurately elsewhere — see below |
-| Editing any annotation (`title`, `description`, `examples`, …) | Not a constraint; produces **zero** deltas |
+| Editing any annotation (`title`, `description`, `examples`, …) | Not a constraint; produces **zero** deltas. `default` is **not** in this set — serde substitutes it, so it is compared where it is live |
 
 ### Why removing a workflow type is *compatible* here
 
@@ -218,21 +222,34 @@ guess and lets you acknowledge.
 
 ### Limits the gate does not cover
 
-Three are worth knowing before you rely on it:
+Four are worth knowing before you rely on it:
 
 - **It cannot see behind an unresolvable `$ref`.** A *change* to such a
   reference is reported breaking, but if both revisions point at the same
   external document and the *document* changes, that is outside this gate's
   reach. Keep published schemas self-contained — `schemars` output already is.
-- **`oneOf` disjointness rests on serde's own serializer.** An added branch is
-  treated as disjoint only when **every** branch in the set carries a tag, a
-  unit `enum`, or the single-property shape serde emits for an externally-tagged
-  enum. That is sound because a payload already in `harvest_events` was written
-  by serde's `Serialize`, which emits exactly one variant key, so it matches
-  exactly one branch however many variants are added. A set containing even one
-  untagged branch is not provably disjoint and an addition to it is reported
-  breaking; a hand-written schema that invents its own `oneOf` shape falls into
-  that arm, or into the indistinguishable-branches handling below.
+- **`oneOf` disjointness is proved pairwise, from the schema.** An added branch
+  is treated as disjoint only when **every pair** of branches in the set is
+  provably disjoint — by disjoint `type` sets, by an internal tag pinning the
+  *same* key to different values, by different singleton `enum`s, or by serde's
+  externally-tagged shape (one required property, one declared property, under
+  `additionalProperties: false`). All three of those are exactly what `schemars`
+  emits, so a derived enum keeps its proof.
+
+  Carrying *a* discriminator each is not enough, which is why the proof is
+  pairwise: an internal tag on `tag` beside one on `kind` are both real
+  discriminators, yet `{"tag":"A","kind":"B"}` satisfies both branches — and
+  `oneOf` requires *exactly* one match, so that recorded payload is rejected.
+  For the same reason two *open* single-required-field objects are not disjoint:
+  each treats the other's key as an undeclared extra. A set that is not provably
+  disjoint reports an addition as breaking; a hand-written schema that invents
+  its own `oneOf` shape falls into that arm, or into the
+  indistinguishable-branches handling below.
+
+  The mirror-image hazard is covered too: **widening an existing `oneOf` branch**
+  until it overlaps a sibling is breaking, because a payload that used to match
+  one branch now matches two. Narrowing needs no such check — it cannot create an
+  overlap, and the payloads it drops are already reported by the narrowing.
 - **Indistinguishable branches are compared by position.** Two multi-field
   object variants of a `#[serde(untagged)]` enum both key as `type:object`, so
   the differ cannot match them by identity. Failing closed unconditionally would
@@ -245,6 +262,26 @@ Three are worth knowing before you rely on it:
   deltas that do not correspond to a single edit. They are acknowledgeable — and
   for `anyOf` a reorder is a real rebind risk anyway. A change in the branch
   **count** remains unclassifiable and still fails closed.
+- **Declaring a key that recorded payloads already carried as an extra.** Serde
+  *ignores* an undeclared key but *parses* a declared one. So if some recorded
+  payload carried `b` as an undeclared extra, adding `b: Option<String>` makes
+  that payload fail to deserialize whenever its `b` was not a string.
+
+  The gate catches this only when it is **provable**: when the baseline declared
+  what an extra had to look like (`"additionalProperties": {"type": "integer"}`)
+  and the new property's type shares nothing with it, every recorded `b` is now
+  invalid and the addition is reported breaking. On a fully **open** object
+  (`additionalProperties` absent or `true` — what `schemars` emits by default)
+  nothing is provable in either direction: the baseline permitted *any* value
+  for `b`, so the differ cannot know whether a payload carrying one exists.
+  Reporting it breaking would make **every** optional-field addition breaking,
+  which is both the single most common compatible change and the opposite of
+  what this gate is for, so it stays compatible.
+
+  The mitigation is `#[serde(deny_unknown_fields)]`. A baseline that denied
+  unknown keys could not have recorded `b` at all, which turns the unprovable
+  case into a provably safe one — such an addition is reported compatible on
+  those grounds rather than by assumption.
 
 ### Annotations never dirty the file
 
@@ -253,10 +290,21 @@ every doc edit produced a spurious diff, and the baseline would rot until
 everyone stopped reading it.
 
 Stored schemas are therefore **canonicalised**: annotations (`title`,
-`description`, `examples`, `default`, `$schema`, non-numeric `format`, …) are
-stripped, `enum` arrays are sorted, and the two `schemars` unit-enum forms are
-normalised to one. Both sides are canonicalised again at diff time, so a
-doc-comment edit yields both zero deltas *and* a byte-identical artifact.
+`description`, `examples`, `$schema`, non-numeric `format`, …) are stripped,
+`enum` arrays are sorted, and the two `schemars` unit-enum forms are normalised
+to one. Both sides are canonicalised again at diff time, so a doc-comment edit
+yields both zero deltas *and* a byte-identical artifact.
+
+`default` is deliberately **not** in that list, even though it is a pure
+annotation to a *validator* — no value of it changes whether a payload
+validates. It is not an annotation to *serde*: `#[serde(default = "retries")]`
+leaves the field optional and records the computed fallback there, so changing
+the function from `3` to `5` means every recorded payload that omitted the key
+deserializes to a different value. Same JSON, different meaning, and invisible
+if it were stripped. A `default` is compared only where serde would actually
+substitute it — beside a key that is optional on **both** sides. One beside a
+required key, or on a root or array-item schema, is never substituted and stays
+silent, so documentation edits do not produce deltas.
 
 ---
 
