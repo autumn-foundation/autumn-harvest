@@ -16,7 +16,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
 const OUTBOX_INIT_SQL: &str =
-    include_str!("../migrations/20260409010000_harvest_workflow_outbox/up.sql");
+    include_str!("../migrations/app/20260409010000_harvest_workflow_outbox/up.sql");
 #[derive(Debug, QueryableByName)]
 struct CountRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]

@@ -58,7 +58,11 @@ metrics named in issue #355 (`harvest.workflow.started`,
 `harvest.shard.stranded_pending` — the engine's own background samplers
 already compute these under the same `is_enabled()` gate the nine required
 metrics live behind, so they're implemented too rather than sampled and
-discarded. **It does not back the full starter alert pack**
+discarded. It also covers the four broker-connector families
+(`harvest.connector.received`, `harvest.connector.dispatched`,
+`harvest.connector.poisoned`, `harvest.connector.lag`), which back the shipped
+connector dashboard panels — without them a dropped metric would be
+indistinguishable from an idle consumer. **It does not back the full starter alert pack**
 (`docs/alerts/starter-pack-v0.1.0.json`), which also references metrics this
 endpoint never emits (e.g. `harvest_workflow_terminal_total`,
 `harvest_activity_attempts_total`/`retries_total`,
@@ -356,6 +360,10 @@ metric is emitted in the source code.
 | `harvest.mutex.wait_duration` | Histogram | `worker.rs` — `persist_mutex_acquire_park`, on grant: wall-clock seconds a workflow waited to acquire a durable mutex, from request (enqueued as a FIFO waiter) to grant (issue #691) |
 | `harvest.mutex.held_duration` | Histogram | `worker.rs` — `process_mutex_releases_from_commands`, on release: wall-clock seconds a durable mutex was held, from grant (`MutexGranted.acquired_at`) to release (drop / explicit / terminal sweep / lease reclaim) (issue #691) |
 | `harvest.mutex.contention_depth` | Gauge | `worker.rs` — `persist_mutex_acquire_park`, at the moment a grant is made: the FIFO waiter-queue length for the key (number of workflows waiting on that mutex key) (issue #691) |
+| `harvest.connector.received` | Counter | `connector/runtime.rs` (plugin) — once per message pulled from a broker source, before dispatch, regardless of outcome (issue #944) |
+| `harvest.connector.dispatched` | Counter | `connector/runtime.rs` (plugin) — the **settlement breakdown**: exactly one sample per received message, so the series sums to `harvest.connector.received`. `dispatched` (a fresh execution), `idempotent_replay` (harvest recognised the redelivery and returned the existing run), `deferred` (a start throttle, issue #607, parked it — a **success** for ack purposes), `dead_lettered` (poison; see `harvest.connector.poisoned` for the reason), or `retried` (a transient harvest-side failure; the message is left un-acked for redelivery) (issue #944) |
+| `harvest.connector.poisoned` | Counter | `connector/runtime.rs` (plugin) — once per message quarantined to a dead-letter destination: a deterministic decode failure (`malformed`), a mapping-function rejection repeated `poison_threshold` times (`mapping_rejected`, default 3, mirroring `poison_pill_threshold` #367), or a permanent harvest rejection (`target_rejected`). A poisoned message is **acked** so one bad message never wedges a partition (issue #944) |
+| `harvest.connector.lag` | Gauge | `connector/runtime.rs` (plugin) — sampled per pass from `EventSource::lag()`, for sources whose client exposes it. **Kafka**: high watermark minus the committed offset, clamped up to the low watermark so records retention already deleted are not counted as a backlog the consumer can never work off. A partition the group has never committed is baselined by the **effective** `auto.offset.reset` (the `earliest` default, or a caller's `.property("auto.offset.reset", "latest")` override), so a latest-starting group owes nothing rather than reporting the topic's whole retained history forever. Summed across **every partition of the topic** (from `fetch_metadata` + `committed_offsets`, deliberately NOT `assignment()`). Consumer lag is a property of the *group*: an assignment-scoped sum is a property of one replica, so with N replicas each would report roughly `1/N` of the backlog and `max by (source)` would surface the largest subtotal while hiding a partition stalled on another replica. Group-wide means every replica reports the same number, so one aggregation is correct for both adapters. The cost is that broker calls per sample scale with replica count — bounded work on the lag interval, not the message path. **SQS**: `ApproximateNumberOfMessages` **plus** `ApproximateNumberOfMessagesNotVisible` — a message abandoned for visibility-timeout retry becomes *not visible*, so the visible count alone drains toward zero during an outage while the outstanding population is unchanged. Both read "still owed to this consumer", not "immediately fetchable". Sources with no lag concept simply never emit (issue #944) |
 
 ### Label sets
 
@@ -407,6 +415,10 @@ metric is emitted in the source code.
 | `harvest.canary.roundtrip` | `queue`, `shard` (probed task queue + writable shard; **no `execution.id`** — issue #796) |
 | `harvest.canary.success` | `queue`, `shard` |
 | `harvest.canary.failure` | `queue`, `shard` |
+| `harvest.connector.received` | `source` (the binding's `source_name`, a registered `SourceBinding` — closed set) — the message key, partition, and offset are **never** labels (ADR-0001 §7, issue #944) |
+| `harvest.connector.dispatched` | `source`, `outcome` (`dispatched\|idempotent_replay\|deferred\|dead_lettered\|retried` — bounded enum) |
+| `harvest.connector.poisoned` | `source`, `reason` (`malformed\|mapping_rejected\|target_rejected` — bounded enum) |
+| `harvest.connector.lag` | `source` |
 
 **Cardinality rule:** `execution.id` is **never** a metric label. It is
 span-only (see ADR-0001 §4). The `MetricsRecorder` API enforces this by

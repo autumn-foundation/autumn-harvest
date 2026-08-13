@@ -23,6 +23,17 @@ mcp = ["autumn-web/mcp"]
 # app's shared /actuator/prometheus endpoint. No new dependency: rendering
 # is done entirely through autumn-web's existing MetricsSource contract.
 metrics = []
+# Broker event-source connectors for workflow triggers (issue #944).
+#
+# `connectors` alone brings only the broker-AGNOSTIC layer (bindings,
+# idempotency, ack ordering, poison isolation, backpressure, MockSource) with
+# no broker client at all — enough to unit-test a mapping function and the
+# whole dispatch path with no Docker. `kafka` / `sqs` add the respective
+# client. The core `autumn-harvest` crate gains zero broker dependencies under
+# every combination; `tests/connector_dependency_graph.rs` enforces it.
+connectors = ["dep:async-trait", "dep:sha2"]
+kafka = ["connectors", "dep:rdkafka"]
+sqs = ["connectors", "dep:aws-config", "dep:aws-sdk-sqs"]
 
 
 [dependencies]
@@ -60,11 +71,32 @@ matchit = "0.8"
 percent-encoding = "2.3"
 maud = { version = "0.27", features = ["axum"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+thiserror = { workspace = true }
+
+# ── Broker connectors (issue #944) — all optional, all off by default ──
+# Object-safe async traits for the EventSource / DeadLetterSink seams
+# (same version autumn-harvest-redis already uses).
+async-trait = { version = "0.1", optional = true }
+# Collision-resistant digest for the bounded idempotency-key encoding, so a
+# pathological topic/key component can never blow the 512-byte start-key cap
+# (the issue #699 `bound_key_component` precedent).
+sha2 = { version = "0.10", optional = true }
+# Kafka client. `cmake-build` builds librdkafka from the vendored source, so
+# the adapter needs no system librdkafka. NOTE: librdkafka's build requires
+# libcurl headers (`libcurl4-openssl-dev` on Debian/Ubuntu) even with
+# `WITH_CURL=0` — see the CI step added alongside this feature.
+rdkafka = { version = "0.38", default-features = false, features = ["cmake-build", "libz", "tokio"], optional = true }
+# SQS client.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"], optional = true }
+aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio", "rustls"], optional = true }
 
 [dev-dependencies]
 autumn-web = { version = "0.6", features = ["test-support", "mcp"] }
 autumn-harvest = { version = "0.5.0", path = "../autumn-harvest", features = ["db", "testing"] }
 tower = "0.5"
+# `test-util` for `#[tokio::test(start_paused = true)]`: the shutdown-drain
+# deadline is a 30s wall-clock wait that must be asserted, not slept through.
+tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tracing-subscriber = "0.3"
@@ -83,3 +115,11 @@ required-features = ["webhooks"]
 [[example]]
 name = "metrics_scrape_quickstart"
 required-features = ["metrics"]
+
+[[example]]
+name = "kafka_connector_quickstart"
+required-features = ["kafka"]
+
+[[example]]
+name = "sqs_connector_quickstart"
+required-features = ["sqs"]
