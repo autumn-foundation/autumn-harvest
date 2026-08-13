@@ -703,3 +703,43 @@ now scans the invocation lines specifically and fails on that mutation. The
 over-firing guards ship alongside: a real annotation is still stripped, an
 already-current baseline still passes `--require-current`, and an artifact
 carrying acknowledgement records is current once its schemas match.
+
+### Thirteenth review round
+
+Two P2 findings, both about the gate quietly disagreeing with itself.
+
+- **A `$ref` inside an unanalysed constraint laundered a breaking change.** The
+  fail-closed sweep compares an untracked keyword's value literally, and
+  `definitions`/`$defs` are filtered out of it as containers "reached through
+  `$ref`". But only the *analysed* traversal follows refs — so when a definition
+  is referenced solely from an unanalysed keyword, nothing walks there.
+  `"not": {"$ref": "#/$defs/T"}` stays byte-identical while `T` is rewritten
+  from `{"type":"string"}` to `{"type":"integer"}`: a recorded `1` goes from
+  accepted to rejected and the gate reports a clean pass. Writing that identical
+  change inline was already breaking, so one level of indirection was enough to
+  bypass the rule. Every local reference reachable from an unchanged unanalysed
+  constraint is now resolved on both sides — transitively, cycle-safe via the
+  pointer set that doubles as the visited guard, and depth-capped — with any
+  differing target reported breaking, one delta per keyword. A target that
+  resolves on only one side counts as differing, which is the fail-closed
+  outcome. Because both roots are canonicalized before the diff, annotation
+  churn inside such a definition still produces nothing.
+- **Every generated artifact told operators that `default` and non-numeric
+  `format` are stripped.** Rounds 9 and 10 promoted both to analysed keywords
+  whose change is reported breaking, and the hand-written description never
+  followed. The round-10 drift guard structurally cannot catch this: it compares
+  the artifact to the code constant, so a stale sentence is stale on both sides
+  and compares equal. The description is now *generated* from
+  `ANNOTATION_KEYWORDS`, the same constant the canonicalizer uses, so it cannot
+  contradict the ruleset it describes; `unanalysed_keyword_policy` gained the
+  ref-following clause above. Two new guards pin it against the ruleset rather
+  than against a copy of it: no analysed keyword may appear in the stripped list,
+  and the list must equal `ignored_annotations` exactly — the second one blocking
+  the trivial "delete the sentence" fix to the first.
+
+Four mutants, each reverted individually with the specific test confirmed
+failing: flag every constraint containing a `$ref` (all three over-firing guards
+fail), follow only one hop (the transitive test fails), and restore the stale
+hardcoded annotation list (both description guards fail). The over-firing guards
+ship alongside — an unchanged definition, annotation churn inside one, and a
+self-referential definition each stay silent.

@@ -1,7 +1,7 @@
 {
   "version": "0.5.0",
   "contract_version": "1",
-  "description": "Versioned machine-readable baseline of every registered workflow type's published input/output/error JSON Schema (issue #373), used by `harvest schema check` to gate backward-incompatible payload changes before they DLQ in-flight executions (issue #794). Stored schemas are canonicalised: annotations (title/description/examples/default/non-numeric format) are stripped so a doc-comment edit never dirties this file. Regenerate with `harvest schema update`; a breaking change must be acknowledged with a recorded justification. See docs/workflow-schema-contract-guide.md.",
+  "description": "Versioned machine-readable baseline of every registered workflow type's published input/output/error JSON Schema (issue #373), used by `harvest schema check` to gate backward-incompatible payload changes before they DLQ in-flight executions (issue #794). Stored schemas are canonicalised: only the pure annotations (title/description/$comment/$schema/$id/examples/deprecated/readOnly/writeOnly) are stripped, so a doc-comment edit never dirties this file. Every other keyword is compared — see `compatibility.analysed_keywords` for the set the differ classifies, and `compatibility.unanalysed_keyword_policy` for what happens to the rest. Regenerate with `harvest schema update`; a breaking change must be acknowledged with a recorded justification. See docs/workflow-schema-contract-guide.md.",
   "compatibility": {
     "perspective": "replay-read: JSON already recorded in harvest_events must still deserialize into the new type, and must still mean the same thing",
     "breaking_changes": [
@@ -63,7 +63,7 @@
       "readOnly",
       "writeOnly"
     ],
-    "unanalysed_keyword_policy": "Any change (added, modified or removed) to a constraint keyword outside the analysed set is reported breaking. Keywords interact — removing one does not reliably loosen a schema — so the differ fails closed and lets the author acknowledge."
+    "unanalysed_keyword_policy": "Any change (added, modified or removed) to a constraint keyword outside the analysed set is reported breaking, as is a change to any sub-schema it reaches through `$ref`. Keywords interact — removing one does not reliably loosen a schema — so the differ fails closed and lets the author acknowledge."
   },
   "coverage": {
     "workflows_total": 2,

@@ -223,6 +223,16 @@ the schema: keys the pattern used to admit become "additional" and are now
 rejected. The differ does not model keyword interactions, so it refuses to
 guess and lets you acknowledge.
 
+The same verdict applies **through one level of indirection**. An unanalysed
+keyword may point into the schema — `"not": {"$ref": "#/$defs/T"}` — and stay
+byte-identical while `T` is rewritten underneath it. Nothing in the analysed
+traversal walks there, because no analysed keyword references `T`, so without
+this the identical change would be breaking written inline and invisible
+written through a `$ref`. Every local reference reachable from an unchanged
+unanalysed constraint is therefore resolved on both sides (transitively, and
+cycle-safe), and any difference in a target is reported breaking. A target that
+resolves on only one side counts as a difference.
+
 ### Limits the gate does not cover
 
 Four are worth knowing before you rely on it:
@@ -292,15 +302,28 @@ Four are worth knowing before you rely on it:
 every doc edit produced a spurious diff, and the baseline would rot until
 everyone stopped reading it.
 
-Stored schemas are therefore **canonicalised**: annotations (`title`,
-`description`, `examples`, `$schema`, non-numeric `format`, …) are stripped,
-`enum` arrays are sorted, and the two `schemars` unit-enum forms are normalised
-to one. Both sides are canonicalised again at diff time, so a doc-comment edit
-yields both zero deltas *and* a byte-identical artifact.
+Stored schemas are therefore **canonicalised**: the pure annotations (`title`,
+`description`, `$comment`, `$schema`, `$id`, `examples`, `deprecated`,
+`readOnly`, `writeOnly`) are stripped, `enum` arrays are sorted, and the two
+`schemars` unit-enum forms are normalised to one. Both sides are canonicalised
+again at diff time, so a doc-comment edit yields both zero deltas *and* a
+byte-identical artifact.
 
-`default` is deliberately **not** in that list, even though it is a pure
-annotation to a *validator* — no value of it changes whether a payload
-validates. It is not an annotation to *serde*: `#[serde(default = "retries")]`
+That list is the whole of it. It is generated into the artifact's own
+`description` from the same constant the canonicaliser uses, so the file can
+never claim to strip something it compares — read
+`compatibility.ignored_annotations` for the authoritative set.
+
+Two keywords that look like annotations are deliberately **not** in it:
+
+`format` is not stripped. To a validator it is advisory, but the field's *type*
+is what runs the parser: `Uuid` accepts only what `Uuid::from_str` accepts. So
+introducing or changing a semantic `format` is breaking (a recorded value the
+new parser rejects no longer deserializes) and removing one is compatible.
+
+`default` is not stripped either, even though it is a pure annotation to a
+*validator* — no value of it changes whether a payload validates. It is not an
+annotation to *serde*: `#[serde(default = "retries")]`
 leaves the field optional and records the computed fallback there, so changing
 the function from `3` to `5` means every recorded payload that omitted the key
 deserializes to a different value. Same JSON, different meaning, and invisible

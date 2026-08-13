@@ -1154,6 +1154,63 @@ fn the_checked_in_baseline_documents_the_current_ruleset() {
     );
 }
 
+/// The parenthesised keyword list the description says is stripped.
+#[track_caller]
+fn described_stripped_keywords(description: &str) -> Vec<&str> {
+    let head = description
+        .split_once("are stripped")
+        .unwrap_or_else(|| panic!("description must name what is stripped: {description}"))
+        .0;
+    let open = head
+        .rfind('(')
+        .expect("stripped list must be parenthesised");
+    let close = head
+        .rfind(')')
+        .expect("stripped list must be parenthesised");
+    head[open + 1..close].split('/').map(str::trim).collect()
+}
+
+/// The prose description must not claim to strip a keyword the differ analyses.
+///
+/// `the_checked_in_baseline_documents_the_current_ruleset` cannot catch this:
+/// it compares the artifact to the code constant, so a hand-written sentence
+/// that has fallen behind the ruleset is stale on *both* sides and matches. The
+/// human-readable half is the part operators actually read when auditing an
+/// acknowledgement, so it is pinned against `ANALYSED_KEYWORDS` directly.
+#[test]
+fn the_baseline_description_never_claims_an_analysed_keyword_is_stripped() {
+    let contract = WorkflowSchemaContract::parse(CHECKED_IN_BASELINE).expect("parse");
+    let described = described_stripped_keywords(&contract.description);
+    for keyword in &contract.compatibility.analysed_keywords {
+        assert!(
+            !described.contains(&keyword.as_str()),
+            "the contract description claims `{keyword}` is stripped, but it is an ANALYSED \
+             keyword whose change is reported. Described as stripped: {described:?}"
+        );
+    }
+}
+
+/// …and it must name exactly the annotations that genuinely are stripped.
+///
+/// Guards the trivial "delete the sentence" fix to the test above, and pins the
+/// list against the ruleset rather than against a hand-written copy of it.
+#[test]
+fn the_baseline_description_names_exactly_the_stripped_annotations() {
+    let contract = WorkflowSchemaContract::parse(CHECKED_IN_BASELINE).expect("parse");
+    let described = described_stripped_keywords(&contract.description);
+    let expected: Vec<&str> = contract
+        .compatibility
+        .ignored_annotations
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        described, expected,
+        "the description's stripped-keyword list has drifted from the ruleset; it is generated \
+         from ANNOTATION_KEYWORDS, so regenerate the baseline with `harvest schema update`"
+    );
+}
+
 #[test]
 fn every_acknowledgement_in_the_checked_in_baseline_has_a_justification() {
     let c = WorkflowSchemaContract::parse(CHECKED_IN_BASELINE).expect("parse");
@@ -1818,6 +1875,123 @@ fn an_unchanged_external_ref_is_not_reported() {
         json!({"$ref": "https://example.com/schemas/A.json"}),
         json!({"$ref": "https://example.com/schemas/A.json"}),
     );
+}
+
+/// An unanalysed constraint that *points* at a definition must not hide a
+/// change to that definition.
+///
+/// `diff_unanalysed` compares an untracked keyword's value literally, and
+/// `definitions`/`$defs` are filtered out of that sweep as containers reached
+/// through `$ref`. So `"not": {"$ref": "#/$defs/T"}` stays byte-identical while
+/// `T` is rewritten underneath it — and nothing in the analysed traversal walks
+/// there either, because no analysed keyword references `T`. A recorded `1`
+/// goes from accepted (`not: string`) to rejected (`not: integer`) with the
+/// gate reporting a clean pass.
+///
+/// Changing the constraint *inline* is already breaking; routing the identical
+/// change through one level of indirection must not launder it.
+#[test]
+fn a_definition_reached_only_through_an_unanalysed_constraint_is_followed() {
+    let with_target = |t: Value| {
+        json!({
+            "type": "object",
+            "properties": {"a": {"not": {"$ref": "#/$defs/T"}}},
+            "$defs": {"T": t},
+        })
+    };
+    assert_breaking(
+        with_target(json!({"type": "string"})),
+        with_target(json!({"type": "integer"})),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// The indirection may be several hops deep: the closure is transitive.
+#[test]
+fn a_transitively_referenced_definition_is_followed_through_an_unanalysed_constraint() {
+    let with_target = |t: Value| {
+        json!({
+            "type": "object",
+            "properties": {"a": {"not": {"$ref": "#/$defs/Outer"}}},
+            "$defs": {
+                "Outer": {"type": "object", "properties": {"inner": {"$ref": "#/$defs/Inner"}}},
+                "Inner": t,
+            },
+        })
+    };
+    assert_breaking(
+        with_target(json!({"type": "string"})),
+        with_target(json!({"type": "integer"})),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// A definition that vanishes under an unanalysed constraint fails closed.
+#[test]
+fn a_definition_dropped_under_an_unanalysed_constraint_is_breaking() {
+    assert_breaking(
+        json!({
+            "type": "object",
+            "properties": {"a": {"not": {"$ref": "#/$defs/T"}}},
+            "$defs": {"T": {"type": "string"}},
+        }),
+        json!({
+            "type": "object",
+            "properties": {"a": {"not": {"$ref": "#/$defs/T"}}},
+            "$defs": {},
+        }),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// Over-firing guard: an *unchanged* referenced definition stays silent.
+///
+/// Without this, "always flag a constraint that contains a `$ref`" would pass
+/// the tests above while making every schema with a referencing constraint
+/// permanently dirty.
+#[test]
+fn an_unchanged_definition_under_an_unanalysed_constraint_is_not_reported() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"a": {"not": {"$ref": "#/$defs/T"}}},
+        "$defs": {"T": {"type": "string"}},
+    });
+    assert_compatible(schema.clone(), schema);
+}
+
+/// Over-firing guard: annotation churn inside the referenced definition is not
+/// a change.
+///
+/// Both roots are canonicalised before the diff, so a doc-comment edit on a
+/// definition reached only through an unanalysed constraint must stay invisible
+/// — the same promise the analysed traversal makes.
+#[test]
+fn annotation_churn_in_a_definition_under_an_unanalysed_constraint_is_not_reported() {
+    assert_compatible(
+        json!({
+            "type": "object",
+            "properties": {"a": {"not": {"$ref": "#/$defs/T"}}},
+            "$defs": {"T": {"type": "string", "description": "before"}},
+        }),
+        json!({
+            "type": "object",
+            "properties": {"a": {"not": {"$ref": "#/$defs/T"}}},
+            "$defs": {"T": {"type": "string", "description": "after"}},
+        }),
+    );
+}
+
+/// Over-firing guard: a recursive definition must terminate, not hang.
+#[test]
+fn a_self_referential_definition_under_an_unanalysed_constraint_terminates() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"a": {"not": {"$ref": "#/$defs/Node"}}},
+        "$defs": {
+            "Node": {"type": "object", "properties": {"next": {"$ref": "#/$defs/Node"}}},
+        },
+    });
+    assert_compatible(schema.clone(), schema);
 }
 
 /// A bound that is present but not a number must not read as "removed".

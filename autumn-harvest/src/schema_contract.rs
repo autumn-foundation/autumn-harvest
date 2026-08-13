@@ -495,9 +495,9 @@ impl CompatibilityRules {
                 .collect(),
             unanalysed_keyword_policy:
                 "Any change (added, modified or removed) to a constraint keyword outside the \
-                 analysed set is reported breaking. Keywords interact — removing one does not \
-                 reliably loosen a schema — so the differ fails closed and lets the author \
-                 acknowledge."
+                 analysed set is reported breaking, as is a change to any sub-schema it reaches \
+                 through `$ref`. Keywords interact — removing one does not reliably loosen a \
+                 schema — so the differ fails closed and lets the author acknowledge."
                     .to_string(),
         }
     }
@@ -628,7 +628,7 @@ impl WorkflowSchemaContract {
         Self {
             version: version.to_string(),
             contract_version: SCHEMA_CONTRACT_VERSION.to_string(),
-            description: DEFAULT_CONTRACT_DESCRIPTION.to_string(),
+            description: default_description(),
             compatibility: CompatibilityRules::current(),
             coverage,
             acknowledged_breaking_changes: Vec::new(),
@@ -786,16 +786,28 @@ impl WorkflowSchemaContract {
 /// `GET /workflows/registered` array, which carries no crate version.
 const UNKNOWN_VERSION: &str = "unknown";
 
-const DEFAULT_CONTRACT_DESCRIPTION: &str = "Versioned machine-readable baseline of every \
-     registered workflow type's published input/output/error JSON Schema (issue #373), used by \
-     `harvest schema check` to gate backward-incompatible payload changes before they DLQ \
-     in-flight executions (issue #794). Stored schemas are canonicalised: annotations \
-     (title/description/examples/default/non-numeric format) are stripped so a doc-comment edit \
-     never dirties this file. Regenerate with `harvest schema update`; a breaking change must be \
-     acknowledged with a recorded justification. See docs/workflow-schema-contract-guide.md.";
-
+/// Human-readable header stamped into every generated artifact.
+///
+/// The stripped-keyword list is GENERATED from [`ANNOTATION_KEYWORDS`] rather
+/// than written by hand. A hand-written sentence cannot be caught by the
+/// artifact-vs-code drift guard — a stale claim is stale on both sides and
+/// compares equal — and this one had already fallen behind twice: `default` and
+/// non-numeric `format` were promoted from annotations to analysed keywords,
+/// while the prose kept telling operators both were stripped. Deriving it means
+/// the description cannot contradict the ruleset it describes.
 fn default_description() -> String {
-    DEFAULT_CONTRACT_DESCRIPTION.to_string()
+    let stripped = ANNOTATION_KEYWORDS.join("/");
+    format!(
+        "Versioned machine-readable baseline of every registered workflow type's published \
+         input/output/error JSON Schema (issue #373), used by `harvest schema check` to gate \
+         backward-incompatible payload changes before they DLQ in-flight executions (issue \
+         #794). Stored schemas are canonicalised: only the pure annotations ({stripped}) are \
+         stripped, so a doc-comment edit never dirties this file. Every other keyword is \
+         compared — see `compatibility.analysed_keywords` for the set the differ classifies, and \
+         `compatibility.unanalysed_keyword_policy` for what happens to the rest. Regenerate with \
+         `harvest schema update`; a breaking change must be acknowledged with a recorded \
+         justification. See docs/workflow-schema-contract-guide.md."
+    )
 }
 
 // ── Keyword partition ────────────────────────────────────────────────────────
@@ -3400,6 +3412,16 @@ fn diff_unanalysed(
         .collect();
     for key in keys {
         if bo.get(key) == co.get(key) {
+            // Byte-identical is not the same as unchanged: the value may point
+            // INTO the schema with `$ref`. `definitions`/`$defs` are filtered
+            // out above as containers "reached through `$ref`" — but only the
+            // ANALYSED traversal follows refs, and nothing analysed points at a
+            // definition that is referenced solely from an unanalysed keyword.
+            // Rewriting that definition would then be invisible, even though
+            // changing the same constraint inline is breaking.
+            if let Some(v) = bo.get(key) {
+                diff_refs_under_unanalysed(ctx, key, v, path, diff);
+            }
             continue;
         }
         // Fail closed in BOTH directions. "Removing a constraint always loosens"
@@ -3416,6 +3438,84 @@ fn diff_unanalysed(
                  it if it is safe"
             ),
         ));
+    }
+}
+
+/// Collect every LOCAL `$ref` target reachable from `value`, transitively.
+///
+/// Returns RFC 6901 pointers (the `#`-stripped tail), so each can be fed
+/// straight to [`Value::pointer`]. `out` doubles as the cycle guard, so a
+/// self-referential definition terminates. External (`https://…`) refs are
+/// skipped: the differ cannot read their targets either way, and
+/// [`diff_ref_pair`] already fails closed when such a ref *changes*.
+fn collect_local_refs(root: &Value, value: &Value, out: &mut BTreeSet<String>, depth: usize) {
+    if depth >= MAX_DIFF_DEPTH {
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                if k != "$ref" {
+                    collect_local_refs(root, v, out, depth + 1);
+                    continue;
+                }
+                let Some(pointer) = v.as_str().and_then(|r| r.strip_prefix('#')) else {
+                    continue;
+                };
+                if !out.insert(pointer.to_string()) {
+                    continue; // already expanded (or a cycle)
+                }
+                if let Some(target) = root.pointer(pointer) {
+                    collect_local_refs(root, target, out, depth + 1);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                collect_local_refs(root, v, out, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Fail closed when a sub-schema referenced by an *unchanged* unanalysed
+/// constraint has itself changed.
+///
+/// Both roots are canonicalised before the diff, so annotation churn inside the
+/// target stays invisible — the same promise the analysed traversal makes. A
+/// target that resolves on one side only compares as different, which is the
+/// intended fail-closed outcome.
+fn diff_refs_under_unanalysed(
+    ctx: &DiffCtx<'_>,
+    key: &str,
+    value: &Value,
+    path: &str,
+    diff: &mut SchemaContractDiff,
+) {
+    let mut pointers = BTreeSet::new();
+    collect_local_refs(ctx.base_root, value, &mut pointers, 0);
+    // Sharing `pointers` across both roots is safe: a target reachable on only
+    // one side must itself differ, and that difference is reported below.
+    collect_local_refs(ctx.cur_root, value, &mut pointers, 0);
+
+    for pointer in &pointers {
+        if ctx.base_root.pointer(pointer) == ctx.cur_root.pointer(pointer) {
+            continue;
+        }
+        diff.push(ctx.delta(
+            path,
+            ChangeKind::UnanalysedConstraintChanged,
+            Verdict::Breaking,
+            format!(
+                "the `{key}` keyword is unchanged, but the `#{pointer}` sub-schema it references \
+                 was rewritten. `{key}` is outside the subset this gate analyses, so the effect \
+                 cannot be classified and is reported breaking (fail closed). Acknowledge it if \
+                 it is safe"
+            ),
+        ));
+        // One delta per keyword is enough signal; the rest would be noise.
+        break;
     }
 }
 
