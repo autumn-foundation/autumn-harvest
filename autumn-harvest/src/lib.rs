@@ -189,6 +189,12 @@ pub mod run_chain;
 pub mod saga;
 /// Background control-loop liveness heartbeats (issue #797).
 pub mod scanner_health;
+/// Workflow payload-schema contract baseline and replay-compatibility diffing (issue #794).
+///
+/// Deliberately ungated: the CLI links `autumn-harvest` with
+/// `default-features = false`, so the gate must be reachable without `db` or
+/// `schema`.
+pub mod schema_contract;
 /// Worker session fleet-side registry and pure decision functions (issue #606).
 pub mod sessions;
 pub mod shard;
@@ -429,6 +435,12 @@ pub use schedule_decision::record_decision_graceful;
 pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
     register_schedules, register_workflow_schedules, tick_once, trigger_unified_dag,
+};
+pub use schema_contract::{
+    AcknowledgedBreakingChange, ChangeKind, CompatibilityRules, DEFAULT_SCHEMA_CONTRACT_PATH,
+    MAX_DELTAS, SCHEMA_CONTRACT_VERSION, SchemaContractDiff, SchemaContractError, SchemaCoverage,
+    SchemaDelta, SchemaRole, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
+    canonicalize_schema, diff_schema_contracts, dropped_acknowledgements, unacknowledged_breaking,
 };
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;

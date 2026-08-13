@@ -44,6 +44,11 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      # Resolved base revision, exported so the issue #794 schema gate can
+      # compare the checked-in artifact against its PREVIOUS revision. This job
+      # is the only one with `fetch-depth: 0`, so it is the only place the base
+      # can be resolved reliably.
+      base_sha: ${{ steps.filter.outputs.base_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,6 +72,7 @@ jobs:
             base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
           fi
           echo "Comparing ${base}...${head}"
+          echo "base_sha=${base}" >> "$GITHUB_OUTPUT"
           # --no-renames disables rename detection so a code->docs move surfaces
           # the deleted source path (setting code=true) instead of a docs-only add.
           changed="$(git diff --name-only --no-renames "$base" "$head")"
@@ -74,7 +80,14 @@ jobs:
           echo "$changed"
           # Docs-only = every changed path matches docs/** or **/*.md. If any
           # other path is present, we have code changes and must run the matrix.
-          if echo "$changed" | grep -qvE '^(docs/|.*\.md$)'; then
+          #
+          # Carve-out: `docs/workflow-schema-contract.json` is a checked-in
+          # CONTRACT artifact, not prose. The issue #794 schema gate compares it
+          # against the freshly generated contract, so a baseline-only PR must
+          # still run the matrix — otherwise a hand-edited, stale, or malformed
+          # baseline merges with no comparison at all, defeating the gate.
+          if echo "$changed" | grep -qvE '^(docs/|.*\.md$)' \
+            || echo "$changed" | grep -qxF 'docs/workflow-schema-contract.json'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
             echo "code=false" >> "$GITHUB_OUTPUT"
@@ -312,6 +325,62 @@ jobs:
       - name: Run wasm_activity example (issue #965)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo run -p autumn-harvest --features wasm-activities --example wasm_activity
+      # Issue #794: the schema-contract gate, end to end. Generates the
+      # currently-published schemas from the example registry, then diffs them
+      # against the checked-in baseline. This is simultaneously the drift guard
+      # for `docs/workflow-schema-contract.json` and the proof that the
+      # documented CI recipe actually works. No database, no services.
+      #
+      # Linux-only, matching the benchmark bit-rot guard above: schema drift is
+      # a property of the checked-in artifact, not of the OS, so one leg proves
+      # it. The step builds twice (`--features schema` pulls schemars; the CLI
+      # links the whole `harvest` binary), so restricting it saves two legs'
+      # worth of minutes for zero added coverage.
+      - name: "Gate workflow payload-schema changes (issue #794)"
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        shell: bash
+        env:
+          BASE_SHA: ${{ needs.changes.outputs.base_sha }}
+          ARTIFACT: docs/workflow-schema-contract.json
+        run: |
+          set -euo pipefail
+          cargo run --quiet -p autumn-harvest --no-default-features --features schema \
+            --example schema_workflow -- --emit-contract > "${RUNNER_TEMP}/schema-current.json"
+
+          # 1. Is the checked-in artifact current, and is every delta safe?
+          #    --require-current also refuses an unabsorbed COMPATIBLE delta: a
+          #    baseline allowed to lag records what was deployed some time ago
+          #    while this gate reads it as what was deployed last, so a field
+          #    added in one release and removed in the next is invisible even
+          #    though replay of data written in between fails.
+          cargo run --quiet -p autumn-harvest-cli --bin harvest -- \
+            schema check --require-current --current "${RUNNER_TEMP}/schema-current.json"
+
+          # 2. Was the ARTIFACT's own change since the base revision recorded?
+          #
+          # Step 1 alone is bypassable: regenerate the artifact by hand in the
+          # same PR and it agrees with the generated contract, so the diff is
+          # empty and a replay-breaking change merges with no justification.
+          # Comparing against the artifact's PREVIOUS revision is the only
+          # signal left, so this is what makes the escape hatch auditable.
+          #
+          # The matrix checkout is shallow, so fetch just the base commit.
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" 2>/dev/null || true
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            # The base object is unreachable (a force-push, or a transient fetch
+            # failure). Warn rather than block every PR on infrastructure: step 1
+            # still ran, and a reviewer sees the artifact in the diff.
+            echo "::warning::base commit ${BASE_SHA} unavailable — skipped the" \
+                 "acknowledgement check; review artifact changes manually"
+          elif git cat-file -e "${BASE_SHA}:${ARTIFACT}" 2>/dev/null; then
+            git show "${BASE_SHA}:${ARTIFACT}" > "${RUNNER_TEMP}/schema-base.json"
+            cargo run --quiet -p autumn-harvest-cli --bin harvest -- \
+              schema check --baseline "${RUNNER_TEMP}/schema-base.json" \
+                           --current "${RUNNER_TEMP}/schema-current.json" \
+                           --acknowledged-in "$ARTIFACT"
+          else
+            echo "no artifact at ${BASE_SHA} — first introduction, nothing to compare"
+          fi
       # ── Manifest-driven integration suites ──────────────────────────────
       # The per-suite `cargo test` steps that used to live here are now data in
       # `.github/ci/integration-suites.txt`, executed by `.github/ci/run-suites.sh`.

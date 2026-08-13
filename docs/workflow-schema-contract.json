@@ -1,0 +1,120 @@
+{
+  "version": "0.5.0",
+  "contract_version": "1",
+  "description": "Versioned machine-readable baseline of every registered workflow type's published input/output/error JSON Schema (issue #373), used by `harvest schema check` to gate backward-incompatible payload changes before they DLQ in-flight executions (issue #794). Stored schemas are canonicalised: only the pure annotations (title/description/$comment/$schema/$id/examples/deprecated/readOnly/writeOnly) are stripped, so a doc-comment edit never dirties this file. Every other keyword is compared — see `compatibility.analysed_keywords` for the set the differ classifies, and `compatibility.unanalysed_keyword_policy` for what happens to the rest. Regenerate with `harvest schema update`; a breaking change must be acknowledged with a recorded justification. See docs/workflow-schema-contract-guide.md.",
+  "compatibility": {
+    "perspective": "replay-read: JSON already recorded in harvest_events must still deserialize into the new type, and must still mean the same thing",
+    "breaking_changes": [
+      "Adding a required property (no #[serde(default)])",
+      "Removing a property (the recorded value is silently dropped; a hard deserialization failure under #[serde(deny_unknown_fields)])",
+      "Renaming a property (surfaces as removed + added-required)",
+      "Making an optional property required",
+      "Narrowing a type (e.g. string to integer, or dropping null)",
+      "Narrowing a numeric format (e.g. int64 to int32, i64 to u64)",
+      "Introducing or changing a semantic format (e.g. String to Uuid, uuid to date-time): the format names the parser the field's type runs, so a recorded value it rejects no longer deserializes",
+      "Removing an enum value or a oneOf/anyOf variant",
+      "Restricting additionalProperties (absent > schema > false)",
+      "Introducing or tightening a bound (minimum/maximum/minLength/maxLength)",
+      "Changing tuple arity",
+      "Withdrawing a previously published schema (coverage regression)",
+      "Any change to a constraint keyword outside the analysed set (fail closed)",
+      "A cardinality bound (minLength/maxLength/minItems/maxItems) that is present but is not a non-negative integer on either side: the engine's validator reads them with as_u64 and IGNORES anything else, so such a value is not a smaller bound but an absent one (fail closed)"
+    ],
+    "non_breaking_changes": [
+      "Adding an optional property (Option<T> or #[serde(default)])",
+      "Removing a required marker (making a property optional)",
+      "Widening a type (e.g. integer to number, T to Option<T>)",
+      "Widening a numeric format (e.g. int32 to int64)",
+      "Removing a semantic format (e.g. Uuid to String)",
+      "Adding an enum value, or a disjoint oneOf/anyOf variant",
+      "Relaxing additionalProperties or a bound",
+      "Adding a workflow type, or publishing a schema for the first time",
+      "Removing a workflow type (gated more accurately by `harvest workflow-types reachability`, issue #520)",
+      "Editing any annotation (title, description, examples, …)"
+    ],
+    "analysed_keywords": [
+      "type",
+      "required",
+      "properties",
+      "enum",
+      "items",
+      "additionalProperties",
+      "allOf",
+      "anyOf",
+      "oneOf",
+      "minLength",
+      "maxLength",
+      "minimum",
+      "maximum",
+      "minItems",
+      "maxItems",
+      "format",
+      "$ref",
+      "default"
+    ],
+    "ignored_annotations": [
+      "title",
+      "description",
+      "$comment",
+      "$schema",
+      "$id",
+      "examples",
+      "deprecated",
+      "readOnly",
+      "writeOnly"
+    ],
+    "unanalysed_keyword_policy": "Any change (added, modified or removed) to a constraint keyword outside the analysed set is reported breaking, as is a change to any sub-schema it reaches through `$ref`. Keywords interact — removing one does not reliably loosen a schema — so the differ fails closed and lets the author acknowledge."
+  },
+  "coverage": {
+    "workflows_total": 2,
+    "with_input_schema": 1,
+    "with_output_schema": 1,
+    "with_error_schema": 1
+  },
+  "acknowledged_breaking_changes": [],
+  "workflows": [
+    {
+      "name": "no_schema_workflow",
+      "input_schema": null,
+      "output_schema": null,
+      "error_schema": null
+    },
+    {
+      "name": "onboarding",
+      "description": "Handles new-user onboarding from signup to first action",
+      "input_schema": {
+        "properties": {
+          "email": {
+            "minLength": 5,
+            "type": "string"
+          },
+          "referral_code": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "user_id",
+          "email"
+        ],
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "welcome_email_sent": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "welcome_email_sent"
+        ],
+        "type": "object"
+      },
+      "error_schema": {
+        "type": "string"
+      }
+    }
+  ]
+}
