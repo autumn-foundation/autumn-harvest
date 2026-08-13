@@ -321,6 +321,16 @@ Four are worth knowing before you rely on it:
   also records whether each pair actually changed. A repeat visit to a changed
   pair is treated exactly like a diff truncated by the storage cap: the overlap
   is checked, with no local deltas to attribute it to.
+
+  A **self**-recursive branch — one whose `$ref` points back at the definition
+  currently being walked — has no verdict to read yet, since the traversal that
+  would produce it is the one this check is nested inside. Guessing either way
+  is wrong: *unchanged* hides a real rebind, and *changed* would report every
+  unchanged recursive type as breaking (the overlap test asks whether the branch
+  overlaps a rival as it now stands, not whether the overlap is new). Such a
+  check is therefore **parked** and resolved when that definition finishes and
+  its verdict is known — exact, because a branch that is a `$ref` to a
+  definition changes precisely when the definition does.
 - **Indistinguishable branches are compared by position.** Two multi-field
   object variants of a `#[serde(untagged)]` enum both key as `type:object`, so
   the differ cannot match them by identity. Failing closed unconditionally would

@@ -1061,3 +1061,50 @@ emitted deltas count — survived the first pass: one level of sharing exercises
 the memo but never a memo hit *nested under* another memoised pair. A two-level
 fixture pins it, with the intermediate definition carrying its own keywords so
 it forms a memo pair of its own rather than chain-resolving away.
+
+### Twenty-first review round
+
+One P1, fixed — a residual of the twentieth round's own fix.
+
+- **P1 — the memo's in-progress placeholder read as "unchanged".** The previous
+  round taught the `$ref` memo to record whether a pair's subtree changed, so a
+  repeat visit could still tell the branch guard "this changed". But the entry
+  is written *twice*: once as a placeholder before recursing (which is what
+  makes a recursive type terminate) and once with the real verdict afterwards.
+  The placeholder was `false`, indistinguishable from a settled "did not
+  change".
+
+  So a **self**-recursive definition — one whose own `oneOf` branch points back
+  at it — hit its own unfinished traversal and read a verdict that did not exist
+  yet. The branch guard saw nothing and skipped its overlap check, exactly as
+  before the previous round's fix; only the trigger moved from a *shared*
+  definition to a *recursive* one.
+
+  Neither answer is available at that moment. Reading it as unchanged hides a
+  real rebind. Reading it as changed reports **every** unchanged recursive type
+  as breaking, because the guard's disjointness check asks whether the branch
+  overlaps a rival *as it now stands*, not whether the overlap is new — so an
+  untyped recursive branch beside any rival would fail, and that workflow's own
+  baseline could never pass the gate again. That is the same trap the tenth
+  round's positional-branch comparison was introduced to avoid.
+
+  The memo entry therefore became a three-state `PairVisit`
+  (`InProgress` / `Done(true)` / `Done(false)`), and a guard that back-edges into
+  an in-progress pair **parks** its check instead of deciding it. Each pair, on
+  settling as changed, resolves the checks waiting on it. The answer is exact
+  rather than conservative: a branch that *is* a `$ref` to pair P changes if and
+  only if P changes, and P's own frame is the thing that knows.
+
+  A parked record names every active pair its branch reached and fires on the
+  first to settle as changed, so a branch that back-edges into two pairs is
+  reported once; records whose pairs all settle unchanged are simply never
+  drained.
+
+Five mutants. Making an in-progress hit record nothing reproduces the reported
+bug; making it fail closed trips the unchanged-recursive control; never draining,
+and draining regardless of the pair's verdict, fail one each. The fifth — firing
+a parked record on whichever pair settles first rather than on its own —
+**survived**, because every fixture so far changed only inside the recursive
+definition, where the two are indistinguishable. A schema that holds the
+recursive branch fixed and changes an unrelated definition beside it pins the
+keying.

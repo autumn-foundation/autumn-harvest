@@ -4749,3 +4749,125 @@ fn an_unchanged_transitively_shared_ref_is_not_reported() {
         diff.deltas
     );
 }
+
+/// A **self**-recursive definition whose own `oneOf` branch points back at it.
+/// Unlike the shared-definition cases above, the second visit to `A` happens
+/// while `A`'s first traversal is *still running*, so the memo holds the
+/// termination placeholder rather than a settled verdict.
+///
+/// `A`'s own body is byte-identical across revisions — only `C`, which it
+/// reaches through `properties.n`, changes. That is load-bearing: a change to
+/// `A` itself would alter the branch's identity key and be caught as a
+/// variant swap long before the memo mattered. Keys sort `choice` ahead of `n`,
+/// so the branch guard runs *before* the delta that proves `A` changed.
+fn self_recursive_branch_schema(maximum: i64) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "entry": {"$ref": "#/definitions/A"}
+        },
+        "definitions": {
+            "A": {
+                "properties": {
+                    "n": {"$ref": "#/definitions/C"},
+                    "choice": {
+                        "oneOf": [
+                            {"$ref": "#/definitions/A"},
+                            {
+                                "type": "object",
+                                "required": ["n"],
+                                "properties": {"n": {"type": "integer", "minimum": 1}}
+                            }
+                        ]
+                    }
+                }
+            },
+            "C": {"type": "integer", "maximum": maximum}
+        }
+    })
+}
+
+#[test]
+fn relaxing_a_bound_on_an_actively_traversed_recursive_ref_is_breaking() {
+    let baseline = self_recursive_branch_schema(0);
+    let current = self_recursive_branch_schema(2);
+    // Baseline: `{"n": 1}` fails `A` (C caps `n` at 0), so only the object rival
+    // matches — exactly one. Current: C admits `1`, so `A` matches too and
+    // `oneOf` rejects a payload it used to accept.
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"entry": {"choice": {"n": 1}}}));
+    assert!(
+        diff_input(baseline, current).has_breaking(),
+        "a back-edge into a pair still being traversed must not be read as `unchanged`"
+    );
+}
+
+#[test]
+fn an_unchanged_self_recursive_branch_is_not_reported() {
+    // The negative control that rules out fixing the above by simply failing
+    // closed on every back-edge: these branches are not provably disjoint, so a
+    // blanket pessimistic hit would report this unchanged schema breaking and
+    // permanently block its own baseline.
+    let diff = diff_input(
+        self_recursive_branch_schema(0),
+        self_recursive_branch_schema(0),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "an unchanged self-recursive branch must emit nothing: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The same recursive `A`, held completely fixed, beside an unrelated
+/// definition that does change. `A` is reached first, so its branch parks a
+/// check; the change then lands somewhere `A` cannot see.
+fn self_recursive_with_unrelated_schema(unrelated_maximum: i64) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "entry": {"$ref": "#/definitions/A"},
+            "other": {"$ref": "#/definitions/D"}
+        },
+        "definitions": {
+            "A": {
+                "properties": {
+                    "n": {"$ref": "#/definitions/C"},
+                    "choice": {
+                        "oneOf": [
+                            {"$ref": "#/definitions/A"},
+                            {
+                                "type": "object",
+                                "required": ["n"],
+                                "properties": {"n": {"type": "integer", "minimum": 1}}
+                            }
+                        ]
+                    }
+                }
+            },
+            "C": {"type": "integer", "maximum": 0},
+            "D": {"type": "integer", "maximum": unrelated_maximum}
+        }
+    })
+}
+
+#[test]
+fn an_unrelated_change_does_not_fire_a_parked_recursive_branch_check() {
+    // A parked check must be keyed to the pair it actually depends on. Firing
+    // it on whichever pair happens to settle as changed would report this
+    // branch breaking because a definition it never reaches was relaxed.
+    let diff = diff_input(
+        self_recursive_with_unrelated_schema(0),
+        self_recursive_with_unrelated_schema(2),
+    );
+    assert!(
+        !diff.has_breaking(),
+        "a change outside the recursive branch's own subtree must not fire its \
+         parked overlap check: {:#?}",
+        diff.deltas
+    );
+    assert_eq!(
+        diff.compatible_count, 1,
+        "the unrelated relaxation is still reported: {:#?}",
+        diff.deltas
+    );
+}

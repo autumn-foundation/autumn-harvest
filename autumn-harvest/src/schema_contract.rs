@@ -1422,6 +1422,8 @@ fn diff_role(
                 base_root: &bc,
                 cur_root: &cc,
                 visited: BTreeMap::new(),
+                active_hits: Vec::new(),
+                pending_branch_guards: Vec::new(),
                 suppressed_changes: 0,
             };
             diff_node(&mut ctx, &bc, &cc, "", 0, diff);
@@ -1439,7 +1441,15 @@ struct DiffCtx<'a> {
     /// value records whether that pair's subtree produced any delta, so a later
     /// memo HIT can still tell a caller "this changed" — see
     /// [`DiffCtx::suppressed_changes`].
-    visited: BTreeMap<(String, String), bool>,
+    visited: BTreeMap<(String, String), PairVisit>,
+    /// Pairs whose traversal a back-edge landed in *while it was still running*,
+    /// appended in visit order. A caller samples the length around its own
+    /// recursion; anything new is a pair whose verdict cannot be known yet.
+    active_hits: Vec<(String, String)>,
+    /// Overlap checks that could not be decided when they ran, because the
+    /// branch back-edged into a pair still being traversed. Re-examined as each
+    /// of those pairs settles — see [`run_pending_branch_guards`].
+    pending_branch_guards: Vec<PendingBranchGuard>,
     /// How many times a memo hit swallowed a subtree that had CHANGED.
     ///
     /// The memo makes the diff linear, but it also makes the second visit to a
@@ -1451,6 +1461,37 @@ struct DiffCtx<'a> {
     /// monotonic like `visited`; a caller samples it around its own recursion
     /// and treats an increase as "changed, but not inspectable here".
     suppressed_changes: usize,
+}
+
+/// Where a `$ref` pair is in the traversal.
+///
+/// The distinction is what separates "already compared, and it did not change"
+/// from "cannot say yet". Collapsing them to one `bool` is what let a
+/// self-recursive branch read its own unfinished traversal as unchanged.
+#[derive(Clone, Copy)]
+enum PairVisit {
+    /// Being traversed right now. A back-edge lands here; its verdict is not
+    /// decidable until the frame that opened it returns.
+    InProgress,
+    /// Traversal finished. `true` when the subtree produced any delta.
+    Done(bool),
+}
+
+/// A branch-overlap check parked until the pair it depends on settles.
+///
+/// Owned rather than borrowed: the check outlives the traversal frame that
+/// registered it, and only ever fires for a branch that back-edged into an
+/// active pair — a genuinely recursive type — so the clone is off the hot path.
+struct PendingBranchGuard {
+    /// Every active pair this branch reached. The branch changed iff *any* of
+    /// them did, so the first to settle as changed fires the check and the
+    /// record is consumed.
+    on_pairs: Vec<(String, String)>,
+    cur: Value,
+    rivals: Vec<Value>,
+    is_anyof: bool,
+    path: String,
+    sub_path: String,
 }
 
 impl DiffCtx<'_> {
@@ -1526,7 +1567,7 @@ fn diff_node(
             b_ref.unwrap_or_else(|| path.to_string()),
             c_ref.unwrap_or_else(|| path.to_string()),
         );
-        if let Some(&changed) = ctx.visited.get(&key) {
+        if let Some(&state) = ctx.visited.get(&key) {
             // Already expanded this pair: either a recursive type, or a
             // definition reached by a second path. Coinductively compatible —
             // anything reachable from here was compared the first time.
@@ -1544,12 +1585,21 @@ fn diff_node(
             // let a compatible relaxation silence the branch-overlap check. The
             // pair's own verdict is replayed on the counter instead, so the
             // signal survives without re-walking the subtree.
-            if changed {
-                ctx.suppressed_changes += 1;
+            //
+            // A pair still IN PROGRESS has no verdict to replay — this is a
+            // back-edge into the very traversal we are nested in, so whether it
+            // changed is not yet knowable. Answering "no" would be a guess in
+            // the unsafe direction, and answering "yes" would report every
+            // unchanged recursive type as breaking. Record the back-edge and
+            // let the caller park its decision until the pair settles.
+            match state {
+                PairVisit::Done(true) => ctx.suppressed_changes += 1,
+                PairVisit::Done(false) => {}
+                PairVisit::InProgress => ctx.active_hits.push(key),
             }
             return;
         }
-        ctx.visited.insert(key.clone(), false);
+        ctx.visited.insert(key.clone(), PairVisit::InProgress);
         let before_total = diff.breaking_count + diff.compatible_count;
         let before_suppressed = ctx.suppressed_changes;
         // A chain that terminates on a CYCLE lands on a node that STILL carries
@@ -1577,7 +1627,12 @@ fn diff_node(
         // would simply move one level down.
         let changed = diff.breaking_count + diff.compatible_count > before_total
             || ctx.suppressed_changes > before_suppressed;
-        ctx.visited.insert(key, changed);
+        ctx.visited.insert(key.clone(), PairVisit::Done(changed));
+        // The pair now has a verdict, so any check that back-edged into it while
+        // it was running can finally be resolved.
+        if changed {
+            run_pending_branch_guards(ctx, &key, diff);
+        }
         return;
     }
 
@@ -3413,8 +3468,12 @@ fn diff_branch_guarding_rebind(
     let before_total = diff.breaking_count + diff.compatible_count;
     let before_stored = diff.deltas.len();
     let before_suppressed = ctx.suppressed_changes;
+    let before_active = ctx.active_hits.len();
     diff_node(ctx, base, cur, sub_path, depth + 1, diff);
 
+    // Taken unconditionally, so the log never accumulates entries from a branch
+    // that had no rivals to check against.
+    let back_edges: Vec<_> = ctx.active_hits.drain(before_active..).collect();
     if rivals.is_empty() {
         return;
     }
@@ -3427,6 +3486,23 @@ fn diff_branch_guarding_rebind(
     // definition first, and the branch context never learns about it.
     let swallowed = ctx.suppressed_changes > before_suppressed;
     if emitted == 0 && !swallowed {
+        // Nothing OBSERVED — but a back-edge means the observation is not
+        // finished. This branch is a `$ref` to a pair whose traversal encloses
+        // this very call, so "did the branch change" is exactly "does that pair
+        // change", and only the frame that opened it can answer. Park the check
+        // rather than resolve it either way: guessing "unchanged" hides a real
+        // rebind, and guessing "changed" reports every unchanged recursive type
+        // as breaking, which would block its own baseline forever.
+        if !back_edges.is_empty() {
+            ctx.pending_branch_guards.push(PendingBranchGuard {
+                on_pairs: back_edges,
+                cur: cur.clone(),
+                rivals: rivals.to_vec(),
+                is_anyof,
+                path: path.to_string(),
+                sub_path: sub_path.to_string(),
+            });
+        }
         return;
     }
     let cur_root = ctx.cur_root;
@@ -3463,6 +3539,27 @@ fn diff_branch_guarding_rebind(
     if !is_anyof && all_stored && stored.iter().any(|d| d.verdict == Verdict::Breaking) {
         return;
     }
+    emit_rebind_if_overlapping(ctx, cur, rivals, is_anyof, path, sub_path, diff);
+}
+
+/// The tail of [`diff_branch_guarding_rebind`]: the branch is known to have
+/// changed, so report it unless every rival is provably disjoint from it.
+///
+/// Split out because two callers reach this point with no local deltas to
+/// inspect — a change swallowed by the memo, and one parked on a pair that had
+/// not settled yet — so the delta-shape filters above simply do not apply to
+/// them. They are exactly the fail-closed cases the disjointness check exists
+/// to adjudicate.
+fn emit_rebind_if_overlapping(
+    ctx: &DiffCtx<'_>,
+    cur: &Value,
+    rivals: &[Value],
+    is_anyof: bool,
+    path: &str,
+    sub_path: &str,
+    diff: &mut SchemaContractDiff,
+) {
+    let cur_root = ctx.cur_root;
     if rivals
         .iter()
         .all(|l| branches_provably_disjoint(cur, l, cur_root))
@@ -3488,6 +3585,41 @@ fn diff_branch_guarding_rebind(
              the differ cannot see"
         ),
     ));
+}
+
+/// Resolve every parked overlap check that was waiting on `key`, now that the
+/// pair has settled as CHANGED.
+///
+/// A record naming several pairs fires on the first of them to change and is
+/// removed, so a branch that back-edged into two active pairs is reported once.
+/// Records whose pairs all settle as unchanged are simply never drained — the
+/// branch genuinely did not change, which is the whole reason the decision was
+/// parked instead of guessed.
+fn run_pending_branch_guards(
+    ctx: &mut DiffCtx<'_>,
+    key: &(String, String),
+    diff: &mut SchemaContractDiff,
+) {
+    if ctx.pending_branch_guards.is_empty() {
+        return;
+    }
+    // Taken out of `ctx` first so the checks below can borrow it immutably.
+    // They only read `cur_root` and never recurse, so nothing can register a
+    // new record while this runs.
+    let all = std::mem::take(&mut ctx.pending_branch_guards);
+    let (due, keep): (Vec<_>, Vec<_>) = all.into_iter().partition(|p| p.on_pairs.contains(key));
+    ctx.pending_branch_guards = keep;
+    for p in due {
+        emit_rebind_if_overlapping(
+            ctx,
+            &p.cur,
+            &p.rivals,
+            p.is_anyof,
+            &p.path,
+            &p.sub_path,
+            diff,
+        );
+    }
 }
 
 /// Compare a branch set the differ cannot key, by POSITION.
