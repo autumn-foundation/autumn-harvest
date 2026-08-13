@@ -258,7 +258,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ),
     // Background control-loop liveness heartbeat (issue #797). Bounded
     // `scanner` label; no execution/workflow identity exists at this layer.
-    ("harvest_scanner_tick", &["scanner"]),
+    ("harvest_scanner_tick", &["scanner", "shard"]),
     ("harvest_mutex_wait_duration", &["workflow"]),
     ("harvest_mutex_held_duration", &["workflow"]),
     ("harvest_mutex_contention_depth", &["workflow"]),

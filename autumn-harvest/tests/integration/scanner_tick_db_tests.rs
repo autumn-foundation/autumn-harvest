@@ -123,7 +123,8 @@ impl TickRecorder {
 }
 
 impl MetricsRecorder for TickRecorder {
-    fn record_scanner_tick(&self, scanner: &str) {
+    fn record_scanner_tick(&self, scanner: &str, shard: &str) {
+        let _ = shard;
         self.ticks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -1282,6 +1282,14 @@ pub const METRIC_LABEL_DECISION: &str = "decision";
 /// Bounded by construction to the [`Scanner`](crate::scanner_health::Scanner)
 /// variants — a call site passes the enum's `as_str()`, never a free string.
 pub const METRIC_LABEL_SCANNER: &str = "scanner";
+/// `shard` label value for a control loop that is **not** per-shard (issue #797).
+///
+/// The `retention` and `schedule` loops run once per process rather than once
+/// per assigned shard, and a single-shard deployment's per-shard loops have no
+/// shard id to report. They emit this sentinel so every
+/// [`METRIC_SCANNER_TICK`] series carries the same label set — a family with a
+/// sometimes-present label is awkward to query and easy to mis-aggregate.
+pub const SCANNER_SHARD_LABEL_NONE: &str = "none";
 
 // ---------------------------------------------------------------------------
 // Custom (user) metric constants and validation (issue #532)
@@ -1985,9 +1993,22 @@ pub trait MetricsRecorder: Send + Sync {
     /// One background control-loop iteration completed (issue #797).
     ///
     /// Maps to the counter [`METRIC_SCANNER_TICK`], labeled `scanner` (=
-    /// [`METRIC_LABEL_SCANNER`]). `scanner` is always
+    /// [`METRIC_LABEL_SCANNER`]) and `shard` (= [`METRIC_LABEL_SHARD`]).
+    /// `scanner` is always
     /// [`Scanner::as_str`](crate::scanner_health::Scanner::as_str), so the
     /// label's cardinality is bounded by construction.
+    ///
+    /// `shard` is what stops one healthy sibling from **masking** a wedged
+    /// one. A multi-shard worker spawns a `timeout`, `poison_pill`, and
+    /// `pause_auto_resume` loop *per assigned shard*; without a per-shard
+    /// dimension they would all increment one series, so a healthy shard's
+    /// ticks would keep `rate(...) > 0` while another shard's loop was dead
+    /// and the paging alert would never fire. Use
+    /// [`SCANNER_SHARD_LABEL_NONE`] for the process-wide loops (`retention`,
+    /// `schedule`) and single-shard deployments, so the label set is uniform
+    /// across the series family. Cardinality stays bounded: shard count is
+    /// operator-configured and small, matching the existing `shard`-labeled
+    /// metrics (`harvest.dlq.entries`, `harvest.shard.stranded_pending`).
     ///
     /// Called **unconditionally at the end of every iteration**, including
     /// no-work iterations — that is what makes a flat-lined counter mean
@@ -1999,8 +2020,8 @@ pub trait MetricsRecorder: Send + Sync {
     ///
     /// Additive with a no-op default: implementing it is optional and no
     /// existing implementor breaks.
-    fn record_scanner_tick(&self, scanner: &str) {
-        let _ = scanner;
+    fn record_scanner_tick(&self, scanner: &str, shard: &str) {
+        let _ = (scanner, shard);
     }
 
     /// A background control loop registered itself, before its first
@@ -2008,7 +2029,9 @@ pub trait MetricsRecorder: Send + Sync {
     ///
     /// Initializes that scanner's [`METRIC_SCANNER_TICK`] series **at zero**
     /// rather than recording a separate metric — implementations should
-    /// increment the tick counter by `0`.
+    /// increment the tick counter by `0`, with the same `scanner` and `shard`
+    /// labels [`record_scanner_tick`](Self::record_scanner_tick) uses, so the
+    /// initialized series is the one the ticks go on to increment.
     ///
     /// Without this, a loop that panics or hangs during its *first* iteration
     /// never reaches [`record_scanner_tick`](Self::record_scanner_tick), so
@@ -2024,8 +2047,8 @@ pub trait MetricsRecorder: Send + Sync {
     ///
     /// Additive with a no-op default: implementing it is optional and no
     /// existing implementor breaks.
-    fn record_scanner_registered(&self, scanner: &str) {
-        let _ = scanner;
+    fn record_scanner_registered(&self, scanner: &str, shard: &str) {
+        let _ = (scanner, shard);
     }
 
     /// Results of one retention-janitor tick on a shard.

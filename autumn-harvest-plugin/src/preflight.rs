@@ -1360,10 +1360,10 @@ fn scanner_liveness_check(statuses: &[ScannerStatus]) -> PreflightCheckResult {
     // shard when there is one. Kept separate from `stale_scanners` so that
     // field stays a stable, machine-readable list of bare scanner names.
     let mut stale_labels = Vec::new();
-    // The standard `affected_shards` contract field: the shards of the stale
-    // instances only. `check()` sorts and dedups it, and the CLI's SCOPE column
-    // reads exactly this field, so a per-shard wedge must land here and not
-    // only in the summary and details.
+    // The standard `affected_shards` contract field: the shards of every stale
+    // instance. `check()` sorts and dedups it, and the CLI's SCOPE column reads
+    // exactly this field, so a per-shard wedge must land here and not only in
+    // the summary and details.
     let mut affected_shards = Vec::new();
     let mut entries = Vec::with_capacity(statuses.len());
 
@@ -1387,9 +1387,12 @@ fn scanner_liveness_check(statuses: &[ScannerStatus]) -> PreflightCheckResult {
                 || status.scanner.as_str().to_owned(),
                 |shard| format!("{} (shard {})", status.scanner.as_str(), shard.as_i32()),
             ));
-            if let Some(shard) = status.shard {
-                affected_shards.push(shard.as_i32());
-            }
+            // EVERY stale instance's shard, not just the worst one's: the
+            // worst-instance fold picks one owner for the verdict, so pushing
+            // only `status.shard` would report shard 1 while shard 2 was
+            // equally unprotected -- an understated blast radius on the exact
+            // surface an operator uses to decide what to restart.
+            affected_shards.extend(status.stale_shards.iter().copied().map(ShardId::as_i32));
         }
         entries.push(json!({
             "scanner": status.scanner.as_str(),
@@ -1556,6 +1559,33 @@ mod tests {
         tick_count: u64,
         shard: Option<ShardId>,
     ) -> ScannerStatus {
+        // Mirror `snapshot_as_of`: a single-instance status is stale on its own
+        // shard exactly when its own reading is not healthy.
+        let mut built = status_with_stale_shards(
+            scanner,
+            poll_interval_secs,
+            age_secs,
+            tick_count,
+            shard,
+            Vec::new(),
+        );
+        if classify_scanner(&built) != ScannerLivenessVerdict::Healthy {
+            built.stale_shards = shard.into_iter().collect();
+        }
+        built
+    }
+
+    /// Build a status whose `stale_shards` is set explicitly, for the
+    /// multi-shard folds `snapshot_as_of` produces but a single-instance
+    /// helper cannot express.
+    fn status_with_stale_shards(
+        scanner: Scanner,
+        poll_interval_secs: u64,
+        age_secs: u64,
+        tick_count: u64,
+        shard: Option<ShardId>,
+        stale_shards: Vec<ShardId>,
+    ) -> ScannerStatus {
         ScannerStatus {
             scanner,
             poll_interval: Duration::from_secs(poll_interval_secs),
@@ -1564,6 +1594,7 @@ mod tests {
             age: Duration::from_secs(age_secs),
             has_ticked: tick_count > 0,
             shard,
+            stale_shards,
         }
     }
 
@@ -1652,6 +1683,37 @@ mod tests {
             result.affected_shards,
             vec![1],
             "shard 2 is ticking normally, so it must not be reported as affected"
+        );
+    }
+
+    /// Issue #797, Codex review: `snapshot_as_of` folds the per-shard
+    /// instances of one scanner down to the **worst** owner so the verdict is
+    /// reproducible from the folded status. That fold is right for the
+    /// verdict and wrong for the blast radius — if two shards are wedged at
+    /// once, reporting only the worse one tells the operator to fix one
+    /// database while the other stays unprotected. `stale_shards` carries all
+    /// of them through, and `affected_shards` must surface all of them.
+    #[test]
+    fn scanner_liveness_affected_shards_covers_every_stale_shard_not_just_the_worst() {
+        // One folded status for `timeout`, whose worst instance is shard 1 but
+        // whose shard 2 instance is also stale -- exactly what `snapshot_as_of`
+        // now produces for a two-shard worker with both loops wedged.
+        let result = scanner_liveness_check(&[status_with_stale_shards(
+            Scanner::Timeout,
+            30,
+            200,
+            4,
+            Some(ShardId::new(1)),
+            vec![ShardId::new(1), ShardId::new(2)],
+        )]);
+
+        assert_eq!(result.status, PreflightStatus::Fail);
+        assert_eq!(
+            result.affected_shards,
+            vec![1, 2],
+            "both wedged shards must be in the blast radius -- reporting only \
+             the worst instance's shard understates it and sends the operator \
+             to one database while the other stays unprotected"
         );
     }
 

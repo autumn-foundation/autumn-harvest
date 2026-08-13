@@ -52,13 +52,14 @@
 //!   process: a multi-shard worker spawns a timeout checker, poison-pill
 //!   reclaimer, and pause auto-resumer per assigned shard. Each instance is
 //!   tracked separately and the health check reports the **worst** of them, so
-//!   a healthy shard cannot mask a wedged sibling. The *metric*, however,
-//!   carries no shard label — its series is the sum across a process's
-//!   instances, so on a multi-shard worker the counter alone cannot say
-//!   *which* shard stalled. The health check can, and says so: the reported
-//!   instance carries its [`ShardId`] through to the check payload, so the
-//!   operator learns which database was left unprotected rather than only
-//!   that some timeout checker died.
+//!   a healthy shard cannot mask a wedged sibling. The *metric* carries a
+//!   bounded `shard` label for the same reason: without it every per-shard
+//!   instance would increment one series on one scrape target, so a healthy
+//!   shard's ticks would hold `rate(...) > 0` while a sibling's loop was dead
+//!   and the paging alert would never fire — masking, not merely a lost
+//!   localization. The health check additionally names the shard in its
+//!   payload and lists **every** stale shard in `stale_shards`, so an
+//!   operator sees the full blast radius rather than one database.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,7 +68,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
-use crate::telemetry::MetricsRecorder;
+use crate::telemetry::{MetricsRecorder, SCANNER_SHARD_LABEL_NONE};
 use crate::types::ShardId;
 
 /// Lower bound on the staleness threshold, regardless of how fast a loop
@@ -251,11 +252,25 @@ pub struct ScannerStatus {
     /// pause-auto-resume). `None` for the process-wide loops (retention,
     /// schedule) and for single-shard deployments.
     ///
-    /// This is the *worst* instance's shard, so it names the database that is
-    /// actually unprotected. It is deliberately absent from the tick metric —
-    /// localizing a single-shard wedge is precisely the job this in-process
-    /// check does that `harvest.scanner.tick` cannot.
+    /// This is the *worst* instance's shard, so it names the single database
+    /// most in need of attention. When more than one shard is affected, read
+    /// [`stale_shards`](Self::stale_shards) instead — this field alone
+    /// understates the blast radius.
     pub shard: Option<ShardId>,
+    /// **Every** shard whose instance of this scanner is currently
+    /// `Stale` or `Wedged`, sorted and deduplicated.
+    ///
+    /// The worst-instance fold that produces [`shard`](Self::shard) is right
+    /// for the *verdict* — one verdict per scanner, reproducible from the
+    /// folded status — but wrong for the *blast radius*: two shards can be
+    /// wedged at once, and reporting only the worse of them tells an operator
+    /// to fix one database while the other stays unprotected. This field is
+    /// what populates the preflight check's standard `affected_shards`.
+    ///
+    /// Empty when the scanner is healthy, and for the process-wide loops
+    /// (`retention`, `schedule`) and single-shard deployments, which carry no
+    /// shard to report.
+    pub stale_shards: Vec<ShardId>,
 }
 
 /// Classify one scanner's liveness reading.
@@ -279,6 +294,7 @@ pub fn classify_scanner(status: &ScannerStatus) -> ScannerLivenessVerdict {
 pub struct ScannerOwner {
     scanner: Scanner,
     id: u64,
+    shard: Option<ShardId>,
 }
 
 impl ScannerOwner {
@@ -286,6 +302,28 @@ impl ScannerOwner {
     #[must_use]
     pub const fn scanner(self) -> Scanner {
         self.scanner
+    }
+
+    /// Which shard this instance polls, for the per-shard loops.
+    ///
+    /// Carried on the handle rather than looked up at tick time so
+    /// [`record_scanner_tick`] can label the counter without touching the
+    /// registry lock on the hot path.
+    #[must_use]
+    pub const fn shard(self) -> Option<ShardId> {
+        self.shard
+    }
+
+    /// This instance's `shard` metric label value.
+    ///
+    /// [`SCANNER_SHARD_LABEL_NONE`] for a process-wide loop, so every
+    /// `harvest.scanner.tick` series carries the same label set.
+    #[must_use]
+    pub fn shard_label(self) -> String {
+        self.shard.map_or_else(
+            || SCANNER_SHARD_LABEL_NONE.to_owned(),
+            |shard| shard.as_i32().to_string(),
+        )
     }
 }
 
@@ -388,10 +426,11 @@ impl ScannerLiveness {
     ///
     /// A multi-shard worker spawns one timeout checker, poison-pill reclaimer,
     /// and pause auto-resumer per assigned shard, all sharing one [`Scanner`]
-    /// label. Recording which shard each instance polls is what lets the
-    /// liveness snapshot name the database left unprotected when one of them
-    /// wedges — the tick counter carries no shard label, so this check is the
-    /// only surface that can localize it.
+    /// label. Recording which shard each instance polls does two things: it
+    /// lets the liveness snapshot name the database left unprotected, and it
+    /// supplies the `shard` metric label that keeps each instance on its own
+    /// `harvest.scanner.tick` series so a healthy sibling cannot mask a
+    /// wedged one.
     pub fn register_for_shard(
         &self,
         scanner: Scanner,
@@ -439,7 +478,7 @@ impl ScannerLiveness {
             },
         );
         drop(entries);
-        ScannerOwner { scanner, id }
+        ScannerOwner { scanner, id, shard }
     }
 
     /// Declare that one instance has stopped **gracefully**.
@@ -562,6 +601,22 @@ impl ScannerLiveness {
                             *age,
                         )
                     })?;
+                // Every stale instance's shard, not just the worst one's: two
+                // shards can be wedged at once, and the worst-instance fold
+                // that decides the *verdict* would otherwise silently drop the
+                // second unprotected database from the blast radius.
+                let mut stale_shards: Vec<ShardId> = owners
+                    .values()
+                    .filter(|state| {
+                        classify_reading(
+                            now.saturating_duration_since(state.reference()),
+                            state.poll_interval,
+                        ) != ScannerLivenessVerdict::Healthy
+                    })
+                    .filter_map(|state| state.shard)
+                    .collect();
+                stale_shards.sort_unstable();
+                stale_shards.dedup();
                 Some(ScannerStatus {
                     scanner: *scanner,
                     poll_interval: worst.poll_interval,
@@ -570,6 +625,7 @@ impl ScannerLiveness {
                     age,
                     has_ticked: worst.last_tick.is_some(),
                     shard: worst.shard,
+                    stale_shards,
                 })
             })
             .collect()
@@ -628,9 +684,9 @@ pub fn register_scanner(
 ///
 /// The timeout checker, poison-pill reclaimer, and pause auto-resumer are
 /// spawned one-per-assigned-shard, all under one [`Scanner`] label. Passing the
-/// shard here is what lets `scanner_liveness` name the unprotected database
-/// when one of them wedges; the tick counter deliberately carries no shard
-/// label, so this in-process check is the only surface that can localize it.
+/// shard here both lets `scanner_liveness` name the unprotected database and
+/// puts each instance on its own `harvest.scanner.tick` series, so a healthy
+/// shard's ticks cannot hold the alert quiet while a sibling is wedged.
 #[must_use]
 pub fn register_scanner_for_shard(
     metrics: &dyn MetricsRecorder,
@@ -659,7 +715,7 @@ pub fn register_scanner_on(
     shard: Option<ShardId>,
 ) -> ScannerOwner {
     let owner = liveness.register_for_shard(scanner, poll_interval, shard);
-    metrics.record_scanner_registered(scanner.as_str());
+    metrics.record_scanner_registered(scanner.as_str(), &owner.shard_label());
     owner
 }
 
@@ -697,7 +753,7 @@ pub fn record_scanner_tick_on(
     owner: ScannerOwner,
 ) {
     liveness.tick(owner);
-    metrics.record_scanner_tick(owner.scanner().as_str());
+    metrics.record_scanner_tick(owner.scanner().as_str(), &owner.shard_label());
 }
 
 #[cfg(test)]

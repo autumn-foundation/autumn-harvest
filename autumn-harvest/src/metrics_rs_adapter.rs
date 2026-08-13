@@ -411,24 +411,31 @@ impl MetricsRecorder for MetricsRsRecorder {
         let _ = (shard, candidate_count, deleted_count, duration_secs);
     }
 
-    fn record_scanner_tick(&self, scanner: &str) {
-        // Bounded label: `scanner` is always `Scanner::as_str()` (issue #797),
-        // one of seven compile-time variants.
+    fn record_scanner_tick(&self, scanner: &str, shard: &str) {
+        // Bounded labels: `scanner` is always `Scanner::as_str()` (issue #797),
+        // one of seven compile-time variants; `shard` is an operator-configured
+        // shard id or `SCANNER_SHARD_LABEL_NONE`. The shard dimension is what
+        // stops a healthy per-shard sibling from masking a wedged one on the
+        // shared series.
         counter!(
             METRIC_SCANNER_TICK,
             METRIC_LABEL_SCANNER => scanner.to_owned(),
+            METRIC_LABEL_SHARD => shard.to_owned(),
         )
         .increment(1);
     }
 
-    fn record_scanner_registered(&self, scanner: &str) {
-        // Same counter, incremented by zero: this exists purely to bring the
-        // series into existence at registration, so a loop that wedges before
-        // its first tick still reads `rate(...) == 0` instead of exporting no
-        // series at all (issue #797).
+    fn record_scanner_registered(&self, scanner: &str, shard: &str) {
+        // Same counter and the same label set, incremented by zero: this exists
+        // purely to bring the series into existence at registration, so a loop
+        // that wedges before its first tick still reads `rate(...) == 0`
+        // instead of exporting no series at all (issue #797). The labels must
+        // match `record_scanner_tick` exactly or it would initialize a
+        // different series than the one the ticks increment.
         counter!(
             METRIC_SCANNER_TICK,
             METRIC_LABEL_SCANNER => scanner.to_owned(),
+            METRIC_LABEL_SHARD => shard.to_owned(),
         )
         .increment(0);
     }
@@ -1197,16 +1204,19 @@ mod tests {
     }
 
     /// Every `Scanner` variant's expected `harvest.scanner.tick` counter key.
-    fn expected_scanner_counter_keys() -> Vec<CounterKey> {
+    fn expected_scanner_counter_keys(shard: &str) -> Vec<CounterKey> {
         crate::scanner_health::Scanner::ALL
             .iter()
             .map(|scanner| {
                 (
                     METRIC_SCANNER_TICK.to_owned(),
-                    vec![(
-                        METRIC_LABEL_SCANNER.to_owned(),
-                        (*scanner).as_str().to_owned(),
-                    )],
+                    vec![
+                        (
+                            METRIC_LABEL_SCANNER.to_owned(),
+                            (*scanner).as_str().to_owned(),
+                        ),
+                        (METRIC_LABEL_SHARD.to_owned(), shard.to_owned()),
+                    ],
                 )
             })
             .collect()
@@ -1265,16 +1275,16 @@ mod tests {
         metrics::with_local_recorder(&&capture, || {
             let rec = MetricsRsRecorder;
             for scanner in crate::scanner_health::Scanner::ALL {
-                rec.record_scanner_tick(scanner.as_str());
+                rec.record_scanner_tick(scanner.as_str(), "3");
             }
         });
 
         let counters = capture.counters.lock().unwrap().clone();
         assert_eq!(
             counters,
-            expected_scanner_counter_keys(),
+            expected_scanner_counter_keys("3"),
             "the bridge must register harvest.scanner.tick with exactly the \
-             bounded `scanner` label for every Scanner variant"
+             bounded `scanner` and `shard` labels for every Scanner variant"
         );
     }
 
@@ -1293,14 +1303,14 @@ mod tests {
         metrics::with_local_recorder(&&capture, || {
             let rec = MetricsRsRecorder;
             for scanner in crate::scanner_health::Scanner::ALL {
-                rec.record_scanner_registered(scanner.as_str());
+                rec.record_scanner_registered(scanner.as_str(), "3");
             }
         });
 
         let counters = capture.counters.lock().unwrap().clone();
         assert_eq!(
             counters,
-            expected_scanner_counter_keys(),
+            expected_scanner_counter_keys("3"),
             "registration must initialize the very same harvest.scanner.tick \
              series the tick increments, so a first-iteration wedge is visible \
              to rate() == 0"

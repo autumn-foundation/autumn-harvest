@@ -1905,16 +1905,20 @@ own work counters and its `tracing::error!`, not this heartbeat.
   needs no gate because it knows what is registered.
 - **Not a false positive: one wedged shard.** A multi-shard worker spawns a
   `timeout`, `poison_pill`, and `pause_auto_resume` loop **per assigned shard**,
-  all under one `scanner` label. The preflight check tracks each instance
-  separately and reports the **worst**, so one wedged shard is flagged even
-  while its peers tick — but the *metric* carries no shard label, so its series
-  is the sum across the process's instances and keeps incrementing. On a
-  multi-shard worker, trust the preflight check to catch a single-shard wedge;
-  the counter will not.
+  all under one `scanner` label. Both surfaces handle this, and both have to:
+  the counter carries a bounded **`shard`** label (the shard id, or `none` for
+  the process-wide `retention`/`schedule` loops and single-shard deployments),
+  so each instance lives on its own series and `rate(...) == 0` evaluates the
+  wedged shard on its own. Without that label the instances would share one
+  series on one scrape target and a healthy shard's ticks would hold the rate
+  above zero while a sibling's loop was dead — the wedge would be **masked**,
+  not merely unlocalised. If you write your own grouping, keep `shard` for the
+  same reason you keep `instance`.
 
-  The check also **names the shard**, in both the summary and the per-scanner
-  entry, so you can go straight to the unprotected database rather than
-  restarting the whole worker blind:
+  The preflight check tracks each instance separately, reports the **worst**,
+  and **names the shard** in both the summary and the per-scanner entry — plus
+  **every** stale shard in `affected_shards`, so a two-shard wedge shows both
+  rather than sending you to one database while the other stays unprotected:
 
   ```console
   $ harvest preflight --output json | jq '.checks[] | select(.name == "scanner_liveness")'
@@ -1941,8 +1945,11 @@ own work counters and its `tracing::error!`, not this heartbeat.
   fail    scanner_liveness   shards=1  1 of 5 background control loops are stale: timeout (shard 1)
   ```
 
-  It lists only the **stale** instances, so a healthy sibling shard is never
-  reported as affected. `shard` / `affected_shards` are empty for the
+  When more than one shard is wedged, `affected_shards` carries **all** of
+  them (`shards=1,2`) while the `shard` field names the single worst instance —
+  the fold that decides the verdict picks one owner, but the blast radius must
+  not be understated. It lists only the **stale** instances, so a healthy
+  sibling shard is never reported as affected. `shard` / `affected_shards` are empty for the
   process-wide loops (`retention`, `schedule`) and on single-shard deployments,
   where there is no fan-out to disambiguate; the SCOPE column then reads `-`.
 

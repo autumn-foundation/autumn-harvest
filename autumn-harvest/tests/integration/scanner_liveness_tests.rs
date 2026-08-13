@@ -84,8 +84,8 @@ fn record_scanner_tick_has_a_noop_default() {
     struct Minimal;
     impl MetricsRecorder for Minimal {}
 
-    Minimal.record_scanner_tick(Scanner::Timeout.as_str());
-    Minimal.record_scanner_tick(Scanner::Retention.as_str());
+    Minimal.record_scanner_tick(Scanner::Timeout.as_str(), "0");
+    Minimal.record_scanner_tick(Scanner::Retention.as_str(), "none");
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +519,151 @@ fn the_reported_instance_names_the_shard_that_is_wedged() {
     );
 }
 
+/// Issue #797, Codex review (P1): a multi-shard worker spawns one `timeout`
+/// loop **per assigned shard**. Without a per-shard dimension on the counter
+/// they all increment one series on one scrape target, so a healthy shard's
+/// ticks keep `rate(...) > 0` while another shard's loop is dead — the shipped
+/// paging alert would never fire. That is *masking*, not merely an inability
+/// to localize, so the metric carries a bounded `shard` label.
+///
+/// This is the falsifying test: drop the label from the recorder call and the
+/// two instances become indistinguishable at the metric layer.
+#[test]
+fn each_per_shard_instance_ticks_its_own_metric_series() {
+    #[derive(Default)]
+    struct LabelCapture(std::sync::Mutex<Vec<(String, String)>>);
+    impl MetricsRecorder for LabelCapture {
+        fn record_scanner_tick(&self, scanner: &str, shard: &str) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((scanner.to_owned(), shard.to_owned()));
+        }
+    }
+
+    let liveness = ScannerLiveness::new();
+    let capture = LabelCapture::default();
+    let interval = Duration::from_secs(30);
+
+    let shard_0 = autumn_harvest::scanner_health::register_scanner_on(
+        &liveness,
+        &capture,
+        Scanner::Timeout,
+        interval,
+        Some(ShardId::new(0)),
+    );
+    let shard_1 = autumn_harvest::scanner_health::register_scanner_on(
+        &liveness,
+        &capture,
+        Scanner::Timeout,
+        interval,
+        Some(ShardId::new(1)),
+    );
+
+    // Shard 0 keeps ticking; shard 1's loop is wedged and never ticks again.
+    autumn_harvest::scanner_health::record_scanner_tick_on(&liveness, &capture, shard_0);
+    autumn_harvest::scanner_health::record_scanner_tick_on(&liveness, &capture, shard_0);
+    autumn_harvest::scanner_health::record_scanner_tick_on(&liveness, &capture, shard_1);
+
+    let ticks = capture
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        ticks,
+        vec![
+            ("timeout".to_owned(), "0".to_owned()),
+            ("timeout".to_owned(), "0".to_owned()),
+            ("timeout".to_owned(), "1".to_owned()),
+        ],
+        "each per-shard instance must tick its OWN series -- sharing one series \
+         lets a healthy shard's rate mask a wedged sibling and the paging alert \
+         never fires"
+    );
+
+    // The distinguishing property, stated directly: shard 0 and shard 1 are
+    // separate series, so `rate(...) == 0` evaluates shard 1 on its own.
+    assert_ne!(shard_0.shard_label(), shard_1.shard_label());
+}
+
+/// The process-wide loops (`retention`, `schedule`) and single-shard
+/// deployments have no shard id, but must still carry the label so the series
+/// family has a uniform label set rather than a sometimes-present dimension.
+#[test]
+fn a_process_wide_loop_ticks_the_none_shard_label() {
+    let liveness = ScannerLiveness::new();
+    let owner = liveness.register(Scanner::Retention, Duration::from_secs(30));
+    assert_eq!(
+        owner.shard_label(),
+        autumn_harvest::SCANNER_SHARD_LABEL_NONE,
+        "a process-wide loop must emit the sentinel, not omit the label"
+    );
+}
+
+/// Issue #797, Codex review: the worst-instance fold decides the *verdict*,
+/// but two shards can be wedged at once. Folding to one owner and reporting
+/// only its shard understates the blast radius on the surface an operator uses
+/// to decide what to restart -- so every stale instance's shard is carried
+/// through the snapshot alongside the worst one.
+#[test]
+fn the_snapshot_carries_every_stale_shard_not_just_the_worst() {
+    let liveness = ScannerLiveness::new();
+    let t0 = std::time::Instant::now();
+    let interval = Duration::from_secs(30);
+
+    // Three per-shard timeout checkers: shard 0 keeps ticking, shards 1 and 2
+    // both go silent -- 1 for longer, so it is the worst instance.
+    let healthy =
+        liveness.register_for_shard_at(Scanner::Timeout, interval, Some(ShardId::new(0)), t0);
+    let wedged_worse =
+        liveness.register_for_shard_at(Scanner::Timeout, interval, Some(ShardId::new(1)), t0);
+    let wedged_also =
+        liveness.register_for_shard_at(Scanner::Timeout, interval, Some(ShardId::new(2)), t0);
+    liveness.tick_at(wedged_worse, t0);
+    liveness.tick_at(wedged_also, t0 + Duration::from_secs(60));
+
+    let now = t0 + Duration::from_secs(200);
+    liveness.tick_at(healthy, now);
+
+    let status = &liveness.snapshot_as_of(now)[0];
+    assert_eq!(
+        status.shard,
+        Some(ShardId::new(1)),
+        "the worst instance still drives the single-shard field"
+    );
+    assert_eq!(
+        status.stale_shards,
+        vec![ShardId::new(1), ShardId::new(2)],
+        "both silent shards must survive the fold -- reporting only shard 1 \
+         sends the operator to one unprotected database while shard 2 stays \
+         equally unprotected"
+    );
+}
+
+/// The blast-radius list must stay empty while every instance is healthy, so a
+/// healthy multi-shard worker renders SCOPE as `-` rather than naming shards.
+#[test]
+fn the_snapshot_reports_no_stale_shards_while_every_instance_is_healthy() {
+    let liveness = ScannerLiveness::new();
+    let t0 = std::time::Instant::now();
+    let interval = Duration::from_secs(30);
+
+    let a = liveness.register_for_shard_at(Scanner::Timeout, interval, Some(ShardId::new(0)), t0);
+    let b = liveness.register_for_shard_at(Scanner::Timeout, interval, Some(ShardId::new(1)), t0);
+    let now = t0 + Duration::from_secs(5);
+    liveness.tick_at(a, now);
+    liveness.tick_at(b, now);
+
+    let status = &liveness.snapshot_as_of(now)[0];
+    assert_eq!(classify_scanner(status), ScannerLivenessVerdict::Healthy);
+    assert!(
+        status.stale_shards.is_empty(),
+        "a healthy fleet must report no affected shards: {:?}",
+        status.stale_shards
+    );
+}
+
 /// A process-wide loop (retention, schedule) has no shard to report, and must
 /// say so rather than inventing one. Keeps the payload honest on the
 /// single-shard deployments that are the common case.
@@ -749,7 +894,8 @@ fn record_scanner_tick_emits_the_counter_and_the_timestamp_together() {
     #[derive(Default)]
     struct Capture(std::sync::Mutex<Vec<String>>);
     impl MetricsRecorder for Capture {
-        fn record_scanner_tick(&self, scanner: &str) {
+        fn record_scanner_tick(&self, scanner: &str, shard: &str) {
+            let _ = shard;
             self.0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -783,18 +929,18 @@ fn record_scanner_tick_emits_the_counter_and_the_timestamp_together() {
 struct RegisterCapture(std::sync::Mutex<Vec<String>>);
 
 impl MetricsRecorder for RegisterCapture {
-    fn record_scanner_registered(&self, scanner: &str) {
+    fn record_scanner_registered(&self, scanner: &str, shard: &str) {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(format!("register:{scanner}"));
+            .push(format!("register:{scanner}@{shard}"));
     }
 
-    fn record_scanner_tick(&self, scanner: &str) {
+    fn record_scanner_tick(&self, scanner: &str, shard: &str) {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(format!("tick:{scanner}"));
+            .push(format!("tick:{scanner}@{shard}"));
     }
 }
 
@@ -827,7 +973,7 @@ fn registration_initializes_the_series_before_the_first_iteration() {
     );
 
     // A wedge on iteration one: registered, never ticked.
-    assert_eq!(capture.events(), ["register:retention"]);
+    assert_eq!(capture.events(), ["register:retention@none"]);
     let status = &liveness.snapshot()[0];
     assert!(
         !status.has_ticked,
@@ -837,7 +983,10 @@ fn registration_initializes_the_series_before_the_first_iteration() {
 
     // And once it does run, the tick follows the registration.
     autumn_harvest::scanner_health::record_scanner_tick_on(&liveness, &capture, owner);
-    assert_eq!(capture.events(), ["register:retention", "tick:retention"]);
+    assert_eq!(
+        capture.events(),
+        ["register:retention@none", "tick:retention@none"]
+    );
 }
 
 #[test]
@@ -859,7 +1008,7 @@ fn every_scanner_variant_initializes_its_own_series() {
 
     let expected: Vec<String> = Scanner::ALL
         .iter()
-        .map(|s| format!("register:{}", s.as_str()))
+        .map(|s| format!("register:{}@none", s.as_str()))
         .collect();
     assert_eq!(capture.events(), expected);
 }
