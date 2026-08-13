@@ -11,15 +11,15 @@
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::telemetry::{
-    ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
-    METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_PAUSED, METRIC_RETENTION_DELETED,
-    METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED,
-    METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
-    METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED, METRIC_TIMER_STARTED, METRIC_UPDATE_ADMITTED,
-    METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION, METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED,
-    METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION,
-    METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
-    MetricsRecorder, NoOpMetrics, WorkflowStatus,
+    ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_LABEL_SCANNER,
+    METRIC_LABEL_SHARD, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_PAUSED,
+    METRIC_RETENTION_DELETED, METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED,
+    METRIC_SCANNER_TICK, METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS,
+    METRIC_SCHEDULE_SKIPPED, METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED, METRIC_TIMER_STARTED,
+    METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION, METRIC_UPDATE_FAILED,
+    METRIC_UPDATE_REJECTED, METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_CONTINUE_AS_NEW,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
+    METRIC_WORKFLOW_TASK_TIMEOUT, MetricsRecorder, NoOpMetrics, WorkflowStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -178,6 +178,16 @@ impl MetricsRecorder for RecordingMetrics {
         self.samples.lock().unwrap().push(MetricSample {
             name: METRIC_SCHEDULE_DECISION_WRITE_FAILED,
             labels: vec![],
+        });
+    }
+
+    fn record_scanner_tick(&self, scanner: &str, shard: &str) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_SCANNER_TICK,
+            labels: vec![
+                (METRIC_LABEL_SCANNER, scanner.to_owned()),
+                (METRIC_LABEL_SHARD, shard.to_owned()),
+            ],
         });
     }
 
@@ -354,6 +364,7 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
     rec.record_schedule_skipped("workflow", "nightly", "paused");
     rec.record_schedule_decision_write_failed();
     rec.record_retention_tick(0, 100, 50, 0.01);
+    rec.record_scanner_tick("timeout", "0");
     rec.record_retention_deleted("my_workflow", 50);
     rec.record_workflow_task_timeout("my_workflow", "default");
     rec.record_task_dispatched("default");
@@ -430,6 +441,10 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
         "harvest.retention.deleted not sampled"
     );
     assert!(
+        names.contains(&METRIC_SCANNER_TICK),
+        "harvest.scanner.tick not sampled"
+    );
+    assert!(
         names.contains(&METRIC_WORKFLOW_TASK_TIMEOUT),
         "harvest.workflow.task_timeout not sampled"
     );
@@ -477,6 +492,9 @@ fn cardinality_no_execution_id_label_on_any_metric() {
     rec.record_update_rejected("wf", "set_priority");
     rec.record_update_completed("wf", "set_priority", "default");
     rec.record_update_failed("wf", "set_priority", "default");
+    for scanner in autumn_harvest::scanner_health::Scanner::ALL {
+        rec.record_scanner_tick(scanner.as_str(), "0");
+    }
 
     for sample in rec.drain() {
         for (key, _val) in &sample.labels {

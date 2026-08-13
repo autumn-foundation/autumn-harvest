@@ -3171,6 +3171,35 @@ pub struct WorkerConfig {
     pub max_concurrent_sessions: i32,
 }
 
+/// Drop duplicate shard ids, preserving first-occurrence order (issue #797).
+///
+/// A duplicate entry in [`WorkerConfig::shard_assignments`] is never useful and
+/// is actively harmful: the worker fans its per-shard control loops out over
+/// the assignment list one-to-one, so `[0, 0]` spawns **two** timeout checkers,
+/// **two** poison-pill reclaimers, and **two** pause auto-resumers against the
+/// *same* database — doubling enforcement passes, connection pressure, and DB
+/// load for no added coverage, since each pair scans identical rows.
+///
+/// It also collapses those instances onto one `harvest.scanner.tick` series
+/// (they share both the `scanner` and `shard` label values), so a healthy
+/// duplicate would keep `rate(...) > 0` and mask its wedged twin from the
+/// `harvest_scanner_stalled` alert. Deduplicating at the config boundary fixes
+/// the root cause rather than papering over the symptom with an unbounded
+/// owner-id metric label — the registry's owner ids are monotonic and never
+/// reused, so labelling by them would violate the ADR-0001 §7 bounded-label
+/// rule in any process that restarts a runtime.
+///
+/// First-occurrence order is preserved rather than sorting, so a deliberate
+/// polling order stays intact.
+#[must_use]
+pub(crate) fn dedup_shard_assignments(shards: Vec<ShardId>) -> Vec<ShardId> {
+    let mut seen = std::collections::BTreeSet::new();
+    shards
+        .into_iter()
+        .filter(|shard| seen.insert(*shard))
+        .collect()
+}
+
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
@@ -3295,10 +3324,11 @@ impl WorkerConfig {
     /// Assign which shards this worker is responsible for.
     ///
     /// Empty assignments default back to `[ShardId::new(0)]` to preserve the
-    /// single-shard behaviour.
+    /// single-shard behaviour. Duplicates are dropped — see
+    /// [`dedup_shard_assignments`].
     #[must_use]
     pub fn with_shard_assignments(mut self, shards: impl IntoIterator<Item = ShardId>) -> Self {
-        let shards: Vec<ShardId> = shards.into_iter().collect();
+        let shards = dedup_shard_assignments(shards.into_iter().collect());
         self.shard_assignments = if shards.is_empty() {
             vec![ShardId::new(0)]
         } else {
@@ -3645,6 +3675,54 @@ mod tests {
     use crate::dag::DagBuilder;
     use crate::info::{DagInfo, WorkflowInfo};
     use crate::policy::Schedule;
+
+    /// A duplicate shard would fan the per-shard control loops out twice
+    /// against one database, and would collapse those two instances onto a
+    /// single `(scanner, shard)` tick series so a healthy duplicate masks its
+    /// wedged twin (issue #797).
+    #[test]
+    fn with_shard_assignments_drops_duplicate_shards() {
+        let cfg = WorkerConfig::default().with_shard_assignments([
+            ShardId::new(0),
+            ShardId::new(1),
+            ShardId::new(0),
+        ]);
+        assert_eq!(
+            cfg.shard_assignments,
+            vec![ShardId::new(0), ShardId::new(1)],
+            "a repeated shard must not spawn a second set of control loops \
+             against the same database",
+        );
+    }
+
+    /// Ordering is a deliberate polling order, not an artifact — dedup must
+    /// not reorder the shards an operator listed.
+    #[test]
+    fn dedup_shard_assignments_preserves_first_occurrence_order() {
+        let deduped = dedup_shard_assignments(vec![
+            ShardId::new(2),
+            ShardId::new(0),
+            ShardId::new(2),
+            ShardId::new(1),
+            ShardId::new(0),
+        ]);
+        assert_eq!(
+            deduped,
+            vec![ShardId::new(2), ShardId::new(0), ShardId::new(1)],
+        );
+    }
+
+    /// An all-duplicates list must still leave a usable assignment rather than
+    /// collapsing to empty and tripping the single-shard fallback.
+    #[test]
+    fn with_shard_assignments_keeps_one_entry_when_every_entry_is_the_same() {
+        let cfg = WorkerConfig::default().with_shard_assignments([
+            ShardId::new(3),
+            ShardId::new(3),
+            ShardId::new(3),
+        ]);
+        assert_eq!(cfg.shard_assignments, vec![ShardId::new(3)]);
+    }
 
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {

@@ -139,6 +139,7 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_workflow_population_leak` | Workflow lifecycle | Active workflows by type & state | [runbook](../runbooks/harvest-alerts.md#harvest_workflow_population_leak) |
 | `harvest_workflow_history_bloat` | Workflow health | Workflow history bloat (early warning) | [runbook](../runbooks/harvest-alerts.md#harvest_workflow_history_bloat) |
 | `harvest_queue_paused_too_long` | Queues & workers | Paused queues (dispatch held) | [runbook](../runbooks/harvest-alerts.md#harvest_queue_paused_too_long) |
+| `harvest_scanner_stalled` | Background control loops (scanner liveness) | Scanner tick rate | [runbook](../runbooks/harvest-alerts.md#harvest_scanner_stalled) |
 
 ### Readiness-style alerts (no native metric)
 

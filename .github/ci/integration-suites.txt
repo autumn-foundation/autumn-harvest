@@ -78,6 +78,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          retention_overrides_tests
 linux        autumn-harvest         integration                      -                          retention_summary_tests
 linux        autumn-harvest         integration                      -                          retry_after_tests
+linux        autumn-harvest         integration                      -                          scanner_tick_db_tests
 linux        autumn-harvest         integration                      -                          schedule_runs_tests
 linux        autumn-harvest         integration                      -                          scheduler_overdue_tests
 linux        autumn-harvest         integration                      -                          scheduler_registration_tests

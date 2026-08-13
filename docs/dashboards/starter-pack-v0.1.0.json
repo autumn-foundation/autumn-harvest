@@ -5213,6 +5213,121 @@
           "description": "Unconsumed backlog per binding where the broker client exposes it (issue #944), measured as work still owed to the consumer rather than immediately fetchable: Kafka high watermark minus the committed offset (clamped up to the low watermark, so retention-deleted records are excluded); SQS ApproximateNumberOfMessages plus ApproximateNumberOfMessagesNotVisible (a message abandoned for retry is not visible, so the visible count alone drains toward zero during an outage). Every replica reports the same number -- SQS reads whole-queue depth, and the Kafka sample is group-wide across the topic's partitions rather than the replica's own assignment -- so `max by` deduplicates replicas without under-reporting either adapter."
         }
       ]
+    },
+    {
+      "id": 925,
+      "type": "row",
+      "title": "Background control loops (scanner liveness)",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 123
+      },
+      "panels": [
+        {
+          "id": 926,
+          "type": "timeseries",
+          "title": "Scanner tick rate",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 124
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              },
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (scanner, instance, shard) (rate(harvest_scanner_tick_total[$__rate_interval]))",
+              "legendFormat": "{{scanner}} shard={{shard}} @ {{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Liveness heartbeat rate of each background control loop (issue #797). Every loop ticks on EVERY iteration, including no-work iterations, so a series that flat-lines to zero means that loop is wedged (panicked, deadlocked, or stalled on a never-returning query) -- not merely idle. Kept per-instance deliberately: every replica runs its own copy of all seven loops, so summing across instances would let a healthy replica mask a wedged one. Note `retention` polls hourly by default, so at short rate intervals its line sits indistinguishably near zero when healthy -- judge it on the 3h panel beside this one, whose window is longer than the janitor's cadence. Alert: harvest_scanner_stalled. Bounded `scanner` label (7 values); execution.id is never a label (ADR-0001 SS7)."
+        },
+        {
+          "id": 927,
+          "type": "timeseries",
+          "title": "Scanner ticks (3h)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 124
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1,
+                "scaleDistribution": {
+                  "type": "log",
+                  "log": 10
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (scanner, instance, shard) (increase(harvest_scanner_tick_total[3h]))",
+              "legendFormat": "{{scanner}} shard={{shard}} @ {{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Iterations completed per loop over 3h (issue #797) -- the low-frequency companion to the rate panel, and the panel to judge `retention` on. The window is deliberately LONGER than the slowest loop's cadence: the janitor polls hourly by default, so any window under an hour legitimately contains zero increments for much of every healthy hour and the \"zero means wedged\" reading would be false exactly where it is supposed to be authoritative. At 3h a healthy janitor floors at ~3. A series that stops incrementing is the wedge signal -- note that on the log axis a zero reads as a BREAK in the line rather than a dip to the baseline. The axis is log because a sub-second loop contributes ~21,600 ticks over the same window against the janitor's ~3, and a linear scale would pin retention indistinguishably to zero -- the exact illegibility this panel exists to fix. Retune alongside the alert's 3h window if you have changed the retention tick interval. Per-instance so one replica's wedged loop is not hidden by its healthy peers. A multi-shard worker runs one timeout/poison_pill/pause_auto_resume loop PER SHARD under one label, and the metric carries no shard label -- to catch a single-shard wedge use the scanner_liveness check in GET /admin/preflight, which names the wedged instance's shard."
+        }
+      ]
     }
   ]
 }

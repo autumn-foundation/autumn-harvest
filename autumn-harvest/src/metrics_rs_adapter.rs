@@ -55,16 +55,16 @@ use crate::telemetry::{
     METRIC_LABEL_BUILD_ID, METRIC_LABEL_DECISION, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY,
     METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME,
     METRIC_LABEL_PATH, METRIC_LABEL_PRODUCER, METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE,
-    METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE, METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD,
-    METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATE, METRIC_LABEL_STATUS,
-    METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE,
+    METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE, METRIC_LABEL_SCANNER, METRIC_LABEL_SCOPE,
+    METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATE,
+    METRIC_LABEL_STATUS, METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE,
     METRIC_MUTEX_CONTENTION, METRIC_MUTEX_HELD, METRIC_MUTEX_WAIT, METRIC_PAYLOAD_BYTES,
     METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED, METRIC_PAYLOAD_REJECTED,
     METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
     METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_PAUSED, METRIC_QUEUE_SCHEDULE_TO_START,
     METRIC_RATE_LIMIT_REFILL_RATE, METRIC_RATE_LIMIT_THROTTLED, METRIC_RATE_LIMIT_TOKENS_AVAILABLE,
     METRIC_RETENTION_DELETED, METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED,
-    METRIC_SCHEDULE_AUTO_PAUSED, METRIC_SCHEDULE_DECISION_WRITE_FAILED,
+    METRIC_SCANNER_TICK, METRIC_SCHEDULE_AUTO_PAUSED, METRIC_SCHEDULE_DECISION_WRITE_FAILED,
     METRIC_SCHEDULE_FIRE_ATTEMPTS, METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_OVERDUE,
     METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED, METRIC_SESSION_ACQUISITION,
     METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED, METRIC_SUMMARY_DELETED,
@@ -409,6 +409,35 @@ impl MetricsRecorder for MetricsRsRecorder {
         // count and duration have no metric today; kept as a no-op so the
         // per-shard tick observability point remains available.
         let _ = (shard, candidate_count, deleted_count, duration_secs);
+    }
+
+    fn record_scanner_tick(&self, scanner: &str, shard: &str) {
+        // Bounded labels: `scanner` is always `Scanner::as_str()` (issue #797),
+        // one of seven compile-time variants; `shard` is an operator-configured
+        // shard id or `SCANNER_SHARD_LABEL_NONE`. The shard dimension is what
+        // stops a healthy per-shard sibling from masking a wedged one on the
+        // shared series.
+        counter!(
+            METRIC_SCANNER_TICK,
+            METRIC_LABEL_SCANNER => scanner.to_owned(),
+            METRIC_LABEL_SHARD => shard.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_scanner_registered(&self, scanner: &str, shard: &str) {
+        // Same counter and the same label set, incremented by zero: this exists
+        // purely to bring the series into existence at registration, so a loop
+        // that wedges before its first tick still reads `rate(...) == 0`
+        // instead of exporting no series at all (issue #797). The labels must
+        // match `record_scanner_tick` exactly or it would initialize a
+        // different series than the one the ticks increment.
+        counter!(
+            METRIC_SCANNER_TICK,
+            METRIC_LABEL_SCANNER => scanner.to_owned(),
+            METRIC_LABEL_SHARD => shard.to_owned(),
+        )
+        .increment(0);
     }
 
     fn record_retention_deleted(&self, workflow: &str, count: u64) {
@@ -1157,6 +1186,135 @@ mod tests {
         let rec = MetricsRsRecorder;
         rec.record_activity_panic("send_email", "default");
         rec.record_workflow_panic("onboarding", "default");
+    }
+
+    // -----------------------------------------------------------------------
+    // Background control-loop liveness heartbeat bridge (issue #797)
+    // -----------------------------------------------------------------------
+
+    // Real label-content assertion support: a local `metrics::Recorder` that
+    // captures every registered counter key, so a wrong metric name, a dropped
+    // label, or a mis-named label constant is caught here rather than surfacing
+    // as a silently-missing series in production.
+    type CounterKey = (String, Vec<(String, String)>);
+
+    #[derive(Default)]
+    struct CapturingRecorder {
+        counters: std::sync::Mutex<Vec<CounterKey>>,
+    }
+
+    /// Every `Scanner` variant's expected `harvest.scanner.tick` counter key.
+    fn expected_scanner_counter_keys(shard: &str) -> Vec<CounterKey> {
+        crate::scanner_health::Scanner::ALL
+            .iter()
+            .map(|scanner| {
+                (
+                    METRIC_SCANNER_TICK.to_owned(),
+                    vec![
+                        (
+                            METRIC_LABEL_SCANNER.to_owned(),
+                            (*scanner).as_str().to_owned(),
+                        ),
+                        (METRIC_LABEL_SHARD.to_owned(), shard.to_owned()),
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    impl metrics::Recorder for CapturingRecorder {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            self.counters.lock().unwrap().push((
+                key.name().to_owned(),
+                key.labels()
+                    .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                    .collect(),
+            ));
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn bridges_scanner_tick_with_the_bounded_scanner_label() {
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            for scanner in crate::scanner_health::Scanner::ALL {
+                rec.record_scanner_tick(scanner.as_str(), "3");
+            }
+        });
+
+        let counters = capture.counters.lock().unwrap().clone();
+        assert_eq!(
+            counters,
+            expected_scanner_counter_keys("3"),
+            "the bridge must register harvest.scanner.tick with exactly the \
+             bounded `scanner` and `shard` labels for every Scanner variant"
+        );
+    }
+
+    #[test]
+    fn bridges_scanner_registered_by_initializing_the_same_tick_series() {
+        // A loop that panics or hangs on its *first* iteration never reaches a
+        // tick, so without an explicit registration sample the process exports
+        // no series at all -- and the shipped alert
+        // `rate(harvest_scanner_tick_total{...}[5m]) == 0` only evaluates
+        // series that exist, so the page would stay silent forever.
+        //
+        // Registration must therefore pre-create the *same* counter key the
+        // tick uses: same metric name, same bounded `scanner` label. A separate
+        // series (or a differently-labelled one) would not satisfy the alert.
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            for scanner in crate::scanner_health::Scanner::ALL {
+                rec.record_scanner_registered(scanner.as_str(), "3");
+            }
+        });
+
+        let counters = capture.counters.lock().unwrap().clone();
+        assert_eq!(
+            counters,
+            expected_scanner_counter_keys("3"),
+            "registration must initialize the very same harvest.scanner.tick \
+             series the tick increments, so a first-iteration wedge is visible \
+             to rate() == 0"
+        );
     }
 
     #[test]

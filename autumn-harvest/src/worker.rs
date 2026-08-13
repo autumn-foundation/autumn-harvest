@@ -334,7 +334,12 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             cancellation_grace_period: cfg.cancellation_grace_period,
             sticky_timeout: cfg.sticky_timeout,
             max_local_activity_start_to_close: cfg.max_local_activity_start_to_close,
-            shard_assignments: cfg.shard_assignments,
+            // Deduplicated here, not only in `with_shard_assignments`, because
+            // `shard_assignments` is a `pub` field an embedder can set
+            // directly. This `From` is the single choke point every worker's
+            // config passes through on its way to the per-shard monitor
+            // fan-out (issue #797).
+            shard_assignments: crate::builder::dedup_shard_assignments(cfg.shard_assignments),
             worker_heartbeat_interval: cfg.worker_heartbeat_interval,
             build_id: cfg.build_id,
             deployment_name: cfg.deployment_name,
@@ -15160,7 +15165,18 @@ fn spawn_pause_auto_resumer(
     interval: Duration,
     max_pause_duration: Duration,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    shard: Option<crate::types::ShardId>,
 ) -> tokio::task::JoinHandle<()> {
+    // Issue #797: declare the loop before its first iteration so the
+    // `scanner_liveness` check expects it and grants it boot grace. The shard
+    // is carried so a multi-shard worker's snapshot can name WHICH shard's
+    // auto-resumer wedged -- the tick counter carries no shard label.
+    let owner = crate::scanner_health::register_scanner_for_shard(
+        &*telemetry.metrics,
+        crate::scanner_health::Scanner::PauseAutoResume,
+        interval,
+        shard,
+    );
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -15191,10 +15207,17 @@ fn spawn_pause_auto_resumer(
                 }
             }
 
+            // Issue #797: unconditional end-of-iteration liveness tick.
+            crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
+
             if cancel.is_cancelled() {
                 break;
             }
         }
+        // Issue #797: a graceful stop retires this loop from the expected
+        // scanner set. A panic unwinds past here, so a panicked loop stays
+        // registered and correctly ages into `Wedged`.
+        crate::scanner_health::deregister_scanner(owner);
     })
 }
 
@@ -16493,19 +16516,26 @@ impl Worker {
         // tasks/executions on every assigned shard are recovered (fix #3,
         // issue #522). When a ShardedDbPool is available each shard gets its own
         // instance; otherwise the single default pool is used.
+        //
+        // Each pool is paired with the `ShardId` it was resolved from (issue
+        // #797): all N per-shard instances share one `Scanner` label, so the
+        // liveness snapshot needs the id to name WHICH shard is unprotected
+        // when one of them wedges. `None` on the single-pool fallback, where
+        // there is no per-shard fan-out to disambiguate.
         #[cfg(feature = "db")]
-        let shard_pools_for_monitors: Vec<DbPool> = {
+        let shard_pools_for_monitors: Vec<(DbPool, Option<crate::types::ShardId>)> = {
             let assignments = &self.config.shard_assignments;
             match (assignments.is_empty(), self.config.sharded_pool.as_ref()) {
                 (false, Some(sp)) => assignments
                     .iter()
-                    .map(|s| sp.pool_for(*s).clone())
+                    .map(|s| (sp.pool_for(*s).clone(), Some(*s)))
                     .collect(),
-                _ => vec![pool.clone()],
+                _ => vec![(pool.clone(), None)],
             }
         };
         #[cfg(not(feature = "db"))]
-        let shard_pools_for_monitors: Vec<DbPool> = vec![pool.clone()];
+        let shard_pools_for_monitors: Vec<(DbPool, Option<crate::types::ShardId>)> =
+            vec![(pool.clone(), None)];
 
         // Worker-stale threshold mirrors the fleet-health classifier:
         // 2 × heartbeat interval, with a 1 s floor for sub-second intervals.
@@ -16532,8 +16562,8 @@ impl Worker {
         // peer-shard delivery is unchanged.
         let timeout_checkers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|shard_pool| {
-                crate::timeout::spawn_timeout_checker(
+            .map(|(shard_pool, shard)| {
+                crate::timeout::spawn_timeout_checker_for_shard(
                     shard_pool.clone(),
                     self.shutdown.clone(),
                     self.config.poll_interval,
@@ -16544,20 +16574,22 @@ impl Worker {
                     self.registry.circuit_breakers(),
                     self.config.max_workflow_history_events,
                     worker_stale_secs,
+                    *shard,
                 )
             })
             .collect();
 
         let poison_pill_reclaimers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|shard_pool| {
-                crate::poison_pill::spawn_poison_pill_reclaimer(
+            .map(|(shard_pool, shard)| {
+                crate::poison_pill::spawn_poison_pill_reclaimer_for_shard(
                     shard_pool.clone(),
                     self.shutdown.clone(),
                     self.config.worker_heartbeat_interval,
                     self.config.poison_pill_threshold,
                     worker_stale_secs,
                     self.registry.telemetry().clone(),
+                    *shard,
                 )
             })
             .collect();
@@ -16573,7 +16605,7 @@ impl Worker {
         // same interval via `enforce_timeouts_once`).
         let session_slot_reconcilers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|shard_pool| {
+            .map(|(shard_pool, _shard)| {
                 crate::sessions::spawn_session_slot_reconciler(
                     shard_pool.clone(),
                     Arc::clone(&self.session_slots_in_use),
@@ -16584,13 +16616,14 @@ impl Worker {
             .collect();
         let pause_auto_resumers: Vec<_> = shard_pools_for_monitors
             .iter()
-            .map(|shard_pool| {
+            .map(|(shard_pool, shard)| {
                 spawn_pause_auto_resumer(
                     shard_pool.clone(),
                     self.shutdown.clone(),
                     self.config.worker_heartbeat_interval,
                     self.config.max_workflow_pause_duration,
                     self.registry.telemetry().clone(),
+                    *shard,
                 )
             })
             .collect();
@@ -18763,6 +18796,31 @@ mod tests {
     fn worker_config_validates() {
         let cfg = default_runtime_config();
         assert!(cfg.validate().is_ok());
+    }
+
+    /// `shard_assignments` is a `pub` field, so an embedder can set it
+    /// directly and bypass `with_shard_assignments`. The `From` conversion is
+    /// the choke point every worker's config passes through on its way to the
+    /// per-shard monitor fan-out, so it must dedup too (issue #797).
+    #[test]
+    fn runtime_config_dedupes_directly_set_shard_assignments() {
+        // Deliberately bypassing `with_shard_assignments`, exactly as an
+        // embedder setting the `pub` field can.
+        let worker_config = crate::builder::WorkerConfig {
+            shard_assignments: vec![
+                crate::types::ShardId::new(0),
+                crate::types::ShardId::new(1),
+                crate::types::ShardId::new(0),
+            ],
+            ..crate::builder::WorkerConfig::default()
+        };
+        let runtime_config = WorkerRuntimeConfig::from(worker_config);
+        assert_eq!(
+            runtime_config.shard_assignments,
+            vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)],
+            "a duplicate shard must not reach the per-shard monitor fan-out, \
+             which spawns one control-loop set per assignment entry",
+        );
     }
 
     #[test]

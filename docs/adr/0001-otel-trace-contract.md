@@ -256,6 +256,7 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_SCHEDULE_SKIPPED`  | `harvest.schedule.skipped`    | Counter      | `kind`, `name`, `reason` (3 values)           |                       |
 | `METRIC_SCHEDULE_OVERDUE`  | `harvest.schedule.overdue`    | Gauge        | `kind` (2 values), `name` (bounded)           | `execution.id`        |
 | `METRIC_RETENTION_DELETED` | `harvest.retention.deleted`   | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`)        |                       |
+| `METRIC_SCANNER_TICK`      | `harvest.scanner.tick`        | Counter      | `scanner` (bounded, 7 values: timeout/sla/poison_pill/external_outbox/retention/schedule/pause_auto_resume; 7 labels but 5 spawned loops — `sla`/`external_outbox` are ticked by the `timeout` loop that drives them, so those three cannot diverge), `shard` (operator-configured shard id, or `none` for the process-wide `retention`/`schedule` loops and single-shard deployments — required so a healthy per-shard sibling cannot mask a wedged one on a shared series) | `execution.id` |
 | `METRIC_WORKFLOW_PAUSED`   | `harvest.workflow.paused`     | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id`      |
 | `METRIC_WORKFLOW_PAUSE_DURATION` | `harvest.workflow.pause_duration` | Histogram | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
 | `METRIC_SAGA_COMPENSATED`  | `harvest.saga.compensated`    | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
