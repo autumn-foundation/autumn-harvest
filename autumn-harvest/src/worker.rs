@@ -334,7 +334,12 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             cancellation_grace_period: cfg.cancellation_grace_period,
             sticky_timeout: cfg.sticky_timeout,
             max_local_activity_start_to_close: cfg.max_local_activity_start_to_close,
-            shard_assignments: cfg.shard_assignments,
+            // Deduplicated here, not only in `with_shard_assignments`, because
+            // `shard_assignments` is a `pub` field an embedder can set
+            // directly. This `From` is the single choke point every worker's
+            // config passes through on its way to the per-shard monitor
+            // fan-out (issue #797).
+            shard_assignments: crate::builder::dedup_shard_assignments(cfg.shard_assignments),
             worker_heartbeat_interval: cfg.worker_heartbeat_interval,
             build_id: cfg.build_id,
             deployment_name: cfg.deployment_name,
@@ -18782,6 +18787,31 @@ mod tests {
     fn worker_config_validates() {
         let cfg = default_runtime_config();
         assert!(cfg.validate().is_ok());
+    }
+
+    /// `shard_assignments` is a `pub` field, so an embedder can set it
+    /// directly and bypass `with_shard_assignments`. The `From` conversion is
+    /// the choke point every worker's config passes through on its way to the
+    /// per-shard monitor fan-out, so it must dedup too (issue #797).
+    #[test]
+    fn runtime_config_dedupes_directly_set_shard_assignments() {
+        // Deliberately bypassing `with_shard_assignments`, exactly as an
+        // embedder setting the `pub` field can.
+        let worker_config = crate::builder::WorkerConfig {
+            shard_assignments: vec![
+                crate::types::ShardId::new(0),
+                crate::types::ShardId::new(1),
+                crate::types::ShardId::new(0),
+            ],
+            ..crate::builder::WorkerConfig::default()
+        };
+        let runtime_config = WorkerRuntimeConfig::from(worker_config);
+        assert_eq!(
+            runtime_config.shard_assignments,
+            vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)],
+            "a duplicate shard must not reach the per-shard monitor fan-out, \
+             which spawns one control-loop set per assignment entry",
+        );
     }
 
     #[test]

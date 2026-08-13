@@ -60,6 +60,35 @@
 //!   localization. The health check additionally names the shard in its
 //!   payload and lists **every** stale shard in `stale_shards`, so an
 //!   operator sees the full blast radius rather than one database.
+//!
+//! # Residual: two runtimes on one shard in one process
+//!
+//! `(instance, scanner, shard)` separates every instance the deployment shapes
+//! Harvest supports actually produce — one worker process per shard, or one
+//! multi-shard worker — because a duplicate `shard_assignments` entry is
+//! deduplicated at the config boundary (`builder::dedup_shard_assignments`,
+//! applied by both `WorkerConfig::with_shard_assignments` and the
+//! `WorkerConfig -> WorkerRuntimeConfig` conversion).
+//!
+//! What it does **not** separate is two *independently constructed* runtimes
+//! (two `Worker`s, or two `RetentionRuntime`s) living in one process and
+//! polling the **same** shard. Their ticks land on one series, so a healthy
+//! one holds `rate(...) > 0` after its peer wedges and the alert stays quiet.
+//!
+//! This is not closed with a per-owner metric label on purpose. Owner ids are
+//! monotonic and never reused, so a process that stops and restarts a runtime
+//! would mint label values without bound — an ADR-0001 §7 violation, and a
+//! worse bug than the one it would fix. A separate "worst registered owner"
+//! gauge was likewise rejected: exporting it needs its own sampler loop, which
+//! is another background loop carrying the very wedge risk this module exists
+//! to detect, whereas a per-instance counter is self-reporting.
+//!
+//! The capability is not absent, only on a different surface: the registry
+//! tracks these owners **separately** (that is what [`ScannerOwner`] ids are
+//! for), so the `scanner_liveness` preflight check reports the worst of them
+//! and names the affected shard. An operator running two runtimes of the same
+//! kind in one process should treat that check — not the counter — as the
+//! authority for those scanners.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -1913,7 +1913,10 @@ own work counters and its `tracing::error!`, not this heartbeat.
   series on one scrape target and a healthy shard's ticks would hold the rate
   above zero while a sibling's loop was dead — the wedge would be **masked**,
   not merely unlocalised. If you write your own grouping, keep `shard` for the
-  same reason you keep `instance`.
+  same reason you keep `instance`. A repeated entry in `shard_assignments` is
+  deduplicated at the config boundary, so a duplicate can neither spawn a
+  second set of loops against one database nor collapse two instances onto a
+  single series.
 
   The preflight check tracks each instance separately, reports the **worst**,
   and **names the shard** in both the summary and the per-scanner entry — plus
@@ -1952,6 +1955,25 @@ own work counters and its `tracing::error!`, not this heartbeat.
   sibling shard is never reported as affected. `shard` / `affected_shards` are empty for the
   process-wide loops (`retention`, `schedule`) and on single-shard deployments,
   where there is no fan-out to disambiguate; the SCOPE column then reads `-`.
+
+- **Known blind spot: two runtimes on one shard in one process.** The alert
+  separates instances by `(instance, scanner, shard)`, which covers every
+  deployment shape Harvest supports — one worker process per shard, or one
+  multi-shard worker. It does **not** separate two *independently constructed*
+  runtimes (two `Worker`s, or two `RetentionRuntime`s) polling the **same**
+  shard inside one process: their ticks land on one series, so a healthy one
+  holds the rate above zero after its peer wedges and this alert stays quiet.
+
+  A per-owner metric label was rejected rather than overlooked — the registry's
+  owner ids are monotonic and never reused, so labelling by them would grow
+  without bound in any process that restarts a runtime, which is a worse bug
+  (unbounded cardinality) than the one it would fix.
+
+  The capability is not missing, only on the other surface: the registry tracks
+  those owners **separately**, so `harvest preflight` still reports the worst
+  of them and names the affected shard. If you run two runtimes of the same
+  kind in one process, treat the `scanner_liveness` check — not this alert —
+  as the authority for those scanners.
 
 ### Safe actions
 
