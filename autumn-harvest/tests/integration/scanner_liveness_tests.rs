@@ -199,6 +199,45 @@ fn success_metric_detection_bound_holds_for_every_shipped_interval() {
 }
 
 #[test]
+fn the_floor_tolerates_a_slow_but_healthy_iteration() {
+    // Guards the deliberate deviation in the other direction: someone reading
+    // the issue's literal "2x poll interval" success metric might be tempted
+    // to drop or shrink the floor so a 500 ms loop is flagged in 1 s. That
+    // would make the check flap on a busy-but-working system and, because the
+    // CLI exits 2 on `warn`, break deploy pipelines.
+    //
+    // A loop's ITERATION PERIOD is not its poll interval: each pass sleeps the
+    // interval and *then* does real work — the timeout checker calls
+    // `pool.get().await` (deadpool waits for a free connection, by default
+    // with no timeout at all) and then runs a multi-query enforcement pass. So
+    // the threshold must comfortably exceed a plausible slow-but-healthy
+    // iteration, not merely two sleeps.
+    const PLAUSIBLE_SLOW_ITERATION: Duration = Duration::from_secs(30);
+    assert!(
+        MIN_SCANNER_STALENESS_THRESHOLD >= PLAUSIBLE_SLOW_ITERATION,
+        "the floor must tolerate a single slow-but-healthy iteration \
+         (saturated pool / slow query), or the check flaps under load and \
+         fails deploy pipelines that gate on `harvest preflight`"
+    );
+
+    // Concretely, for every shipped sub-minute loop the threshold must absorb
+    // many consecutive missed iterations before it says a word.
+    for interval in [
+        Duration::from_millis(500),
+        Duration::from_secs(1),
+        Duration::from_secs(5),
+    ] {
+        let missed = staleness_threshold(interval).as_secs_f64() / interval.as_secs_f64();
+        assert!(
+            missed >= 10.0,
+            "a {interval:?} loop must be allowed to miss >= 10 iterations \
+             before being flagged (got {missed:.1}); a hair-trigger threshold \
+             flags healthy loops under load"
+        );
+    }
+}
+
+#[test]
 fn staleness_threshold_saturates_instead_of_overflowing() {
     // A pathological interval must not panic in release-mode wrap or debug
     // overflow — an operator misconfiguration should degrade, not crash.

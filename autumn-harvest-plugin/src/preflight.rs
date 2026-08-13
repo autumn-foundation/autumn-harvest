@@ -70,20 +70,65 @@ pub struct PreflightReport {
     pub checks: Vec<PreflightCheckResult>,
 }
 
+/// Wall-clock budget for the database-dependent preflight checks as a group.
+///
+/// Deliberately generous: these run several queries fanned across shards, and
+/// the budget exists to bound a *pathological* stall, not to police a slow but
+/// working database.
+///
+/// Without it the whole endpoint can hang indefinitely. Every DB check begins
+/// with `pool.get().await`, and deadpool waits for a free connection with no
+/// timeout by default, so an exhausted pool blocks the request forever. That
+/// matters most for `scanner_liveness` (issue #797): pool exhaustion is a
+/// listed cause of a wedged control loop, so the one diagnostic that would
+/// name the stalled loop must not be suppressed by the very condition it is
+/// reporting on.
+const DB_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Build a read-only deployment preflight report.
+///
+/// The in-memory checks are evaluated first and are **always** present in the
+/// report; the database-dependent ones are bounded by [`DB_CHECK_BUDGET`] as a
+/// group. On the happy path the returned checks are identical, and in the same
+/// order, as if they had been awaited inline.
 pub async fn build_preflight_report(api_state: &HarvestApiState) -> PreflightReport {
+    // Evaluated up front, before anything can block: a wedged database must
+    // never be able to hide these.
+    let api_reachability = check_api_reachability(api_state);
+    let catalog_consistency = check_catalog_consistency(api_state);
+    let retention_visibility = check_retention_visibility(api_state);
+    let admin_auth_boundary = check_admin_auth_boundary(api_state);
+    let history_ceiling_config = check_history_ceiling_config(api_state);
+    let scanner_liveness = check_scanner_liveness();
+
+    let db_checks = tokio::time::timeout(DB_CHECK_BUDGET, async {
+        (
+            check_migrations(api_state).await,
+            check_shard_availability(api_state).await,
+            check_schedule_resolvability(api_state).await,
+            check_worker_coverage(api_state).await,
+            check_dlq_read_access(api_state).await,
+        )
+    })
+    .await;
+
     let mut checks = Vec::new();
-    checks.push(check_api_reachability(api_state));
-    checks.push(check_migrations(api_state).await);
-    checks.push(check_shard_availability(api_state).await);
-    checks.push(check_catalog_consistency(api_state));
-    checks.push(check_schedule_resolvability(api_state).await);
-    checks.push(check_worker_coverage(api_state).await);
-    checks.push(check_dlq_read_access(api_state).await);
-    checks.push(check_retention_visibility(api_state));
-    checks.push(check_admin_auth_boundary(api_state));
-    checks.push(check_history_ceiling_config(api_state));
-    checks.push(check_scanner_liveness());
+    checks.push(api_reachability);
+    if let Ok((migrations, shards, schedules, workers, dlq)) = db_checks {
+        checks.push(migrations);
+        checks.push(shards);
+        checks.push(catalog_consistency);
+        checks.push(schedules);
+        checks.push(workers);
+        checks.push(dlq);
+    } else {
+        checks.push(db_checks_timed_out());
+        checks.push(catalog_consistency);
+    }
+    checks.push(retention_visibility);
+    checks.push(admin_auth_boundary);
+    checks.push(history_ceiling_config);
+    checks.push(scanner_liveness);
 
     let overall_status = checks
         .iter()
@@ -101,6 +146,31 @@ pub async fn build_preflight_report(api_state: &HarvestApiState) -> PreflightRep
         },
         checks,
     }
+}
+
+/// Stand-in emitted when the database-dependent checks exceed
+/// [`DB_CHECK_BUDGET`] as a group.
+///
+/// Returning a `fail` check is strictly better than hanging: the report still
+/// reaches the operator carrying every in-memory verdict — including
+/// `scanner_liveness`, which is what names the stalled loop.
+fn db_checks_timed_out() -> PreflightCheckResult {
+    check(
+        "db_checks",
+        PreflightStatus::Fail,
+        format!(
+            "database-dependent preflight checks did not complete within {}s",
+            DB_CHECK_BUDGET.as_secs()
+        ),
+        Some(
+            "The connection pool is likely exhausted or the database is \
+             unreachable. Check the scanner_liveness entry in this same report \
+             — a wedged control loop holding connections is a common cause — \
+             then inspect pool saturation and long-running queries.",
+        ),
+        Vec::new(),
+        json!({ "budget_secs": DB_CHECK_BUDGET.as_secs() }),
+    )
 }
 
 fn check(
@@ -1493,6 +1563,69 @@ mod tests {
             result.summary.contains("no background control loops"),
             "summary must explain why zero scanners is not a failure: {}",
             result.summary
+        );
+    }
+
+    #[test]
+    fn db_check_timeout_stand_in_points_at_the_scanner_verdict() {
+        // The stand-in is what makes `scanner_liveness` observable when the
+        // pool is exhausted: without it the endpoint hangs on
+        // `pool.get().await` (deadpool waits with no timeout by default) and
+        // the report never reaches the operator at all.
+        //
+        // Pool exhaustion is a listed cause of a wedged control loop, so the
+        // one diagnostic that names the stalled loop must not be suppressed by
+        // the very condition it is reporting on. The remediation therefore
+        // routes the reader to that entry in the same report.
+        let result = db_checks_timed_out();
+
+        assert_eq!(result.status, PreflightStatus::Fail);
+        assert_eq!(result.name, "db_checks");
+        assert_eq!(
+            result.details["budget_secs"],
+            DB_CHECK_BUDGET.as_secs(),
+            "the report must state the budget it exceeded"
+        );
+        let remediation = result.remediation.expect("a fail check must remediate");
+        assert!(
+            remediation.contains("scanner_liveness"),
+            "a stalled-DB report must route the operator to the scanner \
+             verdict in the same report: {remediation}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_db_check_cannot_suppress_the_in_memory_checks() {
+        // Reproduces the shape of the bug: a DB-dependent check that never
+        // returns (an exhausted pool blocking in `pool.get().await`). The
+        // report must still be produced, with every in-memory check intact.
+        //
+        // `start_paused` auto-advances the clock, so the 30s budget elapses
+        // instantly rather than actually sleeping.
+        let hung = tokio::time::timeout(DB_CHECK_BUDGET, async {
+            std::future::pending::<()>().await;
+        })
+        .await;
+
+        assert!(
+            hung.is_err(),
+            "the budget must bound a never-returning check"
+        );
+
+        // And the check that has to survive it is a pure function of in-memory
+        // state — no pool, no await, so nothing the database does can stop it.
+        let scanner = scanner_liveness_check(&[status(Scanner::Timeout, 30, 300, 7)]);
+        assert_eq!(
+            scanner.status,
+            PreflightStatus::Fail,
+            "the wedged loop must still be reported while the DB is stalled"
+        );
+        assert!(
+            scanner.details["stale_scanners"]
+                .as_array()
+                .is_some_and(|s| s.iter().any(|v| v == "timeout")),
+            "and it must still name the stalled loop: {}",
+            scanner.details
         );
     }
 

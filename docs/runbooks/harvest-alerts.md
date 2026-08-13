@@ -1857,14 +1857,37 @@ own work counters and its `tracing::error!`, not this heartbeat.
   `absent()` is deliberately **not** used to paper over either case: a process
   that runs none of these loops (an API-only replica) legitimately exports no
   series, and would page falsely forever.
-- **Graceful shutdown.** A draining worker stops its loops on purpose. The
-  `scanner_liveness` check is not fooled — a clean stop deregisters each loop,
-  so a process that drains its worker while continuing to serve HTTP reports
-  `pass` with `scanners_registered: 0` rather than seven phantom wedged
-  scanners. (A loop that *panics* deliberately does **not** deregister, so it
-  still ages into `wedged` — that is the signal.) The rate-based alert has no
-  such context, so scope it to processes that are up, or accept a short flap
-  during rollout.
+- **Graceful shutdown — the one case that needs a gate.** A draining worker
+  stops its loops on purpose. The `scanner_liveness` check is not fooled — a
+  clean stop deregisters each loop, so a process that drains its worker while
+  continuing to serve HTTP reports `pass` with `scanners_registered: 0` rather
+  than seven phantom wedged scanners. (A loop that *panics* deliberately does
+  **not** deregister, so it still ages into `wedged` — that is the signal.)
+
+  The rate-based alert has no such context. Deregistration is in-process only:
+  Prometheus counters cannot be un-exported, so a drained loop's series stays
+  in the exporter at its final value and reads `rate() == 0` forever. If the
+  process **exits** after draining, the scrape target disappears and the alert
+  resolves on its own; if it **keeps serving HTTP** after draining (a real
+  shape — `stop_harvest_runtime` leaves the API up), the alert pages
+  indefinitely for a loop that was stopped on purpose. Gate it on the process
+  still owning worker duties. The worker slot gauges are the natural signal:
+  they are sampled by the worker's own monitoring task, so they go stale and
+  then absent once it drains, while a *wedged* loop leaves them reporting
+  normally:
+
+  ```promql
+  (rate(harvest_scanner_tick_total{scanner!="retention"}[5m]) == 0)
+    and on(instance) (count by (instance) (harvest_worker_slots_available) > 0)
+  ```
+
+  Since the tick series is created at registration (see below), this also
+  covers the narrow case of a process that registers its loops and drains
+  before any of them completes a first iteration. Adapt `instance` to whatever
+  target label your scrape config uses. If your topology runs `retention` or
+  `schedule` on a process with no worker, gate those two on that process's own
+  identifying label instead — or rely on the `scanner_liveness` check, which
+  needs no gate because it knows what is registered.
 - **Not a false positive: one wedged shard.** A multi-shard worker spawns a
   `timeout`, `poison_pill`, and `pause_auto_resume` loop **per assigned shard**,
   all under one `scanner` label. The preflight check tracks each instance

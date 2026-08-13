@@ -69,6 +69,29 @@ use crate::telemetry::MetricsRecorder;
 /// Lower bound on the staleness threshold, regardless of how fast a loop
 /// polls. Keeps a sub-second poll interval from producing a hair-trigger
 /// threshold that would flap on ordinary scheduler jitter.
+///
+/// # Deliberate deviation from a literal "2 x poll interval" bound
+///
+/// For the six sub-minute loops this floor, not the `2 x` multiplier, is what
+/// binds: a 500 ms loop is detected in 60 s, **not** 1 s. That is intentional,
+/// and `success_metric_detection_bound_holds_for_every_shipped_interval` pins
+/// it explicitly so the bound is never over-claimed.
+///
+/// The reason is that a loop's *iteration period* is not its poll interval.
+/// Each pass sleeps `poll_interval` and **then** does real work: the timeout
+/// checker calls `pool.get().await` (deadpool waits for a free connection --
+/// by default with no timeout at all) and then runs a multi-query enforcement
+/// pass. Under a saturated pool or a slow query a perfectly healthy 500 ms
+/// loop can legitimately take seconds per iteration, so a 1 s threshold would
+/// report `stale` continuously on a busy-but-working system.
+///
+/// The cost asymmetry decides it. This verdict feeds `GET /admin/preflight`,
+/// and the CLI exits `2` on `warn` / `1` on `fail`, so a false `warn` **breaks
+/// a deploy pipeline**. A missed 60 s of detection latency is a far cheaper
+/// error than a check that flaps under load. Sixty seconds absolute is also
+/// still well inside the issue's intent (catch a wedge in ~a minute, not in
+/// hours) -- and is *better* in absolute terms than the literal `2 x` bound
+/// would give the hourly retention janitor, which is 2 hours.
 pub const MIN_SCANNER_STALENESS_THRESHOLD: Duration = Duration::from_secs(60);
 
 /// The bounded `scanner` label value set for

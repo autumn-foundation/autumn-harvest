@@ -91,6 +91,22 @@ fn build_pool(url: &str) -> DbPool {
 /// outbox passes as part of its own iteration, so all three share its liveness.
 const OWNED: [Scanner; 3] = [Scanner::Timeout, Scanner::Sla, Scanner::ExternalOutbox];
 
+/// Serializes every test in this file that spawns a **real** loop against the
+/// **process-global** scanner registry.
+///
+/// These tests assert on registration-count *deltas* (`before` vs `after`)
+/// around a spawn/drain, which is only sound if no sibling test registers or
+/// deregisters the same `Scanner` in between. CI runs this suite with
+/// `--test-threads=1`, but that is a property of the runner invocation, not of
+/// the tests: a developer running `cargo test ... scanner_tick_db_tests`
+/// locally gets the default parallel harness and would see genuine flakes.
+/// Correctness should not depend on a CLI flag, so the guard lives here.
+///
+/// Mirrors the `TEST_SERIAL` precedent in `completion_callback_tests.rs`,
+/// which guards the same class of process-global state.
+static TEST_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// Records every `harvest.scanner.tick` label it sees.
 #[derive(Default)]
 struct TickRecorder {
@@ -120,6 +136,9 @@ impl MetricsRecorder for TickRecorder {
 /// outbox rows — still emits a tick for every scanner the loop owns.
 #[tokio::test]
 async fn spawned_timeout_checker_ticks_all_owned_scanners_with_no_work() {
+    // Serialize against sibling tests that touch the process-global registry;
+    // the delta assertions below are only sound with exclusive access.
+    let _serial = TEST_SERIAL.lock().await;
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
     let recorder = std::sync::Arc::new(TickRecorder::default());
@@ -213,6 +232,9 @@ async fn spawned_timeout_checker_ticks_all_owned_scanners_with_no_work() {
 /// spawns it, never by the pass it drives.
 #[tokio::test]
 async fn enforce_timeouts_once_records_no_scanner_ticks() {
+    // Serialize against sibling tests that touch the process-global registry;
+    // the delta assertions below are only sound with exclusive access.
+    let _serial = TEST_SERIAL.lock().await;
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
     let mut conn = pool.get().await.expect("connection");
@@ -262,6 +284,9 @@ async fn enforce_timeouts_once_records_no_scanner_ticks() {
 /// works on a deployment that never wired telemetry.
 #[tokio::test]
 async fn the_loop_advances_liveness_without_a_metrics_recorder() {
+    // Serialize against sibling tests that touch the process-global registry;
+    // the delta assertions below are only sound with exclusive access.
+    let _serial = TEST_SERIAL.lock().await;
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -311,6 +336,9 @@ async fn the_loop_advances_liveness_without_a_metrics_recorder() {
 /// cheapest of the remaining loops to drive directly.
 #[tokio::test]
 async fn spawned_poison_pill_reclaimer_registers_ticks_and_deregisters() {
+    // Serialize against sibling tests that touch the process-global registry;
+    // the delta assertions below are only sound with exclusive access.
+    let _serial = TEST_SERIAL.lock().await;
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
     let recorder = std::sync::Arc::new(TickRecorder::default());
