@@ -37,7 +37,7 @@ current for the audited revision, not as prose.
 | Is harvest's determinism core backend-portable? | **Yes, already.** It consumes plain values (`ExecutionId`, `Vec<WorkflowEvent>`, a handler `fn`, JSON) — no connection, no trait object. |
 | Is harvest's *coordination* layer backend-portable? | **No.** Multi-worker claim, push notification, and cross-connection locking are the three load-bearing Postgres features, and SQLite substitutes them only by dropping capability. |
 | Did the prototype work? | **Yes — 4/4 durability scenarios**, plus cross-backend replay. Now productized. |
-| Should core grow a `StorageBackend` trait? | **No.** Costed below at a scale the benefit does not justify, and it would tax the Postgres hot path for a use case that does not share its concurrency model. |
+| Should core grow a `StorageBackend` trait? | **No.** Buildable, but costed below at a scale the benefit does not justify — 18 of 43 coupled modules are portable only by dropping a capability or reimplementing wholesale, for a use case that does not share the Postgres concurrency model. |
 | What shipped instead? | `autumn-harvest-sqlite` — reuses the determinism core wholesale, reimplements persistence only. |
 
 The one-sentence version: **the valuable half of harvest is already portable
@@ -227,12 +227,13 @@ A trait that genuinely allowed a second backend would need, at minimum:
 1. **Event store** — append (with the sequential-id contract), load, delta-load.
    *Trait-able cleanly.* ~6 methods.
 2. **Task queue** — enqueue, claim, complete, fail, requeue, park, wake, plus
-   the timer and signal tables. *This is where it breaks.* The claim method's
-   contract is not "give me a task"; it is "give me a task **such that no
-   concurrent claimer can also get it**, without blocking on rows other
-   claimers hold". SKIP LOCKED is that contract. Single-writer SQLite satisfies
-   it vacuously. There is no shared contract that is meaningfully testable
-   against both.
+   the timer and signal tables. *This is the most demanding method.* The claim
+   method's contract is not "give me a task"; it is "give me a task **such that
+   no concurrent claimer can also get it**, without blocking on rows other
+   claimers hold". That postcondition **is** statable as a trait contract
+   independent of SKIP LOCKED — but the two backends satisfy its two clauses
+   very differently, and one of them fails outright. See *Why the seam is the
+   wrong shape*.
 3. **The scanner family** — `timeout`, `retention`, `poison_pill`, `debounce`,
    `throttle`, `completion_callback`, `event_batch`: seven claim-batch-mutate
    loops, each relying on `FOR UPDATE SKIP LOCKED` for its concurrency safety.
@@ -251,20 +252,43 @@ A trait that genuinely allowed a second backend would need, at minimum:
 The trait's hard part is not the method list. It is that **the two backends do
 not share a concurrency model.** Postgres harvest is a multi-worker, multi-
 replica fleet coordinating through the database. SQLite harvest is one writer
-with a global write lock. A trait spanning both either:
+with a global write lock.
 
-- **encodes the Postgres contract** (SKIP LOCKED semantics, advisory-lock
-  ordering, push notification) — in which case SQLite implements it by
-  pretending, and every guarantee the trait documents is unverifiable on one
-  side; or
-- **encodes the weaker intersection** — in which case the Postgres path loses
-  the ability to express the very coordination that makes it correct, and the
-  `store`/`concurrency` consumers of the claim invariant have no way to state
-  their requirement at all.
+An earlier draft turned that into a dichotomy: a trait must either encode the
+Postgres *mechanism* (SKIP LOCKED, advisory-lock ordering, push notification),
+leaving every guarantee unverifiable on the SQLite side, or encode a weaker
+intersection that strips the Postgres path of the coordination that makes it
+correct. **That was a false dichotomy**, and — like the performance claim
+corrected in the next section — it is fixed here rather than quietly dropped.
 
-The `store`/`concurrency` finding above is the empirical proof: those modules
-depend on the claim invariant *without a call site*. No trait boundary drawn
-around SQL call sites would have caught them.
+A trait *can* state the behavioural postcondition instead of the mechanism —
+"a claimed task is claimed by exactly one caller, and claiming does not block
+behind claims on unrelated rows" — and such a contract is verifiable against
+both implementations. A guarantee that one backend satisfies trivially is not
+thereby unverifiable: a single-writer test can still assert exclusivity, and
+will pass. What the backends do not share is the mechanism, and a well-drawn
+trait is not obliged to expose one.
+
+Two narrower observations survive, and neither is a dichotomy:
+
+- **The honest postcondition is not trivially satisfied — half of it is
+  violated.** Exclusivity is trivial under a single writer. The *non-blocking*
+  clause is not met at all: SQLite serialises on a global write lock, so a claim
+  waits behind any concurrent write, whether or not it touches a row the claimer
+  wants. So a trait stating the honest contract would have one implementation
+  that fails it, and a trait weakened to accommodate that would no longer state
+  the property the Postgres scanners are built on. That is a real cost of the
+  seam — not a proof that the seam cannot be drawn.
+- **A trait derived from SQL call sites would have been drawn in the wrong
+  place.** `store` and `concurrency` depend on the claim invariant *without
+  issuing the SQL* (see the finding above). Mechanically extracting a trait from
+  call sites would have abstracted the invariant's writers and orphaned its
+  consumers. That constrains how the seam must be *derived* — by human
+  judgement, not by generation — not whether it can exist.
+
+**So the trait is buildable.** The recommendation does not rest on impossibility;
+it rests on the measured cost of building it, sized next, against the measured
+absence of demand for what it would buy.
 
 ### Estimated build cost of the seam
 
@@ -282,7 +306,8 @@ Against a companion crate, which touched **zero** core modules.
 
 ## Cost to the Postgres path
 
-The seam's cost to the shipped product was the decisive factor.
+The seam's cost to the shipped product is the largest single input to the
+recommendation — though, per the note below, not a load-bearing one on its own.
 
 **Performance — and what it does *not* depend on.** An earlier draft of this
 report asserted that a `StorageBackend` trait would impose dynamic dispatch on
@@ -304,13 +329,27 @@ So the honest position is that a coarse-grained generic seam **avoids both
 performance objections**. If performance were the deciding factor, the trait
 would be buildable.
 
-It is not the deciding factor. The decisive argument is the one in *Why the
-seam is the wrong shape* below, and it is **invariant to this choice**: a
-`claim_task` method must document a contract, that contract is "no concurrent
-claimer can also get this task, without blocking on rows other claimers hold",
-and a single-writer backend satisfies it vacuously. Monomorphisation does not
-make a vacuous guarantee meaningful. The trait would be cheap to call and still
-wrong to define.
+**No single argument here is load-bearing — deliberately.** Twice now, an
+argument nominated as *the* decisive one has not survived review: first the
+dispatch and query-decomposition claims corrected immediately above, then the
+"no statable shared contract" dichotomy corrected in *Why the seam is the wrong
+shape*. The structural fix is to stop resting a recommendation on one limb. It
+rests instead on the audit's measurements, none of which any review round has
+disputed:
+
+- **18 modules are class (c)** — portable only by dropping a capability or
+  reimplementing wholesale — against 8 that are trivially trait-able.
+- **26 modules reach for raw SQL**, so their portability cannot be read off
+  their Diesel usage at all.
+- The **capability losses are documented and unavoidable** on the single-writer
+  side (*Known capability losses*, below), so the second backend is not the same
+  product with a different file on disk.
+- The companion crate delivered that capability at **structurally zero cost** to
+  the Postgres path, against a seam sized above at ~43 modules touched.
+
+Each subsection below is a cost, weighed against that. None is offered as a
+proof that the trait is impossible; the previous section establishes that it is
+not.
 
 **Code complexity.** Harvest's correctness work is overwhelmingly about
 concurrency edges — lock ordering, claim-vs-scanner races, the wake-request

@@ -835,6 +835,59 @@ fn markdown_section_ignores_headings_inside_code_fences() {
 /// `performance_docs::performance_guards_run_on_docs_only_changes`, which
 /// exists because that suite spent three rounds unable to fire on the change
 /// class it was written for.
+/// The **whole** workflow step stanza containing `needle`, from its `- name:`
+/// through to the line before the next step's `- name:` (or the end of the
+/// block).
+///
+/// Bounding at the *next* step rather than at `needle` is the load-bearing
+/// part. An earlier revision sliced only up to the matched text, which sits
+/// inside the step's `run:` line — so every key written *after* `run:` was
+/// invisible. GitHub Actions does not care about key order within a step, so
+/// moving an `if:` below the `run:` line was enough to re-gate the guards while
+/// the test that exists to prevent exactly that kept passing. A guard that a
+/// two-line reordering can evade is worse than no guard, because it also
+/// reports success.
+fn workflow_step_stanza<'a>(block: &'a str, needle: &str) -> Option<&'a str> {
+    const STEP: &str = "\n      - name:";
+    let at = block.find(needle)?;
+    let start = block[..at].rfind(STEP).unwrap_or(0);
+    // Search for the next step from just past this stanza's own `- name:`, so
+    // the marker we started from is not rediscovered as the terminator.
+    let after_marker = start + STEP.len();
+    let end = block[after_marker..]
+        .find(STEP)
+        .map_or(block.len(), |rel| after_marker + rel);
+    Some(&block[start..end])
+}
+
+#[test]
+fn step_stanza_covers_keys_written_after_run() {
+    // `if:` placed *below* `run:` — valid YAML, identical semantics to placing
+    // it above, and invisible to a slice that stops at the `run:` line.
+    let block = "\n      - name: Some earlier step\n        run: echo earlier\n\
+                 \n      - name: Guard step\n        run: cargo test GUARD_FILTER\n\
+                 \n        if: needs.changes.outputs.code == 'true'\n\
+                 \n      - name: A later step\n        run: echo later\n";
+
+    let stanza = workflow_step_stanza(block, "GUARD_FILTER").expect("stanza is present");
+
+    assert!(
+        stanza.contains("\n        if:"),
+        "the stanza must extend past `run:` to the next step, or an `if:` \
+         written below `run:` re-gates the guards undetected. Stanza:\n{stanza}"
+    );
+    assert!(
+        !stanza.contains("A later step"),
+        "the stanza must stop at the next step, not swallow it — otherwise an \
+         unrelated neighbour's `if:` would raise a false alarm. Stanza:\n{stanza}"
+    );
+    assert!(
+        !stanza.contains("Some earlier step"),
+        "the stanza must start at its own `- name:`, not an earlier step's. \
+         Stanza:\n{stanza}"
+    );
+}
+
 #[test]
 fn guards_run_on_docs_only_changes() {
     const FILTER: &str = "--test integration sqlite_feasibility_docs::";
@@ -877,9 +930,8 @@ fn guards_run_on_docs_only_changes() {
     // And it must be unconditional. A step that grew an `if:` is back behind a
     // gate — which is the exact regression this test exists to prevent.
     let block = &workflow[lint_start..test_start];
-    let step_idx = block.find(FILTER).expect("step is inside the lint block");
-    let stanza_start = block[..step_idx].rfind("\n      - name:").unwrap_or(0);
-    let stanza = &block[stanza_start..step_idx];
+    let stanza = workflow_step_stanza(block, FILTER)
+        .expect("the guard step is inside the lint block, located above");
     assert!(
         !stanza.contains("\n        if:"),
         "the sqlite_feasibility_docs guard step has acquired an `if:` condition. \
