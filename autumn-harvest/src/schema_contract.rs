@@ -190,6 +190,11 @@ pub enum ChangeKind {
     NumericFormatNarrowed,
     /// A numeric `format` widened, or was removed.
     NumericFormatWidened,
+    /// A semantic (non-numeric) `format` was introduced or changed, so a
+    /// recorded value the baseline accepted may no longer deserialize.
+    StringFormatNarrowed,
+    /// A semantic (non-numeric) `format` restriction was removed.
+    StringFormatWidened,
     /// A tuple-form `items` array changed length.
     TupleArityChanged,
     /// An `allOf` conjunction was introduced, removed, or changed length.
@@ -229,6 +234,8 @@ impl ChangeKind {
             Self::BoundRelaxed => "bound_relaxed",
             Self::NumericFormatNarrowed => "numeric_format_narrowed",
             Self::NumericFormatWidened => "numeric_format_widened",
+            Self::StringFormatNarrowed => "string_format_narrowed",
+            Self::StringFormatWidened => "string_format_widened",
             Self::TupleArityChanged => "tuple_arity_changed",
             Self::AllOfMembersChanged => "all_of_members_changed",
             Self::UnanalysedConstraintChanged => "unanalysed_constraint_changed",
@@ -448,12 +455,19 @@ impl CompatibilityRules {
                 "Making an optional property required",
                 "Narrowing a type (e.g. string to integer, or dropping null)",
                 "Narrowing a numeric format (e.g. int64 to int32, i64 to u64)",
+                "Introducing or changing a semantic format (e.g. String to Uuid, uuid to \
+                 date-time): the format names the parser the field's type runs, so a recorded \
+                 value it rejects no longer deserializes",
                 "Removing an enum value or a oneOf/anyOf variant",
                 "Restricting additionalProperties (absent > schema > false)",
                 "Introducing or tightening a bound (minimum/maximum/minLength/maxLength)",
                 "Changing tuple arity",
                 "Withdrawing a previously published schema (coverage regression)",
                 "Any change to a constraint keyword outside the analysed set (fail closed)",
+                "A cardinality bound (minLength/maxLength/minItems/maxItems) that is present but \
+                 is not a non-negative integer on either side: the engine's validator reads them \
+                 with as_u64 and IGNORES anything else, so such a value is not a smaller bound \
+                 but an absent one (fail closed)",
             ]
             .into_iter()
             .map(ToString::to_string)
@@ -463,6 +477,7 @@ impl CompatibilityRules {
                 "Removing a required marker (making a property optional)",
                 "Widening a type (e.g. integer to number, T to Option<T>)",
                 "Widening a numeric format (e.g. int32 to int64)",
+                "Removing a semantic format (e.g. Uuid to String)",
                 "Adding an enum value, or a disjoint oneOf/anyOf variant",
                 "Relaxing additionalProperties or a bound",
                 "Adding a workflow type, or publishing a schema for the first time",
@@ -834,6 +849,14 @@ const LOWER_BOUNDS: &[&str] = &["minimum", "minLength", "minItems"];
 /// Bounds whose *decrease* narrows the accepted set.
 const UPPER_BOUNDS: &[&str] = &["maximum", "maxLength", "maxItems"];
 
+/// `true` for the bounds that count things (characters, elements) rather than
+/// measure a value. JSON Schema requires a non-negative integer for these, and
+/// the engine's `validate_node` reads them with `as_u64` — so anything else is
+/// a constraint the validator silently ignores, not a smaller bound.
+fn is_cardinality_bound(key: &str) -> bool {
+    matches!(key, "minLength" | "maxLength" | "minItems" | "maxItems")
+}
+
 /// Inclusive value range of a numeric `format`, as `(min, max)`.
 ///
 /// `schemars` records integer width and signedness **only** in `format` — the
@@ -861,9 +884,13 @@ fn numeric_format_range(format: &str) -> Option<(i128, i128)> {
     Some(r)
 }
 
-/// `true` when `format` names a numeric width. Every other `format` value
-/// (`uuid`, `date-time`, `email`, …) is a pure annotation here: the engine's
-/// validator never reads it, and a string stays a string.
+/// `true` when `format` names a numeric width.
+///
+/// The distinction is about which LATTICE applies, not about which formats
+/// matter. A numeric width is orderable — `int32` sits strictly inside `int64`
+/// — so those are compared by range. Every other value (`uuid`, `date-time`,
+/// `email`, …) is an opaque label with no ordering, so it is compared for
+/// equality by [`diff_format`]'s semantic arm.
 fn is_numeric_format(format: &str) -> bool {
     numeric_format_range(format).is_some()
 }
@@ -890,7 +917,7 @@ fn is_integral_format(format: &str) -> bool {
 /// byte-identical artifact.
 ///
 /// Specifically:
-/// - drops [`ANNOTATION_KEYWORDS`] and every non-numeric `format`;
+/// - drops [`ANNOTATION_KEYWORDS`];
 /// - sorts `enum` arrays (an `enum` is a set; order is not semantic);
 /// - collapses a `oneOf`/`anyOf` of singleton-`enum` branches into one flat
 ///   `enum` — `schemars` flips between the two forms when a *single* unit
@@ -919,9 +946,7 @@ fn canonicalize_node(schema: &Value, depth: usize) -> Value {
                     continue;
                 }
                 if k == "format" {
-                    if v.as_str().is_some_and(is_numeric_format) {
-                        out.insert(k.clone(), v.clone());
-                    }
+                    out.insert(k.clone(), v.clone());
                     continue;
                 }
                 if k == "enum" {
@@ -1458,7 +1483,7 @@ fn diff_node(
 
     diff_types(ctx, bo, co, path, diff);
     diff_enum(ctx, bo, co, path, diff);
-    diff_numeric_format(ctx, bo, co, path, diff);
+    diff_format(ctx, bo, co, path, diff);
     diff_bounds(ctx, bo, co, path, diff);
     diff_properties(ctx, bo, co, path, depth, diff);
     diff_additional_properties(ctx, bo, co, path, depth, diff);
@@ -1764,7 +1789,22 @@ fn diff_enum(
     }
 }
 
-fn diff_numeric_format(
+/// Compare `format` on both the numeric-width lattice and the semantic axis.
+///
+/// A numeric width is orderable, so `int32 -> int64` is a widening. A semantic
+/// format (`uuid`, `date-time`, `ip`, …) is an opaque label: it is `schemars`'
+/// record that the field's Rust type PARSES the string, and that type's
+/// `Deserialize` rejects a string that does not parse. So introducing or
+/// changing one is a narrowing of what recorded JSON still reads, and only
+/// removing one is safe.
+///
+/// **Accepted cost:** a purely descriptive `#[schemars(format = "email")]` on a
+/// plain `String` — where nothing actually validates — is flagged too. The
+/// differ cannot see the Rust type, only the schema, and the alternative
+/// (a curated allowlist of "really assertive" formats) is silently wrong for
+/// any custom `JsonSchema` impl. It is a one-time, acknowledgeable flag;
+/// the mirror mistake would let a real `String -> Uuid` break merge silently.
+fn diff_format(
     ctx: &DiffCtx<'_>,
     bo: &Map<String, Value>,
     co: &Map<String, Value>,
@@ -1776,6 +1816,20 @@ fn diff_numeric_format(
     match (b, c) {
         (Some(bf), Some(cf)) if bf != cf => {
             let (Some(br), Some(cr)) = (numeric_format_range(bf), numeric_format_range(cf)) else {
+                // At least one side is a semantic label, so there is no shared
+                // lattice to compare on. Two different labels name two
+                // different parsers; a recorded value that satisfied the old
+                // one need not satisfy the new one.
+                diff.push(ctx.delta(
+                    path,
+                    ChangeKind::StringFormatNarrowed,
+                    Verdict::Breaking,
+                    format!(
+                        "`format` changed from `{bf}` to `{cf}`; a semantic format names the \
+                         parser the field's type runs, so a recorded value accepted by `{bf}` may \
+                         fail to deserialize under `{cf}`"
+                    ),
+                ));
                 return;
             };
             // Fractional -> integral is breaking on the integrality axis, no
@@ -1826,6 +1880,26 @@ fn diff_numeric_format(
             Verdict::Compatible,
             format!("the {bf} numeric width restriction was removed"),
         )),
+        (None, Some(cf)) => diff.push(ctx.delta(
+            path,
+            ChangeKind::StringFormatNarrowed,
+            Verdict::Breaking,
+            format!(
+                "`format: {cf}` was introduced where the value was unconstrained; `schemars` \
+                 emits it because the field's type PARSES the value (`String -> Uuid` is the \
+                 canonical case), so a recorded value that is not a valid `{cf}` fails to \
+                 deserialize"
+            ),
+        )),
+        (Some(bf), None) => diff.push(ctx.delta(
+            path,
+            ChangeKind::StringFormatWidened,
+            Verdict::Compatible,
+            format!(
+                "the `{bf}` format restriction was removed; every recorded value that satisfied \
+                 it is still accepted by the unconstrained type"
+            ),
+        )),
         _ => {}
     }
 }
@@ -1840,13 +1914,29 @@ fn diff_bounds(
     for (keys, tighter_is_greater) in [(LOWER_BOUNDS, true), (UPPER_BOUNDS, false)] {
         for key in keys {
             let (b_raw, c_raw) = (bo.get(*key), co.get(*key));
-            // A bound that is PRESENT but not a JSON number (`"minimum": "10"`
-            // in a hand-written schema) cannot be placed on the tighten/relax
-            // lattice. Reading it through `as_f64` alone would collapse it to
-            // `None` — indistinguishable from absent — so a malformed value
-            // would be reported as "`minimum` was removed" => COMPATIBLE, and
-            // two different malformed values would produce no delta at all.
-            let unreadable = |v: Option<&Value>| v.is_some_and(|v| v.as_f64().is_none());
+            // A bound that is PRESENT but unreadable cannot be placed on the
+            // tighten/relax lattice. Collapsing it to `None` would make it
+            // indistinguishable from absent — so a malformed value would read
+            // as "`minimum` was removed" => COMPATIBLE, and two different
+            // malformed values would produce no delta at all.
+            //
+            // "Readable" has to mean what the ENGINE'S validator reads, not
+            // merely what is a JSON number. `validate_node` takes a cardinality
+            // (`minLength`/`maxLength`/`minItems`/`maxItems`) through `as_u64`
+            // and a numeric bound (`minimum`/`maximum`) through `as_f64`. Using
+            // `as_f64` for both would put a cardinality the validator IGNORES
+            // (`1.5`) on the same lattice as one it ENFORCES (`1`) and score
+            // `1.5 -> 1` a relaxation, when the effective constraint actually
+            // went from none to "rejects the empty string".
+            let unreadable = |v: Option<&Value>| {
+                v.is_some_and(|v| {
+                    if is_cardinality_bound(key) {
+                        v.as_u64().is_none()
+                    } else {
+                        v.as_f64().is_none()
+                    }
+                })
+            };
             if unreadable(b_raw) || unreadable(c_raw) {
                 if b_raw != c_raw {
                     diff.push(ctx.delta(
@@ -3144,11 +3234,27 @@ fn diff_ambiguous_branches(
         return;
     }
     for (i, (b, c)) in base_branches.iter().zip(cur_branches).enumerate() {
+        // Same rule as `rivals_of` in `diff_branch_set`, by index instead of by
+        // key. `anyOf` binds the FIRST match, so only the branches declared
+        // after this one can lose data to it. `oneOf` requires EXACTLY one
+        // match and is order-independent, so widening the LAST branch until it
+        // overlaps an EARLIER one is just as fatal — and later-only would hand
+        // it no rivals at all and score the widening on its own merits.
+        let rivals: Vec<Value> = if is_anyof {
+            cur_branches[i + 1..].to_vec()
+        } else {
+            cur_branches
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, v)| v.clone())
+                .collect()
+        };
         diff_branch_guarding_rebind(
             ctx,
             b,
             c,
-            &cur_branches[i + 1..],
+            &rivals,
             is_anyof,
             path,
             &format!("{path}/[{i}]"),

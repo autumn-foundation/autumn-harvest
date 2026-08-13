@@ -364,14 +364,20 @@ fn signed_to_unsigned_same_width_is_breaking() {
     );
 }
 
+/// Superseded assertion, kept as a regression test for the reasoning error.
+///
+/// This used to assert that swapping `uuid` for `date-time` produced NO delta,
+/// justified by "the engine's validator ignores `format` entirely; a string is
+/// a string". The validator does ignore it — but the validator is not what
+/// reads recorded history. `serde` is, and `Uuid`/`DateTime` both reject a
+/// string that does not parse, so the swap drops every recorded value.
 #[test]
-fn non_numeric_formats_are_annotations_and_never_produce_a_delta() {
-    // The engine's validator ignores `format` entirely; a string is a string.
-    let diff = diff_input(
+fn swapping_one_semantic_format_for_another_is_breaking_not_an_annotation() {
+    assert_breaking(
         json!({"type":"object","properties":{"a":{"type":"string","format":"uuid"}}}),
         json!({"type":"object","properties":{"a":{"type":"string","format":"date-time"}}}),
+        ChangeKind::StringFormatNarrowed,
     );
-    assert!(diff.deltas.is_empty(), "got: {:#?}", diff.deltas);
 }
 
 // ── Bounds, additionalProperties, maps, tuples ──────────────────────────────
@@ -726,7 +732,7 @@ fn constraining_previously_unconstrained_additional_properties_is_breaking() {
 }
 
 #[test]
-fn canonicalize_strips_annotations_but_keeps_numeric_format() {
+fn canonicalize_strips_annotations_but_keeps_every_format() {
     let out = canonicalize_schema(&json!({
         "$schema":"http://json-schema.org/draft-07/schema#",
         "title":"T","description":"d","readOnly":true,
@@ -734,11 +740,18 @@ fn canonicalize_strips_annotations_but_keeps_numeric_format() {
     }));
     assert_eq!(out, json!({"type":"integer","format":"int64","minimum":0}));
 
+    // A SEMANTIC format is kept too. It used to be stripped as an annotation,
+    // on the reasoning that "the engine's validator ignores `format`, and a
+    // string is a string" — which answers the wrong question. This gate asks
+    // whether recorded JSON still DESERIALIZES, and `format: "uuid"` is
+    // `schemars`' record that the field is a `Uuid`, whose `Deserialize`
+    // rejects a string that is not one. Stripping it made `String -> Uuid`
+    // canonicalize identically on both sides and vanish from the diff.
     let out2 = canonicalize_schema(&json!({"type":"string","format":"uuid","description":"d"}));
     assert_eq!(
         out2,
-        json!({"type":"string"}),
-        "a non-numeric `format` is a pure annotation and must be stripped"
+        json!({"type":"string","format":"uuid"}),
+        "a semantic `format` names a real parser and must survive canonicalization"
     );
 }
 
@@ -1122,6 +1135,22 @@ fn the_checked_in_baseline_parses_and_is_self_consistent() {
         diff.deltas.is_empty(),
         "the checked-in baseline must diff cleanly against itself: {:#?}",
         diff.deltas
+    );
+}
+
+/// The artifact embeds the ruleset, so it is one of the two places the rules
+/// are published (the other is the guide). Nothing else compares it to the
+/// code: `schema check` diffs SCHEMAS, and a ruleset edit produces no delta —
+/// so a new rule could ship while the checked-in artifact kept telling
+/// operators the old one. This is the drift guard for that.
+#[test]
+fn the_checked_in_baseline_documents_the_current_ruleset() {
+    let c = WorkflowSchemaContract::parse(CHECKED_IN_BASELINE).expect("parse");
+    assert_eq!(
+        c.compatibility,
+        autumn_harvest::schema_contract::CompatibilityRules::current(),
+        "the checked-in artifact's published ruleset has drifted from the code — regenerate it \
+         with `harvest schema update`"
     );
 }
 
@@ -3263,5 +3292,221 @@ fn declaring_a_property_on_a_closed_baseline_stays_compatible() {
                "additionalProperties": false}),
         json!({"type": "object",
                "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Codex review 10: ambiguous `oneOf` — widening the LAST branch
+// ---------------------------------------------------------------------------
+//
+// `diff_ambiguous_branches` compares branches by POSITION, and used to hand
+// `diff_branch_guarding_rebind` only the branches declared *after* the one
+// being compared — for `anyOf` and `oneOf` alike. `anyOf` binds the FIRST
+// match, so later-only is right there. `oneOf` requires EXACTLY one match and
+// is order-independent, so widening the LAST branch until it overlaps an
+// EARLIER one is just as fatal — and it got no rivals at all, so the widening
+// was scored on its own (compatible) merits.
+
+/// Two ambiguous object branches: relaxing the LAST one's `required` makes it
+/// match anything, so a payload that used to match branch 0 alone now matches
+/// both and `oneOf` rejects it.
+#[test]
+fn widening_the_last_ambiguous_oneof_branch_to_overlap_an_earlier_one_is_breaking() {
+    let branch_a = json!({
+        "type": "object",
+        "required": ["a", "x"],
+        "properties": {"a": {"type": "string"}, "x": {"type": "string"}},
+    });
+    assert_breaking(
+        json!({"oneOf": [branch_a, {
+            "type": "object",
+            "required": ["b", "c"],
+            "properties": {"b": {"type": "string"}, "c": {"type": "string"}},
+        }]}),
+        json!({"oneOf": [branch_a, {
+            "type": "object",
+            "properties": {"b": {"type": "string"}, "c": {"type": "string"}},
+        }]}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// The mirror guard: under `anyOf` the LAST branch has nothing after it, so
+/// widening it cannot steal a binding from anyone. Must stay compatible, or
+/// the fix has over-fired onto every untagged-enum edit.
+#[test]
+fn widening_the_last_ambiguous_anyof_branch_is_compatible() {
+    let branch_a = json!({
+        "type": "object",
+        "required": ["a", "x"],
+        "properties": {"a": {"type": "string"}, "x": {"type": "string"}},
+    });
+    assert_compatible(
+        json!({"anyOf": [branch_a, {
+            "type": "object",
+            "required": ["b", "c"],
+            "properties": {"b": {"type": "string"}, "c": {"type": "string"}},
+        }]}),
+        json!({"anyOf": [branch_a, {
+            "type": "object",
+            "properties": {"b": {"type": "string"}, "c": {"type": "string"}},
+        }]}),
+    );
+}
+
+/// The over-firing guard that matters most: ambiguous by KEY, but provably
+/// disjoint by an internal tag. Widening the last branch's bound cannot create
+/// an overlap, so it stays a plain compatible relaxation.
+#[test]
+fn widening_the_last_ambiguous_oneof_branch_stays_compatible_when_tags_prove_disjointness() {
+    let tagged = |tag: &str, max: i64| {
+        json!({
+            "type": "object",
+            "required": ["kind", "n"],
+            "properties": {"kind": {"enum": [tag]}, "n": {"type": "integer", "maximum": max}},
+        })
+    };
+    assert_compatible(
+        json!({"oneOf": [tagged("A", 10), tagged("B", 10)]}),
+        json!({"oneOf": [tagged("A", 10), tagged("B", 20)]}),
+    );
+}
+
+/// Narrowing the last `oneOf` branch cannot create an overlap. It is breaking
+/// on its own terms (the payloads it drops), but must not also draw the
+/// rebind verdict — otherwise every narrowing is double-reported.
+#[test]
+fn narrowing_the_last_ambiguous_oneof_branch_reports_only_the_narrowing() {
+    let branch_a = json!({
+        "type": "object",
+        "required": ["a", "x"],
+        "properties": {"a": {"type": "string"}, "x": {"type": "string"}},
+    });
+    let diff = diff_input(
+        json!({"oneOf": [branch_a, {
+            "type": "object",
+            "required": ["b", "c"],
+            "properties": {"b": {"type": "string"}, "c": {"type": "string"}},
+        }]}),
+        json!({"oneOf": [branch_a, {
+            "type": "object",
+            "required": ["b", "c", "d"],
+            "properties": {"b": {"type": "string"}, "c": {"type": "string"}, "d": {"type": "string"}},
+        }]}),
+    );
+    assert!(
+        !diff
+            .deltas
+            .iter()
+            .any(|d| d.change == ChangeKind::UnanalysedConstraintChanged),
+        "a narrowing cannot create an overlap and must not draw the rebind verdict: {:#?}",
+        diff.deltas
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Codex review 10: a semantic `format` is not an annotation
+// ---------------------------------------------------------------------------
+//
+// Canonicalization used to drop every non-numeric `format`, on the reasoning
+// that "the engine's validator never reads it, and a string stays a string".
+// That answers the wrong question. This gate's perspective is the REPLAY READ:
+// does JSON already in `harvest_events` still deserialize into the new Rust
+// type? `format: "uuid"` is `schemars`' record that the field is a `Uuid`, and
+// `Uuid`'s `Deserialize` rejects a string that is not one. Stripping it made
+// `String -> Uuid` — a textbook break — canonicalize identically on both sides.
+
+#[test]
+fn introducing_a_semantic_string_format_is_breaking() {
+    assert_breaking(
+        json!({"type": "string"}),
+        json!({"type": "string", "format": "uuid"}),
+        ChangeKind::StringFormatNarrowed,
+    );
+}
+
+#[test]
+fn changing_a_semantic_string_format_is_breaking() {
+    assert_breaking(
+        json!({"type": "string", "format": "uuid"}),
+        json!({"type": "string", "format": "date-time"}),
+        ChangeKind::StringFormatNarrowed,
+    );
+}
+
+/// The widening direction: every recorded UUID string is still a valid
+/// `String`, so dropping the format is compatible.
+#[test]
+fn dropping_a_semantic_string_format_is_compatible() {
+    assert_compatible_delta(
+        json!({"type": "string", "format": "uuid"}),
+        json!({"type": "string"}),
+        ChangeKind::StringFormatWidened,
+    );
+}
+
+/// Over-firing guard: an UNCHANGED semantic format must produce no delta at
+/// all, or every workflow carrying a `Uuid` field fails the gate forever.
+#[test]
+fn an_unchanged_semantic_string_format_is_not_a_delta() {
+    let diff = diff_input(
+        json!({"type": "string", "format": "uuid"}),
+        json!({"type": "string", "format": "uuid"}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "an unchanged format is not a change: {:#?}",
+        diff.deltas
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Codex review 10: cardinality bounds are unsigned integers
+// ---------------------------------------------------------------------------
+//
+// `minLength`/`maxLength`/`minItems`/`maxItems` are cardinalities: JSON Schema
+// requires a non-negative integer, and the engine's own `validate_node` reads
+// them with `as_u64` — silently ignoring anything else. Reading them here with
+// `as_f64` put a value the validator IGNORES (`1.5`) on the same lattice as
+// one it ENFORCES (`1`) and called the change a relaxation, when the effective
+// constraint actually went from "none" to "rejects the empty string".
+
+#[test]
+fn a_non_integer_cardinality_bound_fails_closed() {
+    assert_breaking(
+        json!({"type": "string", "minLength": 1.5}),
+        json!({"type": "string", "minLength": 1}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+#[test]
+fn a_non_integer_max_items_bound_fails_closed() {
+    assert_breaking(
+        json!({"type": "array", "maxItems": 2.5}),
+        json!({"type": "array", "maxItems": 2}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// `minimum`/`maximum` are genuine numbers — the validator reads them with
+/// `as_f64` — so a fractional bound there is readable and its relaxation is a
+/// real relaxation. The stricter cardinality check must not leak onto them.
+#[test]
+fn a_fractional_numeric_bound_is_still_readable_and_relaxing_it_is_compatible() {
+    assert_compatible_delta(
+        json!({"type": "number", "minimum": 1.5}),
+        json!({"type": "number", "minimum": 1}),
+        ChangeKind::BoundRelaxed,
+    );
+}
+
+/// Over-firing guard: an ordinary integer cardinality relaxation is untouched.
+#[test]
+fn relaxing_an_integer_cardinality_bound_is_still_compatible() {
+    assert_compatible_delta(
+        json!({"type": "string", "minLength": 2}),
+        json!({"type": "string", "minLength": 1}),
+        ChangeKind::BoundRelaxed,
     );
 }

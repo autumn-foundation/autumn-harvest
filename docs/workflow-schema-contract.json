@@ -11,18 +11,21 @@
       "Making an optional property required",
       "Narrowing a type (e.g. string to integer, or dropping null)",
       "Narrowing a numeric format (e.g. int64 to int32, i64 to u64)",
+      "Introducing or changing a semantic format (e.g. String to Uuid, uuid to date-time): the format names the parser the field's type runs, so a recorded value it rejects no longer deserializes",
       "Removing an enum value or a oneOf/anyOf variant",
       "Restricting additionalProperties (absent > schema > false)",
       "Introducing or tightening a bound (minimum/maximum/minLength/maxLength)",
       "Changing tuple arity",
       "Withdrawing a previously published schema (coverage regression)",
-      "Any change to a constraint keyword outside the analysed set (fail closed)"
+      "Any change to a constraint keyword outside the analysed set (fail closed)",
+      "A cardinality bound (minLength/maxLength/minItems/maxItems) that is present but is not a non-negative integer on either side: the engine's validator reads them with as_u64 and IGNORES anything else, so such a value is not a smaller bound but an absent one (fail closed)"
     ],
     "non_breaking_changes": [
       "Adding an optional property (Option<T> or #[serde(default)])",
       "Removing a required marker (making a property optional)",
       "Widening a type (e.g. integer to number, T to Option<T>)",
       "Widening a numeric format (e.g. int32 to int64)",
+      "Removing a semantic format (e.g. Uuid to String)",
       "Adding an enum value, or a disjoint oneOf/anyOf variant",
       "Relaxing additionalProperties or a bound",
       "Adding a workflow type, or publishing a schema for the first time",

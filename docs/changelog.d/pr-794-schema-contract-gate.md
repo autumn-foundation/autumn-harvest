@@ -572,3 +572,58 @@ compatible.
 The checked-in baseline was regenerated: it embeds the ruleset, and moving
 `default` from the ignored-annotation list to the analysed one changes it. The
 gate re-run reports zero deltas and the artifact is byte-current.
+
+### Tenth review round
+
+Three more false-COMPATIBLEs — each one a shape where the gate would have let a
+real replay break merge — plus one documentation-drift gap found while fixing
+them.
+
+- **Widening the *last* `oneOf` branch.** Ambiguous branches (two that key the
+  same, e.g. two multi-field object variants) are compared by position, and the
+  positional path handed each branch only the branches declared *after* it —
+  for `anyOf` and `oneOf` alike. That is right for `anyOf`, which binds the
+  first match. `oneOf` requires **exactly** one match and is order-independent,
+  so the last branch got no rivals at all and its widening was scored on its own
+  compatible merits. Relaxing the last branch's `required` until it matches
+  anything now correctly reports breaking. Round 9 fixed this for *keyed*
+  branches; this is the same rule for the positional path.
+- **A semantic `format` is not an annotation.** Canonicalization dropped every
+  non-numeric `format`, justified by "the engine's validator ignores `format`,
+  and a string is a string". That answers the wrong question: this gate asks
+  whether recorded JSON still **deserializes**, and `format: "uuid"` is
+  `schemars`' record that the field is a `Uuid`, whose `Deserialize` rejects a
+  string that is not one. So `String -> Uuid` — a textbook break — canonicalized
+  identically on both sides and vanished. Introducing or changing a semantic
+  format is now breaking; removing one is compatible. The accepted cost is that
+  a purely descriptive `#[schemars(format = "email")]` on a plain `String` is
+  flagged too: the differ sees the schema, not the Rust type, and a curated
+  allowlist of "really assertive" formats would be silently wrong for any custom
+  `JsonSchema` impl. That is a one-time acknowledgeable flag; the mirror mistake
+  is a silent break.
+- **Cardinality bounds are unsigned integers.** `minLength`/`maxLength`/
+  `minItems`/`maxItems` count things, and the engine's own `validate_node` reads
+  them with `as_u64`, **ignoring** anything else — while the differ read them
+  with `as_f64`. So `"minLength": 1.5` (which the validator ignores) compared
+  against `1` (which it enforces) scored as a *relaxation*, when the effective
+  constraint actually went from none to "rejects the empty string". Readability
+  now matches the validator: `as_u64` for cardinalities, `as_f64` for
+  `minimum`/`maximum`.
+- **Ruleset drift guard.** The artifact embeds the published ruleset, but
+  nothing compared it to the code — `schema check` diffs *schemas*, and a
+  ruleset edit produces no delta. A new rule could therefore ship while the
+  checked-in artifact kept telling operators the old one, which is precisely
+  what happened while writing this round.
+  `the_checked_in_baseline_documents_the_current_ruleset` closes it.
+
+Seven mutants, one per fix, each reverted individually with the specific test
+confirmed failing before restoring. Over-firing guards again ship with each
+fix: widening the last **`anyOf`** branch stays compatible (nothing binds after
+it), a tagged `oneOf` whose branches are provably disjoint stays compatible
+under the same widening, narrowing reports only the narrowing, an unchanged
+`format` produces no delta at all, and a fractional `minimum` — genuinely
+readable — still relaxes compatibly.
+
+The baseline was regenerated for the ruleset change; the gate re-run reports
+zero deltas, which also confirms the semantic-format rule costs the shipped
+`examples/**` schemas nothing.
