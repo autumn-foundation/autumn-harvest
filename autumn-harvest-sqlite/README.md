@@ -117,3 +117,8 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
   [`examples/durability.rs`](examples/durability.rs).
 - **API reference:** `cargo doc --open -p autumn-harvest-sqlite` — the
   crate-level docs are the canonical design/contract document.
+- **Why this crate exists (and why it is not a core trait):**
+  [`docs/rnd/sqlite-feasibility.md`](../docs/rnd/sqlite-feasibility.md) — the
+  R&D decision record behind the companion-crate shape, including the
+  module-by-module Postgres-coupling audit and the capabilities the
+  single-writer model gives up.

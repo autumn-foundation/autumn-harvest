@@ -148,6 +148,20 @@ jobs:
       - name: Run docs/performance.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration performance_docs::"
 
+      # Issue #966: same reasoning as the step above, for the R&D report's
+      # coupling-inventory guards. `docs/rnd/sqlite-feasibility.md` matches BOTH
+      # clauses of the docs-only filter (`^(docs/|.*\.md$)`), so a PR that edits
+      # only the report — deleting inventory rows, staling a count, dropping a
+      # classification — sets `code=false` and skips the entire `test` matrix.
+      # That is precisely the change class these guards exist to catch, so they
+      # run here in the ungated `lint` job.
+      #
+      # Guarded by `sqlite_feasibility_docs::guards_run_on_docs_only_changes`,
+      # which fails if this step is removed or becomes conditional. Quoted for
+      # the same trailing-`::` YAML reason as above.
+      - name: Run docs/rnd/sqlite-feasibility.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration sqlite_feasibility_docs::"
+
   test:
     name: Test (${{ matrix.os }})
     needs: [lint, changes]
