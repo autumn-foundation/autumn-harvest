@@ -814,6 +814,42 @@ pub const METRIC_WEBHOOK_RECEIVED: &str = "harvest.webhook.received";
 /// counter.
 pub const METRIC_WEBHOOK_REJECTED: &str = "harvest.webhook.rejected";
 
+/// Counter: incremented once for **every** message a broker event-source
+/// connector pulls off its topic/queue, before any mapping or dispatch is
+/// attempted (issue #944).
+///
+/// Labels: `source` (= [`METRIC_LABEL_SOURCE`], the operator-declared binding
+/// name — a closed set fixed at `HarvestPlugin::build` time, exactly like the
+/// webhook receiver's `path`). Per ADR-0001 §7 the message key, partition and
+/// offset are **never** labels: they are unbounded broker-supplied values, so
+/// they stay span-/log-only.
+pub const METRIC_CONNECTOR_RECEIVED: &str = "harvest.connector.received";
+
+/// Counter: incremented once per connector message that reached a terminal
+/// disposition (issue #944).
+///
+/// Labels: `source` (= [`METRIC_LABEL_SOURCE`]) and `outcome`
+/// (= [`METRIC_LABEL_OUTCOME`], one of [`ConnectorOutcome`]'s bounded values).
+/// Never labeled by message coordinates (ADR-0001 §7).
+pub const METRIC_CONNECTOR_DISPATCHED: &str = "harvest.connector.dispatched";
+
+/// Counter: incremented once per connector message dead-lettered (issue #944).
+///
+/// A message is dead-lettered when it is malformed, deterministically refused
+/// by the target, or rejected by the mapping function past the poison
+/// threshold.
+///
+/// Labels: `source` (= [`METRIC_LABEL_SOURCE`]) and `reason`
+/// (= [`METRIC_LABEL_REASON`], one of [`PoisonReason`]'s bounded values).
+pub const METRIC_CONNECTOR_POISONED: &str = "harvest.connector.poisoned";
+
+/// Gauge: the broker-reported consumer lag for a connector source, sampled on
+/// each poll cycle for the adapters whose client exposes it (issue #944).
+///
+/// Labels: `source` (= [`METRIC_LABEL_SOURCE`]). Adapters that cannot report
+/// lag simply never emit this gauge.
+pub const METRIC_CONNECTOR_LAG: &str = "harvest.connector.lag";
+
 /// Counter: incremented once per worker-session acquisition attempt (issue
 /// #606), i.e. once per `ctx.create_session(...)` call.
 ///
@@ -822,6 +858,30 @@ pub const METRIC_WEBHOOK_REJECTED: &str = "harvest.webhook.rejected";
 /// values: `acquired`/`timed_out`/`broken`). Per ADR-0001 §7, `execution.id`
 /// is never a label -- a session's identity stays span-/log-only here.
 pub const METRIC_SESSION_ACQUISITION: &str = "harvest.session.acquisition";
+
+/// Counter: one background control-loop iteration completed (issue #797).
+///
+/// Incremented **unconditionally at the end of every iteration** of each
+/// background scanner — including iterations that found no work and
+/// iterations whose pass returned an error. That unconditional emission is
+/// the whole point: the pre-existing loop metrics
+/// ([`METRIC_RETENTION_DELETED`], [`METRIC_SCHEDULE_FIRE_ATTEMPTS`], the
+/// timeout/SLA/quarantine counters) only fire when there is work to do, so a
+/// healthy idle loop and a wedged one both read zero. Here a **flat-lined
+/// counter is itself the wedge signal**, and a wedged loop is detectable
+/// within `2 ×` its poll interval.
+///
+/// Labeled by `scanner` (= [`METRIC_LABEL_SCANNER`]) whose value set is
+/// bounded by construction to the seven
+/// [`Scanner`](crate::scanner_health::Scanner) variants. Per ADR-0001 §7,
+/// `execution.id` is never a label — these are process-level control loops
+/// and carry no execution identity at all.
+///
+/// Alert on the *rate*, not the value:
+/// `rate(harvest_scanner_tick_total[5m]) == 0`. The companion in-process
+/// last-tick registry is surfaced by the `scanner_liveness` check in
+/// `GET /admin/preflight` for deployments without a metrics pipeline.
+pub const METRIC_SCANNER_TICK: &str = "harvest.scanner.tick";
 
 /// Counter: a `SignalReceived` event was durably delivered into a workflow's
 /// history and promoted to a live workflow-task wake (issue #684).
@@ -1068,6 +1128,90 @@ impl std::fmt::Display for WebhookOutcome {
     }
 }
 
+/// Bounded terminal outcomes for one message consumed by a broker event-source
+/// connector (issue #944), used as the `outcome` label on
+/// [`METRIC_CONNECTOR_DISPATCHED`].
+///
+/// Closed set: adding a variant is an additive change, but the set must stay
+/// small so the metric's cardinality is bounded by construction (ADR-0001 §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectorOutcome {
+    /// The message durably started a workflow or delivered a signal.
+    Dispatched,
+    /// The message was recognized as a redelivery of an already-dispatched
+    /// message; nothing new was committed, but the original dispatch is
+    /// durable so the message is safe to acknowledge.
+    IdempotentReplay,
+    /// The target workflow carries a throttle/debounce/batch policy and the
+    /// admission was durably parked (an HTTP `202`-equivalent). The start is
+    /// recorded and will fire on the owning scanner's schedule, so this is a
+    /// success from the connector's point of view.
+    Deferred,
+    /// The message was routed to a dead-letter destination (see
+    /// [`METRIC_CONNECTOR_POISONED`] for the reason breakdown).
+    DeadLettered,
+    /// A transient harvest-side failure left the message unacknowledged for
+    /// broker-native redelivery.
+    Retried,
+}
+
+impl ConnectorOutcome {
+    /// Stable lower-case outcome string used as the `outcome` metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dispatched => "dispatched",
+            Self::IdempotentReplay => "idempotent_replay",
+            Self::Deferred => "deferred",
+            Self::DeadLettered => "dead_lettered",
+            Self::Retried => "retried",
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectorOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Bounded reasons a connector message was routed to a dead-letter
+/// destination (issue #944), used as the `reason` label on
+/// [`METRIC_CONNECTOR_POISONED`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoisonReason {
+    /// The raw message body could not be decoded into the shape the binding's
+    /// mapping function expects. Deterministic — retrying can never help, so
+    /// this dead-letters on the first occurrence.
+    Malformed,
+    /// The mapping function ran but rejected the message, `threshold`
+    /// consecutive times.
+    MappingRejected,
+    /// The dispatch target refused the message deterministically (a `4xx`
+    /// from the start / signal-with-start path, e.g. published-schema
+    /// validation). Deterministic — dead-letters on the first occurrence.
+    TargetRejected,
+}
+
+impl PoisonReason {
+    /// Stable lower-case reason string used as the `reason` metric label and
+    /// persisted on the dead-letter record.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed",
+            Self::MappingRejected => "mapping_rejected",
+            Self::TargetRejected => "target_rejected",
+        }
+    }
+}
+
+impl std::fmt::Display for PoisonReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Metric label key constants
 // Used by MetricsRecorder implementations to avoid string literals at call
@@ -1075,6 +1219,14 @@ impl std::fmt::Display for WebhookOutcome {
 // (ATTR_EXECUTION_ID) deliberately has no entry here so it cannot be
 // accidentally used on a metric.
 // ---------------------------------------------------------------------------
+
+/// Metric label: the broker event-source binding name (issue #944).
+///
+/// A closed set fixed at `HarvestPlugin::build` time (one value per declared
+/// binding), so it is bounded by construction. The topic/queue, partition,
+/// offset and message key are deliberately **not** labels — they are
+/// unbounded broker-supplied values (ADR-0001 §7).
+pub const METRIC_LABEL_SOURCE: &str = "source";
 
 /// Metric label: the workflow name.
 pub const METRIC_LABEL_WORKFLOW: &str = "workflow";
@@ -1125,6 +1277,19 @@ pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
 /// Metric label: adaptive slot-tuner decision (`"grow"` / `"shrink"` / `"hold"`,
 /// issue #548).
 pub const METRIC_LABEL_DECISION: &str = "decision";
+/// Metric label: background control loop identity (issue #797).
+///
+/// Bounded by construction to the [`Scanner`](crate::scanner_health::Scanner)
+/// variants — a call site passes the enum's `as_str()`, never a free string.
+pub const METRIC_LABEL_SCANNER: &str = "scanner";
+/// `shard` label value for a control loop that is **not** per-shard (issue #797).
+///
+/// The `retention` and `schedule` loops run once per process rather than once
+/// per assigned shard, and a single-shard deployment's per-shard loops have no
+/// shard id to report. They emit this sentinel so every
+/// [`METRIC_SCANNER_TICK`] series carries the same label set — a family with a
+/// sometimes-present label is awkward to query and easy to mis-aggregate.
+pub const SCANNER_SHARD_LABEL_NONE: &str = "none";
 
 // ---------------------------------------------------------------------------
 // Custom (user) metric constants and validation (issue #532)
@@ -1825,6 +1990,67 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (queue_name, age_secs);
     }
 
+    /// One background control-loop iteration completed (issue #797).
+    ///
+    /// Maps to the counter [`METRIC_SCANNER_TICK`], labeled `scanner` (=
+    /// [`METRIC_LABEL_SCANNER`]) and `shard` (= [`METRIC_LABEL_SHARD`]).
+    /// `scanner` is always
+    /// [`Scanner::as_str`](crate::scanner_health::Scanner::as_str), so the
+    /// label's cardinality is bounded by construction.
+    ///
+    /// `shard` is what stops one healthy sibling from **masking** a wedged
+    /// one. A multi-shard worker spawns a `timeout`, `poison_pill`, and
+    /// `pause_auto_resume` loop *per assigned shard*; without a per-shard
+    /// dimension they would all increment one series, so a healthy shard's
+    /// ticks would keep `rate(...) > 0` while another shard's loop was dead
+    /// and the paging alert would never fire. Use
+    /// [`SCANNER_SHARD_LABEL_NONE`] for the process-wide loops (`retention`,
+    /// `schedule`) and single-shard deployments, so the label set is uniform
+    /// across the series family. Cardinality stays bounded: shard count is
+    /// operator-configured and small, matching the existing `shard`-labeled
+    /// metrics (`harvest.dlq.entries`, `harvest.shard.stranded_pending`).
+    ///
+    /// Called **unconditionally at the end of every iteration**, including
+    /// no-work iterations — that is what makes a flat-lined counter mean
+    /// "wedged" rather than merely "idle". Prefer the
+    /// [`record_scanner_tick`](crate::scanner_health::record_scanner_tick)
+    /// choke point over calling this directly: it also bumps the in-process
+    /// liveness registry that backs the `scanner_liveness` preflight check,
+    /// so the counter and the timestamp cannot drift apart.
+    ///
+    /// Additive with a no-op default: implementing it is optional and no
+    /// existing implementor breaks.
+    fn record_scanner_tick(&self, scanner: &str, shard: &str) {
+        let _ = (scanner, shard);
+    }
+
+    /// A background control loop registered itself, before its first
+    /// iteration (issue #797).
+    ///
+    /// Initializes that scanner's [`METRIC_SCANNER_TICK`] series **at zero**
+    /// rather than recording a separate metric — implementations should
+    /// increment the tick counter by `0`, with the same `scanner` and `shard`
+    /// labels [`record_scanner_tick`](Self::record_scanner_tick) uses, so the
+    /// initialized series is the one the ticks go on to increment.
+    ///
+    /// Without this, a loop that panics or hangs during its *first* iteration
+    /// never reaches [`record_scanner_tick`](Self::record_scanner_tick), so
+    /// the process exports no series for it at all. `rate(...) == 0` only
+    /// evaluates series that exist, and `absent()` is deliberately not used by
+    /// the shipped alert (an API-only replica legitimately exports nothing),
+    /// so that startup wedge would page *never* — the worst failure mode for a
+    /// liveness signal. Registration happens before the first iteration, which
+    /// is exactly when the process knows the loop is supposed to be running.
+    ///
+    /// A process that runs no control loops still exports nothing, so the
+    /// API-only-replica case that rules out `absent()` is unchanged.
+    ///
+    /// Additive with a no-op default: implementing it is optional and no
+    /// existing implementor breaks.
+    fn record_scanner_registered(&self, scanner: &str, shard: &str) {
+        let _ = (scanner, shard);
+    }
+
     /// Results of one retention-janitor tick on a shard.
     fn record_retention_tick(
         &self,
@@ -2338,6 +2564,40 @@ pub trait MetricsRecorder: Send + Sync {
     /// and `outcome`. `outcome` is never [`WebhookOutcome::Accepted`] here.
     fn record_webhook_rejected(&self, path: &str, outcome: WebhookOutcome) {
         let _ = (path, outcome);
+    }
+
+    /// A broker event-source connector pulled a message off its topic/queue
+    /// (issue #944), before any mapping or dispatch was attempted.
+    ///
+    /// Maps to the counter [`METRIC_CONNECTOR_RECEIVED`] with label `source`.
+    /// The message key/partition/offset are never labels (ADR-0001 §7).
+    fn record_connector_received(&self, source: &str) {
+        let _ = source;
+    }
+
+    /// A connector message reached a terminal disposition (issue #944).
+    ///
+    /// Maps to the counter [`METRIC_CONNECTOR_DISPATCHED`] with labels
+    /// `source` and `outcome`.
+    fn record_connector_dispatched(&self, source: &str, outcome: ConnectorOutcome) {
+        let _ = (source, outcome);
+    }
+
+    /// A connector message was routed to a dead-letter destination
+    /// (issue #944).
+    ///
+    /// Maps to the counter [`METRIC_CONNECTOR_POISONED`] with labels `source`
+    /// and `reason`.
+    fn record_connector_poisoned(&self, source: &str, reason: PoisonReason) {
+        let _ = (source, reason);
+    }
+
+    /// The broker-reported consumer lag for a connector source (issue #944).
+    ///
+    /// Maps to the gauge [`METRIC_CONNECTOR_LAG`] with label `source`.
+    /// Adapters whose client cannot report lag never call this.
+    fn record_connector_lag(&self, source: &str, lag: i64) {
+        let _ = (source, lag);
     }
 
     /// A saga compensation sequence started running forward (issue #801).
@@ -3544,6 +3804,76 @@ mod tests {
         let rec = NoOpMetrics;
         rec.record_webhook_received("/hooks/orders", WebhookOutcome::Accepted);
         rec.record_webhook_rejected("/hooks/orders", WebhookOutcome::VerifyFailed);
+    }
+
+    #[test]
+    fn connector_metric_names_are_stable() {
+        // These names are the operator-facing contract (dashboards, alerts).
+        assert_eq!(METRIC_CONNECTOR_RECEIVED, "harvest.connector.received");
+        assert_eq!(METRIC_CONNECTOR_DISPATCHED, "harvest.connector.dispatched");
+        assert_eq!(METRIC_CONNECTOR_POISONED, "harvest.connector.poisoned");
+        assert_eq!(METRIC_CONNECTOR_LAG, "harvest.connector.lag");
+        assert_eq!(METRIC_LABEL_SOURCE, "source");
+    }
+
+    #[test]
+    fn connector_outcome_stringifies_to_bounded_values() {
+        assert_eq!(ConnectorOutcome::Dispatched.as_str(), "dispatched");
+        assert_eq!(
+            ConnectorOutcome::IdempotentReplay.as_str(),
+            "idempotent_replay"
+        );
+        assert_eq!(ConnectorOutcome::Deferred.as_str(), "deferred");
+        assert_eq!(ConnectorOutcome::DeadLettered.as_str(), "dead_lettered");
+        assert_eq!(ConnectorOutcome::Retried.as_str(), "retried");
+        assert_eq!(ConnectorOutcome::Dispatched.to_string(), "dispatched");
+    }
+
+    #[test]
+    fn poison_reason_stringifies_to_bounded_values() {
+        assert_eq!(PoisonReason::Malformed.as_str(), "malformed");
+        assert_eq!(PoisonReason::MappingRejected.as_str(), "mapping_rejected");
+        assert_eq!(PoisonReason::TargetRejected.as_str(), "target_rejected");
+        assert_eq!(PoisonReason::Malformed.to_string(), "malformed");
+    }
+
+    #[test]
+    fn connector_outcome_label_values_are_a_small_closed_set() {
+        // ADR-0001 §7: the `outcome`/`reason` label values must be a bounded,
+        // closed set so `harvest.connector.*` cardinality stays
+        // `sources x small-constant`, never `sources x messages`.
+        let outcomes = [
+            ConnectorOutcome::Dispatched,
+            ConnectorOutcome::IdempotentReplay,
+            ConnectorOutcome::Deferred,
+            ConnectorOutcome::DeadLettered,
+            ConnectorOutcome::Retried,
+        ];
+        let distinct: std::collections::BTreeSet<&str> =
+            outcomes.iter().map(|o| o.as_str()).collect();
+        assert_eq!(
+            distinct.len(),
+            outcomes.len(),
+            "outcome labels must be unique"
+        );
+
+        let reasons = [
+            PoisonReason::Malformed,
+            PoisonReason::MappingRejected,
+            PoisonReason::TargetRejected,
+        ];
+        let distinct_reasons: std::collections::BTreeSet<&str> =
+            reasons.iter().map(|r| r.as_str()).collect();
+        assert_eq!(distinct_reasons.len(), reasons.len());
+    }
+
+    #[test]
+    fn noop_metrics_implements_connector_methods_without_panicking() {
+        let rec = NoOpMetrics;
+        rec.record_connector_received("orders");
+        rec.record_connector_dispatched("orders", ConnectorOutcome::Dispatched);
+        rec.record_connector_poisoned("orders", PoisonReason::Malformed);
+        rec.record_connector_lag("orders", 42);
     }
 
     #[test]

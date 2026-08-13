@@ -616,6 +616,11 @@ mod scanner {
 
     /// Spawn a background task that periodically reclaims orphaned poison-pill
     /// tasks. Stops when `cancel` is triggered.
+    ///
+    /// Equivalent to [`spawn_poison_pill_reclaimer_for_shard`] with no shard
+    /// attributed. The shard is only used to label this loop in the
+    /// `scanner_liveness` health check (issue #797); it never affects which
+    /// tasks the loop reclaims -- that is the connection's own database.
     #[must_use]
     pub fn spawn_poison_pill_reclaimer(
         pool: diesel_async::pooled_connection::deadpool::Pool<AsyncPgConnection>,
@@ -625,6 +630,47 @@ mod scanner {
         worker_stale_secs: i64,
         telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
     ) -> tokio::task::JoinHandle<()> {
+        spawn_poison_pill_reclaimer_for_shard(
+            pool,
+            cancel,
+            interval,
+            threshold,
+            worker_stale_secs,
+            telemetry,
+            None,
+        )
+    }
+
+    /// [`spawn_poison_pill_reclaimer`], attributing this loop instance to
+    /// `shard` in the `scanner_liveness` health check (issue #797).
+    ///
+    /// A multi-shard worker spawns one reclaimer per assigned shard, all
+    /// registered under the same `poison_pill` scanner label. Passing the shard
+    /// here is what lets the health check say *which* shard's loop is wedged --
+    /// the metric carries no shard label, so this is the only surface that can
+    /// localize it.
+    ///
+    /// Pass `None` for a process-wide loop or a single-shard deployment.
+    #[must_use]
+    pub fn spawn_poison_pill_reclaimer_for_shard(
+        pool: diesel_async::pooled_connection::deadpool::Pool<AsyncPgConnection>,
+        cancel: CancellationToken,
+        interval: std::time::Duration,
+        threshold: i32,
+        worker_stale_secs: i64,
+        telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
+        shard: Option<crate::types::ShardId>,
+    ) -> tokio::task::JoinHandle<()> {
+        // Issue #797: declare the loop before its first iteration so the
+        // `scanner_liveness` check expects it and grants it boot grace. The
+        // shard is carried so a multi-shard worker's snapshot can name WHICH
+        // shard's reclaimer wedged -- the tick counter carries no shard label.
+        let owner = crate::scanner_health::register_scanner_for_shard(
+            &*telemetry.metrics,
+            crate::scanner_health::Scanner::PoisonPill,
+            interval,
+            shard,
+        );
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -658,16 +704,25 @@ mod scanner {
                         tracing::error!(error = %e, "failed to acquire DB connection for poison-pill reclaim");
                     }
                 }
+                // Issue #797: unconditional end-of-iteration liveness tick.
+                crate::scanner_health::record_scanner_tick(&*telemetry.metrics, owner);
                 if cancel.is_cancelled() {
                     break;
                 }
             }
+            // Issue #797: a graceful stop retires this loop from the expected
+            // scanner set. A panic unwinds past here, so a panicked loop stays
+            // registered and correctly ages into `Wedged`.
+            crate::scanner_health::deregister_scanner(owner);
         })
     }
 }
 
 #[cfg(feature = "db")]
-pub use scanner::{QUARANTINE_REASON, reclaim_orphaned_tasks, spawn_poison_pill_reclaimer};
+pub use scanner::{
+    QUARANTINE_REASON, reclaim_orphaned_tasks, spawn_poison_pill_reclaimer,
+    spawn_poison_pill_reclaimer_for_shard,
+};
 
 #[cfg(test)]
 mod tests {

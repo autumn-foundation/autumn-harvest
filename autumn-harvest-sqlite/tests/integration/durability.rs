@@ -29,6 +29,28 @@ async fn single_activity(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     Ok(out.as_i64().ok_or("bad activity output")? * 2)
 }
 
+/// Two activities in sequence, the second consuming the first's output.
+///
+/// AC-D2 words the first durability scenario as "one workflow with **two
+/// activities** and a retry". `single_activity` above covers the retry with one
+/// activity; this covers the literal shape, which is also the more interesting
+/// one: the second activity's input is the first's *recorded* output, so a
+/// retry of either must not perturb the value the other sees.
+#[workflow]
+async fn two_activities(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    let doubled = ctx
+        .execute_activity_raw("double", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    let incremented = ctx
+        .execute_activity_raw("increment", doubled, "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    incremented
+        .as_i64()
+        .ok_or_else(|| "bad activity output".to_string())
+}
+
 /// Arm a durable timer, then return a constant.
 #[workflow]
 async fn timer_then_done(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
@@ -97,6 +119,95 @@ async fn activity_retry_then_success() {
         .filter(|e| matches!(e, WorkflowEvent::ActivityFailed { .. }))
         .count();
     assert_eq!(scheduled, 0, "a recovered retry appends no ActivityFailed");
+}
+
+// ── AC4(a), literal shape: TWO activities and a retry ────────────────────────
+
+/// The AC-D2 scenario as worded: two activities in one workflow, one of which
+/// retries.
+///
+/// The retry is placed on the *first* activity deliberately. Its recovered
+/// output is what the second activity consumes, so a retry that leaked the
+/// failed attempt's state — or re-ran the first activity when replaying to
+/// reach the second — would corrupt the second's input rather than merely
+/// costing an extra call. The assertions therefore pin the *value* the second
+/// activity received, not just the final result: `(21 * 2) + 1 == 43`, with
+/// `double` called twice (fail, ok) and `increment` called exactly once.
+#[tokio::test]
+async fn two_activities_with_retry() {
+    let double_calls = Arc::new(AtomicUsize::new(0));
+    let increment_calls = Arc::new(AtomicUsize::new(0));
+    // What the second activity actually saw, so a corrupted hand-off is visible
+    // as a wrong input rather than only as a wrong final answer.
+    let increment_inputs = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+
+    let double_body = double_calls.clone();
+    let increment_body = increment_calls.clone();
+    let seen = increment_inputs.clone();
+
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&two_activities_info());
+    rt.register_activity_raw(
+        "double",
+        ActivitySpec::new(3, move |input: serde_json::Value| {
+            // Fail the first attempt, succeed the second.
+            if double_body.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err("transient".to_string())
+            } else {
+                Ok(json!(input.as_i64().unwrap() * 2))
+            }
+        }),
+    );
+    rt.register_activity_raw(
+        "increment",
+        ActivitySpec::new(1, move |input: serde_json::Value| {
+            let n = input.as_i64().unwrap();
+            increment_body.fetch_add(1, Ordering::SeqCst);
+            seen.lock().unwrap().push(n);
+            Ok(json!(n + 1))
+        }),
+    );
+
+    let exec = rt.start_workflow("two_activities", json!(21)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v.as_i64() == Some(43)),
+        "expected Completed(43) = (21 * 2) + 1, got {state:?}"
+    );
+    assert_eq!(
+        double_calls.load(Ordering::SeqCst),
+        2,
+        "`double` ran twice (fail, then ok)"
+    );
+    assert_eq!(
+        increment_calls.load(Ordering::SeqCst),
+        1,
+        "`increment` ran exactly once — the first activity's retry must not \
+         re-drive the second"
+    );
+    assert_eq!(
+        *increment_inputs.lock().unwrap(),
+        vec![42],
+        "the second activity must consume the *recovered* output of the first, \
+         not the failed attempt's"
+    );
+
+    // Both activities are in the replayable log; the retryable failure is not.
+    let history = rt.load_history(exec).unwrap();
+    let completed = history
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
+        .count();
+    assert_eq!(
+        completed, 2,
+        "both activities must record an ActivityCompleted: {history:#?}"
+    );
+    let failed = history
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ActivityFailed { .. }))
+        .count();
+    assert_eq!(failed, 0, "a recovered retry appends no ActivityFailed");
 }
 
 // ── AC4(b): a durable timer fires across a restart ───────────────────────────

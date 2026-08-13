@@ -58,7 +58,11 @@ metrics named in issue #355 (`harvest.workflow.started`,
 `harvest.shard.stranded_pending` — the engine's own background samplers
 already compute these under the same `is_enabled()` gate the nine required
 metrics live behind, so they're implemented too rather than sampled and
-discarded. **It does not back the full starter alert pack**
+discarded. It also covers the four broker-connector families
+(`harvest.connector.received`, `harvest.connector.dispatched`,
+`harvest.connector.poisoned`, `harvest.connector.lag`), which back the shipped
+connector dashboard panels — without them a dropped metric would be
+indistinguishable from an idle consumer. **It does not back the full starter alert pack**
 (`docs/alerts/starter-pack-v0.1.0.json`), which also references metrics this
 endpoint never emits (e.g. `harvest_workflow_terminal_total`,
 `harvest_activity_attempts_total`/`retries_total`,
@@ -333,6 +337,7 @@ metric is emitted in the source code.
 | `harvest.schedule.overdue` | Gauge | `scheduler.rs` — `sample_overdue_schedules`, emitted per schedule by the worker's overdue sampler (`spawn_schedule_overdue_sampler`, on the `poll_interval` cadence, per shard). `1` when an *active* schedule is past its own cadence grace (`now − next_run_at > cadence step + jitter + tick`), `0` otherwise. Runs on the worker, not the scheduler tick, so a wedged tick cannot suppress its own health signal (issue #696). Paused / auto-paused / manual / exhausted / at-capacity schedules read `0`; deleted schedules go stale (standard gauge property). |
 | `harvest.retention.deleted` | Counter | `retention.rs` — `RetentionRuntime` tick, once per workflow type with a real (non-dry-run) deletion; labeled by workflow type so per-type retention overrides are confirmable (issue #737). `sum(harvest.retention.deleted)` equals the aggregate **workflow-history** deletion count for the tick, excluding orphaned `harvest_completion_deliveries` reclaims (issue #921), which have no workflow to attribute. |
 | `harvest.retention.summary_deleted` | Counter | `retention.rs` — summaries deleted by the tiered-retention summary GC pass, once per workflow type with a real (non-dry-run) deletion; labeled by workflow type. A distinct member of the retention metric family from `harvest.retention.deleted` (history rows), so the two tiers are observable independently (issue #752). |
+| `harvest.scanner.tick` | Counter | `timeout.rs` / `poison_pill.rs` / `worker.rs` / `retention.rs` / `scheduler.rs` — incremented **unconditionally at the end of every background control-loop iteration**, including no-work iterations and iterations whose pass returned an error, via the single `scanner_health::record_scanner_tick` choke point (issue #797). Unlike every other loop metric here (which only emits when there is work), a **flat-lined series means the loop is wedged**, not idle. There are seven labels but **five** spawned loops: `sla` and `external_outbox` are enforcement responsibilities inside the `timeout` loop and are ticked **by that loop**, so the three share one liveness fate and cannot diverge (ticking them mid-pass instead would put them behind a `?` and skip them on a transient DB error, giving a flat-lined counter two possible meanings). A multi-shard worker runs one `timeout`/`poison_pill`/`pause_auto_resume` loop **per shard** under one label, so the counter carries a bounded `shard` label (the shard id, or `none` for the process-wide `retention`/`schedule` loops and single-shard deployments). Without it every per-shard instance would share one series on one scrape target and a healthy shard's ticks would hold `rate(...) > 0` while a sibling's loop was dead — **masking** the wedge, not merely failing to localise it. The `scanner_liveness` check complements this by tracking each instance, reporting the worst, and listing **every** stale shard in the check payload. The same choke point bumps an in-process last-tick registry surfaced by the `scanner_liveness` check in `GET /admin/preflight`, so liveness is observable with no metrics pipeline configured. |
 | `harvest.workflow.nondeterministic_block` | Counter | `worker.rs` — `block_workflow_for_non_determinism`, once per non-terminal replay-divergence block entry (incl. re-blocks); the runtime companion to the `harvest.workflow.non_determinism` detection counter (issue #603) |
 | `harvest.workflow.start_throttled` | Counter | `api.rs` (HTTP/batch) + `scheduler.rs` (scheduled/buffered fires) — once per workflow start deferred by a start throttle because the per-key token bucket was empty (issue #607) |
 | `harvest.webhook.received` | Counter | `webhook_receiver.rs` — every request that reaches an inbound webhook receiver route, regardless of outcome (issue #344) |
@@ -355,6 +360,10 @@ metric is emitted in the source code.
 | `harvest.mutex.wait_duration` | Histogram | `worker.rs` — `persist_mutex_acquire_park`, on grant: wall-clock seconds a workflow waited to acquire a durable mutex, from request (enqueued as a FIFO waiter) to grant (issue #691) |
 | `harvest.mutex.held_duration` | Histogram | `worker.rs` — `process_mutex_releases_from_commands`, on release: wall-clock seconds a durable mutex was held, from grant (`MutexGranted.acquired_at`) to release (drop / explicit / terminal sweep / lease reclaim) (issue #691) |
 | `harvest.mutex.contention_depth` | Gauge | `worker.rs` — `persist_mutex_acquire_park`, at the moment a grant is made: the FIFO waiter-queue length for the key (number of workflows waiting on that mutex key) (issue #691) |
+| `harvest.connector.received` | Counter | `connector/runtime.rs` (plugin) — once per message pulled from a broker source, before dispatch, regardless of outcome (issue #944) |
+| `harvest.connector.dispatched` | Counter | `connector/runtime.rs` (plugin) — the **settlement breakdown**: exactly one sample per received message, so the series sums to `harvest.connector.received`. `dispatched` (a fresh execution), `idempotent_replay` (harvest recognised the redelivery and returned the existing run), `deferred` (a start throttle, issue #607, parked it — a **success** for ack purposes), `dead_lettered` (poison; see `harvest.connector.poisoned` for the reason), or `retried` (a transient harvest-side failure; the message is left un-acked for redelivery) (issue #944) |
+| `harvest.connector.poisoned` | Counter | `connector/runtime.rs` (plugin) — once per message quarantined to a dead-letter destination: a deterministic decode failure (`malformed`), a mapping-function rejection repeated `poison_threshold` times (`mapping_rejected`, default 3, mirroring `poison_pill_threshold` #367), or a permanent harvest rejection (`target_rejected`). A poisoned message is **acked** so one bad message never wedges a partition (issue #944) |
+| `harvest.connector.lag` | Gauge | `connector/runtime.rs` (plugin) — sampled per pass from `EventSource::lag()`, for sources whose client exposes it. **Kafka**: high watermark minus the committed offset, clamped up to the low watermark so records retention already deleted are not counted as a backlog the consumer can never work off. A partition the group has never committed is baselined by the **effective** `auto.offset.reset` (the `earliest` default, or a caller's `.property("auto.offset.reset", "latest")` override), so a latest-starting group owes nothing rather than reporting the topic's whole retained history forever. Summed across **every partition of the topic** (from `fetch_metadata` + `committed_offsets`, deliberately NOT `assignment()`). Consumer lag is a property of the *group*: an assignment-scoped sum is a property of one replica, so with N replicas each would report roughly `1/N` of the backlog and `max by (source)` would surface the largest subtotal while hiding a partition stalled on another replica. Group-wide means every replica reports the same number, so one aggregation is correct for both adapters. The cost is that broker calls per sample scale with replica count — bounded work on the lag interval, not the message path. **SQS**: `ApproximateNumberOfMessages` **plus** `ApproximateNumberOfMessagesNotVisible` — a message abandoned for visibility-timeout retry becomes *not visible*, so the visible count alone drains toward zero during an outage while the outstanding population is unchanged. Both read "still owed to this consumer", not "immediately fetchable". Sources with no lag concept simply never emit (issue #944) |
 
 ### Label sets
 
@@ -381,6 +390,7 @@ metric is emitted in the source code.
 | `harvest.schedule.skipped` | `kind`, `name`, `reason` (`paused\|max_active_runs_reached\|catchup_disabled`) |
 | `harvest.schedule.overdue` | `kind` (`workflow\|dag`), `name` |
 | `harvest.retention.deleted` | `workflow` |
+| `harvest.scanner.tick` | `scanner` (`timeout\|sla\|poison_pill\|external_outbox\|retention\|schedule\|pause_auto_resume`) |
 | `harvest.retention.summary_deleted` | `workflow` |
 | `harvest.workflow.nondeterministic_block` | `workflow`, `queue` |
 | `harvest.workflow.history_bloat` | `workflow` (= `METRIC_LABEL_WORKFLOW`) — no `execution.id` label (ADR-0001 §7); see `GET /api/harvest/workflows?history_bloat_min_events=<N>` to find the specific execution(s) driving a crossing (issue #704) |
@@ -405,6 +415,10 @@ metric is emitted in the source code.
 | `harvest.canary.roundtrip` | `queue`, `shard` (probed task queue + writable shard; **no `execution.id`** — issue #796) |
 | `harvest.canary.success` | `queue`, `shard` |
 | `harvest.canary.failure` | `queue`, `shard` |
+| `harvest.connector.received` | `source` (the binding's `source_name`, a registered `SourceBinding` — closed set) — the message key, partition, and offset are **never** labels (ADR-0001 §7, issue #944) |
+| `harvest.connector.dispatched` | `source`, `outcome` (`dispatched\|idempotent_replay\|deferred\|dead_lettered\|retried` — bounded enum) |
+| `harvest.connector.poisoned` | `source`, `reason` (`malformed\|mapping_rejected\|target_rejected` — bounded enum) |
+| `harvest.connector.lag` | `source` |
 
 **Cardinality rule:** `execution.id` is **never** a metric label. It is
 span-only (see ADR-0001 §4). The `MetricsRecorder` API enforces this by

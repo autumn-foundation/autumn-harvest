@@ -121,6 +121,17 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features metrics -- -D warnings
       - name: Clippy autumn-harvest-plugin (webhooks feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features webhooks -- -D warnings
+      # issue #944. `connectors` alone is the broker-agnostic layer (no broker
+      # client), so it lints without any system dependency. `kafka` needs the
+      # libcurl headers vendored librdkafka's cmake build looks for.
+      - name: Clippy autumn-harvest-plugin (connectors feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features connectors -- -D warnings
+      - name: Clippy autumn-harvest-plugin (sqs feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
+      - name: Install librdkafka build deps
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      - name: Clippy autumn-harvest-plugin (kafka feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features kafka -- -D warnings
       - name: Clippy autumn-harvest-macros
         run: cargo clippy -p autumn-harvest-macros -- -D warnings
       - name: Clippy autumn-harvest-cli
@@ -149,6 +160,20 @@ jobs:
       # `performance_docs::ci_yaml_plain_scalars_do_not_contain_a_mapping_colon`.
       - name: Run docs/performance.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration performance_docs::"
+
+      # Issue #966: same reasoning as the step above, for the R&D report's
+      # coupling-inventory guards. `docs/rnd/sqlite-feasibility.md` matches BOTH
+      # clauses of the docs-only filter (`^(docs/|.*\.md$)`), so a PR that edits
+      # only the report — deleting inventory rows, staling a count, dropping a
+      # classification — sets `code=false` and skips the entire `test` matrix.
+      # That is precisely the change class these guards exist to catch, so they
+      # run here in the ungated `lint` job.
+      #
+      # Guarded by `sqlite_feasibility_docs::guards_run_on_docs_only_changes`,
+      # which fails if this step is removed or becomes conditional. Quoted for
+      # the same trailing-`::` YAML reason as above.
+      - name: Run docs/rnd/sqlite-feasibility.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration sqlite_feasibility_docs::"
 
   test:
     name: Test (${{ matrix.os }})
@@ -211,6 +236,15 @@ jobs:
       - name: Run plugin lib tests (webhooks feature, issue #618 outbound-delegate gating)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features webhooks --lib
+      - name: Run plugin connector tests (issue #944)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-plugin --features connectors --lib connector
+      # No CI step ran the plugin's doctests, so a broken `///` example landed
+      # silently (issue #944 review found exactly that). These are compile-only
+      # (`no_run`), so they cost seconds and need no database.
+      - name: Run plugin doctests (issue #944 review)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test --doc -p autumn-harvest-plugin --features connectors
       - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests
@@ -220,6 +254,18 @@ jobs:
       - name: Compile plugin metrics scrape example
         if: needs.changes.outputs.code == 'true'
         run: cargo build -p autumn-harvest-plugin --example metrics_scrape_quickstart --features metrics
+      # `aws-sdk-sqs` is pure Rust, so the SQS example builds on every OS.
+      - name: Compile plugin SQS connector example (issue #944)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo build -p autumn-harvest-plugin --example sqs_connector_quickstart --features sqs
+      # issue #944: the Kafka example is the success metric's measured artifact
+      # (see tests/connector_example_budget.rs), so it must keep compiling.
+      # Linux-only for the same librdkafka reason as the broker suite.
+      - name: Compile plugin Kafka connector example (issue #944, Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+          cargo build -p autumn-harvest-plugin --example kafka_connector_quickstart --features kafka
       - name: Run macros tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-macros
@@ -270,6 +316,15 @@ jobs:
       - name: Run fanout_batch example tests (issue #750)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example fanout_batch
+      # The WASM example is a `main()` that self-asserts the sandbox contract
+      # (echo round-trip, a granted capability, and an ungranted import denied as
+      # SandboxDenied), so RUN it rather than only building it. It needs no
+      # database. Linux-only: it is the one example gated on `wasm-activities`,
+      # which drags in wasmtime — a multi-minute build not worth paying on three
+      # legs, and the macOS/Windows legs never build core examples at all.
+      - name: Run wasm_activity example (issue #965)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo run -p autumn-harvest --features wasm-activities --example wasm_activity
       # Issue #794: the schema-contract gate, end to end. Generates the
       # currently-published schemas from the example registry, then diffs them
       # against the checked-in baseline. This is simultaneously the drift guard
@@ -359,6 +414,18 @@ jobs:
       - name: Run Docker-backed signal/update metric integration tests (issue #684)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --test integration -- metrics_integration::update_completed_metric_fires_on_the_suspend_path nd_block_tests::genuine_terminal_with_undrained_signal_emits_signal_unhandled nd_block_tests::nd_blocked_cycle_does_not_emit_signal_unhandled --test-threads=1
+      # Issue #944's Kafka broker suite stays a literal Linux-only step rather
+      # than a manifest row: it needs the apt install below first, and the
+      # manifest's `compile` mode would try to build vendored librdkafka on the
+      # macOS and Windows legs too. Its ALLOWLIST entry in `ci_run_coverage.rs`
+      # points here. (The SQS broker suite IS a manifest row — `aws-sdk-sqs` is
+      # pure Rust and compiles everywhere.)
+      - name: Install librdkafka build deps (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      - name: Run plugin Kafka broker connector tests (issue #944)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest-plugin --features kafka --test connector_kafka_broker -- --test-threads=1
 
   quickstart:
     name: Quickstart example builds

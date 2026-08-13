@@ -256,6 +256,7 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_SCHEDULE_SKIPPED`  | `harvest.schedule.skipped`    | Counter      | `kind`, `name`, `reason` (3 values)           |                       |
 | `METRIC_SCHEDULE_OVERDUE`  | `harvest.schedule.overdue`    | Gauge        | `kind` (2 values), `name` (bounded)           | `execution.id`        |
 | `METRIC_RETENTION_DELETED` | `harvest.retention.deleted`   | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`)        |                       |
+| `METRIC_SCANNER_TICK`      | `harvest.scanner.tick`        | Counter      | `scanner` (bounded, 7 values: timeout/sla/poison_pill/external_outbox/retention/schedule/pause_auto_resume; 7 labels but 5 spawned loops — `sla`/`external_outbox` are ticked by the `timeout` loop that drives them, so those three cannot diverge), `shard` (operator-configured shard id, or `none` for the process-wide `retention`/`schedule` loops and single-shard deployments — required so a healthy per-shard sibling cannot mask a wedged one on a shared series) | `execution.id` |
 | `METRIC_WORKFLOW_PAUSED`   | `harvest.workflow.paused`     | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id`      |
 | `METRIC_WORKFLOW_PAUSE_DURATION` | `harvest.workflow.pause_duration` | Histogram | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
 | `METRIC_SAGA_COMPENSATED`  | `harvest.saga.compensated`    | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
@@ -269,6 +270,19 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_UPDATE_COMPLETED`  | `harvest.update.completed`    | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `name` (update name, bounded), `queue` | `execution.id` |
 | `METRIC_UPDATE_FAILED`     | `harvest.update.failed`       | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `name` (update name, bounded), `queue` | `execution.id` |
 | `METRIC_UPDATE_DURATION`   | `harvest.update.duration`     | Histogram    | `workflow` (= `METRIC_LABEL_WORKFLOW`), `name` (update name, bounded — `__unregistered__` for an unresolved name), `queue`, `outcome` (`completed`/`failed`, bounded — rejected excluded) | `execution.id`, `update_id` |
+| `METRIC_CONNECTOR_RECEIVED` | `harvest.connector.received` | Counter      | `source` (= `METRIC_LABEL_SOURCE`, the binding's registered `source_name` — a closed set fixed at build time) | `execution.id`, message key, partition, offset, `MessageId` |
+| `METRIC_CONNECTOR_DISPATCHED` | `harvest.connector.dispatched` | Counter   | `source`, `outcome` (5 values: dispatched/idempotent_replay/deferred/dead_lettered/retried — one sample per received message, so the series sums to `harvest.connector.received`) | `execution.id`, message key, partition, offset |
+| `METRIC_CONNECTOR_POISONED` | `harvest.connector.poisoned` | Counter      | `source`, `reason` (3 values: malformed/mapping_rejected/target_rejected) | `execution.id`, message key, partition, offset |
+| `METRIC_CONNECTOR_LAG`     | `harvest.connector.lag`       | Gauge        | `source` — only emitted for sources whose broker client exposes lag (Kafka, SQS); others never emit | `execution.id`, partition |
+
+**Broker-connector labels (issue #944).** A broker message's own coordinates —
+Kafka `{topic}:{partition}:{offset}`, an SQS `MessageId`, or a partition key —
+are **unbounded by construction** (one series per message) and are therefore
+never metric labels; they belong on the dead-letter record and in logs. The
+only per-message dimension exposed is the binding's `source` name, which is a
+closed set fixed at build time by the registered `SourceBinding`s. Per-message
+provenance is recoverable from the started execution's `start_source_ref`
+(issue #740) and from `harvest_connector_dead_letters`.
 
 **Cardinality rule**: `execution.id` (a UUID) is **explicitly forbidden** as a
 metric label. It is unbounded and would explode the metric time-series in any

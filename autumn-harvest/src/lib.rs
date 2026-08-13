@@ -187,6 +187,8 @@ pub mod retention;
 /// Continue-as-new run-chain assembly (issue #701).
 pub mod run_chain;
 pub mod saga;
+/// Background control-loop liveness heartbeats (issue #797).
+pub mod scanner_health;
 /// Workflow payload-schema contract baseline and replay-compatibility diffing (issue #794).
 ///
 /// Deliberately ungated: the CLI links `autumn-harvest` with
@@ -448,9 +450,10 @@ pub use simulator::{SimulatorResult, WorkflowSimulator};
 #[cfg(feature = "db")]
 pub use store::AwaitMode;
 pub use telemetry::{
-    ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, TelemetryConfig,
-    TelemetryConfigBuilder, TraceContextCarrier, TraceContextPropagator, USER_METRIC_PREFIX,
-    UserMetricError, UserMetrics, WebhookOutcome, WorkflowStatus, validate_user_metric,
+    ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, SCANNER_SHARD_LABEL_NONE,
+    TelemetryConfig, TelemetryConfigBuilder, TraceContextCarrier, TraceContextPropagator,
+    USER_METRIC_PREFIX, UserMetricError, UserMetrics, WebhookOutcome, WorkflowStatus,
+    validate_user_metric,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use test_generator::TestHarnessGenerator;

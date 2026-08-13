@@ -9,8 +9,26 @@ module — from any source language — that satisfies the ABI below.
 
 | File | Language | Role |
 |------|----------|------|
-| `echo.wat` | WebAssembly text | **The guest CI executes.** Assembled with `wat::parse_str(...)` by the `wasm-activities` integration tests and the `wasm_activity` example, then run through the worker's WASM dispatch seam. Hand-written, no toolchain. |
-| `echo.ts` | AssemblyScript | **Illustrative, NOT CI-compiled.** The same `alloc`/`run` contract in a real source language, to demonstrate polyglot reach. Build it with the `asc` command below. |
+| `echo.wat` | WebAssembly text | **Executed by CI.** `include_str!`d by the `wasm-activities` integration tests and the `wasm_activity` example, assembled with `wat::parse_str(...)`, then run through the worker's WASM dispatch seam. Hand-written, no toolchain. |
+| `echo.ts` | AssemblyScript | **Source** for `echo.wasm`. The same `alloc`/`run` contract in a real source language. Rebuild with the `asc` command below. |
+| `echo.wasm` | (compiled from `echo.ts`) | **Executed by CI.** `include_bytes!`d by `worker_runs_an_assemblyscript_compiled_guest_to_completion`, which runs it end-to-end through the standard dispatch path. Committed so the suite needs no npm toolchain and the bytes are deterministic. |
+
+Every file here is referenced by code — nothing in this directory is decorative.
+If you change `echo.wat`, the tests and the example pick it up automatically; if
+you change `echo.ts`, **recompile and commit `echo.wasm`** or the test keeps
+running the old bytes.
+
+## Why both a `.wat` and a real-language guest?
+
+`.wat` is the *textual encoding of the wasm binary format itself* — `wat::parse_str`
+is an assembler, not a compiler from a distinct language. It proves the host is not
+Rust-specific, but it exercises no real toolchain's codegen, allocator, or memory
+layout. The AssemblyScript guest does, and that difference is not academic: the
+first compiled build of `echo.ts` **failed** against the host, because
+`asc --runtime stub` emits a module with **zero initial memory pages**, so the
+bump pointer handed back an address no memory backed. A hand-written `.wat` that
+declares `(memory 1)` can never surface that class of bug. `alloc` in `echo.ts`
+now grows memory explicitly — see the comment there.
 
 Both implement an **echo** activity (output = input) so the ABI itself is the point.
 

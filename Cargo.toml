@@ -57,7 +57,14 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 
 # Dev / test
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
+testcontainers-modules = { version = "0.15", features = [
+    "postgres",
+    "redis",
+    # Broker containers for the issue #944 connector adapter tests
+    # (dev-dependency only — no production dependency on either).
+    "kafka",
+    "elasticmq",
+] }
 proptest = "1.11.0"
 
 [workspace.lints.rust]

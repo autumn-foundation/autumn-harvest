@@ -443,6 +443,16 @@ impl SchedulerRuntime {
         // Issue #1157, defect 2: per-schedule registration backoff state must
         // span ticks, so the loop owns it rather than the (stateless) tick fn.
         let backoff = ScheduleRegistrationBackoff::new();
+        // Issue #797: declare the loop before its first iteration so the
+        // `scanner_liveness` check expects it and grants it boot grace. Unlike
+        // the other loops, the schedule ticker sleeps AFTER its first pass, so
+        // it normally ticks almost immediately.
+        let scanner_metrics = Arc::clone(&registry.telemetry().metrics);
+        let owner = crate::scanner_health::register_scanner(
+            scanner_metrics.as_ref(),
+            crate::scanner_health::Scanner::Schedule,
+            DEFAULT_SCHEDULER_TICK_INTERVAL,
+        );
         let handle = tokio::spawn(async move {
             while !shutdown_for_task.is_cancelled() {
                 if let Err(error) = tick_once_sharded_with_backoff(
@@ -459,11 +469,22 @@ impl SchedulerRuntime {
                     tracing::warn!(error = %error, "harvest scheduler tick failed");
                 }
 
+                // Issue #797: unconditional end-of-pass liveness tick — a tick
+                // that fired nothing (the overwhelmingly common case) still
+                // proves the ticker is alive, which the work-only
+                // `harvest.schedule.fire_attempts` counter cannot.
+                crate::scanner_health::record_scanner_tick(scanner_metrics.as_ref(), owner);
+
                 tokio::select! {
                     () = shutdown_for_task.cancelled() => break,
                     () = tokio::time::sleep(DEFAULT_SCHEDULER_TICK_INTERVAL) => {}
                 }
             }
+
+            // Issue #797: a graceful stop retires this loop from the expected
+            // scanner set. A panic unwinds past here, so a panicked loop stays
+            // registered and correctly ages into `Wedged`.
+            crate::scanner_health::deregister_scanner(owner);
 
             let total = dags.len() + workflow_schedules.len();
             monitor_for_task.mark_stopped(total);

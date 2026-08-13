@@ -17,6 +17,7 @@
 //! - template variables are only applied to series that carry the label;
 //! - every alert-pack rule maps to a panel and a resolvable runbook anchor.
 
+use autumn_harvest::telemetry::PoisonReason;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -86,6 +87,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_workflow_debounced_total",
     "harvest_workflow_debounce_fired_total",
     "harvest_workflow_start_throttled_total",
+    "harvest_scanner_tick_total",
     "harvest_saga_compensated_total",
     "harvest_saga_compensation_failed_total",
     "harvest_canary_success_total",
@@ -126,6 +128,9 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_webhook_rejected_total",
     "harvest_session_acquisition_total",
     "harvest_worker_tuner_decisions_total",
+    "harvest_connector_received_total",
+    "harvest_connector_dispatched_total",
+    "harvest_connector_poisoned_total",
     // --- histograms (`_bucket` / `_count` / `_sum`) -------------------------
     "harvest_workflow_duration_bucket",
     "harvest_workflow_duration_count",
@@ -184,6 +189,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_concurrency_in_flight",
     "harvest_concurrency_deferred",
     "harvest_mutex_contention_depth",
+    "harvest_connector_lag",
 ];
 
 /// Per-series label ground truth (Prometheus-normalized label names),
@@ -250,6 +256,9 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
         "harvest_update_duration",
         &["workflow", "name", "queue", "outcome"],
     ),
+    // Background control-loop liveness heartbeat (issue #797). Bounded
+    // `scanner` label; no execution/workflow identity exists at this layer.
+    ("harvest_scanner_tick", &["scanner", "shard"]),
     ("harvest_mutex_wait_duration", &["workflow"]),
     ("harvest_mutex_held_duration", &["workflow"]),
     ("harvest_mutex_contention_depth", &["workflow"]),
@@ -318,6 +327,10 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_webhook_received", &["path", "outcome"]),
     ("harvest_webhook_rejected", &["path", "outcome"]),
     ("harvest_session_acquisition", &["queue", "outcome"]),
+    ("harvest_connector_received", &["source"]),
+    ("harvest_connector_dispatched", &["source", "outcome"]),
+    ("harvest_connector_poisoned", &["source", "reason"]),
+    ("harvest_connector_lag", &["source"]),
 ];
 
 /// Unbounded / dotted label forms that must never appear in an expression or
@@ -925,12 +938,171 @@ fn dashboard_readme_documents_prerequisites() {
 }
 
 #[test]
+fn documented_poison_reasons_match_the_emitted_labels() {
+    // An operator builds an alert or a query by copying a `reason` value out
+    // of these tables. A documented value the code never emits selects no
+    // series at all, which reads as "this never happens" rather than "you
+    // typed the wrong label" — so the docs must enumerate exactly what
+    // `PoisonReason::as_str()` produces, no more and no less.
+    //
+    // The enum is the source of truth: a new variant appears here
+    // automatically and fails until every doc surface names it.
+    let emitted: Vec<&str> = [
+        PoisonReason::Malformed,
+        PoisonReason::MappingRejected,
+        PoisonReason::TargetRejected,
+    ]
+    .iter()
+    .map(|r| r.as_str())
+    .collect();
+
+    // Values that were documented once and are not emitted by anything.
+    // Listing them explicitly keeps the guard falsifiable: without this the
+    // test would pass on a doc that names every real value *and* a stale one.
+    let stale = ["deserialize_failed", "permanent_failure"];
+
+    for path in ["docs/telemetry.md", "docs/adr/0001-otel-trace-contract.md"] {
+        let doc = read_doc(path);
+        let poison_lines: Vec<&str> = doc
+            .lines()
+            .filter(|line| line.contains("harvest.connector.poisoned"))
+            .collect();
+        assert!(
+            !poison_lines.is_empty(),
+            "{path} must document harvest.connector.poisoned"
+        );
+        let block = poison_lines.join("\n");
+
+        for reason in &emitted {
+            assert!(
+                block.contains(reason),
+                "{path} must document the emitted poison reason `{reason}`; \
+                 documented rows were:\n{block}"
+            );
+        }
+        for bogus in stale {
+            assert!(
+                !block.contains(bogus),
+                "{path} documents `{bogus}`, which PoisonReason::as_str() \
+                 never emits — that selector matches no series"
+            );
+        }
+    }
+}
+
+#[test]
 fn runbook_cross_links_dashboard() {
     let runbook = read_doc(RUNBOOK_PATH);
     assert!(
         runbook.contains(DASHBOARD_PATH),
         "docs/runbooks/harvest-alerts.md must point first-responders at the \
          dashboard pack ({DASHBOARD_PATH})"
+    );
+}
+
+/// Issue #797, Codex review: the low-frequency scanner panel is the one an
+/// operator is told to judge `retention` on, because at a short `$__rate_interval`
+/// the hourly janitor's rate line sits indistinguishably near zero. That only
+/// works if the panel's window is longer than retention's **cadence** -- with a
+/// window shorter than one hour, a perfectly healthy janitor contributes zero
+/// increments to most evaluations, so the panel alternates to zero on its own
+/// and the "a bar at zero means wedged" reading is false exactly where it was
+/// supposed to be authoritative.
+///
+/// Pin that the window comfortably exceeds the default hourly cadence.
+#[test]
+fn low_frequency_scanner_panel_window_outlasts_the_retention_cadence() {
+    let dashboard = read_dashboard();
+    let panels = all_panels(&dashboard);
+    let low_frequency: Vec<&Value> = panels
+        .iter()
+        .copied()
+        .filter(|panel| {
+            panel_exprs(panel)
+                .iter()
+                .any(|expr| expr.contains("increase(harvest_scanner_tick_total"))
+        })
+        .collect();
+    assert!(
+        !low_frequency.is_empty(),
+        "the dashboard must carry a low-frequency scanner-tick panel"
+    );
+
+    for panel in low_frequency {
+        for expr in panel_exprs(panel) {
+            if !expr.contains("increase(harvest_scanner_tick_total") {
+                continue;
+            }
+            let Some((window, _)) = expr
+                .split_once("harvest_scanner_tick_total[")
+                .and_then(|(_, tail)| tail.split_once(']'))
+            else {
+                panic!("expected a bracketed range window in {expr}");
+            };
+            let hours = window.strip_suffix('h').and_then(|n| n.parse::<u32>().ok());
+            assert!(
+                hours.is_some_and(|hours| hours > 1),
+                "panel {} uses a [{window}] window, which is not longer than the default hourly \
+                 retention cadence -- a healthy janitor would read zero for most of every hour: \
+                 {expr}",
+                panel_name(panel)
+            );
+        }
+    }
+}
+
+/// A scanner panel that groups by `shard` must also *render* it (issue #797).
+///
+/// The `shard` dimension exists so a wedged shard's flat series is
+/// distinguishable from a healthy sibling's advancing one. Grouping by it while
+/// legending only `{{scanner}} @ {{instance}}` renders both series under the
+/// same name, so the legend and tooltip cannot tell them apart -- the series
+/// are separate, but the operator still cannot say which shard stalled.
+#[test]
+fn scanner_panel_legends_render_every_grouped_dimension() {
+    let dashboard = read_dashboard();
+    let panels = all_panels(&dashboard);
+    let mut checked = 0_usize;
+
+    for panel in panels {
+        let targets = panel
+            .get("targets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for target in &targets {
+            let Some(expr) = target.get("expr").and_then(Value::as_str) else {
+                continue;
+            };
+            if !expr.contains("harvest_scanner_tick_total") {
+                continue;
+            }
+            let legend = target
+                .get("legendFormat")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            for dimension in ["scanner", "shard", "instance"] {
+                let grouped = expr.contains(&format!("by ({dimension},"))
+                    || expr.contains(&format!(" {dimension},"))
+                    || expr.contains(&format!(" {dimension})"));
+                if !grouped {
+                    continue;
+                }
+                assert!(
+                    legend.contains(&format!("{{{{{dimension}}}}}")),
+                    "panel {} groups scanner ticks by `{dimension}` but its legend \
+                     `{legend}` does not render it, so two series differing only in \
+                     that dimension are indistinguishable: {expr}",
+                    panel_name(panel)
+                );
+            }
+            checked += 1;
+        }
+    }
+
+    assert!(
+        checked >= 2,
+        "expected both scanner-tick panels to be checked, saw {checked}"
     );
 }
 

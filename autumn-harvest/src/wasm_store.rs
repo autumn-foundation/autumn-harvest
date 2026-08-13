@@ -59,10 +59,29 @@ pub struct WasmBinding {
 
 /// A single WASM activity registration supplied to the builder (issue #965).
 ///
-/// Bundles the activity's name, its module bytes, and every knob a native
-/// `#[activity]` exposes (queue, retry policy, start-to-close) plus the sandbox
-/// [`WasmCapabilities`]/[`WasmLimits`]. Construct with [`WasmActivityRegistration::new`]
-/// and refine with the fluent `with_*` setters.
+/// Bundles the activity's name, its module bytes, the scheduling knobs a native
+/// `#[activity]` exposes (queue, retry policy, start-to-close, schedule-to-close)
+/// and the sandbox [`WasmCapabilities`]/[`WasmLimits`]. Construct with
+/// [`WasmActivityRegistration::new`] and refine with the fluent `with_*` setters.
+///
+/// # Knobs a native `#[activity]` has that this deliberately omits
+///
+/// These are absent by design in the spike, not oversights (issue #965 review):
+///
+/// * `heartbeat_timeout` — a guest cannot heartbeat. Delivering heartbeats into
+///   the guest is the main GA gap; see `docs/rnd/wasm-activities-spike.md` §4.
+/// * `circuit_breaker` and `rate_limit_*` — both exist to protect a *downstream
+///   dependency*. Under deny-all capabilities a guest performs no I/O, so there
+///   is no downstream to protect. Revisit if network capabilities are ever
+///   granted.
+/// * `max_input_bytes` / `max_result_bytes` — guest output is already bounded by
+///   [`crate::wasm_activities::WASM_MAX_OUTPUT_BYTES`], checked before the host
+///   parses it.
+/// * `schedule_to_start` — no WASM-specific queue-wait semantics exist.
+///
+/// Because they are hardcoded `None` on the generated [`crate::info::ActivityInfo`],
+/// setting them elsewhere would silently do nothing; they are listed here so that
+/// is a documented decision rather than a surprise.
 #[derive(Debug, Clone)]
 pub struct WasmActivityRegistration {
     /// Snake-case activity name — the key both the task queue and the module
@@ -74,8 +93,16 @@ pub struct WasmActivityRegistration {
     pub queue: Option<String>,
     /// Retry policy applied to failed attempts.
     pub retry: RetryPolicy,
-    /// Start-to-close timeout. `None` = unbounded; default `Some(30s)`.
+    /// Start-to-close timeout for a single attempt. `None` = unbounded;
+    /// default `Some(30s)`.
     pub start_to_close: Option<Duration>,
+    /// Cross-retry schedule-to-close deadline (issue #378). `None` (the default)
+    /// = unbounded, matching a native `#[activity]` that does not set one.
+    ///
+    /// This is the only bound that stops a deterministically-failing guest from
+    /// walking its entire retry curve: `start_to_close` bounds one attempt,
+    /// `schedule_to_close` bounds the whole sequence.
+    pub schedule_to_close: Option<Duration>,
     /// Host capabilities granted to the guest (deny-all by default).
     pub capabilities: WasmCapabilities,
     /// Per-invocation resource budget.
@@ -94,6 +121,7 @@ impl WasmActivityRegistration {
             queue: None,
             retry: RetryPolicy::default(),
             start_to_close: Some(Duration::from_secs(30)),
+            schedule_to_close: None,
             capabilities: WasmCapabilities::default(),
             limits: WasmLimits::default(),
         }
@@ -117,6 +145,14 @@ impl WasmActivityRegistration {
     #[must_use]
     pub const fn with_start_to_close(mut self, start_to_close: Option<Duration>) -> Self {
         self.start_to_close = start_to_close;
+        self
+    }
+
+    /// Bound the activity's whole retry sequence with a schedule-to-close
+    /// deadline (issue #378). `None` leaves it unbounded.
+    #[must_use]
+    pub const fn with_schedule_to_close(mut self, schedule_to_close: Option<Duration>) -> Self {
+        self.schedule_to_close = schedule_to_close;
         self
     }
 
@@ -786,6 +822,41 @@ mod tests {
         assert_eq!(reg.start_to_close, Some(Duration::from_secs(30)));
         assert_eq!(reg.capabilities, WasmCapabilities::default());
         assert_eq!(reg.limits, WasmLimits::default());
+    }
+
+    #[test]
+    fn registration_carries_schedule_to_close_into_activity_info() {
+        // Issue #965 review: `schedule_to_close` (#378) is the CROSS-RETRY wall
+        // clock — the only bound that stops a deterministically-failing guest
+        // (say, an infinite loop that burns its start-to-close every attempt)
+        // from walking the whole retry curve. A native `#[activity]` can set it;
+        // a WASM activity had no way to, and `ActivityInfo::wasm` hardcoded
+        // `None`, so the bound was structurally unreachable.
+        let reg = WasmActivityRegistration::new("wasm_act", b"\0asm".to_vec())
+            .with_schedule_to_close(Some(Duration::from_secs(300)));
+        assert_eq!(reg.schedule_to_close, Some(Duration::from_secs(300)));
+
+        let info = crate::info::ActivityInfo::wasm(
+            "wasm_act",
+            None,
+            None,
+            reg.start_to_close,
+            reg.schedule_to_close,
+        );
+        assert_eq!(
+            info.default_schedule_to_close,
+            Some(Duration::from_secs(300)),
+            "the registration's schedule_to_close must reach ActivityInfo, otherwise the \
+             enqueue path never sets schedule_to_close_at and the cross-retry deadline \
+             silently does not exist"
+        );
+    }
+
+    #[test]
+    fn registration_schedule_to_close_defaults_to_none() {
+        // Back-compat: unset means "no cross-retry deadline", exactly as before.
+        let reg = WasmActivityRegistration::new("wasm_act", b"\0asm".to_vec());
+        assert_eq!(reg.schedule_to_close, None);
     }
 
     #[test]

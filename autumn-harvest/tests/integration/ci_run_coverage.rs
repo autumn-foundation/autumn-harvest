@@ -177,6 +177,9 @@ const ALLOWLIST_TESTING_REASON: &str = "DB+testing-gated integration test not ye
 // out of scope for this test-infra PR — tracked here honestly instead.
 const ALLOWLIST_MCP_IGNORED_REASON: &str = "mcp-feature-gated (only `compileonly` in the manifest) AND all tests are #[ignore]d \
      (TestDb/run_pending paved-path DB harness) — no CI run can execute it; tracked";
+const ALLOWLIST_KAFKA_BROKER_REASON: &str = "kafka-feature-gated: DOES run in CI, via a dedicated Linux-only \
+     ci.yml step (it needs an apt libcurl/cmake install first, and the manifest's compile mode would try to build \
+     vendored librdkafka on macOS/Windows). Not a coverage gap — see the `Run plugin Kafka broker connector tests` step.";
 const ALLOWLIST_WEBHOOKS_IGNORED_REASON: &str = "webhooks-feature-gated — not run in CI (no manifest row) — AND all tests are #[ignore]d \
      (TestDb/run_pending paved-path DB harness); tracked";
 
@@ -225,6 +228,10 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("plugin:archival_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:batch_operations_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:build_routing_ui_integration", ALLOWLIST_DEBT_REASON),
+    (
+        "plugin:connector_kafka_broker",
+        ALLOWLIST_KAFKA_BROKER_REASON,
+    ),
     ("plugin:dag_retry_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:dlq_redrive_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:erase_payloads_integration", ALLOWLIST_DEBT_REASON),
@@ -277,7 +284,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
 /// a whole-module row), `core:completion_callback_tests`, and
 /// `core:event_batch_tests`. 73 = minus `plugin:workflow_reachability_integration`,
 /// now wired to a covering `linux` manifest row (issue #700).
-const ALLOWLIST_MAX_LEN: usize = 73;
+const ALLOWLIST_MAX_LEN: usize = 74;
 
 fn allowlisted(key: &str) -> bool {
     ALLOWLIST.iter().any(|&(k, _)| k == key)
