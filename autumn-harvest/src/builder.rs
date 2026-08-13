@@ -1620,6 +1620,7 @@ impl HarvestBuilder {
             queue,
             Some(registration.retry.clone()),
             registration.start_to_close,
+            registration.schedule_to_close,
         ));
         self.wasm_bindings
             .insert(registration.name.clone(), registration.binding());

@@ -45,7 +45,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -119,11 +119,18 @@ pub const WASM_MAX_INSTANCES: usize = 1;
 /// change. Host-function stack usage counts toward this bound too.
 pub const WASM_MAX_STACK_BYTES: usize = 512 * 1024;
 
-/// Default hard wall-clock ceiling for a single guest invocation: 5 minutes.
+/// Default value of the per-invocation wall-clock ceiling: 5 minutes.
 ///
-/// This is the *mandatory* upper bound — even a caller that passes no
-/// per-call deadline (or a larger one) is clamped to this. A guest can never be
-/// bounded by fuel alone, so this ceiling guarantees termination.
+/// The ceiling itself is [`WasmLimits::max_wall_clock`], and it is *mandatory* in
+/// the sense that it always applies: a caller that passes no per-call deadline —
+/// or a larger one — is clamped to it, so a guest can never run unbounded. A
+/// guest can spin without consuming fuel, so this bound (not fuel) is what
+/// guarantees termination.
+///
+/// This constant is the **default** that ceiling takes. An embedder may raise or
+/// lower `WasmLimits::max_wall_clock` for an activity, so this value is not
+/// itself an upper bound on every invocation in the process (issue #965 review
+/// round 10 — the doc previously overstated it as one).
 pub const DEFAULT_MAX_WALL_CLOCK: Duration = Duration::from_secs(300);
 
 /// How often the shared epoch ticker advances the engine's epoch counter.
@@ -208,10 +215,26 @@ struct HostState {
     rng: u64,
 }
 
-/// Process-wide RNG seed source. Advanced by a golden-ratio increment per
-/// invocation so successive stores get distinct (non-cryptographic) seeds
-/// without depending on the wall clock.
-static RNG_SEED_COUNTER: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+/// Process-wide RNG seed source for the `env::random_u64` capability.
+///
+/// Advanced by a golden-ratio increment per invocation so successive stores get
+/// distinct (non-cryptographic) seeds without depending on the wall clock.
+///
+/// Initialised **lazily from OS entropy** on first use (issue #965 review round
+/// 10). A fixed start value made the whole stream reproducible across process
+/// restarts — invocation *N* in any process drew the identical sequence — which
+/// is a stronger and more surprising property than the documented
+/// "non-cryptographic" caveat implies. Seeding from entropy keeps draws
+/// unpredictable across restarts; the stream is still **not** cryptographically
+/// secure (xorshift64), so guests must not use it for tokens or nonces.
+static RNG_SEED_COUNTER: OnceLock<AtomicU64> = OnceLock::new();
+
+/// Draw the next per-invocation RNG seed, initialising the counter from OS
+/// entropy on first use. Always returns a nonzero seed (xorshift64 requires it).
+fn next_rng_seed() -> u64 {
+    let counter = RNG_SEED_COUNTER.get_or_init(|| AtomicU64::new(rand::random::<u64>()));
+    counter.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed) | 1
+}
 
 /// Non-cryptographic xorshift64 step. Requires a nonzero state.
 const fn xorshift64(state: &mut u64) -> u64 {
@@ -318,11 +341,23 @@ impl WasmModuleStore {
         // (`wasm_legacy_exceptions` is a deprecated internal spec-testsuite knob,
         // not a guest-reachable proposal — deliberately not toggled.)
         // Deliberately KEPT enabled: required by the ABI or rustc-emitted guests
-        // and bounded by fuel/memory/table limits, so not host-resource-escape
-        // vectors — `reference_types` (funcref tables + `ref.null func`),
-        // `bulk_memory` (`memory.copy`/`fill`, and a `reference_types`
-        // prerequisite), `multi_value`, `simd` (`v128` is a bounded value type),
-        // `backtrace` (trap diagnostics).
+        // and bounded by the store limits and the wall-clock ceiling, so not
+        // host-resource-escape vectors — `reference_types` (funcref tables +
+        // `ref.null func`), `bulk_memory` (`memory.copy`/`fill`, and a
+        // `reference_types` prerequisite), `multi_value`, `simd` (`v128` is a
+        // bounded value type), `backtrace` (trap diagnostics).
+        //
+        // Caveat on `bulk_memory` and FUEL specifically (issue #965 review round
+        // 10): fuel is charged per *instruction*, not per byte, so `memory.fill`
+        // / `memory.copy` / `memory.init` each cost ONE unit no matter how many
+        // bytes they move. Fuel therefore does NOT bound the work a bulk-memory
+        // guest performs, and must not be relied on to. What bounds it is the
+        // mandatory wall-clock ceiling (armed against a real `Instant`, see
+        // `invoke_wasm_activity_inner`) plus the linear-memory cap that limits any
+        // single bulk operation. We deliberately do not re-price these operators
+        // via `Config::operator_cost`: fuel would still not be length-proportional
+        // (the cost is per instruction either way), so it would buy no real bound
+        // while silently changing what `DEFAULT_FUEL` means for every guest.
         let engine = Engine::new(&config)
             .expect("wasmtime engine construction from a fixed valid config never fails");
 
@@ -752,7 +787,7 @@ fn invoke_wasm_activity_inner(
 
     // Per-attempt fresh store with an independent limiter, fuel budget, and
     // wall-clock epoch deadline.
-    let seed = RNG_SEED_COUNTER.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed) | 1;
+    let seed = next_rng_seed();
     let host = HostState {
         limits: StoreLimitsBuilder::new()
             .memory_size(limits.memory_bytes)
@@ -802,16 +837,28 @@ fn invoke_wasm_activity_inner(
 
     // Wall-clock bound + cooperative cancellation via a per-invocation
     // epoch-deadline callback (issue #965 review). Arm the first deadline one
-    // tick out, then drive the countdown from the callback: each tick it polls
-    // the cancellation token and decrements the remaining budget, trapping (as
-    // an epoch interrupt → retryable `ResourceExhausted`) when either the token
-    // fires or the `effective` ceiling is reached. This is per-`Store`, so N
-    // concurrent invocations keep independent deadlines off the single shared
-    // ticker, and a cancelled guest is interrupted within ~1 tick instead of
-    // running to the ceiling. A guest that completes before the first tick never
-    // invokes the callback, so the fast path pays nothing.
+    // tick out; on each callback poll the cancellation token and compare the
+    // *real clock* against an absolute deadline, trapping (as an epoch interrupt
+    // → retryable `ResourceExhausted`) when either the token fires or the
+    // `effective` ceiling is reached. This is per-`Store`, so N concurrent
+    // invocations keep independent deadlines off the single shared ticker, and a
+    // cancelled guest is interrupted within ~1 tick instead of running to the
+    // ceiling. A guest that completes before the first tick never invokes the
+    // callback, so the fast path pays nothing.
+    //
+    // The bound is an absolute `Instant`, NOT a countdown of callback
+    // invocations (issue #965 review round 10). wasmtime emits epoch checks only
+    // at function entry, loop headers, and host libcalls, so a guest controls how
+    // much work sits between two consecutive callbacks. Counting invocations
+    // therefore measures "check points crossed", not time: a guest that does more
+    // work per check point than one tick's worth stretches the ceiling by that
+    // ratio. Measured overrun with a `memory.fill`-heavy guest was ~1.2-2.3x the
+    // configured ceiling — bounded (each bulk fill is itself a check point, and a
+    // single fill is capped by the 16 MiB memory ceiling), but real. Reading the
+    // clock makes the ceiling mean what its documentation says, and caps overrun
+    // at whatever single uninterruptible operation is in flight.
     wasm_store.set_epoch_deadline(1);
-    let mut remaining_ticks = deadline_ticks(effective);
+    let hard_deadline = Instant::now().checked_add(effective);
     let cancel_for_cb = cancel.cloned();
     // Set by the callback when the wall-clock ceiling is reached, so the
     // post-call classifier reports "wall-clock deadline exceeded" without
@@ -827,8 +874,10 @@ fn invoke_wasm_activity_inner(
             // this into a "cancelled" `ResourceExhausted`.
             return Err(wasmtime::Error::from(Trap::Interrupt));
         }
-        remaining_ticks = remaining_ticks.saturating_sub(1);
-        if remaining_ticks == 0 {
+        // `checked_add` overflowed only for an absurd `effective`; treat that as
+        // "no representable deadline" and let fuel/cancellation bound the guest
+        // rather than trapping immediately.
+        if hard_deadline.is_some_and(|d| Instant::now() >= d) {
             // Hard wall-clock ceiling reached → epoch interrupt.
             deadline_hit_cb.store(true, Ordering::Relaxed);
             return Err(wasmtime::Error::from(Trap::Interrupt));
@@ -844,12 +893,22 @@ fn invoke_wasm_activity_inner(
     // flag); otherwise defer to `classify_wasmtime_err_phase` (fuel/memory/trap,
     // and — for `instantiate` — an unsatisfied import → `SandboxDenied`).
     let classify = |e: &wasmtime::Error, phase: WasmErrPhase| -> ActivityFailure {
+        // A permanent capability denial outranks a concurrent cancellation
+        // (issue #965 review round 10). An ungranted import is a deterministic
+        // misconfiguration: reporting it as a retryable "cancelled" just because
+        // the token happened to fire during `instantiate` would spend the whole
+        // retry budget rediscovering the same denial. Classify first and keep a
+        // `SandboxDenied` verdict; otherwise fall back to the run-state reasons.
+        let classified = classify_wasmtime_err_phase(e, phase);
+        if classified.error_type == crate::failure::ERROR_TYPE_SANDBOX_DENIED {
+            return classified;
+        }
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             ActivityFailure::resource_exhausted("wasm activity cancelled before completion")
         } else if deadline_hit.load(Ordering::Relaxed) {
             ActivityFailure::resource_exhausted("wall-clock deadline exceeded")
         } else {
-            classify_wasmtime_err_phase(e, phase)
+            classified
         }
     };
 
@@ -1204,9 +1263,15 @@ mod tests {
     "#;
 
     #[test]
-    fn granted_env_instantiates_and_runs() {
-        // A non-empty allowlist links env_get; the guest runs regardless of
-        // whether its probed key matches.
+    fn granted_env_links_the_host_fn_and_does_not_deny_instantiation() {
+        // Issue #965 review: this test's job is narrow and worth naming exactly.
+        // It proves ONLY that a non-empty allowlist LINKS `env::env_get`, so the
+        // guest instantiates instead of being denied. It deliberately does NOT
+        // prove the grant returns data — the probed key is not on the allowlist,
+        // so the in-band check denies it and the guest reports `true`, which is
+        // the same value `env_get_denies_non_allowlisted_key_in_band` asserts.
+        // The genuine positive path (an allowlisted key returning its value) is
+        // covered by `env_get_allowlisted_key_returns_value_length`.
         let store = WasmModuleStore::new();
         let module = compile(&store, ENV_PROBE_WAT);
         let caps = WasmCapabilities {
@@ -1221,9 +1286,8 @@ mod tests {
             &fast_limits(DEFAULT_FUEL),
             None,
         )
-        .expect("granted env guest must run");
-        // The probed key "DENIED_KEY" is not on the allowlist, so env_get
-        // returns -1 and the guest reports `true`.
+        .expect("a granted env guest must instantiate and run, not be denied");
+        // The load-bearing assertion is the `expect` above (no SandboxDenied).
         assert_eq!(out, serde_json::json!(true));
     }
 
@@ -1432,6 +1496,35 @@ mod tests {
             (loop $l (br $l))
             (i64.const 0)))
     "#;
+
+    /// Build an infinite loop whose *body* is expensive but crosses only ONE
+    /// epoch check point per iteration (issue #965 review: wall-clock ceiling).
+    ///
+    /// wasmtime emits epoch checks only at function entry and loop headers, so a
+    /// guest is charged one callback per back-edge no matter how long the body
+    /// takes. `memory.fill` is the amplifier: it costs a single fuel unit
+    /// regardless of length, so `fills` bulk fills of ~16 MiB each buy tens of
+    /// milliseconds of real work per check point for a handful of fuel.
+    ///
+    /// A ceiling that counts callback *invocations* lets this guest run for
+    /// `ticks x body_duration`; a ceiling anchored to a real instant bounds it at
+    /// the configured duration plus at most one body.
+    fn expensive_body_loop_wat(fills: usize) -> String {
+        let body =
+            "(memory.fill (i32.const 0) (i32.const 65) (i32.const 16000000))\n".repeat(fills);
+        format!(
+            r#"
+        (module
+          (memory (export "memory") 256)
+          (func (export "alloc") (param i32) (result i32) (i32.const 0))
+          (func (export "run") (param i32 i32) (result i64)
+            (loop $l
+              {body}
+              (br $l))
+            (i64.const 0)))
+    "#
+        )
+    }
 
     #[test]
     fn fuel_exhaustion_is_retryable_resource_exhausted() {
@@ -1687,6 +1780,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wall_clock_ceiling_bounds_elapsed_time_not_callback_count() {
+        // Issue #965 review (P2): the ceiling must be anchored to a real instant.
+        //
+        // wasmtime emits epoch checks only at function entry and loop headers, so
+        // counting callback *invocations* charges one tick per back-edge however
+        // long the body took. With a 100 ms ceiling that is 100 ticks; a body of
+        // tens of milliseconds then runs for SECONDS - the documented "mandatory
+        // hard ceiling" silently multiplied by the body duration.
+        //
+        // A guest that spins with a cheap body (INFINITE_LOOP_WAT) hides this,
+        // because there one tick ~= one trivial iteration. This guest makes the
+        // two definitions diverge by more than an order of magnitude.
+        let store = WasmModuleStore::new();
+        // ~256 fills x 16 MiB = ~4 GiB of memset per back-edge: tens of ms of
+        // real work for ~256 units of fuel.
+        // ~1024 fills x 16 MiB per back-edge. Each bulk fill is itself an epoch
+        // check point, so this maximises work-per-check-point: measured ~2.3x
+        // overrun before the fix, ~1.03x after.
+        let module = compile(&store, &expensive_body_loop_wat(1024));
+        let ceiling = Duration::from_millis(100);
+        let start = Instant::now();
+        let err = invoke_wasm_activity(
+            &store,
+            &module,
+            &serde_json::json!(null),
+            &WasmCapabilities::default(),
+            &WasmLimits {
+                memory_bytes: DEFAULT_MEMORY_BYTES,
+                // Effectively unbounded fuel: `memory.fill` costs one unit per
+                // instruction regardless of length, so fuel cannot bound this.
+                fuel: u64::MAX,
+                max_wall_clock: ceiling,
+            },
+            None,
+        )
+        .expect_err("the mandatory wall-clock ceiling must terminate the guest");
+        let elapsed = start.elapsed();
+        assert_eq!(err.error_type, ERROR_TYPE_RESOURCE_EXHAUSTED);
+        // Anchored to a real instant, elapsed tracks the ceiling regardless of how
+        // much work the guest packs between check points OR how fast the machine
+        // is - measured 103 ms for this 100 ms ceiling. Counting callback
+        // invocations instead measured 229 ms, and gets WORSE on a slower machine.
+        // 2x the ceiling therefore separates the two with real margin on both
+        // sides rather than being a timing coin-flip.
+        assert!(
+            elapsed < ceiling * 2,
+            "wall-clock ceiling of {ceiling:?} must bound ELAPSED time, but the guest ran for \
+             {elapsed:?}; the ceiling is counting epoch-callback invocations rather than time"
+        );
+    }
+
     // ---- concurrent deadline isolation (the key M1 test) ----------------
 
     #[test]
@@ -1905,6 +2050,62 @@ mod tests {
         )
         .expect("an under-cap output must parse normally");
         assert_eq!(out, serde_json::json!(true));
+    }
+
+    #[test]
+    fn rng_seed_stream_is_not_a_fixed_process_constant() {
+        // Issue #965 review round 10: the seed counter used to start from a fixed
+        // constant, so invocation N in ANY process drew an identical stream. It is
+        // now initialised from OS entropy. We cannot observe a "restart" in-process,
+        // so assert the property that made the old behaviour reproducible: the very
+        // first seed is not the hard-coded golden-ratio start value, and successive
+        // seeds advance (and stay nonzero, which xorshift64 requires).
+        const OLD_FIXED_START: u64 = 0x9E37_79B9_7F4A_7C15;
+        let first = next_rng_seed();
+        let second = next_rng_seed();
+        assert_ne!(
+            first,
+            OLD_FIXED_START | 1,
+            "the first seed must come from entropy, not a compile-time constant"
+        );
+        assert_ne!(
+            first, second,
+            "successive invocations must get distinct seeds"
+        );
+        assert_ne!(first, 0, "xorshift64 requires a nonzero seed");
+        assert_ne!(second, 0, "xorshift64 requires a nonzero seed");
+    }
+
+    #[test]
+    fn sandbox_denial_outranks_a_concurrent_cancellation() {
+        // Issue #965 review round 10: an ungranted import is a permanent
+        // misconfiguration. If the cancellation token fires while `instantiate`
+        // is failing on that import, the failure must still be reported as the
+        // NON-retryable `SandboxDenied` — reporting a retryable "cancelled"
+        // would spend the whole retry budget rediscovering the same denial.
+        let store = WasmModuleStore::new();
+        let module = compile(&store, &deny_guest_importing("now_millis"));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = invoke_wasm_activity_cancellable(
+            &store,
+            &module,
+            &serde_json::json!(null),
+            &WasmCapabilities::default(),
+            &WasmLimits::default(),
+            None,
+            None,
+            Some(&cancel),
+        )
+        .expect_err("an ungranted import must fail");
+        assert_eq!(
+            err.error_type, ERROR_TYPE_SANDBOX_DENIED,
+            "a cancelled attempt must still report the permanent capability denial, got: {err:?}"
+        );
+        assert!(
+            err.non_retryable,
+            "SandboxDenied must stay non-retryable even under cancellation"
+        );
     }
 
     #[test]

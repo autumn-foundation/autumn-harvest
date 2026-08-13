@@ -289,6 +289,15 @@ jobs:
       - name: Run fanout_batch example tests (issue #750)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example fanout_batch
+      # The WASM example is a `main()` that self-asserts the sandbox contract
+      # (echo round-trip, a granted capability, and an ungranted import denied as
+      # SandboxDenied), so RUN it rather than only building it. It needs no
+      # database. Linux-only: it is the one example gated on `wasm-activities`,
+      # which drags in wasmtime — a multi-minute build not worth paying on three
+      # legs, and the macOS/Windows legs never build core examples at all.
+      - name: Run wasm_activity example (issue #965)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        run: cargo run -p autumn-harvest --features wasm-activities --example wasm_activity
       # ── Manifest-driven integration suites ──────────────────────────────
       # The per-suite `cargo test` steps that used to live here are now data in
       # `.github/ci/integration-suites.txt`, executed by `.github/ci/run-suites.sh`.

@@ -94,23 +94,13 @@ async fn scrub(conn: &mut AsyncPgConnection) {
 
 /// A correct bump-allocator echo guest (mirrors the M1 `ECHO_WAT`): `run`
 /// returns `packed(in_ptr, in_len)`, so the host reads back the exact input.
-const ECHO_WAT: &str = r#"
-    (module
-      (memory (export "memory") 1)
-      (global $bump (mut i32) (i32.const 1024))
-      (func (export "alloc") (param $len i32) (result i32)
-        (local $ptr i32)
-        (local.set $ptr (global.get $bump))
-        (global.set $bump (i32.add (global.get $bump) (local.get $len)))
-        (local.get $ptr))
-      (func (export "run") (param $in_ptr i32) (param $in_len i32) (result i64)
-        (i64.or
-          (i64.shl (i64.extend_i32_u (local.get $in_ptr)) (i64.const 32))
-          (i64.extend_i32_u (local.get $in_len)))))
-"#;
+/// The echo guest, loaded from the shared guests directory so the tests and the
+/// `wasm_activity` example execute the SAME bytes the docs point at (issue #965
+/// review). Previously each site carried its own inline copy, so
+/// `examples/wasm-guests/echo.wat` was unreferenced and free to drift from what
+/// CI actually ran.
+const ECHO_WAT: &str = include_str!("../../examples/wasm-guests/echo.wat");
 
-/// A second, byte-distinct echo guest (extra scratch global) so its content
-/// hash differs from `ECHO_WAT` while behaving identically.
 const ECHO_WAT_V2: &str = r#"
     (module
       (memory (export "memory") 1)
@@ -861,6 +851,8 @@ struct WasmActivitySpec {
     caps: WasmCapabilities,
     limits: WasmLimits,
     retry: Option<RetryPolicy>,
+    /// Cross-retry deadline (issue #378). `None` = unbounded, the default.
+    schedule_to_close: Option<Duration>,
 }
 
 /// Build a `HandlerRegistry` wired with WASM activities (bindings, shared store,
@@ -880,6 +872,7 @@ fn build_wasm_registry(
             None,
             spec.retry.clone(),
             Some(Duration::from_secs(5)),
+            spec.schedule_to_close,
         ));
         bindings.insert(
             spec.name.to_string(),
@@ -1152,6 +1145,7 @@ async fn worker_runs_wasm_echo_to_completion_with_ordinary_events() {
             caps: WasmCapabilities::default(),
             limits: WasmLimits::default(),
             retry: None,
+            schedule_to_close: None,
         }],
         Arc::new(RecordingMetrics::default()),
     );
@@ -1218,6 +1212,7 @@ async fn worker_with_empty_shard_assignments_seeds_wasm_on_default_pool() {
             caps: WasmCapabilities::default(),
             limits: WasmLimits::default(),
             retry: None,
+            schedule_to_close: None,
         }],
         Arc::new(RecordingMetrics::default()),
     );
@@ -1282,6 +1277,7 @@ async fn worker_fails_closed_when_seeding_wasm_modules_fails() {
             caps: WasmCapabilities::default(),
             limits: WasmLimits::default(),
             retry: None,
+            schedule_to_close: None,
         }],
         Arc::new(RecordingMetrics::default()),
     );
@@ -1327,6 +1323,7 @@ async fn worker_wasm_sandbox_denial_fails_workflow_terminally() {
             caps: WasmCapabilities::default(), // deny-all: fs_read is never granted
             limits: WasmLimits::default(),
             retry: Some(RetryPolicy::fixed(3, Duration::from_millis(50))),
+            schedule_to_close: None,
         }],
         metrics.clone(),
     );
@@ -1457,6 +1454,7 @@ async fn worker_wasm_fuel_exhaustion_is_retried_then_terminal() {
             caps: WasmCapabilities::default(),
             limits,
             retry: Some(RetryPolicy::fixed(2, Duration::from_millis(50))),
+            schedule_to_close: None,
         }],
         metrics.clone(),
     );
@@ -1485,6 +1483,40 @@ async fn worker_wasm_fuel_exhaustion_is_retried_then_terminal() {
     assert!(
         !metrics.retried.lock().unwrap().is_empty(),
         "a retryable resource exhaustion must be retried"
+    );
+
+    // AC5 explicitly requires that a runaway module must NOT trip the poison-pill
+    // quarantine (#367) — that mechanism stays defence-in-depth for a worker that
+    // actually dies. A guest burning its fuel returns a clean `Err` from a live
+    // worker, so no crash strike is recorded and nothing is quarantined. Assert
+    // it rather than inferring it: the structural argument (poison-pill keys on a
+    // MISSING worker heartbeat) is sound but silent, and a future refactor that
+    // routed guest failures through the crash path would go unnoticed.
+    let crash_strikes: i64 = diesel::sql_query(
+        "SELECT COALESCE(MAX(crash_strikes), 0)::int8 AS n FROM harvest_task_queue \
+         WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result::<CountRow>(&mut conn)
+    .await
+    .expect("crash strike query")
+    .n;
+    assert_eq!(
+        crash_strikes, 0,
+        "a fuel-exhausted guest must not accrue poison-pill crash strikes"
+    );
+
+    let dlq_rows: i64 = diesel::sql_query(
+        "SELECT COUNT(*)::int8 AS n FROM harvest_dead_letters WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result::<CountRow>(&mut conn)
+    .await
+    .expect("dlq query")
+    .n;
+    assert_eq!(
+        dlq_rows, 0,
+        "a fuel-exhausted guest must not be quarantined to the dead-letter queue"
     );
 }
 
@@ -1580,6 +1612,7 @@ fn build_mixed_registry(
             None,
             spec.retry.clone(),
             Some(Duration::from_secs(5)),
+            spec.schedule_to_close,
         ));
         bindings.insert(
             spec.name.to_string(),
@@ -1631,6 +1664,163 @@ fn workflow_completed_output(history: &[WorkflowEvent]) -> Option<serde_json::Va
     })
 }
 
+/// AC4 + success metric: a module swap reaches the next attempt on a **live**
+/// worker, with **zero restarts**, in well under 5 s.
+///
+/// The pinning test proves the two halves at the dispatch primitive; this proves
+/// them where the AC actually makes its claim — one worker process that keeps
+/// running across the publish. The worker is started ONCE and shut down ONCE, so
+/// "0 worker restarts" is a property of the test's structure, not an assertion
+/// that could quietly become vacuous.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hot_swap_reaches_the_next_attempt_on_a_live_worker_without_restart() {
+    let (url, _c) = setup_db().await;
+    let queue = "q-wasm-live-swap";
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    // v1 is the active version before the worker starts.
+    publish_wasm_module(&mut conn, "echo_wasm", &assemble(VERSION1_WAT))
+        .await
+        .expect("publish v1");
+
+    let registry = build_wasm_registry(
+        vec![wf_info("wf_run_wasm", wf_run_wasm)],
+        vec![WasmActivitySpec {
+            name: "echo_wasm",
+            // Startup SEED must not clobber the already-active v1.
+            bytes: assemble(VERSION1_WAT),
+            caps: WasmCapabilities::default(),
+            limits: WasmLimits::default(),
+            retry: None,
+            schedule_to_close: None,
+        }],
+        Arc::new(RecordingMetrics::default()),
+    );
+    let worker = build_worker("w-wasm-live-swap", queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+
+    // ONE worker, started once and never restarted for the whole test.
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
+
+    // First run observes v1.
+    let first = seed_workflow(&mut conn, "wf_run_wasm", serde_json::json!(null), queue).await;
+    wait_for_state(&url, first, "COMPLETED", Duration::from_secs(30)).await;
+    assert_eq!(
+        completed_output_for(&load_history(&url, first).await, "echo_wasm"),
+        Some(serde_json::json!({"version": 1})),
+        "the first run must observe the active v1 module"
+    );
+
+    // Hot swap while that same worker keeps polling.
+    let swap_at = std::time::Instant::now();
+    publish_wasm_module(&mut conn, "echo_wasm", &assemble(VERSION2_WAT))
+        .await
+        .expect("publish v2");
+
+    // The NEXT attempt picks it up — no restart, no redeploy.
+    let second = seed_workflow(&mut conn, "wf_run_wasm", serde_json::json!(null), queue).await;
+    wait_for_state(&url, second, "COMPLETED", Duration::from_secs(30)).await;
+    let propagation = swap_at.elapsed();
+
+    worker.shutdown();
+    handle.await.expect("worker joins cleanly");
+
+    assert_eq!(
+        completed_output_for(&load_history(&url, second).await, "echo_wasm"),
+        Some(serde_json::json!({"version": 2})),
+        "the next attempt after the swap must run v2 on the SAME worker process"
+    );
+    // Success metric: "a module swap propagates to the next attempt in < 5 s".
+    // Measured from publish to the dependent run reaching COMPLETED, so it
+    // includes claim + resolve + compile, not just the DB write.
+    assert!(
+        propagation < Duration::from_secs(5),
+        "hot swap must reach the next attempt within 5s, took {propagation:?}"
+    );
+}
+
+/// The **`AssemblyScript`** guest, compiled to wasm with `asc` and committed.
+///
+/// AC1 asks for a guest "compiled from at least one non-Rust language".
+/// `echo.wat` does not satisfy that on its own: WebAssembly Text is the textual
+/// encoding of the wasm binary format itself, and `wat::parse_str` is an
+/// assembler, not a compiler from a distinct source language — it exercises no
+/// real toolchain's codegen, allocator, or memory layout. These bytes come from
+/// `AssemblyScript`'s compiler, so they do.
+///
+/// Committed rather than built in CI so the suite needs no npm toolchain and the
+/// bytes are deterministic. Regenerate with the `asc` command in
+/// `examples/wasm-guests/README.md`.
+const ECHO_ASSEMBLYSCRIPT_WASM: &[u8] = include_bytes!("../../examples/wasm-guests/echo.wasm");
+
+/// AC1 (non-Rust guest): a module compiled by the **`AssemblyScript`** toolchain
+/// runs end-to-end through the standard dispatch path.
+///
+/// Deliberately exercises the whole seam — startup publish, task-queue claim,
+/// `resolve_wasm_dispatch`, sandboxed invoke, ordinary `ActivityCompleted` — not
+/// just the runtime, so this proves polyglot reach rather than merely that
+/// wasmtime can run a foreign module.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_runs_an_assemblyscript_compiled_guest_to_completion() {
+    let (url, _c) = setup_db().await;
+    let queue = "q-wasm-assemblyscript";
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+    let input = serde_json::json!({ "guest": "assemblyscript", "payload": [1, 2, 3] });
+    let exec_id = seed_workflow(&mut conn, "wf_run_wasm", input.clone(), queue).await;
+
+    // Sanity-check the committed artifact really is a wasm binary, so a
+    // truncated or mis-copied file fails loudly here rather than as an opaque
+    // "module invalid" deep inside dispatch.
+    assert_eq!(
+        &ECHO_ASSEMBLYSCRIPT_WASM[..4],
+        b"\0asm",
+        "the committed AssemblyScript guest must be a wasm binary"
+    );
+
+    let registry = build_wasm_registry(
+        vec![wf_info("wf_run_wasm", wf_run_wasm)],
+        vec![WasmActivitySpec {
+            name: "echo_wasm",
+            bytes: ECHO_ASSEMBLYSCRIPT_WASM.to_vec(),
+            // Deny-all: the AssemblyScript guest imports nothing.
+            caps: WasmCapabilities::default(),
+            limits: WasmLimits::default(),
+            retry: None,
+            schedule_to_close: None,
+        }],
+        Arc::new(RecordingMetrics::default()),
+    );
+    let worker = build_worker("w-wasm-as", queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "COMPLETED",
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let history = load_history(&url, exec_id).await;
+    assert_eq!(
+        completed_output_for(&history, "echo_wasm"),
+        Some(input),
+        "the AssemblyScript-compiled guest must echo its JSON input"
+    );
+    // Indistinguishable from a native activity in history (AC6).
+    assert!(
+        history
+            .iter()
+            .all(|e| !e.type_name().to_ascii_lowercase().contains("wasm")),
+        "a WASM activity must record only ordinary activity events"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runs_one_native_and_one_wasm_activity_to_completion() {
     let (url, _c) = setup_db().await;
@@ -1652,6 +1842,7 @@ async fn runs_one_native_and_one_wasm_activity_to_completion() {
             caps: WasmCapabilities::default(),
             limits: WasmLimits::default(),
             retry: None,
+            schedule_to_close: None,
         }],
         Arc::new(RecordingMetrics::default()),
     );
@@ -1790,12 +1981,17 @@ fn dispatch_overhead_wasm_echo_vs_native() {
     println!("  wasm   p50={w50:?}  p99={w99:?}");
     println!("  native p50={n50:?}  p99={n99:?}");
     println!("  overhead (wasm - native)  p50={d50:?}  p99={d99:?}");
-    println!(
-        "  success-metric target: p99 overhead < 10ms  →  {}",
-        if d99 < Duration::from_millis(10) {
-            "MET"
-        } else {
-            "NOT MET (per-invocation instantiation cost; mitigation: instance pooling)"
-        }
+    println!("  success-metric target: p99 overhead < 10ms");
+
+    // ASSERT the success metric rather than only reporting it (issue #965
+    // review). Printing "MET"/"NOT MET" meant this test could not fail on the
+    // one number it exists to establish, so a regression that doubled dispatch
+    // cost would still show a green run. It stays `#[ignore]`d — a percentile
+    // microbenchmark is not a per-PR gate — but when it IS run, it now enforces.
+    assert!(
+        d99 < Duration::from_millis(10),
+        "WASM dispatch overhead must stay under the 10ms p99 success metric, but measured \
+         p99={d99:?} (wasm p99={w99:?}, native p99={n99:?}). The dominant cost is per-invocation \
+         instantiation; the mitigation on file is instance pooling."
     );
 }

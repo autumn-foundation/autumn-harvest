@@ -55,22 +55,14 @@ use autumn_harvest::wasm_activities::{
 };
 use autumn_harvest::wasm_store::WasmActivityRegistration;
 
-/// Echo guest (no imports): `run` returns `packed(in_ptr, in_len)`, so the host
-/// reads back the exact JSON bytes it wrote. A bump allocator serves `alloc`.
-const ECHO_WAT: &str = r#"
-    (module
-      (memory (export "memory") 1)
-      (global $bump (mut i32) (i32.const 1024))
-      (func (export "alloc") (param $len i32) (result i32)
-        (local $ptr i32)
-        (local.set $ptr (global.get $bump))
-        (global.set $bump (i32.add (global.get $bump) (local.get $len)))
-        (local.get $ptr))
-      (func (export "run") (param $in_ptr i32) (param $in_len i32) (result i64)
-        (i64.or
-          (i64.shl (i64.extend_i32_u (local.get $in_ptr)) (i64.const 32))
-          (i64.extend_i32_u (local.get $in_len)))))
-"#;
+/// Echo guest (no imports), loaded from the shared guests directory so this
+/// example runs the SAME bytes the integration tests and `wasm-guests/README.md`
+/// point at (issue #965 review — each site previously carried its own inline
+/// copy, leaving the documented guest unreferenced and free to drift).
+///
+/// `run` returns `packed(in_ptr, in_len)`, so the host reads back the exact JSON
+/// bytes it wrote. A bump allocator serves `alloc`.
+const ECHO_WAT: &str = include_str!("wasm-guests/echo.wat");
 
 /// Clock guest: imports `env::now_millis` (a GRANTABLE capability), calls it, and
 /// returns the JSON literal `true`. Runs only when `allow_clock` is granted.
