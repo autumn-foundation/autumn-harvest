@@ -469,11 +469,32 @@ Guardrails:
       - name: Gate backward-incompatible payload changes
         run: |
           cargo run --quiet -p autumn-harvest-cli --bin harvest -- \
-            schema check --current /tmp/current.json
+            schema check --require-current --current /tmp/current.json
 ```
 
 `schema check` needs no database and no services, so it belongs in the same
 cheap lint job as `det-check`.
+
+#### Why `--require-current` in CI
+
+Without it the gate passes on a **compatible** delta and nobody regenerates the
+artifact — so the baseline records what was deployed *some time ago* while the
+gate reads it as what was deployed *last*. That gap round-trips:
+
+1. add an enum variant — compatible, so the gate passes and the artifact is left
+   alone;
+2. deploy, and record payloads carrying the new variant;
+3. remove the variant again — the generated contract now equals the **stale**
+   baseline, so the gate sees zero deltas.
+
+Replay of anything written by the intermediate release fails, and no step ever
+reported a delta. `--require-current` refuses any unabsorbed delta, so step 1
+cannot merge until the artifact is advanced — and step 3 is then a removal
+against a baseline that knows the variant existed, which is breaking and needs
+an acknowledgement.
+
+The fix is always the same: run `harvest schema update`, and commit the
+regenerated artifact alongside the change.
 
 #### Also verify the escape hatch (recommended)
 
@@ -522,9 +543,11 @@ allowed: neither can make a record cover a different break.
 # Block commits that break replay of in-flight executions.
 cargo run -q --bin dump-schema-contract > /tmp/harvest-schema-current.json || exit 1
 if ! cargo run -q -p autumn-harvest-cli --bin harvest -- \
-        schema check --current /tmp/harvest-schema-current.json; then
-    echo "A workflow payload schema changed incompatibly." >&2
-    echo "Fix it, or acknowledge a deliberate migration with:" >&2
+        schema check --require-current --current /tmp/harvest-schema-current.json; then
+    echo "A workflow payload schema changed, and the baseline is behind." >&2
+    echo "Absorb a safe change with:" >&2
+    echo "  harvest schema update --current …" >&2
+    echo "…or acknowledge a deliberate breaking migration with:" >&2
     echo "  harvest schema update --current … --acknowledge \"<why this is safe>\"" >&2
     exit 1
 fi

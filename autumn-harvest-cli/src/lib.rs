@@ -805,6 +805,18 @@ enum SchemaCommand {
         /// `json` (per-type, per-field verdict and reason).
         #[arg(long, value_enum, default_value_t)]
         format: SchemaCheckFormat,
+        /// Fail on ANY unabsorbed delta, not only a breaking one.
+        ///
+        /// Without this the artifact is allowed to lag: a compatible change
+        /// passes and nobody regenerates it, so the baseline records what was
+        /// deployed *some time ago* while the gate reads it as what was deployed
+        /// *last*. That gap round-trips — add an enum variant (compatible, so
+        /// nothing is absorbed), deploy and record payloads carrying it, then
+        /// remove it again, and the generated contract equals the stale baseline
+        /// while replay of the intermediate release's data fails. Use it in CI;
+        /// the fix is always `harvest schema update`.
+        #[arg(long, default_value_t = false, conflicts_with = "acknowledged_in")]
+        require_current: bool,
         /// Verify the ESCAPE HATCH instead of the artifact's freshness.
         ///
         /// Pass the artifact as it stands now, with `--baseline` pointing at the
@@ -2531,8 +2543,15 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                 baseline,
                 current,
                 format,
+                require_current,
                 acknowledged_in,
-            } => run_schema_check(baseline, current, *format, acknowledged_in.as_deref()),
+            } => run_schema_check(
+                baseline,
+                current,
+                *format,
+                *require_current,
+                acknowledged_in.as_deref(),
+            ),
             SchemaCommand::Update {
                 baseline,
                 current,
@@ -3000,6 +3019,7 @@ pub fn run_schema_check(
     baseline: &Path,
     current: &Path,
     format: SchemaCheckFormat,
+    require_current: bool,
     acknowledged_in: Option<&Path>,
 ) -> Result<(), CliError> {
     let base = read_schema_contract(baseline)?;
@@ -3076,6 +3096,20 @@ pub fn run_schema_check(
         return Err(CliError::SchemaContractBreaking {
             breaking: diff.breaking_count,
         });
+    }
+
+    // Checked AFTER the breaking verdict so a break is always reported as a
+    // break: staleness is the milder finding, and reporting it first would bury
+    // the severe one behind "run schema update".
+    if require_current && !diff.deltas.is_empty() {
+        return Err(CliError::InvalidInput(format!(
+            "the checked-in baseline is not current: {} unabsorbed compatible delta(s). \
+             A baseline allowed to lag records what was deployed some time ago while \
+             this gate reads it as what was deployed last — so a field added in one \
+             release and removed in the next is invisible, even though replay of data \
+             written in between fails. Regenerate it with `harvest schema update`.",
+            diff.deltas.len()
+        )));
     }
     Ok(())
 }
@@ -11171,16 +11205,56 @@ mod schema_contract_cli_tests {
                         baseline,
                         current,
                         format,
+                        require_current,
                         acknowledged_in,
                     },
             } => {
                 assert_eq!(baseline, PathBuf::from("base.json"));
                 assert_eq!(current, PathBuf::from("cur.json"));
                 assert_eq!(format, SchemaCheckFormat::Json);
+                assert!(!require_current, "the currency check is opt-in");
                 assert_eq!(acknowledged_in, None, "the escape-hatch mode is opt-in");
             }
             other => panic!("expected Schema::Check, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn schema_check_require_current_and_acknowledged_in_are_mutually_exclusive() {
+        let cli = parse(&[
+            "schema",
+            "check",
+            "--current",
+            "cur.json",
+            "--require-current",
+        ]);
+        match cli.command {
+            Commands::Schema {
+                command:
+                    SchemaCommand::Check {
+                        require_current, ..
+                    },
+            } => assert!(require_current, "--require-current must set the flag"),
+            other => panic!("expected Schema::Check, got {other:?}"),
+        }
+
+        // The escape-hatch mode diffs the BASE revision against the generated
+        // contract, where deltas are the whole point — demanding currency there
+        // would fail every legitimate acknowledged change.
+        assert!(
+            Cli::try_parse_from([
+                "harvest",
+                "schema",
+                "check",
+                "--current",
+                "cur.json",
+                "--require-current",
+                "--acknowledged-in",
+                "head.json",
+            ])
+            .is_err(),
+            "combining the two modes is a contradiction and must not parse"
+        );
     }
 
     #[test]

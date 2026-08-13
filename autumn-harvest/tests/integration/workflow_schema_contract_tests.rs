@@ -2196,8 +2196,37 @@ const CI_YAML: &str = include_str!("../../../.github/workflows/ci.yml");
 #[test]
 fn ci_runs_the_schema_gate() {
     assert!(
-        CI_YAML.contains("schema check --current"),
+        CI_YAML.contains("schema check --require-current --current"),
         "ci.yml must run `harvest schema check --current` — without it the gate is decorative"
+    );
+}
+
+/// CI must demand a CURRENT baseline, not merely a non-breaking one.
+///
+/// `schema check` alone exits 0 for a compatible delta, so the artifact is free
+/// to lag — and a lagging baseline records what was deployed some time ago while
+/// the gate reads it as what was deployed last. A variant added in one release
+/// and removed in the next then round-trips to the stale baseline with zero
+/// deltas reported, even though replay of data written in between fails.
+#[test]
+fn ci_requires_the_baseline_to_be_current() {
+    // Scan the INVOCATION, not the file: the step carries a comment explaining
+    // the flag, and a bare `contains` would happily pass on that comment while
+    // the command itself had lost it.
+    let invocations: Vec<&str> = CI_YAML
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#') && l.contains("schema check"))
+        .collect();
+    assert!(
+        !invocations.is_empty(),
+        "ci.yml must invoke `harvest schema check`"
+    );
+    assert!(
+        invocations.iter().any(|l| l.contains("--require-current")),
+        "the currency check must be on the COMMAND, not just described in a \
+         comment — an unabsorbed compatible delta otherwise leaves the baseline \
+         stale and a later removal becomes invisible: {invocations:?}"
     );
 }
 
@@ -2386,6 +2415,104 @@ fn a_pre_existing_acknowledgement_does_not_cover_a_fresh_break() {
         missing.len(),
         diff.breaking_count,
         "records carried over from the base revision must cover nothing: {missing:#?}"
+    );
+}
+
+// ── Canonicalisation must not confuse payload keys with annotations ─────────
+
+/// A payload field is not an annotation, however it is spelled.
+///
+/// Annotation stripping is keyed on the KEY NAME, and the recursion treated
+/// every object as a schema — including the `properties` map, whose keys are
+/// arbitrary field names chosen by the payload author. A field literally named
+/// `description` was therefore deleted from both revisions, and a field that
+/// does not exist cannot be seen to change type.
+#[test]
+fn a_payload_field_named_like_an_annotation_survives_canonicalisation() {
+    for name in ["description", "title", "examples", "deprecated", "readOnly"] {
+        let baseline = json!({
+            "type": "object",
+            "properties": { name: {"type": "string"} },
+            "required": [name],
+        });
+        let current = json!({
+            "type": "object",
+            "properties": { name: {"type": "integer"} },
+            "required": [name],
+        });
+
+        let canon = canonicalize_schema(&baseline);
+        assert!(
+            canon["properties"].get(name).is_some(),
+            "the payload field `{name}` must survive canonicalisation: {canon}"
+        );
+
+        let diff = diff_input(baseline, current);
+        assert!(
+            diff.has_breaking(),
+            "narrowing `{name}` from string to integer is breaking: {:#?}",
+            diff.deltas
+        );
+    }
+}
+
+/// The over-firing guard: a real annotation, in the position a real annotation
+/// occupies, is still stripped — otherwise every doc-comment edit is a delta.
+#[test]
+fn a_genuine_annotation_beside_a_schema_keyword_is_still_stripped() {
+    let plain = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+    let documented = json!({
+        "type": "object",
+        "title": "Onboard",
+        "description": "the input",
+        "properties": { "a": {"type": "string", "description": "the field"} },
+    });
+    assert_eq!(
+        canonicalize_schema(&plain),
+        canonicalize_schema(&documented),
+        "annotations in annotation position must still be stripped"
+    );
+    assert!(
+        diff_input(plain, documented).deltas.is_empty(),
+        "documenting a schema must produce no delta"
+    );
+}
+
+/// An object-valued `default` is an INSTANCE, not a schema: its keys are the
+/// payload author's, so stripping annotation names from it rewrites the very
+/// value `diff_serde_default` compares.
+#[test]
+fn an_object_valued_default_keeps_its_payload_keys() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "opts": {
+                "type": "object",
+                "default": {"description": "hello", "retries": 3},
+            }
+        },
+    });
+    let canon = canonicalize_schema(&schema);
+    let default = &canon["properties"]["opts"]["default"];
+    assert_eq!(
+        default,
+        &json!({"description": "hello", "retries": 3}),
+        "a default is instance data and must be preserved verbatim: {canon}"
+    );
+}
+
+/// A definition named after an annotation must not vanish from `$defs`, or the
+/// `$ref` pointing at it resolves to nothing and the subtree stops being compared.
+#[test]
+fn a_definition_named_like_an_annotation_survives_canonicalisation() {
+    let schema = json!({
+        "$defs": { "description": {"type": "string"} },
+        "properties": { "a": {"$ref": "#/$defs/description"} },
+    });
+    let canon = canonicalize_schema(&schema);
+    assert!(
+        canon["$defs"].get("description").is_some(),
+        "a definition key is a name, not an annotation: {canon}"
     );
 }
 

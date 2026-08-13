@@ -658,3 +658,48 @@ the check still exits 1 (the core filter is what makes it fail closed) and only
 the message assertion fails, which is exactly the split the two fixes encode.
 The over-firing guard — a record with a real reason still covering its delta —
 was green *before* the fix, pinning it on both sides.
+
+### Twelfth review round
+
+Two findings, and neither is in the branch-matching machinery the previous six
+rounds circled — one is in canonicalization's most basic assumption, the other
+is in what CI asks the gate for.
+
+- **A payload field is not an annotation, however it is spelled.** Annotation
+  stripping keys on the KEY NAME, and the recursion treated every JSON object as
+  a schema — including the `properties` map, whose keys are arbitrary field names
+  chosen by the payload author. A field literally called `description` (or
+  `title`, `examples`, `deprecated`, `readOnly`) was therefore **deleted from
+  both revisions**, and a field that does not exist cannot be seen to change
+  type: `String -> integer` on it canonicalized identically and passed. The same
+  applied to `$defs`/`definitions` entries (a deleted definition leaves its
+  `$ref` dangling, so the whole subtree stops being compared) and to an
+  object-valued `default`, which is instance data the round-9 fix compares —
+  rewriting it silently changes what is compared. Canonicalization is now
+  context-aware: `SCHEMA_MAP_KEYWORDS` (`properties`, `patternProperties`,
+  `$defs`, `definitions`, `dependentSchemas`, `dependencies`) preserve every key
+  and canonicalize each value as a schema; `INSTANCE_VALUE_KEYWORDS` (`default`,
+  `const`) are preserved byte-for-byte; everything else recurses as before. A
+  genuine annotation in annotation position is still stripped, so no doc-comment
+  edit becomes a delta.
+- **CI asked "is anything breaking?" when the artifact's promise is "this is
+  what was deployed".** `schema check` exits 0 on a compatible delta, so nobody
+  regenerates the baseline, so it records what was deployed *some time ago* while
+  the gate reads it as what was deployed *last*. That gap round-trips: add an
+  enum variant (compatible, nothing absorbed), deploy and record payloads
+  carrying it, then remove it again — the generated contract now equals the
+  **stale** baseline, both checks see zero deltas, and replay of anything written
+  by the intermediate release fails with no step ever reporting a delta. New
+  `schema check --require-current` refuses any unabsorbed delta, compatible ones
+  included, and CI passes it. It is `conflicts_with` the escape-hatch mode, where
+  deltas against the base revision are the entire point.
+
+Four mutants across the two fixes, each reverted individually with the specific
+test confirmed failing before restoring — and one of them **survived on the first
+attempt**, which was the useful result: the CI-wiring guard asserted
+`CI_YAML.contains("--require-current")`, and the step carries a comment
+explaining the flag, so removing it from the *command* left the guard green. It
+now scans the invocation lines specifically and fails on that mutation. The
+over-firing guards ship alongside: a real annotation is still stripped, an
+already-current baseline still passes `--require-current`, and an artifact
+carrying acknowledgement records is current once its schemas match.

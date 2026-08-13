@@ -844,6 +844,29 @@ const ANNOTATION_KEYWORDS: &[&str] = &[
 /// are reached through `$ref`, never compared directly.
 const CONTAINER_KEYWORDS: &[&str] = &["definitions", "$defs"];
 
+/// Keywords whose value is a MAP of author-chosen names to sub-schemas.
+///
+/// Their keys are payload field names and definition names — not schema
+/// keywords — so [`ANNOTATION_KEYWORDS`] must never be applied to them. A field
+/// called `description` is a field, and deleting it would make it invisible to
+/// the differ: a type change on it would canonicalise identically on both sides.
+const SCHEMA_MAP_KEYWORDS: &[&str] = &[
+    "properties",
+    "patternProperties",
+    "definitions",
+    "$defs",
+    "dependentSchemas",
+    "dependencies",
+];
+
+/// Keywords whose value is INSTANCE data rather than a sub-schema.
+///
+/// Recursing into one would rewrite the very value the differ compares — an
+/// object-valued `default` carrying a `description` key is payload data, not an
+/// annotated schema. `enum` belongs to this class too but has its own arm,
+/// because its members are sorted (an `enum` is a set).
+const INSTANCE_VALUE_KEYWORDS: &[&str] = &["default", "const"];
+
 /// Bounds whose *increase* narrows the accepted set.
 const LOWER_BOUNDS: &[&str] = &["minimum", "minLength", "minItems"];
 /// Bounds whose *decrease* narrows the accepted set.
@@ -953,6 +976,17 @@ fn canonicalize_node(schema: &Value, depth: usize) -> Value {
                     out.insert(k.clone(), sorted_enum(v));
                     continue;
                 }
+                // Instance data, not a schema: preserve it byte-for-byte.
+                if INSTANCE_VALUE_KEYWORDS.contains(&k.as_str()) {
+                    out.insert(k.clone(), v.clone());
+                    continue;
+                }
+                // A map of author-chosen NAMES to sub-schemas: the keys are not
+                // keywords, so the annotation filter must not see them.
+                if SCHEMA_MAP_KEYWORDS.contains(&k.as_str()) {
+                    out.insert(k.clone(), canonicalize_schema_map(v, depth + 1));
+                    continue;
+                }
                 out.insert(k.clone(), canonicalize_node(v, depth + 1));
             }
             collapse_unit_enum_branches(&mut out);
@@ -961,6 +995,29 @@ fn canonicalize_node(schema: &Value, depth: usize) -> Value {
         }
         other => other.clone(),
     }
+}
+
+/// Canonicalise a map of author-chosen NAMES to sub-schemas.
+///
+/// Every key is preserved verbatim — it is a payload field or definition name,
+/// not a schema keyword — while every value is canonicalised as a schema. This
+/// is the whole difference between a schema object and a `properties` map, and
+/// [`canonicalize_node`] cannot tell them apart from shape alone: both are JSON
+/// objects.
+fn canonicalize_schema_map(value: &Value, depth: usize) -> Value {
+    if depth >= MAX_DIFF_DEPTH {
+        return value.clone();
+    }
+    let Value::Object(map) = value else {
+        // Malformed (a `properties` that is not an object). Leave it to the
+        // fail-closed sweep rather than guessing at a shape it does not have.
+        return value.clone();
+    };
+    Value::Object(
+        map.iter()
+            .map(|(k, v)| (k.clone(), canonicalize_node(v, depth + 1)))
+            .collect(),
+    )
 }
 
 /// Collapse `{"allOf": [X]}` into `X`.

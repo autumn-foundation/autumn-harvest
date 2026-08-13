@@ -293,8 +293,13 @@ jobs:
             --example schema_workflow -- --emit-contract > "${RUNNER_TEMP}/schema-current.json"
 
           # 1. Is the checked-in artifact current, and is every delta safe?
+          #    --require-current also refuses an unabsorbed COMPATIBLE delta: a
+          #    baseline allowed to lag records what was deployed some time ago
+          #    while this gate reads it as what was deployed last, so a field
+          #    added in one release and removed in the next is invisible even
+          #    though replay of data written in between fails.
           cargo run --quiet -p autumn-harvest-cli --bin harvest -- \
-            schema check --current "${RUNNER_TEMP}/schema-current.json"
+            schema check --require-current --current "${RUNNER_TEMP}/schema-current.json"
 
           # 2. Was the ARTIFACT's own change since the base revision recorded?
           #

@@ -69,14 +69,14 @@ fn tree(
 #[test]
 fn a_compatible_change_exits_zero() {
     let (_d, b, c) = tree(BASELINE, CURRENT_COMPATIBLE);
-    let out = run_schema_check(&b, &c, SchemaCheckFormat::Text, None);
+    let out = run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None);
     assert!(out.is_ok(), "a compatible change must exit 0: {out:?}");
 }
 
 #[test]
 fn a_breaking_change_exits_one() {
     let (_d, b, c) = tree(BASELINE, CURRENT_BREAKING);
-    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, None)
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None)
         .expect_err("a breaking change must fail the gate");
     assert_eq!(
         err.exit_code(),
@@ -91,7 +91,7 @@ fn a_missing_baseline_is_a_clear_error_not_a_silent_pass() {
     let missing = dir.path().join("nope.json");
     let c = dir.path().join("current.json");
     std::fs::write(&c, CURRENT_COMPATIBLE).unwrap();
-    let err = run_schema_check(&missing, &c, SchemaCheckFormat::Text, None)
+    let err = run_schema_check(&missing, &c, SchemaCheckFormat::Text, false, None)
         .expect_err("a missing baseline must be an error, never a silent pass");
     assert!(
         format!("{err}").contains("nope.json"),
@@ -102,7 +102,7 @@ fn a_missing_baseline_is_a_clear_error_not_a_silent_pass() {
 #[test]
 fn a_malformed_contract_is_a_clear_error() {
     let (_d, b, c) = tree("{ not json", CURRENT_COMPATIBLE);
-    assert!(run_schema_check(&b, &c, SchemaCheckFormat::Text, None).is_err());
+    assert!(run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None).is_err());
 }
 
 // ── AC-4: output formats ────────────────────────────────────────────────────
@@ -204,7 +204,7 @@ fn update_with_an_acknowledgement_writes_the_baseline_and_records_the_reason() {
     .expect("acknowledged update must succeed");
 
     // The rewritten baseline now matches current, so `check` is clean...
-    assert!(run_schema_check(&b, &c, SchemaCheckFormat::Text, None).is_ok());
+    assert!(run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None).is_ok());
 
     // ...and the justification is a visible, permanent record in the artifact.
     let written = std::fs::read_to_string(&b).unwrap();
@@ -220,7 +220,7 @@ fn update_with_an_acknowledgement_writes_the_baseline_and_records_the_reason() {
 fn update_of_a_compatible_change_needs_no_acknowledgement() {
     let (_d, b, c) = tree(BASELINE, CURRENT_COMPATIBLE);
     run_schema_update(&b, &c, None, None).expect("a compatible update needs no acknowledgement");
-    assert!(run_schema_check(&b, &c, SchemaCheckFormat::Text, None).is_ok());
+    assert!(run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None).is_ok());
     let written = std::fs::read_to_string(&b).unwrap();
     assert!(written.contains("referral_code"));
 }
@@ -309,7 +309,7 @@ fn current_may_be_a_raw_registered_workflows_response() {
         ]"#,
     )
     .unwrap();
-    run_schema_check(&b, &c, SchemaCheckFormat::Text, None)
+    run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None)
         .expect("a bare GET /workflows/registered body must be usable as --current");
 }
 
@@ -467,7 +467,7 @@ fn a_truncated_but_entirely_compatible_diff_still_fails_closed() {
     assert!(!diff.has_breaking(), "fixture must be compatible-only");
     assert!(diff.truncated, "fixture must exceed the delta cap");
 
-    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, None)
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None)
         .expect_err("an incomplete report must never pass the gate");
     assert_eq!(err.exit_code(), 1);
     assert!(
@@ -539,7 +539,7 @@ const EMPTY_CONTRACT: &str = r#"{
 #[test]
 fn an_empty_current_is_diagnosed_rather_than_read_as_a_mass_deletion() {
     let (_d, b, c) = tree(BASELINE, EMPTY_CONTRACT);
-    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, None)
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None)
         .expect_err("an empty current contract must be refused");
     let msg = err.to_string();
     assert!(
@@ -582,15 +582,102 @@ fn an_empty_current_cannot_overwrite_the_baseline_even_with_an_acknowledgement()
 #[test]
 fn an_empty_baseline_against_an_empty_current_is_not_refused() {
     let (_d, b, c) = tree(EMPTY_CONTRACT, EMPTY_CONTRACT);
-    run_schema_check(&b, &c, SchemaCheckFormat::Text, None).expect("empty-to-empty is a no-op");
+    run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None)
+        .expect("empty-to-empty is a no-op");
 }
 
 /// ...and adding the first workflow to an empty baseline is compatible.
 #[test]
 fn growing_from_an_empty_baseline_is_compatible() {
     let (_d, b, c) = tree(EMPTY_CONTRACT, BASELINE);
-    run_schema_check(&b, &c, SchemaCheckFormat::Text, None)
+    run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None)
         .expect("publishing a new workflow must not fail the gate");
+}
+
+// ── The baseline must be CURRENT, not merely non-breaking ───────────────────
+
+/// A compatible delta left unabsorbed makes the artifact a record of what was
+/// deployed *some time ago*, and the gate reads it as the record of what was
+/// deployed *last*. That gap is round-trippable:
+///
+/// 1. add an enum variant — compatible, so the gate passes and nobody
+///    regenerates the artifact;
+/// 2. deploy, and record payloads carrying the new variant;
+/// 3. remove the variant again — the generated contract now equals the stale
+///    baseline, so BOTH checks see zero deltas.
+///
+/// Replay of anything written by the intermediate release fails, and no step
+/// ever reported a delta. `--require-current` closes it by refusing any
+/// unabsorbed delta, compatible ones included.
+#[test]
+fn an_unabsorbed_compatible_delta_fails_the_currency_check() {
+    let (_d, b, c) = tree(BASELINE, CURRENT_COMPATIBLE);
+
+    // The ordinary check passes — the change really is safe to deploy.
+    assert!(
+        run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None).is_ok(),
+        "a compatible change is not breaking, and must not be reported as such"
+    );
+
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, true, None)
+        .expect_err("a stale baseline must fail the currency check");
+    assert_eq!(err.exit_code(), 1, "the gate exits 1");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("schema update"),
+        "the failure must name the one command that fixes it: {msg}"
+    );
+}
+
+/// The A→B→A round trip the currency check exists to prevent, end to end: with
+/// the baseline advanced at step 1, removing the variant is caught as breaking.
+#[test]
+fn advancing_the_baseline_makes_the_later_removal_visible() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = dir.path().join("baseline.json");
+    let c = dir.path().join("current.json");
+
+    // Step 1: absorb the compatible addition, as the currency check forces.
+    std::fs::write(&b, BASELINE).unwrap();
+    std::fs::write(&c, CURRENT_COMPATIBLE).unwrap();
+    run_schema_update(&b, &c, None, None).expect("a compatible update needs no acknowledgement");
+    assert!(
+        run_schema_check(&b, &c, SchemaCheckFormat::Text, true, None).is_ok(),
+        "the absorbed baseline is current"
+    );
+
+    // Step 3: the field goes away again. Against the ADVANCED baseline this is
+    // a removal — which is exactly what replay of step-2 data would hit.
+    std::fs::write(&c, BASELINE).unwrap();
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None)
+        .expect_err("removing a field recorded by the intermediate release is breaking");
+    assert_eq!(err.exit_code(), 1, "the gate exits 1");
+}
+
+/// The over-firing guard: an artifact that IS current passes, so the check
+/// cannot simply reject everything.
+#[test]
+fn a_current_baseline_passes_the_currency_check() {
+    let (_d, b, c) = tree(BASELINE, BASELINE);
+    assert!(
+        run_schema_check(&b, &c, SchemaCheckFormat::Text, true, None).is_ok(),
+        "an artifact equal to the generated contract is current"
+    );
+}
+
+/// Currency is about deltas, not about the acknowledgement log: an artifact
+/// carrying records still passes once its schemas match.
+#[test]
+fn an_acknowledged_baseline_is_current_once_absorbed() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = dir.path().join("baseline.json");
+    let c = dir.path().join("current.json");
+    std::fs::write(&b, acknowledged_head()).unwrap();
+    std::fs::write(&c, CURRENT_BREAKING).unwrap();
+    assert!(
+        run_schema_check(&b, &c, SchemaCheckFormat::Text, true, None).is_ok(),
+        "an absorbed, acknowledged artifact is current"
+    );
 }
 
 // ── AC-5: the escape hatch must not be bypassable by hand-editing ────────────
@@ -621,12 +708,18 @@ fn a_hand_edited_baseline_fails_the_escape_hatch_check() {
 
     // The ordinary in-PR check passes — that is precisely the problem.
     assert!(
-        run_schema_check(&head, &generated, SchemaCheckFormat::Text, None).is_ok(),
+        run_schema_check(&head, &generated, SchemaCheckFormat::Text, false, None).is_ok(),
         "the in-PR check is clean by construction; the bypass is invisible to it"
     );
 
-    let err = run_schema_check(&base, &generated, SchemaCheckFormat::Text, Some(&head))
-        .expect_err("an unrecorded break must fail the escape-hatch check");
+    let err = run_schema_check(
+        &base,
+        &generated,
+        SchemaCheckFormat::Text,
+        false,
+        Some(&head),
+    )
+    .expect_err("an unrecorded break must fail the escape-hatch check");
     assert_eq!(err.exit_code(), 1, "the gate exits 1");
     let msg = format!("{err}");
     assert!(
@@ -646,7 +739,13 @@ fn an_acknowledged_baseline_passes_the_escape_hatch_check() {
     std::fs::write(&generated, CURRENT_BREAKING).unwrap();
     std::fs::write(&head, acknowledged_head()).unwrap();
 
-    let out = run_schema_check(&base, &generated, SchemaCheckFormat::Text, Some(&head));
+    let out = run_schema_check(
+        &base,
+        &generated,
+        SchemaCheckFormat::Text,
+        false,
+        Some(&head),
+    );
     assert!(
         out.is_ok(),
         "a recorded, justified break must pass the escape-hatch check: {out:?}"
@@ -682,8 +781,14 @@ fn a_blank_reason_record_fails_the_escape_hatch_check() {
     }
     std::fs::write(&head, serde_json::to_string_pretty(&artifact).unwrap()).unwrap();
 
-    let err = run_schema_check(&base, &generated, SchemaCheckFormat::Text, Some(&head))
-        .expect_err("a blank justification must not cover a break");
+    let err = run_schema_check(
+        &base,
+        &generated,
+        SchemaCheckFormat::Text,
+        false,
+        Some(&head),
+    )
+    .expect_err("a blank justification must not cover a break");
     assert_eq!(err.exit_code(), 1, "the gate exits 1");
     let msg = format!("{err}");
     assert!(
@@ -704,7 +809,14 @@ fn a_compatible_change_passes_the_escape_hatch_check() {
     std::fs::write(&head, CURRENT_COMPATIBLE).unwrap();
 
     assert!(
-        run_schema_check(&base, &generated, SchemaCheckFormat::Text, Some(&head)).is_ok(),
+        run_schema_check(
+            &base,
+            &generated,
+            SchemaCheckFormat::Text,
+            false,
+            Some(&head)
+        )
+        .is_ok(),
         "a compatible change must not need an acknowledgement"
     );
 }
@@ -752,8 +864,14 @@ fn a_retargeted_acknowledgement_record_fails_the_escape_hatch_check() {
         .collect();
     std::fs::write(&head, serde_json::to_string_pretty(&head_artifact).unwrap()).unwrap();
 
-    let err = run_schema_check(&base, &generated, SchemaCheckFormat::Text, Some(&head))
-        .expect_err("a rewritten audit log must fail the escape-hatch check");
+    let err = run_schema_check(
+        &base,
+        &generated,
+        SchemaCheckFormat::Text,
+        false,
+        Some(&head),
+    )
+    .expect_err("a rewritten audit log must fail the escape-hatch check");
     assert_eq!(err.exit_code(), 1, "the gate exits 1");
     assert!(
         matches!(
@@ -798,7 +916,13 @@ fn appending_to_a_non_empty_acknowledgement_log_passes() {
     std::fs::write(&generated, CURRENT_BREAKING).unwrap();
     std::fs::write(&head, serde_json::to_string_pretty(&head_artifact).unwrap()).unwrap();
 
-    let out = run_schema_check(&base, &generated, SchemaCheckFormat::Text, Some(&head));
+    let out = run_schema_check(
+        &base,
+        &generated,
+        SchemaCheckFormat::Text,
+        false,
+        Some(&head),
+    );
     assert!(out.is_ok(), "an append-only update must pass: {out:?}");
 }
 
@@ -806,7 +930,7 @@ fn appending_to_a_non_empty_acknowledgement_log_passes() {
 #[test]
 fn the_escape_hatch_check_is_opt_in() {
     let (_d, b, c) = tree(BASELINE, CURRENT_BREAKING);
-    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, None)
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None)
         .expect_err("the ordinary check still fails on a breaking delta");
     assert!(
         matches!(
