@@ -1421,7 +1421,8 @@ fn diff_role(
                 role,
                 base_root: &bc,
                 cur_root: &cc,
-                visited: BTreeSet::new(),
+                visited: BTreeMap::new(),
+                suppressed_changes: 0,
             };
             diff_node(&mut ctx, &bc, &cc, "", 0, diff);
         }
@@ -1434,8 +1435,22 @@ struct DiffCtx<'a> {
     role: SchemaRole,
     base_root: &'a Value,
     cur_root: &'a Value,
-    /// `$ref` pairs already expanded, so a recursive type terminates.
-    visited: BTreeSet<(String, String)>,
+    /// `$ref` pairs already expanded, so a recursive type terminates. The
+    /// value records whether that pair's subtree produced any delta, so a later
+    /// memo HIT can still tell a caller "this changed" — see
+    /// [`DiffCtx::suppressed_changes`].
+    visited: BTreeMap<(String, String), bool>,
+    /// How many times a memo hit swallowed a subtree that had CHANGED.
+    ///
+    /// The memo makes the diff linear, but it also makes the second visit to a
+    /// pair emit nothing — and one caller,
+    /// [`diff_branch_guarding_rebind`], decides whether to run its
+    /// overlap check by asking whether the branch emitted anything. A shared
+    /// definition reached first from an ordinary property and then from a
+    /// `oneOf` branch would silence that check entirely. This counter is
+    /// monotonic like `visited`; a caller samples it around its own recursion
+    /// and treats an increase as "changed, but not inspectable here".
+    suppressed_changes: usize,
 }
 
 impl DiffCtx<'_> {
@@ -1511,7 +1526,7 @@ fn diff_node(
             b_ref.unwrap_or_else(|| path.to_string()),
             c_ref.unwrap_or_else(|| path.to_string()),
         );
-        if !ctx.visited.insert(key) {
+        if let Some(&changed) = ctx.visited.get(&key) {
             // Already expanded this pair: either a recursive type, or a
             // definition reached by a second path. Coinductively compatible —
             // anything reachable from here was compared the first time.
@@ -1522,8 +1537,21 @@ fn diff_node(
             // exponentially: a few KB of `$ref`s never finishes. Memoising
             // instead makes each pair O(1) and the whole diff linear in the
             // number of distinct pairs.
+            //
+            // Emitting nothing is right for the DIFF, but not for a caller that
+            // reads "emitted nothing" as "did not change": the same definition
+            // reached from an ordinary property and from a `oneOf` branch would
+            // let a compatible relaxation silence the branch-overlap check. The
+            // pair's own verdict is replayed on the counter instead, so the
+            // signal survives without re-walking the subtree.
+            if changed {
+                ctx.suppressed_changes += 1;
+            }
             return;
         }
+        ctx.visited.insert(key.clone(), false);
+        let before_total = diff.breaking_count + diff.compatible_count;
+        let before_suppressed = ctx.suppressed_changes;
         // A chain that terminates on a CYCLE lands on a node that STILL carries
         // `$ref` (`resolve_ref` breaks out rather than looping). Recursing would
         // re-resolve to this same pair, hit the memo above, and return — so the
@@ -1538,13 +1566,39 @@ fn diff_node(
         // resolved` reassignment does the same.
         if b.get("$ref").is_none() && c.get("$ref").is_none() {
             diff_node(ctx, b, c, path, depth + 1, diff);
-            return;
+        } else {
+            // The landing node of a CYCLE. Termination still holds: the memo was
+            // already inserted, so anything under it that walks back around the
+            // cycle resolves to this same pair and returns.
+            diff_node_body(ctx, b, c, path, depth, diff);
         }
-        // Fall through with `b`/`c` bound to the landing nodes. Termination still
-        // holds: the memo was already inserted, so anything under them that walks
-        // back around the cycle resolves to this same pair and returns.
+        // Record what this pair's subtree did, for every later memo hit. A
+        // nested pair that was itself swallowed counts too, or the suppression
+        // would simply move one level down.
+        let changed = diff.breaking_count + diff.compatible_count > before_total
+            || ctx.suppressed_changes > before_suppressed;
+        ctx.visited.insert(key, changed);
+        return;
     }
 
+    diff_node_body(ctx, b, c, path, depth, diff);
+}
+
+/// Everything [`diff_node`] does once `$ref` resolution and memoisation are
+/// settled: compare two already-resolved nodes keyword by keyword.
+///
+/// Split out so `diff_node` can measure exactly what one `$ref` pair's subtree
+/// contributes — the cycle-landing case falls through to the same body the
+/// ref-free case reaches by recursion, and both have to be inside the
+/// measurement.
+fn diff_node_body(
+    ctx: &mut DiffCtx<'_>,
+    b: &Value,
+    c: &Value,
+    path: &str,
+    depth: usize,
+    diff: &mut SchemaContractDiff,
+) {
     let (Some(bo), Some(co)) = (b.as_object(), c.as_object()) else {
         // A non-object schema node: JSON Schema's boolean form (`true`/`false`)
         // or something malformed. None of the keyword comparisons apply, but
@@ -3358,13 +3412,21 @@ fn diff_branch_guarding_rebind(
 ) {
     let before_total = diff.breaking_count + diff.compatible_count;
     let before_stored = diff.deltas.len();
+    let before_suppressed = ctx.suppressed_changes;
     diff_node(ctx, base, cur, sub_path, depth + 1, diff);
 
     if rivals.is_empty() {
         return;
     }
     let emitted = (diff.breaking_count + diff.compatible_count) - before_total;
-    if emitted == 0 {
+    // A branch that is a `$ref` to a definition ANOTHER path already visited
+    // emits nothing, because the memo that keeps this diff linear returns on the
+    // second visit. Reading that as "unchanged" is what let a compatible
+    // relaxation of a shared definition slip an overlap past this guard: the
+    // relaxation is reported once, at the ordinary property that reached the
+    // definition first, and the branch context never learns about it.
+    let swallowed = ctx.suppressed_changes > before_suppressed;
+    if emitted == 0 && !swallowed {
         return;
     }
     let cur_root = ctx.cur_root;
@@ -3380,8 +3442,13 @@ fn diff_branch_guarding_rebind(
     };
     // A delta dropped by the storage cap cannot be inspected, so treat the
     // branch as changed rather than assuming the unseen deltas were benign.
+    // A swallowed change has no deltas here to inspect, so it is treated exactly
+    // like one dropped by the storage cap: assume it might have widened, and let
+    // the disjointness check below decide. That keeps the fail-closed direction
+    // — a shared definition whose branch rivals are provably disjoint still
+    // reports nothing.
     let stored = &diff.deltas[before_stored.min(diff.deltas.len())..];
-    let all_stored = stored.len() == emitted;
+    let all_stored = !swallowed && stored.len() == emitted;
     if all_stored
         && !stored
             .iter()

@@ -1015,3 +1015,49 @@ compatible whether or not the collapse fires — diffing the branch form directl
 against the flat form is what pins it. The array-spelling test needed the same
 correction, because with the current side written in the bare-string form the old
 code lifted *that* one and caught the break by accident.
+
+### Twentieth review round
+
+One P1, fixed.
+
+- **P1 — the `$ref` memo silenced the branch-rebinding guard.** `diff_node`
+  memoises `$ref` pairs so a recursive type terminates and the diff stays linear
+  over cross-referencing definitions. The memo is monotonic: a second visit to a
+  pair returns immediately and emits nothing. That is right for the *diff* — the
+  deltas are already recorded under the first path — but wrong for any caller
+  that infers *"emitted nothing"* means *"did not change"*.
+
+  `diff_branch_guarding_rebind` is exactly such a caller. It exists because a
+  `oneOf` branch that widens can start overlapping a sibling, turning
+  exactly-one-match into a match-both rejection: a payload that used to validate
+  no longer does, so a per-branch delta that looks compatible in isolation is
+  actually breaking. The guard runs that overlap check only when the branch
+  itself reported a change — so a branch that is a `$ref` to a definition some
+  *earlier* path already visited slipped through with the overlap unexamined.
+
+  The shape is ordinary rather than exotic: one definition reached from both a
+  plain property and a `oneOf` branch, with the property sorted first. Relaxing
+  a bound on the shared definition then reports a lone COMPATIBLE delta under
+  the property, and the `oneOf` break it also caused is never looked for.
+
+  The memo now records, per pair, whether that pair's subtree produced any
+  delta, and a hit on a *changed* pair bumps a monotonic counter. The guard
+  samples the counter around its own recursion and treats an increase as
+  "changed, but not inspectable here" — running the overlap check with no
+  deltas to attribute, exactly as it already does for a diff truncated by the
+  storage cap. The counter is monotonic like the memo itself, so a pair whose
+  own change was *itself* swallowed still propagates upward rather than
+  stopping one level down.
+
+  Splitting `diff_node`'s keyword comparison into `diff_node_body` is what makes
+  the measurement exact: the memo arm can now bracket precisely one `$ref`
+  pair's subtree, instead of a range that also covers the caller's own work.
+
+Five mutants. Making the guard ignore the swallow signal, never recording a
+change in the memo, dropping the `!swallowed` condition from the
+all-deltas-inspected check, and hard-coding the swallow flag true all fail. The
+fifth — dropping the *upward propagation* term, so only a pair's own directly
+emitted deltas count — survived the first pass: one level of sharing exercises
+the memo but never a memo hit *nested under* another memoised pair. A two-level
+fixture pins it, with the intermediate definition carrying its own keywords so
+it forms a memo pair of its own rather than chain-resolving away.

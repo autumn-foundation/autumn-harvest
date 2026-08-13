@@ -311,6 +311,16 @@ Four are worth knowing before you rely on it:
   until it overlaps a sibling is breaking, because a payload that used to match
   one branch now matches two. Narrowing needs no such check — it cannot create an
   overlap, and the payloads it drops are already reported by the narrowing.
+
+  That check runs whenever the branch changed, **including when the change was
+  made through a `$ref` some earlier path already walked**. Resolution memoises
+  each `$ref` pair so recursive types terminate and the walk stays linear, which
+  means a second visit emits nothing — the deltas are already recorded under the
+  first path. Reading that silence as *"unchanged"* would skip the overlap check
+  for a definition shared between an ordinary property and a branch, so the memo
+  also records whether each pair actually changed. A repeat visit to a changed
+  pair is treated exactly like a diff truncated by the storage cap: the overlap
+  is checked, with no local deltas to attribute it to.
 - **Indistinguishable branches are compared by position.** Two multi-field
   object variants of a `#[serde(untagged)]` enum both key as `type:object`, so
   the differ cannot match them by identity. Failing closed unconditionally would

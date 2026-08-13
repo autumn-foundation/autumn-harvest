@@ -4629,3 +4629,123 @@ fn narrowing_an_array_typed_singleton_branch_set_is_breaking() {
         "dropping `null` from every branch's array type must be reported"
     );
 }
+
+// ── Round 20: a memoized $ref must not silence the branch-overlap guard ────
+
+/// `A` is referenced from an ordinary property AND from a `oneOf` branch.
+/// `properties` is a sorted map, so `a_common` is traversed first and consumes
+/// the `A`/`A` memo entry; `z_choice`'s branch then resolves to the same pair
+/// and returns without emitting anything.
+fn shared_ref_branch_schema(maximum: i64) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "a_common": {"$ref": "#/definitions/A"},
+            "z_choice": {
+                "oneOf": [{"$ref": "#/definitions/A"}, {"type": "integer", "minimum": 1}]
+            }
+        },
+        "definitions": {"A": {"type": "integer", "maximum": maximum}}
+    })
+}
+
+#[test]
+fn relaxing_a_shared_ref_into_a_sibling_branch_is_breaking() {
+    // Relaxing `A.maximum` 0 -> 2 reads as an ordinary compatible bound
+    // relaxation at `/a_common`. Under `z_choice` it is not: the recorded `1`
+    // used to match ONLY the `minimum: 1` branch, and now matches both — and
+    // `oneOf` requires exactly one, so it is rejected. The branch guard has to
+    // see the change even though the memo already consumed the ref pair.
+    let baseline = shared_ref_branch_schema(0);
+    let current = shared_ref_branch_schema(2);
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"a_common": 0, "z_choice": 1}));
+    assert!(
+        diff_input(baseline, current).has_breaking(),
+        "a compatible-looking relaxation must not absorb a `oneOf` overlap through a memoized ref"
+    );
+}
+
+#[test]
+fn relaxing_a_shared_ref_with_disjoint_siblings_stays_compatible() {
+    // The over-firing guard: same shape, but the sibling branch is a different
+    // JSON type, so no relaxation of `A` can ever make a payload match both.
+    // Replaying the change signal must not turn every shared ref into a break.
+    let with = |maximum: i64| {
+        json!({
+            "type": "object",
+            "properties": {
+                "a_common": {"$ref": "#/definitions/A"},
+                "z_choice": {
+                    "oneOf": [{"$ref": "#/definitions/A"}, {"type": "string"}]
+                }
+            },
+            "definitions": {"A": {"type": "integer", "maximum": maximum}}
+        })
+    };
+    assert_compatible(with(0), with(2));
+}
+
+#[test]
+fn an_unchanged_shared_ref_under_a_branch_is_not_reported() {
+    // The churn guard: an untouched definition must stay silent, or every
+    // schema that references one from a `oneOf` reports on every run.
+    let diff = diff_input(shared_ref_branch_schema(0), shared_ref_branch_schema(0));
+    assert!(
+        diff.deltas.is_empty(),
+        "an unchanged shared ref must emit nothing: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Two levels of sharing: `B` is reached first from an ordinary property, then
+/// through `A` (which has its own keywords, so it is its own memo pair), and
+/// only then from a `oneOf` branch. `A` emits nothing of its own — its whole
+/// change is a swallowed hit on `B` — so the signal has to propagate UP through
+/// the memo, not just out of it.
+fn nested_shared_ref_branch_schema(maximum: i64) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "a_first": {"$ref": "#/definitions/B"},
+            "m_mid": {"$ref": "#/definitions/A"},
+            "z_choice": {
+                "oneOf": [
+                    {"$ref": "#/definitions/A"},
+                    {"type": "array", "items": {"type": "integer", "minimum": 1}}
+                ]
+            }
+        },
+        "definitions": {
+            "A": {"type": "array", "items": {"$ref": "#/definitions/B"}},
+            "B": {"type": "integer", "maximum": maximum}
+        }
+    })
+}
+
+#[test]
+fn relaxing_a_transitively_shared_ref_into_a_sibling_branch_is_breaking() {
+    let baseline = nested_shared_ref_branch_schema(0);
+    let current = nested_shared_ref_branch_schema(2);
+    assert_oracle_agrees_breaking(
+        &baseline,
+        &current,
+        &json!({"a_first": 0, "m_mid": [0], "z_choice": [1]}),
+    );
+    assert!(
+        diff_input(baseline, current).has_breaking(),
+        "a change swallowed one level DOWN must still reach the branch guard"
+    );
+}
+
+#[test]
+fn an_unchanged_transitively_shared_ref_is_not_reported() {
+    let diff = diff_input(
+        nested_shared_ref_branch_schema(0),
+        nested_shared_ref_branch_schema(0),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "an unchanged nested shared ref must emit nothing: {:#?}",
+        diff.deltas
+    );
+}
