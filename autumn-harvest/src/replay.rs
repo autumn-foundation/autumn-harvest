@@ -1105,11 +1105,29 @@ impl HistoryMatcher {
 
             match &self.events[scan_cursor] {
                 WorkflowEvent::ActivityCompleted {
-                    activity_id: id,
-                    output,
+                    activity_id: id, ..
                 } if *id == activity_id => {
+                    // Take rather than clone the recorded output. This is the
+                    // only production read of an already-matched
+                    // `ActivityCompleted`'s `output` anywhere in this matcher
+                    // -- `settle_terminal` below re-reads only `activity_id`
+                    // from this same event, never `output` -- so once matched,
+                    // the recorded payload is never observed again and cloning
+                    // it (a deep clone for an arbitrary-shape `Value`, e.g. a
+                    // `BTreeMap`-backed object) is pure waste. Re-indexed
+                    // mutably here (rather than converting the whole match's
+                    // scrutinee, which would force every other arm below to
+                    // separately satisfy the borrow checker for no benefit):
+                    // the shared borrow above ends at the guard check, since
+                    // `id` is the only field bound from it. See
+                    // `docs/performance-replay.md`.
+                    let WorkflowEvent::ActivityCompleted { output, .. } =
+                        &mut self.events[scan_cursor]
+                    else {
+                        unreachable!("just matched ActivityCompleted above")
+                    };
                     let result = HistoryMatch::Matched {
-                        output: output.clone(),
+                        output: std::mem::take(output),
                     };
                     return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
