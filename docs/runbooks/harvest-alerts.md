@@ -1907,6 +1907,7 @@ own work counters and its `tracing::error!`, not this heartbeat.
     "name": "scanner_liveness",
     "status": "fail",
     "summary": "1 of 5 background control loops are stale: timeout (shard 1)",
+    "affected_shards": [1],
     "details": {
       "scanners": [
         { "scanner": "timeout", "shard": 1, "verdict": "wedged", "age_secs": 214, ... }
@@ -1915,8 +1916,20 @@ own work counters and its `tracing::error!`, not this heartbeat.
   }
   ```
 
-  `shard` is `null` for the process-wide loops (`retention`, `schedule`) and on
-  single-shard deployments, where there is no fan-out to disambiguate.
+  `affected_shards` is the standard localization field every preflight check
+  shares, so the plain table view carries it too -- `harvest preflight` renders
+  it in the SCOPE column:
+
+  ```console
+  $ harvest preflight
+  STATUS  CHECK              SCOPE     SUMMARY
+  fail    scanner_liveness   shards=1  1 of 5 background control loops are stale: timeout (shard 1)
+  ```
+
+  It lists only the **stale** instances, so a healthy sibling shard is never
+  reported as affected. `shard` / `affected_shards` are empty for the
+  process-wide loops (`retention`, `schedule`) and on single-shard deployments,
+  where there is no fan-out to disambiguate; the SCOPE column then reads `-`.
 
 ### Safe actions
 

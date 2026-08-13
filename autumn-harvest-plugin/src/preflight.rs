@@ -1360,6 +1360,11 @@ fn scanner_liveness_check(statuses: &[ScannerStatus]) -> PreflightCheckResult {
     // shard when there is one. Kept separate from `stale_scanners` so that
     // field stays a stable, machine-readable list of bare scanner names.
     let mut stale_labels = Vec::new();
+    // The standard `affected_shards` contract field: the shards of the stale
+    // instances only. `check()` sorts and dedups it, and the CLI's SCOPE column
+    // reads exactly this field, so a per-shard wedge must land here and not
+    // only in the summary and details.
+    let mut affected_shards = Vec::new();
     let mut entries = Vec::with_capacity(statuses.len());
 
     for status in statuses {
@@ -1382,6 +1387,9 @@ fn scanner_liveness_check(statuses: &[ScannerStatus]) -> PreflightCheckResult {
                 || status.scanner.as_str().to_owned(),
                 |shard| format!("{} (shard {})", status.scanner.as_str(), shard.as_i32()),
             ));
+            if let Some(shard) = status.shard {
+                affected_shards.push(shard.as_i32());
+            }
         }
         entries.push(json!({
             "scanner": status.scanner.as_str(),
@@ -1434,7 +1442,7 @@ fn scanner_liveness_check(statuses: &[ScannerStatus]) -> PreflightCheckResult {
                  process; see docs/runbooks/harvest-alerts.md#harvest_scanner_stalled.",
             )
         },
-        Vec::new(),
+        affected_shards,
         json!({
             "scanners_registered": statuses.len(),
             "stale_scanners": stale_scanners,
@@ -1607,6 +1615,58 @@ mod tests {
         // `stale_scanners` stays a stable, machine-readable list of bare
         // scanner names — the shard rides the summary and the entry.
         assert_eq!(result.details["stale_scanners"][0], "timeout");
+    }
+
+    #[test]
+    fn scanner_liveness_populates_the_affected_shards_contract_field() {
+        // `affected_shards` is the STANDARD localization field every preflight
+        // check shares, and the CLI's SCOPE column derives from it exclusively
+        // (it prints `-` for an empty vec). Putting the shard only in the
+        // summary and the nested details would leave `harvest preflight` and
+        // every machine consumer without it.
+        let result = scanner_liveness_check(&[
+            status_on_shard(Scanner::Timeout, 30, 200, 4, Some(ShardId::new(1))),
+            status_on_shard(Scanner::PoisonPill, 30, 300, 2, Some(ShardId::new(2))),
+        ]);
+
+        assert_eq!(result.status, PreflightStatus::Fail);
+        assert_eq!(
+            result.affected_shards,
+            vec![1, 2],
+            "every stale per-shard instance must appear in the standard \
+             affected_shards field, sorted and deduped"
+        );
+    }
+
+    #[test]
+    fn scanner_liveness_affected_shards_covers_only_the_stale_instances() {
+        // A healthy per-shard loop must not widen the blast radius: an operator
+        // reading SCOPE should see the shards that are actually unprotected.
+        let result = scanner_liveness_check(&[
+            status_on_shard(Scanner::Timeout, 30, 200, 4, Some(ShardId::new(1))),
+            status_on_shard(Scanner::PoisonPill, 30, 1, 99, Some(ShardId::new(2))),
+        ]);
+
+        assert_eq!(result.status, PreflightStatus::Fail);
+        assert_eq!(
+            result.affected_shards,
+            vec![1],
+            "shard 2 is ticking normally, so it must not be reported as affected"
+        );
+    }
+
+    #[test]
+    fn scanner_liveness_affected_shards_is_empty_for_a_process_wide_loop() {
+        // Retention and schedule are process-wide, so there is no shard to
+        // localize -- the field stays empty and the CLI renders `-`.
+        let result = scanner_liveness_check(&[status(Scanner::Retention, 30, 200, 4)]);
+
+        assert_eq!(result.status, PreflightStatus::Fail);
+        assert!(
+            result.affected_shards.is_empty(),
+            "a process-wide loop has no shard to attribute: {:?}",
+            result.affected_shards
+        );
     }
 
     /// A process-wide loop has no shard to report and must say so rather than
