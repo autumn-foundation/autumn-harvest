@@ -665,6 +665,82 @@ fn a_current_baseline_passes_the_currency_check() {
     );
 }
 
+/// `BASELINE` with one regenerated-metadata field edited, serialised back.
+///
+/// Built through the real parse/serialise round trip rather than by string
+/// surgery, so the fixture is always a VALID artifact — a malformed one would
+/// fail at parse and prove nothing about the currency check.
+fn doctor(edit: impl FnOnce(&mut autumn_harvest::WorkflowSchemaContract)) -> String {
+    let mut c = autumn_harvest::WorkflowSchemaContract::parse(BASELINE).expect("fixture parses");
+    let before = c.clone();
+    edit(&mut c);
+    assert_ne!(c, before, "the fixture must actually be doctored");
+    c.to_json_pretty().expect("serialises")
+}
+
+/// Currency is not only about schemas. `compatibility` is the machine-readable
+/// claim about WHICH rules this gate implements, and nothing above compares it —
+/// the differ only ever looks at `workflows`. An artifact edited to advertise a
+/// keyword the differ does not analyse would promise a guarantee no code
+/// provides, and pass every other check untouched.
+#[test]
+fn a_hand_edited_ruleset_fails_the_currency_check() {
+    let doctored = doctor(|c| {
+        // Advertise a keyword the differ does not analyse.
+        c.compatibility
+            .analysed_keywords
+            .push("pattern".to_string());
+    });
+    let (_d, b, c) = tree(&doctored, BASELINE);
+
+    // The schemas are identical, so every schema-level check is clean.
+    assert!(
+        run_schema_check(&b, &c, SchemaCheckFormat::Text, false, None).is_ok(),
+        "the doctored artifact's SCHEMAS match, so the ordinary check passes"
+    );
+
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, true, None)
+        .expect_err("an artifact advertising rules the gate does not implement is not current");
+    assert_eq!(err.exit_code(), 1, "the gate exits 1");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("compatibility"),
+        "the failure must name the stale field: {msg}"
+    );
+    assert!(
+        msg.contains("schema update"),
+        "the failure must name the one command that fixes it: {msg}"
+    );
+}
+
+/// The same hole in prose rather than in the machine-readable ruleset.
+#[test]
+fn a_hand_edited_description_fails_the_currency_check() {
+    let doctored = doctor(|c| {
+        c.description = "this gate verifies every JSON Schema keyword".to_string();
+    });
+    let (_d, b, c) = tree(&doctored, BASELINE);
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, true, None)
+        .expect_err("an artifact describing rules the gate does not implement is not current");
+    assert!(
+        format!("{err}").contains("description"),
+        "the failure must name the stale field"
+    );
+}
+
+/// The over-firing guard for the metadata check: the crate version records WHICH
+/// BUILD generated the artifact, not what the gate checks, so it must not tie
+/// currency to every release bump.
+#[test]
+fn a_differing_crate_version_does_not_fail_the_currency_check() {
+    let bumped = doctor(|c| c.version = "9.9.9-test".to_string());
+    let (_d, b, c) = tree(&bumped, BASELINE);
+    assert!(
+        run_schema_check(&b, &c, SchemaCheckFormat::Text, true, None).is_ok(),
+        "provenance metadata is not a claim about the ruleset"
+    );
+}
+
 /// Currency is about deltas, not about the acknowledgement log: an artifact
 /// carrying records still passes once its schemas match.
 #[test]

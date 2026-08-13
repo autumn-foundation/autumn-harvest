@@ -2652,23 +2652,29 @@ fn branch_key(branch: &Value, root: &Value) -> (String, Discriminator) {
     // the discriminant in `required`, so this costs no legitimate shape.
     if let Some(props) = obj.get("properties").and_then(Value::as_object) {
         for (name, sub) in props {
-            let tag = sub.get("const").cloned().or_else(|| {
-                match sub.get("enum").and_then(Value::as_array) {
-                    Some(vals) if vals.len() == 1 => Some(vals[0].clone()),
-                    _ => None,
-                }
-            });
-            if let Some(t) = tag {
-                let d = if req.contains(name) {
-                    Discriminator::Tag {
-                        name: name.clone(),
-                        value: t.clone(),
-                    }
-                } else {
-                    Discriminator::None
-                };
-                return (format!("tag:{name}={t}"), d);
-            }
+            // A singleton `enum` is the ONLY spelling that proves anything: the
+            // engine's `validate_node` enforces `enum`, and has no `const` arm
+            // at all. An unenforced `const` accepts every value — the universal
+            // set, exactly like an unrecognised `type` name — so two branches
+            // "pinned" to different `const`s both accept a recorded tag and
+            // `oneOf` rejects it. `const` still keys the branch for IDENTITY,
+            // which never claims disjointness: dropping it there would make two
+            // differently-tagged branches key alike and mask a removal.
+            let enum_tag = match sub.get("enum").and_then(Value::as_array) {
+                Some(vals) if vals.len() == 1 => Some(vals[0].clone()),
+                _ => None,
+            };
+            let Some(t) = enum_tag.clone().or_else(|| sub.get("const").cloned()) else {
+                continue;
+            };
+            let d = match (enum_tag, req.contains(name)) {
+                (Some(v), true) => Discriminator::Tag {
+                    name: name.clone(),
+                    value: v,
+                },
+                _ => Discriminator::None,
+            };
+            return (format!("tag:{name}={t}"), d);
         }
     }
     // Unit variant: a singleton `enum`.
@@ -2763,6 +2769,15 @@ fn type_sets_disjoint(a: &Value, a_root: &Value, b: &Value, b_root: &Value) -> b
 /// and a new `string` property share `string`, yet a recorded `1` was accepted
 /// as an extra before and is rejected now.
 ///
+/// Containing the extras' `type` is not containing the extras: every OTHER
+/// constraint keyword narrows further. A new property typed `string` with
+/// `"enum": ["x"]` contains the extras type `string` and still rejects a
+/// recorded `"y"`. Proving the general case is full schema containment, so
+/// anything the extras schema does not already demand *identically* fails
+/// closed. The exceptions are `type`, which has its own containment rule below,
+/// and `default`, which supplies a value for an ABSENT key — a recorded extra
+/// is by definition present, so it cannot reject one.
+///
 /// Each side resolves against **its own** root so a `$ref` in one cannot
 /// accidentally resolve against the other's `definitions`.
 fn declared_admits_baseline_extras(
@@ -2771,11 +2786,21 @@ fn declared_admits_baseline_extras(
     declared: &Value,
     declared_root: &Value,
 ) -> bool {
-    let types = |v: &Value, root: &Value| -> Option<BTreeSet<String>> {
-        let (r, _) = resolve_ref(root, v);
-        type_set(r.as_object()?)
-    };
-    match (types(extras, extras_root), types(declared, declared_root)) {
+    let (extras, _) = resolve_ref(extras_root, extras);
+    let (declared, _) = resolve_ref(declared_root, declared);
+    let extras_obj = extras.as_object();
+    if let Some(d) = declared.as_object()
+        && d.iter().any(|(k, v)| {
+            k != "type"
+                && k != "default"
+                && !ANNOTATION_KEYWORDS.contains(&k.as_str())
+                && extras_obj.and_then(|e| e.get(k)) != Some(v)
+        })
+    {
+        return false;
+    }
+    let types = |v: &Value| -> Option<BTreeSet<String>> { type_set(v.as_object()?) };
+    match (types(extras), types(declared)) {
         // The new property restricts nothing, so it admits every recorded extra.
         (_, None) => true,
         // The baseline accepted extras of EVERY JSON type (an object with no

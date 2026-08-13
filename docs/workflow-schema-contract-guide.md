@@ -164,7 +164,7 @@ travels with the file.
 | An `enum` present in both revisions where **either side is not a JSON array** | A validator ignores the unreadable side and enforces the readable one, so `"enum": "x"` → `"enum": ["x"]` newly rejects every recorded value outside the set. `enum` is nominally analysed, so it never reaches the fail-closed sweep — it fails closed here instead. Two identical malformed values are not an edit and emit nothing |
 | Widening an existing `oneOf` branch until it overlaps a sibling | `oneOf` requires **exactly** one match. Baseline branches `{"maximum":0}` and `{"minimum":1}` accept a recorded `1` exactly once; relaxing the first to `{"maximum":2}` reads as a compatible bound relaxation in isolation, but `1` now satisfies both branches and is rejected. Checked against **every other** branch, in both directions — unlike `anyOf`, where first-match binding means only the branches declared *after* this one can lose data, so widening the **last** `oneOf` branch is just as fatal as widening the first. Narrowing needs no such check — it cannot create an overlap, and the payloads it drops are already reported by the narrowing itself |
 | Changing the `default` of a property that is optional on **both** sides | `default` is a pure annotation to a validator, but not to serde: `#[serde(default = "retries")]` records the computed fallback there. Change it from `3` to `5` and every recorded payload that omitted the key deserializes to a different value — the same JSON, a different meaning. Only compared where serde would actually substitute it; one beside a required key, or on a root or array-item schema, is never substituted and emits nothing |
-| Declaring a property that does **not accept every value the baseline allowed as an extra** | Serde *ignores* an undeclared key but *parses* a declared one. If the baseline said `"additionalProperties": {"type":"integer"}`, a recorded `b: 1` was carried along as an extra; declaring `b: Option<String>` now fails to parse it. The test is **containment**, not overlap: extras typed `["string","integer"]` and a new `string` property share `string`, yet a recorded `1` was accepted before and is rejected now. Only reported when provable — on a fully open object nothing is knowable in either direction, so it stays compatible (see the limits below) |
+| Declaring a property that does **not accept every value the baseline allowed as an extra** | Serde *ignores* an undeclared key but *parses* a declared one. If the baseline said `"additionalProperties": {"type":"integer"}`, a recorded `b: 1` was carried along as an extra; declaring `b: Option<String>` now fails to parse it. The test is **containment**, not overlap: extras typed `["string","integer"]` and a new `string` property share `string`, yet a recorded `1` was accepted before and is rejected now. Containment is over the *whole* schema, not just `type` — every other constraint narrows further, so `{"type":"string","enum":["x"]}` contains the extras' `string` and still rejects a recorded `"y"`. Full schema containment is not implemented, so any constraint the extras schema does not already demand **identically** fails closed; the one-directional cost is that a *looser* declared constraint (`minLength` 5 → 3) asks for an acknowledgement it does not strictly need. Only reported when provable — on a fully open object nothing is knowable in either direction, so it stays compatible (see the limits below) |
 | `additionalProperties` present but **neither a boolean nor a schema** | A validator ignores a non-schema value, so it constrains nothing and ranks with `true`. Correcting `"additionalProperties": "oops"` to `{"type":"string"}` therefore *restricts*, and newly rejects every recorded non-string extra. Two different malformed values are both ignored at runtime and emit nothing |
 | A checked-in acknowledgement whose reason is **blank** | A rubber stamp is not an acknowledgement; the artifact is rejected |
 | Any change to a constraint keyword **outside the analysed set** | Fail-closed — see below |
@@ -282,6 +282,17 @@ Four are worth knowing before you rely on it:
   disjoint from nothing, and a branch declaring one is never proved disjoint.
   `schemars` only ever emits the seven, so this can fire only on a hand-written
   schema.
+
+  The same rule rejects **`const` as a proof**. `const` is not in the analysed
+  set and the engine's validator has no arm for it, so a `const`-tagged branch
+  accepts every value — the universal set, exactly like an unrecognised `type`
+  name. Only a singleton `enum` proves anything, because `enum` *is* enforced.
+  `const` still *identifies* a branch, though: matching a baseline branch to its
+  current counterpart never claims disjointness, and ignoring the tag there would
+  make two differently-tagged branches look alike and hide a variant removal. So
+  a `const` tag keys the branch but mints no discriminator — identity and proof
+  are separate jobs. `schemars` emits singleton `enum`s, so this too fires only
+  on a hand-written schema.
 
   The mirror-image hazard is covered too: **widening an existing `oneOf` branch**
   until it overlaps a sibling is breaking, because a payload that used to match
@@ -544,6 +555,20 @@ reported a delta. `--require-current` refuses any unabsorbed delta, so step 1
 cannot merge until the artifact is advanced — and step 3 is then a removal
 against a baseline that knows the variant existed, which is breaking and needs
 an acknowledgement.
+
+The flag also checks the artifact's **regenerated metadata**, which the differ
+never looks at — it reads only `workflows`. `compatibility` is the
+machine-readable claim about which rules this gate implements, and `description`
+is the same claim in prose; a hand-edited `analysed_keywords` would otherwise
+sail through and tell a reviewer this build enforces something it does not. Both
+are compared, and a mismatch names which drifted.
+
+Two siblings are deliberately *not* compared. `version` records which **build**
+produced the artifact rather than what the gate checks, so comparing it would
+force a regeneration on every crate version bump for no change in meaning.
+`contract_version` needs no comparison at all — parsing already hard-refuses a
+value this build does not implement, and rebuilds `workflows` and `coverage`
+from the entries.
 
 The fix is always the same: run `harvest schema update`, and commit the
 regenerated artifact alongside the change.

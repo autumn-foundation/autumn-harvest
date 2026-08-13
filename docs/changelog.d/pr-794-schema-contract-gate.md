@@ -867,3 +867,84 @@ the ignored one, both fail the rewritten-target test. Two over-firing guards shi
 with the sweep — an unchanged target and annotation churn inside one — and three
 with the containment predicate, covering the wider-extras, unconstrained-property
 and already-compatible directions.
+
+### Seventeenth review round
+
+One P1, fixed.
+
+- **P1 — containing the extras' `type` is not containing the extras.** The
+  sixteenth round replaced overlap with containment at the
+  `additionalProperties` site, but the containment it computed was over `type`
+  alone. Every *other* constraint keyword narrows further, so a declared
+  property could contain the extras' type and still reject values the baseline
+  accepted: extras `{"type": "string"}` with a new property
+  `{"type": "string", "enum": ["x"]}` contains `string`, yet a recorded
+  `{"b": "y"}` deserialized before and does not now. The same holds for a bound
+  (`minLength`), a `pattern`, or any keyword the extras schema did not already
+  demand. Proving the general case is full schema containment, which this differ
+  does not implement, so the predicate now fails closed on anything the extras
+  schema does not already demand *identically*. Two keywords are exempt by
+  construction: `type`, which has its own containment rule, and `default`, which
+  supplies a value for an *absent* key — a recorded extra is by definition
+  present, so a default cannot reject one.
+
+  The accepted cost is one direction of over-firing: a declared constraint
+  *looser* than the baseline's own extra constraint (`minLength` 5 → 3) reads as
+  a difference and fails closed, even though every recorded extra still
+  validates. That is the safe direction — it asks for an acknowledgement rather
+  than silently passing a break — and ships pinned by a test that documents it
+  as a decision rather than an accident.
+
+Four mutants. Dropping the constraint guard entirely, and weakening it to
+presence-only rather than value-identity, each fail their own detection test —
+the second only after a *tightened*-constraint test was added, since a guard that
+merely checks presence still catches the *added*-keyword direction. Inverting the
+two `type`-containment arms fails the wider-extras and unconstrained-property
+guards. A fifth mutant survives and is documented rather than tested: the
+`ANNOTATION_KEYWORDS` filter inside the guard is unreachable, because
+canonicalisation strips annotations from both roots before the diff ever runs. It
+stays as defensive code that would matter if that ordering ever changed.
+
+### Eighteenth review round
+
+Two findings, both fixed — one in the differ, one in the CI gate itself.
+
+- **P1 — `const` is not a proof of disjointness.** A `oneOf` branch tagged with
+  `const` was accepted as a discriminator, so adding a branch beside it read as
+  COMPATIBLE on the grounds that the two are provably disjoint. The engine's
+  `validate_node` has no `const` arm at all: an unenforced keyword accepts every
+  value, making a `const`-tagged branch the universal set — exactly the
+  unrecognised-`type`-name case the fifteenth round closed. Only a singleton
+  `enum` proves anything, because `enum` *is* enforced.
+
+  The fix separates the two jobs the tag was doing. A branch **key** is identity
+  — it matches a baseline branch to its current counterpart — and never claims
+  disjointness, so it still keys on `const`; dropping it there would make two
+  differently-tagged branches key alike and mask a variant removal. A
+  **`Discriminator`** is proof, and is now minted only from a singleton `enum`.
+  This is the same directional rule the differ already applies elsewhere: an
+  unreadable or unenforced construct never buys a COMPATIBLE verdict.
+
+- **P2 — `--require-current` never compared the artifact's regenerated
+  metadata.** The flag refused a stale schema *body*, but the differ only ever
+  reads `workflows`, so a hand-edited `compatibility` block — the
+  machine-readable claim about which rules this gate implements — sailed
+  through. A reviewer trusting `analysed_keywords` could therefore read a
+  keyword list this build does not implement. `--require-current` now also
+  compares `description` and `compatibility`, naming which drifted and pointing
+  at `harvest schema update`.
+
+  Two siblings are deliberately excluded. `version` records which *build*
+  produced the artifact rather than what the gate checks, so comparing it would
+  force a regeneration on every crate version bump for no change in meaning.
+  `contract_version` needs no comparison at all — `parse` already hard-refuses a
+  value this build does not implement, and rebuilds `workflows` and `coverage`
+  from the entries.
+
+Five mutants. Dropping either metadata comparison fails its own detection test;
+adding a `version` comparison fails the over-firing guard that pins the exclusion.
+On the differ side, restoring `const` to the discriminator fails the
+added-branch test, and dropping `const` from the branch *key* fails the
+variant-removal test — the pin that makes the identity-versus-proof split sharp,
+since an unchanged schema compares identically even with degraded keys and so
+cannot distinguish the two.

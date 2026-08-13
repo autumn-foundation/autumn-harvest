@@ -3493,6 +3493,69 @@ fn adding_a_oneof_branch_tagged_at_the_same_key_stays_compatible() {
     );
 }
 
+/// A `const` tag proves nothing, because the engine does not enforce `const`.
+///
+/// `validate_node` has no `const` arm at all, so `{"const": "B"}` accepts every
+/// value — the same universal-set problem an unrecognised `type` name has. Two
+/// branches "pinned" to different `const`s therefore both accept a recorded
+/// `{"tag": "A"}`, and `oneOf`'s exactly-one rule rejects it.
+#[test]
+fn adding_a_oneof_branch_tagged_with_const_is_breaking() {
+    let branch = |v: &str| {
+        json!({"type": "object", "required": ["tag"],
+               "properties": {"tag": {"const": v}}})
+    };
+    let baseline = json!({"oneOf": [branch("A")]});
+    let current = json!({"oneOf": [branch("A"), branch("B")]});
+    assert_breaking(baseline.clone(), current.clone(), ChangeKind::VariantAdded);
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"tag": "A"}));
+}
+
+/// The engine-enforced spelling of the same shape — a singleton `enum`, which is
+/// what `schemars` emits — must stay compatible, or the fix above would block
+/// every internally-tagged enum that gains a variant.
+#[test]
+fn adding_a_oneof_branch_tagged_with_a_singleton_enum_stays_compatible() {
+    let branch = |v: &str| {
+        json!({"type": "object", "required": ["tag"],
+               "properties": {"tag": {"enum": [v]}}})
+    };
+    assert_compatible(
+        json!({"oneOf": [branch("A")]}),
+        json!({"oneOf": [branch("A"), branch("B")]}),
+    );
+}
+
+/// Refusing `const` as a *proof* must not stop it identifying a branch. An
+/// untouched `const`-tagged `oneOf` still keys each branch by its tag, so
+/// nothing is reported and no branch is mistaken for another.
+#[test]
+fn an_unchanged_const_tagged_oneof_is_not_reported() {
+    let branch = |v: &str| {
+        json!({"type": "object", "required": ["tag"],
+               "properties": {"tag": {"const": v}, "n": {"type": "integer"}}})
+    };
+    let schema = json!({"oneOf": [branch("A"), branch("B")]});
+    assert_compatible(schema.clone(), schema);
+}
+
+/// The identity claim, exercised rather than asserted: with the tag keying each
+/// branch, REMOVING one is a clean variant removal. Were `const` dropped from the
+/// key, both branches would key alike as bare objects and the removal would read
+/// as something else — which is why the fix above narrows the *proof* only.
+#[test]
+fn removing_a_const_tagged_oneof_branch_is_reported_as_a_variant_removal() {
+    let branch = |v: &str| {
+        json!({"type": "object", "required": ["tag"],
+               "properties": {"tag": {"const": v}, "n": {"type": "integer"}}})
+    };
+    assert_breaking(
+        json!({"oneOf": [branch("A"), branch("B")]}),
+        json!({"oneOf": [branch("A")]}),
+        ChangeKind::VariantRemoved,
+    );
+}
+
 /// An ordinary one-required-field struct is not an externally-tagged variant.
 /// Without `additionalProperties: false` the recorded `{"id":1,"name":"x"}`
 /// satisfies both branches — `name` is merely an undeclared extra on the first.
@@ -3959,6 +4022,106 @@ fn declaring_a_property_on_a_fully_open_object_stays_compatible() {
         json!({"type": "object", "properties": {"a": {"type": "string"}}}),
         json!({"type": "object",
                "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}),
+        ChangeKind::OptionalPropertyAdded,
+    );
+}
+
+/// Containing the extras' TYPE is not containing the extras. A declared property
+/// may carry any other constraint keyword, and every one of them narrows further
+/// than the type alone.
+#[test]
+fn declaring_a_property_that_adds_an_enum_over_the_baselines_extras_is_breaking() {
+    let extras = json!({"type": "string"});
+    let baseline = json!({"type": "object", "additionalProperties": extras});
+    let current = json!({"type": "object",
+                         "properties": {"b": {"type": "string", "enum": ["x"]}},
+                         "additionalProperties": extras});
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::RequiredPropertyAdded,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"b": "y"}));
+}
+
+/// The same hole through a bound rather than an `enum`.
+#[test]
+fn declaring_a_property_that_adds_a_bound_over_the_baselines_extras_is_breaking() {
+    let extras = json!({"type": "string"});
+    let baseline = json!({"type": "object", "additionalProperties": extras});
+    let current = json!({"type": "object",
+                         "properties": {"b": {"type": "string", "minLength": 3}},
+                         "additionalProperties": extras});
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::RequiredPropertyAdded,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"b": "xy"}));
+}
+
+/// The over-firing guard: a declared property that merely REPEATS what the
+/// baseline already demanded of an extra accepts exactly the same values, so it
+/// must stay compatible or every constrained extras schema becomes unusable.
+#[test]
+fn declaring_a_property_repeating_the_baselines_extra_constraints_stays_compatible() {
+    let extras = json!({"type": "string", "minLength": 3});
+    assert_compatible_delta(
+        json!({"type": "object", "additionalProperties": extras}),
+        json!({"type": "object", "properties": {"b": extras},
+               "additionalProperties": extras}),
+        ChangeKind::OptionalPropertyAdded,
+    );
+}
+
+/// Carrying the same keyword is not carrying the same constraint. Extras
+/// demanding `minLength: 3` and a property demanding `minLength: 5` share the
+/// keyword and the type, yet a recorded four-character extra is newly rejected —
+/// so the comparison is on the VALUE, not on the key's presence.
+#[test]
+fn declaring_a_property_that_tightens_a_baseline_extra_constraint_is_breaking() {
+    let baseline = json!({"type": "object",
+                          "additionalProperties": {"type": "string", "minLength": 3}});
+    let current = json!({"type": "object",
+                         "properties": {"b": {"type": "string", "minLength": 5}},
+                         "additionalProperties": {"type": "string", "minLength": 3}});
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::RequiredPropertyAdded,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"b": "abcd"}));
+}
+
+/// A deliberate over-fire, pinned so it is a decision rather than a surprise.
+///
+/// A property whose constraint is LOOSER than the extras schema's genuinely
+/// admits every recorded extra, but proving that means ordering every keyword's
+/// value space — full schema containment. Only `type` gets that treatment; the
+/// rest fail closed, and `--acknowledge` is the exit.
+#[test]
+fn declaring_a_property_that_loosens_a_baseline_extra_constraint_fails_closed() {
+    assert_breaking(
+        json!({"type": "object",
+               "additionalProperties": {"type": "string", "minLength": 3}}),
+        json!({"type": "object",
+               "properties": {"b": {"type": "string", "minLength": 1}},
+               "additionalProperties": {"type": "string", "minLength": 3}}),
+        ChangeKind::RequiredPropertyAdded,
+    );
+}
+
+/// `default` is not a restriction: it supplies a value for an ABSENT key, and a
+/// recorded extra is by definition present. Failing closed on it would report
+/// every `#[serde(default = "…")]` field added over typed extras as breaking.
+#[test]
+fn declaring_a_property_with_a_serde_default_over_typed_extras_stays_compatible() {
+    let extras = json!({"type": "string"});
+    assert_compatible_delta(
+        json!({"type": "object", "additionalProperties": extras}),
+        json!({"type": "object",
+               "properties": {"b": {"type": "string", "default": "d"}},
+               "additionalProperties": extras}),
         ChangeKind::OptionalPropertyAdded,
     );
 }

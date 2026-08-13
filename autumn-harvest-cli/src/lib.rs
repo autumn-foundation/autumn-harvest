@@ -3098,6 +3098,43 @@ pub fn run_schema_check(
         });
     }
 
+    // Regenerated METADATA is not compared by the differ, which only ever looks
+    // at `workflows` — so a hand-edit to it survives every check above. That
+    // matters because `compatibility` is the machine-readable claim about WHICH
+    // rules this gate implements: an artifact advertising `pattern` as analysed
+    // would promise a guarantee no code provides, and `description` is the same
+    // claim in prose. `schema update` regenerates both, so requiring them to
+    // match the freshly generated contract costs nothing legitimate.
+    //
+    // Two siblings are deliberately NOT compared here. `version` records which
+    // BUILD produced the artifact rather than what the gate checks, so tying
+    // currency to it would force a regeneration on every crate version bump for
+    // no safety gain. `contract_version` needs no check at all — `parse` already
+    // hard-refuses a value this build does not implement — and `workflows` and
+    // `coverage` are rebuilt from the entries on parse.
+    //
+    // Reported before the delta staleness below because it is the stronger
+    // claim: a stale schema means the artifact is behind, while a doctored
+    // ruleset means it is lying.
+    if require_current {
+        let stale: Vec<&str> = [
+            ("description", base.description != cur.description),
+            ("compatibility", base.compatibility != cur.compatibility),
+        ]
+        .into_iter()
+        .filter_map(|(name, differs)| differs.then_some(name))
+        .collect();
+        if !stale.is_empty() {
+            return Err(CliError::InvalidInput(format!(
+                "the checked-in baseline's regenerated metadata does not match this build: {}. \
+                 That metadata is the artifact's own description of WHICH rules this gate \
+                 implements, so a stale or hand-edited value advertises a guarantee the checker \
+                 does not provide. Regenerate it with `harvest schema update`.",
+                stale.join(", ")
+            )));
+        }
+    }
+
     // Checked AFTER the breaking verdict so a break is always reported as a
     // break: staleness is the milder finding, and reporting it first would bury
     // the severe one behind "run schema update".
