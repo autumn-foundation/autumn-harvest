@@ -241,6 +241,14 @@ Four are worth knowing before you rely on it:
   reference is reported breaking, but if both revisions point at the same
   external document and the *document* changes, that is outside this gate's
   reach. Keep published schemas self-contained — `schemars` output already is.
+
+  Local reference *cycles* are resolvable and are compared. Resolution walks the
+  chain until it repeats, and the node it stops on — which still carries the
+  `$ref` that closes the loop — has its own keywords compared like any other:
+  `{"$ref": "#", "type": "string"}` → `{"$ref": "#", "type": "integer"}` is
+  breaking, matching the engine, which breaks the cycle the same way and then
+  enforces that `type`. Recursive types stay silent; only a real change to a
+  cycle's landing node is reported.
 - **`oneOf` disjointness is proved pairwise, from the schema.** An added branch
   is treated as disjoint only when **every pair** of branches in the set is
   provably disjoint — by disjoint `type` sets, by an internal tag pinning the

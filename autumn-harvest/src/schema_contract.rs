@@ -1514,8 +1514,25 @@ fn diff_node(
             // number of distinct pairs.
             return;
         }
-        diff_node(ctx, b, c, path, depth + 1, diff);
-        return;
+        // A chain that terminates on a CYCLE lands on a node that STILL carries
+        // `$ref` (`resolve_ref` breaks out rather than looping). Recursing would
+        // re-resolve to this same pair, hit the memo above, and return — so the
+        // landing node's OWN keywords would never be compared, and
+        // `{"$ref":"#","type":"string"}` -> `"integer"` would read as no change.
+        // The engine's `validate_node` breaks the cycle the same way and then
+        // enforces exactly those siblings, so fall through and compare them.
+        //
+        // Only the cycle-terminated case falls through. When resolution reaches a
+        // ref-free target, discarding the referring node's siblings is correct:
+        // that is draft-07 `$ref` semantics, and the engine's own `schema =
+        // resolved` reassignment does the same.
+        if b.get("$ref").is_none() && c.get("$ref").is_none() {
+            diff_node(ctx, b, c, path, depth + 1, diff);
+            return;
+        }
+        // Fall through with `b`/`c` bound to the landing nodes. Termination still
+        // holds: the memo was already inserted, so anything under them that walks
+        // back around the cycle resolves to this same pair and returns.
     }
 
     let (Some(bo), Some(co)) = (b.as_object(), c.as_object()) else {

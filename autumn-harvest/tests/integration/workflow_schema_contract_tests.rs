@@ -512,6 +512,85 @@ fn a_recursive_ref_cycle_terminates() {
 }
 
 #[test]
+fn a_cyclic_ref_still_has_its_sibling_keywords_compared() {
+    // `{"$ref":"#", …}` is a chain that terminates on a CYCLE: resolution lands
+    // back on a node that STILL carries `$ref`. Recursing into it would re-resolve
+    // to the same pair and hit the memo, so the landing node's own keywords would
+    // never be compared — and the memo is what makes the whole diff linear, so it
+    // cannot simply be dropped. The engine's `validate_node` breaks the cycle the
+    // same way and then enforces exactly those siblings, so they must be compared.
+    let baseline = json!({"$ref":"#","type":"string"});
+    let current = json!({"$ref":"#","type":"integer"});
+    assert_breaking(baseline.clone(), current.clone(), ChangeKind::TypeNarrowed);
+    assert_oracle_agrees_breaking(&baseline, &current, &json!("recorded"));
+}
+
+#[test]
+fn a_multi_hop_ref_cycle_has_the_landing_nodes_keywords_compared() {
+    // A -> B -> A: resolution walks two hops and terminates on the second, so the
+    // landing node is `B`, not the node the property pointed at. The changed
+    // constraint lives on `B`.
+    let schema = |ty: &str| {
+        json!({
+            "type":"object",
+            "properties":{"x":{"$ref":"#/definitions/A"}},
+            "definitions":{
+                "A":{"$ref":"#/definitions/B"},
+                "B":{"$ref":"#/definitions/A","type":ty}
+            }
+        })
+    };
+    assert_breaking(
+        schema("string"),
+        schema("integer"),
+        ChangeKind::TypeNarrowed,
+    );
+}
+
+/// Over-firing guard: an unchanged cyclic schema must still be silent.
+#[test]
+fn an_unchanged_cyclic_ref_is_not_reported() {
+    let cyclic = json!({"$ref":"#","type":"string"});
+    let diff = diff_input(cyclic.clone(), cyclic);
+    assert!(
+        diff.deltas.is_empty(),
+        "expected silence: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Over-firing guard: annotation churn inside a cyclic node is still ignored.
+#[test]
+fn annotation_churn_in_a_cyclic_ref_is_not_reported() {
+    let diff = diff_input(
+        json!({"$ref":"#","type":"string","description":"before"}),
+        json!({"$ref":"#","type":"string","description":"after"}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "expected silence: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Over-firing guard: comparing the landing node's keywords must not re-walk the
+/// cycle. A recursive type reaches its own definition through `properties`, which
+/// is exactly the path the fall-through now opens up.
+#[test]
+fn comparing_a_cyclic_landing_nodes_keywords_still_terminates() {
+    let recursive = json!({
+        "$ref":"#/definitions/R",
+        "definitions":{"R":{
+            "$ref":"#/definitions/R",
+            "type":"object",
+            "properties":{"child":{"$ref":"#/definitions/R"}}
+        }}
+    });
+    let diff = diff_input(recursive.clone(), recursive);
+    assert!(!diff.has_breaking(), "expected silence: {:#?}", diff.deltas);
+}
+
+#[test]
 fn a_deeply_nested_schema_stops_at_the_depth_cap_rather_than_recursing() {
     // Just past the differ's cap — deep enough that the cap must engage, and
     // shallow enough to be safe on every platform's test-thread stack.

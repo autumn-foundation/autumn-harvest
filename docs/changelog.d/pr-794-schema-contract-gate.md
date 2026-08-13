@@ -743,3 +743,36 @@ fail), follow only one hop (the transitive test fails), and restore the stale
 hardcoded annotation list (both description guards fail). The over-firing guards
 ship alongside — an unchanged definition, annotation churn inside one, and a
 self-referential definition each stay silent.
+
+### Fourteenth review round
+
+One P1, verified against both the differ and the engine before acting.
+
+- **A `$ref` cycle silently swallowed the landing node's own constraints.**
+  `diff_node` memoizes each resolved `$ref` pair before recursing, which is what
+  makes the diff linear rather than exponential over cross-referencing
+  definitions. But a chain that terminates on a *cycle* lands on a node that
+  still carries `$ref` — `resolve_ref` breaks out rather than looping — so the
+  recursive call re-resolved to that same pair, hit the memo, and returned
+  without comparing anything. `{"$ref":"#","type":"string"}` →
+  `{"$ref":"#","type":"integer"}` produced zero deltas, while the engine's
+  `validate_node` breaks the cycle the same way and then *enforces* the sibling
+  `type`, so a recorded string went from accepted to rejected on a clean gate
+  pass. The memo is kept — dropping it does not terminate — and the recursion is
+  now gated on the resolved node being ref-free; the cycle-terminated case falls
+  through to the keyword comparison that was already there, with `b`/`c` bound to
+  the landing nodes. Termination still holds because the memo was already
+  inserted, so anything under the landing node that walks back around the cycle
+  resolves to the same pair and returns.
+
+  Only the cycle-terminated case changed. When resolution reaches a ref-free
+  target, discarding the referring node's siblings stays correct: that is
+  draft-07 `$ref` semantics, and it is what the engine's own `schema = resolved`
+  reassignment does.
+
+Two mutants, each reverted individually with the specific outcome confirmed:
+restoring the unconditional recursion fails exactly the two detection tests, and
+disabling the memo does not terminate at all. Three over-firing guards ship
+alongside — an unchanged cyclic schema, annotation churn inside one, and a
+recursive definition reached through `properties` from its own cycle landing
+node each stay silent.
