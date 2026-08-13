@@ -12,7 +12,7 @@ use autumn_harvest::info::validate_against_schema;
 use autumn_harvest::schema_contract::{
     AcknowledgedBreakingChange, ChangeKind, MAX_DELTAS, SCHEMA_CONTRACT_VERSION,
     SchemaContractDiff, SchemaRole, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
-    canonicalize_schema, unacknowledged_breaking,
+    canonicalize_schema, dropped_acknowledgements, unacknowledged_breaking,
 };
 use serde_json::{Value, json};
 
@@ -2368,5 +2368,130 @@ fn a_compatible_baseline_update_needs_no_acknowledgement() {
     assert!(
         unacknowledged_breaking(&diff, &base_artifact, &head_generated).is_empty(),
         "a compatible change needs no acknowledgement"
+    );
+}
+
+// ── Codex review 4: degenerate duplicate branches, audit-log integrity ───────
+
+/// Canonicalisation must not dedupe DUPLICATE `oneOf` singleton branches.
+///
+/// `oneOf` requires exactly one match, so a second identical `{"enum":["x"]}`
+/// branch makes the recorded value `"x"` match twice and be rejected. Merging
+/// the branches into one flat `enum` and deduping the values erases exactly
+/// that difference, so both revisions canonicalise identically.
+#[test]
+fn duplicating_a_one_of_singleton_branch_is_breaking() {
+    assert_breaking(
+        json!({"oneOf": [{"type": "string", "enum": ["x"]}]}),
+        json!({"oneOf": [
+            {"type": "string", "enum": ["x"]},
+            {"type": "string", "enum": ["x"]},
+        ]}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// `anyOf` is "at least one", so duplicate branches are genuinely harmless and
+/// must still collapse — otherwise every unit-only enum churns.
+#[test]
+fn duplicating_an_any_of_singleton_branch_stays_compatible() {
+    assert_compatible(
+        json!({"anyOf": [{"type": "string", "enum": ["x"]}]}),
+        json!({"anyOf": [
+            {"type": "string", "enum": ["x"]},
+            {"type": "string", "enum": ["x"]},
+        ]}),
+    );
+}
+
+/// The ordinary unit-enum collapse — distinct values — is untouched, in both
+/// containers. This is the shape `schemars` emits for a unit-only Rust enum, so
+/// a regression here would churn every such workflow.
+#[test]
+fn distinct_one_of_singleton_branches_still_collapse() {
+    let flat = json!({"type": "string", "enum": ["A", "B"]});
+    for kw in ["oneOf", "anyOf"] {
+        let branched = json!({
+            kw: [{"type": "string", "enum": ["A"]}, {"type": "string", "enum": ["B"]}]
+        });
+        assert_eq!(
+            canonicalize_schema(&branched),
+            canonicalize_schema(&flat),
+            "distinct singleton `{kw}` branches must still normalise to the flat form"
+        );
+    }
+}
+
+/// The acknowledgement log is promised **append-only**. Retargeting an existing
+/// record at a fresh break — editing its workflow/path/change while keeping a
+/// plausible reason — would cover the new delta while erasing the old record,
+/// so the multiset subtraction alone cannot see it.
+#[test]
+fn a_rewritten_acknowledgement_record_is_detected() {
+    let plain_base = bypass_fixture("email");
+    let head_generated = bypass_fixture("email_address");
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&plain_base, &head_generated);
+
+    // Base carries a record for an unrelated, earlier break.
+    let stale = AcknowledgedBreakingChange {
+        workflow: "some_other_workflow".to_string(),
+        role: Some(SchemaRole::Output),
+        field_path: "/legacy".to_string(),
+        change: ChangeKind::PropertyRemoved,
+        reason: "an EARLIER, unrelated break".to_string(),
+        recorded_in: Some("#111".to_string()),
+    };
+    let mut base_artifact = plain_base;
+    base_artifact.acknowledged_breaking_changes = vec![stale];
+
+    // Head RETARGETS that one record at this PR's break instead of appending.
+    let mut head_artifact = bypass_fixture("email_address");
+    head_artifact.acknowledged_breaking_changes = diff
+        .deltas
+        .iter()
+        .filter(|d| d.verdict == Verdict::Breaking)
+        .map(|d| AcknowledgedBreakingChange {
+            workflow: d.workflow.clone(),
+            role: d.role,
+            field_path: d.field_path.clone(),
+            change: d.change,
+            reason: "retargeted".to_string(),
+            recorded_in: Some("#111".to_string()),
+        })
+        .collect();
+
+    let dropped = dropped_acknowledgements(&base_artifact, &head_artifact);
+    assert!(
+        !dropped.is_empty(),
+        "a record present at the base revision but absent now must be reported"
+    );
+    assert_eq!(dropped[0].workflow, "some_other_workflow");
+}
+
+/// A legitimate acknowledged update APPENDS, so nothing is ever dropped.
+#[test]
+fn a_legitimate_acknowledged_update_drops_nothing() {
+    let mut base_artifact = bypass_fixture("email");
+    base_artifact
+        .acknowledged_breaking_changes
+        .push(AcknowledgedBreakingChange {
+            workflow: "some_other_workflow".to_string(),
+            role: Some(SchemaRole::Output),
+            field_path: "/legacy".to_string(),
+            change: ChangeKind::PropertyRemoved,
+            reason: "an EARLIER, unrelated break".to_string(),
+            recorded_in: Some("#111".to_string()),
+        });
+    let head_artifact = base_artifact
+        .acknowledged_update(
+            &bypass_fixture("email_address"),
+            "renamed for GDPR",
+            Some("#794"),
+        )
+        .expect("acknowledging must succeed");
+
+    assert!(
+        dropped_acknowledgements(&base_artifact, &head_artifact).is_empty(),
+        "an append-only update must drop nothing"
     );
 }

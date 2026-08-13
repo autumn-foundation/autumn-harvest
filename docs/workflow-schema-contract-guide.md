@@ -152,6 +152,7 @@ travels with the file.
 | Two indistinguishable `oneOf`/`anyOf` branches, and the branch **count** changed | Branches are matched across revisions by identity; ambiguous keying means the differ cannot say *which* branch was added or removed, so it fails closed. (When the count is unchanged the branches are compared pairwise by position instead — see below.) |
 | Inserting an `anyOf` variant **ahead of** a pre-existing branch | `anyOf` is `#[serde(untagged)]` and serde binds the **first** matching variant. Prepending `Float(f64)` before `Int(i64)` captures every recorded integer — it still deserializes, but into a different variant. Appending after every existing branch is compatible (that is the `T` → `Option<T>` shape, which appends a `null` branch) |
 | Adding a `oneOf` branch when **any** branch in the set carries no variant tag | A tag on the *added* branch says it is narrow, not that its new neighbours are. Adding `{"enum":["x"]}` beside a broad `{"type":"string"}` makes the recorded value `"x"` match two branches, and `oneOf` requires exactly one. Disjointness is only established when **every** branch is tagged — serde's externally-tagged shape, whose serializer emits exactly one variant key |
+| **Duplicating** a `oneOf` branch pinned to a single value | `oneOf` requires exactly one match, so a value matching two identical branches is rejected. (Unit-only enum branches normally collapse into one flat `enum` array so annotation churn produces no delta; that collapse is skipped when it would dedupe a genuine duplicate away. `anyOf` is "at least one", where duplicates are harmless, so it still collapses) |
 | Changing the branch container `anyOf` → `oneOf` | `anyOf` accepts a value matching two or more branches; `oneOf` requires exactly one. With `integer` and `number` branches a recorded integer matches both — accepted before, rejected now — even though no branch changed |
 | **Reordering** `anyOf` branches | `anyOf` is `#[serde(untagged)]`, and serde binds the **first** matching variant in declaration order. Swapping `Int(i64)` and `Float(f64)` rebinds a recorded integer to the float variant: it still deserializes, but it no longer means the same thing. (`oneOf` requires exactly one match, so order cannot affect binding — reordering it is not a delta.) Reported without proving the branches overlap; acknowledge it if they are disjoint |
 | A node carrying **both** `oneOf` and `anyOf` | Only one is analysed as the branch container, so a change to the other cannot be classified |
@@ -447,6 +448,15 @@ records it — so the legitimate `schema update --acknowledge` path passes and a
 hand-edit fails. Requires the base commit to be fetchable (`fetch-depth: 0`, or
 the targeted fetch above); the check is skipped on the artifact's first
 introduction, when there is no previous revision to compare.
+
+The same step enforces that the acknowledgement log is **append-only**. Coverage
+is matched as a multiset difference against the base revision's records, so a
+record recorded for an earlier break cannot be reused for a new one. Editing an
+existing record to point at a different break would defeat that — the retargeted
+entry looks like fresh coverage — so a record present at the base revision and
+missing now is reported on its own, with the remedy being to restore it and
+append. Editing only a record's `reason` or `recorded_in` is deliberately
+allowed: neither can make a record cover a different break.
 
 ### Pre-commit hook
 

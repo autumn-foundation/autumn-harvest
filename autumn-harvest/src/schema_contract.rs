@@ -1026,7 +1026,17 @@ fn collapse_unit_enum_branches(obj: &mut Map<String, Value>) {
                 _ => false,
             }
         });
-        if all_singleton_enums {
+        // `oneOf` requires EXACTLY one match, so two branches pinned to the same
+        // value make that value match twice and be rejected. Merging them into
+        // one `enum` array — which `sorted_enum` then dedupes — would erase that
+        // difference and report the change compatible. `anyOf` is "at least
+        // one", where duplicate branches are genuinely harmless, so it still
+        // collapses (and must, or every unit-only enum would churn).
+        let duplicated = key == "oneOf" && {
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            values.iter().any(|v| !seen.insert(v.to_string()))
+        };
+        if all_singleton_enums && !duplicated {
             let types: BTreeSet<String> = branches
                 .iter()
                 .filter_map(|b| b.get("type").and_then(Value::as_str))
@@ -1108,6 +1118,50 @@ pub fn unacknowledged_breaking<'d>(
                 }
                 _ => true,
             }
+        })
+        .collect()
+}
+
+/// Acknowledgement records present at `base` that `head` no longer carries.
+///
+/// The log is promised **append-only**, and [`unacknowledged_breaking`] leans on
+/// that: it subtracts the base revision's records so a stale one cannot cover a
+/// fresh break. A contributor who *retargets* an existing record — editing its
+/// workflow/role/path/change to name this PR's break — defeats that subtraction,
+/// because the identity it looked for is no longer in the base multiset. The
+/// rewrite is invisible to the diff (the artifact and the generated contract
+/// still agree) and invisible to the multiset check (the retargeted record looks
+/// new). Its one observable signature is that a record the previous revision
+/// carried has vanished.
+///
+/// Matching is a multiset difference over the same
+/// `(workflow, role, field_path, change)` identity `unacknowledged_breaking`
+/// uses. Editing only a record's `reason` or `recorded_in` is therefore **not**
+/// reported: those fields cannot make a record cover a different break, so
+/// flagging a typo fix would block legitimate work for no safety gain.
+///
+/// Returns the dropped records — empty means the log grew, or stayed put.
+#[must_use]
+pub fn dropped_acknowledgements<'b>(
+    base: &'b WorkflowSchemaContract,
+    head: &WorkflowSchemaContract,
+) -> Vec<&'b AcknowledgedBreakingChange> {
+    let identity = |a: &AcknowledgedBreakingChange| {
+        (a.workflow.clone(), a.role, a.field_path.clone(), a.change)
+    };
+    let mut available: BTreeMap<(String, Option<SchemaRole>, String, ChangeKind), usize> =
+        BTreeMap::new();
+    for a in &head.acknowledged_breaking_changes {
+        *available.entry(identity(a)).or_default() += 1;
+    }
+    base.acknowledged_breaking_changes
+        .iter()
+        .filter(|a| match available.get_mut(&identity(a)) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
         })
         .collect()
 }

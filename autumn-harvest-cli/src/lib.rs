@@ -7,8 +7,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use autumn_harvest::{
-    DetCheckReport, DetSeverity, SchemaContractDiff, SchemaDelta, SchemaRole,
-    WorkflowSchemaContract, check_paths, diff_schema_contracts, unacknowledged_breaking,
+    AcknowledgedBreakingChange, DetCheckReport, DetSeverity, SchemaContractDiff, SchemaDelta,
+    SchemaRole, WorkflowSchemaContract, check_paths, diff_schema_contracts,
+    dropped_acknowledgements, unacknowledged_breaking,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -433,6 +434,27 @@ pub enum CliError {
         /// Number of breaking deltas with no covering record.
         missing: usize,
         /// One line per unrecorded break.
+        detail: String,
+    },
+
+    /// The acknowledgement log lost a record it previously carried.
+    ///
+    /// The log is append-only, and the coverage check above leans on that: it
+    /// subtracts the records the previous revision already had, so a stale one
+    /// cannot cover a fresh break. Retargeting an existing record — editing the
+    /// break it names rather than appending — defeats that subtraction, and is
+    /// invisible to both the ordinary diff and the coverage check. A vanished
+    /// record is its one observable signature. Exit code is `1`.
+    #[error(
+        "schema check: {dropped} acknowledgement record(s) present in the previous revision of \
+         the artifact are missing now:\n{detail}\nThe acknowledgement log is append-only. Restore \
+         the record(s) and append a new one with `harvest schema update --acknowledge \
+         \"<why this is safe>\"` instead of editing an existing entry."
+    )]
+    SchemaContractAuditLogRewritten {
+        /// Number of records the previous revision carried that are now gone.
+        dropped: usize,
+        /// One line per vanished record.
         detail: String,
     },
 }
@@ -3002,6 +3024,18 @@ pub fn run_schema_check(
     // leaves the ordinary check clean and the change unrecorded.
     if let Some(ack_path) = acknowledged_in {
         let head = read_schema_contract(ack_path)?;
+        // An INDEPENDENT check, not a precondition of the coverage one: a
+        // retargeted record covers the delta, so coverage passes and only this
+        // notices the rewrite. Reported first because it is the root cause when
+        // both fire, and because the remedy differs — restore the record and
+        // append, rather than record this break — hence its own error type.
+        let dropped = dropped_acknowledgements(&base, &head);
+        if !dropped.is_empty() {
+            return Err(CliError::SchemaContractAuditLogRewritten {
+                dropped: dropped.len(),
+                detail: format_dropped(&dropped),
+            });
+        }
         let missing = unacknowledged_breaking(&diff, &base, &head);
         if !missing.is_empty() {
             return Err(CliError::SchemaContractUnacknowledged {
@@ -3038,6 +3072,26 @@ fn format_unacknowledged(missing: &[&SchemaDelta]) -> String {
             d.field_path,
             d.change.as_str(),
             d.reason
+        );
+    }
+    out
+}
+
+/// One line per vanished record, naming what it used to cover.
+fn format_dropped(dropped: &[&AcknowledgedBreakingChange]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for a in dropped {
+        let role = a
+            .role
+            .map_or_else(String::new, |r| format!(".{}", r.as_str()));
+        let _ = writeln!(
+            out,
+            "  {}{role}{}: {} — recorded as {:?}",
+            a.workflow,
+            a.field_path,
+            a.change.as_str(),
+            a.reason
         );
     }
     out

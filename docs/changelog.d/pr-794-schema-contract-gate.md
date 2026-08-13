@@ -162,7 +162,7 @@ silently regress.
 New core module `autumn-harvest/src/schema_contract.rs` (unconditional — no `db`
 or `schema` gate, so the CLI can link it with `default-features = false`).
 
-128 no-DB integration tests in
+133 no-DB integration tests in
 `autumn-harvest/tests/integration/workflow_schema_contract_tests.rs`. Every rule
 that is a *validation* narrowing carries an independent **oracle** assertion
 against the engine's own `validate_against_schema` — the same code that gates
@@ -176,7 +176,7 @@ annotation churn producing zero deltas, artifact round-trip and byte stability,
 the escape hatch in all three states, and the seeded breaking/compatible
 success-metric fixtures.
 
-31 CLI integration tests in
+35 CLI integration tests in
 `autumn-harvest-cli/tests/integration/schema_check_cli.rs` (exit codes, missing
 and malformed baselines, both output shapes, the escape hatch, clap wiring, and
 the raw `GET /workflows/registered` body as `--current`) — including three that
@@ -329,3 +329,41 @@ and the Windows implementation passes `MOVEFILE_REPLACE_EXISTING`):
   object being unreachable (force-push, transient fetch failure) warns rather
   than blocking every PR on infrastructure; the artifact's first introduction
   has no previous revision and is skipped.
+
+**Fifth review round** — two more Codex findings, both false-COMPATIBLE:
+
+- **Canonicalisation deduped a genuine `oneOf` duplicate away.** Unit-only enum
+  branches (`oneOf: [{"enum":["A"]}, {"enum":["B"]}]`, the shape `schemars` emits
+  for a fieldless Rust enum) collapse into one flat `enum` array so a purely
+  representational change produces no delta — and `sorted_enum` dedupes the
+  merged values. Duplicating a branch (`[{"enum":["x"]}, {"enum":["x"]}]`) makes
+  the recorded value `"x"` match twice, which `oneOf` rejects, but the collapse
+  merged the two branches and the dedupe erased the difference: both revisions
+  canonicalised identically and the break was invisible. The collapse is now
+  skipped when it would dedupe a duplicate away, and only for `oneOf` — `anyOf`
+  is "at least one", where duplicate branches are genuinely harmless, so it still
+  collapses (it must, or every unit-only enum would churn). Distinct singleton
+  branches still collapse in both containers, pinned by a test that would fail if
+  the normalisation regressed.
+- **The append-only acknowledgement log could be rewritten rather than
+  appended to.** `unacknowledged_breaking()` subtracts the base revision's
+  records so a stale one cannot cover a fresh break — but a contributor who
+  *retargets* an existing record (editing the workflow/role/path/change it names,
+  keeping a plausible reason) defeats that subtraction: the identity it looked
+  for is no longer in the base multiset, so nothing is subtracted and the
+  modified record reads as fresh coverage. The rewrite is invisible to the
+  ordinary diff too, since the artifact and the generated contract still agree.
+  New `dropped_acknowledgements()` reports records the base revision carried that
+  are gone now — the rewrite's one observable signature — surfaced as a distinct
+  `SchemaContractAuditLogRewritten` error because the remedy differs (restore the
+  record and append, rather than record this break). Matching uses the same
+  four-field identity, so editing only a `reason` or `recorded_in` is deliberately
+  not reported: neither can make a record cover a different break, and flagging a
+  typo fix would block legitimate work for no safety gain.
+
+Both fixes were mutation-verified — the guard removed, the specific test
+confirmed failing, then restored. A third mutant (moving the audit-log check
+after the coverage check) **survived**, correctly: the two checks are
+independent and both run before the branch returns, so ordering only decides
+which failure is reported first. The code comment claiming otherwise was
+corrected rather than left as an unfalsifiable rationale.

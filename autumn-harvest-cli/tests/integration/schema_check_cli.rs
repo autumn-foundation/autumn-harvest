@@ -670,6 +670,99 @@ fn a_compatible_change_passes_the_escape_hatch_check() {
     );
 }
 
+/// Retargeting an existing record rather than appending is caught.
+///
+/// The coverage check alone cannot see it: the retargeted record names this
+/// PR's break and is absent from the base multiset, so it looks like fresh
+/// coverage. Its one signature is that the record the base carried is gone.
+#[test]
+fn a_retargeted_acknowledgement_record_fails_the_escape_hatch_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.json");
+    let generated = dir.path().join("generated.json");
+    let head = dir.path().join("head.json");
+
+    // The base revision already carries a record for an earlier, unrelated break.
+    let mut base_artifact = autumn_harvest::WorkflowSchemaContract::parse(BASELINE).unwrap();
+    let stale = autumn_harvest::AcknowledgedBreakingChange {
+        workflow: "some_other_workflow".to_string(),
+        role: Some(autumn_harvest::SchemaRole::Output),
+        field_path: "/legacy".to_string(),
+        change: autumn_harvest::ChangeKind::PropertyRemoved,
+        reason: "an EARLIER, unrelated break".to_string(),
+        recorded_in: Some("#111".to_string()),
+    };
+    base_artifact.acknowledged_breaking_changes = vec![stale];
+    std::fs::write(&base, serde_json::to_string_pretty(&base_artifact).unwrap()).unwrap();
+    std::fs::write(&generated, CURRENT_BREAKING).unwrap();
+
+    // Head EDITS that record to name this PR's break instead of appending.
+    let mut head_artifact =
+        autumn_harvest::WorkflowSchemaContract::parse(CURRENT_BREAKING).unwrap();
+    let diff = autumn_harvest::diff_schema_contracts(&base_artifact, &head_artifact);
+    head_artifact.acknowledged_breaking_changes = diff
+        .breaking()
+        .map(|d| autumn_harvest::AcknowledgedBreakingChange {
+            workflow: d.workflow.clone(),
+            role: d.role,
+            field_path: d.field_path.clone(),
+            change: d.change,
+            reason: "retargeted".to_string(),
+            recorded_in: Some("#111".to_string()),
+        })
+        .collect();
+    std::fs::write(&head, serde_json::to_string_pretty(&head_artifact).unwrap()).unwrap();
+
+    let err = run_schema_check(&base, &generated, SchemaCheckFormat::Text, Some(&head))
+        .expect_err("a rewritten audit log must fail the escape-hatch check");
+    assert_eq!(err.exit_code(), 1, "the gate exits 1");
+    assert!(
+        matches!(
+            err,
+            autumn_harvest_cli::CliError::SchemaContractAuditLogRewritten { .. }
+        ),
+        "the remedy differs from 'record it', so the error must too: {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("some_other_workflow") && msg.contains("append-only"),
+        "the failure must name the vanished record and the rule: {msg}"
+    );
+}
+
+/// A legitimate acknowledged update APPENDS, so the audit-log check is silent
+/// even when the base already carried unrelated records.
+#[test]
+fn appending_to_a_non_empty_acknowledgement_log_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.json");
+    let generated = dir.path().join("generated.json");
+    let head = dir.path().join("head.json");
+
+    let mut base_artifact = autumn_harvest::WorkflowSchemaContract::parse(BASELINE).unwrap();
+    base_artifact
+        .acknowledged_breaking_changes
+        .push(autumn_harvest::AcknowledgedBreakingChange {
+            workflow: "some_other_workflow".to_string(),
+            role: Some(autumn_harvest::SchemaRole::Output),
+            field_path: "/legacy".to_string(),
+            change: autumn_harvest::ChangeKind::PropertyRemoved,
+            reason: "an EARLIER, unrelated break".to_string(),
+            recorded_in: Some("#111".to_string()),
+        });
+    let cur = autumn_harvest::WorkflowSchemaContract::parse(CURRENT_BREAKING).unwrap();
+    let head_artifact = base_artifact
+        .acknowledged_update(&cur, "renamed for GDPR", Some("#794"))
+        .expect("acknowledging must succeed");
+
+    std::fs::write(&base, serde_json::to_string_pretty(&base_artifact).unwrap()).unwrap();
+    std::fs::write(&generated, CURRENT_BREAKING).unwrap();
+    std::fs::write(&head, serde_json::to_string_pretty(&head_artifact).unwrap()).unwrap();
+
+    let out = run_schema_check(&base, &generated, SchemaCheckFormat::Text, Some(&head));
+    assert!(out.is_ok(), "an append-only update must pass: {out:?}");
+}
+
 /// Omitting the flag leaves the ordinary check byte-for-byte unchanged.
 #[test]
 fn the_escape_hatch_check_is_opt_in() {
