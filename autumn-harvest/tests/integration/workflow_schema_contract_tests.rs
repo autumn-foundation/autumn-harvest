@@ -2693,3 +2693,205 @@ fn widening_a_field_behind_option_struct_stays_compatible() {
         diff.deltas
     );
 }
+
+// ── Codex review 7: mixed-precision bounds, closed-branch widening, malformed enum ──
+
+/// A bound moving between a float and an integer that differ only above 2^53.
+///
+/// `cmp_json_numbers` takes its exact `i128` path only when **both** sides are
+/// JSON integers. `9007199254740992.0` is a float (it has a `.`), so the pair
+/// falls back to `f64` — where `9007199254740993` rounds *down* to `2^53` and
+/// compares equal to the baseline. The bound genuinely tightened: a recorded
+/// `9007199254740992` satisfied the old minimum and is rejected by the new one.
+#[test]
+fn a_bound_tightening_across_the_f64_mantissa_is_breaking() {
+    assert_breaking(
+        json!({"type": "integer", "minimum": 9_007_199_254_740_992.0}),
+        json!({"type": "integer", "minimum": 9_007_199_254_740_993_i64}),
+        ChangeKind::BoundTightened,
+    );
+}
+
+/// The same collapse in the relaxing direction still has to produce a delta.
+#[test]
+fn a_bound_relaxing_across_the_f64_mantissa_is_reported() {
+    let diff = diff_input(
+        json!({"type": "integer", "minimum": 9_007_199_254_740_993_i64}),
+        json!({"type": "integer", "minimum": 9_007_199_254_740_992.0}),
+    );
+    assert!(
+        !diff.deltas.is_empty(),
+        "a bound that moved must emit a delta, not compare equal through f64: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Ordinary same-representation bounds must keep comparing equal.
+///
+/// Guards the fix from over-firing: making the mixed path exact must not make
+/// an *unchanged* bound look changed just because it is written `10` vs `10.0`.
+#[test]
+fn an_unchanged_bound_written_two_ways_emits_nothing() {
+    let diff = diff_input(
+        json!({"type": "number", "minimum": 10}),
+        json!({"type": "number", "minimum": 10.0}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "10 and 10.0 are the same bound: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Adding an *optional* property to a branch that denies unknown properties.
+///
+/// The rebind guard exempts `OptionalPropertyAdded` because a schema that
+/// tolerates extra keys already accepted that payload. That reasoning does not
+/// survive `additionalProperties: false`: branch 0 rejected `{a,b}` before and
+/// accepts it now, so a recorded `{a,b}` that used to bind branch 1 is silently
+/// rebound to branch 0 under serde's first-match `untagged` rule.
+#[test]
+fn adding_an_optional_property_to_a_closed_earlier_branch_is_breaking() {
+    let baseline = json!({
+        "anyOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}},
+             "required": ["a"], "additionalProperties": false},
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a", "b"], "additionalProperties": false}
+        ]
+    });
+    let current = json!({
+        "anyOf": [
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a"], "additionalProperties": false},
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a", "b"], "additionalProperties": false}
+        ]
+    });
+    let diff = diff_input(baseline, current);
+    assert!(
+        diff.has_breaking(),
+        "a closed branch that grew an optional property can steal a later \
+         branch's payloads: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The exemption must survive on an OPEN branch — this is the common widening.
+///
+/// Without `additionalProperties: false` the branch already matched `{a,b}`
+/// (the extra key was simply undeclared), so declaring `b` changes nothing
+/// about which payloads validate and must stay compatible.
+#[test]
+fn adding_an_optional_property_to_an_open_earlier_branch_stays_compatible() {
+    let baseline = json!({
+        "anyOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a", "b"]}
+        ]
+    });
+    let current = json!({
+        "anyOf": [
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a"]},
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a", "b"]}
+        ]
+    });
+    let diff = diff_input(baseline, current);
+    assert!(
+        !diff.has_breaking(),
+        "an open branch already accepted the extra key, so declaring it is a \
+         no-op for matching: {:#?}",
+        diff.deltas
+    );
+}
+
+/// A closed branch in FINAL position has nothing after it to steal from.
+#[test]
+fn adding_an_optional_property_to_a_closed_final_branch_stays_compatible() {
+    let baseline = json!({
+        "anyOf": [
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a", "b"], "additionalProperties": false},
+            {"type": "object", "properties": {"a": {"type": "string"}},
+             "required": ["a"], "additionalProperties": false}
+        ]
+    });
+    let current = json!({
+        "anyOf": [
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+             "required": ["a", "b"], "additionalProperties": false},
+            {"type": "object",
+             "properties": {"a": {"type": "string"}, "c": {"type": "string"}},
+             "required": ["a"], "additionalProperties": false}
+        ]
+    });
+    let diff = diff_input(baseline, current);
+    assert!(
+        !diff.has_breaking(),
+        "the last branch has no later branch to rebind away from: {:#?}",
+        diff.deltas
+    );
+}
+
+/// A malformed `enum` becoming a well-formed one newly constrains the value.
+///
+/// Both revisions carry the key, so neither presence branch fires and the
+/// comparison returns silently. At runtime the malformed baseline imposes no
+/// restriction while the corrected array does, so recorded values outside the
+/// set are newly rejected — the unanalysed sweep's fail-closed posture applied
+/// to a keyword that is nominally analysed.
+#[test]
+fn a_malformed_enum_becoming_an_array_is_breaking() {
+    let diff = diff_input(
+        json!({"type": "string", "enum": "x"}),
+        json!({"type": "string", "enum": ["x"]}),
+    );
+    assert!(
+        diff.has_breaking(),
+        "an unreadable baseline enum constrains nothing; the corrected array \
+         does: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The mirror: a well-formed `enum` degrading into a malformed one.
+///
+/// The differ can no longer tell what the current schema accepts, which is the
+/// definition of unanalysable — fail closed rather than call it a relaxation.
+#[test]
+fn an_enum_becoming_malformed_is_breaking() {
+    let diff = diff_input(
+        json!({"type": "string", "enum": ["x"]}),
+        json!({"type": "string", "enum": "x"}),
+    );
+    assert!(
+        diff.has_breaking(),
+        "an unreadable current enum cannot be certified compatible: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Two malformed enums that are identical are not a change at all.
+#[test]
+fn an_unchanged_malformed_enum_emits_nothing() {
+    let diff = diff_input(
+        json!({"type": "string", "enum": "x"}),
+        json!({"type": "string", "enum": "x"}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "an unchanged (if malformed) enum is not an edit: {:#?}",
+        diff.deltas
+    );
+}

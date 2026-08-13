@@ -162,7 +162,7 @@ silently regress.
 New core module `autumn-harvest/src/schema_contract.rs` (unconditional — no `db`
 or `schema` gate, so the CLI can link it with `default-features = false`).
 
-141 no-DB integration tests in
+150 no-DB integration tests in
 `autumn-harvest/tests/integration/workflow_schema_contract_tests.rs`. Every rule
 that is a *validation* narrowing carries an independent **oracle** assertion
 against the engine's own `validate_against_schema` — the same code that gates
@@ -415,3 +415,49 @@ confirmed failing, then restored. The escape and the exemption were given their
 own tests precisely because a guard's *carve-outs* are where a false-BREAKING
 would hide, and neither would have been falsifiable through the guard's own
 positive test.
+
+**Seventh review round** — three Codex findings: two false-COMPATIBLE paths and
+one unreachable arm.
+
+- **A MIXED integer/float bound comparison still collapsed through `f64`.** The
+  round-2 precision fix took its exact `i128` path only when *both* operands
+  were JSON integers. A bound rewritten `9007199254740992.0` → `9007199254740993`
+  is one integer and one float, so it fell back to `f64` — where the integer
+  rounds *down* to 2^53 and compares equal to the baseline. That is a genuine
+  tightening (the recorded value 2^53 satisfied the old minimum and is rejected
+  by the new one) reported as no change at all: the round-2 hole, reached
+  through the one pairing that fix did not cover. New `cmp_i128_f64` keeps the
+  integer exact and compares it against the float's `floor`, with any fractional
+  remainder breaking the tie; only a float/float pair still uses `f64`, where
+  `f64` *is* both values' own representation. A bound written `10` in one
+  revision and `10.0` in the other still compares equal, so the fix cannot make
+  an unchanged bound look changed.
+- **The rebind guard's optional-property exemption ignored `additionalProperties`.**
+  Round 6 exempted `OptionalPropertyAdded` from altering a branch's match set,
+  on the reasoning that a schema tolerating unknown keys already accepted that
+  payload. That reasoning does not survive `additionalProperties: false`
+  (serde's `deny_unknown_fields`): such a branch *rejected* `{a,b}` before and
+  accepts it now. With branch 0 accepting only `{a}` and branch 1 accepting
+  `{a,b}`, adding optional `b` to branch 0 silently rebinds every recorded
+  `{a,b}` from variant B to variant A under serde's first-match rule — the exact
+  hazard round 6 exists to catch, walking straight through its own exemption.
+  The exemption is now withdrawn when the branch denies unknown properties. The
+  guard's own doc comment had stated this precondition ("a schema *without*
+  `additionalProperties: false`") without the code ever checking it.
+- **A malformed `enum` becoming a well-formed one emitted nothing.** `diff_enum`
+  handled "appeared" and "disappeared" but not "present in both, unreadable in
+  one": with both objects carrying the key, neither presence arm fired and the
+  function returned silently. A validator ignores a non-array `enum` and
+  enforces an array one, so `"enum": "x"` → `"enum": ["x"]` newly rejects every
+  recorded value outside the set while every flat-compared keyword is unchanged
+  — the round-1 malformed-bound finding, in the one analysed keyword that never
+  reaches the fail-closed sweep. Both directions now fail closed; two identical
+  malformed values are not an edit and still emit nothing.
+
+Three mutants were run for this round, one per fix, each reverted individually
+with the specific test confirmed failing before restoring. Four
+over-firing guards were written alongside them and were **already green before
+the fixes** — an open branch gaining an optional property, a closed *final*
+branch (nothing after it to steal from), an unchanged bound written `10` vs
+`10.0`, and an unchanged malformed enum — so each fix is pinned on both sides:
+it fires on the hazard and stays silent on the shapes it must not block.

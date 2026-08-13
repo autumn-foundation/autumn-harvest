@@ -1707,6 +1707,24 @@ fn diff_enum(
                 "this value was unconstrained and is now restricted to a fixed set of enum values"
                     .to_string(),
             ));
+        } else if bo.get("enum") != co.get("enum") {
+            // Both revisions carry the key (the arms above ruled out either
+            // being absent) yet at least one is not an array, so the differ
+            // cannot read what it restricts. A validator ignores the unreadable
+            // side and enforces the readable one, so `"x"` -> `["x"]` newly
+            // rejects every recorded value outside the set while every
+            // flat-compared keyword is unchanged. Fail closed, as the
+            // unanalysed sweep does — `enum` is nominally analysed, so it never
+            // reaches that sweep.
+            diff.push(ctx.delta(
+                path,
+                ChangeKind::UnanalysedConstraintChanged,
+                Verdict::Breaking,
+                "the `enum` keyword changed and at least one revision is not a JSON array, so what \
+                 it restricts cannot be determined; a malformed enum constrains nothing at runtime \
+                 while a well-formed one does"
+                    .to_string(),
+            ));
         }
         return;
     };
@@ -1920,20 +1938,56 @@ fn diff_bounds(
 ///   on an `i64` field can move without producing a delta.
 ///
 /// Integers are therefore compared exactly through `i128` (every JSON integer
-/// `serde_json` produces fits in `i64` or `u64`). Only a genuine float falls
-/// back to `f64`, where `f64` *is* the value's own representation and nothing
-/// JSON preserved is lost. `None` means incomparable (NaN), which callers
-/// report fail-closed rather than treating as unchanged.
+/// `serde_json` produces fits in `i64` or `u64`). The MIXED pair — one integer,
+/// one float — must not fall back either, because converting the integer to
+/// `f64` reintroduces exactly the mantissa collapse above: `9007199254740993`
+/// against the float `9007199254740992.0` rounds to a tie, hiding a genuine
+/// tightening. [`cmp_i128_f64`] keeps the integer exact instead. Only a
+/// float/float pair uses `f64`, where `f64` *is* both values' own
+/// representation and nothing JSON preserved is lost. `None` means incomparable
+/// (NaN), which callers report fail-closed rather than treating as unchanged.
 fn cmp_json_numbers(a: &Value, b: &Value) -> Option<Ordering> {
     let exact = |v: &Value| {
         v.as_i64()
             .map(i128::from)
             .or_else(|| v.as_u64().map(i128::from))
     };
-    if let (Some(x), Some(y)) = (exact(a), exact(b)) {
-        return Some(x.cmp(&y));
+    match (exact(a), exact(b)) {
+        (Some(x), Some(y)) => Some(x.cmp(&y)),
+        (Some(x), None) => cmp_i128_f64(x, b.as_f64()?),
+        // `cmp_i128_f64` answers "integer vs float"; this pair is the reverse.
+        (None, Some(y)) => cmp_i128_f64(y, a.as_f64()?).map(Ordering::reverse),
+        (None, None) => a.as_f64()?.partial_cmp(&b.as_f64()?),
     }
-    a.as_f64()?.partial_cmp(&b.as_f64()?)
+}
+
+/// Compare an exact integer against an `f64` **without** rounding the integer.
+///
+/// `f.floor()` is a whole-valued `f64`, which converts to `i128` exactly
+/// whenever it is in range, so the integer half of the comparison stays exact.
+/// Any fractional remainder then breaks the tie: if `x == floor(f)` and `f` has
+/// a fraction, `f` is the larger value.
+fn cmp_i128_f64(x: i128, f: f64) -> Option<Ordering> {
+    // 2^127; `i128::MAX` is one less, so any `f` at or beyond this magnitude is
+    // outside the integer's range and the comparison is decided by sign alone.
+    const I128_LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+    if f.is_nan() {
+        return None;
+    }
+    let floor = f.floor();
+    if floor >= I128_LIMIT {
+        return Some(Ordering::Less);
+    }
+    if floor < -I128_LIMIT {
+        return Some(Ordering::Greater);
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let whole = floor as i128;
+    Some(match x.cmp(&whole) {
+        // Equal against the floor: `f` wins the tie iff it has a fraction.
+        Ordering::Equal if f > floor => Ordering::Less,
+        other => other,
+    })
 }
 
 fn required_set(obj: &Map<String, Value>) -> BTreeSet<String> {
@@ -2326,13 +2380,15 @@ fn branches_provably_disjoint(a: &Value, b: &Value, root: &Value) -> bool {
 
 /// A change kind that alters WHICH instances a schema matches.
 ///
-/// Only an added *optional* property is exempt: a schema without
-/// `additionalProperties: false` already accepted that key, so declaring it
-/// changes nothing about which payloads validate. Everything else — including
-/// the "unknown" outcomes — is treated as altering the match set, so the rebind
-/// guard fails closed.
-const fn alters_match_set(change: ChangeKind) -> bool {
-    !matches!(change, ChangeKind::OptionalPropertyAdded)
+/// Only an added *optional* property is exempt, and only on an OPEN branch: a
+/// schema without `additionalProperties: false` already accepted that key as an
+/// undeclared extra, so declaring it changes nothing about which payloads
+/// validate. Under `additionalProperties: false` the same edit is a genuine
+/// widening — the branch rejected that payload before and accepts it now — so
+/// `denies_unknown` withdraws the exemption. Everything else, including the
+/// "unknown" outcomes, alters the match set and the rebind guard fails closed.
+const fn alters_match_set(change: ChangeKind, denies_unknown: bool) -> bool {
+    denies_unknown || !matches!(change, ChangeKind::OptionalPropertyAdded)
 }
 
 /// Normalise a node into its branch set: an explicit `oneOf`/`anyOf`, or the
@@ -2754,14 +2810,28 @@ fn diff_branch_guarding_rebind(
     if emitted == 0 {
         return;
     }
+    let cur_root = ctx.cur_root;
+    // Whether the branch AS IT NOW STANDS rejects undeclared keys. This decides
+    // if adding an optional property widened it (see `alters_match_set`).
+    let denies_unknown = {
+        let (resolved, _) = resolve_ref(cur_root, cur);
+        resolved
+            .as_object()
+            .and_then(|o| o.get("additionalProperties"))
+            .and_then(Value::as_bool)
+            == Some(false)
+    };
     // A delta dropped by the storage cap cannot be inspected, so treat the
     // branch as changed rather than assuming the unseen deltas were benign.
     let stored = &diff.deltas[before_stored.min(diff.deltas.len())..];
     let all_stored = stored.len() == emitted;
-    if all_stored && !stored.iter().any(|d| alters_match_set(d.change)) {
+    if all_stored
+        && !stored
+            .iter()
+            .any(|d| alters_match_set(d.change, denies_unknown))
+    {
         return;
     }
-    let cur_root = ctx.cur_root;
     if later
         .iter()
         .all(|l| branches_provably_disjoint(cur, l, cur_root))
