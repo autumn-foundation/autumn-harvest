@@ -1138,27 +1138,37 @@ fn collapse_unit_enum_branches(obj: &mut Map<String, Value>) {
             values.iter().any(|v| !seen.insert(v.to_string()))
         };
         if all_singleton_enums && !duplicated {
-            let types: BTreeSet<String> = branches
-                .iter()
-                .filter_map(|b| b.get("type").and_then(Value::as_str))
-                .map(ToString::to_string)
-                .collect();
-            let lifted_type = (types.len() == 1)
-                .then(|| types.into_iter().next())
-                .flatten();
+            // EVERY branch must agree on `type` — including all agreeing on
+            // having none. Keeping only the branches that declare one would be
+            // wrong twice over. When they disagree there is no single type to
+            // lift, so collapsing DROPS them all and two schemas with opposite
+            // meanings canonicalize alike: `[{string,"x"},{integer,1}]` and the
+            // same pair with the types swapped (which accepts nothing at all)
+            // both flatten to `enum:["x",1]`. And when only some declare one,
+            // lifting it would constrain the branches that deliberately did
+            // not. Either way the collapse is abandoned rather than approximated
+            // — it exists to stop unit enums churning, not to reinterpret them.
+            //
+            // Compared as a whole `Value` so the array spelling
+            // (`["string","null"]`) is covered too; reading `as_str` treated it
+            // as an absent type and dropped it.
+            let mut branch_types = branches.iter().map(|b| b.get("type"));
+            let first = branch_types.next().flatten();
+            if !branch_types.all(|t| t == first) {
+                continue;
+            }
+            let lifted_type = first.cloned();
             // A parent `type` that disagrees with the branches' shared type is a
             // contradictory schema, not a normalisation opportunity — rewriting
             // it would change what the node means. Leave the whole node alone.
-            if let (Some(existing), Some(lifted)) = (
-                obj.get("type").and_then(Value::as_str),
-                lifted_type.as_deref(),
-            ) && existing != lifted
+            if let (Some(existing), Some(lifted)) = (obj.get("type"), lifted_type.as_ref())
+                && existing != lifted
             {
                 continue;
             }
             obj.remove(key);
             if let Some(t) = lifted_type {
-                obj.insert("type".to_string(), Value::String(t));
+                obj.insert("type".to_string(), t);
             }
             obj.insert("enum".to_string(), sorted_enum(&Value::Array(values)));
         }

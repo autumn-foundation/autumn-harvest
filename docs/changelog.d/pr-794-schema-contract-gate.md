@@ -948,3 +948,70 @@ added-branch test, and dropping `const` from the branch *key* fails the
 variant-removal test — the pin that makes the identity-versus-proof split sharp,
 since an unchanged schema compares identically even with degraded keys and so
 cannot distinguish the two.
+
+### Nineteenth review round
+
+Two findings: one P1 fixed, one P2 refuted.
+
+- **P1 — the unit-enum collapse dropped per-branch types.** `oneOf`/`anyOf`
+  whose branches are all singleton `enum`s are flattened into one `enum`, so
+  that adding a variant reads as an addition rather than a whole-container
+  rewrite. The shared `type` was lifted onto the flattened node only when
+  *exactly one* distinct type was declared across the branches — and when the
+  branches **disagreed**, the collapse still fired and dropped every type.
+  `[{string,"x"}, {integer,1}]` and the same pair with the two types **swapped**
+  therefore canonicalised to the identical `enum:["x",1]`, so the gate reported
+  no delta at all — even though the first accepts both values and the second,
+  each branch demanding a type its own value cannot have, accepts nothing.
+
+  Counting only the branches that *declare* a type was wrong in a second
+  direction too: with one branch typed and one not, the declared set has size
+  one, so that type was lifted onto the untyped branch as well — a narrowing the
+  differ performed silently. And because the type was read through `as_str`, the
+  array spelling (`["string","null"]`) looked *absent*, so dropping `null` from
+  every branch canonicalised to no change.
+
+  The rule is now that **every** branch must agree, including all agreeing on
+  having no type, and the comparison is over the whole `Value` so the array form
+  is covered. When they disagree the collapse is abandoned rather than
+  approximated: it exists to stop unit enums churning, not to reinterpret them.
+
+- **Refuted — a `$ref`'s siblings are inert, so skipping them is not a
+  fail-closed hole.** The report noted that flattening a single-member `allOf`
+  `$ref` wrapper leaves an unanalysed sibling (`pattern`) beside the `$ref`,
+  which `diff_node` then discards while resolving — so editing only that sibling
+  produces no delta despite the advertised fail-closed policy.
+
+  The mechanism is exactly right; the conclusion does not follow, because the
+  engine discards it too. `validate_node` resolves `$ref` in a `while let` loop
+  that **reassigns** `schema = resolved` and then validates only the landing
+  node, so a sibling constrains nothing at runtime. A recorded payload's fate is
+  therefore identical under both revisions, which is what makes reporting no
+  delta correct rather than merely convenient.
+
+  Behind that sits an invariant worth pinning rather than asserting: the skip is
+  safe only while **every keyword the engine enforces is one the differ
+  analyses**. A new test checks it behaviourally over ten unanalysed draft-07
+  keywords — `pattern`, `const`, `not`, `multipleOf`, `uniqueItems`,
+  `exclusiveMinimum`, `patternProperties`, `dependencies`, `propertyNames`,
+  `contains` — each with an instance the keyword *would* reject. All ten
+  validate, proving the engine ignores them. If someone teaches the engine one,
+  the test fails and forces the differ to stop discarding it. Two more tests
+  ship with it: one pinning the sibling equivalence against the real validator,
+  one guarding that a change to what the `$ref` actually *points at* is still
+  breaking, so the wrapper does not become a blind spot.
+
+  This is the same reasoning as the sixteenth round's malformed-`properties`
+  refutation, in the opposite direction: there an unreadable construct could not
+  buy a COMPATIBLE verdict, here a provably-inert one cannot justify a BREAKING
+  one.
+
+Four mutants on the fix. Reverting to the declared-only, `as_str` rule fails all
+three detection tests; requiring only the *declared* types to agree fails the
+mixed-declared case specifically; refusing to lift any type fails the collapse
+guard. That guard had to be rewritten to bite: comparing an added variant proved
+nothing, since distinct singleton branches are a disjointness proof and stay
+compatible whether or not the collapse fires — diffing the branch form directly
+against the flat form is what pins it. The array-spelling test needed the same
+correction, because with the current side written in the bare-string form the old
+code lifted *that* one and caught the break by accident.

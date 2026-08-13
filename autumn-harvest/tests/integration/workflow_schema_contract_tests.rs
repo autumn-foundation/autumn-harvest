@@ -4401,3 +4401,231 @@ fn relaxing_an_integer_cardinality_bound_is_still_compatible() {
         ChangeKind::BoundRelaxed,
     );
 }
+
+// ── Round 19: unit-enum collapse must not drop per-branch types ─────────────
+
+#[test]
+fn swapping_types_between_mixed_type_singleton_branches_is_breaking() {
+    // Every branch is a singleton `enum`, so the collapse fires — but the
+    // branches carry DIFFERENT types, so there is no single type to lift. The
+    // values alone are identical on both sides, so dropping the types makes
+    // two schemas with opposite meanings canonicalize to the same node.
+    let baseline = json!({
+        "oneOf": [
+            {"type": "string", "enum": ["x"]},
+            {"type": "integer", "enum": [1]}
+        ]
+    });
+    // Swapped: each branch now demands a type its own value cannot have, so the
+    // schema accepts NOTHING.
+    let current = json!({
+        "oneOf": [
+            {"type": "integer", "enum": ["x"]},
+            {"type": "string", "enum": [1]}
+        ]
+    });
+    assert_oracle_agrees_breaking(&baseline, &current, &json!("x"));
+    assert!(
+        diff_input(baseline, current).has_breaking(),
+        "swapping the types between mixed-type singleton branches must not canonicalize away"
+    );
+}
+
+#[test]
+fn typing_a_previously_untyped_singleton_branch_is_breaking() {
+    // Only SOME branches declare a type, so the declared ones agree trivially.
+    // Lifting that single type onto the collapsed node would constrain the
+    // untyped branch too, which is a narrowing the differ must not perform
+    // silently — and here the current revision performs it for real.
+    let baseline = json!({
+        "oneOf": [{"enum": ["x"]}, {"type": "integer", "enum": [1]}]
+    });
+    let current = json!({
+        "oneOf": [{"type": "integer", "enum": ["x"]}, {"type": "integer", "enum": [1]}]
+    });
+    assert_oracle_agrees_breaking(&baseline, &current, &json!("x"));
+    assert!(
+        diff_input(baseline, current).has_breaking(),
+        "adding a type to one singleton branch must be reported"
+    );
+}
+
+#[test]
+fn same_type_singleton_branches_still_collapse() {
+    // The over-firing guard, asserted on the collapse ITSELF rather than on a
+    // verdict. Comparing an added variant would prove nothing: distinct
+    // singleton branches are a disjointness proof, so that stays compatible
+    // whether or not the collapse fires. Diffing the branch form against the
+    // flat form is the sharp test — they agree only if one canonicalizes into
+    // the other, which also pins that the shared `type` is LIFTED rather than
+    // dropped.
+    let diff = diff_input(
+        json!({"oneOf": [{"type": "string", "enum": ["a"]}, {"type": "string", "enum": ["b"]}]}),
+        json!({"type": "string", "enum": ["a", "b"]}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "a same-typed unit enum must still collapse to the flat form (with its type): {:#?}",
+        diff.deltas
+    );
+}
+
+#[test]
+fn untyped_singleton_branches_still_collapse() {
+    // The other half: no branch declares a type, so there is nothing to
+    // preserve and the collapse must still fire — to a flat `enum` carrying no
+    // type at all.
+    let diff = diff_input(
+        json!({"oneOf": [{"enum": ["a"]}, {"enum": ["b"]}]}),
+        json!({"enum": ["a", "b"]}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "an untyped unit enum must still collapse to the flat form: {:#?}",
+        diff.deltas
+    );
+}
+
+#[test]
+fn reordering_mixed_type_singleton_branches_is_not_reported() {
+    // `oneOf` requires exactly one match, so its branch ORDER cannot affect
+    // binding — a pure reorder of the very shape the collapse no longer
+    // flattens must still produce nothing, or every such schema churns.
+    assert_compatible(
+        json!({"oneOf": [{"type": "string", "enum": ["x"]}, {"type": "integer", "enum": [1]}]}),
+        json!({"oneOf": [{"type": "integer", "enum": [1]}, {"type": "string", "enum": ["x"]}]}),
+    );
+}
+
+// ── Round 19: what the engine actually enforces ────────────────────────────
+
+#[test]
+fn every_keyword_the_engine_enforces_is_in_the_analysed_set() {
+    // The invariant behind two of this differ's rules: the fail-closed sweep
+    // may skip a `$ref`'s siblings (the engine reassigns `schema = resolved`
+    // and never looks at them), and an unenforced keyword may never buy a
+    // COMPATIBLE verdict. Both hold only while every keyword the engine
+    // actually enforces is one the differ analyses.
+    //
+    // Asserted behaviourally rather than by reading `validate_node`: each entry
+    // is a schema whose keyword WOULD reject the instance if it were enforced.
+    // A passing validation therefore proves the engine ignores it. If someone
+    // teaches the engine one of these, this test fails and forces the differ to
+    // stop discarding it.
+    let unenforced: &[(&str, Value, Value)] = &[
+        (
+            "pattern",
+            json!({"type": "string", "pattern": "^a$"}),
+            json!("zzz"),
+        ),
+        ("const", json!({"const": "a"}), json!("b")),
+        ("not", json!({"not": {"type": "string"}}), json!("a")),
+        (
+            "multipleOf",
+            json!({"type": "integer", "multipleOf": 10}),
+            json!(3),
+        ),
+        (
+            "uniqueItems",
+            json!({"type": "array", "uniqueItems": true}),
+            json!([1, 1]),
+        ),
+        (
+            "exclusiveMinimum",
+            json!({"type": "integer", "exclusiveMinimum": 10}),
+            json!(10),
+        ),
+        (
+            "patternProperties",
+            json!({"type": "object", "patternProperties": {"^a$": {"type": "integer"}}}),
+            json!({"a": "not-an-integer"}),
+        ),
+        (
+            "dependencies",
+            json!({"type": "object", "dependencies": {"a": ["b"]}}),
+            json!({"a": 1}),
+        ),
+        (
+            "propertyNames",
+            json!({"type": "object", "propertyNames": {"pattern": "^a$"}}),
+            json!({"zzz": 1}),
+        ),
+        (
+            "contains",
+            json!({"type": "array", "contains": {"type": "string"}}),
+            json!([1, 2]),
+        ),
+    ];
+    for (keyword, schema, instance) in unenforced {
+        assert!(
+            validate_against_schema(schema, instance).is_ok(),
+            "the engine now enforces `{keyword}`, so the differ may no longer treat it as inert: \
+             a `$ref` sibling carrying it must stop being discarded, and it may now prove things"
+        );
+    }
+}
+
+#[test]
+fn a_ref_sibling_is_inert_at_runtime_so_changing_one_is_not_reported() {
+    // Pins the refutation of "flattening an `allOf` `$ref` wrapper hides an
+    // unanalysed sibling". The engine resolves `$ref` in a loop and then
+    // validates ONLY the landing node, so a sibling constrains nothing — it is
+    // the same value under both revisions, which is what makes reporting no
+    // delta correct rather than merely convenient.
+    let with = |pattern: &str| {
+        json!({
+            "type": "object",
+            "properties": {"a": {"allOf": [{"$ref": "#/definitions/T"}], "pattern": pattern}},
+            "definitions": {"T": {"type": "string"}}
+        })
+    };
+    let recorded = json!({"a": "zzz"});
+    // Neither revision rejects the recorded payload: the sibling is dead.
+    assert!(validate_against_schema(&with("^a$"), &recorded).is_ok());
+    assert!(validate_against_schema(&with("^b$"), &recorded).is_ok());
+    assert_compatible(with("^a$"), with("^b$"));
+}
+
+#[test]
+fn a_ref_target_change_under_that_same_wrapper_is_still_breaking() {
+    // The over-firing guard for the refutation above: the wrapper must not
+    // become a blind spot. A change to what the `$ref` actually points at is
+    // still compared, so only the provably-inert sibling is skipped.
+    let with = |ty: &str| {
+        json!({
+            "type": "object",
+            "properties": {"a": {"allOf": [{"$ref": "#/definitions/T"}], "pattern": "^a$"}},
+            "definitions": {"T": {"type": ty}}
+        })
+    };
+    assert_oracle_agrees_breaking(&with("string"), &with("integer"), &json!({"a": "x"}));
+    assert!(
+        diff_input(with("string"), with("integer")).has_breaking(),
+        "the ref target is still compared through the wrapper"
+    );
+}
+
+#[test]
+fn narrowing_an_array_typed_singleton_branch_set_is_breaking() {
+    // The array spelling of `type` is the other half of the same bug: read
+    // through `as_str` it looks ABSENT, so every branch's type was dropped and
+    // dropping `null` from all of them canonicalized to no change at all.
+    let baseline = json!({
+        "oneOf": [
+            {"type": ["string", "null"], "enum": ["x"]},
+            {"type": ["string", "null"], "enum": [null]}
+        ]
+    });
+    // Both revisions use the ARRAY spelling deliberately: with the current side
+    // written as a bare `"string"` the old code lifted THAT one and reported an
+    // added type, catching the break by accident. Only when both sides are
+    // invisible to `as_str` does the miss show.
+    let current = json!({
+        "oneOf": [{"type": ["string"], "enum": ["x"]}, {"type": ["string"], "enum": [null]}]
+    });
+    assert_oracle_agrees_breaking(&baseline, &current, &json!(null));
+    assert!(
+        diff_input(baseline, current).has_breaking(),
+        "dropping `null` from every branch's array type must be reported"
+    );
+}
