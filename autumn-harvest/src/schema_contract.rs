@@ -2225,7 +2225,15 @@ fn branch_key(branch: &Value, root: &Value) -> (String, bool) {
     let Some(obj) = branch.as_object() else {
         return (branch.to_string(), false);
     };
+    let req = required_set(obj);
     // Internally tagged: a property pinned to a single `enum`/`const` value.
+    //
+    // The tag proves disjointness only when it is REQUIRED. With an optional
+    // `tag` pinned to `"A"`, the empty object already validates, so a sibling
+    // branch whose optional `tag` is pinned to `"B"` also accepts it and the
+    // two overlap — `oneOf`'s exactly-one rule then rejects a recorded `{}`.
+    // Probed against `schemars` 0.8.22: a real `#[serde(tag = "…")]` enum emits
+    // the discriminant in `required`, so this costs no legitimate shape.
     if let Some(props) = obj.get("properties").and_then(Value::as_object) {
         for (name, sub) in props {
             let tag = sub.get("const").cloned().or_else(|| {
@@ -2235,7 +2243,7 @@ fn branch_key(branch: &Value, root: &Value) -> (String, bool) {
                 }
             });
             if let Some(t) = tag {
-                return (format!("tag:{name}={t}"), true);
+                return (format!("tag:{name}={t}"), req.contains(name));
             }
         }
     }
@@ -2256,16 +2264,22 @@ fn branch_key(branch: &Value, root: &Value) -> (String, bool) {
     // Disjointness here rests on `serde`'s own externally-tagged *serializer*
     // emitting exactly one key, so a payload already in `harvest_events` cannot
     // match two variant branches at once.
-    let req = required_set(obj);
     let prop_count = obj
         .get("properties")
         .and_then(Value::as_object)
         .map_or(0, Map::len);
+    // The KEY is the single required property's name alone; only the
+    // *discriminated* flag also demands that it is the only declared property.
+    //
+    // Folding `prop_count` into the key made the key unstable under a
+    // compatible edit: a one-required-field struct behind `Option<T>` that
+    // gains an optional field flips from `variant:a` to `type:object`, and the
+    // branch then reads as removed-and-re-added — a false BREAKING on one of
+    // the most common widenings there is.
     if req.len() == 1
-        && prop_count == 1
         && let Some(name) = req.iter().next()
     {
-        return (format!("variant:{name}"), true);
+        return (format!("variant:{name}"), prop_count == 1);
     }
     // Only reachable for an *unresolvable* `$ref` (external, or a dangling
     // local pointer): `resolve_ref` above already inlined every resolvable one.
@@ -2276,6 +2290,49 @@ fn branch_key(branch: &Value, root: &Value) -> (String, bool) {
         return (format!("type:{}", join_sorted(&ts)), false);
     }
     (branch.to_string(), false)
+}
+
+/// `true` when no single JSON value can satisfy both branches.
+///
+/// Used to decide whether a change to an earlier `anyOf` branch can steal
+/// recorded data from a later one. Conservative by design: it must never claim
+/// disjointness it cannot demonstrate, so anything it cannot read returns
+/// `false` and the caller fails closed.
+///
+/// Two proofs are accepted:
+/// - **Type.** Disjoint `type` sets can share no instance. `integer` is widened
+///   to also cover `number` first, because a recorded integer satisfies both.
+/// - **Variant tag.** Two branches that are each *discriminated* (a required
+///   internal tag, a unit `enum`, or serde's externally-tagged single-key
+///   shape) with different keys cannot both match one payload.
+fn branches_provably_disjoint(a: &Value, b: &Value, root: &Value) -> bool {
+    let widened = |v: &Value| -> Option<BTreeSet<String>> {
+        let (r, _) = resolve_ref(root, v);
+        let mut set = type_set(r.as_object()?)?;
+        if set.contains("integer") {
+            set.insert("number".to_string());
+        }
+        Some(set)
+    };
+    if let (Some(x), Some(y)) = (widened(a), widened(b))
+        && x.is_disjoint(&y)
+    {
+        return true;
+    }
+    let (ka, da) = branch_key(a, root);
+    let (kb, db) = branch_key(b, root);
+    da && db && ka != kb
+}
+
+/// A change kind that alters WHICH instances a schema matches.
+///
+/// Only an added *optional* property is exempt: a schema without
+/// `additionalProperties: false` already accepted that key, so declaring it
+/// changes nothing about which payloads validate. Everything else — including
+/// the "unknown" outcomes — is treated as altering the match set, so the rebind
+/// guard fails closed.
+const fn alters_match_set(change: ChangeKind) -> bool {
+    !matches!(change, ChangeKind::OptionalPropertyAdded)
 }
 
 /// Normalise a node into its branch set: an explicit `oneOf`/`anyOf`, or the
@@ -2510,18 +2567,44 @@ fn diff_branches(
     // a key collapse in the map and one is silently dropped — which would hide
     // a variant REMOVAL behind a same-keyed survivor and report it compatible.
     if base_by_key.len() != base_branches.len() || cur_by_key.len() != cur_branches.len() {
-        diff_ambiguous_branches(ctx, &base_branches, &cur_branches, path, depth, diff);
+        diff_ambiguous_branches(
+            ctx,
+            &base_branches,
+            &cur_branches,
+            cur_kw == "anyOf",
+            path,
+            depth,
+            diff,
+        );
         return;
     }
 
+    // Branches that follow `key` in the CURRENT declaration order, for the
+    // first-match rebind guard below.
+    let later_than = |key: &str| -> Vec<Value> {
+        cur_keys
+            .iter()
+            .position(|k| k == key)
+            .map(|i| {
+                cur_keys[i + 1..]
+                    .iter()
+                    .filter_map(|k| cur_by_key.get(k).map(|(v, _)| v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
     for (key, b) in &base_by_key {
         match cur_by_key.get(key) {
-            Some((c, _)) => diff_node(
+            Some((c, _)) => diff_branch_guarding_rebind(
                 ctx,
                 b,
                 c,
+                &later_than(key),
+                cur_kw == "anyOf",
+                path,
                 &format!("{path}/<{}>", key.replace('/', "~1")),
-                depth + 1,
+                depth,
                 diff,
             ),
             None => diff.push(ctx.delta(
@@ -2633,6 +2716,72 @@ fn diff_added_branches(
     }
 }
 
+/// Recurse into one branch, guarding `anyOf`'s first-match binding.
+///
+/// `anyOf` is what `schemars` emits for `#[serde(untagged)]`, and serde binds
+/// the FIRST matching variant in declaration order. So a change to a branch
+/// that is not last can silently move recorded data onto it — or off it — even
+/// when the change is otherwise compatible for the read contract. Making
+/// branch 0's `a` optional, with branch 1 requiring `b`, lets a recorded
+/// `{"b": …}` that used to bind to variant B match branch 0 and bind to
+/// variant A: it still deserializes, it just means something else.
+///
+/// `later` is the branches that follow this one in the CURRENT declaration
+/// order — the ones it can steal from. When this branch is provably disjoint
+/// from all of them, no instance can move either way and the change is judged
+/// on its own merits. Nothing is reported for `oneOf`, whose exactly-one rule
+/// makes binding order irrelevant, nor for the final branch.
+#[allow(clippy::too_many_arguments)]
+fn diff_branch_guarding_rebind(
+    ctx: &mut DiffCtx<'_>,
+    base: &Value,
+    cur: &Value,
+    later: &[Value],
+    is_anyof: bool,
+    path: &str,
+    sub_path: &str,
+    depth: usize,
+    diff: &mut SchemaContractDiff,
+) {
+    let before_total = diff.breaking_count + diff.compatible_count;
+    let before_stored = diff.deltas.len();
+    diff_node(ctx, base, cur, sub_path, depth + 1, diff);
+
+    if !is_anyof || later.is_empty() {
+        return;
+    }
+    let emitted = (diff.breaking_count + diff.compatible_count) - before_total;
+    if emitted == 0 {
+        return;
+    }
+    // A delta dropped by the storage cap cannot be inspected, so treat the
+    // branch as changed rather than assuming the unseen deltas were benign.
+    let stored = &diff.deltas[before_stored.min(diff.deltas.len())..];
+    let all_stored = stored.len() == emitted;
+    if all_stored && !stored.iter().any(|d| alters_match_set(d.change)) {
+        return;
+    }
+    let cur_root = ctx.cur_root;
+    if later
+        .iter()
+        .all(|l| branches_provably_disjoint(cur, l, cur_root))
+    {
+        return;
+    }
+    diff.push(ctx.delta(
+        path,
+        ChangeKind::UnanalysedConstraintChanged,
+        Verdict::Breaking,
+        format!(
+            "branch `{sub_path}` of this `anyOf` changed what it matches, and it is not provably \
+             disjoint from a branch declared after it. For `#[serde(untagged)]` serde binds the \
+             FIRST matching variant, so recorded data can be silently REBOUND to a different \
+             variant — it still deserializes, but it no longer means the same thing. Acknowledge \
+             it if the branches are disjoint on grounds the differ cannot see"
+        ),
+    ));
+}
+
 /// Compare a branch set the differ cannot key, by POSITION.
 ///
 /// Two branches that share a key (two multi-field object variants of a
@@ -2655,6 +2804,7 @@ fn diff_ambiguous_branches(
     ctx: &mut DiffCtx<'_>,
     base_branches: &[Value],
     cur_branches: &[Value],
+    is_anyof: bool,
     path: &str,
     depth: usize,
     diff: &mut SchemaContractDiff,
@@ -2676,7 +2826,17 @@ fn diff_ambiguous_branches(
         return;
     }
     for (i, (b, c)) in base_branches.iter().zip(cur_branches).enumerate() {
-        diff_node(ctx, b, c, &format!("{path}/[{i}]"), depth + 1, diff);
+        diff_branch_guarding_rebind(
+            ctx,
+            b,
+            c,
+            &cur_branches[i + 1..],
+            is_anyof,
+            path,
+            &format!("{path}/[{i}]"),
+            depth,
+            diff,
+        );
     }
 }
 

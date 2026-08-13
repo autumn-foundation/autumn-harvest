@@ -812,7 +812,10 @@ enum SchemaCommand {
         /// breaking delta must then be covered by an acknowledgement that is new
         /// in this artifact — which catches a baseline hand-edited to absorb a
         /// break silently, something the ordinary check cannot see because the
-        /// artifact and the generated contract already agree.
+        /// artifact and the generated contract already agree. Also enforces that
+        /// the acknowledgement log is append-only: a record the previous
+        /// revision carried and this one does not is reported, since retargeting
+        /// an existing record would otherwise read as fresh coverage.
         #[arg(long, value_name = "PATH")]
         acknowledged_in: Option<PathBuf>,
     },

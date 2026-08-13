@@ -2495,3 +2495,201 @@ fn a_legitimate_acknowledged_update_drops_nothing() {
         "an append-only update must drop nothing"
     );
 }
+
+// ── Codex review 5: optional tags, untagged rebinding ────────────────────────
+
+/// A tag proves disjointness only when the tag property is REQUIRED.
+///
+/// With an optional `tag` pinned to `"A"`, the empty object `{}` already
+/// validates. Adding a branch whose optional `tag` is pinned to `"B"` makes
+/// `{}` match twice, and `oneOf` requires exactly one — so a recorded `{}` is
+/// rejected. Probed against `schemars` 0.8.22: a real `#[serde(tag = "type")]`
+/// enum emits the discriminant in `required`, so this narrowing cannot make a
+/// genuine internally-tagged enum churn.
+#[test]
+fn adding_a_one_of_branch_with_an_optional_tag_is_breaking() {
+    assert_breaking(
+        json!({"oneOf": [
+            {"type": "object", "properties": {"tag": {"enum": ["A"]}}},
+        ]}),
+        json!({"oneOf": [
+            {"type": "object", "properties": {"tag": {"enum": ["A"]}}},
+            {"type": "object", "properties": {"tag": {"enum": ["B"]}}},
+        ]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// The shape `schemars` actually emits for `#[serde(tag = "type")]` — the tag
+/// in `required` — must stay compatible, or every internally-tagged enum churns.
+#[test]
+fn adding_a_one_of_branch_with_a_required_tag_is_compatible() {
+    assert_compatible(
+        json!({"oneOf": [
+            {"type": "object", "required": ["type"],
+             "properties": {"type": {"enum": ["A"]}}},
+        ]}),
+        json!({"oneOf": [
+            {"type": "object", "required": ["type"],
+             "properties": {"type": {"enum": ["A"]}}},
+            {"type": "object", "required": ["type"],
+             "properties": {"type": {"enum": ["B"]}}},
+        ]}),
+    );
+}
+
+/// Widening a non-final `anyOf` branch can rebind recorded data.
+///
+/// `anyOf` is `#[serde(untagged)]` and serde binds the FIRST matching variant.
+/// Both branches here are objects, so neither is provably disjoint from the
+/// other; broadening branch 0's `v` to also accept a string lets a recorded
+/// `{"v": "x"}` — which bound to variant B — match branch 0 and bind to
+/// variant A instead. It still deserializes; it no longer means the same thing.
+///
+/// The widening is deliberately INSIDE a property so the branch's identity key
+/// is unchanged: this must fail because of the rebind rule, not because the
+/// branch looked removed-and-re-added.
+#[test]
+fn widening_a_non_final_untagged_branch_is_breaking() {
+    let base = json!({"anyOf": [
+        {"type": "object", "required": ["v"],
+         "properties": {"v": {"type": "integer"}, "note": {"type": "string"}}},
+        {"type": "object", "required": ["w"],
+         "properties": {"w": {"type": "string"}, "note": {"type": "string"}}},
+    ]});
+    let cur = json!({"anyOf": [
+        {"type": "object", "required": ["v"],
+         "properties": {"v": {"type": ["integer", "string"]}, "note": {"type": "string"}}},
+        {"type": "object", "required": ["w"],
+         "properties": {"w": {"type": "string"}, "note": {"type": "string"}}},
+    ]});
+    let diff = diff_input(base, cur);
+    assert!(
+        diff.deltas.iter().any(|d| d.verdict == Verdict::Breaking
+            && d.reason
+                .contains("not provably disjoint from a branch declared after it")),
+        "widening a non-final untagged branch can rebind recorded data: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The LAST `anyOf` branch has nothing after it to steal from, so widening it
+/// cannot rebind anything. Same shape as the test above, widening the other
+/// branch — so the two together pin that the guard is position-aware rather
+/// than flagging every untagged widening.
+#[test]
+fn widening_the_final_untagged_branch_is_compatible() {
+    assert_compatible(
+        json!({"anyOf": [
+            {"type": "object", "required": ["v"],
+             "properties": {"v": {"type": "integer"}, "note": {"type": "string"}}},
+            {"type": "object", "required": ["w"],
+             "properties": {"w": {"type": "string"}, "note": {"type": "string"}}},
+        ]}),
+        json!({"anyOf": [
+            {"type": "object", "required": ["v"],
+             "properties": {"v": {"type": "integer"}, "note": {"type": "string"}}},
+            {"type": "object", "required": ["w"],
+             "properties": {"w": {"type": ["string", "integer"]}, "note": {"type": "string"}}},
+        ]}),
+    );
+}
+
+/// The single most common widening must NOT regress: `Option<Struct>` is
+/// `anyOf: [{$ref: Struct}, {"type":"null"}]`, so adding an optional field to
+/// `Struct` widens the non-final branch 0 — but `object` and `null` are
+/// provably disjoint, so nothing can rebind. Verified against `schemars`
+/// 0.8.22 output.
+#[test]
+fn widening_an_option_struct_branch_stays_compatible() {
+    let base = json!({
+        "definitions": {"Inner": {"type": "object", "required": ["a"],
+                                   "properties": {"a": {"type": "integer"}}}},
+        "anyOf": [{"$ref": "#/definitions/Inner"}, {"type": "null"}]
+    });
+    let cur = json!({
+        "definitions": {"Inner": {"type": "object", "required": ["a"],
+                                   "properties": {"a": {"type": "integer"},
+                                                  "b": {"type": ["string", "null"]}}}},
+        "anyOf": [{"$ref": "#/definitions/Inner"}, {"type": "null"}]
+    });
+    let diff = diff_input(base, cur);
+    assert!(
+        !diff.has_breaking(),
+        "adding an optional field behind `Option<T>` must stay compatible: {:#?}",
+        diff.deltas
+    );
+}
+
+/// Adding an OPTIONAL property does not change which instances a branch
+/// matches (the schema already accepted the key), so it must not be reported
+/// as a rebind even on a non-final, non-disjoint branch.
+#[test]
+fn adding_an_optional_property_to_a_non_final_untagged_branch_is_compatible() {
+    assert_compatible(
+        json!({"anyOf": [
+            {"type": "object", "required": ["a"],
+             "properties": {"a": {"type": "integer"}, "tail": {"type": "string"}}},
+            {"type": "object", "required": ["b"],
+             "properties": {"b": {"type": "integer"}, "tail": {"type": "string"}}},
+        ]}),
+        json!({"anyOf": [
+            {"type": "object", "required": ["a"],
+             "properties": {"a": {"type": "integer"}, "tail": {"type": "string"},
+                            "note": {"type": ["string", "null"]}}},
+            {"type": "object", "required": ["b"],
+             "properties": {"b": {"type": "integer"}, "tail": {"type": "string"}}},
+        ]}),
+    );
+}
+
+/// `oneOf` requires exactly one match, so declaration order cannot affect
+/// binding — the rebind guard is `anyOf`-only and must not fire here.
+#[test]
+fn widening_a_non_final_one_of_branch_is_not_a_rebind() {
+    let base = json!({"oneOf": [
+        {"type": "object", "required": ["a"], "properties": {"a": {"type": "integer"}}},
+        {"type": "string"},
+    ]});
+    let cur = json!({"oneOf": [
+        {"type": "object", "properties": {"a": {"type": "integer"}}},
+        {"type": "string"},
+    ]});
+    let diff = diff_input(base, cur);
+    assert!(
+        !diff.deltas.iter().any(|d| d
+            .reason
+            .contains("not provably disjoint from a branch declared after it")),
+        "the rebind guard is anyOf-only: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The disjointness escape is what keeps the rebind guard from flagging the
+/// most common untagged shape there is.
+///
+/// `Option<Struct>` is `anyOf: [{$ref: Struct}, {"type":"null"}]`, so ANY
+/// change inside `Struct` alters the non-final branch 0. Widening a field's
+/// type genuinely changes what branch 0 matches — but `object` and `null` can
+/// share no instance, so nothing can rebind and the change must stay
+/// compatible. Without the escape this reports breaking, and every widening
+/// behind an `Option<T>` would need an acknowledgement.
+#[test]
+fn widening_a_field_behind_option_struct_stays_compatible() {
+    let with_type = |t: Value| {
+        json!({
+            "definitions": {"Inner": {"type": "object", "required": ["a"],
+                                       "properties": {"a": t}}},
+            "anyOf": [{"$ref": "#/definitions/Inner"}, {"type": "null"}]
+        })
+    };
+    let diff = diff_input(
+        with_type(json!({"type": "integer"})),
+        with_type(json!({"type": ["integer", "string"]})),
+    );
+    assert!(
+        !diff.has_breaking(),
+        "`object` and `null` are disjoint, so branch 0 can steal nothing: {:#?}",
+        diff.deltas
+    );
+}

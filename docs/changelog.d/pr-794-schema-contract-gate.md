@@ -162,7 +162,7 @@ silently regress.
 New core module `autumn-harvest/src/schema_contract.rs` (unconditional — no `db`
 or `schema` gate, so the CLI can link it with `default-features = false`).
 
-133 no-DB integration tests in
+141 no-DB integration tests in
 `autumn-harvest/tests/integration/workflow_schema_contract_tests.rs`. Every rule
 that is a *validation* narrowing carries an independent **oracle** assertion
 against the engine's own `validate_against_schema` — the same code that gates
@@ -367,3 +367,51 @@ after the coverage check) **survived**, correctly: the two checks are
 independent and both run before the branch returns, so ordering only decides
 which failure is reported first. The code comment claiming otherwise was
 corrected rather than left as an unfalsifiable rationale.
+
+**Sixth review round** — two Codex findings, plus a third bug their tests
+uncovered:
+
+- **An OPTIONAL tag was taken as proof of disjointness.** A property pinned to
+  a single `enum`/`const` value marked its branch discriminated whether or not
+  the property was `required`. With an optional `tag` pinned to `"A"` the empty
+  object already validates, so adding a branch whose optional `tag` is pinned to
+  `"B"` makes `{}` match twice — rejected by `oneOf`'s exactly-one rule — yet
+  the addition was reported compatible. A tag now counts only when it is in the
+  branch's `required` set. Probed against `schemars` 0.8.22 before changing
+  anything: a real `#[serde(tag = "…")]` enum emits `"required": ["type", …]`,
+  so the narrowing costs no legitimate shape.
+- **Changing a non-final `anyOf` branch could silently rebind recorded data.**
+  `anyOf` is `#[serde(untagged)]`, where serde binds the FIRST matching variant,
+  but the per-branch recursion judged each branch in isolation. Making branch
+  0's `a` optional, with branch 1 requiring `b`, lets a recorded `{"b": …}` that
+  bound to variant B match branch 0 and bind to variant A — it still
+  deserializes, it just means something else — and only a *compatible*
+  `property_became_optional` delta was emitted. Such a change is now breaking
+  unless the branch is provably disjoint from every branch after it.
+  Disjointness is proven two ways, both conservative: disjoint `type` sets
+  (`integer` widened to cover `number` first, since a recorded integer satisfies
+  both) or two differently-tagged discriminated branches. That escape is
+  load-bearing rather than decorative — `Option<T>` is
+  `anyOf: [{$ref: T}, {"type":"null"}]`, so without it *every* widening behind
+  an `Option` would demand an acknowledgement; `object` and `null` share no
+  instance, so nothing can rebind. Adding an *optional* property is also exempt:
+  it does not change which instances the branch matches. `oneOf` is untouched —
+  its exactly-one rule makes declaration order irrelevant.
+- **Found while writing the tests above, not reported: the branch identity key
+  was unstable under a compatible edit.** `branch_key` folded the *declared*
+  property count into the key, so a struct with one required field behind
+  `Option<T>` that gained an optional field flipped from `variant:a` to
+  `type:object` — the branch then read as removed-and-re-added, two breaking
+  deltas for adding an optional field. This is a false-BREAKING on one of the
+  most common widenings there is, and it had been live since the branch-keying
+  work in round 1. The key is now the required property's name alone; the
+  property count still governs the *discriminated* flag, which is the only thing
+  it was ever load-bearing for.
+
+Five separate mutants were run for this round — the tag-required check, the key
+stability fix, the rebind guard, the disjointness escape, and the
+optional-property exemption — each reverted individually, the specific test
+confirmed failing, then restored. The escape and the exemption were given their
+own tests precisely because a guard's *carve-outs* are where a false-BREAKING
+would hide, and neither would have been falsifiable through the guard's own
+positive test.
