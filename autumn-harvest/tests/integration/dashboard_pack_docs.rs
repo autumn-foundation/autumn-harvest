@@ -1033,13 +1033,12 @@ fn low_frequency_scanner_panel_window_outlasts_the_retention_cadence() {
             if !expr.contains("increase(harvest_scanner_tick_total") {
                 continue;
             }
-            let window = expr
+            let Some((window, _)) = expr
                 .split_once("harvest_scanner_tick_total[")
                 .and_then(|(_, tail)| tail.split_once(']'))
-                .map(|(window, _)| window)
-                .unwrap_or_else(|| {
-                    panic!("expected a bracketed range window in {expr}");
-                });
+            else {
+                panic!("expected a bracketed range window in {expr}");
+            };
             let hours = window.strip_suffix('h').and_then(|n| n.parse::<u32>().ok());
             assert!(
                 hours.is_some_and(|hours| hours > 1),

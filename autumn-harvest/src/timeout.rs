@@ -3334,9 +3334,52 @@ pub async fn enforce_timeouts_once(
 /// it finds by mutating queue state and workflow history.
 ///
 /// Stops when the cancellation token is triggered.
+///
+/// Equivalent to [`spawn_timeout_checker_for_shard`] with no shard attributed.
+/// The shard is only used to label this loop in the `scanner_liveness`
+/// health check (issue #797); it never affects which shards the loop
+/// enforces against — that is `shard_assignments`.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_timeout_checker(
+    pool: Pool<AsyncPgConnection>,
+    cancel: CancellationToken,
+    interval: Duration,
+    telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
+    unknown_target_grace_window: Duration,
+    sharded_pool: Option<crate::shard::ShardedDbPool>,
+    shard_assignments: Vec<crate::types::ShardId>,
+    circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
+    max_workflow_history_events: Option<u64>,
+    session_worker_stale_secs: i64,
+) -> tokio::task::JoinHandle<()> {
+    spawn_timeout_checker_for_shard(
+        pool,
+        cancel,
+        interval,
+        telemetry,
+        unknown_target_grace_window,
+        sharded_pool,
+        shard_assignments,
+        circuit_breakers,
+        max_workflow_history_events,
+        session_worker_stale_secs,
+        None,
+    )
+}
+
+/// [`spawn_timeout_checker`], attributing this loop instance to `shard` in the
+/// `scanner_liveness` health check (issue #797).
+///
+/// A multi-shard worker spawns one checker per assigned shard, all registered
+/// under the same `timeout` scanner label. Passing the shard here is what lets
+/// the health check say *which* shard's loop is wedged — the metric carries no
+/// shard label, so this is the only surface that can localize it.
+///
+/// Pass `None` for a process-wide loop or a single-shard deployment.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_timeout_checker_for_shard(
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
     interval: Duration,

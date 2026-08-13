@@ -616,8 +616,43 @@ mod scanner {
 
     /// Spawn a background task that periodically reclaims orphaned poison-pill
     /// tasks. Stops when `cancel` is triggered.
+    ///
+    /// Equivalent to [`spawn_poison_pill_reclaimer_for_shard`] with no shard
+    /// attributed. The shard is only used to label this loop in the
+    /// `scanner_liveness` health check (issue #797); it never affects which
+    /// tasks the loop reclaims -- that is the connection's own database.
     #[must_use]
     pub fn spawn_poison_pill_reclaimer(
+        pool: diesel_async::pooled_connection::deadpool::Pool<AsyncPgConnection>,
+        cancel: CancellationToken,
+        interval: std::time::Duration,
+        threshold: i32,
+        worker_stale_secs: i64,
+        telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
+    ) -> tokio::task::JoinHandle<()> {
+        spawn_poison_pill_reclaimer_for_shard(
+            pool,
+            cancel,
+            interval,
+            threshold,
+            worker_stale_secs,
+            telemetry,
+            None,
+        )
+    }
+
+    /// [`spawn_poison_pill_reclaimer`], attributing this loop instance to
+    /// `shard` in the `scanner_liveness` health check (issue #797).
+    ///
+    /// A multi-shard worker spawns one reclaimer per assigned shard, all
+    /// registered under the same `poison_pill` scanner label. Passing the shard
+    /// here is what lets the health check say *which* shard's loop is wedged --
+    /// the metric carries no shard label, so this is the only surface that can
+    /// localize it.
+    ///
+    /// Pass `None` for a process-wide loop or a single-shard deployment.
+    #[must_use]
+    pub fn spawn_poison_pill_reclaimer_for_shard(
         pool: diesel_async::pooled_connection::deadpool::Pool<AsyncPgConnection>,
         cancel: CancellationToken,
         interval: std::time::Duration,
@@ -684,7 +719,10 @@ mod scanner {
 }
 
 #[cfg(feature = "db")]
-pub use scanner::{QUARANTINE_REASON, reclaim_orphaned_tasks, spawn_poison_pill_reclaimer};
+pub use scanner::{
+    QUARANTINE_REASON, reclaim_orphaned_tasks, spawn_poison_pill_reclaimer,
+    spawn_poison_pill_reclaimer_for_shard,
+};
 
 #[cfg(test)]
 mod tests {

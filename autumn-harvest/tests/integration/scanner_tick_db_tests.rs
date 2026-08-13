@@ -148,7 +148,7 @@ async fn spawned_timeout_checker_ticks_all_owned_scanners_with_no_work() {
     });
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    let handle = timeout::spawn_timeout_checker(
+    let handle = timeout::spawn_timeout_checker_for_shard(
         pool.clone(),
         cancel.clone(),
         Duration::from_millis(50),
@@ -292,7 +292,7 @@ async fn the_loop_advances_liveness_without_a_metrics_recorder() {
     let pool = build_pool(&url);
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    let handle = timeout::spawn_timeout_checker(
+    let handle = timeout::spawn_timeout_checker_for_shard(
         pool.clone(),
         cancel.clone(),
         Duration::from_millis(50),
@@ -351,7 +351,7 @@ async fn spawned_poison_pill_reclaimer_registers_ticks_and_deregisters() {
     let cancel = tokio_util::sync::CancellationToken::new();
 
     let before = global_scanner_liveness().registrations(Scanner::PoisonPill);
-    let handle = autumn_harvest::poison_pill::spawn_poison_pill_reclaimer(
+    let handle = autumn_harvest::poison_pill::spawn_poison_pill_reclaimer_for_shard(
         pool.clone(),
         cancel.clone(),
         Duration::from_millis(50),
@@ -436,4 +436,47 @@ fn a_wedged_loop_is_detected_within_two_poll_intervals_of_its_threshold() {
         ScannerLivenessVerdict::Healthy,
         "a loop silent for 2x its poll interval must already be flagged"
     );
+}
+
+/// The pre-#797 public spawn signatures still exist, unchanged.
+///
+/// `timeout` and `poison_pill` are `pub mod`s, so `spawn_timeout_checker` and
+/// `spawn_poison_pill_reclaimer` are reachable public API that an embedder
+/// running its own worker loop may call directly. Issue #797 needed a shard to
+/// label the loop in the `scanner_liveness` check, but adding it as a mandatory
+/// argument would have broken every such caller for an observability feature
+/// they never asked for. The shard-aware variants are additive siblings
+/// (`*_for_shard`) and these two keep their original argument lists.
+///
+/// This is a **compile-time** assertion: coercing each function to a fn pointer
+/// of its exact expected type fails to build if any argument is added, removed,
+/// or reordered. It needs no database to be meaningful -- it is checked by
+/// `cargo clippy -p autumn-harvest --all-features --tests`, which CI runs on
+/// every push.
+#[test]
+fn the_public_spawn_signatures_are_unchanged_by_shard_attribution() {
+    type TimeoutCheckerFn = fn(
+        diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        tokio_util::sync::CancellationToken,
+        Duration,
+        std::sync::Arc<autumn_harvest::telemetry::TelemetryConfig>,
+        Duration,
+        Option<autumn_harvest::shard::ShardedDbPool>,
+        Vec<ShardId>,
+        std::sync::Arc<autumn_harvest::circuit_breaker::CircuitBreakerRegistry>,
+        Option<u64>,
+        i64,
+    ) -> tokio::task::JoinHandle<()>;
+
+    type PoisonPillReclaimerFn = fn(
+        diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        tokio_util::sync::CancellationToken,
+        Duration,
+        i32,
+        i64,
+        std::sync::Arc<autumn_harvest::telemetry::TelemetryConfig>,
+    ) -> tokio::task::JoinHandle<()>;
+
+    let _: TimeoutCheckerFn = timeout::spawn_timeout_checker;
+    let _: PoisonPillReclaimerFn = autumn_harvest::poison_pill::spawn_poison_pill_reclaimer;
 }

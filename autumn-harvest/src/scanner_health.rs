@@ -721,6 +721,7 @@ mod tests {
             last_tick: Some(t0),
             last_tick_at: None,
             tick_count: 1,
+            shard: None,
         };
         // A stale tick from a stopped runtime must not beat a fresh
         // registration.

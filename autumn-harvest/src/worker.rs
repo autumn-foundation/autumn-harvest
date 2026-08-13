@@ -16549,7 +16549,7 @@ impl Worker {
         let timeout_checkers: Vec<_> = shard_pools_for_monitors
             .iter()
             .map(|(shard_pool, shard)| {
-                crate::timeout::spawn_timeout_checker(
+                crate::timeout::spawn_timeout_checker_for_shard(
                     shard_pool.clone(),
                     self.shutdown.clone(),
                     self.config.poll_interval,
@@ -16568,7 +16568,7 @@ impl Worker {
         let poison_pill_reclaimers: Vec<_> = shard_pools_for_monitors
             .iter()
             .map(|(shard_pool, shard)| {
-                crate::poison_pill::spawn_poison_pill_reclaimer(
+                crate::poison_pill::spawn_poison_pill_reclaimer_for_shard(
                     shard_pool.clone(),
                     self.shutdown.clone(),
                     self.config.worker_heartbeat_interval,
