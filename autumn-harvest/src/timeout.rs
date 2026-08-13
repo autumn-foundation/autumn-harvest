@@ -3367,7 +3367,7 @@ pub fn spawn_timeout_checker(
         crate::scanner_health::Scanner::ExternalOutbox,
     ]
     .into_iter()
-    .map(|scanner| crate::scanner_health::register_scanner(scanner, interval))
+    .map(|scanner| crate::scanner_health::register_scanner(&*telemetry.metrics, scanner, interval))
     .collect();
     tokio::spawn(async move {
         loop {

@@ -1875,6 +1875,31 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = scanner;
     }
 
+    /// A background control loop registered itself, before its first
+    /// iteration (issue #797).
+    ///
+    /// Initializes that scanner's [`METRIC_SCANNER_TICK`] series **at zero**
+    /// rather than recording a separate metric — implementations should
+    /// increment the tick counter by `0`.
+    ///
+    /// Without this, a loop that panics or hangs during its *first* iteration
+    /// never reaches [`record_scanner_tick`](Self::record_scanner_tick), so
+    /// the process exports no series for it at all. `rate(...) == 0` only
+    /// evaluates series that exist, and `absent()` is deliberately not used by
+    /// the shipped alert (an API-only replica legitimately exports nothing),
+    /// so that startup wedge would page *never* — the worst failure mode for a
+    /// liveness signal. Registration happens before the first iteration, which
+    /// is exactly when the process knows the loop is supposed to be running.
+    ///
+    /// A process that runs no control loops still exports nothing, so the
+    /// API-only-replica case that rules out `absent()` is unchanged.
+    ///
+    /// Additive with a no-op default: implementing it is optional and no
+    /// existing implementor breaks.
+    fn record_scanner_registered(&self, scanner: &str) {
+        let _ = scanner;
+    }
+
     /// Results of one retention-janitor tick on a shard.
     fn record_retention_tick(
         &self,

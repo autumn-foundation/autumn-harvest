@@ -747,6 +747,7 @@ impl RetentionRuntime {
         // Issue #797: declare the loop before its first iteration so the
         // `scanner_liveness` check expects it and grants it boot grace.
         let owner = crate::scanner_health::register_scanner(
+            metrics.as_ref(),
             crate::scanner_health::Scanner::Retention,
             config.tick_interval(),
         );

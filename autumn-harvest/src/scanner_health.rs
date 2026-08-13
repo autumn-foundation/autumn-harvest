@@ -530,9 +530,35 @@ pub fn global_scanner_liveness() -> &'static ScannerLiveness {
 /// Call once at spawn time, before the loop's first iteration, and keep the
 /// returned handle: it is what [`record_scanner_tick`] and
 /// [`deregister_scanner`] address.
+///
+/// Also **initializes the scanner's tick series at zero**. Registration is the
+/// earliest moment the process knows the loop is supposed to be running, and a
+/// loop that panics or hangs on its *first* iteration never reaches a tick —
+/// so without this it would export no series at all and `rate(...) == 0` would
+/// match nothing, silently. See
+/// [`MetricsRecorder::record_scanner_registered`].
 #[must_use]
-pub fn register_scanner(scanner: Scanner, poll_interval: Duration) -> ScannerOwner {
-    global_scanner_liveness().register(scanner, poll_interval)
+pub fn register_scanner(
+    metrics: &dyn MetricsRecorder,
+    scanner: Scanner,
+    poll_interval: Duration,
+) -> ScannerOwner {
+    register_scanner_on(global_scanner_liveness(), metrics, scanner, poll_interval)
+}
+
+/// [`register_scanner`] against an explicit registry, for tests that must not
+/// touch process-global state.
+#[doc(hidden)]
+#[must_use]
+pub fn register_scanner_on(
+    liveness: &ScannerLiveness,
+    metrics: &dyn MetricsRecorder,
+    scanner: Scanner,
+    poll_interval: Duration,
+) -> ScannerOwner {
+    let owner = liveness.register(scanner, poll_interval);
+    metrics.record_scanner_registered(scanner.as_str());
+    owner
 }
 
 /// Declare that a control loop has stopped **gracefully** (process-global

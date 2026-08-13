@@ -419,6 +419,18 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_scanner_registered(&self, scanner: &str) {
+        // Same counter, incremented by zero: this exists purely to bring the
+        // series into existence at registration, so a loop that wedges before
+        // its first tick still reads `rate(...) == 0` instead of exporting no
+        // series at all (issue #797).
+        counter!(
+            METRIC_SCANNER_TICK,
+            METRIC_LABEL_SCANNER => scanner.to_owned(),
+        )
+        .increment(0);
+    }
+
     fn record_retention_deleted(&self, workflow: &str, count: u64) {
         counter!(
             METRIC_RETENTION_DELETED,
@@ -1142,79 +1154,20 @@ mod tests {
     // Background control-loop liveness heartbeat bridge (issue #797)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn bridges_scanner_tick_with_the_bounded_scanner_label() {
-        // Real label-content assertion: a local `metrics::Recorder` captures
-        // the registered counter key, so a wrong metric name, a dropped
-        // label, or a mis-named label constant is caught here rather than
-        // surfacing as a silently-missing series in production.
-        type CounterKey = (String, Vec<(String, String)>);
+    // Real label-content assertion support: a local `metrics::Recorder` that
+    // captures every registered counter key, so a wrong metric name, a dropped
+    // label, or a mis-named label constant is caught here rather than surfacing
+    // as a silently-missing series in production.
+    type CounterKey = (String, Vec<(String, String)>);
 
-        #[derive(Default)]
-        struct CapturingRecorder {
-            counters: std::sync::Mutex<Vec<CounterKey>>,
-        }
-        impl metrics::Recorder for CapturingRecorder {
-            fn describe_counter(
-                &self,
-                _: metrics::KeyName,
-                _: Option<metrics::Unit>,
-                _: metrics::SharedString,
-            ) {
-            }
-            fn describe_gauge(
-                &self,
-                _: metrics::KeyName,
-                _: Option<metrics::Unit>,
-                _: metrics::SharedString,
-            ) {
-            }
-            fn describe_histogram(
-                &self,
-                _: metrics::KeyName,
-                _: Option<metrics::Unit>,
-                _: metrics::SharedString,
-            ) {
-            }
-            fn register_counter(
-                &self,
-                key: &metrics::Key,
-                _: &metrics::Metadata<'_>,
-            ) -> metrics::Counter {
-                self.counters.lock().unwrap().push((
-                    key.name().to_owned(),
-                    key.labels()
-                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
-                        .collect(),
-                ));
-                metrics::Counter::noop()
-            }
-            fn register_gauge(
-                &self,
-                _: &metrics::Key,
-                _: &metrics::Metadata<'_>,
-            ) -> metrics::Gauge {
-                metrics::Gauge::noop()
-            }
-            fn register_histogram(
-                &self,
-                _: &metrics::Key,
-                _: &metrics::Metadata<'_>,
-            ) -> metrics::Histogram {
-                metrics::Histogram::noop()
-            }
-        }
+    #[derive(Default)]
+    struct CapturingRecorder {
+        counters: std::sync::Mutex<Vec<CounterKey>>,
+    }
 
-        let capture = CapturingRecorder::default();
-        metrics::with_local_recorder(&&capture, || {
-            let rec = MetricsRsRecorder;
-            for scanner in crate::scanner_health::Scanner::ALL {
-                rec.record_scanner_tick(scanner.as_str());
-            }
-        });
-
-        let counters = capture.counters.lock().unwrap().clone();
-        let expected: Vec<CounterKey> = crate::scanner_health::Scanner::ALL
+    /// Every `Scanner` variant's expected `harvest.scanner.tick` counter key.
+    fn expected_scanner_counter_keys() -> Vec<CounterKey> {
+        crate::scanner_health::Scanner::ALL
             .iter()
             .map(|scanner| {
                 (
@@ -1225,11 +1178,101 @@ mod tests {
                     )],
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    impl metrics::Recorder for CapturingRecorder {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            self.counters.lock().unwrap().push((
+                key.name().to_owned(),
+                key.labels()
+                    .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                    .collect(),
+            ));
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn bridges_scanner_tick_with_the_bounded_scanner_label() {
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            for scanner in crate::scanner_health::Scanner::ALL {
+                rec.record_scanner_tick(scanner.as_str());
+            }
+        });
+
+        let counters = capture.counters.lock().unwrap().clone();
         assert_eq!(
-            counters, expected,
+            counters,
+            expected_scanner_counter_keys(),
             "the bridge must register harvest.scanner.tick with exactly the \
              bounded `scanner` label for every Scanner variant"
+        );
+    }
+
+    #[test]
+    fn bridges_scanner_registered_by_initializing_the_same_tick_series() {
+        // A loop that panics or hangs on its *first* iteration never reaches a
+        // tick, so without an explicit registration sample the process exports
+        // no series at all -- and the shipped alert
+        // `rate(harvest_scanner_tick_total{...}[5m]) == 0` only evaluates
+        // series that exist, so the page would stay silent forever.
+        //
+        // Registration must therefore pre-create the *same* counter key the
+        // tick uses: same metric name, same bounded `scanner` label. A separate
+        // series (or a differently-labelled one) would not satisfy the alert.
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            for scanner in crate::scanner_health::Scanner::ALL {
+                rec.record_scanner_registered(scanner.as_str());
+            }
+        });
+
+        let counters = capture.counters.lock().unwrap().clone();
+        assert_eq!(
+            counters,
+            expected_scanner_counter_keys(),
+            "registration must initialize the very same harvest.scanner.tick \
+             series the tick increments, so a first-iteration wedge is visible \
+             to rate() == 0"
         );
     }
 

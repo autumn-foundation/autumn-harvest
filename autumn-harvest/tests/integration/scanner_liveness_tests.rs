@@ -672,6 +672,116 @@ fn record_scanner_tick_emits_the_counter_and_the_timestamp_together() {
 }
 
 // ---------------------------------------------------------------------------
+// Series initialization: a first-iteration wedge must still be visible
+// ---------------------------------------------------------------------------
+
+/// Records `register`/`tick` events in order so a test can assert both *that*
+/// the series is initialized and *when* relative to the first tick.
+#[derive(Default)]
+struct RegisterCapture(std::sync::Mutex<Vec<String>>);
+
+impl MetricsRecorder for RegisterCapture {
+    fn record_scanner_registered(&self, scanner: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(format!("register:{scanner}"));
+    }
+
+    fn record_scanner_tick(&self, scanner: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(format!("tick:{scanner}"));
+    }
+}
+
+impl RegisterCapture {
+    fn events(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[test]
+fn registration_initializes_the_series_before_the_first_iteration() {
+    // The shipped alert is `rate(harvest_scanner_tick_total{...}[5m]) == 0`, and
+    // PromQL comparisons only evaluate series that *exist*. A loop that panics
+    // or hangs on its very first iteration never reaches `record_scanner_tick`,
+    // so without an explicit registration sample no series is ever created and
+    // the paging alert stays silent forever — the exact failure the alert is
+    // meant to catch. Registration therefore emits its own sample, at spawn
+    // time, before the loop body runs.
+    let liveness = ScannerLiveness::new();
+    let capture = RegisterCapture::default();
+    let owner = autumn_harvest::scanner_health::register_scanner_on(
+        &liveness,
+        &capture,
+        Scanner::Retention,
+        Duration::from_secs(3600),
+    );
+
+    // A wedge on iteration one: registered, never ticked.
+    assert_eq!(capture.events(), ["register:retention"]);
+    let status = &liveness.snapshot()[0];
+    assert!(
+        !status.has_ticked,
+        "a loop wedged on its first iteration has registered but never ticked"
+    );
+    assert_eq!(status.tick_count, 0);
+
+    // And once it does run, the tick follows the registration.
+    autumn_harvest::scanner_health::record_scanner_tick_on(&liveness, &capture, owner);
+    assert_eq!(capture.events(), ["register:retention", "tick:retention"]);
+}
+
+#[test]
+fn every_scanner_variant_initializes_its_own_series() {
+    // The series is keyed by the bounded `scanner` label, so a first-iteration
+    // wedge must be visible for *every* loop, not just the one that happens to
+    // be covered by a test.
+    let liveness = ScannerLiveness::new();
+    let capture = RegisterCapture::default();
+    for scanner in Scanner::ALL {
+        let _owner = autumn_harvest::scanner_health::register_scanner_on(
+            &liveness,
+            &capture,
+            scanner,
+            Duration::from_secs(30),
+        );
+    }
+
+    let expected: Vec<String> = Scanner::ALL
+        .iter()
+        .map(|s| format!("register:{}", s.as_str()))
+        .collect();
+    assert_eq!(capture.events(), expected);
+}
+
+#[test]
+fn record_scanner_registered_has_a_noop_default() {
+    // Additive, no breaking change: a recorder that predates this method still
+    // compiles and is simply silent, exactly like `record_scanner_tick`.
+    struct Silent;
+    impl MetricsRecorder for Silent {}
+
+    let liveness = ScannerLiveness::new();
+    let owner = autumn_harvest::scanner_health::register_scanner_on(
+        &liveness,
+        &Silent,
+        Scanner::Timeout,
+        Duration::from_secs(30),
+    );
+
+    // Liveness is recorded regardless of whether telemetry is wired.
+    assert_eq!(liveness.snapshot()[0].scanner, Scanner::Timeout);
+    liveness.deregister(owner);
+    assert!(liveness.snapshot().is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // Wiring guard: every spawned loop registers, ticks, and deregisters
 // ---------------------------------------------------------------------------
 

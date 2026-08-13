@@ -628,6 +628,7 @@ mod scanner {
         // Issue #797: declare the loop before its first iteration so the
         // `scanner_liveness` check expects it and grants it boot grace.
         let owner = crate::scanner_health::register_scanner(
+            &*telemetry.metrics,
             crate::scanner_health::Scanner::PoisonPill,
             interval,
         );

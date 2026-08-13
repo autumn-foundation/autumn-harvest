@@ -447,11 +447,12 @@ impl SchedulerRuntime {
         // `scanner_liveness` check expects it and grants it boot grace. Unlike
         // the other loops, the schedule ticker sleeps AFTER its first pass, so
         // it normally ticks almost immediately.
+        let scanner_metrics = Arc::clone(&registry.telemetry().metrics);
         let owner = crate::scanner_health::register_scanner(
+            scanner_metrics.as_ref(),
             crate::scanner_health::Scanner::Schedule,
             DEFAULT_SCHEDULER_TICK_INTERVAL,
         );
-        let scanner_metrics = Arc::clone(&registry.telemetry().metrics);
         let handle = tokio::spawn(async move {
             while !shutdown_for_task.is_cancelled() {
                 if let Err(error) = tick_once_sharded_with_backoff(

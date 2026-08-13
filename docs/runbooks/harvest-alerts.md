@@ -1832,14 +1832,31 @@ own work counters and its `tracing::error!`, not this heartbeat.
   to registration time — note that for the hourly retention janitor that grace
   is 2 hours, so a freshly booted process legitimately reports it as healthy
   long before its first tick. A rate-based alert evaluated during startup can
-  transiently read zero.
+  transiently read zero. The tick series is created at **registration** time
+  (see the next bullet), so it exists from process start rather than appearing
+  only at the first tick — the boot window for a slow loop is therefore its
+  first poll interval after start, and the hourly retention expression reads
+  zero throughout hour 0–1 of a fresh process. Give the rule a `for:` of at
+  least one poll interval to ride that out.
 - **A missing series is not an alert.** `== 0` never fires on a series that
-  does not exist. If your metrics come from the plugin's built-in
-  `with_metrics_scrape()` endpoint rather than the `metrics-rs` adapter, no
-  `harvest_scanner_tick` series is exported at all (that endpoint bridges a
-  deliberately narrow subset and does not back the full starter pack), so the
-  alert is silently inert. Use the `metrics-rs` recorder, or rely on the
-  preflight check.
+  does not exist. Two distinct cases:
+  - *A wedge on the very first iteration.* This is **covered**: each loop
+    initializes its own tick series at zero when it **registers**, at spawn
+    time, before the loop body runs. So a loop that panics or hangs before it
+    ever completes a pass still exports a flat series that `rate(...) == 0`
+    matches, instead of exporting nothing and staying silent forever. (The
+    `scanner_liveness` preflight check covered this case from the start —
+    registration precedes the first iteration, so the loop ages into
+    `stale`/`wedged` with `has_ticked: false`.)
+  - *The wrong metrics backend.* This is **not** covered. If your metrics come
+    from the plugin's built-in `with_metrics_scrape()` endpoint rather than the
+    `metrics-rs` adapter, no `harvest_scanner_tick` series is exported at all
+    (that endpoint bridges a deliberately narrow subset and does not back the
+    full starter pack), so the alert is silently inert. Use the `metrics-rs`
+    recorder, or rely on the preflight check.
+  `absent()` is deliberately **not** used to paper over either case: a process
+  that runs none of these loops (an API-only replica) legitimately exports no
+  series, and would page falsely forever.
 - **Graceful shutdown.** A draining worker stops its loops on purpose. The
   `scanner_liveness` check is not fooled — a clean stop deregisters each loop,
   so a process that drains its worker while continuing to serve HTTP reports
