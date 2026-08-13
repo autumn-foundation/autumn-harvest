@@ -162,7 +162,7 @@ silently regress.
 New core module `autumn-harvest/src/schema_contract.rs` (unconditional — no `db`
 or `schema` gate, so the CLI can link it with `default-features = false`).
 
-101 no-DB integration tests in
+121 no-DB integration tests in
 `autumn-harvest/tests/integration/workflow_schema_contract_tests.rs`. Every rule
 that is a *validation* narrowing carries an independent **oracle** assertion
 against the engine's own `validate_against_schema` — the same code that gates
@@ -260,3 +260,40 @@ A second round (automated review on the PR) found four more of the same class:
   the capped delta listing while the rebase took the whole contract, so breaking
   changes past the cap were absorbed with nothing naming them — contradicting
   the artifact's promise of a record per absorbed delta. Now refused.
+
+**Third review round** — two false verdicts and one skipped gate:
+
+- **An unchanged ambiguous branch set was reported breaking.** Two multi-field
+  object variants of a `#[serde(untagged)]` enum both key as `type:object`, so
+  the fail-closed collision guard fired — on *both* sides, for an identical
+  schema. Because the ambiguity is a property of the shape rather than of the
+  edit, that workflow's own baseline could never pass the gate again: a
+  false-BREAKING that permanently blocks every unrelated change to the
+  repository, which for a CI gate is the worst outcome there is. Indistinguishable
+  branches are now compared **pairwise by position** when both sides have the
+  same count — unchanged yields nothing, and a nested change (including a `$ref`
+  target change one level down) is still caught by the recursion. A change in
+  the branch **count** is genuinely unclassifiable (the differ cannot say which
+  branch went) and still fails closed. The accepted cost is that *reordering*
+  ambiguous branches produces positional deltas; they are acknowledgeable, and
+  for `anyOf` a reorder is a real rebind risk anyway.
+- **An `anyOf` variant inserted ahead of an existing branch was compatible.**
+  The second-round order check compares only keys **common to both** revisions,
+  so a newly-added key is invisible to it — and the add loop marked every
+  `anyOf` addition compatible. Prepending `Float(f64)` before `Int(i64)`
+  therefore passed, even though serde's untagged binding rule captures every
+  recorded integer into the new variant: a false-COMPATIBLE on exactly the
+  silent-rebind class the order check exists to catch. Additions are now
+  position-aware — inserted ahead of any pre-existing branch is breaking,
+  appended after all of them stays compatible (the `T` → `Option<T>` shape,
+  which appends a `null` branch). `oneOf` is unaffected: exactly-one matching
+  means order cannot rebind anything.
+- **The gate did not run for baseline-only changes.** The artifact lives under
+  `docs/`, and CI treats a docs-only PR as needing no code jobs — so the gate's
+  own trusted *input* was the one file that could change without being compared
+  against the generated contract. A hand-edited, stale, or malformed baseline
+  merged unchecked, which is precisely the drift the gate exists to prevent. The
+  docs-only filter now carves out `docs/workflow-schema-contract.json` by exact
+  path, pinned by a test that reads `ci.yml`. The guide beside it stays
+  docs-only. This supersedes the earlier note that documented the hole as a
+  known limitation.

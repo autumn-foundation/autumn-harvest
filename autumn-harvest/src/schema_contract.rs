@@ -2307,6 +2307,15 @@ fn diff_anyof_branch_order(
     ));
 }
 
+/// Both sides' branches keyed for matching, plus the current side's keys in
+/// DECLARATION order — which the maps erase but serde's untagged binding rule
+/// depends on.
+struct KeyedBranches {
+    base_by_key: BTreeMap<String, Value>,
+    cur_by_key: BTreeMap<String, (Value, bool)>,
+    cur_keys: Vec<String>,
+}
+
 /// Key both sides' branches, checking `anyOf` declaration order on the way.
 ///
 /// Each side is keyed against *its own* document root, so `$ref` targets are
@@ -2323,7 +2332,7 @@ fn key_branches(
     both_anyof: bool,
     path: &str,
     diff: &mut SchemaContractDiff,
-) -> (BTreeMap<String, Value>, BTreeMap<String, (Value, bool)>) {
+) -> KeyedBranches {
     let base_keys: Vec<String> = base_branches
         .iter()
         .map(|b| branch_key(b, ctx.base_root).0)
@@ -2332,9 +2341,9 @@ fn key_branches(
         .iter()
         .map(|b| branch_key(b, ctx.cur_root))
         .collect();
+    let cur_keys: Vec<String> = cur_keyed.iter().map(|(k, _)| k.clone()).collect();
 
     if both_anyof {
-        let cur_keys: Vec<String> = cur_keyed.iter().map(|(k, _)| k.clone()).collect();
         diff_anyof_branch_order(ctx, &base_keys, &cur_keys, path, diff);
     }
 
@@ -2347,7 +2356,11 @@ fn key_branches(
         .zip(cur_branches.iter().cloned())
         .map(|((k, d), b)| (k, (b, d)))
         .collect();
-    (base_by_key, cur_by_key)
+    KeyedBranches {
+        base_by_key,
+        cur_by_key,
+        cur_keys,
+    }
 }
 
 fn diff_branches(
@@ -2375,27 +2388,17 @@ fn diff_branches(
     );
 
     let both_anyof = cur_kw == "anyOf" && bb.as_ref().is_some_and(|(k, _)| *k == "anyOf");
-    let (base_by_key, cur_by_key) =
-        key_branches(ctx, &base_branches, &cur_branches, both_anyof, path, diff);
+    let KeyedBranches {
+        base_by_key,
+        cur_by_key,
+        cur_keys,
+    } = key_branches(ctx, &base_branches, &cur_branches, both_anyof, path, diff);
 
     // Branches are matched across the two sides BY KEY, so two branches sharing
     // a key collapse in the map and one is silently dropped — which would hide
     // a variant REMOVAL behind a same-keyed survivor and report it compatible.
-    // Ambiguous keying means the differ cannot say which branch is which, so it
-    // fails closed rather than guessing.
     if base_by_key.len() != base_branches.len() || cur_by_key.len() != cur_branches.len() {
-        diff.push(
-            ctx.delta(
-                path,
-                ChangeKind::UnanalysedConstraintChanged,
-                Verdict::Breaking,
-                "two or more branches of this `oneOf`/`anyOf` are indistinguishable to the differ \
-             (no variant tag, unit `enum`, or single-property external tag), so branches cannot \
-             be matched across revisions and a removal could pass unnoticed; the comparison is \
-             reported breaking (fail closed). Acknowledge it if it is safe"
-                    .to_string(),
-            ),
-        );
+        diff_ambiguous_branches(ctx, &base_branches, &cur_branches, path, depth, diff);
         return;
     }
 
@@ -2420,28 +2423,50 @@ fn diff_branches(
             )),
         }
     }
+    // For `anyOf` (serde's untagged shape) the binding rule is FIRST match in
+    // declaration order, so a branch inserted AHEAD of a pre-existing one can
+    // capture recorded data that used to bind to the later branch. Anything
+    // added after every pre-existing branch cannot rebind anything — that is
+    // the `T` -> `Option<T>` shape, which appends a `null` branch.
+    let last_existing = cur_keys
+        .iter()
+        .rposition(|k| base_by_key.contains_key(k))
+        .unwrap_or(0);
     for (key, (_, discriminated)) in &cur_by_key {
         if base_by_key.contains_key(key) {
             continue;
         }
-        // `anyOf` means "at least one", so an added branch can never reject a
+        let inserted_ahead = cur_kw == "anyOf"
+            && cur_keys
+                .iter()
+                .position(|k| k == key)
+                .is_some_and(|i| i < last_existing);
+        if inserted_ahead {
+            diff.push(ctx.delta(
+                path,
+                ChangeKind::VariantAdded,
+                Verdict::Breaking,
+                format!(
+                    "variant `{key}` inserted AHEAD of a pre-existing branch of this `anyOf`; for \
+                     `#[serde(untagged)]` serde binds the FIRST matching variant in declaration \
+                     order, so recorded data that used to bind to a later branch can be silently \
+                     rebound to this one (e.g. prepending `f64` before `i64` captures every \
+                     recorded integer). Append it after every existing branch instead"
+                ),
+            ));
+            continue;
+        }
+        // `anyOf` means "at least one", so an appended branch can never reject a
         // previously-valid instance. `oneOf` means "exactly one", so an added
         // branch that OVERLAPS an existing one turns a single match into two and
         // rejects it — safe only when the branch carries a variant tag proving
-        // disjointness.
+        // disjointness. `oneOf` binding does not depend on order.
         if cur_kw == "anyOf" || *discriminated {
-            let note = if cur_kw == "anyOf" {
-                " (note: for `#[serde(untagged)]`, serde binds the FIRST matching variant in \
-                 declaration order — inserting a permissive variant ahead of an existing one can \
-                 silently rebind recorded data to a different branch)"
-            } else {
-                ""
-            };
             diff.push(ctx.delta(
                 path,
                 ChangeKind::VariantAdded,
                 Verdict::Compatible,
-                format!("variant `{key}` added{note}"),
+                format!("variant `{key}` added"),
             ));
         } else {
             diff.push(ctx.delta(
@@ -2455,6 +2480,53 @@ fn diff_branches(
                 ),
             ));
         }
+    }
+}
+
+/// Compare a branch set the differ cannot key, by POSITION.
+///
+/// Two branches that share a key (two multi-field object variants of a
+/// `#[serde(untagged)]` enum both key as `type:object`) cannot be matched
+/// across revisions by name. Failing closed unconditionally would report an
+/// *unchanged* set breaking — and since the collision fires on both sides, that
+/// workflow's own baseline could never pass the gate again, permanently
+/// blocking unrelated work. So when the two sides have the same NUMBER of
+/// branches, they are compared pairwise by position: an unchanged set yields
+/// zero deltas, and a nested change (including a `$ref` target change one level
+/// down) is still caught by the recursion.
+///
+/// A LENGTH change is genuinely unclassifiable — the differ cannot say which
+/// branch was dropped — so that still fails closed.
+///
+/// The accepted cost is that REORDERING ambiguous branches produces positional
+/// deltas that do not correspond to a real edit. They are acknowledgeable, and
+/// for `anyOf` a reorder is a genuine rebind risk anyway.
+fn diff_ambiguous_branches(
+    ctx: &mut DiffCtx<'_>,
+    base_branches: &[Value],
+    cur_branches: &[Value],
+    path: &str,
+    depth: usize,
+    diff: &mut SchemaContractDiff,
+) {
+    if base_branches.len() != cur_branches.len() {
+        diff.push(ctx.delta(
+            path,
+            ChangeKind::UnanalysedConstraintChanged,
+            Verdict::Breaking,
+            format!(
+                "the number of branches in this `oneOf`/`anyOf` changed ({} -> {}) and the \
+                 branches are indistinguishable to the differ (no variant tag, unit `enum`, or \
+                 single-property external tag), so it cannot say which branch was added or \
+                 removed; reported breaking (fail closed). Acknowledge it if it is safe",
+                base_branches.len(),
+                cur_branches.len()
+            ),
+        ));
+        return;
+    }
+    for (i, (b, c)) in base_branches.iter().zip(cur_branches).enumerate() {
+        diff_node(ctx, b, c, &format!("{path}/[{i}]"), depth + 1, diff);
     }
 }
 

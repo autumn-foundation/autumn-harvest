@@ -2031,3 +2031,146 @@ fn acknowledging_a_truncated_diff_is_refused() {
         "the refusal must name truncation as the cause: {msg}"
     );
 }
+
+// ── Codex review 2: unchanged ambiguous branches, prepended `anyOf` variants ──
+
+/// An UNCHANGED ambiguous branch set must not be reported breaking.
+///
+/// Two multi-field object variants of a `#[serde(untagged)]` enum both key as
+/// `type:object`, so the collision guard fires — on BOTH sides. Reporting that
+/// breaking means the workflow's own baseline can never pass the gate again,
+/// permanently blocking every unrelated change to the repository.
+#[test]
+fn an_unchanged_ambiguous_branch_set_is_not_breaking() {
+    let ambiguous = json!({"anyOf": [
+        {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+        {"type": "object", "properties": {"c": {"type": "string"}, "d": {"type": "string"}}},
+    ]});
+    assert_compatible(ambiguous.clone(), ambiguous);
+}
+
+/// The positional fallback still recurses, so a nested change inside an
+/// ambiguous branch is caught rather than waved through.
+#[test]
+fn a_nested_change_inside_an_ambiguous_branch_is_still_detected() {
+    assert_breaking(
+        json!({"anyOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+            {"type": "object", "properties": {"c": {"type": "string"}, "d": {"type": "string"}}},
+        ]}),
+        json!({"anyOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+            // `c` narrowed from string to integer — recorded strings no longer read.
+            {"type": "object", "properties": {"c": {"type": "integer"}, "d": {"type": "string"}}},
+        ]}),
+        ChangeKind::TypeNarrowed,
+    );
+}
+
+/// A LENGTH change in an ambiguous set is genuinely unclassifiable: the differ
+/// cannot say which branch was dropped, so it must still fail closed.
+#[test]
+fn an_ambiguous_branch_set_that_changes_length_still_fails_closed() {
+    assert_breaking(
+        json!({"anyOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+            {"type": "object", "properties": {"c": {"type": "string"}, "d": {"type": "string"}}},
+        ]}),
+        json!({"anyOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+        ]}),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+}
+
+/// For `#[serde(untagged)]`, serde binds the FIRST matching branch. Inserting a
+/// permissive variant AHEAD of an existing one silently rebinds recorded data
+/// to a different branch — e.g. prepending `Float(f64)` before `Int(i64)`
+/// captures every recorded integer.
+#[test]
+fn prepending_an_anyof_variant_ahead_of_an_existing_branch_is_breaking() {
+    assert_breaking(
+        json!({"anyOf": [
+            {"type": "integer", "format": "int64"},
+        ]}),
+        json!({"anyOf": [
+            {"type": "number", "format": "double"},
+            {"type": "integer", "format": "int64"},
+        ]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// A variant inserted between two existing branches is equally a rebind risk
+/// for every branch after it.
+#[test]
+fn inserting_an_anyof_variant_between_existing_branches_is_breaking() {
+    let a = json!({"type": "object", "required": ["A"], "properties": {"A": {"type": "string"}}});
+    let b = json!({"type": "object", "required": ["B"], "properties": {"B": {"type": "string"}}});
+    assert_breaking(
+        json!({"anyOf": [a, b]}),
+        json!({"anyOf": [a, {"type": "object"}, b]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// Appending stays compatible — nothing recorded can rebind to a branch that
+/// sits after every pre-existing one. This is the `T` -> `Option<T>` shape.
+#[test]
+fn appending_an_anyof_variant_after_every_existing_branch_stays_compatible() {
+    let a = json!({"type": "object", "required": ["A"], "properties": {"A": {"type": "string"}}});
+    let b = json!({"type": "object", "required": ["B"], "properties": {"B": {"type": "string"}}});
+    assert_compatible_delta(
+        json!({"anyOf": [a, b]}),
+        json!({"anyOf": [a, b, {"type": "null"}]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// `oneOf` demands exactly one match, so branch ORDER cannot rebind anything —
+/// the position rule is `anyOf`-only and must not leak into `oneOf`.
+#[test]
+fn prepending_a_disjoint_oneof_variant_stays_compatible() {
+    let a = json!({"type": "object", "required": ["A"], "properties": {"A": {"type": "string"}}});
+    let b = json!({"type": "object", "required": ["B"], "properties": {"B": {"type": "string"}}});
+    assert_compatible_delta(
+        json!({"oneOf": [a]}),
+        json!({"oneOf": [b, a]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+// ── Codex review 2: the gate must run when only the BASELINE changes ─────────
+
+const CI_YAML: &str = include_str!("../../../.github/workflows/ci.yml");
+
+/// The gate step must exist in CI at all.
+#[test]
+fn ci_runs_the_schema_gate() {
+    assert!(
+        CI_YAML.contains("schema check --current"),
+        "ci.yml must run `harvest schema check --current` — without it the gate is decorative"
+    );
+}
+
+/// A PR that changes ONLY the checked-in baseline must still run the gate.
+///
+/// The baseline lives under `docs/`, and the matrix is skipped for docs-only
+/// changes — so without an explicit carve-out a hand-edited, stale, or malformed
+/// baseline merges with no comparison against the generated contract, which is
+/// precisely the drift the gate exists to catch.
+#[test]
+fn the_schema_baseline_is_not_classified_as_a_docs_only_change() {
+    let filter = CI_YAML
+        .split("Docs-only =")
+        .nth(1)
+        .expect("ci.yml must document its docs-only classification rule");
+    // Bound the window to the classification block so a mention elsewhere in the
+    // file cannot satisfy this assertion.
+    let block = &filter[..filter.len().min(1200)];
+    assert!(
+        block.contains("docs/workflow-schema-contract.json"),
+        "the docs-only filter must carve out `docs/workflow-schema-contract.json` so a \
+         baseline-only PR still runs the schema gate; block was:\n{block}"
+    );
+}

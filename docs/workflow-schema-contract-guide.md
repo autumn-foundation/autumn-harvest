@@ -149,7 +149,8 @@ travels with the file.
 | **Withdrawing** a published schema | Coverage regression: the type is no longer gated at all |
 | Adding a `oneOf`/`anyOf` variant that is **not disjoint** from an existing one | Recorded data that matched exactly one branch may now match two — `oneOf` requires exactly one |
 | Adding **or removing** an `allOf` conjunct | `allOf` is an AND: adding narrows. Removing is *also* breaking — draft-07 `additionalProperties` does not see into subschemas, so dropping a member that declared `properties` turns those keys into "additional" and **tightens** the schema |
-| Two `oneOf`/`anyOf` branches the differ cannot tell apart | Branches are matched across revisions by identity; ambiguous keying means a removal could pass unnoticed, so the comparison fails closed |
+| Two indistinguishable `oneOf`/`anyOf` branches, and the branch **count** changed | Branches are matched across revisions by identity; ambiguous keying means the differ cannot say *which* branch was added or removed, so it fails closed. (When the count is unchanged the branches are compared pairwise by position instead — see below.) |
+| Inserting an `anyOf` variant **ahead of** a pre-existing branch | `anyOf` is `#[serde(untagged)]` and serde binds the **first** matching variant. Prepending `Float(f64)` before `Int(i64)` captures every recorded integer — it still deserializes, but into a different variant. Appending after every existing branch is compatible (that is the `T` → `Option<T>` shape, which appends a `null` branch) |
 | Changing the branch container `anyOf` → `oneOf` | `anyOf` accepts a value matching two or more branches; `oneOf` requires exactly one. With `integer` and `number` branches a recorded integer matches both — accepted before, rejected now — even though no branch changed |
 | **Reordering** `anyOf` branches | `anyOf` is `#[serde(untagged)]`, and serde binds the **first** matching variant in declaration order. Swapping `Int(i64)` and `Float(f64)` rebinds a recorded integer to the float variant: it still deserializes, but it no longer means the same thing. (`oneOf` requires exactly one match, so order cannot affect binding — reordering it is not a delta.) Reported without proving the branches overlap; acknowledge it if they are disjoint |
 | A node carrying **both** `oneOf` and `anyOf` | Only one is analysed as the branch container, so a change to the other cannot be classified |
@@ -213,7 +214,7 @@ guess and lets you acknowledge.
 
 ### Limits the gate does not cover
 
-Two are worth knowing before you rely on it:
+Three are worth knowing before you rely on it:
 
 - **It cannot see behind an unresolvable `$ref`.** A *change* to such a
   reference is reported breaking, but if both revisions point at the same
@@ -225,7 +226,19 @@ Two are worth knowing before you rely on it:
   sound because a payload already in `harvest_events` was written by serde's
   `Serialize`, which emits exactly one variant key. A hand-written schema that
   invents its own `oneOf` shape may not satisfy that assumption — but it will
-  fall into the "cannot tell apart" row above and fail closed rather than pass.
+  fall into the indistinguishable-branches handling below rather than pass.
+- **Indistinguishable branches are compared by position.** Two multi-field
+  object variants of a `#[serde(untagged)]` enum both key as `type:object`, so
+  the differ cannot match them by identity. Failing closed unconditionally would
+  report an *unchanged* set breaking — and because the ambiguity is present on
+  both sides, that workflow's own baseline could never pass the gate again,
+  blocking every unrelated change to the repository. So when both sides have the
+  same number of branches they are compared **pairwise by position**: unchanged
+  yields nothing, and a nested change is still caught by the recursion. The
+  accepted cost is that genuinely *reordering* such branches produces positional
+  deltas that do not correspond to a single edit. They are acknowledgeable — and
+  for `anyOf` a reorder is a real rebind risk anyway. A change in the branch
+  **count** remains unclassifiable and still fails closed.
 
 ### Annotations never dirty the file
 
@@ -447,11 +460,15 @@ documented recipe runs.
    justification belong in one reviewable diff.
 
 > **Note.** `docs/workflow-schema-contract.json` lives under `docs/`, and CI
-> treats a docs-only PR as needing no code jobs. A PR that touches *only* this
-> artifact therefore skips the gate and these tests. That matches how
-> `docs/api-contract.json` already behaves, but this file is the gate's trusted
-> *input*, so review artifact-only edits on their merits rather than assuming
-> CI vetted them.
+> treats a docs-only PR as needing no code jobs — so the gate's own trusted
+> *input* would be the one file able to change without being checked. CI's
+> docs-only filter therefore **carves this path out explicitly**: a PR touching
+> only the artifact still runs the matrix, so a hand-edited, stale, or malformed
+> baseline is compared against the generated contract like any other change.
+> The carve-out is pinned by
+> `the_schema_baseline_is_not_classified_as_a_docs_only_change`. (The guide
+> beside it, `docs/workflow-schema-contract-guide.md`, is ordinary prose and
+> stays docs-only — the filter matches the artifact path exactly.)
 
 ---
 

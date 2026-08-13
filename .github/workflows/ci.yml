@@ -74,7 +74,14 @@ jobs:
           echo "$changed"
           # Docs-only = every changed path matches docs/** or **/*.md. If any
           # other path is present, we have code changes and must run the matrix.
-          if echo "$changed" | grep -qvE '^(docs/|.*\.md$)'; then
+          #
+          # Carve-out: `docs/workflow-schema-contract.json` is a checked-in
+          # CONTRACT artifact, not prose. The issue #794 schema gate compares it
+          # against the freshly generated contract, so a baseline-only PR must
+          # still run the matrix — otherwise a hand-edited, stale, or malformed
+          # baseline merges with no comparison at all, defeating the gate.
+          if echo "$changed" | grep -qvE '^(docs/|.*\.md$)' \
+            || echo "$changed" | grep -qxF 'docs/workflow-schema-contract.json'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
             echo "code=false" >> "$GITHUB_OUTPUT"
