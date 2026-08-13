@@ -2247,6 +2247,62 @@ fn a_node_with_both_oneof_and_anyof_fails_closed_on_change() {
     );
 }
 
+/// The guard above compares the two keywords' LITERAL arrays, so an ignored
+/// sibling whose `$ref` target was rewritten slips past it unchanged.
+///
+/// The engine enforces `anyOf` and `oneOf` as independent blocks, so narrowing
+/// the referenced target newly rejects a recorded value that still satisfies the
+/// analysed `oneOf`. Nothing else would see it: `branch_set` traverses `oneOf`
+/// only, `anyOf` is an ANALYSED keyword so the unanalysed sweep skips it, and
+/// `definitions` is excluded from that sweep as "reached through `$ref`".
+#[test]
+fn a_rewritten_ref_target_under_the_ignored_branch_sibling_is_breaking() {
+    let node = json!({
+        "oneOf": [{"type": "string"}],
+        "anyOf": [{"$ref": "#/definitions/T"}],
+    });
+    let with_defs = |t: Value| {
+        let mut s = node.as_object().unwrap().clone();
+        s.insert("definitions".into(), json!({"T": t}));
+        Value::Object(s)
+    };
+    let baseline = with_defs(json!({"type": "string"}));
+    let current = with_defs(json!({"type": "integer"}));
+
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::UnanalysedConstraintChanged,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!("x"));
+}
+
+/// The over-firing guard: an UNCHANGED target under the ignored sibling must
+/// stay silent, or every schema carrying both keywords reports a false break.
+#[test]
+fn an_unchanged_ref_target_under_the_ignored_branch_sibling_is_not_reported() {
+    let schema = json!({
+        "oneOf": [{"type": "string"}],
+        "anyOf": [{"$ref": "#/definitions/T"}],
+        "definitions": {"T": {"type": "string"}},
+    });
+    assert_compatible(schema.clone(), schema);
+}
+
+/// Annotation churn inside the referenced target is not a change: both roots are
+/// canonicalised before the diff, so the sweep compares constraints only.
+#[test]
+fn annotation_churn_under_the_ignored_branch_sibling_is_not_reported() {
+    let with_desc = |d: &str| {
+        json!({
+            "oneOf": [{"type": "string"}],
+            "anyOf": [{"$ref": "#/definitions/T"}],
+            "definitions": {"T": {"type": "string", "description": d}},
+        })
+    };
+    assert_compatible(with_desc("before"), with_desc("after"));
+}
+
 /// Reordering `anyOf` branches silently rebinds recorded data.
 ///
 /// For `#[serde(untagged)]`, serde binds the FIRST matching variant in
@@ -3826,6 +3882,60 @@ fn declaring_a_property_over_unreadable_baseline_extras_is_still_breaking() {
     assert_oracle_agrees_breaking(&baseline, &current, &json!({"a": "x", "b": 1}));
 }
 
+/// Overlap is not enough: the new property must admit EVERY value the baseline
+/// allowed as an extra. Extras typed `["string","integer"]` share `string` with
+/// a new `b: Option<String>`, but a recorded `b: 1` passed the extras schema and
+/// is now parsed against `b` and rejected.
+#[test]
+fn declaring_a_property_narrower_than_the_baselines_extras_is_breaking() {
+    let extras = json!({"type": ["string", "integer"]});
+    let baseline = json!({"type": "object", "additionalProperties": extras});
+    let current = json!({"type": "object", "properties": {"b": {"type": "string"}},
+                         "additionalProperties": extras});
+    assert_breaking(
+        baseline.clone(),
+        current.clone(),
+        ChangeKind::RequiredPropertyAdded,
+    );
+    assert_oracle_agrees_breaking(&baseline, &current, &json!({"b": 1}));
+}
+
+/// Over-firing guard: a new property WIDER than the baseline's extras admits
+/// every recorded value, so it stays compatible.
+#[test]
+fn declaring_a_property_wider_than_the_baselines_extras_stays_compatible() {
+    let baseline = json!({"type": "object", "additionalProperties": {"type": "string"}});
+    let current = json!({"type": "object",
+                         "properties": {"b": {"type": ["string", "integer"]}},
+                         "additionalProperties": {"type": "string"}});
+    assert_compatible_delta(baseline, current, ChangeKind::OptionalPropertyAdded);
+}
+
+/// Over-firing guard: an unconstrained new property admits everything, so it
+/// stays compatible however the baseline typed its extras.
+#[test]
+fn declaring_an_unconstrained_property_over_typed_extras_stays_compatible() {
+    assert_compatible_delta(
+        json!({"type": "object", "additionalProperties": {"type": "integer"}}),
+        json!({"type": "object", "properties": {"b": {}},
+               "additionalProperties": {"type": "integer"}}),
+        ChangeKind::OptionalPropertyAdded,
+    );
+}
+
+/// Extras with no readable `type` admitted every type, so containment cannot be
+/// proved and the declaration fails closed.
+#[test]
+fn declaring_a_property_over_untyped_baseline_extras_is_breaking() {
+    let extras = json!({"minLength": 3});
+    assert_breaking(
+        json!({"type": "object", "additionalProperties": extras}),
+        json!({"type": "object", "properties": {"b": {"type": "string"}},
+               "additionalProperties": extras}),
+        ChangeKind::RequiredPropertyAdded,
+    );
+}
+
 /// When the new property's type OVERLAPS what the baseline allowed for extras,
 /// every recorded value still parses, so the addition stays compatible.
 #[test]
@@ -3850,6 +3960,54 @@ fn declaring_a_property_on_a_fully_open_object_stays_compatible() {
         json!({"type": "object",
                "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}),
         ChangeKind::OptionalPropertyAdded,
+    );
+}
+
+/// A present-but-unreadable `properties` is the SAME case as an absent one, not
+/// a separate one, so it inherits the deferral above rather than failing closed
+/// the way a malformed `enum` or `additionalProperties` does.
+///
+/// The engine reads the keyword as `.get("properties").and_then(as_object)` in
+/// both places it consults it — the recursion into declared fields and the
+/// `known_keys` set that `additionalProperties` subtracts — so `"oops"` declares
+/// exactly nothing, byte-identically to omitting the key. This test pins that
+/// equivalence against the real validator: were the two ever to diverge, the
+/// malformed spelling would need its own rule.
+///
+/// Failing closed on only the malformed spelling would make the verdict depend
+/// on a difference the runtime cannot observe — deleting a corrupt line would
+/// flip BREAKING to COMPATIBLE with no change in behaviour.
+#[test]
+fn a_malformed_properties_baseline_is_indistinguishable_from_an_absent_one() {
+    let recorded = json!({"a": 1});
+    let malformed = json!({"type": "object", "properties": "oops"});
+    let absent = json!({"type": "object"});
+    let declared = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+
+    // The engine cannot tell the two baselines apart.
+    assert!(validate_against_schema(&malformed, &recorded).is_ok());
+    assert!(validate_against_schema(&absent, &recorded).is_ok());
+    assert!(validate_against_schema(&declared, &recorded).is_err());
+
+    // So the differ must not either: both inherit the open-object deferral.
+    assert_compatible_delta(
+        malformed,
+        declared.clone(),
+        ChangeKind::OptionalPropertyAdded,
+    );
+    assert_compatible_delta(absent, declared, ChangeKind::OptionalPropertyAdded);
+}
+
+/// The deferral is scoped to the OPTIONAL case. A corrupt baseline that also
+/// names the key in `required` is still caught, because the `required` walk
+/// visits names the property map never mentions.
+#[test]
+fn a_malformed_properties_baseline_still_reports_a_newly_required_key() {
+    assert_breaking(
+        json!({"type": "object", "properties": "oops"}),
+        json!({"type": "object", "properties": {"a": {"type": "string"}},
+               "required": ["a"]}),
+        ChangeKind::RequiredPropertyAdded,
     );
 }
 

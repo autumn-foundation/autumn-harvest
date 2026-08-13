@@ -809,3 +809,61 @@ disjointness against every other, so the change reads as a whitelist rather than
 a blanket refusal. The whitelist itself is pinned against the ENGINE rather than
 against a copy of itself: each name must actually reject a wrong-typed value,
 and `bogus` must accept every value — the premise the fix rests on.
+
+### Sixteenth review round
+
+Three findings: one genuine P1, one genuine P2, and one refuted with a test that
+now pins the refutation.
+
+- **P1 — declaring an optional property over typed extras needed containment,
+  not overlap.** Serde ignores an undeclared key but *parses* a declared one, so
+  every recorded value that satisfied the baseline's `additionalProperties` is
+  newly type-checked against the added property. The differ asked whether the two
+  shared *no* type, which is the wrong question: extras typed
+  `["string","integer"]` and a new `b: Option<String>` overlap on `string`, so the
+  addition read as compatible, yet a recorded `{"b": 1}` had passed the extras
+  schema and is now rejected. The predicate is now containment (`extras ⊆
+  declared`) via the same `type_set_admits` helper `diff_types` uses, so an
+  unrecognised name on the declared side fails closed identically. Disjointness
+  remains a strict subset of the new answer, so every verdict this site produced
+  before is preserved.
+
+  Consequence: `type_sets_disjoint` no longer has a breaking-direction caller, so
+  the round-15 comment describing two callers with opposite needs is rewritten to
+  state the rule rather than an obsolete inventory.
+
+- **P2 — a `$ref` under the ignored branch-container sibling was invisible.** A
+  node carrying both `oneOf` and `anyOf` is guarded by comparing the two
+  *literal* arrays, so an unchanged `anyOf` whose `$ref` target was rewritten
+  slipped past. Nothing else would see it: `branch_set` traverses `oneOf` only,
+  `anyOf` is an ANALYSED keyword so the fail-closed sweep in `diff_unanalysed`
+  skips it, and `definitions`/`$defs` are excluded there as containers "reached
+  through `$ref`". The engine enforces the two keywords as independent blocks, so
+  narrowing the referenced target really does reject a value the analysed branch
+  set still accepts. The existing `diff_refs_under_unanalysed` sweep is now run
+  over the ignored sibling, with the ignored keyword derived from what
+  `branch_set` actually selected so the two cannot drift.
+
+- **Refuted — a malformed `properties` is not a distinct case.** The report asked
+  for a present-but-unreadable `properties` to fail closed the way a malformed
+  `enum` or `additionalProperties` does. The engine reads the keyword as
+  `.get("properties").and_then(as_object)` in *both* places it consults it — the
+  recursion into declared fields, and the `known_keys` set that
+  `additionalProperties` subtracts — so `"oops"` declares exactly nothing,
+  byte-identically to omitting the key. The transition the report describes is
+  therefore the open-object case already deferred for adjudication, reached
+  through a different spelling. Failing closed on only the malformed spelling
+  would make the verdict depend on a difference the runtime cannot observe:
+  deleting the corrupt line would flip BREAKING to COMPATIBLE with no change in
+  behaviour. Two tests ship instead of a fix — one pinning the equivalence
+  against the real validator (so a future divergence forces the rule), one
+  showing the `required` walk already catches the non-deferred half.
+
+Seven mutants across the two fixes, each killed by the test that pins that
+branch: reverting containment to overlap, and each of the containment predicate's
+three arms flipped, fail exactly their own detection or over-firing guard;
+removing the sibling sweep, and pointing it at the *selected* keyword instead of
+the ignored one, both fail the rewritten-target test. Two over-firing guards ship
+with the sweep — an unchanged target and annotation churn inside one — and three
+with the containment predicate, covering the wider-extras, unconstrained-property
+and already-compatible directions.

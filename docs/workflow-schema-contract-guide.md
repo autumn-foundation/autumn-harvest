@@ -164,7 +164,7 @@ travels with the file.
 | An `enum` present in both revisions where **either side is not a JSON array** | A validator ignores the unreadable side and enforces the readable one, so `"enum": "x"` → `"enum": ["x"]` newly rejects every recorded value outside the set. `enum` is nominally analysed, so it never reaches the fail-closed sweep — it fails closed here instead. Two identical malformed values are not an edit and emit nothing |
 | Widening an existing `oneOf` branch until it overlaps a sibling | `oneOf` requires **exactly** one match. Baseline branches `{"maximum":0}` and `{"minimum":1}` accept a recorded `1` exactly once; relaxing the first to `{"maximum":2}` reads as a compatible bound relaxation in isolation, but `1` now satisfies both branches and is rejected. Checked against **every other** branch, in both directions — unlike `anyOf`, where first-match binding means only the branches declared *after* this one can lose data, so widening the **last** `oneOf` branch is just as fatal as widening the first. Narrowing needs no such check — it cannot create an overlap, and the payloads it drops are already reported by the narrowing itself |
 | Changing the `default` of a property that is optional on **both** sides | `default` is a pure annotation to a validator, but not to serde: `#[serde(default = "retries")]` records the computed fallback there. Change it from `3` to `5` and every recorded payload that omitted the key deserializes to a different value — the same JSON, a different meaning. Only compared where serde would actually substitute it; one beside a required key, or on a root or array-item schema, is never substituted and emits nothing |
-| Declaring a property whose type is **disjoint from what the baseline allowed as an extra** | Serde *ignores* an undeclared key but *parses* a declared one. If the baseline said `"additionalProperties": {"type":"integer"}`, a recorded `b: 1` was carried along as an extra; declaring `b: Option<String>` now fails to parse it. Only reported when provable — on a fully open object nothing is knowable in either direction, so it stays compatible (see the limits below) |
+| Declaring a property that does **not accept every value the baseline allowed as an extra** | Serde *ignores* an undeclared key but *parses* a declared one. If the baseline said `"additionalProperties": {"type":"integer"}`, a recorded `b: 1` was carried along as an extra; declaring `b: Option<String>` now fails to parse it. The test is **containment**, not overlap: extras typed `["string","integer"]` and a new `string` property share `string`, yet a recorded `1` was accepted before and is rejected now. Only reported when provable — on a fully open object nothing is knowable in either direction, so it stays compatible (see the limits below) |
 | `additionalProperties` present but **neither a boolean nor a schema** | A validator ignores a non-schema value, so it constrains nothing and ranks with `true`. Correcting `"additionalProperties": "oops"` to `{"type":"string"}` therefore *restricts*, and newly rejects every recorded non-string extra. Two different malformed values are both ignored at runtime and emit nothing |
 | A checked-in acknowledgement whose reason is **blank** | A rubber stamp is not an acknowledgement; the artifact is rejected |
 | Any change to a constraint keyword **outside the analysed set** | Fail-closed — see below |
@@ -233,6 +233,15 @@ unanalysed constraint is therefore resolved on both sides (transitively, and
 cycle-safe), and any difference in a target is reported breaking. A target that
 resolves on only one side counts as a difference.
 
+The same sweep covers one keyword that is nominally *analysed*. A node carrying
+**both** `oneOf` and `anyOf` is outside the branch model: only one of them is
+traversed as the branch set, so a `$ref` inside the other would be walked by
+neither the analysed traversal nor — since both keywords are in the analysed set
+— the sweep above. Both are enforced independently at runtime, so the ignored
+sibling's references are swept too. (A change to the ignored sibling's own value
+is already reported breaking outright; this covers the case where it is
+byte-identical and only its target moved.)
+
 ### Limits the gate does not cover
 
 Four are worth knowing before you rely on it:
@@ -297,11 +306,16 @@ Four are worth knowing before you rely on it:
 
   The gate catches this only when it is **provable**: when the baseline declared
   what an extra had to look like (`"additionalProperties": {"type": "integer"}`)
-  and the new property's type shares nothing with it, every recorded `b` is now
-  invalid and the addition is reported breaking. On a fully **open** object
-  (`additionalProperties` absent or `true` — what `schemars` emits by default)
-  nothing is provable in either direction: the baseline permitted *any* value
-  for `b`, so the differ cannot know whether a payload carrying one exists.
+  and the new property does not accept every value that allowed, some recorded
+  `b` is now invalid and the addition is reported breaking. On a fully **open**
+  object (`additionalProperties` absent or `true` — what `schemars` emits by
+  default) nothing is provable in either direction: the baseline permitted *any*
+  value for `b`, so the differ cannot know whether a payload carrying one exists.
+  A `properties` value that is present but **not an object** is the same case,
+  not a separate one: the validator reads that keyword as "an object, or
+  nothing", so `"properties": "oops"` declares exactly nothing — indistinguishable
+  from omitting it. Failing closed on only the malformed spelling would make the
+  verdict depend on a difference the runtime cannot observe.
   Reporting it breaking would make **every** optional-field addition breaking,
   which is both the single most common compatible change and the opposite of
   what this gate is for, so it stays compatible.

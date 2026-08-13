@@ -2327,7 +2327,9 @@ fn diff_property_added(
     if let Some(extras) = bo
         .get("additionalProperties")
         .filter(|v| v.is_object())
-        .filter(|extras| type_sets_disjoint(extras, ctx.base_root, added, ctx.cur_root))
+        .filter(|extras| {
+            !declared_admits_baseline_extras(extras, ctx.base_root, added, ctx.cur_root)
+        })
     {
         diff.push(ctx.delta(
             child,
@@ -2335,9 +2337,9 @@ fn diff_property_added(
             Verdict::Breaking,
             format!(
                 "optional property `{name}` added, but the baseline declared undeclared keys as \
-                 `{extras}` and the new type shares no JSON type with that. Serde ignores an \
-                 undeclared key and PARSES a declared one, so a recorded `{name}` that was \
-                 previously carried along as an extra now fails to deserialize"
+                 `{extras}` and the new type does not accept every value that allowed. Serde \
+                 ignores an undeclared key and PARSES a declared one, so a recorded `{name}` that \
+                 was previously carried along as an extra now fails to deserialize"
             ),
         ));
         return;
@@ -2750,6 +2752,43 @@ fn type_sets_disjoint(a: &Value, a_root: &Value, b: &Value, b_root: &Value) -> b
     )
 }
 
+/// `true` when a newly declared property still accepts every value the baseline
+/// allowed under that key as an *extra*.
+///
+/// Overlap is not enough, so this is deliberately not [`type_sets_disjoint`]'s
+/// negation. Serde IGNORES an undeclared key but PARSES a declared one, so every
+/// recorded value that satisfied the baseline's `additionalProperties` is now
+/// type-checked against the new property. The question is therefore containment
+/// (`extras ⊆ declared`), not intersection: extras typed `["string","integer"]`
+/// and a new `string` property share `string`, yet a recorded `1` was accepted
+/// as an extra before and is rejected now.
+///
+/// Each side resolves against **its own** root so a `$ref` in one cannot
+/// accidentally resolve against the other's `definitions`.
+fn declared_admits_baseline_extras(
+    extras: &Value,
+    extras_root: &Value,
+    declared: &Value,
+    declared_root: &Value,
+) -> bool {
+    let types = |v: &Value, root: &Value| -> Option<BTreeSet<String>> {
+        let (r, _) = resolve_ref(root, v);
+        type_set(r.as_object()?)
+    };
+    match (types(extras, extras_root), types(declared, declared_root)) {
+        // The new property restricts nothing, so it admits every recorded extra.
+        (_, None) => true,
+        // The baseline accepted extras of EVERY JSON type (an object with no
+        // readable `type`, e.g. `{"minLength": 3}`). A property that restricts
+        // the type at all cannot admit all of them.
+        (None, Some(_)) => false,
+        // Defers to the same containment helper `diff_types` uses, so an
+        // unrecognised name on the declared side fails closed identically:
+        // `type_set_admits` cannot show it covers the baseline's types.
+        (Some(base), Some(cur)) => type_set_admits(&base, &cur),
+    }
+}
+
 /// The `type` names the engine's `type_matches` actually enforces.
 ///
 /// Anything else — a typo, a hand-written `"bogus"`, a draft-2020 name — falls
@@ -2762,23 +2801,21 @@ const RECOGNISED_JSON_TYPES: &[&str] = &[
 /// [`type_sets_disjoint`], but refusing the proof when either side names a type
 /// the engine does not enforce.
 ///
-/// The distinction is the DIRECTION the proof is used in, and the two callers
-/// genuinely need opposite treatment of an unreadable name:
-///
-/// - Proving disjointness to justify a **compatible** verdict (this function):
-///   an unrecognised name must not qualify. `{"type":"bogus"}` and
-///   `{"type":"string"}` are disjoint as *strings*, but the engine accepts a
-///   recorded string under both, so it matches two `oneOf` branches and is
-///   rejected — a false COMPATIBLE.
-/// - Proving disjointness to justify a **breaking** verdict (the
-///   `additionalProperties` caller, which asks "can no recorded extra satisfy
-///   the newly declared property?"): there an unreadable name means the baseline
-///   accepted extras of every type, so a recorded one really can fail the new
-///   declaration. Refusing the proof there would LOSE a true break.
-///
-/// The unifying rule is that an unreadable type name never buys a COMPATIBLE
-/// verdict, which is why the restriction lives here rather than inside
+/// The restriction belongs to the DIRECTION the proof is used in, not to
+/// disjointness itself, which is why it lives here rather than inside
 /// [`type_sets_disjoint`].
+///
+/// This wrapper proves disjointness to justify a **compatible** verdict, so an
+/// unrecognised name must not qualify: `{"type":"bogus"}` and `{"type":"string"}`
+/// are disjoint as *strings*, but the engine accepts a recorded string under
+/// both, so it matches two `oneOf` branches and is rejected — a false COMPATIBLE.
+///
+/// A caller proving a **breaking** verdict needs the opposite treatment, because
+/// an unreadable name there means the baseline accepted every type and a recorded
+/// value really can fail the new constraint; refusing the proof would LOSE a true
+/// break. Such a caller must use the raw predicate (or, where the question is
+/// containment rather than overlap, [`declared_admits_baseline_extras`]). The
+/// unifying rule is that an unreadable type name never buys a COMPATIBLE verdict.
 fn types_disjoint_for_safety(a: &Value, b: &Value, root: &Value) -> bool {
     let readable = |v: &Value| {
         let (r, _) = resolve_ref(root, v);
@@ -2882,6 +2919,26 @@ fn diff_branch_container_keyword(
             ),
         );
         return;
+    }
+    // Past that guard both keywords carry byte-identical values on both sides —
+    // but `branch_set` traverses only ONE of them, so a `$ref` inside the other
+    // can still point at a target that was rewritten. Nothing else would catch
+    // it: `oneOf`/`anyOf` are ANALYSED keywords, so the fail-closed sweep in
+    // `diff_unanalysed` skips them, and `definitions`/`$defs` are excluded there
+    // as containers "reached through `$ref`". The engine enforces the two
+    // keywords as independent blocks, so narrowing the ignored sibling's target
+    // really can reject a value the analysed branch set still accepts.
+    if both(bo) || both(co) {
+        // Derive the ignored keyword from what `branch_set` actually selected so
+        // the two cannot drift; fall back to the sibling of the pair.
+        let ignored = if bb.or(cb).map(|(k, _)| *k) == Some("anyOf") {
+            "oneOf"
+        } else {
+            "anyOf"
+        };
+        if let Some(value) = bo.get(ignored) {
+            diff_refs_under_unanalysed(ctx, ignored, value, path, diff);
+        }
     }
 
     let (Some((bk, _)), Some((ck, _))) = (bb, cb) else {
