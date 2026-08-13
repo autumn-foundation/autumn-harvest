@@ -856,18 +856,26 @@ const ANNOTATION_KEYWORDS: &[&str] = &[
 /// are reached through `$ref`, never compared directly.
 const CONTAINER_KEYWORDS: &[&str] = &["definitions", "$defs"];
 
-/// Keywords whose value is a MAP of author-chosen names to sub-schemas.
+/// Keywords whose value is a MAP keyed by author-chosen names.
 ///
 /// Their keys are payload field names and definition names — not schema
 /// keywords — so [`ANNOTATION_KEYWORDS`] must never be applied to them. A field
 /// called `description` is a field, and deleting it would make it invisible to
 /// the differ: a type change on it would canonicalise identically on both sides.
+///
+/// Most of these map a name to a sub-schema, but not all: draft-07
+/// `dependencies` takes *either* a sub-schema or an array of property names,
+/// and 2019-09 split it into `dependentSchemas` (the first form) and
+/// `dependentRequired` (the second). What puts all of them here is the shape of
+/// the KEYS, not the values — canonicalising an array of names is a no-op, so
+/// one code path serves both.
 const SCHEMA_MAP_KEYWORDS: &[&str] = &[
     "properties",
     "patternProperties",
     "definitions",
     "$defs",
     "dependentSchemas",
+    "dependentRequired",
     "dependencies",
 ];
 
@@ -2372,7 +2380,10 @@ fn diff_properties(
                     format!(
                         "property `{name}` removed; the value recorded for it is silently dropped \
                          on replay, so the workflow no longer observes it. If this is a rename, \
-                         add `#[serde(alias = \"{name}\")]` to the new field.{extra}"
+                         add `#[serde(alias = \"{name}\")]` to the new field AND acknowledge this \
+                         delta — an alias is deserialization-only and never appears in the \
+                         published schema, so the gate cannot see it and keeps reporting the \
+                         rename.{extra}"
                     ),
                 ));
             }

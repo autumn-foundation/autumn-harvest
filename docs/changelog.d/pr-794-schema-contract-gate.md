@@ -1108,3 +1108,55 @@ a parked record on whichever pair settles first rather than on its own —
 definition, where the two are indistinguishable. A schema that holds the
 recursive branch fixed and changes an unrelated definition beside it pins the
 keying.
+
+### Twenty-second review round
+
+Two P2s. One fixed as reported; one whose *facts* were right but whose framing
+was not, fixed as a wording correction rather than a mechanism.
+
+- **P2 — `dependentRequired` was canonicalised as if its keys were keywords.**
+  The annotation filter must never reach a map keyed by author-chosen names, and
+  six such keywords were already exempt — but not this one. So a dependency
+  keyed `description` was deleted from both revisions and two genuinely
+  different schemas canonicalised alike, while the identical edit under a key
+  named `card` was reported. The behaviour depended on whether a user's field
+  happened to collide with an annotation name.
+
+  Draft-07's `dependencies` takes either a sub-schema or an array of property
+  names; 2019-09 split it into `dependentSchemas` and `dependentRequired`. The
+  first two were exempt and the third was missed, so this is a completion rather
+  than a new category. What puts all of them in that set is the shape of the
+  *keys*, not the values — canonicalising an array of names is a no-op, so one
+  code path serves both, and the constant's doc now says so.
+
+  Scope, honestly: the engine does not enforce `dependentRequired`, so a change
+  to it cannot reject a recorded payload and the restored verdict is
+  conservative rather than load-bearing. The defect worth fixing is the
+  arbitrary silence — and the fact that this becomes a real hole the moment the
+  engine learns the keyword.
+
+- **P2 — the rename remedy implied the alias would clear the gate.** The
+  property-removed delta suggests `#[serde(alias = "old")]`, and the report is
+  correct that `schemars` publishes only the new canonical name: a probe against
+  0.8 emits `{"properties": {"email_address": …}}` with no trace of the alias.
+  So the gate keeps reporting the rename however the advice is followed.
+
+  The suggested remedy — alias-aware metadata, or a comparison that recognises
+  legacy keys — is declined. The artifact is generated from the *published*
+  schema because that is what a non-Rust caller actually sees; a side channel
+  for Rust-only attributes would make it describe something else. Nor is the
+  resulting acknowledgement "false": an alias is precisely a ground the differ
+  cannot see, which is the case the escape hatch exists for, and the same
+  wording already covers disjointness proofs elsewhere.
+
+  What *was* wrong is that the message stopped after the alias, so a reader
+  follows it, re-runs the gate, still sees BREAKING, and concludes the tool or
+  their alias is broken. It now says to add the alias **and** acknowledge, and
+  why — the alias is deserialization-only and never reaches the schema.
+
+Two mutants. Dropping `dependentRequired` from the name-keyed set restores the
+canonicalisation collision; dropping the acknowledgement clause fails the
+message test. Both fixes ship with the control that pins them from the other
+side: an ordinary dependency key was already reported and still is, and an
+unchanged `dependentRequired` map still reports nothing — preserving a key must
+not make an unchanged map look changed.

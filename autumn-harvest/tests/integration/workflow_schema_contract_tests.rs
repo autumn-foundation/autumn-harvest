@@ -4871,3 +4871,80 @@ fn an_unrelated_change_does_not_fire_a_parked_recursive_branch_check() {
         diff.deltas
     );
 }
+
+/// `dependentRequired` is keyed by author-chosen property names, so the
+/// annotation filter must not reach them. Before this was recognised, a
+/// dependency keyed `description` was deleted from both revisions and two
+/// genuinely different schemas canonicalised alike.
+///
+/// The engine does not enforce this keyword, so the change is inert at runtime
+/// and the resulting verdict is conservative rather than load-bearing — but the
+/// silence was arbitrary either way: the very same edit under a key named
+/// `card` was reported, and only a collision with an annotation name hid it.
+#[test]
+fn a_dependency_keyed_by_an_annotation_name_is_still_compared() {
+    let diff = diff_input(
+        json!({"type": "object", "dependentRequired": {"description": ["a"]}}),
+        json!({"type": "object", "dependentRequired": {"description": ["b"]}}),
+    );
+    assert!(
+        !diff.deltas.is_empty(),
+        "a `dependentRequired` entry keyed by an annotation name must not be \
+         canonicalised away"
+    );
+}
+
+#[test]
+fn a_dependency_keyed_by_an_ordinary_name_is_compared() {
+    // The control the case above is measured against: identical edit, ordinary
+    // key. Both must be reported, and for the same reason.
+    let diff = diff_input(
+        json!({"type": "object", "dependentRequired": {"card": ["a"]}}),
+        json!({"type": "object", "dependentRequired": {"card": ["b"]}}),
+    );
+    assert!(
+        !diff.deltas.is_empty(),
+        "an ordinary dependency key is reported"
+    );
+}
+
+#[test]
+fn an_unchanged_dependent_required_map_is_not_reported() {
+    let diff = diff_input(
+        json!({"type": "object", "dependentRequired": {"description": ["a"]}}),
+        json!({"type": "object", "dependentRequired": {"description": ["a"]}}),
+    );
+    assert!(
+        diff.deltas.is_empty(),
+        "preserving the key must not make an UNCHANGED map look changed: {:#?}",
+        diff.deltas
+    );
+}
+
+/// The remedy offered for a renamed property has to be followed by an
+/// acknowledgement, because `#[serde(alias = "...")]` is deserialization-only:
+/// `schemars` publishes the new canonical name and nothing else, so the alias
+/// is invisible to a gate that reads the published schema. Advising the alias
+/// alone reads as "do this and the finding goes away", which it does not.
+#[test]
+fn the_rename_remedy_says_the_alias_alone_will_not_clear_the_gate() {
+    let diff = diff_input(
+        json!({"type": "object", "properties": {"email": {"type": "string"}}}),
+        json!({"type": "object", "properties": {"email_address": {"type": "string"}}}),
+    );
+    let removed = diff
+        .deltas
+        .iter()
+        .find(|d| d.change == ChangeKind::PropertyRemoved)
+        .expect("the removal is reported");
+    assert!(
+        removed.reason.contains("serde(alias"),
+        "the remedy still names the alias: {}",
+        removed.reason
+    );
+    assert!(
+        removed.reason.contains("acknowledge"),
+        "and says the alias alone does not clear the gate: {}",
+        removed.reason
+    );
+}

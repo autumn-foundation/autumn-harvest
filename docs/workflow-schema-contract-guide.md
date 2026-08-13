@@ -405,6 +405,14 @@ substitute it — beside a key that is optional on **both** sides. One beside a
 required key, or on a root or array-item schema, is never substituted and stays
 silent, so documentation edits do not produce deltas.
 
+The strip also applies to schema **keywords** only, never to a map keyed by
+names you chose: `properties`, `patternProperties`, `definitions`, `$defs`,
+`dependencies`, `dependentSchemas`, and `dependentRequired`. A field called
+`description` is a field, and deleting it would make it invisible — a change to
+it would canonicalize identically on both sides. What puts a keyword in that
+set is the shape of its **keys**; the values may be sub-schemas or, for
+`dependentRequired` and one form of `dependencies`, arrays of property names.
+
 ---
 
 ## Exit-code contract
