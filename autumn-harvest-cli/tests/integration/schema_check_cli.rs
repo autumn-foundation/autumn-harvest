@@ -653,6 +653,45 @@ fn an_acknowledged_baseline_passes_the_escape_hatch_check() {
     );
 }
 
+/// A rubber stamp must not buy coverage — and must say so.
+///
+/// `schema update --acknowledge ""` is refused at the authoring path, and the
+/// ordinary check reports a blank reason in the artifact it diffs. Neither
+/// covers THIS mode run on its own: the head artifact is loaded separately from
+/// the two contracts being diffed, so nothing had inspected its reasons before
+/// counting them as coverage.
+#[test]
+fn a_blank_reason_record_fails_the_escape_hatch_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.json");
+    let generated = dir.path().join("generated.json");
+    let head = dir.path().join("head.json");
+    std::fs::write(&base, BASELINE).unwrap();
+    std::fs::write(&generated, CURRENT_BREAKING).unwrap();
+
+    // Take the legitimately-acknowledged artifact and blank every reason,
+    // leaving the covering identities intact — the exact hand-edit that would
+    // otherwise absorb the break.
+    let mut artifact = autumn_harvest::WorkflowSchemaContract::parse(&acknowledged_head()).unwrap();
+    assert!(
+        !artifact.acknowledged_breaking_changes.is_empty(),
+        "fixture must carry records to blank out"
+    );
+    for a in &mut artifact.acknowledged_breaking_changes {
+        a.reason = "   ".to_string();
+    }
+    std::fs::write(&head, serde_json::to_string_pretty(&artifact).unwrap()).unwrap();
+
+    let err = run_schema_check(&base, &generated, SchemaCheckFormat::Text, Some(&head))
+        .expect_err("a blank justification must not cover a break");
+    assert_eq!(err.exit_code(), 1, "the gate exits 1");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("no justification") || msg.contains("rubber stamp"),
+        "the failure must name the blank reason as the root cause: {msg}"
+    );
+}
+
 /// A compatible change needs no record and must not be blocked.
 #[test]
 fn a_compatible_change_passes_the_escape_hatch_check() {

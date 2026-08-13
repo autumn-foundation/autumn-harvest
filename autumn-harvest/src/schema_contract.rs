@@ -1117,6 +1117,15 @@ type AckIdentity<'a> = (&'a str, Option<SchemaRole>, &'a str, ChangeKind);
 /// against a single record. Matching is a multiset difference over
 /// `(workflow, role, field_path, change)`, so N breaks need N records.
 ///
+/// A record whose `reason` is blank buys **no** coverage. Every authoring path
+/// already refuses one — [`WorkflowSchemaContract::acknowledged_update`] returns
+/// [`SchemaContractError::BlankAcknowledgement`], and [`diff_schema_contracts`]
+/// reports [`ChangeKind::AcknowledgementMissingReason`] — but neither sees this
+/// function's `head`, which the escape-hatch mode loads separately from the two
+/// contracts it diffs. Run that mode alone (without the ordinary check, whose
+/// baseline *is* the head artifact) and a hand-written rubber stamp would
+/// otherwise absorb a real break, since coverage matches on identity alone.
+///
 /// Returns the deltas with no covering record — empty means the escape hatch was
 /// used correctly (or nothing broke).
 #[must_use]
@@ -1130,7 +1139,11 @@ pub fn unacknowledged_breaking<'d>(
     };
     let mut available: BTreeMap<(String, Option<SchemaRole>, String, ChangeKind), usize> =
         BTreeMap::new();
-    for a in &head.acknowledged_breaking_changes {
+    for a in head
+        .acknowledged_breaking_changes
+        .iter()
+        .filter(|a| !a.reason.trim().is_empty())
+    {
         *available.entry(identity(a)).or_default() += 1;
     }
     // Consume the records the base revision already carried: they are not new.

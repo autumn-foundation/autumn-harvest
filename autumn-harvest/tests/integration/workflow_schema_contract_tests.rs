@@ -2389,6 +2389,75 @@ fn a_pre_existing_acknowledgement_does_not_cover_a_fresh_break() {
     );
 }
 
+/// A record with a blank justification is a rubber stamp, and the contract
+/// refuses one at every authoring path — so it must not buy coverage either.
+///
+/// `diff_schema_contracts` reports a blank reason, but it only ever sees `base`
+/// and `current`; the head artifact is loaded separately by the escape-hatch
+/// mode. Run that mode on its own — without the ordinary check, whose baseline
+/// *is* the head artifact — and nothing had looked at the head records' reasons
+/// before counting them as coverage.
+#[test]
+fn a_blank_reason_record_cannot_cover_a_breaking_change() {
+    let base_artifact = bypass_fixture("email");
+    let head_generated = bypass_fixture("email_address");
+    let diff =
+        autumn_harvest::schema_contract::diff_schema_contracts(&base_artifact, &head_generated);
+    assert!(diff.has_breaking(), "fixture must be breaking");
+
+    // Hand-written records covering EVERY breaking delta by identity, each with
+    // a whitespace-only reason. Identity is the only thing coverage matched on,
+    // so these would otherwise absorb the whole change.
+    let blank: Vec<AcknowledgedBreakingChange> = diff
+        .deltas
+        .iter()
+        .filter(|d| d.verdict == Verdict::Breaking)
+        .map(|d| AcknowledgedBreakingChange {
+            workflow: d.workflow.clone(),
+            role: d.role,
+            field_path: d.field_path.clone(),
+            change: d.change,
+            reason: "   ".to_string(),
+            recorded_in: Some("#794".to_string()),
+        })
+        .collect();
+    assert!(
+        !blank.is_empty(),
+        "fixture must produce records to blank out"
+    );
+
+    let mut head_artifact = bypass_fixture("email_address");
+    head_artifact.acknowledged_breaking_changes = blank;
+
+    let missing = unacknowledged_breaking(&diff, &base_artifact, &head_artifact);
+    assert_eq!(
+        missing.len(),
+        diff.breaking_count,
+        "a blank justification must buy no coverage: {missing:#?}"
+    );
+}
+
+/// The over-firing guard for the check above: a record that DOES justify itself
+/// still covers its delta, so the blank filter cannot reject real records.
+#[test]
+fn a_record_with_a_real_reason_still_covers_its_breaking_change() {
+    let base_artifact = bypass_fixture("email");
+    let head_generated = bypass_fixture("email_address");
+    let diff =
+        autumn_harvest::schema_contract::diff_schema_contracts(&base_artifact, &head_generated);
+    assert!(diff.has_breaking(), "fixture must be breaking");
+
+    let head_artifact = base_artifact
+        .acknowledged_update(&head_generated, "renamed for GDPR", Some("#794"))
+        .expect("acknowledging must succeed");
+
+    let missing = unacknowledged_breaking(&diff, &base_artifact, &head_artifact);
+    assert!(
+        missing.is_empty(),
+        "a justified record must still cover its delta: {missing:#?}"
+    );
+}
+
 /// Nothing breaking since base means nothing to acknowledge.
 #[test]
 fn a_compatible_baseline_update_needs_no_acknowledgement() {

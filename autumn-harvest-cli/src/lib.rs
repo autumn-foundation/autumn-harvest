@@ -3032,6 +3032,26 @@ pub fn run_schema_check(
         // notices the rewrite. Reported first because it is the root cause when
         // both fire, and because the remedy differs — restore the record and
         // append, rather than record this break — hence its own error type.
+        // The head artifact is loaded here, so `diff_schema_contracts` — which
+        // only ever saw `base` and `current` — never inspected its reasons. The
+        // coverage check below already refuses to let a blank record cover
+        // anything; reporting it here names the root cause instead of leaving
+        // the operator with "nothing acknowledges this" beside a record that
+        // plainly exists.
+        let blank: Vec<&AcknowledgedBreakingChange> = head
+            .acknowledged_breaking_changes
+            .iter()
+            .filter(|a| a.reason.trim().is_empty())
+            .collect();
+        if !blank.is_empty() {
+            return Err(CliError::InvalidInput(format!(
+                "{} acknowledgement record(s) in {} record no justification; an \
+                 acknowledgement without a reason is a rubber stamp:\n{}",
+                blank.len(),
+                ack_path.display(),
+                format_dropped(&blank)
+            )));
+        }
         let dropped = dropped_acknowledgements(&base, &head);
         if !dropped.is_empty() {
             return Err(CliError::SchemaContractAuditLogRewritten {

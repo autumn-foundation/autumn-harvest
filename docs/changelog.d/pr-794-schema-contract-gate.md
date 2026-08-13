@@ -627,3 +627,34 @@ readable — still relaxes compatibly.
 The baseline was regenerated for the ruleset change; the gate re-run reports
 zero deltas, which also confirms the semantic-format rule costs the shipped
 `examples/**` schemas nothing.
+
+### Eleventh review round
+
+One finding, in the escape hatch rather than the differ: a **blank
+acknowledgement could still buy coverage**.
+
+A rubber stamp is refused at every authoring path — `acknowledged_update`
+returns `BlankAcknowledgement`, and `diff_schema_contracts` reports
+`AcknowledgementMissingReason` for a hand-edited one. Neither reaches
+`unacknowledged_breaking`'s `head`: the escape-hatch mode loads that artifact
+*separately* from the two contracts it diffs, and coverage matched on
+`(workflow, role, field_path, change)` alone. Run `schema check
+--acknowledged-in` on its own — without the ordinary check, whose baseline
+happens to *be* the head artifact — and a hand-written record with an empty
+`reason` absorbed a real break.
+
+Fixed in two places, for two different reasons:
+
+- **The core** (`unacknowledged_breaking`) now skips blank-reason records when
+  building the coverage multiset. This is the fail-closed guarantee, and it
+  holds for every caller regardless of invocation order.
+- **The CLI** reports the blank record explicitly. Without it the operator sees
+  "nothing acknowledges this" beside a record that plainly exists; the core fix
+  alone gets the verdict right and the diagnostic wrong.
+
+Two mutants, one per half, each reverted individually with the specific test
+confirmed failing before restoring. Reverting only the CLI half is instructive:
+the check still exits 1 (the core filter is what makes it fail closed) and only
+the message assertion fails, which is exactly the split the two fixes encode.
+The over-firing guard — a record with a real reason still covering its delta —
+was green *before* the fix, pinning it on both sides.
