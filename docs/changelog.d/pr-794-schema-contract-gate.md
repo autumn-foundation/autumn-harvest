@@ -461,3 +461,29 @@ the fixes** — an open branch gaining an optional property, a closed *final*
 branch (nothing after it to steal from), an unchanged bound written `10` vs
 `10.0`, and an unchanged malformed enum — so each fix is pinned on both sides:
 it fires on the hazard and stays silent on the shapes it must not block.
+
+### Windows CLI stack overflow (a pre-existing defect this PR surfaced)
+
+The three `the_real_binary_*` tests added here are the **first** tests in the
+repository to spawn the `harvest` binary as a process, and they immediately
+failed on Windows CI with exit `-1073741571` — `STATUS_STACK_OVERFLOW`
+(`0xC00000FD`). This is **not** a schema-gate regression: `harvest --help`
+overflows identically, before any subcommand is dispatched. Windows gives a
+process's main thread 1 MiB, and a debug build of a CLI with this many
+subcommands exceeds that inside clap's own argument-tree construction; Linux's
+8 MiB default hid it completely, so every `harvest` invocation on Windows has
+been aborting for as long as the CLI has had this many subcommands.
+
+`autumn-harvest-cli`'s `main` now does its work on a thread it spawns with a
+16 MiB stack (a thread's stack is sized at spawn and is not subject to the main
+thread's limit) — the same approach rustc itself takes, for the same reason.
+Exit-code semantics are unchanged; `std::process::exit` does not unwind, so
+stdout is flushed explicitly rather than relying on it to drain a block-buffered
+handle. Skipping the tests on Windows was rejected: it would have deleted the
+evidence and shipped a CLI that cannot run there.
+
+Guarded by `the_real_binary_survives_a_one_mebibyte_main_thread_stack`, which
+reproduces the Windows condition on Unix with `ulimit -s 1024` (that bounds the
+main thread only, so it passes exactly when `main` sizes its own). Confirmed
+red before the fix with `thread 'main' has overflowed its stack / fatal runtime
+error: stack overflow, aborting`, and green after.

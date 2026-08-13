@@ -777,3 +777,50 @@ fn the_escape_hatch_check_is_opt_in() {
         "without the flag the ordinary breaking-change error is reported: {err:?}"
     );
 }
+
+/// The binary must survive a **1 MiB main-thread stack**, which is what Windows
+/// gives every process by default.
+///
+/// A debug build of a CLI this size overflows that inside clap's own
+/// argument-tree construction — before any subcommand is dispatched, so even
+/// `--help` aborts with `STATUS_STACK_OVERFLOW`. Linux's 8 MiB default hides it,
+/// which is why it stayed latent until this suite became the first thing in the
+/// repo to spawn `harvest` as a process.
+///
+/// `ulimit -s` bounds the **main** thread only; a thread's stack is sized at
+/// spawn, so this passes exactly when `main` does its work on one it sized
+/// itself. Unix-only because that is where `ulimit` exists — Windows CI covers
+/// the same guarantee natively by running the three tests above.
+#[cfg(unix)]
+#[test]
+fn the_real_binary_survives_a_one_mebibyte_main_thread_stack() {
+    for args in [
+        vec!["--help"],
+        vec!["schema", "check", "--help"],
+        vec!["det-check", "--help"],
+    ] {
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "ulimit -s 1024; exec {} {}",
+                env!("CARGO_BIN_EXE_harvest"),
+                args.join(" ")
+            ))
+            .output()
+            .expect("the harvest binary must run under /bin/sh");
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("overflowed its stack") && !stderr.contains("stack overflow"),
+            "`harvest {}` overflowed a 1 MiB main-thread stack — this is what \
+             Windows aborts on:\n{stderr}",
+            args.join(" ")
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`harvest {}` must exit 0 under a 1 MiB stack; stderr:\n{stderr}",
+            args.join(" ")
+        );
+    }
+}
