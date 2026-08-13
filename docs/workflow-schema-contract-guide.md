@@ -151,6 +151,7 @@ travels with the file.
 | Adding **or removing** an `allOf` conjunct | `allOf` is an AND: adding narrows. Removing is *also* breaking — draft-07 `additionalProperties` does not see into subschemas, so dropping a member that declared `properties` turns those keys into "additional" and **tightens** the schema |
 | Two indistinguishable `oneOf`/`anyOf` branches, and the branch **count** changed | Branches are matched across revisions by identity; ambiguous keying means the differ cannot say *which* branch was added or removed, so it fails closed. (When the count is unchanged the branches are compared pairwise by position instead — see below.) |
 | Inserting an `anyOf` variant **ahead of** a pre-existing branch | `anyOf` is `#[serde(untagged)]` and serde binds the **first** matching variant. Prepending `Float(f64)` before `Int(i64)` captures every recorded integer — it still deserializes, but into a different variant. Appending after every existing branch is compatible (that is the `T` → `Option<T>` shape, which appends a `null` branch) |
+| Adding a `oneOf` branch when **any** branch in the set carries no variant tag | A tag on the *added* branch says it is narrow, not that its new neighbours are. Adding `{"enum":["x"]}` beside a broad `{"type":"string"}` makes the recorded value `"x"` match two branches, and `oneOf` requires exactly one. Disjointness is only established when **every** branch is tagged — serde's externally-tagged shape, whose serializer emits exactly one variant key |
 | Changing the branch container `anyOf` → `oneOf` | `anyOf` accepts a value matching two or more branches; `oneOf` requires exactly one. With `integer` and `number` branches a recorded integer matches both — accepted before, rejected now — even though no branch changed |
 | **Reordering** `anyOf` branches | `anyOf` is `#[serde(untagged)]`, and serde binds the **first** matching variant in declaration order. Swapping `Int(i64)` and `Float(f64)` rebinds a recorded integer to the float variant: it still deserializes, but it no longer means the same thing. (`oneOf` requires exactly one match, so order cannot affect binding — reordering it is not a delta.) Reported without proving the branches overlap; acknowledge it if they are disjoint |
 | A node carrying **both** `oneOf` and `anyOf` | Only one is analysed as the branch container, so a change to the other cannot be classified |
@@ -220,13 +221,15 @@ Three are worth knowing before you rely on it:
   reference is reported breaking, but if both revisions point at the same
   external document and the *document* changes, that is outside this gate's
   reach. Keep published schemas self-contained — `schemars` output already is.
-- **`oneOf` disjointness rests on serde's own serializer.** A variant branch is
-  treated as disjoint when it carries a tag, a unit `enum`, or the
-  single-property shape serde emits for an externally-tagged enum. That is
-  sound because a payload already in `harvest_events` was written by serde's
-  `Serialize`, which emits exactly one variant key. A hand-written schema that
-  invents its own `oneOf` shape may not satisfy that assumption — but it will
-  fall into the indistinguishable-branches handling below rather than pass.
+- **`oneOf` disjointness rests on serde's own serializer.** An added branch is
+  treated as disjoint only when **every** branch in the set carries a tag, a
+  unit `enum`, or the single-property shape serde emits for an externally-tagged
+  enum. That is sound because a payload already in `harvest_events` was written
+  by serde's `Serialize`, which emits exactly one variant key, so it matches
+  exactly one branch however many variants are added. A set containing even one
+  untagged branch is not provably disjoint and an addition to it is reported
+  breaking; a hand-written schema that invents its own `oneOf` shape falls into
+  that arm, or into the indistinguishable-branches handling below.
 - **Indistinguishable branches are compared by position.** Two multi-field
   object variants of a `#[serde(untagged)]` enum both key as `type:object`, so
   the differ cannot match them by identity. Failing closed unconditionally would
@@ -414,6 +417,37 @@ Guardrails:
 `schema check` needs no database and no services, so it belongs in the same
 cheap lint job as `det-check`.
 
+#### Also verify the escape hatch (recommended)
+
+The step above proves the **artifact is current**. On its own it is bypassable:
+regenerate the artifact by hand in the same PR and it agrees with the generated
+contract, so the diff is empty and a replay-breaking change merges with no
+justification recorded. `schema update` refuses to do that — but nothing stops a
+contributor overwriting the file directly.
+
+The remaining signal is the artifact's change since its **previous revision**:
+
+```yaml
+      - name: Verify the escape hatch was used
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          ARTIFACT: docs/workflow-schema-contract.json
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" || true
+          if git cat-file -e "${BASE_SHA}:${ARTIFACT}" 2>/dev/null; then
+            git show "${BASE_SHA}:${ARTIFACT}" > /tmp/base.json
+            cargo run --quiet -p autumn-harvest-cli --bin harvest -- \
+              schema check --baseline /tmp/base.json --current /tmp/current.json \
+                           --acknowledged-in "$ARTIFACT"
+          fi
+```
+
+With `--acknowledged-in`, a breaking delta is allowed **only** when the artifact
+records it — so the legitimate `schema update --acknowledge` path passes and a
+hand-edit fails. Requires the base commit to be fetchable (`fetch-depth: 0`, or
+the targeted fetch above); the check is skipped on the artifact's first
+introduction, when there is no previous revision to compare.
+
 ### Pre-commit hook
 
 ```sh
@@ -444,9 +478,11 @@ pulls the file in with `include_str!` so a hand-edit cannot slip past:
 | `the_checked_in_baseline_schemas_are_canonicalised` | No annotations were committed, so doc edits stay no-ops |
 
 Plus the CI step **`Gate workflow payload-schema changes (issue #794)`**, which
-regenerates the contract from the example registry and diffs it against the
-checked-in file — proving both that the artifact is current and that the
-documented recipe runs.
+runs both halves of the recipe above: it regenerates the contract from the
+example registry and diffs it against the checked-in file, then compares that
+file against its revision at the PR base with `--acknowledged-in` — proving the
+artifact is current, that its own change was recorded, and that the documented
+recipe runs.
 
 ### When you change a workflow payload type
 

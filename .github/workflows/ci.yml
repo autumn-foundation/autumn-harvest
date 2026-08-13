@@ -44,6 +44,11 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      # Resolved base revision, exported so the issue #794 schema gate can
+      # compare the checked-in artifact against its PREVIOUS revision. This job
+      # is the only one with `fetch-depth: 0`, so it is the only place the base
+      # can be resolved reliably.
+      base_sha: ${{ steps.filter.outputs.base_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,6 +72,7 @@ jobs:
             base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
           fi
           echo "Comparing ${base}...${head}"
+          echo "base_sha=${base}" >> "$GITHUB_OUTPUT"
           # --no-renames disables rename detection so a code->docs move surfaces
           # the deleted source path (setting code=true) instead of a docs-only add.
           changed="$(git diff --name-only --no-renames "$base" "$head")"
@@ -278,11 +284,43 @@ jobs:
       - name: "Gate workflow payload-schema changes (issue #794)"
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         shell: bash
+        env:
+          BASE_SHA: ${{ needs.changes.outputs.base_sha }}
+          ARTIFACT: docs/workflow-schema-contract.json
         run: |
+          set -euo pipefail
           cargo run --quiet -p autumn-harvest --no-default-features --features schema \
             --example schema_workflow -- --emit-contract > "${RUNNER_TEMP}/schema-current.json"
+
+          # 1. Is the checked-in artifact current, and is every delta safe?
           cargo run --quiet -p autumn-harvest-cli --bin harvest -- \
             schema check --current "${RUNNER_TEMP}/schema-current.json"
+
+          # 2. Was the ARTIFACT's own change since the base revision recorded?
+          #
+          # Step 1 alone is bypassable: regenerate the artifact by hand in the
+          # same PR and it agrees with the generated contract, so the diff is
+          # empty and a replay-breaking change merges with no justification.
+          # Comparing against the artifact's PREVIOUS revision is the only
+          # signal left, so this is what makes the escape hatch auditable.
+          #
+          # The matrix checkout is shallow, so fetch just the base commit.
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" 2>/dev/null || true
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            # The base object is unreachable (a force-push, or a transient fetch
+            # failure). Warn rather than block every PR on infrastructure: step 1
+            # still ran, and a reviewer sees the artifact in the diff.
+            echo "::warning::base commit ${BASE_SHA} unavailable — skipped the" \
+                 "acknowledgement check; review artifact changes manually"
+          elif git cat-file -e "${BASE_SHA}:${ARTIFACT}" 2>/dev/null; then
+            git show "${BASE_SHA}:${ARTIFACT}" > "${RUNNER_TEMP}/schema-base.json"
+            cargo run --quiet -p autumn-harvest-cli --bin harvest -- \
+              schema check --baseline "${RUNNER_TEMP}/schema-base.json" \
+                           --current "${RUNNER_TEMP}/schema-current.json" \
+                           --acknowledged-in "$ARTIFACT"
+          else
+            echo "no artifact at ${BASE_SHA} — first introduction, nothing to compare"
+          fi
       # ── Manifest-driven integration suites ──────────────────────────────
       # The per-suite `cargo test` steps that used to live here are now data in
       # `.github/ci/integration-suites.txt`, executed by `.github/ci/run-suites.sh`.

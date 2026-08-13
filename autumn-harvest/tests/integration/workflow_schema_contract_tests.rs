@@ -12,7 +12,7 @@ use autumn_harvest::info::validate_against_schema;
 use autumn_harvest::schema_contract::{
     AcknowledgedBreakingChange, ChangeKind, MAX_DELTAS, SCHEMA_CONTRACT_VERSION,
     SchemaContractDiff, SchemaRole, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
-    canonicalize_schema,
+    canonicalize_schema, unacknowledged_breaking,
 };
 use serde_json::{Value, json};
 
@@ -2172,5 +2172,201 @@ fn the_schema_baseline_is_not_classified_as_a_docs_only_change() {
         block.contains("docs/workflow-schema-contract.json"),
         "the docs-only filter must carve out `docs/workflow-schema-contract.json` so a \
          baseline-only PR still runs the schema gate; block was:\n{block}"
+    );
+}
+
+// ── Codex review 3: a tagged branch is not disjoint from a BROADER sibling ────
+
+/// A tag on the ADDED branch says nothing about the branches already there.
+///
+/// `oneOf` requires EXACTLY one match. Adding the singleton `{"enum":["x"]}`
+/// alongside a broad `{"type":"string"}` makes the recorded value `"x"` match
+/// two branches, so it is rejected — even though the new branch is "tagged".
+#[test]
+fn adding_a_tagged_branch_beside_a_broader_branch_is_breaking() {
+    assert_breaking(
+        json!({"oneOf": [{"type": "string"}]}),
+        json!({"oneOf": [{"type": "string"}, {"type": "string", "enum": ["x"]}]}),
+        ChangeKind::VariantAdded,
+    );
+    // …and the oracle agrees: `"x"` reads under the baseline and not after.
+    assert_oracle_agrees_breaking(
+        &json!({"oneOf": [{"type": "string"}]}),
+        &json!({"oneOf": [{"type": "string"}, {"type": "string", "enum": ["x"]}]}),
+        &json!("x"),
+    );
+}
+
+/// The all-tagged case stays compatible: every branch of a serde
+/// externally-tagged enum carries a distinct variant key, and serde's
+/// serializer emits exactly one — so a recorded payload matches exactly one
+/// branch no matter how many variants are added.
+#[test]
+fn adding_a_variant_to_an_all_tagged_one_of_stays_compatible() {
+    let a = json!({"type": "object", "required": ["A"], "properties": {"A": {"type": "string"}}});
+    let b = json!({"type": "object", "required": ["B"], "properties": {"B": {"type": "string"}}});
+    let c = json!({"type": "object", "required": ["C"], "properties": {"C": {"type": "string"}}});
+    assert_compatible_delta(
+        json!({"oneOf": [a, b]}),
+        json!({"oneOf": [a, b, c]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+/// A unit variant mixed with tagged variants is the shape `schemars` emits for
+/// `enum Foo { A, B(i32) }` — still all-discriminated, still compatible.
+#[test]
+fn adding_a_variant_to_a_mixed_unit_and_tagged_one_of_stays_compatible() {
+    let unit = json!({"type": "string", "enum": ["A"]});
+    let tagged =
+        json!({"type": "object", "required": ["B"], "properties": {"B": {"type": "integer"}}});
+    let added =
+        json!({"type": "object", "required": ["C"], "properties": {"C": {"type": "string"}}});
+    assert_compatible_delta(
+        json!({"oneOf": [unit, tagged]}),
+        json!({"oneOf": [unit, tagged, added]}),
+        ChangeKind::VariantAdded,
+    );
+}
+
+// ── Codex review 3: the escape hatch must not be bypassable by hand-editing ──
+
+/// Fixtures for the bypass: a workflow whose input field is renamed, which is a
+/// breaking change from the replay-read perspective.
+fn bypass_fixture(field: &str) -> WorkflowSchemaContract {
+    WorkflowSchemaContract::from_entries(
+        "0.0.0-test",
+        vec![WorkflowSchemaEntry {
+            name: "onboarding".to_string(),
+            description: None,
+            input_schema: Some(json!({
+                "type": "object",
+                "properties": {field: {"type": "string"}},
+                "required": [field],
+            })),
+            output_schema: None,
+            error_schema: None,
+        }],
+    )
+}
+
+/// A hand-edited baseline that silently absorbed a breaking change must be
+/// caught by comparing against the PREVIOUS revision of the artifact.
+///
+/// Regenerating the artifact in the same PR makes the ordinary check trivially
+/// clean — baseline and generated contract agree — so the *only* signal left is
+/// the artifact's own change since the base revision. Without an
+/// acknowledgement covering it, the escape hatch has been bypassed.
+#[test]
+fn a_hand_edited_baseline_absorbing_a_break_is_unacknowledged() {
+    let base_artifact = bypass_fixture("email");
+    // The contributor renamed the field AND overwrote the artifact by hand, so
+    // the head artifact equals the generated contract and no ack was recorded.
+    let head_generated = bypass_fixture("email_address");
+    let head_artifact = bypass_fixture("email_address");
+
+    // The ordinary check is clean — this is exactly why it cannot catch it.
+    assert!(
+        !autumn_harvest::schema_contract::diff_schema_contracts(&head_artifact, &head_generated)
+            .has_breaking(),
+        "the in-PR check is clean by construction; the bypass is invisible to it"
+    );
+
+    let diff =
+        autumn_harvest::schema_contract::diff_schema_contracts(&base_artifact, &head_generated);
+    assert!(diff.has_breaking(), "the change since base IS breaking");
+    let missing = unacknowledged_breaking(&diff, &base_artifact, &head_artifact);
+    assert!(
+        !missing.is_empty(),
+        "a breaking change with no acknowledgement must be reported unacknowledged"
+    );
+}
+
+/// The legitimate path — `schema update --acknowledge` — must pass.
+#[test]
+fn an_acknowledged_baseline_update_covers_its_breaking_deltas() {
+    let base_artifact = bypass_fixture("email");
+    let head_generated = bypass_fixture("email_address");
+    let head_artifact = base_artifact
+        .acknowledged_update(&head_generated, "renamed for GDPR", Some("#794"))
+        .expect("acknowledging must succeed");
+
+    let diff =
+        autumn_harvest::schema_contract::diff_schema_contracts(&base_artifact, &head_generated);
+    assert!(diff.has_breaking(), "fixture must be breaking");
+    let missing = unacknowledged_breaking(&diff, &base_artifact, &head_artifact);
+    assert!(
+        missing.is_empty(),
+        "an acknowledged update must leave nothing unacknowledged: {missing:#?}"
+    );
+}
+
+/// An acknowledgement already present at the base revision was recorded for an
+/// EARLIER change. Reusing it would let the same field break twice with one
+/// record, so only acknowledgements NEW in this revision count.
+#[test]
+fn a_pre_existing_acknowledgement_does_not_cover_a_fresh_break() {
+    let plain_base = bypass_fixture("email");
+    let head_generated = bypass_fixture("email_address");
+    let diff = autumn_harvest::schema_contract::diff_schema_contracts(&plain_base, &head_generated);
+    assert!(diff.has_breaking(), "fixture must be breaking");
+
+    // Records covering EVERY breaking delta — so the only thing that can make
+    // this unacknowledged is the rule that base-carried records do not count.
+    let stale: Vec<AcknowledgedBreakingChange> = diff
+        .deltas
+        .iter()
+        .filter(|d| d.verdict == Verdict::Breaking)
+        .map(|d| AcknowledgedBreakingChange {
+            workflow: d.workflow.clone(),
+            role: d.role,
+            field_path: d.field_path.clone(),
+            change: d.change,
+            reason: "an EARLIER, unrelated break".to_string(),
+            recorded_in: Some("#111".to_string()),
+        })
+        .collect();
+    assert!(!stale.is_empty(), "fixture must produce records to carry");
+
+    // Base already carries them; head carries exactly the same list and adds
+    // nothing, so this revision recorded no justification of its own.
+    let mut base_artifact = plain_base;
+    base_artifact.acknowledged_breaking_changes = stale.clone();
+    let mut head_artifact = bypass_fixture("email_address");
+    head_artifact.acknowledged_breaking_changes = stale;
+
+    let missing = unacknowledged_breaking(&diff, &base_artifact, &head_artifact);
+    assert_eq!(
+        missing.len(),
+        diff.breaking_count,
+        "records carried over from the base revision must cover nothing: {missing:#?}"
+    );
+}
+
+/// Nothing breaking since base means nothing to acknowledge.
+#[test]
+fn a_compatible_baseline_update_needs_no_acknowledgement() {
+    let base_artifact = bypass_fixture("email");
+    // Widening the field type is compatible.
+    let head_generated = WorkflowSchemaContract::from_entries(
+        "0.0.0-test",
+        vec![WorkflowSchemaEntry {
+            name: "onboarding".to_string(),
+            description: None,
+            input_schema: Some(json!({
+                "type": "object",
+                "properties": {"email": {}},
+                "required": ["email"],
+            })),
+            output_schema: None,
+            error_schema: None,
+        }],
+    );
+    let diff =
+        autumn_harvest::schema_contract::diff_schema_contracts(&base_artifact, &head_generated);
+    assert!(!diff.has_breaking(), "fixture must be compatible");
+    assert!(
+        unacknowledged_breaking(&diff, &base_artifact, &head_generated).is_empty(),
+        "a compatible change needs no acknowledgement"
     );
 }

@@ -162,7 +162,7 @@ silently regress.
 New core module `autumn-harvest/src/schema_contract.rs` (unconditional — no `db`
 or `schema` gate, so the CLI can link it with `default-features = false`).
 
-121 no-DB integration tests in
+128 no-DB integration tests in
 `autumn-harvest/tests/integration/workflow_schema_contract_tests.rs`. Every rule
 that is a *validation* narrowing carries an independent **oracle** assertion
 against the engine's own `validate_against_schema` — the same code that gates
@@ -176,7 +176,7 @@ annotation churn producing zero deltas, artifact round-trip and byte stability,
 the escape hatch in all three states, and the seeded breaking/compatible
 success-metric fixtures.
 
-27 CLI integration tests in
+31 CLI integration tests in
 `autumn-harvest-cli/tests/integration/schema_check_cli.rs` (exit codes, missing
 and malformed baselines, both output shapes, the escape hatch, clap wiring, and
 the raw `GET /workflows/registered` body as `--current`) — including three that
@@ -297,3 +297,35 @@ A second round (automated review on the PR) found four more of the same class:
   path, pinned by a test that reads `ci.yml`. The guide beside it stays
   docs-only. This supersedes the earlier note that documented the hole as a
   known limitation.
+
+**Fourth review round** — one false-COMPATIBLE and one bypassable gate (a third
+finding, that `fs::rename` does not replace an existing file on Windows, was
+refuted: `std` documents "replacing the original file if `to` already exists"
+and the Windows implementation passes `MOVEFILE_REPLACE_EXISTING`):
+
+- **A tag on the ADDED `oneOf` branch was taken as proof of disjointness.** The
+  flag describes the new branch alone — that it is narrow, not that the branches
+  it now sits beside are. Adding the singleton `{"enum":["x"]}` next to a broad
+  `{"type":"string"}` makes the recorded value `"x"` match two branches, and
+  `oneOf` requires exactly one, so the recorded value is rejected — reported
+  compatible. Disjointness is now established only when **every** branch is
+  tagged, which is serde's externally-tagged shape: the serializer emits exactly
+  one variant key, so a recorded payload matches exactly one branch however many
+  variants are added. The oracle (`validate_against_schema`, the same code that
+  gates `POST /workflows/{name}/start`) confirms the fixture is a genuine break.
+- **The escape hatch could be bypassed by hand-editing the artifact.**
+  `schema update` refuses to absorb a breaking change without a justification,
+  but nothing stopped a contributor overwriting the file directly. That leaves
+  the artifact and the freshly generated contract in agreement, so the gate's
+  diff is empty and a replay-breaking change merges with no record — defeating
+  the issue's own success metric ("100% caught at PR/CI time") on exactly the
+  path the audit log exists for. New `unacknowledged_breaking()` compares the
+  artifact's change since its PREVIOUS revision and requires an acknowledgement
+  covering every breaking delta; matching is a multiset difference over
+  `(workflow, role, field_path, change)` restricted to records **new** in this
+  revision, so a record carried over from the base cannot be reused to let the
+  same field break twice. Exposed as `schema check --acknowledged-in <artifact>`
+  and wired as a second CI step against `git show <base>:<artifact>`. The base
+  object being unreachable (force-push, transient fetch failure) warns rather
+  than blocking every PR on infrastructure; the artifact's first introduction
+  has no previous revision and is skipped.

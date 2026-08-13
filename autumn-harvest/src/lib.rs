@@ -438,7 +438,7 @@ pub use schema_contract::{
     AcknowledgedBreakingChange, ChangeKind, CompatibilityRules, DEFAULT_SCHEMA_CONTRACT_PATH,
     MAX_DELTAS, SCHEMA_CONTRACT_VERSION, SchemaContractDiff, SchemaContractError, SchemaCoverage,
     SchemaDelta, SchemaRole, Verdict, WorkflowSchemaContract, WorkflowSchemaEntry,
-    canonicalize_schema, diff_schema_contracts,
+    canonicalize_schema, diff_schema_contracts, unacknowledged_breaking,
 };
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;

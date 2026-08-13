@@ -69,14 +69,14 @@ fn tree(
 #[test]
 fn a_compatible_change_exits_zero() {
     let (_d, b, c) = tree(BASELINE, CURRENT_COMPATIBLE);
-    let out = run_schema_check(&b, &c, SchemaCheckFormat::Text);
+    let out = run_schema_check(&b, &c, SchemaCheckFormat::Text, None);
     assert!(out.is_ok(), "a compatible change must exit 0: {out:?}");
 }
 
 #[test]
 fn a_breaking_change_exits_one() {
     let (_d, b, c) = tree(BASELINE, CURRENT_BREAKING);
-    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text)
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, None)
         .expect_err("a breaking change must fail the gate");
     assert_eq!(
         err.exit_code(),
@@ -91,7 +91,7 @@ fn a_missing_baseline_is_a_clear_error_not_a_silent_pass() {
     let missing = dir.path().join("nope.json");
     let c = dir.path().join("current.json");
     std::fs::write(&c, CURRENT_COMPATIBLE).unwrap();
-    let err = run_schema_check(&missing, &c, SchemaCheckFormat::Text)
+    let err = run_schema_check(&missing, &c, SchemaCheckFormat::Text, None)
         .expect_err("a missing baseline must be an error, never a silent pass");
     assert!(
         format!("{err}").contains("nope.json"),
@@ -102,7 +102,7 @@ fn a_missing_baseline_is_a_clear_error_not_a_silent_pass() {
 #[test]
 fn a_malformed_contract_is_a_clear_error() {
     let (_d, b, c) = tree("{ not json", CURRENT_COMPATIBLE);
-    assert!(run_schema_check(&b, &c, SchemaCheckFormat::Text).is_err());
+    assert!(run_schema_check(&b, &c, SchemaCheckFormat::Text, None).is_err());
 }
 
 // ── AC-4: output formats ────────────────────────────────────────────────────
@@ -204,7 +204,7 @@ fn update_with_an_acknowledgement_writes_the_baseline_and_records_the_reason() {
     .expect("acknowledged update must succeed");
 
     // The rewritten baseline now matches current, so `check` is clean...
-    assert!(run_schema_check(&b, &c, SchemaCheckFormat::Text).is_ok());
+    assert!(run_schema_check(&b, &c, SchemaCheckFormat::Text, None).is_ok());
 
     // ...and the justification is a visible, permanent record in the artifact.
     let written = std::fs::read_to_string(&b).unwrap();
@@ -220,7 +220,7 @@ fn update_with_an_acknowledgement_writes_the_baseline_and_records_the_reason() {
 fn update_of_a_compatible_change_needs_no_acknowledgement() {
     let (_d, b, c) = tree(BASELINE, CURRENT_COMPATIBLE);
     run_schema_update(&b, &c, None, None).expect("a compatible update needs no acknowledgement");
-    assert!(run_schema_check(&b, &c, SchemaCheckFormat::Text).is_ok());
+    assert!(run_schema_check(&b, &c, SchemaCheckFormat::Text, None).is_ok());
     let written = std::fs::read_to_string(&b).unwrap();
     assert!(written.contains("referral_code"));
 }
@@ -309,7 +309,7 @@ fn current_may_be_a_raw_registered_workflows_response() {
         ]"#,
     )
     .unwrap();
-    run_schema_check(&b, &c, SchemaCheckFormat::Text)
+    run_schema_check(&b, &c, SchemaCheckFormat::Text, None)
         .expect("a bare GET /workflows/registered body must be usable as --current");
 }
 
@@ -467,7 +467,7 @@ fn a_truncated_but_entirely_compatible_diff_still_fails_closed() {
     assert!(!diff.has_breaking(), "fixture must be compatible-only");
     assert!(diff.truncated, "fixture must exceed the delta cap");
 
-    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text)
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, None)
         .expect_err("an incomplete report must never pass the gate");
     assert_eq!(err.exit_code(), 1);
     assert!(
@@ -539,7 +539,7 @@ const EMPTY_CONTRACT: &str = r#"{
 #[test]
 fn an_empty_current_is_diagnosed_rather_than_read_as_a_mass_deletion() {
     let (_d, b, c) = tree(BASELINE, EMPTY_CONTRACT);
-    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text)
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, None)
         .expect_err("an empty current contract must be refused");
     let msg = err.to_string();
     assert!(
@@ -582,13 +582,105 @@ fn an_empty_current_cannot_overwrite_the_baseline_even_with_an_acknowledgement()
 #[test]
 fn an_empty_baseline_against_an_empty_current_is_not_refused() {
     let (_d, b, c) = tree(EMPTY_CONTRACT, EMPTY_CONTRACT);
-    run_schema_check(&b, &c, SchemaCheckFormat::Text).expect("empty-to-empty is a no-op");
+    run_schema_check(&b, &c, SchemaCheckFormat::Text, None).expect("empty-to-empty is a no-op");
 }
 
 /// ...and adding the first workflow to an empty baseline is compatible.
 #[test]
 fn growing_from_an_empty_baseline_is_compatible() {
     let (_d, b, c) = tree(EMPTY_CONTRACT, BASELINE);
-    run_schema_check(&b, &c, SchemaCheckFormat::Text)
+    run_schema_check(&b, &c, SchemaCheckFormat::Text, None)
         .expect("publishing a new workflow must not fail the gate");
+}
+
+// ── AC-5: the escape hatch must not be bypassable by hand-editing ────────────
+
+/// The artifact after a legitimate `schema update --acknowledge`: it matches
+/// `CURRENT_BREAKING` and records why the break was accepted.
+fn acknowledged_head() -> String {
+    let base = autumn_harvest::WorkflowSchemaContract::parse(BASELINE).unwrap();
+    let cur = autumn_harvest::WorkflowSchemaContract::parse(CURRENT_BREAKING).unwrap();
+    let head = base
+        .acknowledged_update(&cur, "renamed for GDPR", Some("#794"))
+        .expect("acknowledging must succeed");
+    serde_json::to_string_pretty(&head).unwrap()
+}
+
+/// A baseline hand-edited to match the generated contract, with no record.
+/// This is the bypass: the ordinary check is clean, so only the comparison
+/// against the PREVIOUS revision of the artifact can catch it.
+#[test]
+fn a_hand_edited_baseline_fails_the_escape_hatch_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.json"); // previous revision of the artifact
+    let generated = dir.path().join("generated.json");
+    let head = dir.path().join("head.json"); // artifact as it stands now
+    std::fs::write(&base, BASELINE).unwrap();
+    std::fs::write(&generated, CURRENT_BREAKING).unwrap();
+    std::fs::write(&head, CURRENT_BREAKING).unwrap(); // hand-copied, no ack
+
+    // The ordinary in-PR check passes — that is precisely the problem.
+    assert!(
+        run_schema_check(&head, &generated, SchemaCheckFormat::Text, None).is_ok(),
+        "the in-PR check is clean by construction; the bypass is invisible to it"
+    );
+
+    let err = run_schema_check(&base, &generated, SchemaCheckFormat::Text, Some(&head))
+        .expect_err("an unrecorded break must fail the escape-hatch check");
+    assert_eq!(err.exit_code(), 1, "the gate exits 1");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("acknowledgement"),
+        "the failure must name the missing acknowledgement: {msg}"
+    );
+}
+
+/// The legitimate path passes: `schema update --acknowledge` records the break.
+#[test]
+fn an_acknowledged_baseline_passes_the_escape_hatch_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.json");
+    let generated = dir.path().join("generated.json");
+    let head = dir.path().join("head.json");
+    std::fs::write(&base, BASELINE).unwrap();
+    std::fs::write(&generated, CURRENT_BREAKING).unwrap();
+    std::fs::write(&head, acknowledged_head()).unwrap();
+
+    let out = run_schema_check(&base, &generated, SchemaCheckFormat::Text, Some(&head));
+    assert!(
+        out.is_ok(),
+        "a recorded, justified break must pass the escape-hatch check: {out:?}"
+    );
+}
+
+/// A compatible change needs no record and must not be blocked.
+#[test]
+fn a_compatible_change_passes_the_escape_hatch_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.json");
+    let generated = dir.path().join("generated.json");
+    let head = dir.path().join("head.json");
+    std::fs::write(&base, BASELINE).unwrap();
+    std::fs::write(&generated, CURRENT_COMPATIBLE).unwrap();
+    std::fs::write(&head, CURRENT_COMPATIBLE).unwrap();
+
+    assert!(
+        run_schema_check(&base, &generated, SchemaCheckFormat::Text, Some(&head)).is_ok(),
+        "a compatible change must not need an acknowledgement"
+    );
+}
+
+/// Omitting the flag leaves the ordinary check byte-for-byte unchanged.
+#[test]
+fn the_escape_hatch_check_is_opt_in() {
+    let (_d, b, c) = tree(BASELINE, CURRENT_BREAKING);
+    let err = run_schema_check(&b, &c, SchemaCheckFormat::Text, None)
+        .expect_err("the ordinary check still fails on a breaking delta");
+    assert!(
+        matches!(
+            err,
+            autumn_harvest_cli::CliError::SchemaContractBreaking { .. }
+        ),
+        "without the flag the ordinary breaking-change error is reported: {err:?}"
+    );
 }

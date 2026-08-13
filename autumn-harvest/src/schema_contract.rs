@@ -1054,6 +1054,64 @@ fn collapse_unit_enum_branches(obj: &mut Map<String, Value>) {
     }
 }
 
+// ── The escape hatch, verified ───────────────────────────────────────────────
+
+/// The four fields that identify *which* change an acknowledgement covers.
+type AckIdentity<'a> = (&'a str, Option<SchemaRole>, &'a str, ChangeKind);
+
+/// Breaking deltas in `diff` that `head` does not acknowledge.
+///
+/// [`WorkflowSchemaContract::acknowledged_update`] refuses to absorb a breaking
+/// change without a justification, but a contributor can bypass the tool by
+/// hand-editing the artifact. That leaves the ordinary check trivially clean —
+/// the artifact and the freshly generated contract agree — so the only remaining
+/// signal is the artifact's own change since the PREVIOUS revision.
+///
+/// Pass `diff` = the diff of the *base revision's* artifact against the current
+/// generated contract, `base` = that base artifact, and `head` = the artifact as
+/// it stands now. Every breaking delta must be covered by an acknowledgement
+/// that is **new in `head`**: an entry already present at `base` was recorded
+/// for an earlier change, and reusing it would let the same field break twice
+/// against a single record. Matching is a multiset difference over
+/// `(workflow, role, field_path, change)`, so N breaks need N records.
+///
+/// Returns the deltas with no covering record — empty means the escape hatch was
+/// used correctly (or nothing broke).
+#[must_use]
+pub fn unacknowledged_breaking<'d>(
+    diff: &'d SchemaContractDiff,
+    base: &WorkflowSchemaContract,
+    head: &WorkflowSchemaContract,
+) -> Vec<&'d SchemaDelta> {
+    let identity = |a: &AcknowledgedBreakingChange| {
+        (a.workflow.clone(), a.role, a.field_path.clone(), a.change)
+    };
+    let mut available: BTreeMap<(String, Option<SchemaRole>, String, ChangeKind), usize> =
+        BTreeMap::new();
+    for a in &head.acknowledged_breaking_changes {
+        *available.entry(identity(a)).or_default() += 1;
+    }
+    // Consume the records the base revision already carried: they are not new.
+    for a in &base.acknowledged_breaking_changes {
+        if let Some(n) = available.get_mut(&identity(a)) {
+            *n = n.saturating_sub(1);
+        }
+    }
+    diff.breaking()
+        .filter(|d| {
+            let key: AckIdentity<'_> = (&d.workflow, d.role, &d.field_path, d.change);
+            let owned = (key.0.to_string(), key.1, key.2.to_string(), key.3);
+            match available.get_mut(&owned) {
+                Some(n) if *n > 0 => {
+                    *n -= 1;
+                    false
+                }
+                _ => true,
+            }
+        })
+        .collect()
+}
+
 // ── The differ ───────────────────────────────────────────────────────────────
 
 /// Compare a baseline contract against the current one.
@@ -2423,6 +2481,27 @@ fn diff_branches(
             )),
         }
     }
+    diff_added_branches(
+        &*ctx,
+        &base_by_key,
+        &cur_by_key,
+        &cur_keys,
+        cur_kw,
+        path,
+        diff,
+    );
+}
+
+/// Classify each branch present in `cur` but not in `base`.
+fn diff_added_branches(
+    ctx: &DiffCtx<'_>,
+    base_by_key: &BTreeMap<String, Value>,
+    cur_by_key: &BTreeMap<String, (Value, bool)>,
+    cur_keys: &[String],
+    cur_kw: &str,
+    path: &str,
+    diff: &mut SchemaContractDiff,
+) {
     // For `anyOf` (serde's untagged shape) the binding rule is FIRST match in
     // declaration order, so a branch inserted AHEAD of a pre-existing one can
     // capture recorded data that used to bind to the later branch. Anything
@@ -2432,7 +2511,10 @@ fn diff_branches(
         .iter()
         .rposition(|k| base_by_key.contains_key(k))
         .unwrap_or(0);
-    for (key, (_, discriminated)) in &cur_by_key {
+    // Disjointness is a property of the WHOLE branch set, not of the added
+    // branch — see the comment on the compatible arm below.
+    let all_discriminated = cur_by_key.values().all(|(_, d)| *d);
+    for (key, (_, discriminated)) in cur_by_key {
         if base_by_key.contains_key(key) {
             continue;
         }
@@ -2459,9 +2541,17 @@ fn diff_branches(
         // `anyOf` means "at least one", so an appended branch can never reject a
         // previously-valid instance. `oneOf` means "exactly one", so an added
         // branch that OVERLAPS an existing one turns a single match into two and
-        // rejects it — safe only when the branch carries a variant tag proving
-        // disjointness. `oneOf` binding does not depend on order.
-        if cur_kw == "anyOf" || *discriminated {
+        // rejects it.
+        //
+        // A tag on the ADDED branch alone proves nothing: it says the new branch
+        // is narrow, not that the branches it now sits beside are. Adding the
+        // singleton `{"enum":["x"]}` next to a broad `{"type":"string"}` makes
+        // the recorded value `"x"` match two branches. Disjointness is only
+        // established when EVERY branch is discriminated — that is serde's
+        // externally-tagged shape, where the serializer emits exactly one
+        // variant key, so a recorded payload matches exactly one branch however
+        // many variants are added. `oneOf` binding does not depend on order.
+        if cur_kw == "anyOf" || all_discriminated {
             diff.push(ctx.delta(
                 path,
                 ChangeKind::VariantAdded,
@@ -2469,14 +2559,20 @@ fn diff_branches(
                 format!("variant `{key}` added"),
             ));
         } else {
+            let why = if *discriminated {
+                "at least one EXISTING branch of this `oneOf` carries no variant tag, so the \
+                 added branch is not provably disjoint from it"
+            } else {
+                "the added branch carries no variant tag proving it is disjoint from the existing \
+                 branches"
+            };
             diff.push(ctx.delta(
                 path,
                 ChangeKind::VariantAdded,
                 Verdict::Breaking,
                 format!(
-                    "variant `{key}` added to a `oneOf` without a variant tag proving it is \
-                     disjoint from the existing branches; `oneOf` requires EXACTLY one match, so \
-                     an overlapping branch rejects previously-valid recorded data"
+                    "variant `{key}` added to a `oneOf` and {why}; `oneOf` requires EXACTLY one \
+                     match, so an overlapping branch rejects previously-valid recorded data"
                 ),
             ));
         }

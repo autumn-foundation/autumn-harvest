@@ -7,8 +7,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use autumn_harvest::{
-    DetCheckReport, DetSeverity, SchemaContractDiff, SchemaRole, WorkflowSchemaContract,
-    check_paths, diff_schema_contracts,
+    DetCheckReport, DetSeverity, SchemaContractDiff, SchemaDelta, SchemaRole,
+    WorkflowSchemaContract, check_paths, diff_schema_contracts, unacknowledged_breaking,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -414,6 +414,27 @@ pub enum CliError {
         /// Number of breaking deltas.
         breaking: usize,
     },
+
+    /// `schema check --acknowledged-in` found a breaking change the artifact
+    /// does not record (issue #794).
+    ///
+    /// The escape hatch is auditable by construction: absorbing a break writes
+    /// a justification into the artifact. This fires when the artifact moved
+    /// over a break with no such record — the shape a hand-edited baseline
+    /// takes, which the ordinary check cannot see because the artifact and the
+    /// generated contract already agree. Exit code is `1`.
+    #[error(
+        "schema check: {missing} breaking schema change(s) since the previous revision of the \
+         artifact carry no acknowledgement:\n{detail}\nThe artifact appears to have absorbed a \
+         break without recording why. Regenerate it with `harvest schema update --acknowledge \
+         \"<why this is safe>\"` instead of editing it by hand."
+    )]
+    SchemaContractUnacknowledged {
+        /// Number of breaking deltas with no covering record.
+        missing: usize,
+        /// One line per unrecorded break.
+        detail: String,
+    },
 }
 
 impl CliError {
@@ -762,6 +783,16 @@ enum SchemaCommand {
         /// `json` (per-type, per-field verdict and reason).
         #[arg(long, value_enum, default_value_t)]
         format: SchemaCheckFormat,
+        /// Verify the ESCAPE HATCH instead of the artifact's freshness.
+        ///
+        /// Pass the artifact as it stands now, with `--baseline` pointing at the
+        /// PREVIOUS revision of it (e.g. `git show <base>:<path>`). Every
+        /// breaking delta must then be covered by an acknowledgement that is new
+        /// in this artifact — which catches a baseline hand-edited to absorb a
+        /// break silently, something the ordinary check cannot see because the
+        /// artifact and the generated contract already agree.
+        #[arg(long, value_name = "PATH")]
+        acknowledged_in: Option<PathBuf>,
     },
 
     /// Regenerate the checked-in baseline from the current schemas.
@@ -2475,7 +2506,8 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                 baseline,
                 current,
                 format,
-            } => run_schema_check(baseline, current, *format),
+                acknowledged_in,
+            } => run_schema_check(baseline, current, *format, acknowledged_in.as_deref()),
             SchemaCommand::Update {
                 baseline,
                 current,
@@ -2943,6 +2975,7 @@ pub fn run_schema_check(
     baseline: &Path,
     current: &Path,
     format: SchemaCheckFormat,
+    acknowledged_in: Option<&Path>,
 ) -> Result<(), CliError> {
     let base = read_schema_contract(baseline)?;
     let cur = read_schema_contract(current)?;
@@ -2963,6 +2996,22 @@ pub fn run_schema_check(
         )));
     }
 
+    // Escape-hatch mode: a breaking delta is allowed, but only when THIS
+    // revision of the artifact records why. Without it the tool's refusal to
+    // absorb a break can be sidestepped by hand-editing the artifact, which
+    // leaves the ordinary check clean and the change unrecorded.
+    if let Some(ack_path) = acknowledged_in {
+        let head = read_schema_contract(ack_path)?;
+        let missing = unacknowledged_breaking(&diff, &base, &head);
+        if !missing.is_empty() {
+            return Err(CliError::SchemaContractUnacknowledged {
+                missing: missing.len(),
+                detail: format_unacknowledged(&missing),
+            });
+        }
+        return Ok(());
+    }
+
     // `breaking_count` is the authoritative tally kept by the differ, not a
     // count of the *stored* deltas: it stays correct even where storage is
     // capped, so a breaking change can never be dropped on the floor.
@@ -2972,6 +3021,26 @@ pub fn run_schema_check(
         });
     }
     Ok(())
+}
+
+/// One line per unrecorded break, in the same shape as the ordinary report.
+fn format_unacknowledged(missing: &[&SchemaDelta]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for d in missing {
+        let role = d
+            .role
+            .map_or_else(String::new, |r| format!(".{}", r.as_str()));
+        let _ = writeln!(
+            out,
+            "  {}{role}{}: {} — {}",
+            d.workflow,
+            d.field_path,
+            d.change.as_str(),
+            d.reason
+        );
+    }
+    out
 }
 
 /// Refuses a `--current` that publishes nothing against a non-empty baseline.
@@ -11025,11 +11094,13 @@ mod schema_contract_cli_tests {
                         baseline,
                         current,
                         format,
+                        acknowledged_in,
                     },
             } => {
                 assert_eq!(baseline, PathBuf::from("base.json"));
                 assert_eq!(current, PathBuf::from("cur.json"));
                 assert_eq!(format, SchemaCheckFormat::Json);
+                assert_eq!(acknowledged_in, None, "the escape-hatch mode is opt-in");
             }
             other => panic!("expected Schema::Check, got {other:?}"),
         }
