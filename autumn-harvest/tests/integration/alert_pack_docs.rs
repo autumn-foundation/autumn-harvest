@@ -407,6 +407,28 @@ fn scanner_stalled_retention_expression_cannot_fire_during_the_startup_hour() {
         "the sub-minute expression must NOT gate on a prior tick -- that would hide a loop that \
          wedges on its first iteration: {sub_minute}"
     );
+
+    // A follow-up review asked for a reset-/uptime-scoped gate, on the grounds
+    // that `max_over_time` is not scoped to the current counter lifetime. It is
+    // not: `increase()` IS reset-aware (`last - first + correction`), so a
+    // healthy loop restarted mid-window yields a NONZERO increase and the rule
+    // cannot fire at all. Adding `unless resets(...) > 0` would instead blind
+    // the alert for a full window after every deploy. Pin both halves: no
+    // `resets()` term in the expression, and the reasoning recorded in `notes`
+    // so a future pass does not "fix" this back.
+    assert!(
+        !retention.contains("resets("),
+        "the retention expression must not carry a resets()-scoped gate -- it would blind the \
+         alert for a full window after every deploy: {retention}"
+    );
+    let notes = stalled["prometheus"]["notes"]
+        .as_str()
+        .expect("scanner stalled alert must carry prometheus notes");
+    assert!(
+        notes.contains("RESTART SEMANTICS"),
+        "the notes must record why the startup gate needs no resets()/uptime term, so the \
+         reset-aware increase() argument is not re-derived on every review"
+    );
 }
 
 fn read_pack() -> Value {

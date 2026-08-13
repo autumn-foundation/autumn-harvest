@@ -1838,6 +1838,21 @@ own work counters and its `tracing::error!`, not this heartbeat.
   first poll interval after start, and the hourly retention expression reads
   zero throughout hour 0–1 of a fresh process. Give the rule a `for:` of at
   least one poll interval to ride that out.
+- **Not a false positive: a restart mid-window.** A container restart that
+  preserves the label set resets the counter to zero, but `increase()` is
+  reset-**aware** — it computes `last - first + correction`, adding the
+  pre-reset value back at each reset. A healthy retention janitor that ticked
+  at least once before the restart therefore reads `increase > 0`
+  (`3,4,5,reset,0,0 → 0 - 3 + 5 = 2`), the `== 0` side fails, and the rule cannot
+  fire; the startup gate is never even consulted. The only post-restart shape
+  that fires is one whose pre-restart samples were **flat**
+  (`5,5,5,reset,0,0 → 0 - 5 + 5 = 0`) — i.e. the janitor had already been stalled
+  for the whole window and the rule was already correctly firing. It simply
+  keeps firing, for at most one more hour, until the new process's first pass
+  proves liveness. Do **not** "fix" this with `unless resets(...[3h]) > 0`:
+  that blinds the alert for a full window after **every** deploy, hiding a
+  genuine post-restart wedge — strictly worse than prolonging a page that was
+  already true.
 - **A missing series is not an alert.** `== 0` never fires on a series that
   does not exist. Two distinct cases:
   - *A wedge on the very first iteration.* This is **covered**: each loop
