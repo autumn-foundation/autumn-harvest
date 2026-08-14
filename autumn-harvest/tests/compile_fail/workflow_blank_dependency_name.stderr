@@ -1,0 +1,5 @@
+error: `activities` entry must be a non-empty name
+ --> tests/compile_fail/workflow_blank_dependency_name.rs:6:26
+  |
+6 | #[workflow(activities = [""])]
+  |                          ^^

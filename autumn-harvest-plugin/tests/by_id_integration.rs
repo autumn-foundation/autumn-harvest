@@ -224,6 +224,8 @@ fn progress_workflow<'a>(
 
 fn progress_info() -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "progress_wf",
         module: "tests",

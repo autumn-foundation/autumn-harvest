@@ -1,0 +1,5 @@
+error: `children` takes a bracketed list of names, e.g. `children = [generate_report]` — unlike `owner`/`runbook`/`severity`/`description` it is a list, not a string, and unlike `concurrency(..)`/`throttle(..)` it uses `=`, not parentheses
+ --> tests/compile_fail/workflow_dependency_paren_container.rs:7:12
+  |
+7 | #[workflow(children(generate_report))]
+  |            ^^^^^^^^

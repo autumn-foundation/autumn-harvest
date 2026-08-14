@@ -1,0 +1,5 @@
+error: `activities` is declared more than once — merge the entries into a single `activities = [...]` list; a repeated key would silently discard the earlier declaration and weaken the deploy-time preflight check
+ --> tests/compile_fail/workflow_duplicate_dependency_attr.rs:8:44
+  |
+8 | #[workflow(activities = [missing_handler], activities = [])]
+  |                                            ^^^^^^^^^^

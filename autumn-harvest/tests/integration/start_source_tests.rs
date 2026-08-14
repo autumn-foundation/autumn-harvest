@@ -664,6 +664,8 @@ fn noop_schedule_handler<'a>(
 fn schedule_registry(wf_name: &'static str, handler: WorkflowHandlerFn) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: wf_name,
             module: "start_source_tests",

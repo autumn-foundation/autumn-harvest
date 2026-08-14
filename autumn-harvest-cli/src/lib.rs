@@ -5044,7 +5044,63 @@ fn format_preflight_table(value: &Value) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
-    format!("overall_status: {overall}\nobserved_at: {observed_at}\n\n{table}")
+    let findings = format_preflight_findings(checks);
+    if findings.is_empty() {
+        format!("overall_status: {overall}\nobserved_at: {observed_at}\n\n{table}")
+    } else {
+        format!("overall_status: {overall}\nobserved_at: {observed_at}\n\n{table}\n\n{findings}")
+    }
+}
+
+/// Render the per-check detail block the summary table cannot show.
+///
+/// The table's `SUMMARY` column carries only a check's one-line verdict, so the
+/// payload an operator actually needs in order to act — the specific unresolved
+/// references in `details.failures`, and the check's `remediation` — is
+/// invisible in table mode. Surfacing them beneath the table makes a failing
+/// `harvest preflight` (and its non-zero exit in CI) actionable without
+/// re-running the command through `--output json | jq`.
+///
+/// Only non-`pass` checks contribute, and only when they carry at least one
+/// failure or a remediation, so a healthy fleet's output is unchanged.
+fn format_preflight_findings(checks: &[Value]) -> String {
+    let mut blocks = Vec::new();
+    for check in checks {
+        let status = check.get("status").and_then(Value::as_str).unwrap_or("");
+        if status == "pass" {
+            continue;
+        }
+        let name = check
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("(unnamed)");
+        let mut lines = vec![format!("{name} ({status})")];
+        if let Some(failures) = check
+            .get("details")
+            .and_then(|details| details.get("failures"))
+            .and_then(Value::as_array)
+        {
+            for failure in failures {
+                lines.push(format!("  - {}", preflight_failure_text(failure)));
+            }
+        }
+        if let Some(remediation) = check.get("remediation").and_then(Value::as_str) {
+            lines.push(format!("  remediation: {remediation}"));
+        }
+        if lines.len() > 1 {
+            blocks.push(lines.join("\n"));
+        }
+    }
+    blocks.join("\n\n")
+}
+
+/// A `details.failures` entry is a plain string for some checks (catalog
+/// consistency, worker coverage) and a structured object for others (schedule
+/// resolvability); render both without dropping information.
+fn preflight_failure_text(failure: &Value) -> String {
+    failure
+        .as_str()
+        .map_or_else(|| failure.to_string(), ToString::to_string)
 }
 
 fn format_shard_health_table(value: &Value) -> String {
@@ -12739,5 +12795,145 @@ mod replay_sample_bundle_tests {
 
         response["payload_policy"] = json!("redacted");
         assert!(bundle_is_redacted(&response));
+    }
+}
+
+#[cfg(test)]
+mod preflight_findings_tests {
+    //! Rendering tests for the preflight detail block (issue #802 review).
+    //!
+    //! The summary table carries only each check's one-line verdict, so the
+    //! specific unresolved references live in `details.failures` and used to be
+    //! invisible in table mode — the exact payload the declared-dependency
+    //! check exists to produce. These pin that they are rendered, that a
+    //! healthy fleet's output is unchanged, and that both `failures` element
+    //! shapes (plain string, structured object) survive.
+    use super::*;
+
+    fn check(name: &str, status: &str, failures: &Value, remediation: Option<&str>) -> Value {
+        let mut value = serde_json::json!({
+            "name": name,
+            "status": status,
+            "summary": "…",
+            "details": { "failures": failures },
+        });
+        if let Some(text) = remediation {
+            value["remediation"] = serde_json::json!(text);
+        }
+        value
+    }
+
+    #[test]
+    fn a_failing_check_renders_each_failure_and_its_remediation() {
+        let checks = vec![check(
+            "catalog_consistency",
+            "fail",
+            &serde_json::json!([
+                "workflow 'onboarding' references unregistered activity 'send_emial'",
+                "workflow 'onboarding' references unregistered child workflow 'generate_reprot'",
+            ]),
+            Some("Register the named handler."),
+        )];
+
+        let rendered = format_preflight_findings(&checks);
+
+        assert!(
+            rendered.starts_with("catalog_consistency (fail)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "  - workflow 'onboarding' references unregistered activity 'send_emial'"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "  - workflow 'onboarding' references unregistered child workflow 'generate_reprot'"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  remediation: Register the named handler."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_passing_check_contributes_nothing() {
+        let checks = vec![check(
+            "catalog_consistency",
+            "pass",
+            &serde_json::json!([]),
+            None,
+        )];
+        assert_eq!(format_preflight_findings(&checks), "");
+    }
+
+    #[test]
+    fn a_healthy_fleet_leaves_the_table_output_unchanged() {
+        let value = serde_json::json!({
+            "overall_status": "pass",
+            "observed_at": "2026-08-14T09:12:00Z",
+            "checks": [check("catalog_consistency", "pass", &serde_json::json!([]), None)],
+        });
+        let rendered = format_preflight_table(&value);
+        assert!(
+            !rendered.contains("catalog_consistency (pass)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .ends_with("registered catalog contains unresolved workflow runtime references")
+                || rendered.contains("STATUS"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn structured_failure_objects_are_rendered_not_dropped() {
+        // `schedule_resolvability` pushes objects rather than strings; the
+        // renderer must not silently swallow them.
+        let checks = vec![check(
+            "schedule_resolvability",
+            "fail",
+            &serde_json::json!([{ "schedule": "nightly", "reason": "unregistered workflow" }]),
+            None,
+        )];
+        let rendered = format_preflight_findings(&checks);
+        assert!(rendered.contains("nightly"), "{rendered}");
+        assert!(rendered.contains("unregistered workflow"), "{rendered}");
+    }
+
+    #[test]
+    fn a_warn_check_with_no_failures_and_no_remediation_is_omitted() {
+        let mut value = serde_json::json!({ "name": "worker_health", "status": "warn" });
+        value["details"] = serde_json::json!({});
+        assert_eq!(format_preflight_findings(&[value]), "");
+    }
+
+    #[test]
+    fn the_detail_block_is_appended_beneath_the_table() {
+        let value = serde_json::json!({
+            "overall_status": "fail",
+            "observed_at": "2026-08-14T09:12:00Z",
+            "checks": [check(
+                "catalog_consistency",
+                "fail",
+                &serde_json::json!(["workflow 'onboarding' references unregistered activity 'send_emial'"]),
+                Some("Register the named handler."),
+            )],
+        });
+
+        let rendered = format_preflight_table(&value);
+        let table_at = rendered.find("STATUS").expect("table header");
+        let detail_at = rendered
+            .find("catalog_consistency (fail)")
+            .expect("detail block");
+        assert!(
+            table_at < detail_at,
+            "detail block must follow the table:\n{rendered}"
+        );
+        assert!(rendered.contains("send_emial"), "{rendered}");
     }
 }

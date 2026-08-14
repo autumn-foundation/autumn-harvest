@@ -88,6 +88,8 @@ fn noop_handler<'a>(
 fn make_registry(workflow_name: &'static str) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: workflow_name,
             module: "scheduler_ha_tests",

@@ -1401,6 +1401,8 @@ mod tests {
 
     fn wf(name: &'static str, mcp: bool) -> WorkflowInfo {
         WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             name,
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),

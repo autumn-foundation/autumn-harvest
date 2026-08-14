@@ -55,6 +55,8 @@ fn build_pool(url: &str) -> DbPool {
 fn test_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "onboarding",
             module: "tests",

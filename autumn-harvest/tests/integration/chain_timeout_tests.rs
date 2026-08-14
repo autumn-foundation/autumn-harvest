@@ -491,6 +491,8 @@ fn chain_can_workflow<'a>(
 fn chain_can_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "e2e_test_workflow",
             module: "chain_timeout_tests",
@@ -608,6 +610,8 @@ fn leaked_name(prefix: &str) -> &'static str {
 fn named_registry(name: &'static str, handler: WorkflowHandlerFn) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name,
             module: "chain_timeout_tests",
@@ -910,6 +914,8 @@ async fn scheduler_tick_applies_fleet_wide_chain_ceiling() {
     let registry = Arc::new(
         HandlerRegistry::new(
             vec![WorkflowInfo {
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: wf_name,
                 module: "chain_timeout_tests",

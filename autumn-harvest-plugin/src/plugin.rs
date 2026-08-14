@@ -2704,6 +2704,8 @@ mod tests {
 
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "echo",
             module: "tests",

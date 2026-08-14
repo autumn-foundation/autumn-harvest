@@ -567,6 +567,8 @@ fn strict_schema() -> serde_json::Value {
 
 fn wf_info_with_schema(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         name,
         module: "signal_with_start_tests",
         handler: dummy_handler,

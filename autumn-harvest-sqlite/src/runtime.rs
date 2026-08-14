@@ -2799,6 +2799,11 @@ mod feature_gate_tests {
         info.output_schema = Some(|| serde_json::json!({"type": "integer"}));
         info.error_schema = Some(|| serde_json::json!({"type": "string"}));
         info.mcp = true;
+        // Issue #802: declared activity/child dependencies are preflight-only
+        // registration metadata — this backend runs no preflight and the fields
+        // change no execution semantics, so they are accepted inert.
+        info.declared_activities = Some(&["some_activity"]);
+        info.declared_children = Some(&["some_child"]);
         assert!(
             unsupported_workflow_feature(&info).is_none(),
             "metadata/observability-only fields must be accepted (inert)",

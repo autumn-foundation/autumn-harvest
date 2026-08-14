@@ -263,6 +263,8 @@ fn incremental_etl_handler<'a>(
 fn etl_registry(wf_name: &'static str) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: wf_name,
             module: "schedule_update_integration",

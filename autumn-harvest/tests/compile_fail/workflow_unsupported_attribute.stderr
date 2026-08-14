@@ -1,0 +1,5 @@
+error: unsupported attribute: expected `execution_timeout`, `chain_execution_timeout`, `sla`, `concurrency`, `debounce`, `batch`, `throttle`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, `retry`, `mcp`, `activities`, `children`, or `allow_nondeterministic_apis`
+ --> tests/compile_fail/workflow_unsupported_attribute.rs:7:12
+  |
+7 | #[workflow(bogus_attr = "nope")]
+  |            ^^^^^^^^^^

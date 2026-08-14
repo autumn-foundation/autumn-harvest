@@ -335,6 +335,8 @@ fn release_then_wait_workflow<'a>(
 
 fn wf(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "mutex_tests",

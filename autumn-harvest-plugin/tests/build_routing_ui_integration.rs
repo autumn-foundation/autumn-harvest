@@ -66,6 +66,8 @@ fn test_app_state() -> AppState {
 fn minimal_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "deploy_workflow",
             module: "tests",

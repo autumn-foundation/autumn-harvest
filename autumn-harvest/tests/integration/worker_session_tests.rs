@@ -753,6 +753,8 @@ mod db_tests {
 
         let registry = std::sync::Arc::new(HandlerRegistry::new(
             vec![WorkflowInfo {
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "session_test_wf",
                 module: "worker_session_tests",

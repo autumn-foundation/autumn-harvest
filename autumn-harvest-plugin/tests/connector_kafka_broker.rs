@@ -68,6 +68,8 @@ fn noop_workflow<'a>(
 
 fn workflow_info(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "tests",
