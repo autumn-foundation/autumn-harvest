@@ -568,6 +568,8 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                     None,
                     None, // issue #798: candidate build id (unset in this span test)
                     autumn_harvest::context::WorkflowHistoryPolicy::default(),
+                    // Issue #798: library-default payload limits for this span test.
+                    autumn_harvest::executor::ReplayPayloadLimits::default(),
                 )
                 .await;
             });

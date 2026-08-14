@@ -250,6 +250,8 @@ fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
             None,
             None, // issue #798: candidate build id (unset in this span test)
             autumn_harvest::context::WorkflowHistoryPolicy::default(),
+            // Issue #798: library-default payload limits for this span test.
+            autumn_harvest::executor::ReplayPayloadLimits::default(),
         ));
 
     // 1. Span must be named correctly.

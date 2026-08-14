@@ -2288,3 +2288,133 @@ async fn replay_verifier_carries_the_candidate_build_id() {
         "ReplayVerifier::with_build_id must reach the fixture replay context: {report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Candidate payload caps (Codex round 20)
+// ---------------------------------------------------------------------------
+
+/// Comfortably under the library default activity-input cap (2 MiB) and
+/// comfortably over the candidate cap the tests below configure, so the two
+/// configurations genuinely disagree about this one workflow.
+const CANDIDATE_CAP_BYTES: u64 = 512 * 1024;
+const PAYLOAD_BYTES: usize = 700 * 1024;
+
+/// Schedules a single activity whose input sits between the candidate worker's
+/// configured cap and the library default — i.e. accepted by one and rejected by
+/// the other. The history stops at `WorkflowStarted`, so this dispatch happens
+/// at the frontier, which is where an in-flight fixture actually exercises the
+/// cap: an already-recorded activity matches history and never re-checks it.
+fn large_input_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let payload = Value::String("x".repeat(PAYLOAD_BYTES));
+        ctx.execute_activity_raw("big_step", payload, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// A candidate build that *lowers* a payload cap is the false-GREEN direction:
+/// replay accepts the input under the library default, the promoted worker
+/// rejects it with `PayloadTooLarge`, and the gate has certified a build that
+/// will break the very executions it sampled.
+#[tokio::test]
+async fn candidate_activity_input_cap_reaches_the_replay_context() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &snapshot_json("wf", ExecutionId::new(), vec![started_event()]),
+    );
+
+    let report = autumn_harvest::testing::WorkflowReplayer::new()
+        .register_fn("wf", large_input_workflow as WorkflowHandlerFn)
+        .with_payload_caps(CANDIDATE_CAP_BYTES, 0, 0)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(
+        report.diverged.len(),
+        1,
+        "the candidate's activity-input cap must be applied during replay, so a payload \
+         the promoted worker would reject is reported rather than certified: {report}"
+    );
+}
+
+/// Control: without the setting the same bundle replays clean, so the assertion
+/// above is carried by the cap rather than by the fixture happening to fail.
+#[tokio::test]
+async fn omitting_the_candidate_cap_certifies_the_oversized_input() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &snapshot_json("wf", ExecutionId::new(), vec![started_event()]),
+    );
+
+    let report = autumn_harvest::testing::WorkflowReplayer::new()
+        .register_fn("wf", large_input_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.is_clean(),
+        "control: under the library default cap this payload is accepted, so the test \
+         above is proving the candidate cap carries — not that the fixture is broken: {report}"
+    );
+}
+
+/// The offload threshold (#524) modulates the same decision: a worker that
+/// offloads large payloads *skips* the cap, so a gate that knows the cap but not
+/// the threshold reports drift the promoted worker would never hit — the
+/// false-RED direction of the same gap.
+#[tokio::test]
+async fn candidate_offload_threshold_reaches_the_replay_context() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &snapshot_json("wf", ExecutionId::new(), vec![started_event()]),
+    );
+
+    let report = autumn_harvest::testing::WorkflowReplayer::new()
+        .register_fn("wf", large_input_workflow as WorkflowHandlerFn)
+        .with_payload_caps(CANDIDATE_CAP_BYTES, 0, 0)
+        .with_payload_offload_threshold(Some(CANDIDATE_CAP_BYTES / 2))
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.is_clean(),
+        "a payload above the offload threshold is offloaded rather than capped, so the \
+         gate must not report drift the promoted worker would not hit: {report}"
+    );
+}
+
+/// `ReplayVerifier` is the gate's own public surface — the embedder's gate binary
+/// builds one directly — so the candidate payload limits must be settable there
+/// too, exactly as the build id and history policy already are.
+#[tokio::test]
+async fn replay_verifier_carries_the_candidate_payload_caps() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &snapshot_json("wf", ExecutionId::new(), vec![started_event()]),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", large_input_workflow as WorkflowHandlerFn)
+        .with_payload_caps(CANDIDATE_CAP_BYTES, 0, 0)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(
+        report.diverged.len(),
+        1,
+        "ReplayVerifier::with_payload_caps must reach the fixture replay context: {report}"
+    );
+}

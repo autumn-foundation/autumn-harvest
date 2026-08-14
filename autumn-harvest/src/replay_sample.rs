@@ -62,9 +62,16 @@ pub const MAX_SAMPLE_TOTAL: usize = 2_000;
 ///
 /// The budget is checked *before* fetching each history — the size of a document
 /// is not knowable until it is loaded — so peak retained bytes are bounded by
-/// this budget plus at most one document. A caller who raises `max_bytes` above
-/// the budget therefore still gets one document; bounding a single oversized
-/// export is what `max_bytes` itself is for.
+/// this budget plus at most one document. That is a bound only if one document is
+/// itself bounded, so the sample route also **rejects** a `max_bytes` above this
+/// budget: without that ceiling the budget starts at zero, the first candidate is
+/// therefore always fetched and retained however large it is, and a single
+/// multi-gigabyte history exhausts the API despite this cap. With the ceiling,
+/// peak retained is at most twice this budget.
+///
+/// A per-document limit larger than the whole response budget is also incoherent
+/// — such a document could never be returned within the budget — so it is
+/// refused at the edge rather than loaded and then failed.
 ///
 /// Hitting the budget is **never silent**: the export stops and
 /// [`SampleManifest::truncated_by_size`] records it, so the gate reports a

@@ -9747,7 +9747,7 @@ fn parse_history_sample_export_query(
                 payload_policy = value.parse().map_err(AutumnError::bad_request_msg)?;
             }
             "max_bytes" | "max-bytes" => {
-                max_bytes = parse_history_max_bytes(value)?;
+                max_bytes = parse_sample_max_bytes(value)?;
             }
             "workflow_name" | "workflow-name" => {
                 let trimmed = value.trim();
@@ -9795,6 +9795,39 @@ fn parse_history_sample_export_query(
         order,
         shard_id,
     })
+}
+
+/// Parse `max_bytes` for the **sample** route, bounded by the aggregate budget.
+///
+/// The sample export checks
+/// [`MAX_SAMPLE_RESPONSE_BYTES`](autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES)
+/// *before* each fetch, because a document's size is not knowable until it is
+/// loaded — so peak retained bytes are the budget plus at most one document.
+/// That is a bound only if one document is itself bounded, and `max_bytes` is
+/// caller-supplied. With no ceiling the budget starts at zero, so the first
+/// candidate is always fetched and retained however large it is, and a single
+/// multi-gigabyte history exhausts the management API despite the aggregate cap.
+///
+/// Rejected rather than silently clamped: asking for one document larger than
+/// the entire response budget is incoherent (it can never be returned within
+/// that budget), and quietly shrinking the caller's limit would surface later as
+/// a mystifying per-candidate size failure naming a number they never set.
+///
+/// Scoped to this route deliberately. The single-execution and batch export
+/// routes predate #798, return a different shape, and carry no aggregate budget
+/// for a per-document limit to be coherent against; changing their contract is
+/// not this change's business.
+fn parse_sample_max_bytes(value: &str) -> Result<usize, AutumnError> {
+    let parsed = parse_history_max_bytes(value)?;
+    let ceiling = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
+    if parsed > ceiling {
+        return Err(AutumnError::bad_request_msg(format!(
+            "max_bytes {parsed} exceeds the sample response budget of {ceiling} bytes; \
+             a single history larger than the whole response cannot be sampled — \
+             export it individually with GET /admin/history/export instead"
+        )));
+    }
+    Ok(parsed)
 }
 
 fn parse_history_max_bytes(value: &str) -> Result<usize, AutumnError> {
@@ -43532,6 +43565,69 @@ mod tests {
         budget.charge_attempt(Some(usize::MAX));
         budget.charge_attempt(Some(usize::MAX));
         assert!(budget.exhausted(), "saturating add must stay exhausted");
+    }
+
+    /// The aggregate budget is checked *before* a fetch, so peak retained bytes
+    /// are the budget plus at most one document. That is only a bound if one
+    /// document is itself bounded — and `max_bytes` is caller-supplied.
+    ///
+    /// Without a ceiling the budget starts at zero, so the very first candidate
+    /// is always fetched and retained whatever its size: a single multi-gigabyte
+    /// history exhausts the management API despite `MAX_SAMPLE_RESPONSE_BYTES`.
+    /// Asking for one document larger than the entire response budget is also
+    /// incoherent — it can never be returned within that budget — so it is
+    /// rejected at the edge rather than accepted and then failed after the load.
+    #[test]
+    fn sample_max_bytes_above_the_response_budget_is_rejected() {
+        let cap = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
+
+        let err =
+            parse_history_sample_export_query(&[("max_bytes".to_string(), (cap + 1).to_string())])
+                .expect_err(
+                    "a single document larger than the whole response budget must be rejected",
+                );
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("max_bytes"),
+            "the rejection must name the offending parameter: {rendered}"
+        );
+        assert!(
+            rendered.contains(&cap.to_string()),
+            "the rejection must name the ceiling so the operator can act on it: {rendered}"
+        );
+
+        // Exactly at the ceiling stays legal: it is the largest coherent request.
+        let at_cap =
+            parse_history_sample_export_query(&[("max_bytes".to_string(), cap.to_string())])
+                .expect("max_bytes exactly at the response budget must be accepted");
+        assert_eq!(at_cap.max_bytes, cap);
+    }
+
+    /// The bound the ceiling actually buys, stated as an invariant rather than a
+    /// single example: every query this parser accepts caps one document at or
+    /// below the aggregate budget, so peak retained bytes are bounded by
+    /// `budget + one document` = 2x the budget rather than by caller input.
+    #[test]
+    fn every_accepted_sample_query_bounds_one_document_by_the_response_budget() {
+        let cap = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
+        for candidate in [
+            "1",
+            "1024",
+            &(cap - 1).to_string(),
+            &cap.to_string(),
+            &(cap + 1).to_string(),
+            &usize::MAX.to_string(),
+        ] {
+            if let Ok(query) = parse_history_sample_export_query(&[(
+                "max_bytes".to_string(),
+                candidate.to_string(),
+            )]) {
+                assert!(
+                    query.max_bytes <= cap,
+                    "accepted max_bytes '{candidate}' must not exceed the response budget"
+                );
+            }
+        }
     }
 
     /// The manifest must carry the size-truncation flag, so a bundle cut short

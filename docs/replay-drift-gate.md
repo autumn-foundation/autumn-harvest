@@ -54,7 +54,7 @@ harvest history export-sample --payload-policy full --output-dir ./fixtures/in-f
 | `--order <oldest\|newest>` | `oldest` | Which end of each type's in-flight population to sample. |
 | `--shard-id <N>` | *(all)* | Restrict to one shard. |
 | `--payload-policy <full\|redacted>` | `redacted` | **Pass `full` for a gate bundle** — the default is refused by the gate. See *Payloads and secrets*. |
-| `--max-bytes <N>` | server default | Per-execution export ceiling. |
+| `--max-bytes <N>` | server default | Per-execution export ceiling. Capped at the 64 MiB sample response budget — a single history larger than the whole response cannot be sampled; export it individually with `GET /admin/history/export`. |
 
 The export is **read-only**: `SELECT`-only, no state transition, no event
 appended, no task claimed. Running it against production is safe.
@@ -292,6 +292,42 @@ written into the bundle and why the value must come from your CI config.
 
 Leaving it unset makes `ctx.build_id()` report `None` during replay, which is
 correct only if your deployment does not set a build id at all.
+
+### Payload caps and the offload threshold
+
+Payload caps (issue #252) are **deployment** configuration, exactly like the
+history policy and the build id: they live in no `WorkflowEvent`, and the live
+worker enforces whatever its own `HarvestBuilder` configured. If your candidate
+build changes one, pass the candidate's values:
+
+```rust
+ReplayVerifier::new()
+    .register(workflows![billing_checkout, onboarding])
+    // bytes: (max_activity_input, max_signal_payload, max_workflow_input)
+    .with_payload_caps(512 * 1024, 256 * 1024, 2 * 1024 * 1024)
+    .with_payload_offload_threshold(Some(1024 * 1024))  // if a PayloadStore is registered
+    .replay_bundle(&dir)
+    .await
+```
+
+Leaving them unset replays under the library defaults, which is correct only if
+your deployment does not customise them. The two ways that bites:
+
+* **Lowering a cap is the false-GREEN direction.** Replay accepts an input under
+  the 2 MiB default, the promoted worker rejects it with `PayloadTooLarge`, and
+  the gate has certified a build that breaks the very in-flight executions it
+  sampled.
+* **An offload threshold is the false-RED direction.** A payload above the
+  threshold is offloaded (issue #524) rather than capped, so a gate that knows
+  the cap but not the threshold reports drift that will never happen.
+
+Only a dispatch that is **not** already in recorded history consults the cap —
+i.e. one at the frontier, which is exactly where an in-flight fixture parks, so
+this is the common case rather than an edge one. `max_activity_result` has no
+setting here on purpose: the worker enforces it after an activity returns, never
+`WorkflowContext`, so it cannot affect a replay.
+
+`WorkflowReplayer` carries the same two builders through to `replay_bundle`.
 
 ### Deadline-sensitive workflows
 

@@ -459,6 +459,21 @@ pub struct WorkflowReplayer {
     /// `continue_as_new_deadline_fraction` — replays byte-faithfully to the live
     /// worker instead of surfacing false non-determinism.
     history_policy: crate::context::WorkflowHistoryPolicy,
+    /// The **candidate** worker's payload limits (issue #798, Codex round 20).
+    ///
+    /// Same category as `build_id` and `history_policy` above, and deliberately
+    /// **not** sourced from the fixture: payload caps and the offload threshold
+    /// live in no `WorkflowEvent`, and the live worker supplies its own from
+    /// `BuiltHarvest`. Left at the library defaults, a replay gate answers the
+    /// wrong question — a candidate that *lowers* a cap replays clean here and
+    /// then rejects the sampled in-flight runs with `PayloadTooLarge` once
+    /// promoted (false GREEN), while a candidate that configures an offload
+    /// threshold reports drift that will never happen (false RED).
+    ///
+    /// See [`ReplayPayloadLimits`](crate::executor::ReplayPayloadLimits) for why
+    /// only a frontier dispatch consults these. Defaults to the library values,
+    /// so a caller that does not set them is unaffected.
+    payload_limits: crate::executor::ReplayPayloadLimits,
 }
 
 impl Default for WorkflowReplayer {
@@ -511,6 +526,7 @@ impl WorkflowReplayer {
             build_id: None,
             execution_id: None,
             history_policy: crate::context::WorkflowHistoryPolicy::default(),
+            payload_limits: crate::executor::ReplayPayloadLimits::default(),
         }
     }
 
@@ -634,6 +650,46 @@ impl WorkflowReplayer {
     #[must_use]
     pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
         self.build_id = Some(build_id.into());
+        self
+    }
+
+    /// Apply the **candidate** worker's payload caps to the replay context
+    /// (issue #798).
+    ///
+    /// Bytes, in the order the executor threads them:
+    /// `(max_activity_input, max_signal_payload, max_workflow_input)`. `0` means
+    /// "no cap", matching
+    /// [`WorkflowContext::with_payload_caps`](crate::context::WorkflowContext::with_payload_caps).
+    /// Pass the values the candidate build configures on its `HarvestBuilder`, so
+    /// the gate replays under the limits the promoted worker will actually
+    /// enforce rather than the library defaults.
+    ///
+    /// `max_activity_result` is deliberately absent: it is enforced by the worker
+    /// after an activity returns, never by `WorkflowContext`, so it cannot affect
+    /// a replay and accepting it here would imply a guarantee that does not exist.
+    #[must_use]
+    pub const fn with_payload_caps(
+        mut self,
+        max_activity_input: u64,
+        max_signal_payload: u64,
+        max_workflow_input: u64,
+    ) -> Self {
+        self.payload_limits.max_activity_input = max_activity_input;
+        self.payload_limits.max_signal_payload = max_signal_payload;
+        self.payload_limits.max_workflow_input = max_workflow_input;
+        self
+    }
+
+    /// Apply the **candidate** worker's large-payload offload threshold (#524)
+    /// to the replay context (issue #798).
+    ///
+    /// A payload above the threshold is offloaded rather than capped, so a gate
+    /// that knows the cap but not the threshold reports drift the promoted worker
+    /// would never hit. `None` (the default) models a worker with no
+    /// `PayloadStore` registered.
+    #[must_use]
+    pub const fn with_payload_offload_threshold(mut self, threshold: Option<u64>) -> Self {
+        self.payload_limits.offload_threshold = threshold;
         self
     }
 
@@ -777,6 +833,10 @@ impl WorkflowReplayer {
             queue_name: self.queue_name.clone(),
             build_id: self.build_id.clone(),
             history_policy: self.history_policy,
+            // Codex round 20 extended the same rule to the candidate worker's
+            // payload limits: dropping them here would replay the bundle under
+            // the library defaults and certify a cap-lowering build.
+            payload_limits: self.payload_limits,
         };
         verifier.replay_bundle(dir).await
     }
@@ -972,6 +1032,11 @@ impl WorkflowReplayer {
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
+                // Issue #798 (Codex round 20): the candidate worker's payload
+                // limits, for the same reason as the build id above — a build
+                // that lowers a cap breaks the very in-flight runs the gate
+                // sampled, and the library default would certify it.
+                self.payload_limits,
             )
             .await
         } else {
@@ -998,6 +1063,11 @@ impl WorkflowReplayer {
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
+                // Issue #798 (Codex round 20): the candidate worker's payload
+                // limits, for the same reason as the build id above — a build
+                // that lowers a cap breaks the very in-flight runs the gate
+                // sampled, and the library default would certify it.
+                self.payload_limits,
             )
             .await
         };
@@ -1096,6 +1166,12 @@ impl WorkflowReplayer {
             // of a `should_continue_as_new`-branching workflow stays faithful to
             // the live worker (which uses `registry.history_policy()`).
             self.history_policy,
+            // Issue #798 (Codex round 20): the candidate worker's payload limits.
+            // This is the in-flight gate's own path, and an in-flight fixture
+            // parks at the frontier — exactly where a fresh dispatch consults the
+            // cap — so the library default here is what turns a cap-lowering
+            // build into a false GREEN.
+            self.payload_limits,
         )
         .await;
         outcome_to_report(exec_id, total_events, outcome, true)
@@ -1223,6 +1299,11 @@ impl WorkflowReplayer {
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
+                // Issue #798 (Codex round 20): the candidate worker's payload
+                // limits, for the same reason as the build id above — a build
+                // that lowers a cap breaks the very in-flight runs the gate
+                // sampled, and the library default would certify it.
+                self.payload_limits,
             )
             .await
         } else {
@@ -1248,6 +1329,11 @@ impl WorkflowReplayer {
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
+                // Issue #798 (Codex round 20): the candidate worker's payload
+                // limits, for the same reason as the build id above — a build
+                // that lowers a cap breaks the very in-flight runs the gate
+                // sampled, and the library default would certify it.
+                self.payload_limits,
             )
             .await
         };
@@ -3088,6 +3174,14 @@ struct FixtureReplayDefaults {
     /// and hide candidate-only drift.
     build_id: Option<String>,
     history_policy: crate::context::WorkflowHistoryPolicy,
+    /// The **candidate** worker's payload limits (issue #798, Codex round 20).
+    ///
+    /// Same category as `build_id` above: not a fixture fallback. Payload caps
+    /// and the offload threshold live in no `WorkflowEvent` and the live worker
+    /// supplies its own, so a gate that leaves them at the library defaults
+    /// certifies a cap-lowering build that will then reject the very in-flight
+    /// runs it sampled.
+    payload_limits: crate::executor::ReplayPayloadLimits,
 }
 
 impl Default for ReplayVerifier {
@@ -3169,6 +3263,39 @@ impl ReplayVerifier {
     #[must_use]
     pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
         self.replay_defaults.build_id = Some(build_id.into());
+        self
+    }
+
+    /// Apply the **candidate** worker's payload caps to every fixture replay
+    /// (issue #798).
+    ///
+    /// Bytes: `(max_activity_input, max_signal_payload, max_workflow_input)`;
+    /// `0` means "no cap". Pass what the candidate build configures on its
+    /// `HarvestBuilder`. Without this the gate replays under the library defaults
+    /// and a build that *lowers* a cap replays clean, then rejects the sampled
+    /// in-flight executions with `PayloadTooLarge` once promoted.
+    #[must_use]
+    pub const fn with_payload_caps(
+        mut self,
+        max_activity_input: u64,
+        max_signal_payload: u64,
+        max_workflow_input: u64,
+    ) -> Self {
+        self.replay_defaults.payload_limits.max_activity_input = max_activity_input;
+        self.replay_defaults.payload_limits.max_signal_payload = max_signal_payload;
+        self.replay_defaults.payload_limits.max_workflow_input = max_workflow_input;
+        self
+    }
+
+    /// Apply the **candidate** worker's large-payload offload threshold (#524)
+    /// to every fixture replay (issue #798).
+    ///
+    /// A payload above the threshold is offloaded rather than capped, so without
+    /// this a gate that knows the cap reports drift the promoted worker would
+    /// never hit. `None` (the default) models a worker with no `PayloadStore`.
+    #[must_use]
+    pub const fn with_payload_offload_threshold(mut self, threshold: Option<u64>) -> Self {
+        self.replay_defaults.payload_limits.offload_threshold = threshold;
         self
     }
 
@@ -3881,6 +4008,10 @@ fn fixture_replayer(
         // it via `ReplayVerifier::with_history_policy`. Defaults to the default
         // policy — unchanged pre-#614 behavior for anyone who never customized it.
         history_policy: defaults.history_policy,
+        // Issue #798 (Codex round 20): like the build id, authoritative rather
+        // than a fallback — the bundle describes executions, not the runtime that
+        // will resume them, so the candidate's limits come from the caller.
+        payload_limits: defaults.payload_limits,
     }
 }
 

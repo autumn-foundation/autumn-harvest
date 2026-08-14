@@ -801,6 +801,54 @@ pub async fn run_workflow(
     outcome
 }
 
+/// The **candidate** worker's payload limits, applied to a replay context.
+///
+/// These live in no `WorkflowEvent`, so a pure-history replay cannot recover
+/// them from a fixture: the live worker supplies its own configured caps from
+/// `BuiltHarvest`. Both replay entry points previously left them at the library
+/// defaults, which makes a replay gate answer the wrong question — the caps are
+/// candidate configuration exactly like `build_id` and `history_policy`, and a
+/// build that changes one is precisely what a gate is asked to vet.
+///
+/// The cap is only consulted where a dispatch is *not* already in recorded
+/// history (`HistoryMatch::NoMatch`), i.e. at the frontier — which is where an
+/// in-flight fixture lands. A candidate that **lowers** a cap is the false-GREEN
+/// direction: replay accepts an input the promoted worker will reject with
+/// `PayloadTooLarge`. A candidate that configures an **offload threshold**
+/// (issue #524) is the false-RED direction: an over-threshold payload is
+/// offloaded rather than capped, so a gate that knows the cap but not the
+/// threshold reports drift that will never happen.
+///
+/// Carried as one value rather than four loose parameters so the two replay
+/// paths (strict and canary) have a single carry-through site and cannot drift
+/// apart — the same reason [`FixtureReplayDefaults`](crate::testing) exists.
+///
+/// [`Default`] is the library defaults plus no offload threshold, which is
+/// byte-for-byte the behavior of every caller that does not configure limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayPayloadLimits {
+    /// Caps activity inputs at schedule time.
+    pub max_activity_input: u64,
+    /// Caps signal payloads.
+    pub max_signal_payload: u64,
+    /// Caps child-workflow inputs and side-effect values.
+    pub max_workflow_input: u64,
+    /// When set, a payload larger than this is offloaded (#524) rather than
+    /// capped, so the cap above is not enforced against it.
+    pub offload_threshold: Option<u64>,
+}
+
+impl Default for ReplayPayloadLimits {
+    fn default() -> Self {
+        Self {
+            max_activity_input: crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+            max_signal_payload: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            max_workflow_input: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            offload_threshold: None,
+        }
+    }
+}
+
 /// Like [`run_workflow`] but runs in strict replay mode.
 ///
 /// Uses [`WorkflowContext::for_replay_strict`] so that activity and local-activity
@@ -867,6 +915,11 @@ pub async fn run_workflow_strict(
     // byte-faithful to the live worker rather than silently using the default
     // policy. `WorkflowHistoryPolicy::default()` preserves prior behavior.
     history_policy: WorkflowHistoryPolicy,
+    // Issue #798 (Codex round 20): the **candidate** worker's payload limits.
+    // They live in no `WorkflowEvent`, so a pure-history replay cannot recover
+    // them; leaving them at the library defaults makes the gate answer the wrong
+    // question when the candidate build changes a cap or an offload threshold.
+    payload_limits: ReplayPayloadLimits,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
@@ -878,6 +931,13 @@ pub async fn run_workflow_strict(
         .with_queue_name(queue_name.unwrap_or_default())
         .with_build_id(build_id)
         .with_history_policy(history_policy)
+        .with_payload_caps(
+            payload_limits.max_activity_input,
+            0,
+            payload_limits.max_signal_payload,
+            payload_limits.max_workflow_input,
+        )
+        .with_payload_offload_threshold(payload_limits.offload_threshold)
         .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
@@ -915,6 +975,11 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
     // Issue #614: the runtime registry's history policy (see [`run_workflow_strict`]).
     // `WorkflowHistoryPolicy::default()` preserves prior behavior.
     history_policy: WorkflowHistoryPolicy,
+    // Issue #798 (Codex round 20): the **candidate** worker's payload limits.
+    // They live in no `WorkflowEvent`, so a pure-history replay cannot recover
+    // them; leaving them at the library defaults makes the gate answer the wrong
+    // question when the candidate build changes a cap or an offload threshold.
+    payload_limits: ReplayPayloadLimits,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
@@ -927,6 +992,13 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
         .with_queue_name(queue_name.unwrap_or_default())
         .with_build_id(build_id)
         .with_history_policy(history_policy)
+        .with_payload_caps(
+            payload_limits.max_activity_input,
+            0,
+            payload_limits.max_signal_payload,
+            payload_limits.max_workflow_input,
+        )
+        .with_payload_offload_threshold(payload_limits.offload_threshold)
         .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
@@ -1152,6 +1224,11 @@ pub(crate) async fn run_workflow_canary(
     // byte-faithful to the live worker rather than silently using the default
     // policy. `WorkflowHistoryPolicy::default()` preserves prior behavior.
     history_policy: WorkflowHistoryPolicy,
+    // Issue #798 (Codex round 20): the **candidate** worker's payload limits.
+    // They live in no `WorkflowEvent`, so a pure-history replay cannot recover
+    // them; leaving them at the library defaults makes the gate answer the wrong
+    // question when the candidate build changes a cap or an offload threshold.
+    payload_limits: ReplayPayloadLimits,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_canary_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
@@ -1163,6 +1240,13 @@ pub(crate) async fn run_workflow_canary(
         .with_queue_name(queue_name.unwrap_or_default())
         .with_build_id(build_id)
         .with_history_policy(history_policy)
+        .with_payload_caps(
+            payload_limits.max_activity_input,
+            0,
+            payload_limits.max_signal_payload,
+            payload_limits.max_workflow_input,
+        )
+        .with_payload_offload_threshold(payload_limits.offload_threshold)
         .with_metrics(metrics);
 
     let span = tracing::info_span!(
