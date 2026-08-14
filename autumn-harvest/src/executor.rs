@@ -801,35 +801,18 @@ pub async fn run_workflow(
     outcome
 }
 
-/// The **candidate** worker's payload limits, applied to a replay context.
-///
-/// These live in no `WorkflowEvent`, so a pure-history replay cannot recover
-/// them from a fixture: the live worker supplies its own configured caps from
-/// `BuiltHarvest`. Both replay entry points previously left them at the library
-/// defaults, which makes a replay gate answer the wrong question — the caps are
-/// candidate configuration exactly like `build_id` and `history_policy`, and a
-/// build that changes one is precisely what a gate is asked to vet.
-///
-/// The cap is only consulted where a dispatch is *not* already in recorded
-/// history (`HistoryMatch::NoMatch`), i.e. at the frontier — which is where an
-/// in-flight fixture lands. A candidate that **lowers** a cap is the false-GREEN
-/// direction: replay accepts an input the promoted worker will reject with
-/// `PayloadTooLarge`. A candidate that configures an **offload threshold**
-/// (issue #524) is the false-RED direction: an over-threshold payload is
-/// offloaded rather than capped, so a gate that knows the cap but not the
-/// threshold reports drift that will never happen.
-///
-/// Carried as one value rather than four loose parameters so the two replay
-/// paths (strict and canary) have a single carry-through site and cannot drift
-/// apart — the same reason [`FixtureReplayDefaults`](crate::testing) exists.
-///
-/// [`Default`] is the library defaults plus no offload threshold, which is
-/// byte-for-byte the behavior of every caller that does not configure limits.
 /// Register a candidate's declarative handlers onto a replay context.
 ///
 /// Mirrors the live worker's own registration loop so the two cannot drift; see
 /// [`ReplayDeclarativeHandlers`] for why replay must do this at all.
-#[cfg(any(test, feature = "testing"))]
+///
+/// Deliberately **not** `#[cfg(any(test, feature = "testing"))]`: two of its
+/// three callers — `run_workflow_strict` and `run_workflow_canary` — are
+/// ungated `pub` entry points, so gating this helper made the crate fail to
+/// build under a bare `--no-default-features`. It matches the gating of
+/// everything it touches: the ungated [`ReplayDeclarativeHandlers`] and
+/// [`ReplayPayloadLimits`] structs, and the ungated
+/// `WorkflowContext::register_declarative_{query,update}_handler` it calls.
 fn register_declarative_handlers(ctx: &WorkflowContext, handlers: ReplayDeclarativeHandlers<'_>) {
     for h in handlers.queries {
         ctx.register_declarative_query_handler(h);
@@ -868,6 +851,30 @@ pub struct ReplayDeclarativeHandlers<'a> {
     pub updates: &'a [&'a crate::info::UpdateHandlerInfo],
 }
 
+/// The **candidate** worker's payload limits, applied to a replay context.
+///
+/// These live in no `WorkflowEvent`, so a pure-history replay cannot recover
+/// them from a fixture: the live worker supplies its own configured caps from
+/// `BuiltHarvest`. Both replay entry points previously left them at the library
+/// defaults, which makes a replay gate answer the wrong question — the caps are
+/// candidate configuration exactly like `build_id` and `history_policy`, and a
+/// build that changes one is precisely what a gate is asked to vet.
+///
+/// The cap is only consulted where a dispatch is *not* already in recorded
+/// history (`HistoryMatch::NoMatch`), i.e. at the frontier — which is where an
+/// in-flight fixture lands. A candidate that **lowers** a cap is the false-GREEN
+/// direction: replay accepts an input the promoted worker will reject with
+/// `PayloadTooLarge`. A candidate that configures an **offload threshold**
+/// (issue #524) is the false-RED direction: an over-threshold payload is
+/// offloaded rather than capped, so a gate that knows the cap but not the
+/// threshold reports drift that will never happen.
+///
+/// Carried as one value rather than four loose parameters so the two replay
+/// paths (strict and canary) have a single carry-through site and cannot drift
+/// apart — the same reason [`FixtureReplayDefaults`](crate::testing) exists.
+///
+/// [`Default`] is the library defaults plus no offload threshold, which is
+/// byte-for-byte the behavior of every caller that does not configure limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplayPayloadLimits {
     /// Caps activity inputs at schedule time.
