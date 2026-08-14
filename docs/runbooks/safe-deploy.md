@@ -298,7 +298,7 @@ old pod is healthy, it simply is not the right pod for this task.
 reason:
 
 ```
-no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 5 capability-miss redeliveries)
+no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 5 capability-miss redeliveries; no live worker on this queue has the handler)
 ```
 
 That bound is what keeps a genuinely-missing handler — a workflow type deleted
@@ -325,11 +325,13 @@ for the full triage.
 ### Sizing the budget
 
 `capability_miss_max_redeliveries` (default 5) is a *redelivery* budget, not a
-time budget, but the backoff makes it dwell: five claims span roughly 31
-seconds of backoff **on a single worker**. In a fleet, releases are consumed by
-whichever worker claims next, so a large fleet of incapable workers burns the
-budget faster in wall-clock terms. Raise it if your rollouts are slow or your
-fleet is wide:
+time budget, but the backoff makes it dwell. A budget of `N` permits `N - 1`
+releases and escalates on the `N`th claim, so the default allows four releases
+whose backoffs sum to **15 s** (1 + 2 + 4 + 8) of queue dwell before escalation
+— that is the *minimum* window a capable peer has to appear, measured **on a
+single worker**. In a fleet, releases are consumed by whichever worker claims
+next, so a wide fleet of incapable workers burns the budget in fewer seconds of
+wall clock. Raise it if your rollouts are slow or your fleet is wide:
 
 ```rust
 WorkerConfig::default().with_capability_miss_max_redeliveries(20)
