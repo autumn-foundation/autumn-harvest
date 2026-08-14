@@ -3054,12 +3054,18 @@ fn write_history_sample_bundle(response: &Value, dir: &Path) -> Result<String, C
 /// numbers that never described them.
 ///
 /// Scoped narrowly, because this deletes files in a path the caller chose:
-/// * The manifest must be present — that is the marker identifying a directory
-///   this CLI wrote. A directory holding `*.json` with no manifest is somebody
-///   else's and is **refused**, not cleaned; `--output-dir .` must never eat a
-///   user's files because they mistyped a path.
-/// * Only top-level `*.json` entries are removed. Subdirectories and every
-///   non-`.json` file are left alone.
+/// * A top-level manifest **that is a regular file** must be present — that is
+///   the marker identifying a directory this CLI wrote. A directory holding
+///   `*.json` with no such manifest is somebody else's and is **refused**, not
+///   cleaned; `--output-dir .` must never eat a user's files because they
+///   mistyped a path.
+/// * Every `*.json` entry the gate would replay is removed — at **any depth**,
+///   and whether it is a regular file or a **symlink** (the link is removed,
+///   never the file it points at). The predicate deliberately mirrors
+///   `testing::collect_json_files`: if the two walks disagree about what counts
+///   as a fixture, a leftover entry is replayed against the fresh manifest and
+///   reported as drift the candidate never caused.
+/// * Directories and every non-`.json` file are left alone.
 ///
 /// # Errors
 /// [`CliError::InvalidInput`] when `dir` holds JSON that is not a Harvest
@@ -3098,15 +3104,36 @@ fn clear_stale_bundle(dir: &Path) -> Result<(), CliError> {
                 dirs_to_visit.push(path);
                 continue;
             }
-            if !kind.is_file() {
-                continue;
-            }
+            // Deliberately NOT `is_file()`. `testing::collect_json_files`
+            // decides what the GATE replays with the predicate "not a directory
+            // and ends in `.json`" — which a SYMLINK satisfies. Requiring a
+            // regular file here would leave a linked fixture behind for the
+            // replay walk to pick up, and the disagreement is a false verdict:
+            // the fresh manifest describes this run's sample while the
+            // directory still holds a previous run's, and the stale fixture
+            // surfaces as unrelated drift on an unchanged candidate.
+            //
+            // Containment depends on it too. `fs::write` FOLLOWS a symlink, so
+            // a leftover link whose name collides with a fixture about to be
+            // written sends that write outside the directory the operator
+            // named. Clearing the link first is what keeps the replace inside
+            // `--output-dir`; `fs::remove_file` removes the LINK, never the file
+            // it points at.
             let is_manifest = entry.file_name().to_string_lossy() == manifest_name;
-            if is_manifest {
+            if is_manifest && kind.is_file() {
                 // Only a TOP-LEVEL manifest marks this directory as our bundle;
                 // a nested one is just a file we happen to skip (the replay walk
                 // excludes the reserved name at any depth, so it is never
                 // replayed and never needs deleting).
+                //
+                // The MARKER is held to a stricter rule than the fixtures it
+                // guards — a regular file, not merely a `.json` entry — because
+                // it is what AUTHORIZES deleting this directory's contents. A
+                // *linked* manifest is not evidence we wrote the directory, so
+                // it falls through to the `.json` branch below and blocks the
+                // replace instead of licensing it. That also keeps the manifest
+                // write itself contained, since it is a name we are about to
+                // `fs::write`.
                 if at_top_level {
                     has_manifest = true;
                 }
@@ -12775,6 +12802,141 @@ mod replay_sample_bundle_tests {
         assert!(
             dir.path().join("important.json").exists(),
             "a foreign file must survive"
+        );
+    }
+
+    // ── JSON symlinks: the cleaner and the replay walk must agree (#798) ──
+    //
+    // `testing::collect_json_files` decides what the GATE replays with the
+    // predicate "not a directory, extension `.json`" — a symlink satisfies it.
+    // The cleaner therefore has to use the same rule, or the two walks disagree
+    // about what a bundle contains and the disagreement is a false verdict.
+
+    /// A `*.json` symlink is a fixture to the replay walk, so a re-export has to
+    /// clear it like any other. Leaving it behind means the fresh manifest
+    /// describes this run's sample while the directory still holds a previous
+    /// one, and the gate replays the stale fixture and blocks an unchanged
+    /// candidate — the exact false red this replace exists to prevent.
+    ///
+    /// Removing the LINK must not touch what it points at: the operator pointed
+    /// `--output-dir` at the bundle, not at the target's directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_json_symlink_in_a_marked_bundle_is_cleared_like_a_regular_fixture() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+
+        // Mark the directory as ours so the replace is authorized at all.
+        write_history_sample_bundle(&sample_response(), dir.path()).expect("first export");
+
+        let target = outside.path().join("someone-elses-history.json");
+        fs::write(&target, "{\"not\":\"ours\"}").expect("write target");
+        let link = dir.path().join("stale-linked-fixture.json");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        write_history_sample_bundle(&sample_response(), dir.path()).expect("re-export");
+
+        assert!(
+            !link.exists() && link.symlink_metadata().is_err(),
+            "a .json symlink is replayed by the gate, so the replace must clear \
+             it; leaving it makes the next gate run replay a stale fixture"
+        );
+        assert!(
+            target.exists(),
+            "only the LINK may be removed — the file it points at is outside \
+             the bundle and is not ours to delete"
+        );
+    }
+
+    /// `fs::write` follows a symlink, so a stale link whose name collides with a
+    /// fixture about to be written would send that write OUTSIDE the bundle.
+    /// Clearing the link first is what keeps the replace contained to the
+    /// directory the operator named.
+    #[cfg(unix)]
+    #[test]
+    fn a_re_export_never_writes_through_a_colliding_json_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_history_sample_bundle(&sample_response(), dir.path()).expect("first export");
+
+        // Collide with a name this export really writes, rather than a guess.
+        let fixture_name = history_sample_bundle_files(&sample_response())
+            .expect("bundle files")
+            .into_iter()
+            .map(|file| file.name)
+            .find(|name| name != autumn_harvest::replay_sample::SampleManifest::FILE_NAME)
+            .expect("the sample response must produce at least one fixture");
+
+        let target = outside.path().join("untouchable.json");
+        fs::write(&target, "ORIGINAL").expect("write target");
+        let link = dir.path().join(&fixture_name);
+        fs::remove_file(&link).ok();
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        write_history_sample_bundle(&sample_response(), dir.path()).expect("re-export");
+
+        assert_eq!(
+            fs::read_to_string(&target).expect("read target"),
+            "ORIGINAL",
+            "the replace must stay inside --output-dir: writing through a \
+             colliding symlink clobbers a file the operator never named"
+        );
+    }
+
+    /// The "is this our bundle?" evidence is the count of JSON entries, so a
+    /// symlink has to count toward it too. If it does not, a directory holding
+    /// only a linked JSON reads as empty, the refusal never fires, and this
+    /// command writes into a directory it did not create.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_whose_only_json_is_a_symlink_is_refused_not_written_into() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let target = outside.path().join("important.json");
+        fs::write(&target, "{}").expect("write target");
+        std::os::unix::fs::symlink(&target, dir.path().join("linked.json")).expect("symlink");
+
+        let error = write_history_sample_bundle(&sample_response(), dir.path())
+            .expect_err("a directory of foreign JSON must be refused, linked or not");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("not a bundle") || rendered.contains("--output-dir"),
+            "the error must tell the operator what to do: {rendered}"
+        );
+        assert!(target.exists(), "a foreign file must survive");
+    }
+
+    /// The manifest is what AUTHORIZES deleting a directory's contents, so the
+    /// marker is held to a stricter rule than the fixtures it guards: only a
+    /// real file we wrote counts. A linked manifest is not evidence this bundle
+    /// is ours, and the safe answer to "not ours" is to refuse.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_manifest_does_not_authorize_clearing_the_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let manifest_target = outside.path().join("manifest-elsewhere.json");
+        fs::write(&manifest_target, "{}").expect("write target");
+        std::os::unix::fs::symlink(
+            &manifest_target,
+            dir.path()
+                .join(autumn_harvest::replay_sample::SampleManifest::FILE_NAME),
+        )
+        .expect("symlink");
+        fs::write(dir.path().join("keep-me.json"), "{}").expect("write");
+
+        let error = write_history_sample_bundle(&sample_response(), dir.path())
+            .expect_err("a linked manifest must not authorize deleting real files");
+        assert!(
+            error.to_string().contains("not a bundle")
+                || error.to_string().contains("--output-dir"),
+            "{error}"
+        );
+        assert!(dir.path().join("keep-me.json").exists(), "must survive");
+        assert_eq!(
+            fs::read_to_string(&manifest_target).expect("read"),
+            "{}",
+            "the manifest write must not follow the link out of the bundle"
         );
     }
 
