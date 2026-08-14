@@ -98,6 +98,7 @@ fn snapshot_json(workflow_name: &str, exec_id: ExecutionId, events: Vec<Workflow
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     };
     serde_json::to_string(&snapshot).unwrap()
 }
@@ -1138,6 +1139,120 @@ async fn the_workflow_id_fallback_genuinely_changes_the_outcome() {
         1,
         "control: omitting the id must genuinely change the outcome, else the \
          fallback test would pass without the delegation carrying anything: {report}"
+    );
+}
+
+// ===========================================================================
+// The execution's queue must survive the fixture round trip (Codex round-12 P1)
+// ===========================================================================
+
+/// A workflow that embeds its own execution queue in an activity input.
+///
+/// `ctx.queue_name()` is sourced from the live worker's task row and lives in no
+/// `WorkflowEvent`, so a fixture that omits it leaves the replay context at the
+/// empty-string default — the same family as `context_headers` / `workflow_id`.
+fn queue_bearing_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
+        ctx.execute_activity_raw("step_one", serde_json::json!({ "queue": queue }), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// An in-flight history recorded by a run on the `priority-queue` task queue,
+/// in a snapshot that **does** carry that queue.
+fn queue_snapshot_json(workflow_name: &str, queue: Option<&str>) -> String {
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "step_one".into(),
+            input: serde_json::json!({"queue": "priority-queue"}),
+            queue: "default".into(),
+        },
+    ];
+    let snapshot = HistorySnapshot {
+        workflow_name: workflow_name.to_string(),
+        execution_id: ExecutionId::new(),
+        events,
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
+        queue_name: queue.map(ToString::to_string),
+    };
+    serde_json::to_string(&snapshot).unwrap()
+}
+
+/// The money test: an exported fixture carries the execution's queue, so a
+/// workflow that branches on `ctx.queue_name()` replays clean.
+///
+/// Without the field, `run_workflow_canary` leaves the replay context's queue at
+/// `""`, the recorded activity input no longer matches, and an **unchanged**
+/// candidate false-reports drift — the worst outcome a release gate can produce.
+#[tokio::test]
+async fn a_snapshot_carrying_the_queue_replays_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &queue_snapshot_json("wf", Some("priority-queue")),
+    );
+
+    let report = autumn_harvest::testing::WorkflowReplayer::new()
+        .register_fn("wf", queue_bearing_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.is_clean(),
+        "the snapshot's own queue_name must reach the replay context: {report}"
+    );
+}
+
+/// The control that keeps the money test honest: a snapshot that omits the queue
+/// (a legacy export) genuinely diverges, so the test above cannot pass on a
+/// no-op.
+#[tokio::test]
+async fn a_snapshot_without_the_queue_genuinely_diverges() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &queue_snapshot_json("wf", None));
+
+    let report = autumn_harvest::testing::WorkflowReplayer::new()
+        .register_fn("wf", queue_bearing_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(
+        report.diverged.len(),
+        1,
+        "control: omitting the queue must genuinely change the outcome, else the \
+         money test would pass without the field carrying anything: {report}"
+    );
+}
+
+/// `replay_bundle` delegates to `ReplayVerifier`; the replayer's own configured
+/// queue fallback must survive that hop, exactly like `workflow_id` (round-10 P2).
+#[tokio::test]
+async fn workflow_replayer_bundle_delegation_carries_the_queue_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &queue_snapshot_json("wf", None));
+
+    let report = autumn_harvest::testing::WorkflowReplayer::new()
+        .register_fn("wf", queue_bearing_workflow as WorkflowHandlerFn)
+        .with_queue_name("priority-queue")
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.is_clean(),
+        "the replayer's own queue_name must reach the bundle walk: {report}"
     );
 }
 

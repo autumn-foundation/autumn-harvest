@@ -1042,6 +1042,13 @@ struct CandidateExecution {
     /// is the last surviving copy of it before the row is deleted.
     #[diesel(sql_type = Nullable<SqlUuid>) ]
     parent_id: Option<uuid::Uuid>,
+    /// Task queue (issue #798), carried into the pre-deletion archive document
+    /// (mirrors `context_headers`/`parent_id`) so a workflow that branches on
+    /// `ctx.queue_name()` replays cleanly from cold storage instead of running
+    /// under `""`. The live worker sets it from the claimed task row, so it lives
+    /// in no `WorkflowEvent` and the archive is its last surviving copy.
+    #[diesel(sql_type = Text)]
+    queue_name: String,
 }
 
 #[cfg(feature = "db")]
@@ -1215,7 +1222,7 @@ async fn run_shard_tick(
             // is the `'-infinity'` literal and the cursor/limit binds shift
             // down by one.
             let sql = if global_fallback.is_some() {
-                "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id
+                "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name
                  FROM harvest_workflow_executions
                  WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                    AND completed_at IS NOT NULL
@@ -1234,7 +1241,7 @@ async fn run_shard_tick(
                  LIMIT $6
                  FOR UPDATE SKIP LOCKED"
             } else {
-                "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id
+                "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name
                  FROM harvest_workflow_executions
                  WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                    AND completed_at IS NOT NULL
@@ -1517,6 +1524,10 @@ async fn run_shard_tick(
                             // id-branching workflow's archived history round-trips
                             // `ctx.info().workflow_id` into the JSON replay path.
                             workflow_id: Some(candidate.workflow_id.clone()),
+                            // Issue #798: carry the execution's task queue so a
+                            // `ctx.queue_name()`-branching workflow's archived
+                            // history replays cleanly from cold storage.
+                            queue_name: Some(candidate.queue_name.clone()),
                             execution_id: exec_id,
                             shard_id: shard.as_i32(),
                             state: candidate.state.clone(),
@@ -3013,6 +3024,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_id: None,
+            queue_name: "default".to_string(),
         };
         let candidate_skip = CandidateExecution {
             id: uuid::Uuid::new_v4(),
@@ -3026,6 +3038,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_id: None,
+            queue_name: "default".to_string(),
         };
 
         // When evaluating outcome next_cursor logic, if the first candidate completes,

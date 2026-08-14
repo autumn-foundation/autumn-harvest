@@ -840,6 +840,15 @@ pub async fn run_workflow_strict(
     // non-determinism. `workflow_id` is `None` for a raw-events fixture with no id.
     workflow_name: String,
     workflow_id: Option<String>,
+    // Issue #798: the execution's task queue
+    // (`harvest_workflow_executions.queue_name`). The live worker sets it from
+    // the task row via span_meta, but it lives in no `WorkflowEvent`, so a
+    // pure-history replay must apply it here or a workflow that branches
+    // command-affecting control flow on `ctx.queue_name()` — or embeds it in an
+    // activity input — replays under `""` and false-reports non-determinism.
+    // `None` (a legacy fixture that carries no queue) preserves the prior
+    // empty-string default.
+    queue_name: Option<String>,
     // Issue #614: the runtime registry's history policy
     // (`registry.history_policy()`, threaded by the worker), so a strict/diagnosis
     // replay of a workflow that branches on `ctx.should_continue_as_new()` stays
@@ -854,6 +863,7 @@ pub async fn run_workflow_strict(
         .with_parent_execution_id(parent_execution_id)
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
+        .with_queue_name(queue_name.unwrap_or_default())
         .with_history_policy(history_policy)
         .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
@@ -884,6 +894,8 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
     // [`run_workflow_strict`]).
     workflow_name: String,
     workflow_id: Option<String>,
+    // Issue #798: the execution's task queue (see [`run_workflow_strict`]).
+    queue_name: Option<String>,
     // Issue #614: the runtime registry's history policy (see [`run_workflow_strict`]).
     // `WorkflowHistoryPolicy::default()` preserves prior behavior.
     history_policy: WorkflowHistoryPolicy,
@@ -896,6 +908,7 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
         .with_parent_execution_id(parent_execution_id)
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
+        .with_queue_name(queue_name.unwrap_or_default())
         .with_history_policy(history_policy)
         .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
@@ -1101,6 +1114,12 @@ pub(crate) async fn run_workflow_canary(
     // non-determinism in the deploy replay canary.
     workflow_name: String,
     workflow_id: Option<String>,
+    // Issue #798: the execution's task queue (see [`run_workflow_strict`]).
+    // `run_canary` sources it from the sampled
+    // `harvest_workflow_executions.queue_name` column so a workflow that branches
+    // on `ctx.queue_name()` does not false-report non-determinism in the deploy
+    // replay canary or the in-flight replay-drift gate.
+    queue_name: Option<String>,
     // Issue #614: the runtime registry's history policy
     // (`registry.history_policy()`, threaded by the worker), so a canary/diagnosis
     // replay of a workflow that branches on `ctx.should_continue_as_new()` stays
@@ -1115,6 +1134,7 @@ pub(crate) async fn run_workflow_canary(
         .with_parent_execution_id(parent_execution_id)
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
+        .with_queue_name(queue_name.unwrap_or_default())
         .with_history_policy(history_policy)
         .with_metrics(metrics);
 

@@ -108,6 +108,7 @@ fn canonical_snapshot_json(workflow_name: &str) -> String {
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     };
     serde_json::to_string(&snapshot).unwrap()
 }
@@ -129,6 +130,7 @@ fn unregistered_snapshot_json() -> String {
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     };
     serde_json::to_string(&snapshot).unwrap()
 }

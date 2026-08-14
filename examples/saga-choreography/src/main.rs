@@ -268,6 +268,7 @@ mod tests {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         WorkflowReplayer::new()

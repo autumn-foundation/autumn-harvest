@@ -246,6 +246,8 @@ fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
             "echo_workflow".to_string(),
             None,
             // Issue #614: default history policy for this span test.
+            // Issue #798: no task queue on this fixture.
+            None,
             autumn_harvest::context::WorkflowHistoryPolicy::default(),
         ));
 

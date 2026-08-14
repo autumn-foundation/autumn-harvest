@@ -145,6 +145,21 @@ pub struct HistoryExportDocument {
     /// [`testing::HistorySnapshot::workflow_id`]: crate::testing::HistorySnapshot::workflow_id
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
+    /// The execution's task queue (issue #798), sourced from the
+    /// `harvest_workflow_executions.queue_name` column. The live worker supplies
+    /// `ctx.queue_name()` from the claimed task row, so — like `workflow_id` /
+    /// `parent_execution_id` / `execution_timeout` — it lives in no
+    /// `WorkflowEvent` and must ride the top-level export document, or a replayed
+    /// run reports `queue_name == ""` and a workflow that branches on it (or
+    /// embeds it in an activity input) false-reports non-determinism. Serialised
+    /// at the same top-level name as [`testing::HistorySnapshot::queue_name`], so
+    /// an exported history round-trips into that snapshot verbatim. `None` for a
+    /// legacy export produced before this field. Non-payload operational metadata
+    /// — never redacted.
+    ///
+    /// [`testing::HistorySnapshot::queue_name`]: crate::testing::HistorySnapshot::queue_name
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_name: Option<String>,
     /// Workflow execution whose history was exported.
     pub execution_id: ExecutionId,
     /// Shard that owns the execution.
@@ -217,6 +232,12 @@ pub struct HistoryExportRequest {
     /// `execution_timeout`/`parent_execution_id`: the value lives in no
     /// `WorkflowEvent`, so it must be carried explicitly on the request.
     pub workflow_id: Option<String>,
+    /// The execution's task queue (issue #798), embedded in the export so the
+    /// JSON / `harvest-replay` replay path threads it into the replayed
+    /// `WorkflowContext`. Mirrors `workflow_id`: the value lives in no
+    /// `WorkflowEvent`, so it must be carried explicitly on the request. `None`
+    /// leaves the replayed context at the empty-string default.
+    pub queue_name: Option<String>,
     /// Workflow execution whose history should be exported.
     pub execution_id: ExecutionId,
     /// Shard that owns the execution.
@@ -332,6 +353,9 @@ pub fn export_history_decoded(
         // history round-trips its `workflow_id` into the JSON replay path, exactly
         // like the deadline/parent metadata below.
         workflow_id: request.workflow_id,
+        // Issue #798: the execution's task queue — non-payload operational
+        // metadata, carried verbatim under BOTH policies (never redacted).
+        queue_name: request.queue_name,
         execution_id: request.execution_id,
         shard_id: request.shard_id,
         exported_at: request.exported_at,
@@ -1183,6 +1207,7 @@ mod tests {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .expect("full export should fit under the limit");
 
@@ -1236,6 +1261,7 @@ mod tests {
             deadline_at: Some(deadline),
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .expect("full export should fit under the limit");
 
@@ -1258,6 +1284,104 @@ mod tests {
         assert_eq!(snapshot.deadline_at, Some(deadline));
         assert_eq!(snapshot.workflow_name, "wf");
         assert_eq!(snapshot.execution_id, exec_id);
+    }
+
+    /// Issue #798 (Codex round-12 P1): a history export must carry the execution's
+    /// `queue_name` at the TOP LEVEL — sourced from the row's `queue_name` column,
+    /// present in no `WorkflowEvent` — in the same wire shape a
+    /// `testing::HistorySnapshot` expects.
+    ///
+    /// Without it the replay-drift gate (and every other `replay_from_json`
+    /// caller) replays under `queue_name == ""`, so an **unchanged** workflow that
+    /// branches on `ctx.queue_name()` — or embeds it in an activity input —
+    /// false-reports drift. Carried verbatim under BOTH payload policies: it is
+    /// operational metadata, never a payload.
+    #[test]
+    fn export_carries_queue_name_round_tripping_into_a_snapshot() {
+        use crate::types::ExecutionId;
+
+        for policy in [HistoryPayloadPolicy::Full, HistoryPayloadPolicy::Redacted] {
+            let exec_id = ExecutionId::new();
+            let document = export_history(HistoryExportRequest {
+                workflow_name: "wf".to_string(),
+                execution_id: exec_id,
+                shard_id: 0,
+                state: "RUNNING".to_string(),
+                events: vec![WorkflowEvent::WorkflowStarted {
+                    input: serde_json::json!(null),
+                    timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
+                    scheduled_time: None,
+                }],
+                exported_at: Utc::now(),
+                payload_policy: policy,
+                max_bytes: Some(64 * 1024),
+                context_headers: None,
+                execution_timeout: None,
+                deadline_at: None,
+                parent_execution_id: None,
+                workflow_id: None,
+                queue_name: Some("priority-queue".to_string()),
+            })
+            .expect("export should fit under the limit");
+
+            assert_eq!(
+                document.queue_name.as_deref(),
+                Some("priority-queue"),
+                "queue_name is operational metadata, carried under {policy:?}"
+            );
+
+            let json = serde_json::to_string(&document).expect("export should serialize");
+            let snapshot: crate::testing::HistorySnapshot =
+                serde_json::from_str(&json).expect("export JSON parses as a HistorySnapshot");
+            assert_eq!(
+                snapshot.queue_name.as_deref(),
+                Some("priority-queue"),
+                "the exported queue must round-trip into the snapshot the replay path reads"
+            );
+        }
+    }
+
+    /// A legacy export (produced before issue #798 added the field) omits
+    /// `queue_name` entirely and must still deserialise — to `None`, which falls
+    /// back to the replayer's global / the empty-string default.
+    #[test]
+    fn a_legacy_export_without_queue_name_still_deserialises() {
+        use crate::types::ExecutionId;
+
+        let document = export_history(HistoryExportRequest {
+            workflow_name: "wf".to_string(),
+            execution_id: ExecutionId::new(),
+            shard_id: 0,
+            state: "RUNNING".to_string(),
+            events: vec![WorkflowEvent::WorkflowStarted {
+                input: serde_json::json!(null),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+            exported_at: Utc::now(),
+            payload_policy: HistoryPayloadPolicy::Full,
+            max_bytes: Some(64 * 1024),
+            context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
+            queue_name: None,
+        })
+        .expect("export should fit under the limit");
+
+        let json = serde_json::to_string(&document).expect("export should serialize");
+        assert!(
+            !json.contains("queue_name"),
+            "an absent queue must be omitted from the wire, not serialised as null: {json}"
+        );
+        let snapshot: crate::testing::HistorySnapshot =
+            serde_json::from_str(&json).expect("legacy export JSON parses as a HistorySnapshot");
+        assert_eq!(snapshot.queue_name, None);
     }
 
     /// Issue #698 (Codex P2): a full history export must carry the spawning
@@ -1293,6 +1417,7 @@ mod tests {
             deadline_at: None,
             parent_execution_id: Some(parent),
             workflow_id: None,
+            queue_name: None,
         })
         .expect("full export should fit under the limit");
 
@@ -1386,6 +1511,7 @@ mod tests {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .expect("redacted export should fit under the limit");
 
@@ -1447,6 +1573,7 @@ mod tests {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .expect("redacted export should fit under the limit");
 
@@ -1486,6 +1613,7 @@ mod tests {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .expect_err("oversized full export must fail unless limit is raised");
 
@@ -1654,6 +1782,7 @@ mod tests {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .expect("an envelope-bearing history must export under Full");
 
@@ -1684,6 +1813,7 @@ mod tests {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .expect("an envelope-bearing history must export under Redacted");
 
@@ -1754,6 +1884,7 @@ mod tests {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         }
     }
 

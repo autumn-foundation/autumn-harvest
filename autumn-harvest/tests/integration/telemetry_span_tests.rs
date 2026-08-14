@@ -564,6 +564,8 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                     "telemetry_master_workflow".to_string(),
                     None,
                     // Issue #614: default history policy for this span test.
+                    // Issue #798: no task queue on this fixture.
+                    None,
                     autumn_harvest::context::WorkflowHistoryPolicy::default(),
                 )
                 .await;

@@ -3427,6 +3427,12 @@ struct HistoryExportCandidate {
     // divergence. Parity with the single-execution export and the DB canary.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     context_headers: Option<serde_json::Value>,
+    // Issue #798: the execution's task queue, carried into the export document so
+    // a workflow that branches on `ctx.queue_name()` replays against the queue it
+    // really ran on. The live worker sets it from the claimed task row, so it
+    // lives in no `WorkflowEvent` — same family as `context_headers` above.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    queue_name: String,
 }
 
 /// One in-flight execution selected by the stratified sample query (issue #798).
@@ -3465,6 +3471,12 @@ struct HistorySampleCandidate {
     // divergence. Parity with the single-execution export and the DB canary.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     context_headers: Option<serde_json::Value>,
+    // Issue #798: the execution's task queue — same rationale as
+    // `context_headers`: it lives in no `WorkflowEvent`, so without it a
+    // `ctx.queue_name()`-branching workflow replays under "" and the gate reports
+    // a FALSE divergence.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    queue_name: String,
     /// `COUNT(*) OVER (PARTITION BY workflow_name)` — the in-flight population
     /// of this workflow type **on this shard**. Summed across shards to give
     /// the AC2 coverage denominator.
@@ -3494,6 +3506,8 @@ impl HistorySampleCandidate {
             // header-branching workflow replays against an empty map and the
             // gate reports a divergence the candidate build did not cause.
             context_headers: self.context_headers,
+            // Issue #798: likewise the queue the live run was claimed on.
+            queue_name: self.queue_name,
         }
     }
 }
@@ -29971,6 +29985,7 @@ async fn replay_diagnosis(
         deadline_at: execution.deadline_at,
         parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid),
         workflow_id: Some(execution.workflow_id.clone()),
+        queue_name: None,
     };
 
     // Register ONLY the target handler and replay in CANARY mode. Canary — not
@@ -33289,6 +33304,11 @@ fn export_history_for_execution(
             // replay path (mirrors `parent_execution_id`; the column lives in no
             // `WorkflowEvent`).
             workflow_id: Some(execution.workflow_id.clone()),
+            // Issue #798: carry the execution's task queue so a workflow that
+            // branches on `ctx.queue_name()` replays against the queue it really
+            // ran on, not "" (the live worker sets it from the task row, so it
+            // lives in no `WorkflowEvent`).
+            queue_name: Some(execution.queue_name.clone()),
             execution_id: ExecutionId::from_uuid(execution.id),
             shard_id: execution.shard_id,
             state: execution.state.clone(),
@@ -33328,6 +33348,9 @@ fn export_history_for_candidate(
             // round-trips `ctx.info().workflow_id` into the replay path — parity
             // with the single-execution export.
             workflow_id: Some(candidate.workflow_id.clone()),
+            // Issue #798: carry the execution's task queue — parity with the
+            // single-execution export.
+            queue_name: Some(candidate.queue_name.clone()),
             execution_id: ExecutionId::from_uuid(candidate.id),
             shard_id: candidate.shard_id,
             state: candidate.state.clone(),
@@ -33533,14 +33556,16 @@ SELECT
     w.execution_timeout AS execution_timeout,
     w.deadline_at AS deadline_at,
     w.parent_id AS parent_id,
-    w.context_headers AS context_headers
+    w.context_headers AS context_headers,
+    w.queue_name AS queue_name
 FROM harvest_workflow_executions w
 LEFT JOIN harvest_events e
     ON e.workflow_exec_id = w.id
 WHERE ($1::TEXT IS NULL OR w.workflow_name = $1::TEXT)
   AND (cardinality($2::TEXT[]) = 0 OR w.state = ANY($2::TEXT[]))
 GROUP BY w.id, w.workflow_name, w.workflow_id, w.shard_id, w.state, w.completed_at, w.started_at,
-         w.created_at, w.execution_timeout, w.deadline_at, w.parent_id, w.context_headers
+         w.created_at, w.execution_timeout, w.deadline_at, w.parent_id, w.context_headers,
+         w.queue_name
 HAVING ($3::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) >= $3::TIMESTAMPTZ)
    AND ($4::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) < $4::TIMESTAMPTZ)
 ORDER BY last_history_event_at DESC, w.id DESC
@@ -33624,6 +33649,7 @@ WITH ranked AS (
         w.deadline_at AS deadline_at,
         w.parent_id AS parent_id,
         w.context_headers AS context_headers,
+        w.queue_name AS queue_name,
         ROW_NUMBER() OVER (
             PARTITION BY w.workflow_name
             ORDER BY w.started_at ASC, w.id ASC
@@ -33636,7 +33662,8 @@ WITH ranked AS (
       AND NOT starts_with(w.workflow_name, '__harvest_canary_probe')
 )
 SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
-       execution_timeout, deadline_at, parent_id, context_headers, in_flight_total
+       execution_timeout, deadline_at, parent_id, context_headers, queue_name,
+       in_flight_total
 FROM ranked
 WHERE rn <= $3
 ORDER BY workflow_name ASC, rn ASC
@@ -33660,6 +33687,7 @@ WITH ranked AS (
         w.deadline_at AS deadline_at,
         w.parent_id AS parent_id,
         w.context_headers AS context_headers,
+        w.queue_name AS queue_name,
         ROW_NUMBER() OVER (
             PARTITION BY w.workflow_name
             ORDER BY w.started_at DESC, w.id DESC
@@ -33672,7 +33700,8 @@ WITH ranked AS (
       AND NOT starts_with(w.workflow_name, '__harvest_canary_probe')
 )
 SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
-       execution_timeout, deadline_at, parent_id, context_headers, in_flight_total
+       execution_timeout, deadline_at, parent_id, context_headers, queue_name,
+       in_flight_total
 FROM ranked
 WHERE rn <= $3
 ORDER BY workflow_name ASC, rn ASC
@@ -42701,6 +42730,7 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             context_headers: None,
+            queue_name: "default".to_string(),
         }
     }
 
@@ -42762,6 +42792,7 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             context_headers: None,
+            queue_name: "default".to_string(),
             in_flight_total,
         }
     }
@@ -43382,6 +43413,7 @@ mod tests {
             version: 1,
             workflow_name: workflow_name.to_string(),
             workflow_id: None,
+            queue_name: None,
             execution_id: autumn_harvest::ExecutionId::from_uuid(uuid::Uuid::from_u128(seq)),
             shard_id: 0,
             exported_at: sample_base(),

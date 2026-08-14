@@ -259,6 +259,7 @@ impl std::fmt::Display for ReplayReport {
 ///     deadline_at: None,
 ///     parent_execution_id: None,
 ///     workflow_id: None,
+///     queue_name: None,
 /// };
 /// let json = serde_json::to_string(&snapshot).unwrap();
 /// // Store `json` as a fixture file.
@@ -336,6 +337,26 @@ pub struct HistorySnapshot {
     /// [`history_export::HistoryExportDocument::workflow_id`]: crate::history_export::HistoryExportDocument::workflow_id
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
+    /// The execution's task queue (issue #798), sourced from the
+    /// `harvest_workflow_executions.queue_name` column.
+    ///
+    /// The live worker sets `ctx.queue_name()` from the claimed task row, but the
+    /// value lives in no `WorkflowEvent`, so a captured fixture cannot recover it
+    /// from the event log alone — the same family as
+    /// [`context_headers`](Self::context_headers) and
+    /// [`workflow_id`](Self::workflow_id). When `Some`, both replay paths thread
+    /// it into the `WorkflowContext` (preferring it over the replayer's global
+    /// [`with_queue_name`](WorkflowReplayer::with_queue_name)) so a workflow that
+    /// branches command-affecting control flow on `ctx.queue_name()` — or embeds
+    /// it in an activity input — replays deterministically instead of running
+    /// under `""` and false-reporting drift. Serialised at the same top-level name
+    /// as [`history_export::HistoryExportDocument::queue_name`], so an exported
+    /// history round-trips into this snapshot verbatim. `None` (the field absent —
+    /// a legacy snapshot) falls back to the replayer's global.
+    ///
+    /// [`history_export::HistoryExportDocument::queue_name`]: crate::history_export::HistoryExportDocument::queue_name
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +411,15 @@ pub struct WorkflowReplayer {
     /// carries its own `workflow_id` overrides this global. `None` (the default)
     /// models a run without an explicit id.
     workflow_id: Option<String>,
+    /// Effective task queue threaded into the replayed `WorkflowContext`
+    /// (issue #798). `queue_name` is supplied by the live worker from the claimed
+    /// task row and lives in no `WorkflowEvent`, so a fixture that omits it cannot
+    /// recover it; set it with [`with_queue_name`](Self::with_queue_name) so a
+    /// workflow that branches command-affecting control flow on `ctx.queue_name()`
+    /// — or embeds it in an activity input — replays deterministically. A
+    /// [`HistorySnapshot`] that carries its own `queue_name` overrides this
+    /// global. `None` (the default) preserves the empty-string default.
+    queue_name: Option<String>,
     /// Effective `execution_id` threaded into the replayed `WorkflowContext` on
     /// the raw [`replay_from_events`](Self::replay_from_events) path (issue #698).
     /// `execution_id` is documented as replay-safe (`ctx.info().execution_id`),
@@ -439,6 +469,10 @@ struct SampledExecution {
     // the canary replay so a workflow that branches on `ctx.info().workflow_id`
     // does not false-report non-determinism.
     workflow_id: String,
+    // Issue #798: the sampled row's `queue_name` column, threaded into the canary
+    // replay so a workflow that branches on `ctx.queue_name()` does not
+    // false-report non-determinism.
+    queue_name: String,
 }
 
 impl WorkflowReplayer {
@@ -455,6 +489,7 @@ impl WorkflowReplayer {
             execution_timeout: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
             execution_id: None,
             history_policy: crate::context::WorkflowHistoryPolicy::default(),
         }
@@ -528,6 +563,24 @@ impl WorkflowReplayer {
     #[must_use]
     pub fn with_workflow_id(mut self, workflow_id: impl Into<String>) -> Self {
         self.workflow_id = Some(workflow_id.into());
+        self
+    }
+
+    /// Set the task queue threaded into the replayed `WorkflowContext`
+    /// (issue #798).
+    ///
+    /// Required to replay a workflow whose command-affecting control flow branches
+    /// on `ctx.queue_name()` (or embeds it in an activity input): the live worker
+    /// supplies that value from the claimed task row, so it lives in no
+    /// `WorkflowEvent` and a fixture that omits it cannot carry it. Without it the
+    /// replayed context reports `queue_name == ""` and false-reports
+    /// non-determinism against a history recorded on a named queue. A
+    /// [`HistorySnapshot`](HistorySnapshot::queue_name) that carries its own value
+    /// overrides this global. `None` (the default) preserves the empty-string
+    /// default.
+    #[must_use]
+    pub fn with_queue_name(mut self, queue_name: impl Into<String>) -> Self {
+        self.queue_name = Some(queue_name.into());
         self
     }
 
@@ -668,6 +721,7 @@ impl WorkflowReplayer {
             execution_timeout: self.execution_timeout,
             parent_execution_id: self.parent_execution_id,
             workflow_id: self.workflow_id.clone(),
+            queue_name: self.queue_name.clone(),
             history_policy: self.history_policy,
         };
         verifier.replay_bundle(dir).await
@@ -767,12 +821,19 @@ impl WorkflowReplayer {
             .workflow_id
             .clone()
             .or_else(|| self.workflow_id.clone());
+        // Issue #798: prefer the snapshot's own `queue_name`; fall back to the
+        // replayer's global (set via `with_queue_name`).
+        let queue_name = snapshot
+            .queue_name
+            .clone()
+            .or_else(|| self.queue_name.clone());
         self.replay_from_snapshot_effective(
             snapshot,
             execution_timeout,
             deadline_at,
             parent_execution_id,
             workflow_id,
+            queue_name,
         )
         .await
     }
@@ -790,6 +851,9 @@ impl WorkflowReplayer {
         deadline_at: Option<chrono::DateTime<chrono::Utc>>,
         parent_execution_id: Option<ExecutionId>,
         workflow_id: Option<String>,
+        // Issue #798: the execution's task queue, so a workflow branching on
+        // `ctx.queue_name()` does not replay under `""`.
+        queue_name: Option<String>,
     ) -> ReplayReport {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
@@ -844,6 +908,8 @@ impl WorkflowReplayer {
                 parent_execution_id,
                 workflow_name,
                 workflow_id,
+                // Issue #798: the execution's task queue.
+                queue_name,
                 // Issue #614: thread the replayer's history policy so a strict
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
@@ -864,6 +930,8 @@ impl WorkflowReplayer {
                 parent_execution_id,
                 workflow_name,
                 workflow_id,
+                // Issue #798: the execution's task queue.
+                queue_name,
                 // Issue #614: thread the replayer's history policy so a strict
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
@@ -891,18 +959,25 @@ impl WorkflowReplayer {
             .workflow_id
             .clone()
             .or_else(|| self.workflow_id.clone());
+        // Issue #798: prefer the snapshot's own `queue_name`; fall back to the global.
+        let queue_name = snapshot
+            .queue_name
+            .clone()
+            .or_else(|| self.queue_name.clone());
         self.replay_canary_snapshot_effective(
             snapshot,
             execution_timeout,
             deadline_at,
             parent_execution_id,
             workflow_id,
+            queue_name,
         )
         .await
     }
 
     /// Canary snapshot replay with an explicit per-execution `execution_timeout`
-    /// / live `deadline_at` (issue #772) / spawning-parent id (issue #698).
+    /// / live `deadline_at` (issue #772) / spawning-parent id (issue #698) /
+    /// task queue (issue #798).
     async fn replay_canary_snapshot_effective(
         &self,
         snapshot: HistorySnapshot,
@@ -910,6 +985,7 @@ impl WorkflowReplayer {
         deadline_at: Option<chrono::DateTime<chrono::Utc>>,
         parent_execution_id: Option<ExecutionId>,
         workflow_id: Option<String>,
+        queue_name: Option<String>,
     ) -> ReplayReport {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
@@ -948,6 +1024,8 @@ impl WorkflowReplayer {
             parent_execution_id,
             workflow_name,
             workflow_id,
+            // Issue #798: the execution's task queue.
+            queue_name,
             // Issue #614: thread the replayer's history policy so a canary replay
             // of a `should_continue_as_new`-branching workflow stays faithful to
             // the live worker (which uses `registry.history_policy()`).
@@ -1030,6 +1108,9 @@ impl WorkflowReplayer {
         let (name, &handler) = self.handlers.iter().next().unwrap();
         let workflow_name = name.clone();
         let workflow_id = self.workflow_id.clone();
+        // Issue #798: a raw-events fixture carries no `queue_name` either, so use
+        // the replayer's global (`with_queue_name`) when set.
+        let queue_name = self.queue_name.clone();
         let exec_id = self.execution_id.unwrap_or_default();
         let events = match self.maybe_inflate(events).await {
             Ok(e) => e,
@@ -1065,6 +1146,9 @@ impl WorkflowReplayer {
                 self.parent_execution_id,
                 workflow_name,
                 workflow_id,
+                // Issue #798: the replayer's global queue (a raw-events fixture
+                // carries no snapshot to override it).
+                queue_name,
                 // Issue #614: thread the replayer's history policy so a strict
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
@@ -1085,6 +1169,7 @@ impl WorkflowReplayer {
                 self.parent_execution_id,
                 workflow_name,
                 workflow_id,
+                queue_name,
                 // Issue #614: thread the replayer's history policy so a strict
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
@@ -1198,6 +1283,8 @@ impl WorkflowReplayer {
         let meta = load_workflow_name_and_headers(conn, exec_id).await?;
 
         let workflow_id = Some(meta.workflow_id.clone());
+        // Issue #798: the row's own task queue.
+        let queue_name = Some(meta.queue_name.clone());
         let snapshot = HistorySnapshot {
             workflow_name: meta.workflow_name,
             execution_id: exec_id,
@@ -1210,6 +1297,8 @@ impl WorkflowReplayer {
             parent_execution_id: meta.parent_execution_id,
             // Issue #698: the row's own business `workflow_id`.
             workflow_id: workflow_id.clone(),
+            // Issue #798: the row's own task queue.
+            queue_name: queue_name.clone(),
         };
         Ok(self
             .replay_from_snapshot_effective(
@@ -1218,6 +1307,7 @@ impl WorkflowReplayer {
                 meta.deadline_at,
                 meta.parent_execution_id,
                 workflow_id,
+                queue_name,
             )
             .await)
     }
@@ -1251,7 +1341,7 @@ impl WorkflowReplayer {
 
         let mut all_executions = Vec::new();
         for (shard_id, executions) in query_results {
-            for (id, name, created, headers, exec_timeout, deadline_at, parent_id, wf_id) in
+            for (id, name, created, headers, exec_timeout, deadline_at, parent_id, wf_id, queue) in
                 executions
             {
                 all_executions.push(SampledExecution {
@@ -1267,6 +1357,8 @@ impl WorkflowReplayer {
                     parent_execution_id: parent_id.map(crate::types::ExecutionId::from_uuid),
                     // Issue #698: the sampled row's business `workflow_id` column.
                     workflow_id: wf_id,
+                    // Issue #798: the sampled row's task queue.
+                    queue_name: queue,
                 });
             }
         }
@@ -1319,15 +1411,17 @@ impl WorkflowReplayer {
                                     parent_execution_id: exec.parent_execution_id,
                                     // Issue #698: the sampled row's own business id.
                                     workflow_id: Some(exec.workflow_id.clone()),
+                                    // Issue #798: the sampled row's own task queue.
+                                    queue_name: Some(exec.queue_name.clone()),
                                 }
                             }; // `conn` is dropped here
 
-                            // Issue #772 / #698: thread the sampled execution row's
-                            // own `execution_timeout` / live `deadline_at` / parent
-                            // id / business `workflow_id` so the deadline-aware CAN
-                            // branch and a workflow that branches on
-                            // `ctx.info().workflow_id` / `parent_execution_id` both
-                            // replay cleanly.
+                            // Issue #772 / #698 / #798: thread the sampled execution
+                            // row's own `execution_timeout` / live `deadline_at` /
+                            // parent id / business `workflow_id` / task queue so the
+                            // deadline-aware CAN branch and a workflow that branches
+                            // on `ctx.info().workflow_id` / `parent_execution_id` /
+                            // `ctx.queue_name()` all replay cleanly.
                             let report = replayer_ref
                                 .replay_canary_snapshot_effective(
                                     snapshot,
@@ -1335,6 +1429,7 @@ impl WorkflowReplayer {
                                     exec.deadline_at,
                                     exec.parent_execution_id,
                                     Some(exec.workflow_id.clone()),
+                                    Some(exec.queue_name.clone()),
                                 )
                                 .await;
                             Ok::<_, crate::error::HarvestError>(report)
@@ -1463,6 +1558,7 @@ async fn query_running_executions(
         Option<chrono::DateTime<chrono::Utc>>,
         Option<uuid::Uuid>,
         String,
+        String,
     )>,
 > {
     use crate::schema::harvest_workflow_executions::dsl::{
@@ -1496,6 +1592,9 @@ async fn query_running_executions(
             parent_id,
             // Issue #698: thread the business `workflow_id`.
             workflow_id,
+            // Issue #798: thread the execution's task queue, so a canary replay of
+            // a workflow branching on `ctx.queue_name()` does not run under "".
+            queue_name,
         ))
         .order((created_at.desc(), id.desc()))
         .limit(i64::try_from(options.sample_size).unwrap_or(i64::MAX))
@@ -1507,6 +1606,7 @@ async fn query_running_executions(
             Option<chrono::Duration>,
             Option<chrono::DateTime<chrono::Utc>>,
             Option<uuid::Uuid>,
+            String,
             String,
         )>(conn)
         .await
@@ -1626,6 +1726,9 @@ struct DbReplayMeta {
     // Issue #698: the row's business `workflow_id` column, so `replay_from_db`
     // reports the real `ctx.info().workflow_id`.
     workflow_id: String,
+    // Issue #798: the row's `queue_name` column, so `replay_from_db` reports the
+    // real `ctx.queue_name()` instead of "".
+    queue_name: String,
 }
 
 #[cfg(feature = "db")]
@@ -1641,19 +1744,21 @@ async fn load_workflow_name_and_headers(
     use crate::schema::harvest_workflow_executions::dsl::{
         context_headers as context_headers_col, deadline_at as deadline_at_col,
         execution_timeout as execution_timeout_col, harvest_workflow_executions, id as id_col,
-        parent_id as parent_id_col, workflow_id as workflow_id_col, workflow_name,
+        parent_id as parent_id_col, queue_name as queue_name_col, workflow_id as workflow_id_col,
+        workflow_name,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
     let exec_uuid = exec_id.as_uuid();
 
-    let (name, raw_headers, execution_timeout, deadline_at, parent_uuid, workflow_id): (
+    let (name, raw_headers, execution_timeout, deadline_at, parent_uuid, workflow_id, queue_name): (
         String,
         Option<serde_json::Value>,
         Option<chrono::Duration>,
         Option<chrono::DateTime<chrono::Utc>>,
         Option<uuid::Uuid>,
+        String,
         String,
     ) = harvest_workflow_executions
         .filter(id_col.eq(exec_uuid))
@@ -1664,6 +1769,8 @@ async fn load_workflow_name_and_headers(
             deadline_at_col,
             parent_id_col,
             workflow_id_col,
+            // Issue #798: the row's task queue.
+            queue_name_col,
         ))
         .first(conn)
         .await
@@ -1692,6 +1799,8 @@ async fn load_workflow_name_and_headers(
         parent_execution_id: parent_uuid.map(ExecutionId::from_uuid),
         // Issue #698: the row's business `workflow_id`.
         workflow_id,
+        // Issue #798: the row's task queue.
+        queue_name,
     })
 }
 
@@ -2828,6 +2937,7 @@ struct FixtureReplayDefaults {
     execution_timeout: Option<chrono::Duration>,
     parent_execution_id: Option<ExecutionId>,
     workflow_id: Option<String>,
+    queue_name: Option<String>,
     history_policy: crate::context::WorkflowHistoryPolicy,
 }
 
@@ -3506,6 +3616,9 @@ fn fixture_replayer(
         execution_timeout: defaults.execution_timeout,
         parent_execution_id: defaults.parent_execution_id,
         workflow_id: defaults.workflow_id.clone(),
+        // Issue #798 fallback: a snapshot carrying its own `queue_name` still
+        // wins, so an exported fixture is validated against its real queue.
+        queue_name: defaults.queue_name.clone(),
         // Issue #698: the directory-fixture path routes through
         // `replay_from_snapshot`, which always sources `execution_id` from the
         // snapshot (a required field); no raw-events global override applies.
@@ -3795,6 +3908,13 @@ pub struct TestRunOutcome {
     /// self-checks deterministically instead of false-flagging on the live value
     /// vs the replay's empty default. Defaults to `""` (matching the live run).
     workflow_id: String,
+    /// The task queue carried from the producing `WorkflowTestEnv` (issue #798).
+    /// Like `workflow_name`/`workflow_id`, the live run receives it via `span_meta`
+    /// while it lives in no `WorkflowEvent`, so `replay_check` threads it onto the
+    /// replay snapshot — otherwise a workflow that records `ctx.queue_name()` (e.g.
+    /// in an activity input) self-checks against `""` and false-flags
+    /// non-determinism. Defaults to `""` (matching the live run).
+    queue_name: String,
     /// The durable log lines this run would have persisted (issue #790), in
     /// `seq` order and de-duplicated by `seq` — exactly the shape the store's
     /// `UNIQUE (workflow_exec_id, seq)` + `ON CONFLICT DO NOTHING` produces.
@@ -3981,6 +4101,15 @@ impl TestRunOutcome {
                 None
             } else {
                 Some(self.workflow_id.clone())
+            },
+            // Issue #798: same reasoning as `workflow_id` above — the live run
+            // receives the env's configured queue via span_meta, so a workflow
+            // recording `ctx.queue_name()` (e.g. in an activity input) would
+            // self-check against `""` and false-flag non-determinism without this.
+            queue_name: if self.queue_name.is_empty() {
+                None
+            } else {
+                Some(self.queue_name.clone())
             },
         };
         let mut replayer = WorkflowReplayer::new()
@@ -4637,6 +4766,9 @@ impl WorkflowTestEnv {
                                 // workflow type / business id for replay_check.
                                 workflow_name: self.workflow_name.clone(),
                                 workflow_id: self.workflow_id.clone(),
+                                // Issue #798: carry the env's task queue so `replay_check`
+                                // self-checks against the same queue the live run saw.
+                                queue_name: self.queue_name.clone(),
                                 recorded_logs: recorded_logs.into_values().collect(),
                             };
                         }
@@ -4658,6 +4790,9 @@ impl WorkflowTestEnv {
                             // type / business id for replay_check.
                             workflow_name: self.workflow_name.clone(),
                             workflow_id: self.workflow_id.clone(),
+                            // Issue #798: carry the env's task queue so `replay_check`
+                            // self-checks against the same queue the live run saw.
+                            queue_name: self.queue_name.clone(),
                             recorded_logs: recorded_logs.into_values().collect(),
                         };
                     }
@@ -4691,6 +4826,9 @@ impl WorkflowTestEnv {
             // business id for replay_check.
             workflow_name: self.workflow_name.clone(),
             workflow_id: self.workflow_id.clone(),
+            // Issue #798: carry the env's task queue so `replay_check`
+            // self-checks against the same queue the live run saw.
+            queue_name: self.queue_name.clone(),
             recorded_logs: recorded_logs.into_values().collect(),
         }
     }
@@ -4761,6 +4899,9 @@ impl WorkflowTestEnv {
             // business id for replay_check.
             workflow_name: self.workflow_name.clone(),
             workflow_id: self.workflow_id.clone(),
+            // Issue #798: carry the env's task queue so `replay_check`
+            // self-checks against the same queue the live run saw.
+            queue_name: self.queue_name.clone(),
             recorded_logs,
         }
     }
