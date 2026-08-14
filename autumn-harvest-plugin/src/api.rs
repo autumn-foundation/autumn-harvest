@@ -29651,6 +29651,37 @@ async fn retention_run_now(
     Ok(Json(BasicAck { ok: true }))
 }
 
+/// The build id **this process** is configured with, for the two in-process
+/// replay gates (issue #798).
+///
+/// Both the deploy replay canary and the replay-diagnosis endpoint run inside the
+/// deployed candidate and ask what *the currently deployed code* does with a
+/// recorded history — so the replay context must report the same
+/// [`WorkerConfig::build_id`] the live worker puts on span metadata. Sourcing it
+/// from the execution's recorded `assigned_build_id` instead would replay the
+/// branch the **old** build took, which is exactly the blind spot these gates
+/// exist to remove.
+///
+/// Returns `None` when no snapshot was captured (a runtime booted without the
+/// `with_effective_config` seam) or when the configured build id is empty (the
+/// default for a deployment that does not use build routing at all) — in both
+/// cases `ctx.build_id()` correctly reports `None`, matching the live worker.
+fn running_build_id(runtime: &HarvestApiRuntime) -> Option<String> {
+    normalize_running_build_id(runtime.effective_config().map(|view| view.worker.build_id))
+}
+
+/// The pure half of [`running_build_id`]: an absent snapshot **or** an empty
+/// configured build id both resolve to `None`.
+///
+/// Split out so the rule is unit-testable without constructing a full
+/// [`HarvestApiRuntime`] (which needs eight collaborators). Empty is the default
+/// for a deployment that does not use build routing at all, and the live worker
+/// reports no build in that case — so mapping it to `Some("")` would make the
+/// gate replay under a build id no worker ever reports.
+fn normalize_running_build_id(configured: Option<String>) -> Option<String> {
+    configured.filter(|build_id| !build_id.is_empty())
+}
+
 async fn run_replay_canary_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -29668,6 +29699,17 @@ async fn run_replay_canary_handler(
     let runtime = api_state.runtime().map_err(map_error)?;
 
     let mut replayer = WorkflowReplayer::new();
+    // Issue #798: thread this process's own configured build id. The canary runs
+    // *inside* the deployed candidate, so `WorkerConfig::build_id` here IS the
+    // candidate build — and the live worker reports that same value through span
+    // metadata (never the execution's recorded `assigned_build_id`). Without it
+    // `ctx.build_id()` is `None` during the canary, so a candidate-only branch
+    // such as `if ctx.build_id() == Some("v2")` is unreachable, the historical
+    // path replays clean, and the canary reports success for code that diverges
+    // the moment it takes traffic.
+    if let Some(build_id) = running_build_id(&runtime) {
+        replayer = replayer.with_build_id(build_id);
+    }
     for (name, info) in &runtime.registry().workflows {
         replayer = replayer.register_fn(name.clone(), info.handler);
     }
@@ -30013,10 +30055,18 @@ async fn replay_diagnosis(
     // `workflow_failed` for deployments that configure a non-default policy —
     // even though the same execution replays cleanly on the worker (Codex review,
     // PR #1107).
-    let replayer = autumn_harvest::testing::WorkflowReplayer::new()
+    let mut replayer = autumn_harvest::testing::WorkflowReplayer::new()
         .with_shared_state(runtime.registry().shared_state())
         .with_history_policy(runtime.registry().history_policy())
         .register_fn(execution.workflow_name.clone(), handler);
+    // Issue #798: same reasoning as the replay canary — diagnosis asks "does this
+    // execution diverge under the code deployed *right now*", so the replay
+    // context must report the build id this process is configured with. Left
+    // unset, `ctx.build_id()` is `None` and a build-gated branch takes the wrong
+    // path, so the diagnosis verdict describes code that will not run.
+    if let Some(build_id) = running_build_id(&runtime) {
+        replayer = replayer.with_build_id(build_id);
+    }
     let report = match tokio::time::timeout(
         api_state.query_timeout(),
         replayer.replay_canary_snapshot(snapshot),
@@ -39888,6 +39938,35 @@ mod tests {
     use testcontainers::ImageExt;
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    // ── #798 running build id for the in-process replay gates (pure, no DB) ──
+
+    /// The deploy canary and replay-diagnosis endpoints both run *inside* the
+    /// deployed candidate, so they must replay under this process's own
+    /// configured build id — not the execution's recorded `assigned_build_id`.
+    ///
+    /// A runtime with no captured config snapshot, or one whose build id is the
+    /// empty default (no build routing configured), must resolve to `None` so
+    /// `ctx.build_id()` matches what the live worker reports rather than an
+    /// empty string no worker ever reports.
+    #[test]
+    fn running_build_id_treats_absent_and_empty_config_as_none() {
+        assert_eq!(
+            normalize_running_build_id(None),
+            None,
+            "a runtime booted without the effective-config seam must resolve to None"
+        );
+        assert_eq!(
+            normalize_running_build_id(Some(String::new())),
+            None,
+            "an empty configured build id must resolve to None, not Some(\"\")"
+        );
+        assert_eq!(
+            normalize_running_build_id(Some("v2".to_string())),
+            Some("v2".to_string()),
+            "the configured build id must reach the in-process replay gates"
+        );
+    }
 
     // ── #619 per-shard pause provenance merge (pure, no DB) ────────────────
     fn paused_row(

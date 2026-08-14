@@ -1797,3 +1797,214 @@ fn mentions_workflow<'a>(
         Ok(Value::Null)
     })
 }
+
+// ===========================================================================
+// The candidate build id must reach every fixture context (Codex round-13 P1)
+// ===========================================================================
+//
+// `ctx.build_id()` differs in kind from every other value this gate threads.
+// `queue_name`, `workflow_id`, `parent_execution_id` and `context_headers` are
+// all *recorded per-execution row values*, so the fixture carries them and the
+// snapshot wins. `build_id` is not: the live worker supplies its **own
+// configured** `WorkerConfig::build_id` through `WorkflowExecuteSpanMeta`, not
+// the execution's recorded `assigned_build_id`.
+//
+// That inverts the correct source. Recording the *exporting* worker's build into
+// the fixture and replaying under it would replay the **old** build's id — the
+// precise value that hides the divergence this gate exists to find. The
+// candidate build id is therefore a uniform, operator-supplied *replay-config*
+// value, deliberately with no snapshot field.
+
+/// A workflow that embeds its worker's build id in an activity input.
+fn build_id_bearing_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let build = ctx.build_id().unwrap_or("<none>").to_string();
+        ctx.execute_activity_raw("step_one", serde_json::json!({ "build": build }), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// The shape the finding actually describes: a **candidate-only branch**.
+///
+/// Build `v2` takes a new path; every other build takes the historical one. The
+/// recorded history below was produced by `v1`, so replaying it under the
+/// candidate `v2` *must* surface the divergence — that is the gate working.
+/// With `build_id` stuck at `None` the candidate branch is unreachable, the old
+/// path replays cleanly, and the gate reports **false GREEN** on code that will
+/// diverge the moment it is promoted.
+fn candidate_branching_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let step = if ctx.build_id() == Some("v2") {
+            "step_two_v2"
+        } else {
+            "step_one"
+        };
+        ctx.execute_activity_raw(step, Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// An in-flight history recorded by a worker running build `v1`.
+fn build_id_snapshot_json(workflow_name: &str, recorded_input: Value, activity: &str) -> String {
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: activity.into(),
+            input: recorded_input,
+            queue: "default".into(),
+        },
+    ];
+    let snapshot = HistorySnapshot {
+        workflow_name: workflow_name.to_string(),
+        execution_id: ExecutionId::new(),
+        events,
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
+        queue_name: None,
+    };
+    serde_json::to_string(&snapshot).unwrap()
+}
+
+/// The money test: with the candidate build id threaded, a `v2`-only branch is
+/// actually taken during the gate, so the drift it will cause after promotion is
+/// caught **before** the deploy.
+///
+/// Without the fix this reports clean — the exact false GREEN the finding names.
+#[tokio::test]
+async fn a_candidate_only_branch_is_caught_when_the_build_id_is_threaded() {
+    let dir = tempfile::tempdir().unwrap();
+    // Recorded by build v1: it scheduled `step_one`.
+    write(
+        dir.path(),
+        "a.json",
+        &build_id_snapshot_json("wf", Value::Null, "step_one"),
+    );
+
+    let report = autumn_harvest::testing::WorkflowReplayer::new()
+        .register_fn("wf", candidate_branching_workflow as WorkflowHandlerFn)
+        .with_build_id("v2")
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(
+        report.diverged.len(),
+        1,
+        "the candidate build's v2-only branch must be reachable during the gate, \
+         or the gate false-GREENs on code that diverges after promotion: {report}"
+    );
+}
+
+/// The control that keeps the money test honest: replayed as the *recorded*
+/// build, the same fixture and the same candidate code replay cleanly — so the
+/// divergence above is genuinely attributable to the candidate branch and not to
+/// some unrelated mismatch in the fixture.
+#[tokio::test]
+async fn the_same_fixture_replays_clean_under_the_recorded_build() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &build_id_snapshot_json("wf", Value::Null, "step_one"),
+    );
+
+    let report = autumn_harvest::testing::WorkflowReplayer::new()
+        .register_fn("wf", candidate_branching_workflow as WorkflowHandlerFn)
+        .with_build_id("v1")
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.is_clean(),
+        "control: under the recorded build the candidate branch is not taken, so \
+         the fixture must replay clean — otherwise the money test proves nothing \
+         about the build id specifically: {report}"
+    );
+}
+
+/// The value must reach the replay context verbatim, not merely flip a branch:
+/// a workflow that embeds `ctx.build_id()` in an activity input replays clean
+/// only when the configured build id matches what the recording worker reported.
+#[tokio::test]
+async fn the_configured_build_id_reaches_the_replayed_activity_input() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &build_id_snapshot_json("wf", serde_json::json!({"build": "v2"}), "step_one"),
+    );
+
+    let report = autumn_harvest::testing::WorkflowReplayer::new()
+        .register_fn("wf", build_id_bearing_workflow as WorkflowHandlerFn)
+        .with_build_id("v2")
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.is_clean(),
+        "the replayer's configured build id must reach the bundle walk's replay \
+         context: {report}"
+    );
+}
+
+/// Control for the test above: with no build id configured the context reports
+/// `None`, the recorded input no longer matches, and the fixture diverges — so
+/// the delegation genuinely carries the value.
+#[tokio::test]
+async fn an_unset_build_id_genuinely_diverges() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &build_id_snapshot_json("wf", serde_json::json!({"build": "v2"}), "step_one"),
+    );
+
+    let report = autumn_harvest::testing::WorkflowReplayer::new()
+        .register_fn("wf", build_id_bearing_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(
+        report.diverged.len(),
+        1,
+        "control: omitting the build id must genuinely change the outcome, else \
+         the tests above would pass without the setting carrying anything: {report}"
+    );
+}
+
+/// `ReplayVerifier` is the gate's own public surface — the CLI binary builds one
+/// directly rather than going through `WorkflowReplayer::replay_bundle` — so the
+/// candidate build id must be settable there too.
+#[tokio::test]
+async fn replay_verifier_carries_the_candidate_build_id() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &build_id_snapshot_json("wf", serde_json::json!({"build": "v2"}), "step_one"),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", build_id_bearing_workflow as WorkflowHandlerFn)
+        .with_build_id("v2")
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.is_clean(),
+        "ReplayVerifier::with_build_id must reach the fixture replay context: {report}"
+    );
+}

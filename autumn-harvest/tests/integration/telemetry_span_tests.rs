@@ -566,6 +566,7 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                     // Issue #614: default history policy for this span test.
                     // Issue #798: no task queue on this fixture.
                     None,
+                    None, // issue #798: candidate build id (unset in this span test)
                     autumn_harvest::context::WorkflowHistoryPolicy::default(),
                 )
                 .await;

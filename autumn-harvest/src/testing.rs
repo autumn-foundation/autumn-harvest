@@ -420,6 +420,24 @@ pub struct WorkflowReplayer {
     /// [`HistorySnapshot`] that carries its own `queue_name` overrides this
     /// global. `None` (the default) preserves the empty-string default.
     queue_name: Option<String>,
+    /// The **candidate** build id threaded into the replayed `WorkflowContext`
+    /// (issue #798), reported by [`WorkflowContext::build_id`].
+    ///
+    /// Unlike every sibling field here, this is deliberately **not** sourced
+    /// from the fixture. The live worker supplies its *own configured*
+    /// [`WorkerConfig::build_id`](crate::builder::WorkerConfig::build_id)
+    /// through span metadata — never the execution's recorded
+    /// `assigned_build_id` — so the value a replay gate needs is the build that
+    /// is *about to be promoted*, applied uniformly to every fixture. Recording
+    /// the exporting worker's build into the snapshot and replaying under it
+    /// would take the **historical** branch, so candidate-only code such as
+    /// `if ctx.build_id() == Some("v2")` would replay clean and the gate would
+    /// report false GREEN on exactly the divergence it exists to catch.
+    ///
+    /// Consequently there is no `HistorySnapshot::build_id` to override this:
+    /// set it with [`with_build_id`](Self::with_build_id). `None` (the default)
+    /// reports no build id, matching a worker with none configured.
+    build_id: Option<String>,
     /// Effective `execution_id` threaded into the replayed `WorkflowContext` on
     /// the raw [`replay_from_events`](Self::replay_from_events) path (issue #698).
     /// `execution_id` is documented as replay-safe (`ctx.info().execution_id`),
@@ -490,6 +508,7 @@ impl WorkflowReplayer {
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
+            build_id: None,
             execution_id: None,
             history_policy: crate::context::WorkflowHistoryPolicy::default(),
         }
@@ -581,6 +600,40 @@ impl WorkflowReplayer {
     #[must_use]
     pub fn with_queue_name(mut self, queue_name: impl Into<String>) -> Self {
         self.queue_name = Some(queue_name.into());
+        self
+    }
+
+    /// Set the **candidate** build id threaded into the replayed
+    /// `WorkflowContext` (issue #798), reported by
+    /// [`WorkflowContext::build_id`](crate::context::WorkflowContext::build_id).
+    ///
+    /// Pass the build id of the worker you are **about to deploy**, not the one
+    /// that recorded the fixtures. The live worker reports its own configured
+    /// [`WorkerConfig::build_id`](crate::builder::WorkerConfig::build_id) — never
+    /// the execution's recorded `assigned_build_id` — so a replay gate answers
+    /// "what will the candidate do with these in-flight histories?" only when the
+    /// candidate's own id is threaded through every fixture.
+    ///
+    /// Leaving it unset makes `ctx.build_id()` report `None`, so a candidate-only
+    /// branch is unreachable during the gate: the historical path replays clean
+    /// and the gate reports success on code that diverges the moment it is
+    /// promoted. This is why the value is **not** carried on
+    /// [`HistorySnapshot`] — a fixture-sourced build id would reintroduce exactly
+    /// that blind spot.
+    ///
+    /// ```no_run
+    /// # use autumn_harvest::testing::WorkflowReplayer;
+    /// # async fn demo() {
+    /// let report = WorkflowReplayer::new()
+    ///     .with_build_id("v2") // the build about to be promoted
+    ///     .replay_bundle(std::path::Path::new("./bundle"))
+    ///     .await;
+    /// assert!(report.is_clean());
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
+        self.build_id = Some(build_id.into());
         self
     }
 
@@ -722,6 +775,7 @@ impl WorkflowReplayer {
             parent_execution_id: self.parent_execution_id,
             workflow_id: self.workflow_id.clone(),
             queue_name: self.queue_name.clone(),
+            build_id: self.build_id.clone(),
             history_policy: self.history_policy,
         };
         verifier.replay_bundle(dir).await
@@ -910,6 +964,10 @@ impl WorkflowReplayer {
                 workflow_id,
                 // Issue #798: the execution's task queue.
                 queue_name,
+                // Issue #798: the candidate build id. Deliberately read from the
+                // replayer (never the fixture): the gate must answer what the build
+                // about to be promoted does, not what the recording build did.
+                self.build_id.clone(),
                 // Issue #614: thread the replayer's history policy so a strict
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
@@ -932,6 +990,10 @@ impl WorkflowReplayer {
                 workflow_id,
                 // Issue #798: the execution's task queue.
                 queue_name,
+                // Issue #798: the candidate build id. Deliberately read from the
+                // replayer (never the fixture): the gate must answer what the build
+                // about to be promoted does, not what the recording build did.
+                self.build_id.clone(),
                 // Issue #614: thread the replayer's history policy so a strict
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
@@ -1026,6 +1088,10 @@ impl WorkflowReplayer {
             workflow_id,
             // Issue #798: the execution's task queue.
             queue_name,
+            // Issue #798: the candidate build id. Deliberately read from the
+            // replayer (never the fixture): the gate must answer what the build
+            // about to be promoted does, not what the recording build did.
+            self.build_id.clone(),
             // Issue #614: thread the replayer's history policy so a canary replay
             // of a `should_continue_as_new`-branching workflow stays faithful to
             // the live worker (which uses `registry.history_policy()`).
@@ -1149,6 +1215,10 @@ impl WorkflowReplayer {
                 // Issue #798: the replayer's global queue (a raw-events fixture
                 // carries no snapshot to override it).
                 queue_name,
+                // Issue #798: the candidate build id. Deliberately read from the
+                // replayer (never the fixture): the gate must answer what the build
+                // about to be promoted does, not what the recording build did.
+                self.build_id.clone(),
                 // Issue #614: thread the replayer's history policy so a strict
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
@@ -1170,6 +1240,10 @@ impl WorkflowReplayer {
                 workflow_name,
                 workflow_id,
                 queue_name,
+                // Issue #798: the candidate build id. Deliberately read from the
+                // replayer (never the fixture): the gate must answer what the build
+                // about to be promoted does, not what the recording build did.
+                self.build_id.clone(),
                 // Issue #614: thread the replayer's history policy so a strict
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
@@ -2938,6 +3012,15 @@ struct FixtureReplayDefaults {
     parent_execution_id: Option<ExecutionId>,
     workflow_id: Option<String>,
     queue_name: Option<String>,
+    /// The **candidate** build id (issue #798).
+    ///
+    /// The one field here that is *not* a fixture fallback: no `HistorySnapshot`
+    /// carries a build id, deliberately. The live worker reports its own
+    /// configured build rather than the execution's recorded `assigned_build_id`,
+    /// so a gate must apply the build about to be promoted uniformly to every
+    /// fixture — sourcing it from the fixture would replay the historical branch
+    /// and hide candidate-only drift.
+    build_id: Option<String>,
     history_policy: crate::context::WorkflowHistoryPolicy,
 }
 
@@ -2997,6 +3080,29 @@ impl ReplayVerifier {
         history_policy: crate::context::WorkflowHistoryPolicy,
     ) -> Self {
         self.replay_defaults.history_policy = history_policy;
+        self
+    }
+
+    /// Set the **candidate** build id threaded into every fixture's replay
+    /// context (issue #798).
+    ///
+    /// Pass the build id of the worker you are **about to deploy**. The live
+    /// worker reports its own configured
+    /// [`WorkerConfig::build_id`](crate::builder::WorkerConfig::build_id) via
+    /// span metadata rather than the execution's recorded `assigned_build_id`,
+    /// so a replay gate only answers "what will the candidate do with these
+    /// in-flight histories?" when the candidate's id reaches every fixture.
+    ///
+    /// Unlike the other replay-context values a bundle threads, this is **not** a
+    /// fixture fallback: no [`HistorySnapshot`] carries a build id, because one
+    /// sourced from the fixture would be the *recording* build and would replay
+    /// the historical branch — reporting clean for candidate-only code that
+    /// diverges on promotion.
+    ///
+    /// Leaving it unset makes `ctx.build_id()` report `None` during the gate.
+    #[must_use]
+    pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
+        self.replay_defaults.build_id = Some(build_id.into());
         self
     }
 
@@ -3619,6 +3725,11 @@ fn fixture_replayer(
         // Issue #798 fallback: a snapshot carrying its own `queue_name` still
         // wins, so an exported fixture is validated against its real queue.
         queue_name: defaults.queue_name.clone(),
+        // Issue #798: NOT a fallback — the candidate build id is authoritative
+        // for every fixture, because no snapshot carries one (by design: a
+        // fixture-sourced build would replay the historical branch and hide the
+        // candidate-only drift this gate exists to catch).
+        build_id: defaults.build_id.clone(),
         // Issue #698: the directory-fixture path routes through
         // `replay_from_snapshot`, which always sources `execution_id` from the
         // snapshot (a required field); no raw-events global override applies.
@@ -3915,6 +4026,10 @@ pub struct TestRunOutcome {
     /// in an activity input) self-checks against `""` and false-flags
     /// non-determinism. Defaults to `""` (matching the live run).
     queue_name: String,
+    /// Issue #798: the configured build id, threaded into the live run via
+    /// span metadata AND onto the replay snapshot, so the harness self-check
+    /// stays symmetric for a build-gated workflow.
+    build_id: Option<String>,
     /// The durable log lines this run would have persisted (issue #790), in
     /// `seq` order and de-duplicated by `seq` — exactly the shape the store's
     /// `UNIQUE (workflow_exec_id, seq)` + `ON CONFLICT DO NOTHING` produces.
@@ -4122,6 +4237,16 @@ impl TestRunOutcome {
         if let Some(execution_timeout) = self.execution_timeout {
             replayer = replayer.with_execution_timeout(execution_timeout);
         }
+        // Issue #798: carry the producing env's build id. Unlike `workflow_id` /
+        // `queue_name` above this rides the *replayer*, not the snapshot, because
+        // `HistorySnapshot` deliberately carries no build id (a fixture-sourced
+        // build would be the recording build, hiding candidate-only drift). The
+        // symmetry still matters here: the live run saw this build via span_meta,
+        // so the self-check must replay under it or a build-gated workflow
+        // false-flags non-determinism.
+        if let Some(build_id) = self.build_id.clone() {
+            replayer = replayer.with_build_id(build_id);
+        }
         replayer.replay_from_snapshot(snapshot).await
     }
 }
@@ -4210,6 +4335,10 @@ pub struct WorkflowTestEnv {
     /// Task queue name threaded into the `WorkflowContext` so in-context
     /// engine metrics carry a real `queue` label. Defaults to `""`.
     queue_name: String,
+    /// Issue #798: the configured build id, threaded into the live run via
+    /// span metadata AND onto the replay snapshot, so the harness self-check
+    /// stays symmetric for a build-gated workflow.
+    build_id: Option<String>,
     /// Effective `execution_timeout` budget threaded into the `WorkflowContext`
     /// (issue #772) so a run can exercise deadline-aware `should_continue_as_new`.
     /// `None` (the default) matches a workflow with no execution timeout.
@@ -4270,6 +4399,7 @@ impl WorkflowTestEnv {
             child_mocks: HashMap::new(),
             simulated_now: Utc::now(),
             queued_signals: Vec::new(),
+            build_id: None,
             cancellation_reason: None,
             state: empty_shared_state(),
             last_completion_result: None,
@@ -4554,6 +4684,23 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// Set the worker build id for the contexts this env builds (issue #798), so
+    /// a no-DB test can exercise a workflow whose control flow branches on
+    /// `ctx.build_id()` — the build-routing pattern (issue #171) a replay gate
+    /// exists to protect.
+    ///
+    /// Threaded into the live run via span metadata **and** carried onto the
+    /// [`replay_check`](TestRunOutcome::replay_check) snapshot. Both halves are
+    /// load-bearing: setting it on only the live side would make the harness's
+    /// own replay self-check report false non-determinism for a build-gated
+    /// workflow, which is precisely the asymmetry that made `queue_name` a bug.
+    /// Defaults to `None`, matching a worker with no build id configured.
+    #[must_use]
+    pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
+        self.build_id = Some(build_id.into());
+        self
+    }
+
     /// Set the spawning parent's execution id for the contexts this env builds
     /// (issue #698), so a no-DB test can prove `ctx.info().parent_execution_id`
     /// / `ctx.parent_execution_id()` report the configured parent. `None` (the
@@ -4673,6 +4820,11 @@ impl WorkflowTestEnv {
             && self.queue_name.is_empty()
             && self.execution_timeout.is_none()
             && self.parent_execution_id.is_none()
+            // Issue #798: without this a `with_build_id`-only env falls into the
+            // `None` arm and the configured build never reaches the live context,
+            // so `ctx.build_id()` reports `None` on both sides — self-consistent,
+            // but silently ignoring the caller's setting.
+            && self.build_id.is_none()
         {
             None
         } else {
@@ -4686,7 +4838,9 @@ impl WorkflowTestEnv {
                 queue_name: self.queue_name.clone(),
                 is_replay: false,
                 link_traceparent: None,
-                build_id: None,
+                // Issue #798: thread the configured build id so `ctx.build_id()`
+                // reports it inside the live test run (was hardcoded `None`).
+                build_id: self.build_id.clone(),
                 // Issue #772: thread the deadline budget so a live test run can
                 // exercise deadline-aware continue-as-new.
                 execution_timeout: self.execution_timeout,
@@ -4769,6 +4923,9 @@ impl WorkflowTestEnv {
                                 // Issue #798: carry the env's task queue so `replay_check`
                                 // self-checks against the same queue the live run saw.
                                 queue_name: self.queue_name.clone(),
+                                // Issue #798: likewise carry the env's build id, so a build-gated
+                                // workflow's self-check replays under the same build the live run saw.
+                                build_id: self.build_id.clone(),
                                 recorded_logs: recorded_logs.into_values().collect(),
                             };
                         }
@@ -4793,6 +4950,9 @@ impl WorkflowTestEnv {
                             // Issue #798: carry the env's task queue so `replay_check`
                             // self-checks against the same queue the live run saw.
                             queue_name: self.queue_name.clone(),
+                            // Issue #798: likewise carry the env's build id, so a build-gated
+                            // workflow's self-check replays under the same build the live run saw.
+                            build_id: self.build_id.clone(),
                             recorded_logs: recorded_logs.into_values().collect(),
                         };
                     }
@@ -4829,6 +4989,9 @@ impl WorkflowTestEnv {
             // Issue #798: carry the env's task queue so `replay_check`
             // self-checks against the same queue the live run saw.
             queue_name: self.queue_name.clone(),
+            // Issue #798: likewise carry the env's build id, so a build-gated
+            // workflow's self-check replays under the same build the live run saw.
+            build_id: self.build_id.clone(),
             recorded_logs: recorded_logs.into_values().collect(),
         }
     }
@@ -4902,6 +5065,9 @@ impl WorkflowTestEnv {
             // Issue #798: carry the env's task queue so `replay_check`
             // self-checks against the same queue the live run saw.
             queue_name: self.queue_name.clone(),
+            // Issue #798: likewise carry the env's build id, so a build-gated
+            // workflow's self-check replays under the same build the live run saw.
+            build_id: self.build_id.clone(),
             recorded_logs,
         }
     }

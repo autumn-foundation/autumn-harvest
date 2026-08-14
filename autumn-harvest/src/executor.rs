@@ -849,6 +849,18 @@ pub async fn run_workflow_strict(
     // `None` (a legacy fixture that carries no queue) preserves the prior
     // empty-string default.
     queue_name: Option<String>,
+    // Issue #798: the build id `ctx.build_id()` reports.
+    //
+    // Unlike every other value threaded here, this is **not** a recorded
+    // per-execution row value. The live worker supplies its *own configured*
+    // `WorkerConfig::build_id` through span_meta — never the execution's
+    // recorded `assigned_build_id` — so for a replay gate the semantically
+    // correct value is the **candidate** build's id (what the worker about to be
+    // promoted will report), supplied uniformly by the caller. Sourcing it from
+    // the fixture would replay under the *old* build's id, hiding exactly the
+    // candidate-only divergence the gate exists to find. `None` (the default)
+    // preserves the prior behavior of reporting no build id.
+    build_id: Option<String>,
     // Issue #614: the runtime registry's history policy
     // (`registry.history_policy()`, threaded by the worker), so a strict/diagnosis
     // replay of a workflow that branches on `ctx.should_continue_as_new()` stays
@@ -864,6 +876,7 @@ pub async fn run_workflow_strict(
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
         .with_queue_name(queue_name.unwrap_or_default())
+        .with_build_id(build_id)
         .with_history_policy(history_policy)
         .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
@@ -896,6 +909,9 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
     workflow_id: Option<String>,
     // Issue #798: the execution's task queue (see [`run_workflow_strict`]).
     queue_name: Option<String>,
+    // Issue #798: the candidate build id (see [`run_workflow_strict`] for why
+    // this is a caller-supplied value rather than one sourced from the fixture).
+    build_id: Option<String>,
     // Issue #614: the runtime registry's history policy (see [`run_workflow_strict`]).
     // `WorkflowHistoryPolicy::default()` preserves prior behavior.
     history_policy: WorkflowHistoryPolicy,
@@ -909,6 +925,7 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
         .with_queue_name(queue_name.unwrap_or_default())
+        .with_build_id(build_id)
         .with_history_policy(history_policy)
         .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
@@ -1120,6 +1137,15 @@ pub(crate) async fn run_workflow_canary(
     // on `ctx.queue_name()` does not false-report non-determinism in the deploy
     // replay canary or the in-flight replay-drift gate.
     queue_name: Option<String>,
+    // Issue #798: the **candidate** build id (see [`run_workflow_strict`]).
+    //
+    // Deliberately *not* sourced from the sampled row's `assigned_build_id`: the
+    // live worker reports its own configured build, and both this canary and the
+    // in-flight drift gate exist to answer "what will the build I am about to
+    // promote do with these histories?". Replaying under the recorded build
+    // would take the historical branch and report clean for candidate-only code
+    // that diverges on promotion.
+    build_id: Option<String>,
     // Issue #614: the runtime registry's history policy
     // (`registry.history_policy()`, threaded by the worker), so a canary/diagnosis
     // replay of a workflow that branches on `ctx.should_continue_as_new()` stays
@@ -1135,6 +1161,7 @@ pub(crate) async fn run_workflow_canary(
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
         .with_queue_name(queue_name.unwrap_or_default())
+        .with_build_id(build_id)
         .with_history_policy(history_policy)
         .with_metrics(metrics);
 
@@ -1389,6 +1416,12 @@ pub async fn run_workflow_with_state_advancing_clock(
     // Issue #698: thread the spawning parent's execution id so a child workflow
     // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
     .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
+    // Issue #798: thread the worker build id (mirrors the caps sibling
+    // `run_workflow_with_state_history_policy_and_caps`, which already does) so a
+    // `WorkflowTestEnv::with_build_id` run can exercise a build-gated workflow.
+    // Without it this harness path silently drops the configured build and
+    // `ctx.build_id()` reports `None` inside the live run.
+    .with_build_id(span_meta.and_then(|m| m.build_id.clone()))
     .with_metrics(metrics)
     // Issue #790.
     .with_log_policy(workflow_log_policy);

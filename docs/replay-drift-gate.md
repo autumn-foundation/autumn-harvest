@@ -115,10 +115,15 @@ async fn main() {
         .nth(1)
         .unwrap_or_else(|| "./fixtures/in-flight".to_string());
 
-    let report = ReplayVerifier::new()
-        .register(workflows![billing_checkout, onboarding])
-        .replay_bundle(&dir)
-        .await;
+    let mut verifier = ReplayVerifier::new().register(workflows![billing_checkout, onboarding]);
+
+    // If your workers set `WorkerConfig::build_id` (build routing, issue #171),
+    // pass the build you are ABOUT TO DEPLOY. See "Build-gated workflows" below.
+    if let Ok(build_id) = std::env::var("CANDIDATE_BUILD_ID") {
+        verifier = verifier.with_build_id(build_id);
+    }
+
+    let report = verifier.replay_bundle(&dir).await;
 
     println!("{report}");
     std::process::exit(report.exit_code());
@@ -233,6 +238,46 @@ ReplayVerifier::new()
 
 `WorkflowReplayer::with_history_policy` carries through to `replay_bundle` too,
 so a caller that already holds a configured replayer keeps its policy.
+
+### Build-gated workflows
+
+If your workflows branch on `ctx.build_id()` — the build-routing pattern from
+issue #171, e.g. rolling a new code path out under `if ctx.build_id() ==
+Some("v2")` — pass the **candidate** build id, meaning *the build you are about
+to deploy*:
+
+```rust
+ReplayVerifier::new()
+    .register(workflows![billing_checkout, onboarding])
+    .with_build_id("v2")            // NOT the build that recorded the fixtures
+    .replay_bundle(&dir)
+    .await
+```
+
+This one is the opposite of every other value the gate threads, and getting it
+backwards makes the gate say **yes** when it should say no:
+
+|                       | `queue_name`, `workflow_id`, `context_headers`, … | `build_id` |
+| --------------------- | -------------------------------------------------- | ---------- |
+| Live worker sources it from | the execution's own row                       | its **own** `WorkerConfig::build_id` |
+| Correct replay value  | the fixture's recorded value                        | the **candidate** build |
+| Carried in the bundle | yes — the export writes it, and the fixture wins    | **no**, deliberately |
+
+Because the live worker reports its own configured build rather than the
+execution's recorded `assigned_build_id`, a build id recorded into the fixture
+would be the **old** build's — so replaying under it takes the historical branch
+and the candidate-only path is never executed. The gate would then report clean
+for code that diverges the moment it is promoted. That is why no `build_id` is
+written into the bundle and why the value must come from your CI config.
+
+Leaving it unset makes `ctx.build_id()` report `None` during replay, which is
+correct only if your deployment does not set a build id at all.
+
+The two in-process gates need no configuration here: the [replay canary] and the
+replay-diagnosis endpoint both run *inside* the deployed candidate, so they
+thread that process's own configured build id automatically.
+
+[replay canary]: ./replay-verify.md
 
 ---
 
