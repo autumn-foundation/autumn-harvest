@@ -828,6 +828,51 @@ fn workflow_unregistered_dependency_failures<'a>(
     failures
 }
 
+/// Which failure classes `check_catalog_consistency` actually collected.
+///
+/// The check aggregates three unrelated classes into one `details.failures`
+/// list, so any single fixed remediation string is wrong for at least one of
+/// them. Compose the remediation from the classes present instead — which
+/// matters more now that the CLI prints `remediation` beneath the table by
+/// default rather than leaving it buried in `--output json`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CatalogFailureKinds {
+    /// A `#[dag]` node names an activity that is not registered.
+    unregistered_dag_activity: bool,
+    /// An opt-in `#[workflow(activities/children = …)]` entry does not resolve
+    /// (issue #802).
+    unresolved_declared_dependency: bool,
+    /// An activity declares `queue = ""`.
+    empty_default_queue: bool,
+}
+
+/// Build the remediation from the failure classes present, so an operator is
+/// never told to fix something that is not what failed.
+fn catalog_remediation(kinds: CatalogFailureKinds) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    if kinds.unregistered_dag_activity {
+        parts.push("Register the named activity in activities![…] so the DAG can dispatch it.");
+    }
+    if kinds.unresolved_declared_dependency {
+        // Preflight does not read workflow bodies, so it cannot tell "you
+        // forgot to register the handler" (a runtime hazard) from "you left a
+        // stale declaration behind" (cosmetic). Name both — the fix is one line
+        // either way.
+        parts.push(
+            "Register the named handler in activities![…] / workflows![…], or — if the \
+             workflow no longer references it — delete the stale entry from its declared \
+             dependencies.",
+        );
+    }
+    if kinds.empty_default_queue {
+        parts.push(
+            "Give the activity a non-empty default queue, or drop the queue attribute to \
+             fall back to the default queue.",
+        );
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
 fn check_catalog_consistency(api_state: &HarvestApiState) -> PreflightCheckResult {
     let Ok(runtime) = api_state.runtime() else {
         return check(
@@ -842,6 +887,8 @@ fn check_catalog_consistency(api_state: &HarvestApiState) -> PreflightCheckResul
         );
     };
 
+    let mut kinds = CatalogFailureKinds::default();
+
     let mut failures = dag_unregistered_activity_failures(
         runtime
             .dags()
@@ -849,15 +896,21 @@ fn check_catalog_consistency(api_state: &HarvestApiState) -> PreflightCheckResul
             .map(|dag| (dag.name.as_str(), dag.definition.tasks())),
         |name| runtime.registry().activities.contains_key(name),
     );
+    kinds.unregistered_dag_activity = !failures.is_empty();
+
     // Issue #802: opt-in declared dependencies. A workflow that never declared
     // any contributes nothing, so this is a pure addition for existing catalogs.
-    failures.extend(workflow_unregistered_dependency_failures(
+    let declared = workflow_unregistered_dependency_failures(
         runtime.registry().workflows.values(),
         |name| runtime.registry().activities.contains_key(name),
         |name| runtime.registry().workflows.contains_key(name),
-    ));
+    );
+    kinds.unresolved_declared_dependency = !declared.is_empty();
+    failures.extend(declared);
+
     for activity in runtime.registry().activities.values() {
         if activity.default_queue == Some("") {
+            kinds.empty_default_queue = true;
             failures.push(format!(
                 "activity '{}' declares an empty default queue",
                 activity.name
@@ -870,6 +923,7 @@ fn check_catalog_consistency(api_state: &HarvestApiState) -> PreflightCheckResul
     } else {
         PreflightStatus::Fail
     };
+    let remediation = catalog_remediation(kinds);
     check(
         "catalog_consistency",
         status,
@@ -878,16 +932,7 @@ fn check_catalog_consistency(api_state: &HarvestApiState) -> PreflightCheckResul
         } else {
             "registered catalog contains unresolved workflow runtime references"
         },
-        // Names both branches: preflight does not read workflow bodies, so it
-        // cannot tell "you forgot to register the handler" (a runtime hazard)
-        // from "you left a stale declaration behind" (cosmetic). Failing closed
-        // is correct, but the operator needs to know the fix is one line either
-        // way — the generic "fix the registration" wording named only the first.
-        (status == PreflightStatus::Fail).then_some(
-            "Register the named handler in activities![…] / workflows![…], or — if the \
-             workflow no longer references it — delete the stale entry from its declared \
-             dependencies.",
-        ),
+        remediation.as_deref(),
         Vec::new(),
         json!({
             "workflow_count": runtime.registry().workflows.len(),
@@ -2200,6 +2245,83 @@ mod tests {
                     .to_string()
             ]
         );
+    }
+
+    // `catalog_consistency` aggregates three unrelated failure classes, so its
+    // remediation is composed from the classes actually collected rather than
+    // being one fixed string that is wrong for at least one of them. These pin
+    // that each class contributes its own fix and none is dropped — the CLI now
+    // prints `remediation` beneath the table by default, so a mismatched string
+    // sends an operator after the wrong thing in-band.
+    mod catalog_remediation_composition {
+        use super::super::{CatalogFailureKinds, catalog_remediation};
+
+        #[test]
+        fn no_failures_yield_no_remediation() {
+            assert_eq!(catalog_remediation(CatalogFailureKinds::default()), None);
+        }
+
+        #[test]
+        fn each_class_contributes_only_its_own_fix() {
+            let dag = catalog_remediation(CatalogFailureKinds {
+                unregistered_dag_activity: true,
+                ..CatalogFailureKinds::default()
+            })
+            .expect("a failure class yields a remediation");
+            assert!(dag.contains("so the DAG can dispatch it"), "{dag}");
+            assert!(!dag.contains("declared"), "{dag}");
+            assert!(!dag.contains("default queue"), "{dag}");
+
+            let declared = catalog_remediation(CatalogFailureKinds {
+                unresolved_declared_dependency: true,
+                ..CatalogFailureKinds::default()
+            })
+            .expect("a failure class yields a remediation");
+            assert!(declared.contains("declared dependencies"), "{declared}");
+            assert!(!declared.contains("default queue"), "{declared}");
+
+            let queue = catalog_remediation(CatalogFailureKinds {
+                empty_default_queue: true,
+                ..CatalogFailureKinds::default()
+            })
+            .expect("a failure class yields a remediation");
+            assert!(queue.contains("non-empty default queue"), "{queue}");
+            assert!(!queue.contains("declared"), "{queue}");
+        }
+
+        #[test]
+        fn an_empty_default_queue_failure_keeps_its_own_remediation() {
+            // The regression this guards: narrowing the shared string to only
+            // name the issue #802 declared-dependency fix left this
+            // pre-existing class telling the operator to register a handler or
+            // delete a declaration, neither of which clears `queue = ""`.
+            let only_queue = catalog_remediation(CatalogFailureKinds {
+                empty_default_queue: true,
+                ..CatalogFailureKinds::default()
+            })
+            .expect("a failure class yields a remediation");
+            assert!(
+                only_queue.contains("non-empty default queue"),
+                "{only_queue}"
+            );
+            assert!(
+                !only_queue.contains("activities!["),
+                "an empty-queue-only failure must not be told to register a handler: {only_queue}"
+            );
+        }
+
+        #[test]
+        fn co_occurring_classes_each_keep_their_fix() {
+            let all = catalog_remediation(CatalogFailureKinds {
+                unregistered_dag_activity: true,
+                unresolved_declared_dependency: true,
+                empty_default_queue: true,
+            })
+            .expect("a failure class yields a remediation");
+            assert!(all.contains("so the DAG can dispatch it"), "{all}");
+            assert!(all.contains("delete the stale entry"), "{all}");
+            assert!(all.contains("non-empty default queue"), "{all}");
+        }
     }
 
     // ── Issue #802 — opt-in declared workflow dependencies ────────────────
