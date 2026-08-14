@@ -31795,16 +31795,16 @@ async fn db_conn_for_dag(
 /// Postgres cannot know the threshold is already satisfied until it has
 /// counted every single matching row, so a workflow with 500,000 recorded
 /// events pays to have all 500,000 counted merely to answer "yes, that's
-/// `>= 10,000`". Profiled on a 2.9M-row `harvest_events` fixture (5,000
+/// `>= 10,000`". Profiled on a 5.3M-row `harvest_events` fixture (5,000
 /// ordinary executions plus 15 long-running ones with 50k-450k events each;
 /// `autumn-harvest-plugin/scripts/history_bloat_perf_repro.sh`, artifacts
 /// committed under `docs/perf-artifacts/history-bloat-filter/`):
 /// `(SELECT COUNT(*) ...) >= 10000` against a 448,175-event execution reads
-/// 85,973 total buffers (`pg_stat_statements.total_buffers`, corroborated by
-/// `EXPLAIN (ANALYZE, BUFFERS)` showing `shared hit=13487 read=72547`) via a
+/// 158,593 total buffers (`pg_stat_statements.total_buffers`, corroborated by
+/// `EXPLAIN (ANALYZE, BUFFERS)` showing `shared hit=13578 read=145015`) via a
 /// Parallel Seq Scan over the whole table -- Postgres estimated a
 /// high-selectivity equality predicate cheaper to satisfy by streaming past
-/// the other 2.4M+ non-matching rows than by using the existing
+/// the other ~4.9M non-matching rows than by using the existing
 /// `(workflow_exec_id, event_id)` index.
 ///
 /// # The fix
@@ -31815,17 +31815,17 @@ async fn db_conn_for_dag(
 /// for `0`, `1`, `actual_count - 1`, `actual_count`, `actual_count + 1`, and
 /// values far past `actual_count`), but only ever needs to read
 /// `min(actual_count, min_events)` rows to answer it. On the same fixture
-/// this reads 386 total buffers against the identical 448,175-event
-/// execution -- a 99.55% reduction -- and is unchanged for an ordinary,
-/// un-bloated execution (4 buffers either way, both forms using an Index
+/// this reads 388 total buffers against the identical 448,175-event
+/// execution -- a 99.76% reduction -- and is unchanged for an ordinary,
+/// un-bloated execution (5 buffers either way, both forms using an Index
 /// Only Scan since the whole history fits in a handful of rows).
 ///
 /// **The `ORDER BY event_id` is load-bearing, not decorative.** Without an
 /// explicit sort target, an `EXISTS (... OFFSET n LIMIT 1)` gives Postgres no
 /// reason to walk `idx_harvest_events_exec (workflow_exec_id, event_id)` in
 /// order, and for a high-selectivity `workflow_exec_id` the planner may still
-/// choose a plain Seq Scan (measured: 43,166 buffers on the same fixture --
-/// better than the unbounded `COUNT(*)`, but 111x worse than the indexed
+/// choose a plain Seq Scan (measured: 88,618 buffers on the same fixture --
+/// better than the unbounded `COUNT(*)`, but 228x worse than the indexed
 /// form). With the `ORDER BY`, the same composite index `store::load_history`
 /// already relies on turns this into an Index Only Scan capped at exactly
 /// `min_events` entries regardless of the workflow's true event count.
