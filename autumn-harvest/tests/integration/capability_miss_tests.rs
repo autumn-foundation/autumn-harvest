@@ -60,7 +60,8 @@ use autumn_harvest::telemetry::{
 };
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{
-    DbPool, HandlerRegistry, NO_CAPABLE_WORKER_PREFIX, Worker, WorkerRuntimeConfig,
+    DbPool, HandlerRegistry, NO_CAPABLE_WORKER_PREFIX, SESSION_PINNED_ESCALATION_MARKER, Worker,
+    WorkerRuntimeConfig,
 };
 use autumn_harvest::{RetryPolicy, WorkflowContext, store};
 
@@ -473,9 +474,9 @@ async fn wait_for_terminal(
 // ---------------------------------------------------------------------------
 
 /// Assert the invariants every capability-miss release must satisfy, whatever
-/// the task type: the claim is dropped for a peer, the row carries an operator
-/// breadcrumb, and none of the *crash* accounting is touched (AC4).
-fn assert_released_for_a_peer(task: &TaskQueueItem, expect_error_fragment: &str) {
+/// the task type: the claim is dropped for a peer, none of the *crash*
+/// accounting is touched (AC4), and the row is not marked as having failed.
+fn assert_released_for_a_peer(task: &TaskQueueItem) {
     assert_eq!(
         task.state, "PENDING",
         "a capability miss must release the claim, not hold or fail it"
@@ -504,12 +505,17 @@ fn assert_released_for_a_peer(task: &TaskQueueItem, expect_error_fragment: &str)
          budget silently drains (AC4)"
     );
 
+    // The `error` column is reserved for genuine task failures and must stay
+    // untouched. `/stack` (issue #773) renders any non-null `error` on a pending
+    // activity as a `last_failure` — and because the release also restores
+    // `attempt` to 0 (asserted above), a breadcrumb here would surface as a
+    // failure at an otherwise-unreachable attempt 0 for work that never ran,
+    // violating #773 AC3. The operator breadcrumb reaches them through the
+    // release's `tracing::info!` and the `harvest.task.capability_miss` counter
+    // instead; `release_never_writes_the_error_column` covers both directions.
     assert!(
-        task.error
-            .as_deref()
-            .is_some_and(|e| e.contains(expect_error_fragment)),
-        "the released row must carry an operator breadcrumb naming the missing \
-         handler; wanted {expect_error_fragment:?}, got {:?}",
+        task.error.is_none(),
+        "a capability miss is not a task failure and must not write `error`; got {:?}",
         task.error
     );
 }
@@ -709,10 +715,7 @@ async fn workflow_capability_miss_is_released_for_a_capable_peer() {
     .await;
 
     // AC1 — released back to PENDING for a peer, not failed.
-    assert_released_for_a_peer(
-        &released,
-        "no workflow handler registered for 'peer_only_wf'",
-    );
+    assert_released_for_a_peer(&released);
     assert_eq!(released.task_type, "workflow");
     assert_eq!(
         released.capability_misses, 1,
@@ -847,10 +850,7 @@ async fn activity_capability_miss_is_released_for_a_capable_peer() {
     // AC2 — the ACTIVITY task is the one released.
     assert_eq!(released.task_type, "activity");
     assert_eq!(released.queue_name, Q_ACT_ACTS);
-    assert_released_for_a_peer(
-        &released,
-        "no activity handler registered for 'peer_only_activity'",
-    );
+    assert_released_for_a_peer(&released);
     assert_eq!(
         released.activity_name.as_deref(),
         Some("peer_only_activity"),
@@ -1043,6 +1043,28 @@ async fn session_pinned_capability_miss_escalates_immediately() {
 
     let error = failed.error.unwrap_or_default();
     assert!(error.starts_with(NO_CAPABLE_WORKER_PREFIX), "got {error:?}");
+
+    // The reason must describe THIS branch, not the budget-exhausted one. The
+    // budget above is 50 and zero releases happened, so the shared wording would
+    // have claimed "after 50 capability-miss redeliveries" — a release count
+    // that never occurred — and asserted a fleet-wide conclusion that may be
+    // false, since a capable peer can exist and simply be ineligible for a
+    // pinned row. An operator following the runbook would then check
+    // `reachability`, get `in_use`, and be stranded.
+    assert!(
+        !error.contains("after 50"),
+        "the pinned task was released ZERO times; the reason must not name the \
+         configured budget: {error}"
+    );
+    assert!(
+        !error.contains("no live worker on this queue has the handler"),
+        "a capable peer may exist and merely be ineligible for a pinned row: {error}"
+    );
+    assert!(
+        error.contains(SESSION_PINNED_ESCALATION_MARKER),
+        "the pin is the actual cause and must be named: {error}"
+    );
+
     assert_eq!(
         metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED),
         1,
@@ -1228,24 +1250,32 @@ async fn a_capable_worker_that_parks_resets_the_capability_miss_budget() {
     assert_eq!(load_execution(&url, exec_id).await.state, "RUNNING");
 }
 
-/// The **workflow-task-timeout** re-pend (#494) must reset the budget too.
+/// The **workflow-task-timeout** re-pend (#494) must NOT touch the budget.
 ///
-/// Reaching `reset_timed_out_workflow_task` proves capability just as firmly as
-/// a park does — more so, in fact: the handler was resolved, invoked, and ran
-/// long enough to blow `workflow_task_timeout`. A worker that cannot find the
-/// handler releases in microseconds and never reaches this path.
+/// It is tempting to reset here — a timeout usually means the handler was found
+/// and ran long, which would be proof of capability. That premise does not hold
+/// on this path. The #494 budget is armed around the whole of `process_task`,
+/// and `pool.get()` plus the full history load both sit inside it, strictly
+/// *before* the registry lookup that defines a capability miss. Under pool
+/// starvation or a slow shard the timeout fires with the lookup never having
+/// run, so reaching here proves nothing about the claiming worker.
 ///
-/// Without the reset, a workflow that absorbs some misses during a deploy and
-/// then has one slow decision cycle inherits the stale streak, and a single
-/// later incapable claim can push it straight over the bound — escalating a run
-/// whose handler is demonstrably live and merely slow. That is the same
-/// cumulative-counter failure the park reset exists to prevent, reached by a
-/// different door.
+/// Resetting on that false premise is the worse of the two errors: a genuinely
+/// unregistered type under load would have its consecutive-miss streak zeroed
+/// indefinitely and never escalate, so the run never reaches the
+/// `no_capable_worker:` terminal AC3 promises and the operator sees only the
+/// ticket-severity sustained-release rule instead of the page. It also erases
+/// an in-flight miss when the release UPDATE itself is what timed out.
+///
+/// The accepted cost runs the other way: a capable-but-slow worker's timeout
+/// leaves a stale streak, so a later genuine miss can escalate before spending
+/// the full budget. That direction is fail-safe — a loud, actionable terminal
+/// failure rather than a silently un-escalating task.
 ///
 /// Driven against the real `pub` entry point, so the assertion cannot drift
 /// from the statement the way a SQL-shape test could.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_timed_out_workflow_task_reset_clears_the_capability_miss_budget() {
+async fn a_timed_out_workflow_task_reset_preserves_the_capability_miss_budget() {
     let (url, _container) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1275,10 +1305,10 @@ async fn a_timed_out_workflow_task_reset_clears_the_capability_miss_budget() {
         "the timed-out task must be re-pended for any worker to re-claim"
     );
     assert_eq!(
-        task.capability_misses, 0,
-        "the handler was found and invoked, so the CONSECUTIVE-miss streak must \
-         restart clean; inheriting it would let one later incapable claim escalate \
-         a run whose handler is live"
+        task.capability_misses, 4,
+        "a timeout can fire before the handler lookup ever runs (pool starvation, \
+         slow shard), so it is NOT proof of capability; zeroing here would let an \
+         unregistered type reset its streak indefinitely and never escalate"
     );
     assert!(
         task.worker_id.is_none(),
@@ -1289,6 +1319,89 @@ async fn a_timed_out_workflow_task_reset_clears_the_capability_miss_budget() {
         load_execution(&url, exec_id).await.state,
         "RUNNING",
         "a timeout re-pend must not terminate the execution"
+    );
+}
+
+/// A release must leave the task row's `error` column **untouched** so the
+/// issue #773 `/stack` surface does not fabricate a failure that never happened.
+///
+/// `/stack` renders any non-null `error` on a pending activity as a
+/// `last_failure`, with `error_type: "Error"` and the row's raw `attempt`.
+/// Because a release also restores `attempt` to `0`, writing the diagnostic
+/// there would report a failure at an otherwise-unreachable `attempt: 0` for an
+/// activity that never executed — violating #773 AC3 ("a never-failed pending
+/// activity omits `last_failure`") and making a blameless deploy skew look like
+/// an application bug on the one surface whose runbook question is "why is this
+/// activity retrying?".
+///
+/// A real prior failure must survive the release untouched too: the next
+/// attempt reads it through `ActivityContext::previous_failure()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_never_writes_the_error_column() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    // (a) A fresh, never-failed row must stay never-failed.
+    let exec_id = seed_workflow(&mut conn, "noop_wf", serde_json::json!({}), Q_NOOP).await;
+    let task_id = load_tasks(&url, exec_id).await[0].id;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'incapable', \
+         started_at = NOW(), attempt = 1 WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("simulate a claim");
+
+    let released = queue::release_task_for_capability_miss(
+        &mut conn,
+        task_id,
+        "incapable",
+        Duration::from_secs(1),
+    )
+    .await
+    .expect("release query runs");
+    assert!(released);
+
+    let task = load_task(&url, task_id).await;
+    assert!(
+        task.error.is_none(),
+        "a capability miss is not a task failure; /stack would render this as a \
+         last_failure at attempt 0 for work that never ran (#773 AC3): {:?}",
+        task.error
+    );
+    assert_eq!(
+        task.attempt, 0,
+        "the claim's increment is undone, which is exactly why an `error` here \
+         would surface at an impossible attempt 0"
+    );
+
+    // (b) A genuine prior failure must survive untouched.
+    let exec2 = seed_workflow(&mut conn, "noop_wf", serde_json::json!({ "n": 2 }), Q_NOOP).await;
+    let task2 = load_tasks(&url, exec2).await[0].id;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'incapable', \
+         started_at = NOW(), attempt = 2, error = 'downstream 503' WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task2)
+    .execute(&mut conn)
+    .await
+    .expect("simulate a claim over a real prior failure");
+
+    let released2 = queue::release_task_for_capability_miss(
+        &mut conn,
+        task2,
+        "incapable",
+        Duration::from_secs(1),
+    )
+    .await
+    .expect("release query runs");
+    assert!(released2);
+    assert_eq!(
+        load_task(&url, task2).await.error.as_deref(),
+        Some("downstream 503"),
+        "the real failure the next attempt branches on via previous_failure() \
+         must not be clobbered by an infrastructure string"
     );
 }
 
@@ -1322,7 +1435,6 @@ async fn release_is_a_noop_when_the_claim_was_already_taken() {
         task_id,
         "worker-we-are",
         Duration::from_secs(1),
-        "no workflow handler registered for 'noop_wf'",
     )
     .await
     .expect("release query runs");

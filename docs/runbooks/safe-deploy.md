@@ -356,7 +356,12 @@ WorkerConfig::default().with_capability_miss_max_redeliveries(20)
 ```
 
 Setting it to `0` escalates on the first miss — i.e. opts back into the
-pre-#804 fail-fast behaviour.
+pre-#804 fail-fast behaviour. A run failed that way says so explicitly
+(`capability-miss redelivery is disabled …; a capable worker may exist on this
+queue`) rather than claiming the fleet lacks the handler, because with a budget
+of `0` exactly one worker demonstrated it lacks the handler and no peer was
+ever asked. That matters if you reach for `0` as a rollback switch *during* an
+incident: the resulting terminal error names the knob, not a missing deploy.
 
 ### Interactions and carve-outs
 

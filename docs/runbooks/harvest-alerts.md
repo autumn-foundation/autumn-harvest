@@ -2084,6 +2084,23 @@ Distinct from two adjacent signals, deliberately:
    `error`), which is not the DLQ. Do not look in `GET /dead-letters` for these
    — it will be empty, and that emptiness is not evidence the alert is spurious.
 
+   The `error` distinguishes the **three** escalation causes, which have
+   different fixes — read it before acting on steps 1–3. **Only the first
+   supports a fleet-wide conclusion**; in the other two the task was released
+   *zero* times, so a capable worker may well exist and simply never have been
+   asked, and `reachability` reporting `in_use` at step 1 is expected rather
+   than contradictory:
+
+   | `error` says | Cause | Fix |
+   | --- | --- | --- |
+   | `escalated after N capability-miss redeliveries; no live worker on this queue has the handler` | The task was genuinely offered around the queue N times and nobody took it. | Deploy the handler / finish the rollout. Steps 1–3 apply as written. |
+   | `escalated immediately after 0 redeliveries: capability-miss redelivery is disabled (capability_miss_max_redeliveries = 0) …` | Redelivery is switched off, so the task was failed on its first claim by a single incapable worker and never offered to a peer. | Raise `capability_miss_max_redeliveries` off `0`. Steps 1–3 may find nothing wrong — this is a config, not a missing deploy. |
+   | `escalated immediately after 0 redeliveries: task is pinned to worker session {id} …` | The task is hard-pinned to one host (#606) and could never be offered to a peer at all. | Go to the pinned host, not the fleet — see *Likely causes*. Raising the budget is a **guaranteed no-op** here. |
+
+   The matching worker log carries a `session_pinned` boolean and, when set, a
+   `session_id`, so the same three-way split is greppable in logs as well as in
+   the execution's `error`.
+
 ### Likely causes
 
 - A rolling deploy that introduces a new workflow or activity type is **stalled
@@ -2099,6 +2116,14 @@ Distinct from two adjacent signals, deliberately:
 - The task's owning **worker session** (issue #606) is hard-pinned to a host
   that lacks the handler. A session-pinned task cannot be released for a peer —
   the pin is the point — so it escalates immediately rather than bouncing.
+  **This case is self-identifying**: its `error` says `pinned to worker session
+  {id}` and reports `0 redeliveries`, instead of naming the budget. It is the
+  one escalation where *step 1 is expected to disagree with you* —
+  `reachability` may correctly report `in_use` because a capable worker does
+  exist elsewhere in the fleet; the task simply cannot reach it. Go straight to
+  the pinned host (`GET /api/harvest/workers`, match the session's host) and ask
+  why *it* lacks the handler. Do not chase a missing deploy on the strength of
+  the `no_capable_worker:` prefix alone.
 
 ### False positives
 
@@ -2115,9 +2140,16 @@ Distinct from two adjacent signals, deliberately:
   progressively unlikely — each redelivery waits longer than the last (1s, 2s,
   4s, 8s, 16s at the default budget of 5, ~31 s of total dwell; the curve caps
   at 30 s per redelivery for larger budgets) — but if you see escalation on a
-  queue that
-  `reachability` reports as `in_use`, that is the cause — raise
+  queue that `reachability` reports as `in_use`, that is the cause — raise
   `capability_miss_max_redeliveries` rather than treating it as a lost handler.
+
+  **Check the `error` first, though.** Escalation on an `in_use` queue has two
+  *other* causes that raising the budget cannot fix, and both say so in the
+  `error` (see the three-cause table in *Triage steps*): a **session-pinned**
+  task, where a larger budget is a guaranteed no-op because the pin bypasses it
+  entirely, and a **zero budget**, where the knob is already the problem.
+  Probabilistic exhaustion is the diagnosis only when the `error` names a
+  non-zero redelivery count.
 
 ### Safe actions
 

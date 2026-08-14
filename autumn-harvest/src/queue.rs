@@ -2056,11 +2056,20 @@ pub async fn defer_rate_limited_task(
 ///   first three backoffs whole. Unlike an ordinary retry (where firing early
 ///   is harmless), the backoff is the only thing spacing redeliveries out
 ///   across a rolling deploy, so it must not be defeatable by clock skew.
-/// - **`error` is preserved when already set** (`COALESCE(error, $4)`).
-///   `ActivityContext::previous_failure()` reads this column, so clobbering it
-///   would hand the next attempt an infrastructure string instead of the real
-///   downstream failure it is meant to branch on. A first-claim miss on a row
-///   with no prior failure still records the diagnostic for triage.
+/// - **`error` is left entirely untouched.** A capability miss is not a task
+///   failure — the handler never ran — so the column reserved for real failure
+///   reporting must not carry an infrastructure diagnostic. Two surfaces read
+///   it and would both be misled: `ActivityContext::previous_failure()` (which
+///   an author branches on) and, more sharply, the issue #773 `/stack`
+///   endpoint, which renders any non-null `error` on a pending activity as a
+///   `last_failure`. Because the release also restores `attempt` to `0`, that
+///   would report a failure at an otherwise-unreachable `attempt: 0` for an
+///   activity that never executed — violating #773 AC3 ("a never-failed
+///   pending activity omits `last_failure`") and making a blameless deploy
+///   skew look like an application bug on the one surface whose runbook
+///   question is "why is this activity retrying?". The diagnostic still
+///   reaches the operator through the release's `tracing::info!` and the
+///   `harvest.task.capability_miss` counter.
 #[must_use]
 pub const fn release_task_for_capability_miss_query() -> &'static str {
     "UPDATE harvest_task_queue \
@@ -2072,7 +2081,6 @@ pub const fn release_task_for_capability_miss_query() -> &'static str {
          crash_strikes = 0, \
          capability_misses = capability_misses + 1, \
          scheduled_at = NOW() + make_interval(secs => $3), \
-         error = COALESCE(error, $4), \
          sticky_worker_id = NULL, \
          sticky_until = NULL, \
          sticky_timeout = NULL, \
@@ -2126,12 +2134,57 @@ pub const fn release_task_for_capability_miss_query() -> &'static str {
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
+/// SQL for [`restore_capability_misses`]. Extracted as a `const fn` so the
+/// monotone `GREATEST` guard is unit-testable without a database.
+#[must_use]
+pub const fn restore_capability_misses_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET capability_misses = GREATEST(capability_misses, $2) \
+     WHERE id = $1"
+}
+
+/// Put back a `capability_misses` value that [`park_workflow_task`] zeroed on a
+/// path which is *not* proof the parking worker was capable (issue #804).
+///
+/// Only [`crate::worker::requeue_parent_on_transient_ingest_conflict`] needs
+/// this: it parks from inside the wake-event ingest, which runs before the
+/// handler lookup, so a worker with no handler for the type can reach it. The
+/// reset lives in the shared park SQL that every legitimate post-lookup caller
+/// also uses, so this restores the value rather than parameterising a query
+/// with ten correct callers.
+///
+/// `GREATEST` makes the restore **monotone**, which is what makes it safe
+/// against the narrow window between the park and this statement: if a peer
+/// claimed the freshly-parked row and recorded its own miss in that gap, its
+/// higher count wins and is never clobbered back down. In the ordinary case
+/// nothing touched the row and the pre-park value is restored exactly.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn restore_capability_misses(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    misses: i32,
+) -> HarvestResult<()> {
+    // Nothing to restore, and `GREATEST(x, 0)` is a no-op anyway.
+    if misses <= 0 {
+        return Ok(());
+    }
+    diesel::sql_query(restore_capability_misses_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Integer, _>(misses)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
 pub async fn release_task_for_capability_miss(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     worker_id: &str,
     backoff: StdDuration,
-    reason: &str,
 ) -> HarvestResult<bool> {
     // Bounded by `capability_miss_backoff`'s 30s cap; the clamp is defensive.
     let backoff_secs = f64::min(backoff.as_secs_f64(), 3600.0);
@@ -2139,7 +2192,6 @@ pub async fn release_task_for_capability_miss(
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .bind::<diesel::sql_types::Double, _>(backoff_secs)
-        .bind::<diesel::sql_types::Text, _>(reason)
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -2315,14 +2367,23 @@ pub async fn park_workflow_task(
 /// Parking resets `capability_misses` (issue #804). A workflow task row is
 /// long-lived — it is reused for the entire execution — and parking is the
 /// dominant suspension path (activity, signal, child workflow, mutex; only a
-/// timer suspension goes through [`reschedule_task`]). It is reached only
-/// AFTER the handler lookup in `process_workflow_task` succeeded, so a park is
-/// proof that a capable worker handled this row and the consecutive-miss
-/// budget must start clean. Without this the counter would be cumulative over
-/// the execution's whole life, so a long-lived entity workflow would escalate
-/// during a later, unrelated deploy while a capable worker is demonstrably
-/// live. `primary_repend_workflow_task_query` needs no equivalent reset: the
-/// parked state it matches is produced only here.
+/// timer suspension goes through [`reschedule_task`]). Nearly every caller is
+/// reached only AFTER the handler lookup in `process_workflow_task` succeeded,
+/// so a park is proof that a capable worker handled this row and the
+/// consecutive-miss budget must start clean. Without this the counter would be
+/// cumulative over the execution's whole life, so a long-lived entity workflow
+/// would escalate during a later, unrelated deploy while a capable worker is
+/// demonstrably live. `primary_repend_workflow_task_query` needs no equivalent
+/// reset: the parked state it matches is produced only here.
+///
+/// **One caller is *not* proof of capability** and must therefore undo this
+/// reset itself: [`crate::worker::requeue_parent_on_transient_ingest_conflict`]
+/// (issue #779) parks from inside the wake-event ingest, which runs *before*
+/// the handler lookup. A worker with no handler for the type can reach it, so
+/// letting it zero the counter would restart the consecutive-miss budget on a
+/// path that proves nothing — weakening the escalation bound the release
+/// contract depends on. That caller restores the pre-park value with
+/// [`restore_capability_misses`] immediately afterwards.
 const fn park_workflow_task_sticky_query() -> &'static str {
     "WITH candidate AS ( \
          SELECT id, wake_requested FROM harvest_task_queue \
@@ -3658,6 +3719,57 @@ mod tests {
             sql.contains("capability_misses = capability_misses + 1"),
             "the bounded-redelivery counter is the only counter a capability \
              miss advances (AC3/AC4)",
+        );
+    }
+
+    /// The release must leave the task row's `error` column **untouched**.
+    ///
+    /// `error` is the failure-reporting channel for a task that genuinely ran
+    /// and failed. The issue #773 `/stack` surface renders it verbatim as a
+    /// `last_failure` on any pending activity, with `error_type: "Error"` and
+    /// the row's raw `attempt`. A capability miss never ran the handler AND
+    /// restores `attempt` to `0`, so writing the diagnostic there fabricates a
+    /// failure that did not happen, at an otherwise-unreachable `attempt: 0`,
+    /// and makes a blameless deploy skew indistinguishable from a real
+    /// application failure on the exact surface whose runbook question is "why
+    /// is this activity retrying?".
+    ///
+    /// Issue #773 AC3 states the invariant directly: a never-failed pending
+    /// activity omits `last_failure` entirely. The diagnostic reaches the
+    /// operator through the `tracing::info!` on release and the
+    /// `harvest.task.capability_miss` counter, so nothing is lost by keeping
+    /// it out of a column reserved for real failures.
+    /// The pre-lookup park undo must never *lower* a fresher count.
+    ///
+    /// `park_workflow_task` zeroes `capability_misses`, which is proof-backed
+    /// for every caller except the issue #779 transient-ingest-conflict
+    /// re-drive, which runs before the handler lookup. That caller restores the
+    /// pre-park value — but a peer can claim the freshly-parked row and record
+    /// its own miss in the gap, so a plain assignment would clobber a real
+    /// increment back down and hand the task extra budget. `GREATEST` makes the
+    /// restore monotone, so the higher of the two always survives.
+    #[test]
+    fn restore_capability_misses_query_is_monotone() {
+        let sql = restore_capability_misses_query();
+        assert!(
+            sql.contains("GREATEST(capability_misses, $2)"),
+            "a peer's increment recorded between the park and this restore must \
+             win, so the restore may only ever raise the counter: {sql}"
+        );
+        assert!(
+            !sql.contains("capability_misses = $2"),
+            "a bare assignment would clobber a fresher peer increment: {sql}"
+        );
+        assert!(sql.contains("WHERE id = $1"), "{sql}");
+    }
+
+    #[test]
+    fn capability_miss_release_query_never_writes_the_error_column() {
+        let sql = release_task_for_capability_miss_query();
+        assert!(
+            !sql.contains("error ="),
+            "a capability miss is not a task failure; writing `error` makes \
+             /stack fabricate a last_failure at attempt 0 (issue #773 AC3): {sql}"
         );
     }
 

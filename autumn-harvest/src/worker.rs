@@ -3867,12 +3867,32 @@ pub enum CapabilityMissAction {
 /// by an incapable worker" behaviour. Note this is the *opposite* sentinel to
 /// `poison_pill_threshold`'s `0` (which disables quarantine): "max
 /// redeliveries = 0" literally means no redeliveries are allowed.
+///
+/// **Storage ceiling.** A value of `i32::MAX` always escalates, whatever the
+/// budget. `capability_misses` is a Postgres `INT`, and Rust's saturating
+/// arithmetic diverges from Postgres's here: `i32::saturating_add` clamps, but
+/// `capability_misses + 1` at `2147483647` raises `integer out of range` and
+/// aborts the statement. Releasing at the ceiling would therefore issue an
+/// UPDATE that can only fail, leaving the task `RUNNING` and owned by a *live*
+/// worker — which the poison-pill orphan reclaimer deliberately skips, since it
+/// only reclaims rows whose worker has no live heartbeat. The invariant is
+/// stated on the value about to be persisted rather than on the budget: **never
+/// let the column reach `i32::MAX`**, so `+ 1` is always representable however
+/// the counter got there. Organically it never does (2^31 releases at the 30 s
+/// backoff cap is roughly two thousand years), but the column is writable by an
+/// operator, a backfill, or a test seed.
 #[must_use]
 pub const fn capability_miss_decision(
     misses_after_increment: i32,
     max_redeliveries: u32,
 ) -> CapabilityMissAction {
     if max_redeliveries == 0 {
+        return CapabilityMissAction::Escalate;
+    }
+    if misses_after_increment == i32::MAX {
+        // See "Storage ceiling" above: persisting this would make the next
+        // `+ 1` unrepresentable in the column, so the budget is exhausted by
+        // storage regardless of what it was configured to.
         return CapabilityMissAction::Escalate;
     }
     // `max_redeliveries` is bounded by u32 but the persisted counter is i32;
@@ -3912,18 +3932,114 @@ pub fn capability_miss_backoff(misses_before_this_release: i32) -> Duration {
     )
 }
 
+/// Marker inside the escalation reason for a task that was **never releasable**
+/// because it is hard-pinned to a worker session (issue #606).
+///
+/// The two escalations have genuinely different causes and therefore different
+/// fixes, so they must be tellable apart in the execution's `error` column.
+/// Greppable alongside [`NO_CAPABLE_WORKER_PREFIX`], which both variants keep.
+pub const SESSION_PINNED_ESCALATION_MARKER: &str = "pinned to worker session";
+
+/// Marker inside the escalation reason for a task that was **never releasable**
+/// because redelivery is disabled (`capability_miss_max_redeliveries = 0`).
+///
+/// Greppable alongside [`NO_CAPABLE_WORKER_PREFIX`], which every variant keeps.
+pub const ZERO_BUDGET_ESCALATION_MARKER: &str = "capability-miss redelivery is disabled";
+
+/// Why a capability miss escalated instead of being released (issue #804).
+///
+/// Resolved from the inputs already available to [`no_capable_worker_reason`],
+/// so naming the three cases costs no extra plumbing at the call site — but
+/// makes the match exhaustive, so a future fourth escalation branch cannot
+/// silently inherit another branch's wording (which is exactly how the
+/// session-pinned and zero-budget cases came to claim a budget they never
+/// spent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscalationCause {
+    /// The task really was released `max_redeliveries` times and no worker
+    /// took it. Only this case supports the fleet-wide conclusion.
+    BudgetExhausted,
+    /// Redelivery is disabled, so the task was failed on its first claim by a
+    /// single incapable worker, having been offered to no peer at all.
+    ZeroBudgetFailFast,
+    /// The task is hard-pinned to one host and could never reach a peer,
+    /// whatever the budget says.
+    SessionPinned(uuid::Uuid),
+}
+
+impl EscalationCause {
+    /// The pin outranks the config: a session-pinned task escalates on the
+    /// first miss even with a generous budget, so raising the budget off `0`
+    /// cannot help it. Naming the config there would hand the operator a fix
+    /// that is a guaranteed no-op.
+    const fn resolve(max_redeliveries: u32, session_id: Option<uuid::Uuid>) -> Self {
+        match session_id {
+            Some(session) => Self::SessionPinned(session),
+            None if max_redeliveries == 0 => Self::ZeroBudgetFailFast,
+            None => Self::BudgetExhausted,
+        }
+    }
+}
+
 /// Build the terminal error recorded when a capability miss escalates
 /// (issue #804).
 ///
-/// Prefixed with [`NO_CAPABLE_WORKER_PREFIX`] so the "no live worker in the
-/// fleet has this handler" case is greppable and alertable, and distinct from
-/// an ordinary application failure.
+/// Prefixed with [`NO_CAPABLE_WORKER_PREFIX`] so the "this task could not reach
+/// a worker that has its handler" case is greppable and alertable, and distinct
+/// from an ordinary application failure. Every variant keeps that prefix: the
+/// runbook's recovery sweep matches it over `GET /workflows?state=FAILED`, and
+/// the recovery action (re-start or reset the run) is the same for all three.
+///
+/// Three variants, because the branches have different causes and therefore
+/// different operator fixes. The distinction is load-bearing rather than
+/// cosmetic: **only the first supports a fleet-wide conclusion.**
+///
+/// - **Budget exhausted** — the task really was offered around the queue
+///   `max_redeliveries` times and no worker took it, so "no live worker on this
+///   queue has the handler" is a supported conclusion. Fix: deploy the handler
+///   or roll the fleet forward.
+/// - **Zero budget** (`max_redeliveries == 0`) — redelivery is disabled (the
+///   pre-#804 fail-fast behaviour), so the task was failed on its first claim
+///   by a single incapable worker, having been released **zero** times. Exactly
+///   one worker demonstrated it lacks the handler; a capable peer may well
+///   exist and never have been asked. Fix: raise the knob off `0`.
+/// - **Session-pinned** (`session_id: Some(_)`) — the task escalated on the
+///   **first** miss because the claim gate
+///   (`session_id IS NULL OR sticky_worker_id = $1`) can only ever return it to
+///   the same host (see [`capability_miss_releasable`]). Fix: go to the pinned
+///   host, not the fleet.
+///
+/// In the latter two the task was released zero times, so naming
+/// `max_redeliveries` would state a release count that never happened, and the
+/// fleet-wide clause may be outright false. That matters operationally: the
+/// runbook's first triage step is `GET /admin/workflow-types/reachability`,
+/// which in both cases can report `in_use` and flatly contradict the reason,
+/// stranding whoever is holding the page on a missing deploy that does not
+/// exist.
 #[must_use]
-pub fn no_capable_worker_reason(detail: &str, max_redeliveries: u32) -> String {
-    format!(
-        "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated after {max_redeliveries} \
-         capability-miss redeliveries; no live worker on this queue has the handler)"
-    )
+pub fn no_capable_worker_reason(
+    detail: &str,
+    max_redeliveries: u32,
+    session_id: Option<uuid::Uuid>,
+) -> String {
+    match EscalationCause::resolve(max_redeliveries, session_id) {
+        EscalationCause::BudgetExhausted => format!(
+            "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated after {max_redeliveries} \
+             capability-miss redeliveries; no live worker on this queue has the handler)"
+        ),
+        EscalationCause::ZeroBudgetFailFast => format!(
+            "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated immediately after 0 redeliveries: \
+             {ZERO_BUDGET_ESCALATION_MARKER} (capability_miss_max_redeliveries = 0), so this task \
+             was failed on its first claim by an incapable worker and was never offered to a peer; \
+             a capable worker may exist on this queue)"
+        ),
+        EscalationCause::SessionPinned(session) => format!(
+            "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated immediately after 0 redeliveries: \
+             task is {SESSION_PINNED_ESCALATION_MARKER} {session} and can only ever run on that \
+             host, so it cannot be released to a capable peer; the pinned host does not register \
+             the handler)"
+        ),
+    }
 }
 
 /// Should this task be released for a capable peer at all, or escalated
@@ -7383,6 +7499,14 @@ async fn requeue_parent_on_transient_ingest_conflict(
         Some(queue::StickyHint::new(worker_id, sticky_timeout))
     };
     let _ = queue::park_workflow_task(conn, task.id, sticky).await?;
+    // The shared park SQL zeroes `capability_misses` (issue #804), which is
+    // correct for every OTHER caller because they are all reached after the
+    // handler lookup in `process_workflow_task` succeeded. This one is not: the
+    // wake-event ingest runs before that lookup, so a worker with no handler for
+    // the type reaches it too, and letting it zero the counter would restart the
+    // consecutive-miss budget on a path that proves nothing about capability —
+    // weakening the escalation bound. Restore what the row had on claim.
+    queue::restore_capability_misses(conn, task.id, task.capability_misses).await?;
     queue::wake_workflow_task(conn, exec_id).await?;
     Ok(())
 }
@@ -14361,6 +14485,27 @@ async fn process_workflow_task(
     Ok(())
 }
 
+/// What a dispatch actually did, so the poll loop can tell a task this worker
+/// genuinely ran apart from one it handed straight back (issue #804).
+///
+/// The distinction is load-bearing, not cosmetic. The dispatch site treats a
+/// plain `Ok(())` as evidence the execution made progress and clears the issue
+/// #494 consecutive-workflow-task-timeout strike map for it. A capability-miss
+/// release is *not* that evidence: the handler never ran, so this worker
+/// observed nothing at all about whether the workflow body still hangs.
+/// Collapsing the two would let an incapable worker erase a genuinely hung
+/// execution's hang-detection streak — the mirror image of the argument that
+/// says a capability miss must never *increment* `crash_strikes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskDispatchOutcome {
+    /// The handler ran to a normal conclusion for this dispatch cycle.
+    Completed,
+    /// A capability miss handed the claim back (or found it already taken), so
+    /// the handler never ran and this dispatch proves nothing about the
+    /// execution's health.
+    Released,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_task(
     pool: &DbPool,
@@ -14384,7 +14529,7 @@ async fn process_task(
     // an activity task is not wrapped in it.
     workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
     capability_miss_max_redeliveries: u32,
-) -> HarvestResult<()> {
+) -> HarvestResult<TaskDispatchOutcome> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
     let outcome = match ClaimedTaskKind::from_db(&task.task_type)? {
@@ -14431,7 +14576,7 @@ async fn process_task(
             {
                 conn = pool.get().await.map_err(crate::error::database_error)?;
             } else {
-                return result;
+                return result.map(|()| TaskDispatchOutcome::Completed);
             }
             result
         }
@@ -14443,10 +14588,10 @@ async fn process_task(
     // schedule-activity enqueue). `fail_execution_on_error` passes the typed
     // variant through un-failed precisely so it lands here.
     let Err(error) = &outcome else {
-        return outcome;
+        return outcome.map(|()| TaskDispatchOutcome::Completed);
     };
     let Some((kind, name)) = error.handler_not_registered() else {
-        return outcome;
+        return outcome.map(|()| TaskDispatchOutcome::Completed);
     };
     handle_capability_miss(
         &mut conn,
@@ -14478,7 +14623,7 @@ async fn handle_capability_miss(
     kind: &'static str,
     name: &str,
     max_redeliveries: u32,
-) -> HarvestResult<()> {
+) -> HarvestResult<TaskDispatchOutcome> {
     let (action, misses_after) =
         resolve_capability_miss(task.capability_misses, max_redeliveries, task.session_id);
     let detail = format!("no {kind} handler registered for '{name}'");
@@ -14492,8 +14637,7 @@ async fn handle_capability_miss(
             // statement, so host/Postgres skew cannot swallow it.
             let delay = capability_miss_backoff(task.capability_misses);
             let released =
-                queue::release_task_for_capability_miss(conn, task.id, worker_id, delay, &detail)
-                    .await?;
+                queue::release_task_for_capability_miss(conn, task.id, worker_id, delay).await?;
             if !released {
                 // A concurrent poison-pill reclaim (or an operator action) took
                 // the row out from under this claim. Nothing to do and nothing
@@ -14502,7 +14646,10 @@ async fn handle_capability_miss(
                     task_id = %task.id,
                     "capability-miss release matched no row; the claim was already taken"
                 );
-                return Ok(());
+                // Still `Released`, not `Completed`: this worker observed
+                // nothing about the execution, so it must not be treated as a
+                // clean dispatch (see `TaskDispatchOutcome`).
+                return Ok(TaskDispatchOutcome::Released);
             }
             metrics.record_task_capability_miss(
                 &task.queue_name,
@@ -14520,16 +14667,39 @@ async fn handle_capability_miss(
                 backoff_secs = delay.as_secs(),
                 "released task for a capable peer: no handler registered on this worker"
             );
-            Ok(())
+            Ok(TaskDispatchOutcome::Released)
         }
         CapabilityMissAction::Escalate => {
-            let reason = no_capable_worker_reason(&detail, max_redeliveries);
-            fail_task_and_execution(conn, task, worker_id, &reason).await?;
+            let reason = no_capable_worker_reason(&detail, max_redeliveries, task.session_id);
+            // Recorded BEFORE the terminal write, deliberately. This counter is
+            // what the page-severity `harvest_no_capable_worker` rule selects
+            // on, and the terminal write can fail transiently — which is
+            // precisely the case that most needs the page: a failed
+            // `fail_task_and_execution` leaves the row `RUNNING` under a *live*
+            // worker, where the poison-pill orphan reclaimer (which requires a
+            // dead heartbeat) cannot see it. Ordering the metric after the `?`
+            // would silence the alert in exactly that stranding case.
+            //
+            // The counter therefore reports the escalation *decision*, which is
+            // final by the time it is emitted. A stranded row is re-claimed
+            // later and escalates again, so the counter is at-least-once rather
+            // than exactly-once — the right trade for a paging signal.
             metrics.record_task_capability_miss(
                 &task.queue_name,
                 &task.task_type,
                 crate::telemetry::CAPABILITY_MISS_OUTCOME_ESCALATED,
             );
+            fail_task_and_execution(conn, task, worker_id, &reason).await?;
+            // The message must match the branch, not just carry a field naming
+            // it: a session-pinned escalation is NOT evidence that the queue has
+            // no capable worker (see `no_capable_worker_reason`), and logging it
+            // as such sends whoever is reading logs after a page to look for a
+            // missing deploy that may not exist.
+            let message = if task.session_id.is_some() {
+                "escalated task: pinned to a worker session whose host does not register the handler"
+            } else {
+                "escalated task: no capable worker on this queue registers the handler"
+            };
             tracing::error!(
                 task_id = %task.id,
                 queue = %task.queue_name,
@@ -14539,7 +14709,8 @@ async fn handle_capability_miss(
                 capability_misses = misses_after,
                 max_redeliveries,
                 session_pinned = task.session_id.is_some(),
-                "escalated task: no capable worker on this queue registers the handler"
+                session_id = ?task.session_id,
+                "{message}"
             );
             Err(HarvestError::HandlerNotRegistered {
                 kind,
@@ -17916,7 +18087,7 @@ impl Worker {
                 )
                 .await
                 {
-                    Ok(Ok(())) => {
+                    Ok(Ok(TaskDispatchOutcome::Completed)) => {
                         // Success: clear the consecutive-timeout counter for
                         // this execution so a later transient timeout doesn't
                         // inherit previous strikes.
@@ -17926,6 +18097,18 @@ impl Worker {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .remove(&exec_id);
                         }
+                    }
+                    Ok(Ok(TaskDispatchOutcome::Released)) => {
+                        // Issue #804: a capability-miss release deliberately
+                        // does NOT clear the strike map. The handler never ran,
+                        // so this dispatch is not evidence that the workflow
+                        // body stopped hanging — and clearing it here would let
+                        // an incapable worker reset a genuinely hung
+                        // execution's consecutive-timeout streak every time it
+                        // happened to claim the row, so `poison_pill_threshold`
+                        // would never be reached in a mixed fleet and issue
+                        // #494's protection would be silently defeated by a
+                        // blameless third party.
                     }
                     Ok(Err(error)) => {
                         // Task returned a clean error (not a timeout): clear
@@ -18577,13 +18760,31 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
         // rather than waiting for the expired lease of the hung worker.
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<chrono::Utc>>),
-        // Reaching this path PROVES the claiming worker was capable: the
-        // handler was found and invoked, and ran long enough to exceed
-        // `workflow_task_timeout` (issue #494). `capability_misses` counts
-        // CONSECUTIVE misses, so an intervening capable dispatch must reset it
-        // or a later incapable claim inherits the stale streak and escalates
-        // the workflow early (issue #804).
-        dsl::capability_misses.eq(0),
+        // `capability_misses` is deliberately NOT reset here (issue #804).
+        //
+        // It is tempting to: a workflow-task timeout usually means the handler
+        // was found and ran long, which would be proof of capability. But that
+        // premise does not hold on this path. The timeout is armed around the
+        // whole of `process_task`, and `pool.get()` plus the full history load
+        // both sit inside it — strictly *before* the registry lookup that
+        // defines a capability miss. Under pool starvation or a slow shard the
+        // budget expires with the lookup never having run, so reaching here
+        // proves nothing about the claiming worker.
+        //
+        // Resetting on that false premise is the worse error of the two: a
+        // genuinely unregistered type under load would have its consecutive-miss
+        // streak zeroed indefinitely and never escalate, so the run never
+        // reaches the `no_capable_worker:` terminal AC3 promises and the
+        // operator sees only the ticket-severity sustained-release rule instead
+        // of the page. It also erases an in-flight miss when the release UPDATE
+        // itself is what timed out.
+        //
+        // Accepted cost: a capable-but-slow worker's timeout leaves a stale
+        // streak, so a later genuine miss can escalate before spending the full
+        // budget. That direction is fail-safe — it produces a loud, actionable
+        // terminal failure rather than a silently un-escalating task — and the
+        // two `park_workflow_task` queries already cover the dominant
+        // proof-of-capability path (the handler ran and suspended).
     ))
     .execute(&mut conn)
     .await
@@ -21734,7 +21935,7 @@ mod tests {
 
     #[test]
     fn no_capable_worker_reason_carries_the_stable_prefix_and_detail() {
-        let reason = no_capable_worker_reason("no workflow handler registered for 'wf'", 5);
+        let reason = no_capable_worker_reason("no workflow handler registered for 'wf'", 5, None);
         assert!(
             reason.starts_with(NO_CAPABLE_WORKER_PREFIX),
             "escalation reason must be greppable by its stable prefix: {reason}"
@@ -21745,6 +21946,149 @@ mod tests {
             "reason must name the exact redelivery budget that was exhausted \
              (a single-char containment check cannot catch an off-by-one): {reason}"
         );
+    }
+
+    /// The reason must describe the branch that was actually taken.
+    ///
+    /// A session-pinned task escalates on the FIRST miss, having been released
+    /// zero times — so the budget-exhausted wording states a release count that
+    /// never happened, and its "no live worker on this queue has the handler"
+    /// clause can be outright false: a capable peer may exist and simply be
+    /// ineligible for this row, because the claim gate
+    /// (`session_id IS NULL OR sticky_worker_id = $1`) pins it to one host.
+    ///
+    /// That is not cosmetic. The runbook's first triage step is
+    /// `GET /admin/workflow-types/reachability`, which in that case reports
+    /// `in_use` — directly contradicting the reason, and stranding whoever is
+    /// holding the page on a missing deploy that does not exist.
+    #[test]
+    fn session_pinned_escalation_reason_names_the_pin_not_a_phantom_budget() {
+        let session = uuid::Uuid::new_v4();
+        let pinned = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            50,
+            Some(session),
+        );
+
+        // Still greppable and still identifies the missing handler: the runbook
+        // tells operators to match this prefix on the execution `error` column,
+        // and both escalation causes must remain findable by that one query.
+        assert!(
+            pinned.starts_with(NO_CAPABLE_WORKER_PREFIX),
+            "both escalation causes keep the stable prefix: {pinned}"
+        );
+        assert!(pinned.contains("transcode"), "{pinned}");
+
+        // It must NOT claim a budget it never spent. `50` is the budget the
+        // integration test configures, which under the old shared wording
+        // produced "after 50 ... redeliveries" after zero releases.
+        assert!(
+            !pinned.contains("after 50"),
+            "a session-pinned task is released ZERO times; naming the configured \
+             budget states a release count that never happened: {pinned}"
+        );
+        assert!(
+            pinned.contains("0 redeliveries"),
+            "the real release count must be stated: {pinned}"
+        );
+
+        // It must NOT assert the fleet-wide conclusion, which may be false.
+        assert!(
+            !pinned.contains("no live worker on this queue has the handler"),
+            "a capable peer may exist and merely be ineligible for a pinned row, \
+             so this conclusion must not be asserted: {pinned}"
+        );
+
+        // It must name the actual constraint, and the session it is pinned to.
+        assert!(
+            pinned.contains(SESSION_PINNED_ESCALATION_MARKER),
+            "the pin is the cause and must be greppable: {pinned}"
+        );
+        assert!(
+            pinned.contains(&session.to_string()),
+            "the operator needs the session id to find the host: {pinned}"
+        );
+
+        // The budget-exhausted variant is unchanged and stays distinguishable.
+        let exhausted =
+            no_capable_worker_reason("no activity handler registered for 'transcode'", 50, None);
+        assert!(
+            exhausted.contains("after 50 capability-miss redeliveries"),
+            "{exhausted}"
+        );
+        assert!(
+            exhausted.contains("no live worker on this queue has the handler"),
+            "the budget-exhausted branch DID offer the task around the queue, so \
+             its stronger conclusion is supported: {exhausted}"
+        );
+        assert!(
+            !exhausted.contains(SESSION_PINNED_ESCALATION_MARKER),
+            "the two causes must be tellable apart by grep: {exhausted}"
+        );
+    }
+
+    /// A budget of `0` escalates on the FIRST claim, so the fleet-wide
+    /// conclusion is unsupported there for exactly the same reason it is
+    /// unsupported for a session-pinned task: the task was offered to one
+    /// worker and released zero times.
+    ///
+    /// `0` is a documented, supported config (the pre-#804 fail-fast behaviour),
+    /// and it is the rollback switch an operator reaches for *during* an
+    /// incident when #804's release behaviour is itself suspected — so this
+    /// wording fires precisely when someone is already mid-page. Saying
+    /// "escalated after 0 redeliveries; no live worker on this queue has the
+    /// handler" is self-contradictory (offered zero times, yet concluding
+    /// nobody took it) and sends them to hunt a missing deploy that may not
+    /// exist.
+    #[test]
+    fn zero_budget_escalation_reason_does_not_claim_a_fleet_wide_conclusion() {
+        let zero =
+            no_capable_worker_reason("no activity handler registered for 'transcode'", 0, None);
+
+        assert!(
+            zero.starts_with(NO_CAPABLE_WORKER_PREFIX),
+            "all escalation causes keep the stable prefix: {zero}"
+        );
+        assert!(zero.contains("transcode"), "{zero}");
+
+        // The defect: the fleet-wide conclusion is not supported by a single
+        // incapable claim.
+        assert!(
+            !zero.contains("no live worker on this queue has the handler"),
+            "with a budget of 0 the task was never offered to a peer, so this \
+             conclusion is unsupported and may be outright false: {zero}"
+        );
+
+        // It must name the config as the cause, so the fix is obvious.
+        assert!(
+            zero.contains(ZERO_BUDGET_ESCALATION_MARKER),
+            "the disabled-redelivery config is the cause and must be greppable: {zero}"
+        );
+        assert!(
+            zero.contains("capability_miss_max_redeliveries"),
+            "name the knob so the operator can act without reading source: {zero}"
+        );
+
+        // It is a distinct cause from the session pin, not a relabel of it.
+        assert!(
+            !zero.contains(SESSION_PINNED_ESCALATION_MARKER),
+            "the three causes must be tellable apart by grep: {zero}"
+        );
+
+        // A session-pinned task with a zero budget reports the PIN, because the
+        // pin is the load-bearing constraint: raising the budget off 0 would
+        // still escalate immediately, so naming the config would misdirect.
+        let both = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            0,
+            Some(uuid::Uuid::new_v4()),
+        );
+        assert!(
+            both.contains(SESSION_PINNED_ESCALATION_MARKER),
+            "the pin outranks the config: raising the budget cannot help a \
+             pinned task, so the pin is the actionable cause: {both}"
+        );
+        assert!(!both.contains(ZERO_BUDGET_ESCALATION_MARKER), "{both}");
     }
 
     #[test]
@@ -21815,22 +22159,65 @@ mod tests {
         );
     }
 
+    /// The Rust counter saturates; the Postgres column does **not**.
+    ///
+    /// `saturating_add` clamps at `i32::MAX`, but `capability_misses INT` is a
+    /// signed 4-byte column and `capability_misses + 1` at `2147483647` raises
+    /// `integer out of range` and aborts the statement. So a decision of
+    /// `Release` at the ceiling issues an UPDATE that can only fail, leaving the
+    /// task `RUNNING` and owned by a **live** worker — which the poison-pill
+    /// orphan reclaimer deliberately skips, because it only reclaims rows whose
+    /// worker has no live heartbeat.
+    ///
+    /// The guard is stated as an invariant on the value about to be persisted,
+    /// not on the budget: **never let the column reach `i32::MAX`**, so `+ 1` is
+    /// always representable. That covers both the already-saturated count and
+    /// the last legitimate increment, and holds however the ceiling was reached
+    /// (organically it never is — 2^31 releases at the 30 s backoff cap is
+    /// ~2000 years — but the column is writable by an operator, a backfill, or
+    /// a test seed).
     #[test]
-    fn no_capable_worker_reason_is_greppable_and_names_the_missing_handler() {
-        // AC3 requires "an unambiguous reason"; operators grep the DLQ for the
-        // stable prefix, so it must lead the string and the missing handler's
-        // identity must be present.
-        let reason = no_capable_worker_reason("no workflow handler registered for 'onboarding'", 5);
-        assert!(
-            reason.starts_with(NO_CAPABLE_WORKER_PREFIX),
-            "the stable prefix must lead the reason: {reason}"
+    fn capability_miss_decision_escalates_at_the_storage_ceiling() {
+        // The exact shape flagged in review: a budget at or above the column's
+        // maximum cannot bound a saturated counter by comparison alone.
+        assert_eq!(
+            capability_miss_decision(i32::MAX, i32::MAX.cast_unsigned()),
+            CapabilityMissAction::Escalate,
+            "a saturated counter must escalate even when the budget is i32::MAX"
         );
-        assert!(reason.contains("onboarding"), "{reason}");
-        assert!(
-            reason.contains('5'),
-            "the exhausted budget must be stated: {reason}"
+        assert_eq!(
+            capability_miss_decision(i32::MAX, u32::MAX),
+            CapabilityMissAction::Escalate,
+            "a budget above the column's range is clamped, not wrapped, and still \
+             must not authorise an overflowing increment"
+        );
+        // One below the ceiling is the last value the column may hold, so this
+        // is where the guard starts: persisting it would make the NEXT `+ 1`
+        // unrepresentable.
+        assert_eq!(
+            capability_miss_decision(i32::MAX - 1, u32::MAX),
+            CapabilityMissAction::Release,
+            "the guard must fire only at the ceiling, not one short of it"
+        );
+        // End to end through the real entry point.
+        assert_eq!(
+            resolve_capability_miss(i32::MAX, u32::MAX, None),
+            (CapabilityMissAction::Escalate, i32::MAX),
+            "the persisted-count path must reach the same verdict"
+        );
+        // A normal budget is completely unaffected.
+        assert_eq!(
+            capability_miss_decision(3, 5),
+            CapabilityMissAction::Release,
+            "the ceiling guard must not perturb ordinary budgets"
         );
     }
+
+    // (A near-duplicate of `no_capable_worker_reason_carries_the_stable_prefix_and_detail`
+    // lived here. Its assertions were a strict subset — and its budget check was
+    // `contains('5')`, a single-char containment that could not detect an
+    // off-by-one — so it was folded into that test and the session-variant test
+    // above rather than kept as a weaker second copy.)
 
     // -----------------------------------------------------------------------
     // Contained workflow handler-panic retry (issue #782)
