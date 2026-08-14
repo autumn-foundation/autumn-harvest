@@ -200,6 +200,31 @@ fn declaration_expr(declared: Option<&[String]>) -> proc_macro2::TokenStream {
 /// Parsed through a dedicated [`syn::parse::Parse`] impl so the `bracketed!`
 /// macro receives a real `ParseStream` binding, matching the repo's
 /// `meta.value()?.parse()?` idiom.
+/// Reject a repeated `activities` / `children` key.
+///
+/// Every other `#[workflow]` attribute is last-wins, which is merely surprising
+/// for a scalar. Here it would silently **weaken a safety check**:
+/// `activities = [missing_handler], activities = []` records only the empty
+/// list, so preflight passes even though the first declaration named an
+/// unregistered handler — the exact deploy-time miss this attribute exists to
+/// catch. Fail loud instead. Rejecting rather than merging is deliberate: a
+/// repeated key is a mistake (a copy-paste, or a badly resolved merge), and
+/// silently concatenating would accept two lists the author believed were one.
+fn reject_duplicate_dependency_attr<T>(
+    meta: &syn::meta::ParseNestedMeta<'_>,
+    existing: Option<&T>,
+    attr_name: &str,
+) -> syn::Result<()> {
+    if existing.is_some() {
+        return Err(meta.error(format!(
+            "`{attr_name}` is declared more than once — merge the entries into a single \
+             `{attr_name} = [...]` list; a repeated key would silently discard the earlier \
+             declaration and weaken the deploy-time preflight check"
+        )));
+    }
+    Ok(())
+}
+
 /// Human-facing hint for the two most likely wrong-container mistakes.
 ///
 /// `#[workflow]`'s existing vocabulary has exactly two container idioms:
@@ -563,9 +588,11 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             result.mcp = crate::attr_util::parse_bool_flag(&meta)?;
             Ok(())
         } else if meta.path.is_ident("activities") {
+            reject_duplicate_dependency_attr(&meta, result.declared_activities.as_ref(), "activities")?;
             result.declared_activities = Some(parse_dependency_list(&meta, "activities")?);
             Ok(())
         } else if meta.path.is_ident("children") {
+            reject_duplicate_dependency_attr(&meta, result.declared_children.as_ref(), "children")?;
             result.declared_children = Some(parse_dependency_list(&meta, "children")?);
             Ok(())
         } else {

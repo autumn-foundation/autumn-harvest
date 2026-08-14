@@ -138,9 +138,10 @@ mixed-catalog failure set through the real `HashMap`-backed registry);
 `macros_workflow.rs` — 5 expansion tests covering every path qualifier form
 (`crate::` / `self::` / `super::` / leading `::` / bare ident), string literals,
 the absent case, the explicitly-empty case, and the fluent builders;
-`info.rs` — 4 record/`Debug` tests plus a DAG-shadow pin; five new trybuild
+`info.rs` — 4 record/`Debug` tests plus a DAG-shadow pin; six new trybuild
 `compile_fail` fixtures pin the blank-name rejection, the non-name-entry
-rejection, both wrong-container rejections, and the widened `#[workflow]`
+rejection, both wrong-container rejections, the duplicate-key rejection, and
+the widened `#[workflow]`
 unsupported-attribute whitelist; `interface_schema_integration.rs` — 2 route
 tests proving both discovery endpoints surface the declaration end-to-end;
 `autumn-harvest-cli` — 6 renderer tests pinning that failures and remediation

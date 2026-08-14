@@ -42,6 +42,7 @@ fn compile_fail_cases() {
     t.compile_fail("tests/compile_fail/workflow_invalid_dependency_entry.rs");
     t.compile_fail("tests/compile_fail/workflow_dependency_string_container.rs");
     t.compile_fail("tests/compile_fail/workflow_dependency_paren_container.rs");
+    t.compile_fail("tests/compile_fail/workflow_duplicate_dependency_attr.rs");
     t.compile_fail("tests/compile_fail/workflow_unsupported_attribute.rs");
     t.pass("tests/compile_fail/suppressed_guardrails.rs");
 }
