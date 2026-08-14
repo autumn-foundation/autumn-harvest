@@ -2700,13 +2700,18 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
             return Err(err);
         }
     };
-    let rendered = render_response(&cli, &response)?;
     // Issue #756: a degraded cross-shard read carries its partial-availability
     // warning on STDERR, keeping STDOUT a clean/parseable body (`-o json | jq`)
     // on both the happy and degraded paths. The operator still sees the warning.
     if let Some(notice) = fanout_partial_notice(&response) {
         eprintln!("{notice}");
     }
+    // `render_response` is deliberately called inside each arm rather than once
+    // up front: for a bundle export it produces a full pretty-printed copy of
+    // every sampled payload, which the default (non-JSON) arm then discards in
+    // favour of `summary`. `write_history_sample_bundle` is already serializing
+    // every fixture, so holding a second whole-response copy alongside it is
+    // what pushes a large export toward an OOM on a CI runner.
     if let Some(dir) = history_sample_output_dir(&cli) {
         // Issue #798: the sample export writes a replay BUNDLE (one fixture per
         // sampled execution plus the coverage manifest), not a single blob, so
@@ -2714,17 +2719,18 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         // `-o json` still prints the raw response for scripting.
         let summary = write_history_sample_bundle(&response, dir)?;
         if cli.output == OutputFormat::Json {
-            println!("{rendered}");
+            println!("{}", render_response(&cli, &response)?);
         } else {
             print!("{summary}");
         }
     } else if let Some(path) = history_output_file(&cli) {
+        let rendered = render_response(&cli, &response)?;
         fs::write(path, &rendered).map_err(|source| CliError::WriteOutput {
             path: path.display().to_string(),
             source,
         })?;
     } else {
-        println!("{rendered}");
+        println!("{}", render_response(&cli, &response)?);
     }
     if matches!(cli.command, Commands::Preflight) {
         let exit_code = preflight_exit_code(&response);
@@ -2947,6 +2953,21 @@ pub fn render_history_sample_summary(response: &Value, dir: &Path) -> String {
     if sampled_total < in_flight_total {
         out.push_str(
             "NOTE: the sample is truncated; a clean gate verifies the SAMPLE, not the fleet.\n",
+        );
+    }
+    // Distinct from the NOTE above, and the distinction is what an operator acts
+    // on: that one reports the *intended* truncation of sampling `per_workflow`
+    // out of a larger population, this one an *unplanned* resource limit. Raising
+    // `--per-workflow` would make this strictly worse.
+    if manifest
+        .and_then(|manifest| manifest.get("truncated_by_size"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        out.push_str(
+            "\nWARNING: the export stopped early on the response byte budget, so this bundle \
+             is SMALLER than the sample you asked for. Narrow the export (fewer states, a \
+             single --shard-id, a lower --max-bytes) rather than raising --per-workflow.\n",
         );
     }
 
@@ -12423,6 +12444,64 @@ mod replay_sample_bundle_tests {
         let summary = render_history_sample_summary(&response, Path::new("./fixtures"));
         assert!(!summary.contains("WARNING"), "{summary}");
         assert!(!summary.contains("NOTE:"), "{summary}");
+    }
+
+    /// An export stopped by the response byte budget must say so at write time.
+    ///
+    /// Distinct from the `NOTE: the sample is truncated` line, and the
+    /// distinction is what the operator acts on: that reports the *intended*
+    /// truncation of sampling `--per-workflow` out of a larger population, this
+    /// reports an *unplanned* resource limit. Reading the two as the same thing
+    /// leads to raising `--per-workflow`, which makes it strictly worse.
+    #[test]
+    fn summary_warns_that_the_export_was_cut_short_by_the_byte_budget() {
+        let mut response = sample_response();
+        response["manifest"]["truncated_by_size"] = json!(true);
+
+        let summary = render_history_sample_summary(&response, Path::new("./fixtures"));
+        assert!(
+            summary.contains("response byte budget"),
+            "the cause must be named: {summary}"
+        );
+        assert!(
+            summary.contains("SMALLER than the sample you asked for"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("rather than raising --per-workflow"),
+            "the fix must steer away from the one that makes it worse: {summary}"
+        );
+    }
+
+    /// Control: an export that was NOT size-truncated must not claim it was.
+    ///
+    /// `sample_response()` is already truncated by population, so this also pins
+    /// that the two truncation kinds are reported independently.
+    #[test]
+    fn summary_of_a_population_truncated_sample_does_not_claim_a_size_cut() {
+        let summary = render_history_sample_summary(&sample_response(), Path::new("./fixtures"));
+        assert!(
+            summary.contains("NOTE: the sample is truncated"),
+            "population truncation is still reported: {summary}"
+        );
+        assert!(
+            !summary.contains("response byte budget"),
+            "a population-truncated sample must not claim a size cut: {summary}"
+        );
+    }
+
+    /// A manifest written before `truncated_by_size` existed must not warn.
+    #[test]
+    fn summary_of_a_legacy_manifest_without_the_size_flag_does_not_warn() {
+        let response = json!({
+            "manifest": { "status": "complete", "sampled_total": 4, "in_flight_total": 4,
+                          "per_workflow": [{ "workflow_name": "wf", "sampled": 4, "in_flight_total": 4 }],
+                          "states": ["RUNNING"], "unavailable_shards": [], "inspected_shards": [0],
+                          "generated_at": "2026-01-01T00:00:00Z" },
+            "exports": []
+        });
+        let summary = render_history_sample_summary(&response, Path::new("./fixtures"));
+        assert!(!summary.contains("response byte budget"), "{summary}");
     }
 
     /// The CLI default is `redacted`, and the replay gate REFUSES a redacted

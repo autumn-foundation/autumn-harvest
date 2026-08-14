@@ -33689,6 +33689,11 @@ struct HistorySampleExportWork {
     per_shard_population: Vec<Vec<autumn_harvest::replay_sample::SampleWorkflowCoverage>>,
     /// Sample rows from every shard, globally re-stratified before export.
     sample_rows: Vec<HistorySampleCandidate>,
+    /// Set when the export stopped early on
+    /// [`autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES`], so the
+    /// manifest can report the cut rather than presenting a quietly-trimmed
+    /// bundle as the sample that was asked for.
+    truncated_by_size: bool,
 }
 
 /// Extract the per-workflow-type in-flight population from one shard's rows.
@@ -33865,7 +33870,13 @@ async fn export_sampled_history_candidates(
         max_bytes: query.max_bytes,
     };
     let rows = std::mem::take(&mut work.sample_rows);
+    let mut budget = SampleByteBudget::default();
     for row in rows {
+        if budget.exhausted() {
+            work.truncated_by_size = true;
+            break;
+        }
+        let before = work.batch.exports.len();
         let candidate = row.into_export_candidate();
         export_history_candidate(
             pool,
@@ -33876,6 +33887,60 @@ async fn export_sampled_history_candidates(
             outcome,
         )
         .await;
+        // A candidate that failed (size limit, unreadable shard) records a
+        // failure instead of an export, so charge the budget from what was
+        // actually retained rather than assuming every row costs something.
+        let retained = (work.batch.exports.len() > before)
+            .then(|| {
+                work.batch
+                    .exports
+                    .last()
+                    .map(|document| document.size_limit.actual_bytes)
+            })
+            .flatten();
+        budget.charge_attempt(retained);
+    }
+}
+
+/// Running total of the bytes one sample export has accumulated in memory.
+///
+/// [`autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL`] bounds the fixture
+/// *count*, but `max_bytes` is per-document and caller-raisable, so the count
+/// cap alone leaves the aggregate unbounded — ~20 GiB at the defaults, on a
+/// shared management API. This is the aggregate bound.
+///
+/// Split out as a value rather than inlined so the two rules that matter are
+/// unit-testable without a database: the budget must actually *stop* the loop,
+/// and a candidate that produced no document must not be charged for one.
+#[derive(Debug, Default, Clone, Copy)]
+struct SampleByteBudget {
+    used: usize,
+}
+
+impl SampleByteBudget {
+    /// Whether no further history should be fetched.
+    ///
+    /// Checked *before* a fetch: a document's size is not knowable until it is
+    /// loaded, so peak retained bytes are the budget plus at most one document.
+    const fn exhausted(self) -> bool {
+        self.used >= autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES
+    }
+
+    /// Charge one export attempt.
+    ///
+    /// `retained` is `None` when the attempt produced a *failure* rather than a
+    /// document (over `max_bytes`, unreadable shard). Such an attempt holds no
+    /// bytes, so charging it would shrink the budget for histories that were
+    /// never retained and cut the sample short for free — which is why the
+    /// "did this attempt retain anything?" rule lives here, where it is
+    /// testable, rather than in the loop.
+    ///
+    /// Saturating, so a pathological `max_bytes` cannot wrap the running total
+    /// back under the budget and reopen an exhausted export.
+    const fn charge_attempt(&mut self, retained: Option<usize>) {
+        if let Some(bytes) = retained {
+            self.used = self.used.saturating_add(bytes);
+        }
     }
 }
 
@@ -33923,6 +33988,7 @@ fn build_sample_manifest(
             .map(|shard| format!("shard {}: {}", shard.shard_id, shard.reason))
             .collect(),
         inspected_shards: work.batch.inspected_shards.clone(),
+        truncated_by_size: work.truncated_by_size,
     }
 }
 
@@ -43007,6 +43073,100 @@ mod tests {
             manifest.is_truncated(),
             "0 sampled of 43 in flight is the definition of truncated"
         );
+    }
+
+    /// The aggregate byte budget must actually stop the export loop.
+    ///
+    /// `MAX_SAMPLE_TOTAL` bounds the fixture count, but `max_bytes` is
+    /// per-document and caller-raisable, so without an aggregate bound a routine
+    /// authenticated CI export can accumulate ~20 GiB before the management API
+    /// serializes a single response — on a shared service.
+    #[test]
+    fn sample_byte_budget_stops_the_export_when_exhausted() {
+        let cap = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
+        let mut budget = SampleByteBudget::default();
+        assert!(
+            !budget.exhausted(),
+            "a fresh budget must admit the first fetch"
+        );
+
+        budget.charge_attempt(Some(cap - 1));
+        assert!(
+            !budget.exhausted(),
+            "one byte under the budget must still admit a fetch"
+        );
+
+        budget.charge_attempt(Some(1));
+        assert!(budget.exhausted(), "reaching the budget must stop the loop");
+    }
+
+    /// A candidate that produced no document must not be charged for one.
+    ///
+    /// A failed export (over `max_bytes`, unreadable shard) records a failure
+    /// rather than a document, so charging it would shrink the budget for
+    /// histories that were never retained — cutting the sample short for free.
+    #[test]
+    fn sample_byte_budget_charges_only_retained_documents() {
+        let cap = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
+        let mut budget = SampleByteBudget::default();
+
+        // Park the budget one byte short of exhaustion, so a single wrongly
+        // charged attempt would visibly close it.
+        budget.charge_attempt(Some(cap - 1));
+        assert!(!budget.exhausted());
+
+        // Every candidate here FAILED (over `max_bytes`, unreadable shard), so
+        // no document was retained. Charging any of them would end the export
+        // early and silently shrink the sample.
+        for _ in 0..1_000 {
+            budget.charge_attempt(None);
+        }
+        assert!(
+            !budget.exhausted(),
+            "failed candidates retain no bytes and must not consume the budget"
+        );
+
+        // Control: a genuinely retained document still charges.
+        budget.charge_attempt(Some(1));
+        assert!(budget.exhausted());
+    }
+
+    /// A pathological `max_bytes` must not wrap the running total back under
+    /// the budget and reopen an exhausted export.
+    #[test]
+    fn sample_byte_budget_saturates_rather_than_wrapping() {
+        let mut budget = SampleByteBudget::default();
+        budget.charge_attempt(Some(usize::MAX));
+        budget.charge_attempt(Some(usize::MAX));
+        assert!(budget.exhausted(), "saturating add must stay exhausted");
+    }
+
+    /// The manifest must carry the size-truncation flag, so a bundle cut short
+    /// by the byte budget cannot read back as the full sample that was asked
+    /// for. `is_truncated()` alone cannot say this: it reports the *intended*
+    /// truncation of sampling `per_workflow` out of a larger population.
+    #[test]
+    fn manifest_reports_a_size_truncated_export() {
+        let base = sample_base();
+        let work = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[sample_row("wf", 1, base, 3)])],
+            truncated_by_size: true,
+            ..Default::default()
+        };
+
+        let manifest = build_sample_manifest(&sample_query(), &work);
+
+        assert!(
+            manifest.truncated_by_size,
+            "an export stopped by the byte budget must say so"
+        );
+
+        // Control: the default path must not claim a size truncation.
+        let untruncated = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[sample_row("wf", 1, base, 3)])],
+            ..Default::default()
+        };
+        assert!(!build_sample_manifest(&sample_query(), &untruncated).truncated_by_size);
     }
 
     /// The complement: `sampled` counts the documents actually exported, per

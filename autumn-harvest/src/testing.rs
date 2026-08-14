@@ -2600,6 +2600,15 @@ impl ReplayDriftReport {
                 zero_coverage.join(", "),
             )?;
         }
+        if coverage.truncated_by_size {
+            writeln!(
+                f,
+                "    TRUNCATED BY SIZE: the export stopped early on the response byte \
+                 budget, so this bundle is smaller than the sample that was requested. \
+                 Narrow the export (fewer states, a single shard, a lower max_bytes) \
+                 rather than raising --per-workflow."
+            )?;
+        }
         if self.fixture_count_disagrees_with_manifest() {
             writeln!(
                 f,

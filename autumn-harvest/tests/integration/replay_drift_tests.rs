@@ -436,6 +436,7 @@ async fn bundle_manifest_coverage_is_surfaced_on_the_report() {
         in_flight_total: 4000,
         unavailable_shards: vec![],
         inspected_shards: vec![0],
+        truncated_by_size: false,
     };
     write(
         dir.path(),
@@ -482,6 +483,7 @@ async fn partial_shard_coverage_can_block_the_gate() {
         in_flight_total: 1,
         unavailable_shards: vec!["shard 1: connection refused".into()],
         inspected_shards: vec![0],
+        truncated_by_size: false,
     };
     write(
         dir.path(),
@@ -758,6 +760,7 @@ async fn a_divergence_outranks_the_coverage_rungs() {
         in_flight_total: 900,
         unavailable_shards: vec!["shard 1: connection refused".into()],
         inspected_shards: vec![0],
+        truncated_by_size: false,
     };
     write(
         dir.path(),
@@ -962,6 +965,7 @@ async fn a_bundle_missing_manifest_declared_fixtures_blocks_the_gate() {
         in_flight_total: 3,
         unavailable_shards: vec![],
         inspected_shards: vec![0],
+        truncated_by_size: false,
     };
     write(
         dir.path(),
@@ -1066,6 +1070,7 @@ async fn a_workflow_type_sampled_zero_times_fails_a_complete_coverage_claim() {
         in_flight_total: 901,
         unavailable_shards: vec![],
         inspected_shards: vec![0],
+        truncated_by_size: false,
     };
     write(
         dir.path(),

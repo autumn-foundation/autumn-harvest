@@ -307,7 +307,7 @@ onboarding                                    13        106  no
 NOTE: the sample is truncated; a clean gate verifies the SAMPLE, not the fleet.
 ```
 
-Two failure modes the manifest exists to prevent:
+Three failure modes the manifest exists to prevent:
 
 * **Silent truncation.** `sampled: 50, in_flight_total: 4021` is stated, never
   implied. A workflow type whose entire sample failed the per-execution size
@@ -317,6 +317,19 @@ Two failure modes the manifest exists to prevent:
   `partial` and names the shard — the bundle is a *lower bound*. The CLI prints
   a `WARNING … LOWER BOUND` block, and `require_complete_coverage(true)` turns
   it into a hard failure.
+* **A silently size-capped export.** One request holds every exported document
+  in memory before responding, so the endpoint enforces an aggregate byte budget
+  on top of the per-execution `max_bytes` — without it, the fixture-count cap
+  alone permits ~20 GiB on a shared management API. Hitting the budget stops the
+  export and sets `truncated_by_size`, which the CLI reports and the gate prints
+  as `TRUNCATED BY SIZE`.
+
+  This is **not** the same as the `NOTE: the sample is truncated` line above, and
+  the difference is what you act on: that one is the *intended* truncation of
+  sampling `--per-workflow` out of a larger population; this one is an
+  *unplanned* resource limit. Raising `--per-workflow` makes it strictly worse —
+  narrow the export instead (fewer states, a single `--shard-id`, a lower
+  `--max-bytes`).
 
 ### Raising confidence
 

@@ -50,6 +50,28 @@ pub const MAX_PER_WORKFLOW_SAMPLE: usize = 500;
 /// across every workflow type and every shard.
 pub const MAX_SAMPLE_TOTAL: usize = 2_000;
 
+/// Request-wide budget for the serialized bytes one sample export may hold in
+/// memory before responding.
+///
+/// [`MAX_SAMPLE_TOTAL`] bounds the fixture *count*, but the per-execution
+/// `max_bytes` ceiling is caller-raisable and applies to each document
+/// independently, so the count cap alone leaves the *aggregate* unbounded: at
+/// the 10 MiB default that is ~20 GiB of documents accumulated before a single
+/// response is serialized. The management API is a shared service, so a routine
+/// authenticated CI export must not be able to exhaust it.
+///
+/// The budget is checked *before* fetching each history — the size of a document
+/// is not knowable until it is loaded — so peak retained bytes are bounded by
+/// this budget plus at most one document. A caller who raises `max_bytes` above
+/// the budget therefore still gets one document; bounding a single oversized
+/// export is what `max_bytes` itself is for.
+///
+/// Hitting the budget is **never silent**: the export stops and
+/// [`SampleManifest::truncated_by_size`] records it, so the gate reports a
+/// bundle that is smaller than the sample the operator asked for rather than
+/// certifying a build against a quietly-trimmed subset.
+pub const MAX_SAMPLE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// How the stratified sample orders candidates within each workflow type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -176,6 +198,20 @@ pub struct SampleManifest {
     pub unavailable_shards: Vec<String>,
     /// The shard ids that were successfully inspected.
     pub inspected_shards: Vec<i32>,
+    /// Whether the export stopped early because it reached
+    /// [`MAX_SAMPLE_RESPONSE_BYTES`].
+    ///
+    /// Distinct from [`is_truncated`](Self::is_truncated), and the distinction
+    /// is what an operator acts on: that method reports the *intended*
+    /// truncation of sampling `per_workflow` out of a larger population, while
+    /// this reports an *unplanned* resource limit. The fix differs — narrow the
+    /// export (fewer states, one shard, a lower `max_bytes`) rather than raise
+    /// `--per-workflow`.
+    ///
+    /// `#[serde(default)]` so a manifest written before this field existed
+    /// reads back as `false` rather than failing the whole bundle.
+    #[serde(default)]
+    pub truncated_by_size: bool,
 }
 
 impl SampleManifest {
@@ -514,6 +550,7 @@ mod tests {
             in_flight_total: 2,
             unavailable_shards: vec!["shard 1: down".into()],
             inspected_shards: vec![0],
+            truncated_by_size: false,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         assert!(json.contains("\"status\":\"partial\""), "{json}");
@@ -521,5 +558,53 @@ mod tests {
         assert_eq!(back, manifest);
         assert!(back.is_truncated());
         assert!(!back.is_complete());
+    }
+
+    /// A manifest written before `truncated_by_size` existed must still parse.
+    ///
+    /// The gate reads bundles produced by whatever version exported them, so a
+    /// missing field has to default rather than fail the whole bundle — which
+    /// would turn an older artifact into a blocked gate.
+    #[test]
+    fn manifest_without_truncated_by_size_defaults_to_false() {
+        let legacy = serde_json::json!({
+            "generated_at": "2026-01-01T00:00:00Z",
+            "status": "complete",
+            "states": ["RUNNING"],
+            "per_workflow": [],
+            "sampled_total": 0,
+            "in_flight_total": 0,
+            "unavailable_shards": [],
+            "inspected_shards": [0],
+        });
+        let manifest: SampleManifest = serde_json::from_value(legacy).unwrap();
+        assert!(!manifest.truncated_by_size);
+    }
+
+    /// The aggregate response budget must actually bound the count cap.
+    ///
+    /// `MAX_SAMPLE_TOTAL` alone leaves the retained bytes unbounded, because
+    /// `max_bytes` is per-document and caller-raisable. This pins the budget as
+    /// the load-bearing bound rather than a decorative constant: it has to be
+    /// smaller than what the count cap permits at the default per-document
+    /// ceiling, or it never binds.
+    #[test]
+    fn response_byte_budget_binds_below_the_count_cap() {
+        let unbounded_worst_case =
+            MAX_SAMPLE_TOTAL * crate::history_export::DEFAULT_HISTORY_EXPORT_MAX_BYTES;
+        assert!(
+            MAX_SAMPLE_RESPONSE_BYTES < unbounded_worst_case,
+            "the byte budget must bind before the count cap does: {MAX_SAMPLE_RESPONSE_BYTES} \
+             vs {unbounded_worst_case}"
+        );
+        // And it must still admit a realistic bundle rather than cutting normal
+        // exports short: the default sample is 50 per type, and a typical
+        // in-flight history is well under 1 MiB.
+        let realistic_bundle = DEFAULT_PER_WORKFLOW_SAMPLE * 1024 * 1024;
+        assert!(
+            MAX_SAMPLE_RESPONSE_BYTES >= realistic_bundle,
+            "the budget must not cut an ordinary default-sized export short: \
+             {MAX_SAMPLE_RESPONSE_BYTES} vs {realistic_bundle}"
+        );
     }
 }
