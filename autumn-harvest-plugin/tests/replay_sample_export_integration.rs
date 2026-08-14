@@ -135,6 +135,48 @@ fn build_app(urls: &[String]) -> HarvestApiApp {
     harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
+/// Build an app whose **router** knows about more shards than this process has
+/// pools for — the mid-rollout topology from the CLAUDE.md "add a shard"
+/// procedure, where `readable_shards` is widened before every process has the
+/// new shard's pool wired up.
+fn build_app_with_router_knowing_extra_shard(
+    urls: &[String],
+    router_shards: &[i32],
+) -> HarvestApiApp {
+    use std::sync::Arc;
+
+    use autumn_harvest::policy::WorkflowSchedule;
+    use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
+    use autumn_harvest::shard::ShardRouter;
+    use autumn_harvest::worker::HandlerRegistry;
+    use autumn_harvest_plugin::api::{HarvestApiRuntime, HarvestRetentionRuntime};
+
+    let mut pools = BTreeMap::new();
+    for (index, url) in urls.iter().enumerate() {
+        let shard = ShardId::new(i32::try_from(index).expect("shard index fits i32"));
+        pools.insert(shard, build_pool(url));
+    }
+    let storage = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+
+    let shards: Vec<ShardId> = router_shards.iter().copied().map(ShardId::new).collect();
+    let router = ShardRouter::new(shards.clone(), shards, ShardId::new(0));
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(storage);
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(HandlerRegistry::new(vec![], vec![])),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::<WorkflowSchedule>::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        router,
+    ));
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+}
+
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
     let response = app
         .clone()
@@ -586,6 +628,76 @@ async fn two_logical_shards_sharing_one_database_do_not_double_count() {
         .map(|doc| doc["execution_id"].as_str().expect("execution_id"))
         .collect();
     assert_eq!(ids.len(), 3, "no execution may appear twice: {body}");
+}
+
+/// A shard the **router** knows about but this process has no pool for must be
+/// reported `unavailable`, never silently omitted (Codex round-19 P1).
+///
+/// This is the mid-rollout topology from the CLAUDE.md "add a shard" procedure:
+/// `readable_shards` is widened *before* every process has the new shard's pool
+/// wired up. Enumerating only `pool.iter_shards()` omits that shard from BOTH
+/// `inspected_shards` and `unavailable_shards` — and `SampleStatus::from_counts`
+/// derives `Complete` from `unavailable == 0`.
+///
+/// The consequence is the worst one this gate has: the manifest claims complete
+/// coverage, so even `require_complete_coverage(true)` certifies the candidate
+/// without replaying a single in-flight execution from that shard.
+#[tokio::test]
+async fn a_router_known_shard_with_no_pool_is_reported_unavailable() {
+    let (urls, _guard) = setup_shards(1).await;
+    // Pool for shard 0 only; the router additionally advertises shard 1.
+    let app = build_app_with_router_knowing_extra_shard(&urls[..1], &[0, 1]);
+    let t0 = base_time();
+
+    seed_execution(&urls[0], ShardId::new(0), "wf", "s0-0", "RUNNING", t0).await;
+
+    let (status, body) = get_json(&app, &format!("{SAMPLE_ROUTE}?per_workflow=50")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let manifest = manifest_of(&body);
+    assert_eq!(
+        manifest.inspected_shards,
+        vec![0],
+        "only shard 0 could actually be queried: {body}"
+    );
+    assert!(
+        manifest
+            .unavailable_shards
+            .iter()
+            .any(|entry| entry.contains('1')),
+        "the router-known shard with no pool must be named unavailable, not \
+         omitted — omitting it lets the status read `complete`: {body}"
+    );
+    assert!(
+        !manifest.is_complete(),
+        "a shard that was never queried cannot yield complete coverage: {body}"
+    );
+}
+
+/// The complement: when the router knows exactly the shards that have pools,
+/// coverage is genuinely complete. Pins that the fix does not simply make every
+/// export report `partial`.
+#[tokio::test]
+async fn a_fully_pooled_router_still_reports_complete_coverage() {
+    let (urls, _guard) = setup_shards(1).await;
+    let app = build_app_with_router_knowing_extra_shard(&urls[..1], &[0]);
+    let t0 = base_time();
+
+    seed_execution(&urls[0], ShardId::new(0), "wf", "s0-0", "RUNNING", t0).await;
+
+    let (status, body) = get_json(&app, &format!("{SAMPLE_ROUTE}?per_workflow=50")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let manifest = manifest_of(&body);
+    assert_eq!(manifest.inspected_shards, vec![0]);
+    assert!(
+        manifest.unavailable_shards.is_empty(),
+        "every expected shard was queried: {body}"
+    );
+    assert!(
+        manifest.is_complete(),
+        "complete coverage must still be reachable: {body}"
+    );
 }
 
 /// The engine's built-in liveness canary (issue #796) must never enter a bundle.

@@ -34019,17 +34019,44 @@ impl<'a, I: Iterator<Item = &'a str>> DedupCountSorted<'a> for I {
     }
 }
 
+/// Discover sample candidates across every shard the deployment is **expected**
+/// to have, not merely every shard this process holds a pool for.
+///
+/// The distinction is load-bearing for the gate. `pool.iter_shards()` yields
+/// only shards wired up in *this* process, but during a shard-add rollout the
+/// router's `readable_shards` is widened first (see the workspace CLAUDE.md
+/// "add a shard" procedure), so a shard can be routable — and already holding
+/// in-flight executions — while this node has no pool for it. Enumerating only
+/// the pools would omit that shard *silently*: it would appear in neither
+/// `inspected_shards` nor `unavailable_shards`, and `SampleStatus::from_counts`
+/// derives `Complete` from `unavailable == 0`. The manifest would then claim
+/// complete coverage, and even `require_complete_coverage(true)` would certify
+/// a candidate build without replaying a single one of that shard's workflows —
+/// the exact false green the coverage record exists to prevent.
+///
+/// So this iterates `shard_fanout::expected_shards` (pools ∪ router-known) and
+/// records a shard with no resolvable pool as `unavailable`, which is the same
+/// treatment every other cross-shard read in the repo gives it.
 async fn collect_history_sample_candidates_from_shards(
-    pool: &HarvestDbPool,
+    api_state: &HarvestApiState,
     query: &HistorySampleExportQuery,
     work: &mut HistorySampleExportWork,
 ) {
-    for (shard, shard_pool) in pool.iter_shards() {
-        let shard_id = shard.as_i32();
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    for shard_id in crate::shard_fanout::expected_shards(api_state, &pools) {
         if query.shard_id.is_some_and(|target| target != shard_id) {
             continue;
         }
         work.batch.saw_requested_shard = true;
+
+        // A router-known shard this process has no pool for is unavailable, not
+        // absent. Reported rather than skipped so the status can never read
+        // `complete` over a shard that was never queried.
+        let Some(shard_pool) = pools.get(&shard_id) else {
+            work.batch
+                .note_unavailable(shard_id, "shard pool is not configured".to_string());
+            continue;
+        };
 
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(conn) => conn,
@@ -34211,8 +34238,11 @@ async fn load_history_sample_from_shards(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut work = HistorySampleExportWork::default();
 
-    collect_history_sample_candidates_from_shards(&pool, query, &mut work).await;
+    collect_history_sample_candidates_from_shards(api_state, query, &mut work).await;
     export_sampled_history_candidates(&pool, query, &mut work, decoder, outcome).await;
+    // Only reachable when an explicit `shard_id` names a shard that is neither
+    // pooled nor router-known; a router-known-but-poolless shard is already
+    // recorded as unavailable by the discovery loop itself.
     if let Some(shard_id) = query.shard_id
         && !work.batch.saw_requested_shard
     {
