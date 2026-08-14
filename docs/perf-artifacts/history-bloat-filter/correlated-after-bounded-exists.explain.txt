@@ -1,29 +1,29 @@
 -- correlated-after-bounded-exists --
                                                                           QUERY PLAN                                                                           
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------
- Aggregate  (cost=1705859.14..1705859.15 rows=1 width=8) (actual rows=1 loops=1)
+ Aggregate  (cost=1555710.32..1555710.33 rows=1 width=8) (actual rows=1 loops=1)
    Output: count(*)
-   Buffers: shared hit=19268 read=2897
-   ->  Seq Scan on public.harvest_workflow_executions  (cost=0.00..1705852.87 rows=2508 width=0) (actual rows=15 loops=1)
+   Buffers: shared hit=19539 read=2904
+   ->  Seq Scan on public.harvest_workflow_executions  (cost=0.00..1555704.05 rows=2508 width=0) (actual rows=15 loops=1)
          Filter: (SubPlan 1)
          Rows Removed by Filter: 5000
-         Buffers: shared hit=19268 read=2897
+         Buffers: shared hit=19539 read=2904
          SubPlan 1
-           ->  Limit  (cost=340.07..340.12 rows=1 width=8) (actual rows=0 loops=5015)
+           ->  Limit  (cost=310.13..310.18 rows=1 width=8) (actual rows=0 loops=5015)
                  Output: 1, harvest_events.event_id
-                 Buffers: shared hit=19267 read=2801
-                 ->  Index Only Scan using idx_harvest_events_exec on public.harvest_events  (cost=0.56..340.07 rows=6372 width=8) (actual rows=72 loops=5015)
+                 Buffers: shared hit=19538 read=2808
+                 ->  Index Only Scan using idx_harvest_events_exec on public.harvest_events  (cost=0.56..310.13 rows=5804 width=8) (actual rows=72 loops=5015)
                        Output: 1, harvest_events.event_id
                        Index Cond: (harvest_events.workflow_exec_id = harvest_workflow_executions.id)
                        Heap Fetches: 0
-                       Buffers: shared hit=19267 read=2801
- Query Identifier: -2630596437307874071
+                       Buffers: shared hit=19538 read=2808
+ Query Identifier: -6115357992735421592
  Planning:
    Buffers: shared hit=666 read=94
- Planning Time: 2.182 ms
+ Planning Time: 2.098 ms
  JIT:
    Functions: 12
    Options: Inlining true, Optimization true, Expressions true, Deforming true
- Execution Time: 153.777 ms
+ Execution Time: 145.580 ms
 (24 rows)
 

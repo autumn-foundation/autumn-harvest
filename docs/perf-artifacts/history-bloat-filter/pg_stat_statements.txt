@@ -1,6 +1,6 @@
                                                      query                                                      | calls | total_buffers | shared_blks_read | temp_blks_written 
 ----------------------------------------------------------------------------------------------------------------+-------+---------------+------------------+-------------------
- SELECT (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = $1) >= $2                                 |     1 |        158593 |           144592 |                 0
- SELECT EXISTS (SELECT $1 FROM harvest_events WHERE workflow_exec_id = $2 ORDER BY event_id OFFSET $3 LIMIT $4) |     1 |           388 |                0 |                 0
+ SELECT (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = $1) >= $2                                 |     1 |          3976 |             3970 |                 0
+ SELECT EXISTS (SELECT $1 FROM harvest_events WHERE workflow_exec_id = $2 ORDER BY event_id OFFSET $3 LIMIT $4) |     1 |            94 |                0 |                 0
 (2 rows)
 

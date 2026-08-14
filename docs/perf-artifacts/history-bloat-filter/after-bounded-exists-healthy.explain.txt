@@ -1,22 +1,22 @@
 -- after-bounded-exists-healthy --
-                                                                     QUERY PLAN                                                                     
-----------------------------------------------------------------------------------------------------------------------------------------------------
- Result  (cost=956.75..956.76 rows=1 width=1) (actual rows=1 loops=1)
+                                                                    QUERY PLAN                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------
+ Result  (cost=17.00..17.01 rows=1 width=1) (actual rows=1 loops=1)
    Output: $0
-   Buffers: shared hit=2 read=3
+   Buffers: shared hit=3 read=2
    InitPlan 1 (returns $0)
-     ->  Limit  (cost=952.83..956.75 rows=1 width=8) (actual rows=0 loops=1)
+     ->  Limit  (cost=16.93..17.00 rows=1 width=8) (actual rows=0 loops=1)
            Output: 1, harvest_events.event_id
-           Buffers: shared hit=2 read=3
-           ->  Index Only Scan using idx_harvest_events_exec on public.harvest_events  (cost=0.56..952.83 rows=243 width=8) (actual rows=5 loops=1)
+           Buffers: shared hit=3 read=2
+           ->  Index Only Scan using idx_harvest_events_exec on public.harvest_events  (cost=0.56..16.93 rows=250 width=8) (actual rows=5 loops=1)
                  Output: 1, harvest_events.event_id
-                 Index Cond: (harvest_events.workflow_exec_id = '832d7fb4-9c77-4faa-b43e-5f4e963ff220'::uuid)
+                 Index Cond: (harvest_events.workflow_exec_id = '08ca4ae9-2fb8-473e-9417-1ad754921031'::uuid)
                  Heap Fetches: 0
-                 Buffers: shared hit=2 read=3
- Query Identifier: 2227093904254062132
+                 Buffers: shared hit=3 read=2
+ Query Identifier: -4400857373992584483
  Planning:
    Buffers: shared hit=263
- Planning Time: 1.199 ms
- Execution Time: 0.104 ms
+ Planning Time: 0.674 ms
+ Execution Time: 0.086 ms
 (17 rows)
 

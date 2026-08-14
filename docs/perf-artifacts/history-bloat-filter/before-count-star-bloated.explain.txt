@@ -1,47 +1,38 @@
 -- before-count-star-bloated --
-                                                                                            QUERY PLAN                                                                                             
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Result  (cost=187917.21..187917.22 rows=1 width=1) (actual rows=1 loops=1)
+                                                                                       QUERY PLAN                                                                                       
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result  (cost=22341.27..22341.29 rows=1 width=1) (actual rows=1 loops=1)
    Output: ($1 >= 10000)
-   Buffers: shared hit=13578 read=145015
+   Buffers: shared hit=6 read=3970
    InitPlan 1 (returns $1)
-     ->  Finalize Aggregate  (cost=187917.20..187917.21 rows=1 width=8) (actual rows=1 loops=1)
+     ->  Finalize Aggregate  (cost=22341.26..22341.27 rows=1 width=8) (actual rows=1 loops=1)
            Output: count(*)
-           Buffers: shared hit=13578 read=145015
-           ->  Gather  (cost=187916.98..187917.19 rows=2 width=8) (actual rows=3 loops=1)
+           Buffers: shared hit=6 read=3970
+           ->  Gather  (cost=22341.05..22341.26 rows=2 width=8) (actual rows=3 loops=1)
                  Output: (PARTIAL count(*))
                  Workers Planned: 2
                  Workers Launched: 2
-                 Buffers: shared hit=13578 read=145015
-                 ->  Partial Aggregate  (cost=186916.98..186916.99 rows=1 width=8) (actual rows=1 loops=3)
+                 Buffers: shared hit=6 read=3970
+                 ->  Partial Aggregate  (cost=21341.05..21341.06 rows=1 width=8) (actual rows=1 loops=3)
                        Output: PARTIAL count(*)
-                       Buffers: shared hit=13578 read=145015
+                       Buffers: shared hit=6 read=3970
                        Worker 0:  actual rows=1 loops=1
-                         JIT:
-                           Functions: 4
-                           Options: Inlining false, Optimization false, Expressions true, Deforming true
-                         Buffers: shared hit=4696 read=46679
+                         Buffers: shared hit=2 read=1296
                        Worker 1:  actual rows=1 loops=1
-                         JIT:
-                           Functions: 4
-                           Options: Inlining false, Optimization false, Expressions true, Deforming true
-                         Buffers: shared hit=4358 read=44000
-                       ->  Parallel Seq Scan on public.harvest_events  (cost=0.00..186437.50 rows=191793 width=0) (actual rows=149392 loops=3)
-                             Output: harvest_events.id, harvest_events.workflow_exec_id, harvest_events.event_id, harvest_events.event_type, harvest_events.event_data, harvest_events."timestamp"
-                             Filter: (harvest_events.workflow_exec_id = '08f9adbe-ec53-4782-b4eb-fabbca7bea6b'::uuid)
-                             Rows Removed by Filter: 1632578
-                             Buffers: shared hit=13578 read=145015
-                             Worker 0:  actual rows=147968 loops=1
-                               Buffers: shared hit=4696 read=46679
-                             Worker 1:  actual rows=139183 loops=1
-                               Buffers: shared hit=4358 read=44000
- Query Identifier: -2396632734901249955
+                         Buffers: shared hit=2 read=1301
+                       ->  Parallel Index Only Scan using idx_harvest_events_exec_last on public.harvest_events  (cost=0.56..20878.71 rows=184934 width=0) (actual rows=149392 loops=3)
+                             Output: harvest_events.workflow_exec_id, harvest_events."timestamp"
+                             Index Cond: (harvest_events.workflow_exec_id = '593fc354-f251-43a6-a124-baf0e3a2d121'::uuid)
+                             Heap Fetches: 0
+                             Buffers: shared hit=6 read=3970
+                             Worker 0:  actual rows=146448 loops=1
+                               Buffers: shared hit=2 read=1296
+                             Worker 1:  actual rows=147013 loops=1
+                               Buffers: shared hit=2 read=1301
+ Query Identifier: -8476920030312731657
  Planning:
    Buffers: shared hit=237
- Planning Time: 0.732 ms
- JIT:
-   Functions: 15
-   Options: Inlining false, Optimization false, Expressions true, Deforming true
- Execution Time: 265.096 ms
-(42 rows)
+ Planning Time: 0.656 ms
+ Execution Time: 60.786 ms
+(33 rows)
 

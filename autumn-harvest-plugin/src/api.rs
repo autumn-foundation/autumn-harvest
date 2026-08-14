@@ -31800,12 +31800,16 @@ async fn db_conn_for_dag(
 /// `autumn-harvest-plugin/scripts/history_bloat_perf_repro.sh`, artifacts
 /// committed under `docs/perf-artifacts/history-bloat-filter/`):
 /// `(SELECT COUNT(*) ...) >= 10000` against a 448,175-event execution reads
-/// 158,593 total buffers (`pg_stat_statements.total_buffers`, corroborated by
-/// `EXPLAIN (ANALYZE, BUFFERS)` showing `shared hit=13578 read=145015`) via a
-/// Parallel Seq Scan over the whole table -- Postgres estimated a
-/// high-selectivity equality predicate cheaper to satisfy by streaming past
-/// the other ~4.9M non-matching rows than by using the existing
-/// `(workflow_exec_id, event_id)` index.
+/// 3,976 total buffers (`pg_stat_statements.total_buffers`, corroborated by
+/// `EXPLAIN (ANALYZE, BUFFERS)` showing `shared hit=6 read=3970`) via a
+/// Parallel Index Only Scan in this fixture's current state, but the access
+/// path Postgres picks for the unbounded scan is sensitive to whether the
+/// table's visibility map is fresh -- see
+/// `docs/performance-history-bloat-filter.md#the-problem` for a fixture state
+/// in which the identical query instead read 158,593 buffers via a Parallel
+/// Seq Scan. What is *not* sensitive to that: `COUNT(*)` has no early exit
+/// regardless of which access path answers it, so every one of the 448,175
+/// matching rows still has to be visited to confirm the threshold.
 ///
 /// # The fix
 ///
@@ -31815,20 +31819,28 @@ async fn db_conn_for_dag(
 /// for `0`, `1`, `actual_count - 1`, `actual_count`, `actual_count + 1`, and
 /// values far past `actual_count`), but only ever needs to read
 /// `min(actual_count, min_events)` rows to answer it. On the same fixture
-/// this reads 388 total buffers against the identical 448,175-event
-/// execution -- a 99.76% reduction -- and is unchanged for an ordinary,
+/// this reads 94 total buffers against the identical 448,175-event
+/// execution -- a 97.64% reduction -- and is unchanged for an ordinary,
 /// un-bloated execution (5 buffers either way, both forms using an Index
 /// Only Scan since the whole history fits in a handful of rows).
 ///
-/// **The `ORDER BY event_id` is load-bearing, not decorative.** Without an
-/// explicit sort target, an `EXISTS (... OFFSET n LIMIT 1)` gives Postgres no
-/// reason to walk `idx_harvest_events_exec (workflow_exec_id, event_id)` in
-/// order, and for a high-selectivity `workflow_exec_id` the planner may still
-/// choose a plain Seq Scan (measured: 88,618 buffers on the same fixture --
-/// better than the unbounded `COUNT(*)`, but 228x worse than the indexed
-/// form). With the `ORDER BY`, the same composite index `store::load_history`
-/// already relies on turns this into an Index Only Scan capped at exactly
-/// `min_events` entries regardless of the workflow's true event count.
+/// **The `ORDER BY event_id` is insurance against stale table statistics, not
+/// a guaranteed buffer-count win.** Against this fixture's current,
+/// freshly-`VACUUM`'d state, dropping the `ORDER BY` costs almost nothing (93
+/// buffers vs. 94 -- both via an Index Only Scan, `Heap Fetches: 0`).
+/// Measured against a table whose visibility map had *not* yet been set by
+/// `VACUUM`, however, the identical no-`ORDER BY` query fell back to a plain
+/// Seq Scan reading 2,956,744 non-matching rows first -- 88,618 buffers,
+/// 228x worse than the `ORDER BY`'d form -- because an un-set visibility map
+/// doesn't just inflate `Heap Fetches` within a fixed plan, it can also make
+/// the planner's *cost estimate* for an Index Only Scan look bad enough that
+/// the planner rejects that access path shape entirely. `ORDER BY event_id`
+/// gives the planner a sort target that makes the intended composite index --
+/// the same one `store::load_history` already relies on -- the correct
+/// choice regardless of whether the visibility map happens to be fresh, at
+/// zero cost when it already is. See
+/// `docs/performance-history-bloat-filter.md#why-order-by-is-load-bearing`
+/// for the full before/after.
 ///
 /// `min_events == 0` (`COUNT(*) >= 0`, always true for a non-negative count)
 /// and `min_events == None` (filter not requested) both leave `query`

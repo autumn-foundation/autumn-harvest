@@ -1,22 +1,22 @@
 -- after-bounded-exists-bloated --
-                                                                          QUERY PLAN                                                                          
---------------------------------------------------------------------------------------------------------------------------------------------------------------
- Result  (cost=13791.80..13791.81 rows=1 width=1) (actual rows=1 loops=1)
+                                                                         QUERY PLAN                                                                          
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result  (cost=529.38..529.39 rows=1 width=1) (actual rows=1 loops=1)
    Output: $0
-   Buffers: shared read=388
+   Buffers: shared hit=1 read=93
    InitPlan 1 (returns $0)
-     ->  Limit  (cost=13790.42..13791.80 rows=1 width=8) (actual rows=1 loops=1)
+     ->  Limit  (cost=529.32..529.38 rows=1 width=8) (actual rows=1 loops=1)
            Output: 1, harvest_events.event_id
-           Buffers: shared read=388
-           ->  Index Only Scan using idx_harvest_events_exec on public.harvest_events  (cost=0.56..634815.45 rows=460303 width=8) (actual rows=10000 loops=1)
+           Buffers: shared hit=1 read=93
+           ->  Index Only Scan using idx_harvest_events_exec on public.harvest_events  (cost=0.56..23471.79 rows=443842 width=8) (actual rows=10000 loops=1)
                  Output: 1, harvest_events.event_id
-                 Index Cond: (harvest_events.workflow_exec_id = '08f9adbe-ec53-4782-b4eb-fabbca7bea6b'::uuid)
-                 Heap Fetches: 10000
-                 Buffers: shared read=388
- Query Identifier: 2227093904254062132
+                 Index Cond: (harvest_events.workflow_exec_id = '593fc354-f251-43a6-a124-baf0e3a2d121'::uuid)
+                 Heap Fetches: 0
+                 Buffers: shared hit=1 read=93
+ Query Identifier: -4400857373992584483
  Planning:
-   Buffers: shared hit=263 read=2
- Planning Time: 0.862 ms
- Execution Time: 3.843 ms
+   Buffers: shared hit=260 read=5
+ Planning Time: 0.730 ms
+ Execution Time: 1.448 ms
 (17 rows)
 
