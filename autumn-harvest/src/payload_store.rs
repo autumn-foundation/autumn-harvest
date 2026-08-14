@@ -52,7 +52,12 @@ pub(crate) const PAYLOAD_FIELD_KEYS: [&str; 6] = [
 ];
 
 /// Discriminator key marking an offload reference envelope.
-const OFFLOAD_ENVELOPE_KEY: &str = "_harvest_offload_envelope";
+///
+/// Public so a consumer that must *detect* an envelope without fetching it —
+/// e.g. the replay-drift gate's fixture guard (issue #798), which refuses a
+/// bundle it cannot inflate — can cheaply reject on the raw JSON without
+/// hardcoding the key and drifting from this definition.
+pub const OFFLOAD_ENVELOPE_KEY: &str = "_harvest_offload_envelope";
 
 /// Future returned by [`PayloadStore`] methods.
 pub type PayloadStoreFuture<'a, T> =

@@ -825,3 +825,474 @@ async fn is_clean_always_agrees_with_exit_code_on_every_rung() {
         );
     }
 }
+
+// ===========================================================================
+// History policy must match the deployment (issue #614 / PR #1171 review)
+// ===========================================================================
+
+/// A workflow whose control flow depends on `should_continue_as_new()`.
+///
+/// `continue_as_new_threshold` is a *deployment* setting
+/// (`HarvestBuilder::history_policy`), not a property of the recorded history —
+/// so the bundle cannot carry it and the gate must be told.
+fn checkpointing_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let next = if ctx.should_continue_as_new() {
+            "checkpoint"
+        } else {
+            "keep_working"
+        };
+        ctx.execute_activity_raw(next, Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// An in-flight history recorded by a deployment running a LOW
+/// `continue_as_new_threshold`, so the workflow took the `checkpoint` branch.
+fn checkpointed_snapshot_json(workflow_name: &str) -> String {
+    let exec_id = ExecutionId::new();
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "checkpoint".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+    ];
+    snapshot_json(workflow_name, exec_id, events)
+}
+
+/// Replaying under the DEFAULT policy when production runs a customized one
+/// reports drift for a workflow that never drifted — a false red that blocks a
+/// healthy deploy. `with_history_policy` is what makes the gate faithful.
+///
+/// Both halves are asserted against the same bundle, because the builder is
+/// only meaningful as a pair: if the default-policy replay were also clean, the
+/// test would pass without the fix doing anything.
+#[tokio::test]
+async fn bundle_replays_under_the_configured_history_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &checkpointed_snapshot_json("wf"));
+
+    // The deployment that produced this history: checkpoint early.
+    let production_policy =
+        autumn_harvest::context::WorkflowHistoryPolicy::default().with_continue_as_new_threshold(1);
+
+    let faithful = ReplayVerifier::new()
+        .register_fn("wf", checkpointing_workflow as WorkflowHandlerFn)
+        .with_history_policy(production_policy)
+        .replay_bundle(dir.path())
+        .await;
+    assert!(
+        faithful.is_clean(),
+        "replaying under the deployment's own policy must be clean: {faithful}"
+    );
+
+    // Same bundle, same code, default policy — the threshold is no longer met,
+    // so the workflow schedules `keep_working` and the gate sees a divergence
+    // that does not exist in production.
+    let unfaithful = ReplayVerifier::new()
+        .register_fn("wf", checkpointing_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+    assert_eq!(
+        unfaithful.diverged.len(),
+        1,
+        "control: the default policy must genuinely change the outcome, else \
+         this test would pass without `with_history_policy` doing anything: {unfaithful}"
+    );
+}
+
+/// `WorkflowReplayer::replay_bundle` delegates to `ReplayVerifier`; the policy
+/// must survive that hop, or the builder is silently dropped on that path.
+#[tokio::test]
+async fn workflow_replayer_bundle_delegation_carries_the_history_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &checkpointed_snapshot_json("wf"));
+
+    let report = autumn_harvest::testing::WorkflowReplayer::new()
+        .register_fn("wf", checkpointing_workflow as WorkflowHandlerFn)
+        .with_history_policy(
+            autumn_harvest::context::WorkflowHistoryPolicy::default()
+                .with_continue_as_new_threshold(1),
+        )
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.is_clean(),
+        "the replayer's own history policy must reach the bundle walk: {report}"
+    );
+}
+
+// ===========================================================================
+// The gate must not certify what it did not verify (PR #1171 review)
+// ===========================================================================
+
+/// A manifest declaring more fixtures than the bundle holds means files went
+/// missing after the export — a truncated artifact upload, a partial copy.
+///
+/// Every surviving fixture can replay cleanly, so neither the divergence rung
+/// nor `require_complete_coverage` catches it: the manifest's shard status still
+/// reads `complete`, because the *export* was complete; it was the *bundle* that
+/// lost files. Left unguarded, the gate certifies a strict subset of the sample
+/// and reports success.
+#[tokio::test]
+async fn a_bundle_missing_manifest_declared_fixtures_blocks_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    // One fixture on disk...
+    write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
+    // ...but the manifest says three were exported.
+    let manifest = SampleManifest {
+        generated_at: Utc::now(),
+        status: SampleStatus::Complete,
+        states: vec!["RUNNING".into()],
+        per_workflow: vec![SampleWorkflowCoverage {
+            workflow_name: "wf".into(),
+            sampled: 3,
+            in_flight_total: 3,
+        }],
+        sampled_total: 3,
+        in_flight_total: 3,
+        unavailable_shards: vec![],
+        inspected_shards: vec![0],
+    };
+    write(
+        dir.path(),
+        SampleManifest::FILE_NAME,
+        &serde_json::to_string(&manifest).unwrap(),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", canonical_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        !report.is_clean(),
+        "a bundle missing two thirds of its declared fixtures must not certify a \
+         release: {report}"
+    );
+    assert_eq!(
+        report.exit_code(),
+        2,
+        "an incomplete bundle is a gate that could not fully run, which outranks \
+         a divergence: {report}"
+    );
+    assert!(
+        format!("{report}").contains("BUNDLE INCOMPLETE"),
+        "the operator must be told the bundle disagrees with its manifest: {report}"
+    );
+}
+
+/// A bundle whose every fixture was skipped replayed no workflow at all, so it
+/// verified exactly as much as an empty directory: nothing.
+///
+/// Reachable with `allow_unregistered(true)` when a gate binary is wired to the
+/// wrong bundle, or registers none of the sampled types.
+#[tokio::test]
+async fn a_bundle_whose_fixtures_were_all_skipped_verifies_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
+    write(dir.path(), "b.json", &in_flight_snapshot_json("wf"));
+
+    let report = ReplayVerifier::new()
+        // Deliberately registers a DIFFERENT workflow than the bundle contains.
+        .register_fn(
+            "some_other_workflow",
+            canonical_workflow as WorkflowHandlerFn,
+        )
+        .allow_unregistered(true)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(report.total, 2, "{report}");
+    assert_eq!(report.skipped, 2, "{report}");
+    assert!(
+        report.verified_nothing(),
+        "no workflow was replayed, so nothing was verified: {report}"
+    );
+    assert_eq!(
+        report.exit_code(),
+        3,
+        "an all-skipped run is the same non-answer as an empty bundle: {report}"
+    );
+
+    // ...and the opt-out still works for a caller who genuinely accepts it.
+    let permitted = ReplayVerifier::new()
+        .register_fn(
+            "some_other_workflow",
+            canonical_workflow as WorkflowHandlerFn,
+        )
+        .allow_unregistered(true)
+        .allow_empty_bundle(true)
+        .replay_bundle(dir.path())
+        .await;
+    assert!(permitted.is_clean(), "{permitted}");
+}
+
+/// A workflow type with in-flight work but **zero** sampled fixtures was never
+/// replayed at all — materially worse than ordinary truncation, where at least
+/// some executions of the type are checked.
+#[tokio::test]
+async fn a_workflow_type_sampled_zero_times_fails_a_complete_coverage_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
+
+    let manifest = SampleManifest {
+        generated_at: Utc::now(),
+        status: SampleStatus::Complete,
+        states: vec!["RUNNING".into()],
+        per_workflow: vec![
+            SampleWorkflowCoverage {
+                workflow_name: "wf".into(),
+                sampled: 1,
+                in_flight_total: 1,
+            },
+            // Starved by the global cap: in flight, never sampled.
+            SampleWorkflowCoverage {
+                workflow_name: "never_sampled_wf".into(),
+                sampled: 0,
+                in_flight_total: 900,
+            },
+        ],
+        sampled_total: 1,
+        in_flight_total: 901,
+        unavailable_shards: vec![],
+        inspected_shards: vec![0],
+    };
+    write(
+        dir.path(),
+        SampleManifest::FILE_NAME,
+        &serde_json::to_string(&manifest).unwrap(),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", canonical_workflow as WorkflowHandlerFn)
+        .require_complete_coverage(true)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(
+        report.zero_coverage_types(),
+        vec!["never_sampled_wf"],
+        "{report}"
+    );
+    assert_eq!(
+        report.exit_code(),
+        4,
+        "a type that was never replayed must not pass a complete-coverage claim: {report}"
+    );
+    assert!(
+        format!("{report}").contains("NOT REPLAYED AT ALL"),
+        "the un-replayed type must be named: {report}"
+    );
+
+    // Control: the shard status alone is `complete`, so without the zero-coverage
+    // check this bundle would have certified the release.
+    let without_claim = ReplayVerifier::new()
+        .register_fn("wf", canonical_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+    assert!(
+        without_claim.is_clean(),
+        "opt-in only: the default gate is unchanged: {without_claim}"
+    );
+}
+
+// ===========================================================================
+// Offloaded payloads must block, not masquerade as drift (PR #1171 review)
+// ===========================================================================
+
+/// A workflow that passes a real, non-trivial input to its activity.
+///
+/// The input matters: the guard exists because a claim-check envelope is
+/// compared *against a real value*, so a workflow passing `Value::Null` could
+/// not surface the bug at all.
+fn payload_bearing_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw(
+            "step_one",
+            serde_json::json!({"blob": "x".repeat(64)}),
+            "default",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// An in-flight history whose activity input is either the real payload or a
+/// large-payload **offload reference envelope** (issue #524) standing in for it.
+///
+/// The envelope is built by hand rather than through `PayloadOffloader` so the
+/// fixture needs no `PayloadStore`: the wire shape is the contract the guard
+/// keys on, and building it here proves the guard reads the same discriminator
+/// the offloader writes.
+fn payload_snapshot_json(workflow_name: &str, offloaded: bool) -> String {
+    let real = serde_json::json!({"blob": "x".repeat(64)});
+    let input = if offloaded {
+        serde_json::json!({
+            "_harvest_offload_envelope": 1,
+            "store_id": "s3",
+            "key": "sha256:deadbeef",
+            "len": 64,
+            "checksum": "deadbeef",
+        })
+    } else {
+        real
+    };
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "step_one".into(),
+            input,
+            queue: "default".into(),
+        },
+    ];
+    snapshot_json(workflow_name, ExecutionId::new(), events)
+}
+
+/// The money test for the offload guard.
+///
+/// The export path loads history with `load_history_undecoded`, so on a
+/// deployment with a `PayloadStore` registered any payload over the offload
+/// threshold reaches the bundle as a claim-check envelope. The bundle walk
+/// builds its `WorkflowReplayer` with `payload_offloader: None` and cannot
+/// inflate it, so a **healthy** workflow computing the real input would be
+/// compared against the envelope and reported as drift.
+///
+/// That is a false red on a clean deploy — the single worst outcome a release
+/// gate can produce. It must be a harness error (exit 2) naming the fix.
+#[tokio::test]
+async fn an_offloaded_fixture_blocks_the_gate_instead_of_reporting_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "offloaded.json",
+        &payload_snapshot_json("wf", true),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", payload_bearing_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(
+        report.total, 1,
+        "the fixture still counts in the denominator"
+    );
+    assert!(
+        report.diverged.is_empty(),
+        "an un-inflatable envelope is NOT a determinism regression: {:?}",
+        report.diverged
+    );
+    assert_eq!(
+        report.blocked.len(),
+        1,
+        "expected a harness error: {report}"
+    );
+    assert_eq!(
+        report.exit_code(),
+        2,
+        "a bundle this gate cannot honestly evaluate must not read as drift: {report}"
+    );
+
+    let reason = report.blocked[0].reason.to_string();
+    assert!(
+        reason.contains("offloaded payload reference"),
+        "the reason must name the cause: {reason}"
+    );
+    assert!(
+        reason.contains("payload_offload_threshold"),
+        "the reason must name a concrete fix: {reason}"
+    );
+    assert!(
+        reason.contains("sha256:deadbeef"),
+        "the reason must name the blob so an operator can find it: {reason}"
+    );
+}
+
+/// The control that keeps the guard honest: an envelope-free fixture carrying
+/// the **real** payload is untouched and replays clean.
+///
+/// Without this, the guard could pass by blocking every payload-bearing bundle.
+#[tokio::test]
+async fn a_payload_bearing_fixture_without_envelopes_is_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "real.json", &payload_snapshot_json("wf", false));
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", payload_bearing_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(report.succeeded, 1, "{report}");
+    assert!(report.blocked.is_empty(), "{report}");
+    assert!(report.is_clean(), "{report}");
+    assert_eq!(report.exit_code(), 0);
+}
+
+/// The discriminator appearing inside ordinary payload *data* must not block.
+///
+/// The guard fast-rejects on a raw substring scan, so a workflow whose own JSON
+/// happens to mention the key reaches the structured check — which must find no
+/// real envelope and let the fixture through.
+#[tokio::test]
+async fn the_envelope_key_appearing_as_plain_data_does_not_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "step_one".into(),
+            // The key is present as a *string value*, not an envelope object.
+            input: serde_json::json!({"note": "we set _harvest_offload_envelope upstream"}),
+            queue: "default".into(),
+        },
+    ];
+    write(
+        dir.path(),
+        "mentions.json",
+        &snapshot_json("wf", ExecutionId::new(), events),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", mentions_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.blocked.is_empty(),
+        "a substring hit is not an envelope: {report}"
+    );
+    assert_eq!(report.succeeded, 1, "{report}");
+    assert!(report.is_clean(), "{report}");
+}
+
+/// Companion to [`the_envelope_key_appearing_as_plain_data_does_not_block`].
+fn mentions_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw(
+            "step_one",
+            serde_json::json!({"note": "we set _harvest_offload_envelope upstream"}),
+            "default",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}

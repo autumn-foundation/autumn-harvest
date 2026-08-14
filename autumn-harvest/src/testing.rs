@@ -655,6 +655,12 @@ impl WorkflowReplayer {
         let mut verifier = ReplayVerifier::new();
         verifier.handlers.clone_from(&self.handlers);
         verifier.state = self.state.clone();
+        // Issue #614: carry this replayer's own history policy across the
+        // delegation. Dropping it here would silently ignore
+        // `WorkflowReplayer::with_history_policy` on the bundle path and replay
+        // under the default threshold — reporting drift for a workflow that
+        // never drifted.
+        verifier.history_policy = self.history_policy;
         verifier.replay_bundle(dir).await
     }
 
@@ -2409,6 +2415,42 @@ impl ReplayDriftReport {
         self.total == 0
     }
 
+    /// Whether the run replayed **no workflow at all**, whatever the reason.
+    ///
+    /// Broader than [`is_empty`](Self::is_empty): a bundle whose every fixture
+    /// was *skipped* (`allow_unregistered`, a gate binary wired to the wrong
+    /// bundle, or one that registered none of the sampled types) has
+    /// `total > 0` yet verified exactly as much as an empty directory did —
+    /// nothing. Certifying a release on that is the same false pass, so both
+    /// share the empty-bundle rung and the same `allow_empty_bundle` opt-out.
+    #[must_use]
+    pub const fn verified_nothing(&self) -> bool {
+        self.succeeded == 0 && self.diverged.is_empty() && self.blocked.is_empty()
+    }
+
+    /// Whether the manifest declares more fixtures than the bundle contains.
+    ///
+    /// The manifest is the export's own record of what it wrote. If fixtures go
+    /// missing in transit — a truncated CI artifact upload, a partial copy, a
+    /// `.gitignore`d subdirectory — every surviving fixture can replay cleanly
+    /// while the gate silently certifies a strict subset of the sample. Neither
+    /// the divergence rung nor `require_complete_coverage` catches that: the
+    /// manifest's own shard status still reads `complete`, because the *export*
+    /// was complete; it was the *bundle* that lost files afterwards.
+    ///
+    /// A surplus counts too: an unexpected extra fixture means the directory is
+    /// not the bundle the manifest describes, so its verdict is not about the
+    /// sample the operator thinks they took.
+    #[must_use]
+    pub fn fixture_count_disagrees_with_manifest(&self) -> bool {
+        self.coverage.as_ref().is_some_and(|manifest| {
+            // A `sampled_total` that does not even fit a `usize` cannot equal
+            // the count of files actually walked, so a conversion failure is
+            // itself a disagreement rather than a reason to stay silent.
+            !usize::try_from(manifest.sampled_total).is_ok_and(|declared| declared == self.total)
+        })
+    }
+
     /// Whether the bundle's manifest reports incomplete cross-shard coverage.
     ///
     /// `false` when the bundle carries no manifest — an unclaimed coverage is
@@ -2440,15 +2482,40 @@ impl ReplayDriftReport {
     /// manifest yields `None` rather than an error — so a corrupt manifest and a
     /// missing one are indistinguishable here, and both fail closed.
     #[must_use]
-    pub const fn coverage_claim_unsatisfied(&self) -> bool {
+    pub fn coverage_claim_unsatisfied(&self) -> bool {
         if !self.require_complete_coverage {
             return false;
         }
-        match self.coverage.as_ref() {
-            // No proof of coverage at all: fail closed.
-            None => true,
-            Some(manifest) => !manifest.is_complete(),
-        }
+        // `is_none_or`: no manifest is no proof of coverage at all, so an absent
+        // one fails closed rather than reading as "complete".
+        self.coverage.as_ref().is_none_or(|manifest| {
+            !manifest.is_complete() || !self.zero_coverage_types().is_empty()
+        })
+    }
+
+    /// Workflow types the manifest reports as having in-flight work but **zero**
+    /// sampled fixtures.
+    ///
+    /// Distinct from ordinary truncation, and much worse. `sampled: 50` of
+    /// `in_flight_total: 4000` still replays 50 real executions of that type, so
+    /// a regression in it has 50 chances to surface. `sampled: 0` of
+    /// `in_flight_total: 4000` means the type was **never replayed at all** — the
+    /// gate can say nothing about it, yet the run looks green.
+    ///
+    /// Reachable when the global `MAX_SAMPLE_TOTAL` budget is exhausted by
+    /// earlier types (the per-type floor bottoms out at 1, and beyond
+    /// `MAX_SAMPLE_TOTAL` distinct in-flight types even that cannot be honoured),
+    /// or when every candidate for a type failed the per-execution size ceiling.
+    #[must_use]
+    pub fn zero_coverage_types(&self) -> Vec<&str> {
+        self.coverage.as_ref().map_or_else(Vec::new, |manifest| {
+            manifest
+                .per_workflow
+                .iter()
+                .filter(|coverage| coverage.sampled == 0 && coverage.in_flight_total > 0)
+                .map(|coverage| coverage.workflow_name.as_str())
+                .collect()
+        })
     }
 
     /// Whether the gate passes.
@@ -2463,7 +2530,7 @@ impl ReplayDriftReport {
     /// This always agrees with [`exit_code`](Self::exit_code): `is_clean()` is
     /// true exactly when `exit_code()` is `0`.
     #[must_use]
-    pub const fn is_clean(&self) -> bool {
+    pub fn is_clean(&self) -> bool {
         self.exit_code() == 0
     }
 
@@ -2473,18 +2540,20 @@ impl ReplayDriftReport {
     /// |------|---------|
     /// | `0` | Every fixture replayed cleanly |
     /// | `1` | One or more fixtures diverged — a determinism regression |
-    /// | `2` | One or more fixtures could not be replayed (dominates over `1`, because a gate that did not fully run cannot be trusted — mirrors [`CiReport::exit_code`]) |
-    /// | `3` | The bundle contained no fixtures, so nothing was verified |
-    /// | `4` | `require_complete_coverage` is set and complete coverage was not proven — the sample is knowingly incomplete, **or** the bundle carries no readable manifest at all |
+    /// | `2` | The gate could not fully run: a fixture failed to replay, **or** the bundle holds a different number of fixtures than its manifest declares (dominates over `1`, because a gate that did not fully run cannot be trusted — mirrors [`CiReport::exit_code`]) |
+    /// | `3` | Nothing was verified — the bundle was empty, or every fixture was skipped |
+    /// | `4` | `require_complete_coverage` is set and complete coverage was not proven — the sample is knowingly incomplete, a workflow type with in-flight work was sampled zero times, **or** the bundle carries no readable manifest at all |
     #[must_use]
-    pub const fn exit_code(&self) -> i32 {
-        if !self.blocked.is_empty() {
+    pub fn exit_code(&self) -> i32 {
+        if !self.blocked.is_empty() || self.fixture_count_disagrees_with_manifest() {
             return 2;
         }
         if !self.diverged.is_empty() {
             return 1;
         }
-        if self.is_empty() && !self.allow_empty_bundle {
+        // `verified_nothing` subsumes the empty bundle: both replayed zero
+        // workflows, so both are the same non-answer.
+        if self.verified_nothing() && !self.allow_empty_bundle {
             return 3;
         }
         if self.coverage_claim_unsatisfied() {
@@ -2494,65 +2563,79 @@ impl ReplayDriftReport {
     }
 }
 
-impl std::fmt::Display for ReplayDriftReport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl ReplayDriftReport {
+    /// Render the manifest-derived coverage block, or nothing when the bundle
+    /// carries no manifest.
+    ///
+    /// Split out of [`Display`](std::fmt::Display) so the two "the gate did not
+    /// verify what you think it did" lines — a workflow type sampled zero times,
+    /// and a fixture count that disagrees with the manifest — sit next to the
+    /// coverage numbers they qualify, and so `fmt` itself stays readable.
+    fn fmt_coverage(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some(coverage) = &self.coverage else {
+            return Ok(());
+        };
         writeln!(
             f,
-            "harvest replay-drift: {} fixture(s) — {} clean, {} diverged, {} blocked, {} skipped",
-            self.total,
-            self.succeeded,
-            self.diverged.len(),
-            self.blocked.len(),
-            self.skipped,
+            "  coverage: {} of {} in-flight execution(s) sampled across {} shard(s) [{}]",
+            coverage.sampled_total,
+            coverage.in_flight_total,
+            coverage.inspected_shards.len(),
+            if coverage.is_complete() {
+                "complete"
+            } else {
+                "PARTIAL"
+            },
         )?;
-
-        if let Some(coverage) = &self.coverage {
+        for shard in &coverage.unavailable_shards {
+            writeln!(f, "    unavailable: {shard}")?;
+        }
+        let zero_coverage = self.zero_coverage_types();
+        if !zero_coverage.is_empty() {
             writeln!(
                 f,
-                "  coverage: {} of {} in-flight execution(s) sampled across {} shard(s) [{}]",
-                coverage.sampled_total,
-                coverage.in_flight_total,
-                coverage.inspected_shards.len(),
-                if coverage.is_complete() {
-                    "complete"
-                } else {
-                    "PARTIAL"
-                },
+                "    NOT REPLAYED AT ALL ({} workflow type(s) have in-flight work but were \
+                 sampled zero times): {}",
+                zero_coverage.len(),
+                zero_coverage.join(", "),
             )?;
-            for shard in &coverage.unavailable_shards {
-                writeln!(f, "    unavailable: {shard}")?;
+        }
+        if self.fixture_count_disagrees_with_manifest() {
+            writeln!(
+                f,
+                "  BUNDLE INCOMPLETE: manifest declares {} fixture(s) but {} were found — \
+                 the bundle is not the sample the manifest describes (files lost in \
+                 transit?), so this verdict covers only a subset of what was exported",
+                coverage.sampled_total, self.total,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Render the trailing "this gate did not run" errors: a bundle that
+    /// verified nothing, and an unsatisfied `require_complete_coverage` claim.
+    ///
+    /// Each branch names the concrete operator action, because both are harness
+    /// failures rather than statements about the candidate build.
+    fn fmt_errors(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.verified_nothing() && !self.allow_empty_bundle {
+            if self.is_empty() {
+                writeln!(
+                    f,
+                    "  ERROR: the bundle contained no fixtures — nothing was verified. \
+                     Check the export step, or pass allow_empty_bundle(true) if the fleet \
+                     is legitimately idle."
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "  ERROR: all {} fixture(s) were skipped — no workflow was replayed, so \
+                     nothing was verified. Register the sampled workflow types on this gate \
+                     binary (or point it at the right bundle); pass allow_empty_bundle(true) \
+                     only if verifying nothing is genuinely acceptable.",
+                    self.total,
+                )?;
             }
-        }
-
-        for drift in &self.diverged {
-            writeln!(
-                f,
-                "  DRIFT  {} [{}] {} — {}",
-                drift.workflow_name,
-                drift.kind,
-                drift
-                    .execution_id
-                    .map_or_else(|| "<unknown>".to_string(), |id| id.to_string()),
-                drift.first_divergence,
-            )?;
-            writeln!(f, "         {}", drift.fixture_path.display())?;
-        }
-        for blocked in &self.blocked {
-            writeln!(
-                f,
-                "  BLOCKED  {} — {}",
-                blocked.fixture_path.display(),
-                blocked.reason,
-            )?;
-        }
-
-        if self.is_empty() && !self.allow_empty_bundle {
-            writeln!(
-                f,
-                "  ERROR: the bundle contained no fixtures — nothing was verified. \
-                 Check the export step, or pass allow_empty_bundle(true) if the fleet \
-                 is legitimately idle."
-            )?;
         }
         if self.coverage_claim_unsatisfied() {
             // Name which of the two failure modes occurred: "a shard was
@@ -2576,6 +2659,46 @@ impl std::fmt::Display for ReplayDriftReport {
             }
         }
         Ok(())
+    }
+}
+
+impl std::fmt::Display for ReplayDriftReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "harvest replay-drift: {} fixture(s) — {} clean, {} diverged, {} blocked, {} skipped",
+            self.total,
+            self.succeeded,
+            self.diverged.len(),
+            self.blocked.len(),
+            self.skipped,
+        )?;
+
+        self.fmt_coverage(f)?;
+
+        for drift in &self.diverged {
+            writeln!(
+                f,
+                "  DRIFT  {} [{}] {} — {}",
+                drift.workflow_name,
+                drift.kind,
+                drift
+                    .execution_id
+                    .map_or_else(|| "<unknown>".to_string(), |id| id.to_string()),
+                drift.first_divergence,
+            )?;
+            writeln!(f, "         {}", drift.fixture_path.display())?;
+        }
+        for blocked in &self.blocked {
+            writeln!(
+                f,
+                "  BLOCKED  {} — {}",
+                blocked.fixture_path.display(),
+                blocked.reason,
+            )?;
+        }
+
+        self.fmt_errors(f)
     }
 }
 
@@ -2618,6 +2741,13 @@ pub struct ReplayVerifier {
     /// Drift-gate policy (issue #798): refuse to certify a bundle whose manifest
     /// reports that a shard could not be inspected.
     require_complete_coverage: bool,
+    /// History policy the fixtures are replayed under (issue #614).
+    ///
+    /// Must match the deployment's `HarvestBuilder::history_policy`, because it
+    /// gates `continue_as_new_threshold` and therefore
+    /// [`WorkflowContext::should_continue_as_new`](crate::context::WorkflowContext::should_continue_as_new)
+    /// — see [`with_history_policy`](Self::with_history_policy).
+    history_policy: crate::context::WorkflowHistoryPolicy,
 }
 
 impl Default for ReplayVerifier {
@@ -2641,7 +2771,42 @@ impl ReplayVerifier {
             fixtures_dir: None,
             allow_empty_bundle: false,
             require_complete_coverage: false,
+            history_policy: crate::context::WorkflowHistoryPolicy::default(),
         }
+    }
+
+    /// Replay fixtures under the deployment's history policy (issue #614).
+    ///
+    /// The live worker evaluates
+    /// [`should_continue_as_new`](crate::context::WorkflowContext::should_continue_as_new)
+    /// with the registry's policy (`registry.history_policy()`). A workflow that
+    /// branches on it emits a *different command* under a different
+    /// `continue_as_new_threshold` — so replaying a bundle under the default
+    /// policy while production runs a customized one reports drift for a
+    /// workflow that never drifted, blocking a healthy deploy.
+    ///
+    /// Pass the same value the deployment's `HarvestBuilder` was given:
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::testing::ReplayVerifier;
+    /// # use autumn_harvest::context::WorkflowHistoryPolicy;
+    /// # async fn demo(policy: WorkflowHistoryPolicy) {
+    /// let report = ReplayVerifier::new()
+    ///     .with_history_policy(policy)
+    ///     .replay_bundle("./fixtures/in-flight")
+    ///     .await;
+    /// # }
+    /// ```
+    ///
+    /// Defaults to [`WorkflowHistoryPolicy::default()`](crate::context::WorkflowHistoryPolicy),
+    /// which is correct for any deployment that never customized it.
+    #[must_use]
+    pub const fn with_history_policy(
+        mut self,
+        history_policy: crate::context::WorkflowHistoryPolicy,
+    ) -> Self {
+        self.history_policy = history_policy;
+        self
     }
 
     /// Register a batch of workflow handlers from a `workflows![…]` collector call.
@@ -2858,6 +3023,7 @@ impl ReplayVerifier {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.concurrency));
         let timeout = self.timeout;
         let allow_unregistered = self.allow_unregistered;
+        let history_policy = self.history_policy;
         let handlers = Arc::new(self.handlers.clone());
         let state = self.state.clone();
 
@@ -2869,8 +3035,16 @@ impl ReplayVerifier {
 
             tasks.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
-                replay_fixture_file(&handlers, state, &path, timeout, allow_unregistered, mode)
-                    .await
+                replay_fixture_file(
+                    &handlers,
+                    state,
+                    &path,
+                    timeout,
+                    allow_unregistered,
+                    mode,
+                    history_policy,
+                )
+                .await
             }));
         }
 
@@ -3013,6 +3187,59 @@ struct FixtureGuardFields {
 /// A fixture that declares neither field (a legacy export, or a fixture built by
 /// hand in Rust) is treated as replayable — hand-built fixtures carry real
 /// inputs, and refusing them would break every existing directory fixture.
+/// Refuse a fixture carrying large-payload **offload reference envelopes**
+/// (issue #524) instead of the real payloads.
+///
+/// The export path loads history with `store::load_history_undecoded`
+/// (deliberately, so an encrypted history is not failed before the payload
+/// policy runs), so on a deployment with a `PayloadStore` registered any payload
+/// over the offload threshold is exported as a claim-check envelope. The
+/// directory-replay path builds its `WorkflowReplayer` with
+/// `payload_offloader: None` and therefore cannot inflate it.
+///
+/// Left unguarded, the candidate workflow computes the *real* input while
+/// history holds the envelope, so `match_activity_strict` diverges on every
+/// affected fixture — the gate would report a determinism regression that does
+/// not exist and block a healthy deploy. That is the same false-red class as a
+/// redacted bundle, and gets the same treatment: a harness error (exit 2) that
+/// names the fix, rather than a confidently wrong "your code drifted".
+///
+/// Applies to both replay modes: an un-inflatable envelope is un-replayable
+/// regardless of which gate is asking, and a fixture with no envelope is
+/// untouched — so this can never turn a genuinely-clean run red.
+fn offloaded_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<String> {
+    // Fast reject on the raw text first: the discriminator is a fixed key, so a
+    // substring miss proves no envelope is present without re-serializing a
+    // single event. Only a hit pays for the structured confirmation below.
+    if !json.contains(crate::payload_store::OFFLOAD_ENVELOPE_KEY) {
+        return None;
+    }
+
+    let offloaded: Vec<String> = snapshot
+        .events
+        .iter()
+        .filter_map(|event| serde_json::to_value(event).ok())
+        .flat_map(|value| crate::payload_store::refs_in_event_value(&value))
+        .map(|reference| reference.blob_key)
+        .collect();
+    if offloaded.is_empty() {
+        // The key appeared in payload *data* rather than as a real envelope
+        // (e.g. a workflow whose own JSON mentions it). Nothing to inflate.
+        return None;
+    }
+
+    Some(format!(
+        "fixture carries {} offloaded payload reference(s) (issue #524) that this \
+         gate cannot inflate, so replaying it would compare the candidate's real \
+         inputs against claim-check envelopes and report drift that does not \
+         exist. Sample a workflow whose payloads stay under the offload \
+         threshold, or raise `payload_offload_threshold` for the exported \
+         window. First blob key: {}",
+        offloaded.len(),
+        offloaded.first().map_or("<unknown>", String::as_str),
+    ))
+}
+
 fn unreplayable_fixture_reason(
     guard: &FixtureGuardFields,
     mode: FixtureReplayMode,
@@ -3095,6 +3322,7 @@ async fn replay_fixture_file(
     timeout: std::time::Duration,
     allow_unregistered: bool,
     mode: FixtureReplayMode,
+    history_policy: crate::context::WorkflowHistoryPolicy,
 ) -> FixtureResult {
     // Read file.
     let json = match tokio::fs::read_to_string(path).await {
@@ -3142,7 +3370,9 @@ async fn replay_fixture_file(
     // on `HistorySnapshot`. A fixture that declares neither (hand-built, or a
     // legacy export) parses to all-`None` and is treated as replayable.
     let guard: FixtureGuardFields = serde_json::from_str(&json).unwrap_or_default();
-    if let Some(reason) = unreplayable_fixture_reason(&guard, mode) {
+    if let Some(reason) = unreplayable_fixture_reason(&guard, mode)
+        .or_else(|| offloaded_fixture_reason(&json, &snapshot))
+    {
         return FixtureResult {
             path: path.to_owned(),
             workflow_name,
@@ -3201,9 +3431,11 @@ async fn replay_fixture_file(
         // `replay_from_snapshot`, which always sources `execution_id` from the
         // snapshot (a required field); no raw-events global override applies.
         execution_id: None,
-        // Issue #614: the directory-fixture path carries no history-policy field,
-        // so it replays under the default policy (unchanged pre-#614 behavior).
-        history_policy: crate::context::WorkflowHistoryPolicy::default(),
+        // Issue #614: the bundle carries no history-policy field (it describes
+        // executions, not the runtime that produced them), so the caller supplies
+        // it via `ReplayVerifier::with_history_policy`. Defaults to the default
+        // policy — unchanged pre-#614 behavior for anyone who never customized it.
+        history_policy,
     };
 
     let replay_result = match mode {
