@@ -229,6 +229,16 @@ diesel::table! {
         /// expires, since the session's local state only exists on that one
         /// worker.
         session_id -> Nullable<Uuid>,
+        /// Consecutive claims by workers with no handler registered for this
+        /// task's type (issue #804). Incremented by
+        /// `queue::release_task_for_capability_miss` when a worker releases a
+        /// task it cannot run so a capable peer can claim it; reset to 0 by
+        /// every path that proves the claiming worker WAS capable. Bounds the
+        /// bounce: at `WorkerConfig::capability_miss_max_redeliveries` the task
+        /// escalates to the terminal-failure path with a `no_capable_worker:`
+        /// reason. Deliberately separate from `attempt` (retry budget) and
+        /// `crash_strikes` (poison-pill quarantine).
+        capability_misses -> Int4,
     }
 }
 

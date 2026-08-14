@@ -251,6 +251,7 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_QUEUE_DEPTH`       | `harvest.queue.depth`         | Gauge        | `queue` (bounded)                             | `execution.id`        |
 | `METRIC_WORKFLOW_ACTIVE`   | `harvest.workflow.active`     | Gauge        | `workflow` (bounded), `state` (2 values: running/paused) | `execution.id` |
 | `METRIC_DLQ_ENTRIES`       | `harvest.dlq.entries`         | Gauge        | `shard` (≤ 256)                               |                       |
+| `METRIC_TASK_CAPABILITY_MISS` | `harvest.task.capability_miss` | Counter | `queue` (bounded), `task_type` (2 values: workflow/activity), `outcome` (2 values: released/escalated) | `execution.id`, workflow/activity name |
 | `METRIC_QUEUE_PAUSED`      | `harvest.queue.paused`        | Gauge        | `queue` (bounded)                             | 1 = operator hold in effect (issue #619) |
 | `METRIC_SCHEDULE_RUNS`     | `harvest.schedule.runs`       | Counter      | `kind` (2 values), `name` (bounded)           |                       |
 | `METRIC_SCHEDULE_SKIPPED`  | `harvest.schedule.skipped`    | Counter      | `kind`, `name`, `reason` (3 values)           |                       |

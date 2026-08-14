@@ -3066,6 +3066,33 @@ pub struct WorkerConfig {
     /// poison pills are re-queued indefinitely — the legacy retry-loop
     /// behaviour).
     pub poison_pill_threshold: i32,
+    /// Maximum number of times a task may be **released** back to `PENDING`
+    /// because the claiming worker had no handler registered for its
+    /// workflow/activity type, before it is escalated to the terminal-failure /
+    /// dead-letter path with a `no_capable_worker:` reason (issue #804).
+    ///
+    /// Any worker polling a queue can claim any task on it — the queue's
+    /// non-blocking claim query has no capability filter, and cannot have one
+    /// (a worker can enumerate the handlers it *has* registered, never the
+    /// ones it has not).
+    /// A claim by an incapable worker is therefore released for a capable peer
+    /// rather than terminally failing the execution, which makes the routine
+    /// mid-rolling-deploy window blameless.
+    ///
+    /// Each release increments the task's `capability_misses` and defers it by
+    /// a capped exponential backoff (1 s doubling to 30 s), so the budget buys
+    /// a dwell window comfortably longer than a pod flip. The counter is reset
+    /// to `0` by every path that proves the claiming worker *was* capable, so
+    /// it measures **consecutive** misses — the same semantics
+    /// [`poison_pill_threshold`] has for crashes.
+    ///
+    /// Defaults to **5**. Set to `0` to escalate on the **first** miss (the
+    /// pre-#804 fail-fast behaviour) — note this is *not* an "unlimited
+    /// releases" switch; releasing forever would let a genuinely-unregistered
+    /// type bounce indefinitely, which is exactly what the budget bounds.
+    ///
+    /// [`poison_pill_threshold`]: Self::poison_pill_threshold
+    pub capability_miss_max_redeliveries: u32,
     /// Maximum wall-clock time a single workflow-task dispatch may run before
     /// the worker reclaims the concurrency slot (issue #494).
     ///
@@ -3226,6 +3253,7 @@ impl Default for WorkerConfig {
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            capability_miss_max_redeliveries: 5,
             workflow_task_timeout: Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: DEFAULT_MAX_WORKFLOW_PAUSE_DURATION,
@@ -3422,6 +3450,37 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_poison_pill_threshold(mut self, threshold: i32) -> Self {
         self.poison_pill_threshold = threshold;
+        self
+    }
+
+    /// Override the capability-miss redelivery budget (default 5, issue #804).
+    ///
+    /// A task claimed by a worker with no handler registered for its
+    /// workflow/activity type is released back to `PENDING` for a capable peer,
+    /// with capped exponential backoff. After `budget` such releases it is
+    /// escalated to the terminal-failure / dead-letter path with a
+    /// `no_capable_worker:` reason.
+    ///
+    /// Raise this if your rollouts legitimately take longer than the default
+    /// dwell window (~1 minute of accumulated backoff at the default); this
+    /// trades a longer time-to-detect for fewer spurious escalations.
+    ///
+    /// `0` escalates on the **first** miss — the pre-#804 fail-fast behaviour.
+    /// It is not an "off" switch for the feature; there is deliberately no
+    /// unlimited-release mode, since that would let a genuinely-unregistered
+    /// workflow type bounce around the fleet forever.
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_capability_miss_max_redeliveries(10);
+    /// assert_eq!(config.capability_miss_max_redeliveries, 10);
+    /// ```
+    #[must_use]
+    pub const fn with_capability_miss_max_redeliveries(mut self, budget: u32) -> Self {
+        self.capability_miss_max_redeliveries = budget;
         self
     }
 
@@ -4968,6 +5027,52 @@ mod tests {
     fn worker_config_poison_pill_threshold_zero_disables() {
         let config = WorkerConfig::default().with_poison_pill_threshold(0);
         assert_eq!(config.poison_pill_threshold, 0);
+    }
+
+    // ── Capability-miss redelivery budget tests (issue #804) ──────────────
+
+    #[test]
+    fn worker_config_capability_miss_max_redeliveries_defaults_to_5() {
+        // AC3 asks for a "configurable number ... (default small, e.g. 5)".
+        assert_eq!(
+            WorkerConfig::default().capability_miss_max_redeliveries,
+            5,
+            "the default redelivery budget must be small but large enough to \
+             outlast a rolling pod flip"
+        );
+    }
+
+    #[test]
+    fn worker_config_with_capability_miss_max_redeliveries_overrides() {
+        let config = WorkerConfig::default().with_capability_miss_max_redeliveries(12);
+        assert_eq!(config.capability_miss_max_redeliveries, 12);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn worker_config_capability_miss_zero_escalates_immediately() {
+        // `0` is NOT an off-switch for the feature: it means "escalate on the
+        // first miss", i.e. the pre-#804 fail-fast behaviour. Pinned so nobody
+        // later reinterprets 0 as "release forever" (which would let a
+        // genuinely-unregistered type bounce indefinitely — the exact hazard
+        // the budget exists to bound).
+        let config = WorkerConfig::default().with_capability_miss_max_redeliveries(0);
+        assert_eq!(config.capability_miss_max_redeliveries, 0);
+        assert_eq!(
+            crate::worker::capability_miss_decision(1, config.capability_miss_max_redeliveries),
+            crate::worker::CapabilityMissAction::Escalate
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn worker_config_capability_miss_budget_is_threaded_into_the_runtime_config() {
+        // The knob is inert unless it reaches WorkerRuntimeConfig — the struct
+        // the worker's dispatch path actually reads. This is the same threading
+        // contract `poison_pill_threshold` has.
+        let config = WorkerConfig::default().with_capability_miss_max_redeliveries(9);
+        let runtime: crate::worker::WorkerRuntimeConfig = config.into();
+        assert_eq!(runtime.capability_miss_max_redeliveries, 9);
     }
 
     // ── Workflow panic-retry budget tests (issue #782) ────────────────────

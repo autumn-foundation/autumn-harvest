@@ -1000,6 +1000,54 @@
         "GET /api/harvest/admin/preflight"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_scanner_stalled"
+    },
+    {
+      "id": "harvest_no_capable_worker",
+      "status": "enforceable",
+      "signal_source": "ADR-0001/#138 counter harvest.task.capability_miss{queue, task_type, outcome} (issue #804).",
+      "default_threshold": "Page on ANY non-zero rate of outcome=escalated over 5m: no live worker on that queue registers the handler, so executions ARE being failed. Separately, ticket if outcome=released stays non-zero for more than ~15m (a rolling deploy that should have settled has not).",
+      "severity": "page",
+      "owner_persona": "release on-call",
+      "description": "A worker claimed a task whose workflow/activity type it has no handler registered for. Since issue #804 the engine RELEASES the claim back to PENDING for a capable peer instead of terminally failing the execution, so the benign, self-healing case (the transient window of a rolling deploy that introduces a new type, or a heterogeneous pool sharing a queue) shows up as outcome=released and costs nothing. outcome=escalated is the real page: the per-task redelivery budget (WorkerConfig::capability_miss_max_redeliveries, default 5, with capped exponential backoff) was exhausted without any capable worker claiming it, so the task fell through to the terminal-failure / dead-letter path with a `no_capable_worker:` reason. Distinct from harvest_task_quarantined, which is a worker-process CRASH (issue #367) \u2014 a clean capability miss never increments crash strikes.",
+      "first_action": "GET /api/harvest/admin/workflow-types/reachability (issue #520) to see which registered/unregistered types have live non-terminal executions, then GET /api/harvest/workers to confirm which builds are actually polling the affected queue.",
+      "dependencies": [
+        {
+          "ref": "#804",
+          "status": "shipped",
+          "surface": "METRIC_TASK_CAPABILITY_MISS / harvest.task.capability_miss{queue, task_type, outcome}"
+        },
+        {
+          "ref": "#520",
+          "status": "shipped",
+          "surface": "GET /admin/workflow-types/reachability (which workflow types have live executions but no registered handler)"
+        },
+        {
+          "ref": "#774",
+          "status": "shipped",
+          "surface": "GET /admin/queues/coverage (which queues have no live worker at all)"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "outcome is bounded to exactly released|escalated, and task_type to workflow|activity, so both are safe to group by. Alert on escalated; released is a companion capacity/deploy-skew signal, not a page on its own.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (queue, task_type) (increase(harvest_task_capability_miss_total{outcome=\"escalated\"}[5m])) > 0"
+          },
+          {
+            "kind": "promql",
+            "expr": "sum by (queue, task_type) (increase(harvest_task_capability_miss_total{outcome=\"released\"}[15m])) > 0"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/admin/workflow-types/reachability (issue #520 \u2014 verdict orphaned means a type has live executions but no registered handler anywhere)",
+        "GET /api/harvest/admin/queues/coverage (issue #774 \u2014 confirm the queue has any live worker at all)",
+        "GET /api/harvest/workers (confirm which build_id / deployment is polling the affected queue)",
+        "GET /api/harvest/dead-letters?queue={queue} (escalated tasks land here with a no_capable_worker: reason)"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_no_capable_worker"
     }
   ]
 }

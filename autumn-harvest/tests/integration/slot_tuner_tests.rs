@@ -185,6 +185,7 @@ fn runtime_config(worker_id: &str, slot_tuner: Option<SlotTunerConfig>) -> Worke
         priority_aging_secs: None,
         unknown_target_grace_window: Duration::from_secs(5),
         poison_pill_threshold: 3,
+        capability_miss_max_redeliveries: 5,
         workflow_task_timeout: Duration::from_secs(10),
         workflow_panic_max_attempts: 3,
         labels: std::collections::HashMap::new(),

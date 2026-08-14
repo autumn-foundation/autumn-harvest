@@ -272,6 +272,99 @@ mistaken for "fully covered".
 
 ---
 
+## Worker-fleet handler contract — capability misses are released, not failed (issue #804)
+
+**The contract: all workers polling a queue should register the same handler
+set.** Harvest's task queue has no claim-time capability filter, and — by
+construction — cannot have one: a worker can enumerate the handlers it *has*
+registered, but not the ones it has *not*. `SKIP LOCKED` therefore hands any
+eligible worker any eligible task, including a task for a handler that worker
+has never heard of.
+
+A rolling deploy breaks that contract *by design*, for the length of the
+rollout: while old and new pods coexist, a workflow or activity introduced in
+the new build is enqueued by a new pod and can be claimed by an old one.
+
+**What happens now.** A worker that claims a task whose handler it does not
+register **releases the claim** back to `PENDING` for a capable peer, with
+capped-exponential backoff (1s, 2s, 4s, 8s, 16s, then 30s). Nothing is
+appended to the execution's history and the execution stays `RUNNING` — the
+old pod is healthy, it simply is not the right pod for this task.
+
+**The release is bounded.** Each release increments a per-task
+`capability_misses` counter. Once it reaches
+`WorkerConfig::capability_miss_max_redeliveries` (default **5**) the task
+**escalates** through the ordinary terminal-failure path with a greppable
+reason:
+
+```
+no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 5 capability-miss redeliveries)
+```
+
+That bound is what keeps a genuinely-missing handler — a workflow type deleted
+or renamed in the new build with runs still in flight — from bouncing around
+the fleet forever. It is a *deploy-skew absorber*, not a substitute for
+shipping the handler.
+
+**Prior behaviour (before #804):** the claiming worker failed the execution
+terminally on the spot. Mid-deploy that was a self-inflicted outage — healthy
+old pods failing perfectly good new-build work.
+
+### What to watch during a rollout
+
+| Signal | Meaning | Action |
+|---|---|---|
+| `harvest.task.capability_miss{outcome="released"}` rising, then falling to zero | Normal deploy skew, self-healing | None. Confirm it returns to zero once the rollout completes. |
+| `harvest.task.capability_miss{outcome="released"}` sustained past the rollout | Some pods are stuck on the old build, or the new handler never shipped to part of the fleet | Finish/roll back the deploy; check the fleet's build IDs. |
+| `harvest.task.capability_miss{outcome="escalated"}` non-zero | **No live worker on that queue registers the handler.** Executions are now failing. | Page. Ship the handler, or accept the failures deliberately. |
+
+The alert `harvest_no_capable_worker` (starter pack) fires on the escalation
+signal; see [`harvest-alerts.md`](harvest-alerts.md#harvest_no_capable_worker)
+for the full triage.
+
+### Sizing the budget
+
+`capability_miss_max_redeliveries` (default 5) is a *redelivery* budget, not a
+time budget, but the backoff makes it dwell: five claims span roughly 31
+seconds of backoff **on a single worker**. In a fleet, releases are consumed by
+whichever worker claims next, so a large fleet of incapable workers burns the
+budget faster in wall-clock terms. Raise it if your rollouts are slow or your
+fleet is wide:
+
+```rust
+WorkerConfig::default().with_capability_miss_max_redeliveries(20)
+```
+
+Setting it to `0` escalates on the first miss — i.e. opts back into the
+pre-#804 fail-fast behaviour.
+
+### Interactions and carve-outs
+
+- **Not a poison pill (#367).** A capability miss is a clean "wrong pod", not a
+  crash. It never increments `crash_strikes`, never consumes the task's retry
+  budget (`attempt` is restored on release), and never produces a `PoisonPill`
+  dead-letter row. `harvest_task_quarantined` and `harvest_no_capable_worker`
+  are therefore mutually exclusive diagnoses.
+- **Not a hung body (#494).** The workflow-task timeout strike counter is
+  untouched — a released task never ran a handler at all.
+- **Session-pinned tasks (#606) escalate immediately.** A session task is
+  hard-pinned to its acquiring host, so "release for a capable peer" is false
+  by construction: no other worker can ever claim it. Such a task escalates on
+  the first miss regardless of the budget.
+- **Orthogonal to build-id routing (#171), below.** Build routing asks *"is
+  this worker's build allowed to resume this history?"*; a capability miss
+  asks *"does this worker have the handler at all?"* A fleet using build
+  policies still benefits: routing narrows who *may* claim, but a worker that
+  passes the build gate can still lack a brand-new handler.
+- **Orthogonal to the handler-coverage gate (#520/#700), below.** That gate is
+  a *pre-cutover* check for handlers you are about to **remove**; this is a
+  *runtime* absorber for handlers not yet **added**.
+- **No replay impact.** Release and redelivery are task-queue state, not
+  event-log state: no new `WorkflowEvent` variant, nothing appended on a
+  release, and the adjacently-tagged event JSON contract is unchanged.
+
+---
+
 # Runbook: Build-Id Routing for Safe Rolling Deploys
 
 Use Harvest's build-id routing to gate which workers may resume specific

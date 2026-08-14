@@ -3071,6 +3071,55 @@
             }
           ],
           "description": "Tasks quarantined to the DLQ after repeated worker-process crashes (issue #367)."
+        },
+        {
+          "id": 928,
+          "type": "timeseries",
+          "title": "Capability misses (handler not registered)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 58
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (queue, task_type, outcome) (increase(harvest_task_capability_miss_total{queue=~\"$queue\"}[1h]))",
+              "legendFormat": "{{queue}} {{task_type}} {{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_no_capable_worker (docs/runbooks/harvest-alerts.md#harvest_no_capable_worker) Tasks claimed by a worker with no handler registered for that workflow/activity type (issue #804). outcome=released is the benign, self-healing signature of CAPABILITY SKEW across a queue's fleet \u2014 most often the transient window of a rolling deploy that introduces a new type; the claim is handed back for a capable peer and no execution is failed. outcome=escalated means the redelivery budget was exhausted: NO live worker on that queue registers the handler, and executions ARE being failed with a no_capable_worker: reason. Page on escalated; watch released only if it stays non-zero long after a deploy settles. Distinct from harvest_task_quarantined (a worker-process CRASH, issue #367) \u2014 a capability miss never increments crash strikes."
         }
       ]
     },

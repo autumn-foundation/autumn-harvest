@@ -578,6 +578,36 @@ pub enum HarvestError {
         /// The lock key the workflow already holds.
         key: String,
     },
+
+    /// The worker that claimed a task has **no handler registered** for its
+    /// workflow or activity type (issue #804).
+    ///
+    /// This is a **blameless fleet condition, not a workload failure**: any
+    /// worker polling a queue can claim any task on it (the queue's
+    /// non-blocking claim query has no capability filter, and cannot have one
+    /// — a worker can enumerate the handlers it *has* registered, never the
+    /// ones it has not).
+    /// The routine trigger is the transient window of a rolling deploy that
+    /// introduces a new workflow or activity type.
+    ///
+    /// The worker's dispatch path intercepts this variant specifically and
+    /// **releases** the claim back to `PENDING` for a capable peer, up to
+    /// `WorkerConfig::capability_miss_max_redeliveries`, before falling through
+    /// to the ordinary terminal-failure path with a `no_capable_worker:` reason.
+    ///
+    /// It is a **dedicated variant rather than a `Config` string match** on
+    /// purpose: `Config` is a broad catch-all, and classifying on its message
+    /// would swallow every genuine configuration error into an infinite
+    /// release-and-retry loop.
+    #[error("no {kind} handler registered for '{name}' on this worker")]
+    HandlerNotRegistered {
+        /// `"workflow"` or `"activity"` — the kind of missing handler. A
+        /// `&'static str` (not a `String`) so the value is bounded by
+        /// construction and safe to use as a metric label.
+        kind: &'static str,
+        /// The workflow or activity type name that has no registered handler.
+        name: String,
+    },
 }
 
 /// The Postgres constraint name backing the `harvest_events`
@@ -825,6 +855,23 @@ impl HarvestError {
     #[must_use]
     pub fn is_event_id_unique_violation(&self) -> bool {
         matches!(self, Self::Database(msg) if msg.contains(EVENTS_EVENT_ID_UNIQUE_CONSTRAINT))
+    }
+
+    /// Classify this error as a **capability miss** — the claiming worker has
+    /// no handler registered for the task's workflow/activity type (issue #804).
+    ///
+    /// Returns `Some((kind, name))` for [`Self::HandlerNotRegistered`] and
+    /// `None` for every other variant. This is the single predicate the
+    /// worker's dispatch path keys on to decide release-vs-terminal-fail, so it
+    /// is deliberately **narrow**: a broad match (e.g. on [`Self::Config`]'s
+    /// message text) would sweep genuine configuration bugs into an infinite
+    /// release-and-retry loop instead of surfacing them.
+    #[must_use]
+    pub const fn handler_not_registered(&self) -> Option<(&'static str, &str)> {
+        match self {
+            Self::HandlerNotRegistered { kind, name } => Some((kind, name.as_str())),
+            _ => None,
+        }
     }
 }
 
@@ -1457,5 +1504,60 @@ mod tests {
             HarvestError::SessionAcquireTimeout { .. }
         ));
         assert!(!matches!(timeout, HarvestError::SessionBroken { .. }));
+    }
+
+    // ── Capability-miss classification (issue #804) ──────────────────────
+
+    #[test]
+    fn handler_not_registered_carries_the_kind_and_name() {
+        let wf = HarvestError::HandlerNotRegistered {
+            kind: "workflow",
+            name: "onboarding".into(),
+        };
+        let act = HarvestError::HandlerNotRegistered {
+            kind: "activity",
+            name: "send_email".into(),
+        };
+        assert!(wf.to_string().contains("workflow"));
+        assert!(wf.to_string().contains("onboarding"));
+        assert!(act.to_string().contains("activity"));
+        assert!(act.to_string().contains("send_email"));
+    }
+
+    #[test]
+    fn handler_not_registered_is_classified_as_a_capability_miss() {
+        // The classifier is the single interception predicate the worker's
+        // dispatch path keys on. Anything else must be classified as a genuine
+        // failure, or a real bug would be silently released and retried forever
+        // instead of surfacing.
+        let miss = HarvestError::HandlerNotRegistered {
+            kind: "workflow",
+            name: "onboarding".into(),
+        };
+        assert_eq!(
+            miss.handler_not_registered(),
+            Some(("workflow", "onboarding"))
+        );
+    }
+
+    #[test]
+    fn other_errors_are_not_capability_misses() {
+        // Deliberately includes `Config`, which is what the handler-miss sites
+        // returned BEFORE issue #804 — a broad, catch-all variant. Classifying
+        // on it would swallow every genuine configuration error into an
+        // infinite release loop, which is exactly why #804 introduces a
+        // dedicated variant rather than string-matching `Config`.
+        for err in [
+            HarvestError::Config("no activity handler registered for 'x'".into()),
+            HarvestError::NotFound("nope".into()),
+            HarvestError::non_deterministic_simple("drift"),
+            HarvestError::MutexSelfDeadlock { key: "k".into() },
+        ] {
+            assert_eq!(
+                err.handler_not_registered(),
+                None,
+                "only the dedicated variant may classify as a capability miss: {err}"
+            );
+        }
     }
 }

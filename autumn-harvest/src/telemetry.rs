@@ -480,6 +480,50 @@ pub const METRIC_WORKFLOW_UNFINISHED_HANDLERS: &str = "harvest.workflow.unfinish
 /// (`"poison_pill"`). `execution.id` stays span-only per ADR-0001 §7.
 pub const METRIC_TASK_QUARANTINED: &str = "harvest.task.quarantined";
 
+/// Counter: capability misses (issue #804).
+///
+/// Incremented each time a worker claims a task whose workflow or activity type
+/// it has no handler registered for — either releasing the claim back to
+/// `PENDING` for a capable peer, or escalating to the terminal-failure path once
+/// the redelivery budget is exhausted.
+///
+/// A sustained non-zero release rate is the operator-visible signature of
+/// **capability skew** across a queue's worker fleet — most commonly the
+/// transient window of a rolling deploy that introduces a new workflow or
+/// activity type. A non-zero *escalation* rate means no live worker on that
+/// queue registers the handler at all, and executions are being failed.
+///
+/// Labeled by:
+/// - `queue` (= [`METRIC_LABEL_QUEUE`]): the task queue name (bounded).
+/// - `task_type` (= [`METRIC_LABEL_TASK_TYPE`]): `"workflow"` or `"activity"`
+///   (bounded — `CapabilityMissKind::as_str`).
+/// - `outcome` (= [`METRIC_LABEL_OUTCOME`]): [`CAPABILITY_MISS_OUTCOME_RELEASED`]
+///   or [`CAPABILITY_MISS_OUTCOME_ESCALATED`] (bounded).
+///
+///
+/// The `outcome` dimension is a deliberate bounded **superset** of the label
+/// set named in issue #804 (`{queue, task_type}`): AC5 also requires operators
+/// to be able to "alert on the escalation", which is only expressible if the
+/// benign release and the executions-are-failing escalation are separable on
+/// the same counter. This matches the existing repo idiom
+/// (`harvest.schedule.fire_attempts{outcome}`, `harvest.workflow.terminal{outcome}`).
+///
+/// The workflow/activity **name** is deliberately NOT a label: it is bounded in
+/// practice but the `queue` + `task_type` pair is enough to localize a deploy
+/// skew, and `execution.id` stays span-only per ADR-0001 §7.
+pub const METRIC_TASK_CAPABILITY_MISS: &str = "harvest.task.capability_miss";
+
+/// `outcome` label value on [`METRIC_TASK_CAPABILITY_MISS`]: the claim was
+/// released back to `PENDING` for a capable peer to pick up (issue #804).
+pub const CAPABILITY_MISS_OUTCOME_RELEASED: &str = "released";
+
+/// `outcome` label value on [`METRIC_TASK_CAPABILITY_MISS`]: escalated.
+///
+/// The redelivery budget was exhausted and the task fell through to the
+/// terminal-failure / dead-letter path with a `no_capable_worker:` reason
+/// (issue #804).
+pub const CAPABILITY_MISS_OUTCOME_ESCALATED: &str = "escalated";
+
 /// Counter: incremented each time an activity's circuit breaker trips open
 /// (closed → open) or re-opens after a failed half-open probe (issue #369).
 ///
@@ -1239,6 +1283,9 @@ pub const METRIC_LABEL_ACTIVITY: &str = "activity";
 pub const METRIC_LABEL_ACTIVITY_NAME: &str = "activity.name";
 /// Metric label: the task queue name.
 pub const METRIC_LABEL_QUEUE: &str = "queue";
+/// Metric label: task-queue row kind (`"workflow"` or `"activity"`) — bounded
+/// by `CapabilityMissKind::as_str` (issue #804).
+pub const METRIC_LABEL_TASK_TYPE: &str = "task_type";
 /// Metric label: terminal outcome status (e.g. `"completed"`, `"failed"`).
 pub const METRIC_LABEL_STATUS: &str = "status";
 /// Metric label: active workflow lifecycle state (issue #770) — one of the
@@ -2410,6 +2457,21 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter `harvest.task.quarantined{queue, reason}`.
     fn record_task_quarantined(&self, queue: &str, reason: &str) {
         let _ = (queue, reason);
+    }
+
+    /// A worker claimed a task whose workflow/activity type it has no handler
+    /// registered for, and either released the claim for a capable peer or
+    /// escalated it after exhausting the redelivery budget (issue #804).
+    ///
+    /// Maps to the counter
+    /// `harvest.task.capability_miss{queue, task_type, outcome}`.
+    ///
+    /// `task_type` is `"workflow"` / `"activity"`; `outcome` is
+    /// [`CAPABILITY_MISS_OUTCOME_RELEASED`] / [`CAPABILITY_MISS_OUTCOME_ESCALATED`].
+    /// All three labels are bounded; per ADR-0001 §7 `execution.id` is never a
+    /// metric label (and is not a parameter here, so it cannot become one).
+    fn record_task_capability_miss(&self, queue: &str, task_type: &str, outcome: &str) {
+        let _ = (queue, task_type, outcome);
     }
 
     /// An operator redrive processed one dead-letter entry (issue #510).
@@ -4275,5 +4337,60 @@ mod tests {
         let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
         rec.record_saga_compensated("billing", "default");
         rec.record_saga_compensation_failed("billing", "default");
+    }
+
+    // -----------------------------------------------------------------------
+    // Capability-miss release / escalate counter (issue #804)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metric_capability_miss_constant_has_correct_name() {
+        // AC5 names the counter `harvest.task.capability_miss`. It shares the
+        // `harvest.task.*` family with `harvest.task.quarantined` (issue #367)
+        // so the two fleet-health task signals sort together on a dashboard.
+        assert_eq!(METRIC_TASK_CAPABILITY_MISS, "harvest.task.capability_miss");
+    }
+
+    #[test]
+    fn metric_label_task_type_has_correct_name() {
+        assert_eq!(METRIC_LABEL_TASK_TYPE, "task_type");
+    }
+
+    #[test]
+    fn record_task_capability_miss_has_noop_default() {
+        // Additive no-op default so every existing MetricsRecorder impl
+        // compiles unchanged (the established recipe: #519, #367, #618).
+        let rec = NoOpMetrics;
+        rec.record_task_capability_miss("default", "workflow", "released");
+        rec.record_task_capability_miss("default", "activity", "escalated");
+    }
+
+    #[test]
+    fn capability_miss_outcome_labels_are_bounded() {
+        // AC5 requires that operators can "alert on the escalation" — that is
+        // only expressible if release and escalation are DISTINGUISHABLE on the
+        // counter. The issue text names `{queue, task_type}`; we ship a
+        // deliberate bounded SUPERSET with `outcome`, matching the repo idiom
+        // (`harvest.schedule.fire_attempts{outcome}`,
+        // `harvest.workflow.terminal{outcome}`).
+        //
+        // Exactly two values, both compile-time constants — no caller-supplied
+        // string can widen the cardinality.
+        assert_eq!(CAPABILITY_MISS_OUTCOME_RELEASED, "released");
+        assert_eq!(CAPABILITY_MISS_OUTCOME_ESCALATED, "escalated");
+        assert_ne!(
+            CAPABILITY_MISS_OUTCOME_RELEASED,
+            CAPABILITY_MISS_OUTCOME_ESCALATED
+        );
+    }
+
+    #[test]
+    fn execution_id_is_not_a_parameter_of_record_task_capability_miss() {
+        // Compile-level cardinality pin (ADR-0001 §7): the signature accepts
+        // exactly three bounded strings. An ExecutionId parameter would not
+        // compile, so unbounded per-execution series are impossible here by
+        // construction.
+        let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
+        rec.record_task_capability_miss("default", "workflow", "released");
     }
 }

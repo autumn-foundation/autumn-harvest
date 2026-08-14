@@ -57,10 +57,10 @@ use crate::telemetry::{
     METRIC_LABEL_PATH, METRIC_LABEL_PRODUCER, METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE,
     METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE, METRIC_LABEL_SCANNER, METRIC_LABEL_SCOPE,
     METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATE,
-    METRIC_LABEL_STATUS, METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE,
-    METRIC_MUTEX_CONTENTION, METRIC_MUTEX_HELD, METRIC_MUTEX_WAIT, METRIC_PAYLOAD_BYTES,
-    METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED, METRIC_PAYLOAD_REJECTED,
-    METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
+    METRIC_LABEL_STATUS, METRIC_LABEL_TASK_TYPE, METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW,
+    METRIC_LABEL_WORKFLOW_TYPE, METRIC_MUTEX_CONTENTION, METRIC_MUTEX_HELD, METRIC_MUTEX_WAIT,
+    METRIC_PAYLOAD_BYTES, METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED,
+    METRIC_PAYLOAD_REJECTED, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
     METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_PAUSED, METRIC_QUEUE_SCHEDULE_TO_START,
     METRIC_RATE_LIMIT_REFILL_RATE, METRIC_RATE_LIMIT_THROTTLED, METRIC_RATE_LIMIT_TOKENS_AVAILABLE,
     METRIC_RETENTION_DELETED, METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED,
@@ -68,19 +68,20 @@ use crate::telemetry::{
     METRIC_SCHEDULE_FIRE_ATTEMPTS, METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_OVERDUE,
     METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED, METRIC_SESSION_ACQUISITION,
     METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED, METRIC_SUMMARY_DELETED,
-    METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION, METRIC_TIMER_STARTED, METRIC_UPDATE_ADMITTED,
-    METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION, METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED,
-    METRIC_WEBHOOK_RECEIVED, METRIC_WEBHOOK_REJECTED, METRIC_WORKER_SLOT_TARGET,
-    METRIC_WORKER_SLOTS_AVAILABLE, METRIC_WORKER_SLOTS_IN_USE, METRIC_WORKER_TUNER_DECISIONS,
-    METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS,
-    METRIC_WORKFLOW_CHAIN_TIMEOUT, METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED,
-    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_BLOAT, METRIC_WORKFLOW_HISTORY_OVERSIZED,
-    METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM,
-    METRIC_WORKFLOW_PANIC, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
-    METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED,
-    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL,
-    METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, PoisonReason,
-    SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome, WorkflowStatus,
+    METRIC_TASK_CAPABILITY_MISS, METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION,
+    METRIC_TIMER_STARTED, METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION,
+    METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED, METRIC_WEBHOOK_RECEIVED, METRIC_WEBHOOK_REJECTED,
+    METRIC_WORKER_SLOT_TARGET, METRIC_WORKER_SLOTS_AVAILABLE, METRIC_WORKER_SLOTS_IN_USE,
+    METRIC_WORKER_TUNER_DECISIONS, METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_CACHE_HIT,
+    METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CHAIN_TIMEOUT, METRIC_WORKFLOW_CONTINUE_AS_NEW,
+    METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_BLOAT,
+    METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED,
+    METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PANIC, METRIC_WORKFLOW_PAUSE_DURATION,
+    METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED,
+    METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
+    METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
+    MetricsRecorder, PoisonReason, SessionAcquisitionOutcome, SlotType, TunerDecision,
+    WebhookOutcome, WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -641,6 +642,16 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_TASK_QUARANTINED,
             METRIC_LABEL_QUEUE => queue.to_owned(),
             METRIC_LABEL_REASON => reason.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_task_capability_miss(&self, queue: &str, task_type: &str, outcome: &str) {
+        counter!(
+            METRIC_TASK_CAPABILITY_MISS,
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_TASK_TYPE => task_type.to_owned(),
+            METRIC_LABEL_OUTCOME => outcome.to_owned(),
         )
         .increment(1);
     }
@@ -1885,5 +1896,121 @@ mod tests {
             "the update-duration histogram bridge must register with exactly the \
              workflow/name/queue/outcome label constants, values un-swapped"
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // inline CapturingRecorder boilerplate
+    fn bridges_capability_miss_counter_with_bounded_labels() {
+        // Issue #804 (AC5): a local `metrics::Recorder` captures the registered
+        // counter key, so a swapped or dropped label value in the capability-miss
+        // bridge is caught here (not just no-panic). Both bounded `outcome`
+        // values are exercised so an operator alert keyed on
+        // `outcome="escalated"` is provably expressible.
+        type CounterKey = (String, Vec<(String, String)>);
+
+        #[derive(Default)]
+        struct CapturingRecorder {
+            counters: std::sync::Mutex<Vec<CounterKey>>,
+        }
+
+        impl metrics::Recorder for &CapturingRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                self.counters.lock().unwrap().push((
+                    key.name().to_owned(),
+                    key.labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                ));
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_task_capability_miss(
+                "email-workers",
+                "workflow",
+                autumn_harvest_capability_outcome_released(),
+            );
+            rec.record_task_capability_miss(
+                "email-workers",
+                "activity",
+                autumn_harvest_capability_outcome_escalated(),
+            );
+        });
+
+        let labels = |task_type: &str, outcome: &str| {
+            vec![
+                (METRIC_LABEL_QUEUE.to_owned(), "email-workers".to_owned()),
+                (METRIC_LABEL_TASK_TYPE.to_owned(), task_type.to_owned()),
+                (METRIC_LABEL_OUTCOME.to_owned(), outcome.to_owned()),
+            ]
+        };
+
+        let counters = capture.counters.lock().unwrap().clone();
+        assert_eq!(
+            counters.as_slice(),
+            &[
+                (
+                    METRIC_TASK_CAPABILITY_MISS.to_owned(),
+                    labels("workflow", "released")
+                ),
+                (
+                    METRIC_TASK_CAPABILITY_MISS.to_owned(),
+                    labels("activity", "escalated")
+                ),
+            ],
+            "the capability-miss bridge must register harvest.task.capability_miss \
+             with exactly the queue/task_type/outcome label constants, values \
+             un-swapped, for BOTH bounded outcomes"
+        );
+    }
+
+    const fn autumn_harvest_capability_outcome_released() -> &'static str {
+        crate::telemetry::CAPABILITY_MISS_OUTCOME_RELEASED
+    }
+
+    const fn autumn_harvest_capability_outcome_escalated() -> &'static str {
+        crate::telemetry::CAPABILITY_MISS_OUTCOME_ESCALATED
     }
 }

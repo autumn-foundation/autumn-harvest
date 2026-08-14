@@ -10287,6 +10287,7 @@ mod tests {
             created_at: Some(now),
             wake_requested: false,
             session_id: None,
+            capability_misses: 0,
         }
     }
 

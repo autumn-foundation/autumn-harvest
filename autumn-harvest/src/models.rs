@@ -433,6 +433,21 @@ pub struct TaskQueueItem {
     /// ordinary activity dispatch.
     #[serde(default)]
     pub session_id: Option<Uuid>,
+    /// Consecutive claims by workers with no handler registered for this task's
+    /// type (issue #804).
+    ///
+    /// Incremented each time a worker releases this task back to `PENDING`
+    /// because it has no handler for the workflow/activity type, so a capable
+    /// peer can claim it. Reset to `0` by every path that proves the claiming
+    /// worker *was* capable, so it measures **consecutive** capability misses.
+    /// At `WorkerConfig::capability_miss_max_redeliveries` the task escalates to
+    /// the existing terminal-failure path with a `no_capable_worker:` reason.
+    ///
+    /// Deliberately distinct from `attempt` (retry budget) and `crash_strikes`
+    /// (poison-pill quarantine): a clean "handler not registered" miss must
+    /// consume neither.
+    #[serde(default)]
+    pub capability_misses: i32,
 }
 
 /// Insert struct for enqueuing a new task.

@@ -1,0 +1,33 @@
+-- issue #804: bounded capability-miss redelivery counter.
+--
+-- Any worker polling a queue can claim any task on it (SKIP LOCKED has no
+-- capability filter). When the claiming worker has no handler registered for
+-- that task's workflow/activity type, the engine used to terminally FAIL the
+-- run -- turning a routine, blameless fleet condition (a rolling deploy that
+-- introduces a new type; a heterogeneous pool that shares a queue but
+-- registers different handler subsets) into lost executions and a DLQ flood.
+--
+-- The claim is now RELEASED back to PENDING for a capable peer instead. This
+-- counter bounds that bounce: after `capability_miss_max_redeliveries`
+-- (WorkerConfig, default 5) releases the task falls through to the existing
+-- terminal-failure path with a `no_capable_worker:` reason, so a genuinely
+-- unregistered type cannot bounce forever.
+--
+-- Deliberately a SEPARATE column rather than reusing `attempt` or
+-- `crash_strikes`:
+--   * `attempt` drives the retry budget -- a capability miss never ran the
+--     handler, so it must not consume one (the release decrements the
+--     claim-time `attempt + 1`, mirroring `defer_rate_limited_task`).
+--   * `crash_strikes` drives poison-pill quarantine (issue #367) -- a clean
+--     "handler not registered" miss is not a worker crash and must never
+--     quarantine a perfectly healthy task.
+--
+-- Reset to 0 by every path that proves the claiming worker WAS capable
+-- (retry requeue, ND-block re-pend, panic re-dispatch, rate-limit defer,
+-- reschedule), so the counter measures *consecutive* capability misses --
+-- the same "consecutive" semantics `crash_strikes` uses.
+--
+-- Task-queue state only: no `WorkflowEvent` variant, no change to the
+-- adjacently-tagged event JSON contract, no replay-determinism impact.
+ALTER TABLE harvest_task_queue
+    ADD COLUMN IF NOT EXISTS capability_misses INT NOT NULL DEFAULT 0;

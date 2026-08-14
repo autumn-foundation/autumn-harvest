@@ -25,6 +25,7 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_queue_paused_too_long",
     "harvest_workflow_history_bloat",
     "harvest_scanner_stalled",
+    "harvest_no_capable_worker",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -78,6 +79,7 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_workflow_active",
     "harvest_workflow_history_bloat_total",
     "harvest_scanner_tick_total",
+    "harvest_task_capability_miss_total",
 ];
 
 #[test]

@@ -204,6 +204,11 @@ pub struct WorkerRuntimeConfig {
     /// Consecutive worker crashes a task may cause before quarantine (issue #367).
     /// `0` disables quarantine (reclaimed poison pills are re-queued forever).
     pub poison_pill_threshold: i32,
+    /// Consecutive claims by workers with no handler registered for a task's
+    /// workflow/activity type before it escalates to the terminal-failure /
+    /// dead-letter path with a `no_capable_worker:` reason (issue #804).
+    /// `0` escalates on the first miss (pre-#804 fail-fast behaviour).
+    pub capability_miss_max_redeliveries: u32,
     /// Maximum wall-clock time a single workflow-task dispatch may run before
     /// the worker reclaims the concurrency slot (issue #494).
     /// `Duration::ZERO` disables the timeout (unbounded dispatch time).
@@ -347,6 +352,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             priority_aging_secs: cfg.priority_aging_secs,
             unknown_target_grace_window: cfg.unknown_target_grace_window,
             poison_pill_threshold: cfg.poison_pill_threshold,
+            capability_miss_max_redeliveries: cfg.capability_miss_max_redeliveries,
             workflow_task_timeout: cfg.workflow_task_timeout,
             workflow_panic_max_attempts: cfg.workflow_panic_max_attempts,
             max_workflow_pause_duration: cfg.max_workflow_pause_duration,
@@ -2849,9 +2855,19 @@ async fn run_local_activity_inline(
         detached_commands,
         run,
     } = batch;
-    let activity = registry.activities.get(&run.name).ok_or_else(|| {
-        HarvestError::Config(format!("no activity handler registered for '{}'", run.name))
-    })?;
+    // Issue #804: a local activity runs INLINE on the workflow worker, so a
+    // worker without its handler cannot make progress on this *workflow* task.
+    // The typed error releases the workflow task for a capable peer rather than
+    // failing the run (the pre-#804 `Config` error propagated to
+    // `fail_execution_on_error` and sealed it terminally).
+    let activity =
+        registry
+            .activities
+            .get(&run.name)
+            .ok_or_else(|| HarvestError::HandlerNotRegistered {
+                kind: CapabilityMissKind::Activity.as_str(),
+                name: run.name.clone(),
+            })?;
     // Issue #965: a WASM-backed activity is dispatched through the remote
     // task-queue seam (`process_activity_task`), never inline. `wasm_activity()`
     // always registers a non-local activity, so this is unreachable via the
@@ -3760,6 +3776,178 @@ fn nd_block_backoff(block_count: i32) -> Duration {
         2.0,
         Duration::from_secs(ND_BLOCK_BACKOFF_CAP_SECS),
         attempt,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Capability-miss release / escalate (issue #804)
+// ---------------------------------------------------------------------------
+
+/// Stable, greppable prefix on the terminal error recorded when a task is
+/// escalated after exhausting its capability-miss redelivery budget (issue
+/// #804).
+///
+/// Operators alert on this string to tell "no live worker in the fleet has
+/// this handler" apart from an ordinary application failure.
+pub const NO_CAPABLE_WORKER_PREFIX: &str = "no_capable_worker:";
+
+/// Base delay before the first capability-miss redelivery (issue #804).
+const CAPABILITY_MISS_BACKOFF_BASE_SECS: u64 = 1;
+
+/// Ceiling on the capability-miss redelivery delay (issue #804).
+///
+/// Deliberately much smaller than the ND-block cap (300s): a capability miss
+/// is expected to resolve within one rolling-deploy pod flip, and every second
+/// of backoff is latency added to a task some live peer could already be
+/// running.
+const CAPABILITY_MISS_BACKOFF_CAP_SECS: u64 = 30;
+
+/// Which claim-time handler lookup missed, as a **bounded** metric label
+/// (issue #804).
+///
+/// Exactly two values, ever — `task_type` on
+/// [`crate::telemetry::METRIC_TASK_CAPABILITY_MISS`] must stay bounded per
+/// ADR-0001 §7. The *name* of the missing handler is deliberately never a
+/// label: it is read from the database and is not bounded by this worker's
+/// registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityMissKind {
+    /// A workflow task whose `workflow_name` is not in this worker's registry.
+    Workflow,
+    /// An activity task whose `activity_name` is not in this worker's registry.
+    Activity,
+}
+
+impl CapabilityMissKind {
+    /// The bounded metric-label value for this kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Activity => "activity",
+        }
+    }
+}
+
+/// What to do with a claimed task this worker has no handler for (issue #804).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityMissAction {
+    /// Release the claim back to `PENDING` so a capable peer can claim it.
+    Release,
+    /// The redelivery budget is exhausted — fall through to the existing
+    /// terminal-failure path with a `no_capable_worker:` reason.
+    Escalate,
+}
+
+/// Decide whether a capability miss releases the task for a peer or escalates
+/// to the terminal-failure path (issue #804).
+///
+/// `misses_after_increment` is the value the release UPDATE would persist to
+/// `harvest_task_queue.capability_misses`, so the **first** miss on a task
+/// arrives here as `1`. Escalation fires at `>=`, mirroring
+/// [`crate::poison_pill::quarantine_decision`].
+///
+/// `max_redeliveries == 0` escalates on the first miss — the documented
+/// rollback switch that restores the pre-#804 "fail terminally on first claim
+/// by an incapable worker" behaviour. Note this is the *opposite* sentinel to
+/// `poison_pill_threshold`'s `0` (which disables quarantine): "max
+/// redeliveries = 0" literally means no redeliveries are allowed.
+#[must_use]
+pub const fn capability_miss_decision(
+    misses_after_increment: i32,
+    max_redeliveries: u32,
+) -> CapabilityMissAction {
+    if max_redeliveries == 0 {
+        return CapabilityMissAction::Escalate;
+    }
+    // `max_redeliveries` is bounded by u32 but the persisted counter is i32;
+    // a budget above i32::MAX can never be reached, so clamp rather than wrap.
+    let budget = if max_redeliveries > i32::MAX.cast_unsigned() {
+        i32::MAX
+    } else {
+        max_redeliveries.cast_signed()
+    };
+    if misses_after_increment >= budget {
+        CapabilityMissAction::Escalate
+    } else {
+        CapabilityMissAction::Release
+    }
+}
+
+/// Capped exponential backoff before a capability-missed task becomes
+/// claimable again: `1s * 2^count`, capped at 30s (issue #804).
+///
+/// `misses_before_this_release` is the task's persisted `capability_misses`
+/// *before* this release increments it, so the first release waits 1s.
+///
+/// The backoff exists to stop the releasing worker from immediately
+/// re-claiming its own release in a hot loop; it is not a fairness mechanism.
+/// Thin wrapper over [`crate::policy::compute_retry_delay`] (1-based
+/// `attempt`), mirroring [`nd_block_backoff`].
+#[must_use]
+pub fn capability_miss_backoff(misses_before_this_release: i32) -> Duration {
+    let attempt = u32::try_from(misses_before_this_release.max(0))
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    crate::policy::compute_retry_delay(
+        Duration::from_secs(CAPABILITY_MISS_BACKOFF_BASE_SECS),
+        2.0,
+        Duration::from_secs(CAPABILITY_MISS_BACKOFF_CAP_SECS),
+        attempt,
+    )
+}
+
+/// Build the terminal error recorded when a capability miss escalates
+/// (issue #804).
+///
+/// Prefixed with [`NO_CAPABLE_WORKER_PREFIX`] so the "no live worker in the
+/// fleet has this handler" case is greppable and alertable, and distinct from
+/// an ordinary application failure.
+#[must_use]
+pub fn no_capable_worker_reason(detail: &str, max_redeliveries: u32) -> String {
+    format!(
+        "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated after {max_redeliveries} \
+         capability-miss redeliveries; no live worker on this queue has the handler)"
+    )
+}
+
+/// Should this task be released for a capable peer at all, or escalated
+/// immediately regardless of the redelivery budget (issue #804)?
+///
+/// A task hard-pinned to a **worker session** (issue #606) exists precisely so
+/// it runs on one specific host that holds machine-local state; the claim gate
+/// (`session_id IS NULL OR sticky_worker_id = $1`) will never hand it to a peer.
+/// Releasing it would therefore bounce it back to the same incapable host until
+/// the budget drained, wasting the whole window on a premise ("a capable peer
+/// may claim this") that is false by construction. Escalate immediately instead,
+/// so the operator sees the real condition without the delay.
+#[must_use]
+pub const fn capability_miss_releasable(session_id: Option<uuid::Uuid>) -> bool {
+    session_id.is_none()
+}
+
+/// Resolve what to do about a capability miss on a claimed task (issue #804).
+///
+/// Pure decision function: takes the task's persisted consecutive-miss count
+/// **before** this miss, the configured budget, and whether the task is
+/// session-pinned; returns the action plus the count that will be persisted.
+///
+/// Split out from the async dispatch path so the whole release-vs-escalate
+/// policy — budget arithmetic, the session carve-out, and the `0`-budget
+/// fail-fast — is unit-testable with no database and no worker.
+#[must_use]
+pub const fn resolve_capability_miss(
+    misses_before: i32,
+    max_redeliveries: u32,
+    session_id: Option<uuid::Uuid>,
+) -> (CapabilityMissAction, i32) {
+    let misses_after = misses_before.saturating_add(1);
+    if !capability_miss_releasable(session_id) {
+        return (CapabilityMissAction::Escalate, misses_after);
+    }
+    (
+        capability_miss_decision(misses_after, max_redeliveries),
+        misses_after,
     )
 }
 
@@ -5644,11 +5832,15 @@ async fn persist_scheduled_activities(
     let mut dynamic_rate_buckets: Vec<(String, f64, f64)> = Vec::new();
 
     for scheduled in scheduled_activities {
+        // Issue #804: enqueueing needs the activity's registered defaults
+        // (queue, retry policy, timeouts), so a worker without the handler
+        // cannot persist this workflow decision. Release the *workflow* task for
+        // a capable peer instead of terminally failing the run.
         let activity = registry.activities.get(&scheduled.name).ok_or_else(|| {
-            HarvestError::Config(format!(
-                "no activity handler registered for '{}'",
-                scheduled.name
-            ))
+            HarvestError::HandlerNotRegistered {
+                kind: CapabilityMissKind::Activity.as_str(),
+                name: scheduled.name.clone(),
+            }
         })?;
 
         let queue_name = if scheduled.queue.is_empty() {
@@ -8560,10 +8752,14 @@ async fn process_activity_task(
     }
 
     let Some(activity) = registry.activities.get(activity_name) else {
-        let error = format!("no activity handler registered for '{activity_name}'");
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-        fail_task_and_execution(&mut conn, task, worker_id, &error).await?;
-        return Err(HarvestError::Config(error));
+        // Issue #804 (AC2): mirror of the workflow path above. Return the typed
+        // capability-miss error un-failed so the dispatch path can release this
+        // claim for a capable peer instead of terminally failing the owning
+        // execution over a transient fleet-capability skew.
+        return Err(HarvestError::HandlerNotRegistered {
+            kind: CapabilityMissKind::Activity.as_str(),
+            name: activity_name.to_owned(),
+        });
     };
 
     // Circuit breaker (issue #369): consult the breaker before doing anything
@@ -10294,6 +10490,14 @@ async fn fail_execution_on_error<T>(
         Ok(val) => return Ok(val),
         Err(e) => e,
     };
+    // Issue #804: a capability miss is a blameless fleet condition, not a
+    // workload failure. Pass it through un-failed so the dispatch path
+    // (`process_task`) can release the claim for a capable peer; it decides
+    // release-vs-escalate, and only the escalation branch routes back through
+    // the terminal-failure path.
+    if error.handler_not_registered().is_some() {
+        return Err(error);
+    }
     fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
     Err(error)
 }
@@ -12484,12 +12688,17 @@ async fn process_workflow_task(
         return Ok(());
     };
     let Some(workflow) = registry.workflows.get(&prepared.execution.workflow_name) else {
-        let error = format!(
-            "no workflow handler registered for '{}'",
-            prepared.execution.workflow_name
-        );
-        fail_task_and_execution(conn, task, worker_id, &error).await?;
-        return Err(HarvestError::Config(error));
+        // Issue #804 (AC1): this worker cannot run this type, but a peer on the
+        // same queue may well be able to (a rolling deploy that introduces a new
+        // workflow type puts every pod in this state for a window). Return the
+        // typed capability-miss error WITHOUT failing the execution — the
+        // dispatch path (`process_task`) intercepts it and releases the claim
+        // back to `PENDING` for a capable peer, escalating to the ordinary
+        // terminal-failure path only once the redelivery budget is exhausted.
+        return Err(HarvestError::HandlerNotRegistered {
+            kind: CapabilityMissKind::Workflow.as_str(),
+            name: prepared.execution.workflow_name.clone(),
+        });
     };
 
     let telemetry = registry.telemetry().clone();
@@ -14143,10 +14352,11 @@ async fn process_task(
     // (issue #494); `None` when that timeout is disabled. Workflow path only —
     // an activity task is not wrapped in it.
     workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    capability_miss_max_redeliveries: u32,
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
-    match ClaimedTaskKind::from_db(&task.task_type)? {
+    let outcome = match ClaimedTaskKind::from_db(&task.task_type)? {
         ClaimedTaskKind::Workflow => {
             process_workflow_task(
                 &mut conn,
@@ -14170,7 +14380,7 @@ async fn process_task(
             // one during execution would cause a deadlock when max_size
             // connections are all claimed by concurrent activity tasks.
             drop(conn);
-            process_activity_task(
+            let result = process_activity_task(
                 pool,
                 registry.as_ref(),
                 &task,
@@ -14180,7 +14390,134 @@ async fn process_task(
                 max_concurrent_sessions,
                 session_slots_in_use,
             )
-            .await
+            .await;
+            // Re-acquire only if we actually need to act on a capability miss:
+            // the happy path must not pay for a second checkout.
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.handler_not_registered().is_some())
+            {
+                conn = pool.get().await.map_err(crate::error::database_error)?;
+            } else {
+                return result;
+            }
+            result
+        }
+    };
+
+    // Issue #804: single interception point for every capability miss, whichever
+    // of the four raise sites produced it (workflow-handler lookup, activity-
+    // handler lookup, the local-activity inline dispatch, or the
+    // schedule-activity enqueue). `fail_execution_on_error` passes the typed
+    // variant through un-failed precisely so it lands here.
+    let Err(error) = &outcome else {
+        return outcome;
+    };
+    let Some((kind, name)) = error.handler_not_registered() else {
+        return outcome;
+    };
+    handle_capability_miss(
+        &mut conn,
+        &task,
+        worker_id,
+        registry.telemetry().metrics.as_ref(),
+        kind,
+        name,
+        capability_miss_max_redeliveries,
+    )
+    .await
+}
+
+/// Release a claim taken by a worker with no handler for the task's type, or
+/// escalate it once the redelivery budget is exhausted (issue #804).
+///
+/// Returns `Ok(())` on a release: the task is back at `PENDING` with a backoff,
+/// and this dispatch is a clean no-op from the poll loop's perspective — the
+/// worker did nothing wrong. On escalation it routes through the ordinary
+/// terminal-failure path (`fail_task_and_execution`, which appends
+/// `WorkflowFailed` and moves the task to the DLQ exactly as any other terminal
+/// failure does) and returns the error, so nothing about the terminal contract
+/// changes — only its *reason* string and the delay before reaching it.
+async fn handle_capability_miss(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    kind: &'static str,
+    name: &str,
+    max_redeliveries: u32,
+) -> HarvestResult<()> {
+    let (action, misses_after) =
+        resolve_capability_miss(task.capability_misses, max_redeliveries, task.session_id);
+    let detail = format!("no {kind} handler registered for '{name}'");
+
+    match action {
+        CapabilityMissAction::Release => {
+            // Back off before the next redelivery so the dwell window outlasts a
+            // pod flip: without it the budget would be spent in milliseconds by
+            // the same incapable worker re-claiming its own released row.
+            let delay = capability_miss_backoff(task.capability_misses);
+            let scheduled_at = chrono::Utc::now() + delay;
+            let released = queue::release_task_for_capability_miss(
+                conn,
+                task.id,
+                worker_id,
+                scheduled_at,
+                &detail,
+            )
+            .await?;
+            if !released {
+                // A concurrent poison-pill reclaim (or an operator action) took
+                // the row out from under this claim. Nothing to do and nothing
+                // to count: the row is no longer ours to release.
+                tracing::debug!(
+                    task_id = %task.id,
+                    "capability-miss release matched no row; the claim was already taken"
+                );
+                return Ok(());
+            }
+            metrics.record_task_capability_miss(
+                &task.queue_name,
+                &task.task_type,
+                crate::telemetry::CAPABILITY_MISS_OUTCOME_RELEASED,
+            );
+            tracing::info!(
+                task_id = %task.id,
+                queue = %task.queue_name,
+                task_type = %task.task_type,
+                handler_kind = kind,
+                handler = name,
+                capability_misses = misses_after,
+                max_redeliveries,
+                backoff_secs = delay.as_secs(),
+                "released task for a capable peer: no handler registered on this worker"
+            );
+            Ok(())
+        }
+        CapabilityMissAction::Escalate => {
+            let reason = no_capable_worker_reason(&detail, max_redeliveries);
+            fail_task_and_execution(conn, task, worker_id, &reason).await?;
+            metrics.record_task_capability_miss(
+                &task.queue_name,
+                &task.task_type,
+                crate::telemetry::CAPABILITY_MISS_OUTCOME_ESCALATED,
+            );
+            tracing::error!(
+                task_id = %task.id,
+                queue = %task.queue_name,
+                task_type = %task.task_type,
+                handler_kind = kind,
+                handler = name,
+                capability_misses = misses_after,
+                max_redeliveries,
+                session_pinned = task.session_id.is_some(),
+                "escalated task: no capable worker on this queue registers the handler"
+            );
+            Err(HarvestError::HandlerNotRegistered {
+                kind,
+                name: name.to_owned(),
+            })
         }
     }
 }
@@ -17475,6 +17812,7 @@ impl Worker {
         // Issue #782: contained-handler-panic retry budget + strike map.
         let panic_strikes = Arc::clone(&self.workflow_panic_strikes);
         let workflow_panic_max_attempts = self.config.workflow_panic_max_attempts;
+        let capability_miss_max_redeliveries = self.config.capability_miss_max_redeliveries;
         let exec_id_for_timeout = task.workflow_exec_id;
         let telemetry = Arc::clone(&self.registry);
 
@@ -17546,6 +17884,7 @@ impl Worker {
                         Arc::clone(&panic_strikes),
                         workflow_panic_max_attempts,
                         workflow_task_deadline,
+                        capability_miss_max_redeliveries,
                     ),
                 )
                 .await
@@ -17688,6 +18027,7 @@ impl Worker {
                     // No enclosing workflow-task budget on this arm, so the
                     // local per-attempt budget is the only clock (issue #783).
                     None,
+                    capability_miss_max_redeliveries,
                 )
                 .await
                 {
@@ -18779,6 +19119,7 @@ mod tests {
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            capability_miss_max_redeliveries: 5,
             workflow_task_timeout: Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
@@ -19508,6 +19849,7 @@ mod tests {
             max_workflow_start_delay: Duration::from_secs(365 * 24 * 3600),
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            capability_miss_max_redeliveries: 5,
             workflow_task_timeout: Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
@@ -21221,6 +21563,200 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Capability-miss release / escalate (issue #804)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capability_miss_decision_releases_under_the_bound() {
+        // `misses_after_increment` is the value the release UPDATE will persist,
+        // so the first miss arrives here as 1. With the default budget of 5 the
+        // first four misses release for a peer.
+        for misses in 1..=4 {
+            assert_eq!(
+                capability_miss_decision(misses, 5),
+                CapabilityMissAction::Release,
+                "miss {misses} of 5 must release for a capable peer",
+            );
+        }
+    }
+
+    #[test]
+    fn capability_miss_decision_escalates_at_and_over_the_bound() {
+        assert_eq!(
+            capability_miss_decision(5, 5),
+            CapabilityMissAction::Escalate
+        );
+        assert_eq!(
+            capability_miss_decision(6, 5),
+            CapabilityMissAction::Escalate
+        );
+        assert_eq!(
+            capability_miss_decision(i32::MAX, 5),
+            CapabilityMissAction::Escalate
+        );
+    }
+
+    #[test]
+    fn capability_miss_decision_zero_budget_escalates_on_the_first_miss() {
+        // `0` is the documented rollback switch: no redeliveries allowed, so the
+        // very first capability miss takes the pre-#804 terminal-failure path.
+        assert_eq!(
+            capability_miss_decision(1, 0),
+            CapabilityMissAction::Escalate
+        );
+    }
+
+    #[test]
+    fn capability_miss_decision_tolerates_a_nonpositive_persisted_count() {
+        // Defensive: the column is NOT NULL DEFAULT 0 and only ever incremented,
+        // but a hand-edited/corrupt row must not silently disable escalation.
+        assert_eq!(
+            capability_miss_decision(0, 5),
+            CapabilityMissAction::Release
+        );
+        assert_eq!(
+            capability_miss_decision(-1, 5),
+            CapabilityMissAction::Release
+        );
+        assert_eq!(
+            capability_miss_decision(0, 0),
+            CapabilityMissAction::Escalate
+        );
+    }
+
+    #[test]
+    fn capability_miss_backoff_starts_at_base_and_doubles() {
+        // `misses_before_this_release` is 0-based: the first release waits 1s.
+        assert_eq!(capability_miss_backoff(0), Duration::from_secs(1));
+        assert_eq!(capability_miss_backoff(1), Duration::from_secs(2));
+        assert_eq!(capability_miss_backoff(2), Duration::from_secs(4));
+        assert_eq!(capability_miss_backoff(3), Duration::from_secs(8));
+        assert_eq!(capability_miss_backoff(4), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn capability_miss_backoff_caps_at_thirty_seconds() {
+        // 1 * 2^5 = 32 > 30 — the first count that hits the cap.
+        assert_eq!(capability_miss_backoff(5), Duration::from_secs(30));
+        assert_eq!(capability_miss_backoff(20), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn capability_miss_backoff_saturates_on_extreme_counts() {
+        assert_eq!(capability_miss_backoff(-1), Duration::from_secs(1));
+        assert_eq!(capability_miss_backoff(i32::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn capability_miss_default_budget_dwell_outlasts_a_pod_flip() {
+        // The success metric depends on a released task still being PENDING
+        // while a rolling deploy replaces pods. Summing the backoff of the four
+        // releases the default budget allows gives the minimum queue dwell
+        // before escalation.
+        let dwell: Duration = (0..4).map(capability_miss_backoff).sum();
+        assert_eq!(dwell, Duration::from_secs(1 + 2 + 4 + 8));
+    }
+
+    #[test]
+    fn no_capable_worker_reason_carries_the_stable_prefix_and_detail() {
+        let reason = no_capable_worker_reason("no workflow handler registered for 'wf'", 5);
+        assert!(
+            reason.starts_with(NO_CAPABLE_WORKER_PREFIX),
+            "escalation reason must be greppable by its stable prefix: {reason}"
+        );
+        assert!(reason.contains("no workflow handler registered for 'wf'"));
+        assert!(
+            reason.contains('5'),
+            "reason must name the redelivery budget that was exhausted: {reason}"
+        );
+    }
+
+    #[test]
+    fn capability_miss_kind_labels_are_bounded() {
+        // Metric label cardinality (ADR-0001 §7): exactly two values, ever.
+        assert_eq!(CapabilityMissKind::Workflow.as_str(), "workflow");
+        assert_eq!(CapabilityMissKind::Activity.as_str(), "activity");
+    }
+
+    #[test]
+    fn resolve_capability_miss_releases_then_escalates_at_the_bound() {
+        // Default budget of 5: misses 1..4 release, the 5th escalates. The
+        // returned count is what gets persisted, so it must be the
+        // POST-increment value (the release SQL does `+ 1` in the same UPDATE).
+        for before in 0..4 {
+            assert_eq!(
+                resolve_capability_miss(before, 5, None),
+                (CapabilityMissAction::Release, before + 1),
+                "miss {} of 5 must release",
+                before + 1
+            );
+        }
+        assert_eq!(
+            resolve_capability_miss(4, 5, None),
+            (CapabilityMissAction::Escalate, 5),
+            "the 5th miss exhausts the default budget"
+        );
+    }
+
+    #[test]
+    fn resolve_capability_miss_zero_budget_escalates_immediately() {
+        // `0` is the pre-#804 fail-fast behaviour, NOT an unlimited-release
+        // switch — releasing forever would let a genuinely-unregistered type
+        // bounce around the fleet indefinitely.
+        assert_eq!(
+            resolve_capability_miss(0, 0, None),
+            (CapabilityMissAction::Escalate, 1)
+        );
+    }
+
+    #[test]
+    fn session_pinned_task_escalates_immediately_regardless_of_budget() {
+        // Issue #606: a session-pinned task's claim gate is
+        // `session_id IS NULL OR sticky_worker_id = $1`, so it can only ever go
+        // back to the SAME host. "Release it for a capable peer" is false by
+        // construction there, and bouncing it would burn the whole budget
+        // window before surfacing the real condition.
+        let session = Some(uuid::Uuid::new_v4());
+        assert!(!capability_miss_releasable(session));
+        assert_eq!(
+            resolve_capability_miss(0, 5, session),
+            (CapabilityMissAction::Escalate, 1),
+            "a session-pinned task must escalate on the FIRST miss"
+        );
+        // ...and the un-pinned control still releases with the same budget.
+        assert_eq!(
+            resolve_capability_miss(0, 5, None),
+            (CapabilityMissAction::Release, 1)
+        );
+    }
+
+    #[test]
+    fn resolve_capability_miss_tolerates_a_saturating_persisted_count() {
+        // A pathological persisted value must not panic on overflow.
+        assert_eq!(
+            resolve_capability_miss(i32::MAX, 5, None),
+            (CapabilityMissAction::Escalate, i32::MAX)
+        );
+    }
+
+    #[test]
+    fn no_capable_worker_reason_is_greppable_and_names_the_missing_handler() {
+        // AC3 requires "an unambiguous reason"; operators grep the DLQ for the
+        // stable prefix, so it must lead the string and the missing handler's
+        // identity must be present.
+        let reason = no_capable_worker_reason("no workflow handler registered for 'onboarding'", 5);
+        assert!(
+            reason.starts_with(NO_CAPABLE_WORKER_PREFIX),
+            "the stable prefix must lead the reason: {reason}"
+        );
+        assert!(reason.contains("onboarding"), "{reason}");
+        assert!(
+            reason.contains('5'),
+            "the exhausted budget must be stated: {reason}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Contained workflow handler-panic retry (issue #782)
     // -----------------------------------------------------------------------
 
@@ -22080,6 +22616,7 @@ mod tests {
             created_at: None,
             wake_requested: false,
             session_id: None,
+            capability_misses: 0,
         }
     }
 

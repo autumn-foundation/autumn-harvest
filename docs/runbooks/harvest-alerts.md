@@ -2015,3 +2015,129 @@ Escalate to the team owning the embedding service if a restart does not restore
 ticking, or if the loop re-wedges after restart — that indicates a
 reproducible stall (a pathological query or a connection-pool deadlock) rather
 than a one-off panic, and needs a fix rather than a bounce.
+
+## harvest_no_capable_worker
+
+**What to do when tasks are being claimed by workers that cannot run them:** any
+worker polling a queue can claim any task on it — the `SKIP LOCKED` claim query
+has no capability filter, and cannot have one (a worker can enumerate the
+handlers it *has* registered, never the ones it has not). When the claiming
+worker has no handler for that task's workflow or activity type, the engine
+**releases the claim back to `PENDING`** for a capable peer instead of terminally
+failing the execution (issue #804).
+
+That release is the benign, self-healing case and is what you will see during a
+routine rolling deploy that introduces a new workflow or activity type: for a
+window, some pods have the handler and some do not, and tasks bounce until they
+land on a new pod. Nothing is lost, and the counter reports
+`outcome="released"`.
+
+The page is `outcome="escalated"`. Each release increments a per-task
+`capability_misses` counter with capped exponential backoff; once it reaches
+`WorkerConfig::capability_miss_max_redeliveries` (default **5**) the task falls
+through to the normal terminal-failure / dead-letter path with a stable,
+greppable `no_capable_worker:` reason. Escalation means **no live worker on that
+queue registers the handler at all** — executions are being failed.
+
+**Worker-fleet contract.** All workers polling a given queue should register the
+same handler set. Harvest no longer punishes a *transient* mismatch (it is
+released and retried), but a *durable* one is still fatal, only later and with a
+much clearer reason. If you intentionally run a heterogeneous pool, give each
+handler subset its own queue rather than relying on the redelivery budget to
+route work.
+
+| Signal | Meaning | Action |
+| --- | --- | --- |
+| `outcome="released"`, brief burst during a deploy | Capability skew mid-rollout | None — self-heals as the rollout completes |
+| `outcome="released"`, sustained > ~15m | Rollout stalled, or a pod set permanently lacks the handler | Finish/roll back the deploy; check `GET /workers` |
+| `outcome="escalated"`, any | No capable worker exists; executions failing | Page — see *Triage steps* |
+
+Distinct from two adjacent alerts, deliberately:
+
+- `harvest_task_quarantined` (issue #367) is a worker **process crash**
+  (panic/OOM/segfault). A clean "handler not registered" miss is not a crash and
+  **never** increments `crash_strikes`, so a capability miss can never trip
+  poison-pill quarantine.
+- `harvest_no_compatible_worker` (issue #171) is **build-id routing**: the
+  handler exists, but no worker with a *compatible build* is live. Capability
+  miss is the coarser condition — the handler is not registered at all.
+
+### Triage steps
+
+1. Confirm which types are affected:
+   `GET /api/harvest/admin/workflow-types/reachability` (issue #520). A verdict
+   of `orphaned` means that type has live non-terminal executions but **no**
+   registered handler anywhere in the fleet — the exact condition escalation
+   reports.
+2. Confirm the queue has any live worker at all:
+   `GET /api/harvest/admin/queues/coverage` (issue #774). An uncovered queue is
+   a different (and simpler) failure — see `harvest_queue_uncovered`.
+3. Identify which builds are actually polling the affected queue:
+   `GET /api/harvest/workers`. Compare `build_id` / `deployment_name` against
+   the build you expect to carry the new handler.
+4. Read the escalated tasks:
+   `GET /api/harvest/dead-letters?queue={queue}` — their `error` begins with
+   `no_capable_worker:` and names the missing workflow/activity type.
+
+### Likely causes
+
+- A rolling deploy that introduces a new workflow or activity type is **stalled
+  or was rolled back halfway**, so the pods carrying the handler never became a
+  majority (or were removed).
+- A handler was **deleted or renamed** while in-flight executions of that type
+  still existed. `GET /admin/workflow-types/reachability` before removing a
+  handler is the pre-flight for exactly this (see
+  `docs/runbooks/safe-handler-removal.md`).
+- A **heterogeneous worker pool** shares one queue but registers different
+  handler subsets, and the capable subset is too small (or scaled to zero) for
+  the redelivery budget to find it.
+- The task's owning **worker session** (issue #606) is hard-pinned to a host
+  that lacks the handler. A session-pinned task cannot be released for a peer —
+  the pin is the point — so it escalates immediately rather than bouncing.
+
+### False positives
+
+- **A brief `released` burst during any deploy that adds a type is expected and
+  benign.** Do not page on `released`; it is a capacity/skew *companion* signal.
+  The `> 0 for 15m` expression in the pack exists to catch a rollout that never
+  finished, not a rollout in progress.
+- A single-worker development fleet restarting mid-task will show one or two
+  `released` samples as the task is re-claimed. Harmless.
+- Escalation is **probabilistic, not exhaustive**: because releases have no
+  affinity, a task can in principle exhaust its budget on incapable workers while
+  a capable peer exists but never happened to claim it. Backoff makes this
+  progressively unlikely (the dwell window widens to ~30 s per redelivery, far
+  longer than a pod flip), but if you see escalation on a queue that
+  `reachability` reports as `in_use`, that is the cause — raise
+  `capability_miss_max_redeliveries` rather than treating it as a lost handler.
+
+### Safe actions
+
+- **Complete or roll back the deploy.** This is the fix in the overwhelming
+  majority of cases; the alert clears on its own once every pod polling the
+  queue registers the handler.
+- **Scale up the capable pod set** so a released task is more likely to land on
+  it within the budget.
+- **Raise the budget** (`WorkerConfig::with_capability_miss_max_redeliveries`) if
+  your rollouts legitimately take longer than the default dwell window. This
+  trades a longer time-to-detect for fewer spurious escalations; it does not
+  make a genuinely missing handler survivable.
+- **Redrive escalated tasks after the fix lands**:
+  `POST /api/harvest/dead-letters/{id}/replay`, or the bulk
+  `POST /dead-letters/replay` filtered to the affected queue. Escalation uses the
+  ordinary terminal-failure path, so redrive works exactly as it does for any
+  other DLQ entry.
+- Do **not** set `capability_miss_max_redeliveries` to `0` to "turn the feature
+  off". `0` means *escalate on the first miss* — the pre-#804 behavior, which is
+  strictly worse during a deploy.
+
+### Escalation criteria
+
+Page immediately on any `outcome="escalated"`: executions are being terminally
+failed for a reason that is a fleet-configuration error, not a workload error,
+and every further task of that type will fail the same way until a capable
+worker appears. Escalate to the team owning the deploy if
+`GET /admin/workflow-types/reachability` reports `orphaned` for a type that is
+supposed to be live — that indicates a handler was removed while in-flight work
+still needed it, and the executions cannot make progress until the handler is
+redeployed.

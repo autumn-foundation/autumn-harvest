@@ -186,6 +186,7 @@ fn make_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,

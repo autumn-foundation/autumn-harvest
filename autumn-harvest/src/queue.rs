@@ -1507,6 +1507,11 @@ struct PendingRequeueChangeset {
     started_at: Option<chrono::DateTime<Utc>>,
     last_heartbeat_at: Option<chrono::DateTime<Utc>>,
     crash_strikes: i32,
+    /// Issue #804: reset on every shared pending-requeue, because reaching this
+    /// path PROVES the claiming worker was capable (it resolved a handler and
+    /// ran it). Keeps the counter measuring *consecutive* capability misses,
+    /// the same semantics `crash_strikes` above has.
+    capability_misses: i32,
     scheduled_at: chrono::DateTime<Utc>,
     error: Option<String>,
 }
@@ -1519,6 +1524,7 @@ impl PendingRequeueChangeset {
             started_at: None,
             last_heartbeat_at: None,
             crash_strikes: 0,
+            capability_misses: 0,
             scheduled_at: next_run,
             error: Some(previous_error),
         }
@@ -1902,6 +1908,51 @@ pub async fn force_retry_activity_now(
     })
 }
 
+/// Shared `SET` clause for the **clean-continuation** re-pend paths
+/// ([`reschedule_task`] and [`defer_rate_limited_task`]).
+///
+/// "Clean continuation" means the claiming worker resolved a handler and either
+/// suspended cleanly, hit a retryable error, or reached the dispatch-time
+/// rate-limit gate — i.e. it made progress without crashing. Both consecutive-
+/// failure streak counters therefore reset here:
+///
+/// * `crash_strikes` — the poison-pill quarantine threshold measures
+///   *consecutive* worker crashes (issue #367).
+/// * `capability_misses` — the capability-miss redelivery budget measures
+///   *consecutive* claims by workers with no handler registered (issue #804).
+///   Reaching this path PROVES capability, so the streak must reset or an
+///   interleaving of incapable and capable claims would falsely escalate the
+///   task with `no_capable_worker:`.
+///
+/// `treat_none_as_null = true` for the same reason as
+/// [`PendingRequeueChangeset`]: a `None` field must bind SQL `NULL` rather than
+/// be silently omitted from the `SET` clause.
+#[derive(AsChangeset)]
+#[diesel(table_name = crate::schema::harvest_task_queue, treat_none_as_null = true)]
+struct CleanContinuationChangeset {
+    state: &'static str,
+    worker_id: Option<String>,
+    started_at: Option<chrono::DateTime<Utc>>,
+    last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    crash_strikes: i32,
+    capability_misses: i32,
+    scheduled_at: chrono::DateTime<Utc>,
+}
+
+impl CleanContinuationChangeset {
+    const fn new(scheduled_at: chrono::DateTime<Utc>) -> Self {
+        Self {
+            state: "PENDING",
+            worker_id: None,
+            started_at: None,
+            last_heartbeat_at: None,
+            crash_strikes: 0,
+            capability_misses: 0,
+            scheduled_at,
+        }
+    }
+}
+
 /// Reset a task to `PENDING` at an explicit timestamp.
 ///
 /// Clears only the liveness timestamp for the failed attempt. The heartbeat
@@ -1923,18 +1974,7 @@ pub async fn reschedule_task(
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
-    .set((
-        dsl::state.eq("PENDING"),
-        dsl::worker_id.eq(None::<String>),
-        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
-        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
-        // Clean continuation (suspension or retryable-error reschedule) means
-        // the task made progress without crashing a worker, so the poison-pill
-        // crash streak resets — the threshold measures *consecutive* crashes
-        // (issue #367).
-        dsl::crash_strikes.eq(0),
-        dsl::scheduled_at.eq(scheduled_at),
-    ))
+    .set(CleanContinuationChangeset::new(scheduled_at))
     .returning(dsl::queue_name)
     .get_result::<String>(conn)
     .await
@@ -1975,17 +2015,12 @@ pub async fn defer_rate_limited_task(
             .filter(dsl::state.eq("RUNNING")),
     )
     .set((
-        dsl::state.eq("PENDING"),
-        dsl::worker_id.eq(None::<String>),
-        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
-        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
-        dsl::crash_strikes.eq(0),
+        CleanContinuationChangeset::new(scheduled_at),
         // Undo the claim-time attempt increment: a rate-limit deferral is not an
         // execution, so it must not consume the retry budget.
         dsl::attempt.eq(diesel::dsl::sql::<diesel::sql_types::Integer>(
             "GREATEST(attempt - 1, 0)",
         )),
-        dsl::scheduled_at.eq(scheduled_at),
     ))
     .returning(dsl::queue_name)
     .get_result::<String>(conn)
@@ -1999,6 +2034,99 @@ pub async fn defer_rate_limited_task(
     crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
 
     Ok(())
+}
+
+/// SQL for [`release_task_for_capability_miss`], exposed for no-DB shape tests
+/// (issue #804).
+///
+/// `$1` = task id, `$2` = the releasing worker's id, `$3` = the new
+/// `scheduled_at` (backoff), `$4` = the diagnostic recorded in `error`.
+///
+/// One statement, guarded on `state = 'RUNNING' AND worker_id = $2` so it can
+/// only ever undo *this* worker's own claim — a concurrent poison-pill reclaim
+/// that already took the row simply matches 0 rows here (mirrors
+/// [`crate::queue_pause::release_claim`]).
+#[must_use]
+pub const fn release_task_for_capability_miss_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET state = 'PENDING', \
+         worker_id = NULL, \
+         started_at = NULL, \
+         last_heartbeat_at = NULL, \
+         attempt = GREATEST(attempt - 1, 0), \
+         crash_strikes = 0, \
+         capability_misses = capability_misses + 1, \
+         scheduled_at = $3, \
+         error = $4, \
+         sticky_worker_id = NULL, \
+         sticky_until = NULL, \
+         sticky_timeout = NULL, \
+         wake_requested = FALSE, \
+         activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END \
+     WHERE id = $1 \
+       AND state = 'RUNNING' \
+       AND worker_id = $2"
+}
+
+/// Release a claimed task back to `PENDING` because this worker has **no
+/// handler registered** for its workflow/activity type, so a capable peer can
+/// claim it (issue #804).
+///
+/// This is the always-on capability floor underneath build-id routing (#171):
+/// SKIP LOCKED has no capability filter, so any worker polling a queue can
+/// claim any task on it. Terminally failing the run because the *wrong* worker
+/// picked it up turns a routine rolling deploy or a heterogeneous worker pool
+/// into lost executions; releasing it costs the task one backoff interval.
+///
+/// Semantics, and why each differs from a plain reschedule:
+///
+/// - **`attempt` is restored** (`GREATEST(attempt - 1, 0)`) — [`claim_task`]
+///   increments it on claim, and the handler never ran, so a capability miss
+///   must not drain the retry budget (the exact bug issue #369 fixed for
+///   rate-limit deferrals).
+/// - **`crash_strikes` resets to 0** — a successful claim+release proves the
+///   task crashed no worker, and the poison-pill threshold (#367) measures
+///   *consecutive* crashes. The release also takes the row out of `RUNNING`
+///   with `worker_id NULL`, so the orphan reclaimer cannot see it at all.
+/// - **`capability_misses` is incremented** — the only counter a capability
+///   miss advances. It bounds the bounce; the caller escalates at
+///   `WorkerConfig::capability_miss_max_redeliveries`.
+/// - **Sticky affinity is cleared** — the pinned worker is the one that just
+///   proved it cannot run this task. Leaving the pin would make the release a
+///   no-op (only that worker could re-claim it) and burn the redelivery budget
+///   on a single incapable worker.
+/// - **`activity_name` is cleared on workflow rows only** — a stale
+///   `mixed_signal_suspension` sentinel would let an unrelated wake reset
+///   `scheduled_at` and bypass the backoff (issue #603). On an activity row
+///   `activity_name` is load-bearing and is preserved.
+///
+/// No `pg_notify`: the row is deliberately not claimable until `scheduled_at`,
+/// so waking pollers early would be pure noise (mirrors
+/// [`requeue_workflow_task_nd_blocked`]).
+///
+/// Returns `true` when this worker's claim was actually released; `false`
+/// means the row was already taken by something else (e.g. an orphan reclaim
+/// won the race) and the caller must treat the task as no longer its own.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn release_task_for_capability_miss(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    worker_id: &str,
+    scheduled_at: DateTime<Utc>,
+    reason: &str,
+) -> HarvestResult<bool> {
+    let released = diesel::sql_query(release_task_for_capability_miss_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Timestamptz, _>(scheduled_at)
+        .bind::<diesel::sql_types::Text, _>(reason)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(released > 0)
 }
 
 /// Hint for sticky cross-worker routing when parking or enqueueing a task.
@@ -3422,6 +3550,101 @@ mod tests {
         assert!(sql.contains("sticky_timeout = NULL"));
     }
 
+    // -----------------------------------------------------------------------
+    // Capability-miss release (issue #804)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capability_miss_release_query_is_ownership_guarded() {
+        let sql = release_task_for_capability_miss_query();
+        assert!(
+            sql.contains("state = 'RUNNING'"),
+            "compare-and-swap: only a still-claimed row may be released",
+        );
+        assert!(
+            sql.contains("worker_id = $2"),
+            "a worker may only ever undo its OWN claim -- a concurrent \
+             poison-pill reclaim must not be clobbered",
+        );
+        assert!(sql.contains("id = $1"));
+    }
+
+    #[test]
+    fn capability_miss_release_query_restores_the_attempt() {
+        let sql = release_task_for_capability_miss_query();
+        assert!(
+            sql.contains("attempt = GREATEST(attempt - 1, 0)"),
+            "claim_task does `attempt + 1`; a capability miss never ran the \
+             handler, so it must not consume the retry budget (AC4)",
+        );
+    }
+
+    #[test]
+    fn capability_miss_release_query_never_increments_crash_strikes() {
+        let sql = release_task_for_capability_miss_query();
+        assert!(
+            sql.contains("crash_strikes = 0"),
+            "AC4: a clean capability miss must not quarantine a healthy task; \
+             a successful claim+release proves the task crashed no worker, so \
+             the consecutive-crash streak resets (mirrors every sibling \
+             release path)",
+        );
+        assert!(
+            !sql.contains("crash_strikes = crash_strikes"),
+            "crash_strikes must never be incremented by a capability miss",
+        );
+    }
+
+    #[test]
+    fn capability_miss_release_query_increments_the_capability_counter() {
+        let sql = release_task_for_capability_miss_query();
+        assert!(
+            sql.contains("capability_misses = capability_misses + 1"),
+            "the bounded-redelivery counter is the only counter a capability \
+             miss advances (AC3/AC4)",
+        );
+    }
+
+    #[test]
+    fn capability_miss_release_query_unpins_sticky_so_a_peer_can_claim() {
+        let sql = release_task_for_capability_miss_query();
+        // Without this the row stays pinned to the very worker that just
+        // proved it cannot run it, so no peer can claim it and the task
+        // bounces on one worker straight to escalation.
+        assert!(sql.contains("sticky_worker_id = NULL"));
+        assert!(sql.contains("sticky_until = NULL"));
+        assert!(sql.contains("sticky_timeout = NULL"));
+    }
+
+    #[test]
+    fn capability_miss_release_query_clears_the_claim_columns() {
+        let sql = release_task_for_capability_miss_query();
+        assert!(sql.contains("state = 'PENDING'"));
+        assert!(sql.contains("worker_id = NULL"));
+        assert!(sql.contains("started_at = NULL"));
+        assert!(sql.contains("last_heartbeat_at = NULL"));
+        assert!(
+            sql.contains("wake_requested = FALSE"),
+            "a wake captured mid-cycle must not short-circuit the backoff",
+        );
+    }
+
+    #[test]
+    fn capability_miss_release_query_clears_the_sentinel_on_workflow_rows_only() {
+        let sql = release_task_for_capability_miss_query();
+        // A stale `mixed_signal_suspension` sentinel left in `activity_name` on
+        // a WORKFLOW row lets an unrelated wake reset `scheduled_at` to now and
+        // bypass the backoff (the issue #603 fix). On an ACTIVITY row
+        // `activity_name` is load-bearing and must survive the release.
+        assert!(
+            sql.contains(
+                "activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END"
+            ),
+            "activity_name must be cleared for workflow rows and preserved for \
+             activity rows: {sql}",
+        );
+    }
+
     /// PR-review regression test (Gemini finding): `PendingRequeueChangeset`
     /// must actually null out `worker_id`/`started_at`/`last_heartbeat_at` in
     /// the generated SQL, not silently omit them from the `SET` clause.
@@ -3460,6 +3683,75 @@ mod tests {
         assert!(debug.contains("\"crash_strikes\" = "));
         assert!(debug.contains("\"scheduled_at\" = "));
         assert!(debug.contains("\"error\" = "));
+    }
+
+    /// Issue #804: reaching the shared pending-requeue path PROVES the claiming
+    /// worker was capable (it resolved a handler and ran it), so the
+    /// consecutive-capability-miss counter must reset to 0 there — exactly the
+    /// "consecutive" semantics `crash_strikes` already has on the same
+    /// changeset.
+    ///
+    /// Without the reset the counter would accumulate across unrelated,
+    /// perfectly healthy retries and eventually escalate a task with
+    /// `no_capable_worker:` even though every claim after the first found a
+    /// handler — the false-escalation failure mode.
+    #[test]
+    fn pending_requeue_changeset_resets_the_capability_miss_counter() {
+        use crate::schema::harvest_task_queue::dsl;
+        use diesel::debug_query;
+        use diesel::pg::Pg;
+
+        let changeset =
+            PendingRequeueChangeset::new(chrono::Utc::now(), "some retryable error".to_string());
+        let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
+            .set(&changeset);
+        let debug = debug_query::<Pg, _>(&query).to_string();
+
+        assert!(
+            debug.contains("\"capability_misses\" = "),
+            "the shared pending-requeue changeset must reset capability_misses \
+             (a capable worker ran the handler): {debug}"
+        );
+    }
+
+    /// Issue #804: the clean-continuation path (`reschedule_task`, and
+    /// `defer_rate_limited_task` layered on top of it) also proves capability —
+    /// the worker resolved a handler and either suspended cleanly or reached
+    /// the dispatch-time rate-limit gate. Both must reset the counter.
+    ///
+    /// The false-escalation this guards: worker A (no handler) releases
+    /// (misses = 1), worker B (capable) claims but defers on a rate limit, A
+    /// claims again (misses = 2)… After `capability_miss_max_redeliveries`
+    /// such interleavings the task escalates with `no_capable_worker:` even
+    /// though a capable worker claimed it on every other poll.
+    #[test]
+    fn clean_continuation_changeset_resets_crash_and_capability_counters() {
+        use crate::schema::harvest_task_queue::dsl;
+        use diesel::debug_query;
+        use diesel::pg::Pg;
+
+        let changeset = CleanContinuationChangeset::new(chrono::Utc::now());
+        let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
+            .set(&changeset);
+        let debug = debug_query::<Pg, _>(&query).to_string();
+
+        for column in ["worker_id", "started_at", "last_heartbeat_at"] {
+            assert!(
+                debug.contains(&format!("\"{column}\" = $")),
+                "{column} must be nulled on a clean continuation: {debug}"
+            );
+        }
+        assert!(debug.contains("\"state\" = "), "{debug}");
+        assert!(debug.contains("\"scheduled_at\" = "), "{debug}");
+        assert!(
+            debug.contains("\"crash_strikes\" = "),
+            "poison-pill streak must reset on a clean continuation (issue #367): {debug}"
+        );
+        assert!(
+            debug.contains("\"capability_misses\" = "),
+            "capability-miss streak must reset on a clean continuation \
+             (issue #804): {debug}"
+        );
     }
 
     /// Issue #782: `requeue_workflow_task_after_panic` must generate a `SET`
