@@ -655,12 +655,21 @@ impl WorkflowReplayer {
         let mut verifier = ReplayVerifier::new();
         verifier.handlers.clone_from(&self.handlers);
         verifier.state = self.state.clone();
-        // Issue #614: carry this replayer's own history policy across the
-        // delegation. Dropping it here would silently ignore
-        // `WorkflowReplayer::with_history_policy` on the bundle path and replay
-        // under the default threshold — reporting drift for a workflow that
-        // never drifted.
-        verifier.history_policy = self.history_policy;
+        // Carry every replay-context value this replayer was configured with
+        // across the delegation. Dropping any of them silently ignores the
+        // corresponding `WorkflowReplayer::with_*` builder call on the bundle
+        // path and replays under a different context — reporting drift for a
+        // workflow that never drifted. Issue #614 established this for
+        // `history_policy`; Codex round-10 P2 extended it to the four
+        // `HistorySnapshot`-metadata fallbacks, which matter for any fixture
+        // that omits the metadata (hand-built, or exported before #698).
+        verifier.replay_defaults = FixtureReplayDefaults {
+            context_headers: self.context_headers.clone(),
+            execution_timeout: self.execution_timeout,
+            parent_execution_id: self.parent_execution_id,
+            workflow_id: self.workflow_id.clone(),
+            history_policy: self.history_policy,
+        };
         verifier.replay_bundle(dir).await
     }
 
@@ -2788,12 +2797,37 @@ pub struct ReplayVerifier {
     /// Drift-gate policy (issue #798): refuse to certify a bundle whose manifest
     /// reports that a shard could not be inspected.
     require_complete_coverage: bool,
-    /// History policy the fixtures are replayed under (issue #614).
+    /// Replay-context values threaded into every fixture's replayer, including
+    /// the issue #614 history policy set by
+    /// [`with_history_policy`](Self::with_history_policy).
     ///
-    /// Must match the deployment's `HarvestBuilder::history_policy`, because it
-    /// gates `continue_as_new_threshold` and therefore
-    /// [`WorkflowContext::should_continue_as_new`](crate::context::WorkflowContext::should_continue_as_new)
-    /// — see [`with_history_policy`](Self::with_history_policy).
+    /// The four non-policy fallbacks are not builder-settable on the verifier:
+    /// they exist so a caller who configured them on a `WorkflowReplayer`
+    /// (`with_context_headers`, `with_execution_timeout`,
+    /// `with_parent_execution_id`, `with_workflow_id`) does not silently lose
+    /// them by switching to the bundle path. Configure them there; a fixture
+    /// carrying its own value still overrides.
+    replay_defaults: FixtureReplayDefaults,
+}
+
+/// The replay-context fallbacks a bundle walk threads into every fixture's
+/// per-fixture [`WorkflowReplayer`].
+///
+/// Each is a *fallback*, not an override: a [`HistorySnapshot`] that carries its
+/// own value (every field here is exported by the real #798 export path) wins,
+/// so these only take effect for a hand-built or legacy fixture that omits the
+/// metadata — exactly the contract the equivalent `WorkflowReplayer` globals
+/// document.
+///
+/// Bundled into one struct rather than five more positional parameters so
+/// `replay_fixture_file` stays under the `too_many_arguments` bar and a future
+/// field is a one-line addition instead of another call-site sweep.
+#[derive(Debug, Clone, Default)]
+struct FixtureReplayDefaults {
+    context_headers: HashMap<String, String>,
+    execution_timeout: Option<chrono::Duration>,
+    parent_execution_id: Option<ExecutionId>,
+    workflow_id: Option<String>,
     history_policy: crate::context::WorkflowHistoryPolicy,
 }
 
@@ -2818,7 +2852,7 @@ impl ReplayVerifier {
             fixtures_dir: None,
             allow_empty_bundle: false,
             require_complete_coverage: false,
-            history_policy: crate::context::WorkflowHistoryPolicy::default(),
+            replay_defaults: FixtureReplayDefaults::default(),
         }
     }
 
@@ -2852,7 +2886,7 @@ impl ReplayVerifier {
         mut self,
         history_policy: crate::context::WorkflowHistoryPolicy,
     ) -> Self {
-        self.history_policy = history_policy;
+        self.replay_defaults.history_policy = history_policy;
         self
     }
 
@@ -3070,7 +3104,7 @@ impl ReplayVerifier {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.concurrency));
         let timeout = self.timeout;
         let allow_unregistered = self.allow_unregistered;
-        let history_policy = self.history_policy;
+        let defaults = Arc::new(self.replay_defaults.clone());
         let handlers = Arc::new(self.handlers.clone());
         let state = self.state.clone();
 
@@ -3078,6 +3112,7 @@ impl ReplayVerifier {
         for path in files {
             let sem = Arc::clone(&semaphore);
             let handlers = Arc::clone(&handlers);
+            let defaults = Arc::clone(&defaults);
             let state = state.clone();
 
             tasks.push(tokio::spawn(async move {
@@ -3089,7 +3124,7 @@ impl ReplayVerifier {
                     timeout,
                     allow_unregistered,
                     mode,
-                    history_policy,
+                    &defaults,
                 )
                 .await
             }));
@@ -3287,6 +3322,87 @@ fn offloaded_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<St
     ))
 }
 
+/// Refuse a fixture whose payloads are still **codec envelopes** (issue #608),
+/// or carry the marker a decode attempt left behind when it failed.
+///
+/// The codec half of [`offloaded_fixture_reason`], and reachable in strictly
+/// more deployments: the export loads history with
+/// `store::load_history_undecoded`, and the plugin's `read_path_decoder`
+/// returns `None` whenever `decode_payloads_on_read` is left at its default
+/// `false` — so on a codec-**encrypting** deployment *every* payload-bearing
+/// field reaches the bundle as ciphertext, not just those over a size
+/// threshold.
+///
+/// The directory-replay path builds its `WorkflowReplayer` with no codec
+/// registry and cannot decode it. Left unguarded, the candidate workflow
+/// computes the real plaintext while history holds the envelope, so
+/// `match_activity_strict` diverges on every affected fixture — a determinism
+/// regression that does not exist, blocking a healthy deploy. Same false-red
+/// class as a redacted or offloaded bundle, same treatment: a harness error
+/// (exit 2) naming the fix.
+///
+/// Two discriminators, because a payload can be opaque for two different
+/// reasons and both are equally un-replayable:
+/// - [`CODEC_ENVELOPE_KEY`](crate::payload_codec::CODEC_ENVELOPE_KEY) — never
+///   decoded (flag off, or the caller was not an admin).
+/// - [`UNDECODABLE_MARKER_KEY`](crate::payload_codec::UNDECODABLE_MARKER_KEY) —
+///   a lossy decode *was* attempted and failed (unknown codec, bad base64,
+///   codec error, invalid JSON), so the plaintext is gone either way.
+///
+/// Scoped to the payload-bearing fields of each event's `data` object — exactly
+/// where the codec transform writes — so business data nested deeper cannot
+/// trip it. Envelope detection delegates to
+/// [`is_codec_envelope`](crate::payload_codec::is_codec_envelope), the crate's
+/// own authoritative shape check, so this can never drift from what the decoder
+/// recognises.
+fn codec_opaque_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<String> {
+    use crate::payload_codec::{CODEC_ENVELOPE_KEY, UNDECODABLE_MARKER_KEY};
+
+    // Fast reject on the raw text first: both discriminators are fixed keys, so
+    // a substring miss proves neither is present without re-serializing a single
+    // event. Only a hit pays for the structured confirmation below.
+    if !json.contains(CODEC_ENVELOPE_KEY) && !json.contains(UNDECODABLE_MARKER_KEY) {
+        return None;
+    }
+
+    let mut envelopes = 0usize;
+    let mut undecodable = 0usize;
+    for value in snapshot
+        .events
+        .iter()
+        .filter_map(|event| serde_json::to_value(event).ok())
+    {
+        let Some(data) = value.get("data").and_then(Value::as_object) else {
+            continue;
+        };
+        for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
+            let Some(field) = data.get(key) else { continue };
+            if crate::payload_codec::is_codec_envelope(field) {
+                envelopes += 1;
+            } else if field
+                .as_object()
+                .is_some_and(|obj| obj.contains_key(UNDECODABLE_MARKER_KEY))
+            {
+                undecodable += 1;
+            }
+        }
+    }
+    if envelopes == 0 && undecodable == 0 {
+        // The key appeared in payload *data* rather than as a real envelope
+        // (e.g. a workflow whose own JSON mentions it). Nothing to decode.
+        return None;
+    }
+
+    Some(format!(
+        "fixture carries {envelopes} undecoded codec envelope(s) and {undecodable} \
+         undecodable-payload marker(s) (issue #608) instead of the real payloads, so \
+         replaying it would compare the candidate's real inputs against ciphertext and \
+         report drift that does not exist. Re-export with payload decoding enabled \
+         (`HarvestPlugin::decode_payloads_on_read()`, and call the route as an admin), \
+         or run the gate against a deployment with no payload codec registered."
+    ))
+}
+
 fn unreplayable_fixture_reason(
     guard: &FixtureGuardFields,
     mode: FixtureReplayMode,
@@ -3362,6 +3478,46 @@ enum FixtureReplayMode {
 }
 
 /// Replay a single fixture file and return a [`FixtureResult`].
+/// Build the single-use replayer one bundle fixture is replayed on.
+///
+/// Every replay-context value here is a *fallback* carried from the caller's
+/// builder (Codex round-10 P2): the real #798 export writes `workflow_id`,
+/// `parent_execution_id`, `execution_timeout` and `context_headers` onto the
+/// snapshot, and `replay_from_snapshot` prefers the snapshot's own value — so
+/// these only take effect for a hand-built or legacy fixture that omits the
+/// metadata. Dropping them (as this construction used to) silently ignored
+/// `WorkflowReplayer::with_workflow_id` and friends on the bundle path,
+/// reporting drift for a workflow that never drifted — the same bug class the
+/// issue #614 history-policy carry-through already fixed.
+fn fixture_replayer(
+    handlers: &HashMap<String, WorkflowHandlerFn>,
+    state: SharedState,
+    defaults: &FixtureReplayDefaults,
+) -> WorkflowReplayer {
+    WorkflowReplayer {
+        handlers: handlers.clone(),
+        state,
+        context_headers: defaults.context_headers.clone(),
+        payload_offloader: None,
+        use_advancing_clock: false,
+        metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+        // Issue #772 fallback: a snapshot carrying its own `execution_timeout`
+        // still wins, so a deadline-aware fixture is validated either way.
+        execution_timeout: defaults.execution_timeout,
+        parent_execution_id: defaults.parent_execution_id,
+        workflow_id: defaults.workflow_id.clone(),
+        // Issue #698: the directory-fixture path routes through
+        // `replay_from_snapshot`, which always sources `execution_id` from the
+        // snapshot (a required field); no raw-events global override applies.
+        execution_id: None,
+        // Issue #614: the bundle carries no history-policy field (it describes
+        // executions, not the runtime that produced them), so the caller supplies
+        // it via `ReplayVerifier::with_history_policy`. Defaults to the default
+        // policy — unchanged pre-#614 behavior for anyone who never customized it.
+        history_policy: defaults.history_policy,
+    }
+}
+
 async fn replay_fixture_file(
     handlers: &HashMap<String, WorkflowHandlerFn>,
     state: SharedState,
@@ -3369,7 +3525,7 @@ async fn replay_fixture_file(
     timeout: std::time::Duration,
     allow_unregistered: bool,
     mode: FixtureReplayMode,
-    history_policy: crate::context::WorkflowHistoryPolicy,
+    defaults: &FixtureReplayDefaults,
 ) -> FixtureResult {
     // Read file.
     let json = match tokio::fs::read_to_string(path).await {
@@ -3419,6 +3575,7 @@ async fn replay_fixture_file(
     let guard: FixtureGuardFields = serde_json::from_str(&json).unwrap_or_default();
     if let Some(reason) = unreplayable_fixture_reason(&guard, mode)
         .or_else(|| offloaded_fixture_reason(&json, &snapshot))
+        .or_else(|| codec_opaque_fixture_reason(&json, &snapshot))
     {
         return FixtureResult {
             path: path.to_owned(),
@@ -3450,40 +3607,7 @@ async fn replay_fixture_file(
         };
     }
 
-    // Build a single-use replayer and run with timeout.
-    //
-    // Known limitation (issue #772): `execution_timeout` is hardcoded to `None`
-    // here because the directory-fixture format (`HistorySnapshot` JSON) carries
-    // no execution-timeout field, so this path cannot validate
-    // deadline-triggered `continue_as_new` fixtures — `ctx.deadline()` is always
-    // `None` for directory replays. Follow-up: add an optional timeout field to
-    // the snapshot format if directory-driven deadline fixtures are needed. Tests
-    // that need a deadline use `WorkflowReplayer::with_execution_timeout` directly
-    // (see `tests/integration/replayer_tests.rs`).
-    let replayer = WorkflowReplayer {
-        handlers: handlers.clone(),
-        state,
-        context_headers: HashMap::new(),
-        payload_offloader: None,
-        use_advancing_clock: false,
-        metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
-        execution_timeout: None,
-        // Issue #698: the directory-fixture path relies on the snapshot's own
-        // `parent_execution_id` (absent for a legacy fixture); no global override.
-        parent_execution_id: None,
-        // Issue #698: same as parent — the directory-fixture path relies on the
-        // snapshot's own `workflow_id`; no global override.
-        workflow_id: None,
-        // Issue #698: the directory-fixture path routes through
-        // `replay_from_snapshot`, which always sources `execution_id` from the
-        // snapshot (a required field); no raw-events global override applies.
-        execution_id: None,
-        // Issue #614: the bundle carries no history-policy field (it describes
-        // executions, not the runtime that produced them), so the caller supplies
-        // it via `ReplayVerifier::with_history_policy`. Defaults to the default
-        // policy — unchanged pre-#614 behavior for anyone who never customized it.
-        history_policy,
-    };
+    let replayer = fixture_replayer(handlers, state, defaults);
 
     let replay_result = match mode {
         FixtureReplayMode::Strict => {

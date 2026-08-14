@@ -1058,6 +1058,89 @@ async fn workflow_replayer_bundle_delegation_carries_the_history_policy() {
     );
 }
 
+/// A workflow that embeds its own business `workflow_id` in an activity input.
+///
+/// `workflow_id` lives in no `WorkflowEvent`, so a fixture that omits it leaves
+/// the replay context with `""` unless a fallback is threaded in — making this
+/// the cheapest way to prove the fallback actually arrives.
+fn workflow_id_bearing_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let id = ctx.info().workflow_id;
+        ctx.execute_activity_raw("step_one", serde_json::json!({ "wf_id": id }), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// An in-flight history recorded by a run whose business `workflow_id` was
+/// `order-42`, in a snapshot that does **not** carry the id — a hand-built
+/// fixture, or one exported before issue #698 threaded the field.
+fn workflow_id_snapshot_json(workflow_name: &str) -> String {
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "step_one".into(),
+            input: serde_json::json!({"wf_id": "order-42"}),
+            queue: "default".into(),
+        },
+    ];
+    snapshot_json(workflow_name, ExecutionId::new(), events)
+}
+
+/// `WorkflowReplayer::replay_bundle` delegates to `ReplayVerifier`; every
+/// configured replay-context fallback must survive that hop (Codex round-10 P2).
+///
+/// Issue #614 already proved this for `history_policy`. The four
+/// `HistorySnapshot`-metadata fallbacks — `context_headers`,
+/// `execution_timeout`, `parent_execution_id`, `workflow_id` — were still being
+/// discarded, so a caller who configured them on the replayer and then called
+/// `replay_bundle` silently replayed under a *different* context and got drift
+/// for a workflow that never drifted.
+#[tokio::test]
+async fn workflow_replayer_bundle_delegation_carries_the_workflow_id_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &workflow_id_snapshot_json("wf"));
+
+    let report = autumn_harvest::testing::WorkflowReplayer::new()
+        .register_fn("wf", workflow_id_bearing_workflow as WorkflowHandlerFn)
+        .with_workflow_id("order-42")
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.is_clean(),
+        "the replayer's own workflow_id must reach the bundle walk: {report}"
+    );
+}
+
+/// The control that keeps the fallback test honest: without the builder call the
+/// replay context resolves `workflow_id` to `""`, the activity input differs, and
+/// the fixture genuinely diverges.
+///
+/// Without this, the test above would pass even if the fallback did nothing.
+#[tokio::test]
+async fn the_workflow_id_fallback_genuinely_changes_the_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &workflow_id_snapshot_json("wf"));
+
+    let report = autumn_harvest::testing::WorkflowReplayer::new()
+        .register_fn("wf", workflow_id_bearing_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(
+        report.diverged.len(),
+        1,
+        "control: omitting the id must genuinely change the outcome, else the \
+         fallback test would pass without the delegation carrying anything: {report}"
+    );
+}
+
 // ===========================================================================
 // The gate must not certify what it did not verify (PR #1171 review)
 // ===========================================================================
@@ -1409,6 +1492,178 @@ async fn the_envelope_key_appearing_as_plain_data_does_not_block() {
     );
     assert_eq!(report.succeeded, 1, "{report}");
     assert!(report.is_clean(), "{report}");
+}
+
+/// An in-flight history whose activity input is a **codec envelope**
+/// (issue #608) standing in for the real payload.
+///
+/// Built by hand rather than through a `PayloadCodecs` registry so the fixture
+/// needs no codec: the wire shape is the contract the guard keys on, and
+/// building it here proves the guard reads the same discriminator the codec
+/// encode path writes.
+fn codec_snapshot_json(workflow_name: &str) -> String {
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "step_one".into(),
+            input: serde_json::json!({
+                "_harvest_codec_envelope": 1,
+                "codec_id": "aes-gcm",
+                "data": "Y2lwaGVydGV4dA==",
+            }),
+            queue: "default".into(),
+        },
+    ];
+    snapshot_json(workflow_name, ExecutionId::new(), events)
+}
+
+/// The money test for the codec guard (Codex round-10 P1).
+///
+/// The export loads history with `load_history_undecoded`, and
+/// `read_path_decoder` returns `None` whenever `decode_payloads_on_read` is
+/// left at its default `false` — so on a codec-**encrypting** deployment every
+/// payload-bearing field reaches the bundle as ciphertext in a codec envelope.
+///
+/// The bundle walk builds its `WorkflowReplayer` with no codec registry and
+/// cannot decode it, so a **healthy** workflow computing the real plaintext
+/// input would be compared against the envelope and reported as drift: a false
+/// red blocking a clean deploy, the single worst outcome a release gate can
+/// produce. It must be a harness error (exit 2) naming the fix.
+#[tokio::test]
+async fn a_codec_encrypted_fixture_blocks_the_gate_instead_of_reporting_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "encrypted.json", &codec_snapshot_json("wf"));
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", payload_bearing_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(
+        report.total, 1,
+        "the fixture still counts in the denominator"
+    );
+    assert!(
+        report.diverged.is_empty(),
+        "an undecodable envelope is NOT a determinism regression: {:?}",
+        report.diverged
+    );
+    assert_eq!(
+        report.blocked.len(),
+        1,
+        "expected a harness error: {report}"
+    );
+    assert_eq!(
+        report.exit_code(),
+        2,
+        "a bundle this gate cannot honestly evaluate must not read as drift: {report}"
+    );
+
+    let reason = report.blocked[0].reason.to_string();
+    assert!(
+        reason.contains("codec"),
+        "the reason must name the cause: {reason}"
+    );
+    assert!(
+        reason.contains("decode_payloads_on_read"),
+        "the reason must name a concrete fix: {reason}"
+    );
+}
+
+/// A fixture whose payload carries the issue #608 **undecodable marker** — the
+/// per-field graceful degrade a lossy decode writes when it *tried* and failed
+/// (unknown codec, bad base64, codec error, invalid JSON).
+///
+/// Decoding was attempted and the plaintext is gone, so replaying it is just as
+/// dishonest as replaying the raw envelope. Same treatment.
+#[tokio::test]
+async fn an_undecodable_fixture_blocks_the_gate_instead_of_reporting_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "step_one".into(),
+            input: serde_json::json!({
+                "_harvest_undecodable": {"codec_id": "aes-gcm", "reason": "unknown_codec"},
+            }),
+            queue: "default".into(),
+        },
+    ];
+    write(
+        dir.path(),
+        "undecodable.json",
+        &snapshot_json("wf", ExecutionId::new(), events),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", payload_bearing_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.diverged.is_empty(),
+        "a failed decode is NOT a determinism regression: {:?}",
+        report.diverged
+    );
+    assert_eq!(
+        report.blocked.len(),
+        1,
+        "expected a harness error: {report}"
+    );
+    assert_eq!(report.exit_code(), 2, "{report}");
+}
+
+/// The codec discriminator appearing inside ordinary payload *data* must not
+/// block — the same false-positive guard the offload half already carries.
+#[tokio::test]
+async fn the_codec_key_appearing_as_plain_data_does_not_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "step_one".into(),
+            // The key is present as a *string value*, not an envelope object.
+            input: serde_json::json!({"note": "we set _harvest_codec_envelope upstream"}),
+            queue: "default".into(),
+        },
+    ];
+    write(
+        dir.path(),
+        "mentions_codec.json",
+        &snapshot_json("wf", ExecutionId::new(), events),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", mentions_codec_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.blocked.is_empty(),
+        "a substring hit is not an envelope: {report}"
+    );
+    assert_eq!(report.succeeded, 1, "{report}");
+    assert!(report.is_clean(), "{report}");
+}
+
+/// Companion to [`the_codec_key_appearing_as_plain_data_does_not_block`].
+fn mentions_codec_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw(
+            "step_one",
+            serde_json::json!({"note": "we set _harvest_codec_envelope upstream"}),
+            "default",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
 }
 
 /// Companion to [`the_envelope_key_appearing_as_plain_data_does_not_block`].

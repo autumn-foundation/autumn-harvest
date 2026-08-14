@@ -146,7 +146,7 @@ needs to act:
 |---|---|
 | `total` / `succeeded` | Fixtures replayed, and how many were clean. |
 | `diverged` | `Vec<ReplayDrift>` — one per drifting execution, each carrying `execution_id`, `workflow_name`, `kind: NonDeterminismKind`, and `first_divergence`. |
-| `blocked` | Fixtures the harness could not evaluate (unparseable, an unregistered workflow type, a redacted export, or offloaded payload references). |
+| `blocked` | Fixtures the harness could not evaluate (unparseable, an unregistered workflow type, a redacted export, offloaded payload references, or undecoded codec envelopes). |
 | `skipped` | Orphan fixtures, when `allow_unregistered(true)` is set. |
 | `coverage` | The parsed `SampleManifest`, when the bundle carries one. |
 | `is_clean()` | `exit_code() == 0`. Always agrees with `exit_code()`. |
@@ -160,7 +160,7 @@ needs to act:
 |---|---|
 | `0` | Clean — promote. |
 | `1` | At least one execution diverged. **Do not promote.** |
-| `2` | The gate could not fully run. Dominates `1`. A fixture blocked it (unparseable, an unregistered workflow type, a redacted bundle, or a fixture carrying offloaded payload references); the bundle holds a different number of fixtures than its manifest declares; **or** the export itself delivered fewer fixtures than the sample selected (it hit the response byte budget, or individual selected candidates failed to fetch). |
+| `2` | The gate could not fully run. Dominates `1`. A fixture blocked it (unparseable, an unregistered workflow type, a redacted bundle, or a fixture carrying offloaded payload references or undecoded codec envelopes); the bundle holds a different number of fixtures than its manifest declares; **or** the export itself delivered fewer fixtures than the sample selected (it hit the response byte budget, or individual selected candidates failed to fetch). |
 | `3` | Nothing was verified and `allow_empty_bundle(false)` (the default) — the bundle was empty, **or** every fixture in it was skipped. |
 | `4` | `require_complete_coverage(true)` and complete coverage was not proven — the manifest reports partial shard coverage, the bundle carries no readable manifest, **or** a workflow type with in-flight work was sampled zero times. |
 
@@ -170,12 +170,15 @@ that can happen, so each names the concrete fix in the report body rather than
 collapsing into a bare non-zero.
 
 Exit `2` covers a bundle the gate cannot *honestly evaluate*, and reports it as a
-harness error rather than drift. A redacted export and a fixture carrying
-large-payload claim-check envelopes ([issue #524](https://github.com/autumn-foundation/autumn-harvest/issues/524))
-would both compare the candidate's real inputs against stand-in values and report
+harness error rather than drift. A redacted export, a fixture carrying
+large-payload claim-check envelopes ([issue #524](https://github.com/autumn-foundation/autumn-harvest/issues/524)),
+and a fixture whose payloads are still codec envelopes
+([issue #608](https://github.com/autumn-foundation/autumn-harvest/issues/608))
+would all compare the candidate's real inputs against stand-in values and report
 a determinism regression that does not exist — a false red on a clean deploy. Re-export
-with `--payload-policy full`, and either sample a workflow whose payloads stay under
-the offload threshold or raise `payload_offload_threshold` for the exported window.
+with `--payload-policy full`; either sample a workflow whose payloads stay under
+the offload threshold or raise `payload_offload_threshold` for the exported window;
+and on an encrypted deployment enable read-path decoding (see *Payloads and secrets*).
 A fixture count that disagrees with the manifest means files went missing after the
 export (a truncated artifact upload, a partial copy): every surviving fixture may
 replay cleanly while the gate certifies a strict subset of what was sampled.
@@ -387,11 +390,40 @@ in code that is fine. Refusing to answer is the honest outcome, so the gate
 blocks and names the fix instead. The export step also warns at write time, so
 you find out when you create the bundle rather than when you try to gate on it.
 
-A `full` export applies the admin-gated read-path decode (issue #608), so on an
-encrypted deployment the fixtures carry plaintext. **Treat a `full` bundle as
-production data**: do not commit it, scope the CI artifact's retention tightly
-(or skip the artifact entirely and replay in the same job), and mint the export
-credential `read`-scoped.
+### Encrypted deployments need read-path decoding enabled
+
+`--payload-policy full` selects the *policy*; it does not by itself decode a
+payload codec ([issue #608](https://github.com/autumn-foundation/autumn-harvest/issues/608)).
+The export loads history undecoded, and the read-path decoder engages only when
+**both** hold:
+
+1. the deployment opted in with `HarvestPlugin::decode_payloads_on_read()`, and
+2. the export call is made by an **admin** principal.
+
+Miss either and, on a codec-encrypting deployment, every payload-bearing field
+reaches the bundle as ciphertext in a codec envelope. The offline gate has no
+codec registry, so it refuses those fixtures rather than replaying them:
+
+```
+BLOCKED  ./fixtures/in-flight/billing_checkout--0f2c….json — invalid fixture:
+  fixture carries 3 undecoded codec envelope(s) and 0 undecodable-payload
+  marker(s) (issue #608) instead of the real payloads, so replaying it would
+  compare the candidate's real inputs against ciphertext and report drift that
+  does not exist. Re-export with payload decoding enabled
+  (`HarvestPlugin::decode_payloads_on_read()`, and call the route as an admin),
+  or run the gate against a deployment with no payload codec registered.
+```
+
+The same refusal covers the `_harvest_undecodable` marker a lossy decode leaves
+behind when it *tried* and failed (unregistered codec, bad base64, codec error,
+invalid JSON): the plaintext is gone either way, so replaying it would be just as
+dishonest. Both are exit `2`, for the same reason redaction is — a confidently
+wrong "your code drifted" is worse than an honest "I cannot evaluate this".
+
+When decoding **is** enabled, the fixtures carry plaintext. **Treat a `full`
+bundle as production data**: do not commit it, scope the CI artifact's retention
+tightly (or skip the artifact entirely and replay in the same job), and mint the
+export credential `read`-scoped.
 
 If payload exposure is unacceptable in your environment, this gate is not the
 right check for you — prefer the server-side replay canary (#512), which replays

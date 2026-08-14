@@ -3515,6 +3515,35 @@ impl HistoryBatchExportWork {
             .push(UnavailableShard { shard_id, reason });
     }
 
+    /// Record a candidate that discovery already **selected** but the export
+    /// could not produce a document for because its shard became unreachable
+    /// in between (Codex round-11 P1).
+    ///
+    /// Deliberately records *both* signals, because they answer different
+    /// questions and only one of them is load-bearing for the replay gate:
+    /// - `unavailable_shards` — "this shard is unhealthy", which flips the
+    ///   response `status` to `partial`. The #798 gate honours that only under
+    ///   the opt-in `require_complete_coverage`.
+    /// - `failures` — "the bundle is missing a row it was meant to hold", which
+    ///   the manifest surfaces as `export_failures > 0` and the gate blocks on
+    ///   *unconditionally* (exit 2).
+    ///
+    /// Recording only the first lets a bundle with at least one survivor exit 0
+    /// while silently dropping selected candidates — a biased subset presented
+    /// as a clean gate, the worst outcome this feature can produce. Every other
+    /// `note_unavailable` call site fails *before* selection, so this is the one
+    /// place both are owed.
+    fn note_dropped_candidate(&mut self, shard_id: i32, exec_id: &ExecutionId, reason: &str) {
+        self.note_unavailable(shard_id, reason.to_string());
+        self.failures.push(HistoryExportFailure {
+            execution_id: Some(exec_id.to_string()),
+            shard_id,
+            reason: format!("shard connection unavailable after selection: {reason}"),
+            actual_bytes: None,
+            max_bytes: None,
+        });
+    }
+
     fn normalize_coverage(&mut self) {
         self.inspected_shards.sort_unstable();
         self.inspected_shards.dedup();
@@ -33420,7 +33449,10 @@ async fn export_history_candidate(
     let mut conn = match acquire_conn(pool.pool_for(ShardId::new(shard_id))).await {
         Ok(conn) => conn,
         Err(error) => {
-            work.note_unavailable(shard_id, error.to_string());
+            // This candidate was already *selected*, so an unhealthy-shard note
+            // alone would leave `export_failures = 0` and let a bundle holding a
+            // silently biased subset exit 0 (Codex round-11 P1).
+            work.note_dropped_candidate(shard_id, &exec_id, &error.to_string());
             return;
         }
     };
@@ -43227,6 +43259,83 @@ mod tests {
             0
         );
         assert!(!build_sample_manifest(&sample_query(), &clean).is_incomplete_export());
+    }
+
+    /// A shard that dies **after** discovery selected a candidate must be
+    /// recorded as a dropped candidate, not merely an unhealthy shard.
+    ///
+    /// The two signals gate differently, which is the whole point: the shard
+    /// note only flips `status` to `partial`, which the #798 replay gate honours
+    /// solely under the opt-in `require_complete_coverage(true)`. The failure
+    /// entry is what makes `export_failures > 0`, which blocks the gate
+    /// unconditionally (exit 2).
+    ///
+    /// Recording only the shard note let a bundle with at least one survivor
+    /// replay clean and exit `0` while silently omitting selected executions —
+    /// a biased subset presented as a passing gate (Codex round-11 P1). The
+    /// reacquire race that triggers this is not injectable in a DB test, so the
+    /// decision is pinned here instead.
+    #[test]
+    fn a_candidate_dropped_after_selection_is_counted_as_an_export_failure() {
+        let base = sample_base();
+        let exec_id = ExecutionId::from_uuid(uuid::Uuid::from_u128(7));
+        let mut work = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[sample_row("wf", 1, base, 3)])],
+            ..Default::default()
+        };
+
+        work.batch
+            .note_dropped_candidate(0, &exec_id, "pool timed out");
+
+        assert_eq!(
+            work.batch.unavailable_shards.len(),
+            1,
+            "the shard is genuinely unhealthy and must still be reported"
+        );
+        assert_eq!(
+            work.batch.failures.len(),
+            1,
+            "a selected-but-unexported candidate is a dropped candidate, not just \
+             an unhealthy shard"
+        );
+        assert_eq!(
+            work.batch.failures[0].execution_id.as_deref(),
+            Some(exec_id.to_string().as_str()),
+            "the operator needs the execution id to know what was dropped"
+        );
+
+        let manifest = build_sample_manifest(&sample_query(), &work);
+        assert_eq!(manifest.export_failures, 1);
+        assert!(
+            manifest.is_incomplete_export(),
+            "this is the predicate the gate blocks on, unconditionally: {manifest:?}"
+        );
+    }
+
+    /// The control: `note_unavailable` on its own — the correct call for every
+    /// *pre*-selection failure — must NOT fabricate a dropped candidate.
+    ///
+    /// Six of the seven `note_unavailable` call sites fail before any candidate
+    /// is selected; counting those as export failures would block the gate for a
+    /// shard that never owed the bundle a row.
+    #[test]
+    fn an_unavailable_shard_before_selection_is_not_an_export_failure() {
+        let base = sample_base();
+        let mut work = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[sample_row("wf", 1, base, 3)])],
+            ..Default::default()
+        };
+
+        work.batch.note_unavailable(1, "pool timed out".to_string());
+
+        assert_eq!(work.batch.unavailable_shards.len(), 1);
+        assert!(
+            work.batch.failures.is_empty(),
+            "no candidate was selected from this shard, so none was dropped"
+        );
+        let manifest = build_sample_manifest(&sample_query(), &work);
+        assert_eq!(manifest.export_failures, 0);
+        assert!(!manifest.is_incomplete_export());
     }
 
     /// The complement: `sampled` counts the documents actually exported, per
