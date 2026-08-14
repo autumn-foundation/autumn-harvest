@@ -1078,7 +1078,9 @@ async fn thousand_execution_cross_shard_sample_exports_and_replays_within_budget
     );
 
     let elapsed = started.elapsed();
-    let replay_took = elapsed.saturating_sub(export_took).saturating_sub(write_took);
+    let replay_took = elapsed
+        .saturating_sub(export_took)
+        .saturating_sub(write_took);
     // Phase breakdown so a budget failure says *which* stage regressed rather
     // than only that the total moved.
     let phases =
