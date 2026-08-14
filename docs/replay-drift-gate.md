@@ -90,10 +90,22 @@ has a fixed name — *is* overwritten. The gate walks every `*.json`, so the two
 would disagree: the manifest would count this run's sample while the gate
 replayed executions from every run, some of them long since completed.
 
-Only the manifest and top-level `*.json` files are touched, and only when the
-manifest is present — that is the marker for a directory this command wrote. A
-directory holding JSON with **no** manifest is refused rather than cleaned, so
-`--output-dir .` cannot delete your files because you mistyped a path.
+> **Use a dedicated directory for the bundle.** The replace removes **every
+> `*.json` under `--output-dir`, at any depth** — not just the top level — and
+> that includes `*.json` symlinks (the link is removed, never the file it points
+> at). It has to: the gate replays every `*.json` it finds recursively, so
+> anything the replace skipped would still be replayed, and a fixture left over
+> from an earlier run would surface as drift the candidate never caused. An
+> unrelated `metadata/config.json` sitting inside the bundle directory **will be
+> deleted** on the next export.
+
+Two guards keep that scoped. The replace only runs when the manifest is present
+**as a regular file at the top level** — that is the marker for a directory this
+command wrote. A directory holding JSON with **no** such manifest is refused
+rather than cleaned, so `--output-dir .` cannot delete your files because you
+mistyped a path (and a *symlinked* manifest does not count as the marker, since
+it is not evidence this command wrote the directory). Non-`.json` files and
+directories are never removed.
 
 ---
 
