@@ -1,0 +1,22 @@
+-- after-bounded-exists-no-order-by-bloated --
+                                                       QUERY PLAN                                                        
+-------------------------------------------------------------------------------------------------------------------------
+ Result  (cost=2583.73..2583.74 rows=1 width=1) (actual rows=1 loops=1)
+   Output: $0
+   Buffers: shared hit=295 read=42871
+   InitPlan 1 (returns $0)
+     ->  Limit  (cost=2583.47..2583.73 rows=1 width=4) (actual rows=1 loops=1)
+           Output: 1
+           Buffers: shared hit=295 read=42871
+           ->  Seq Scan on public.harvest_events  (cost=0.00..122218.79 rows=473032 width=4) (actual rows=10000 loops=1)
+                 Output: 1
+                 Filter: (harvest_events.workflow_exec_id = '12464aab-c16a-4ae4-b7e5-441859fd9760'::uuid)
+                 Rows Removed by Filter: 1434083
+                 Buffers: shared hit=295 read=42871
+ Query Identifier: -3661517514735695829
+ Planning:
+   Buffers: shared hit=206
+ Planning Time: 0.891 ms
+ Execution Time: 171.039 ms
+(17 rows)
+
