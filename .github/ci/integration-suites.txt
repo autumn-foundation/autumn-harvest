@@ -124,6 +124,7 @@ linux        autumn-harvest-plugin  queue_pause_integration          -          
 linux        autumn-harvest-plugin  rate_limit_key_admin_integration  -                          -
 linux        autumn-harvest-plugin  read_path_decode_integration     -                          -
 linux        autumn-harvest-plugin  replay_diagnosis_integration     -                          -
+linux        autumn-harvest-plugin  replay_sample_export_integration  -                          -
 linux        autumn-harvest-plugin  run_chain_integration            -                          -
 linux        autumn-harvest-plugin  schedule_runs_integration        -                          -
 linux        autumn-harvest-plugin  shard_placement_integration      -                          -

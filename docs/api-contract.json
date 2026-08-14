@@ -4817,6 +4817,92 @@
     },
     {
       "method": "GET",
+      "path": "/admin/history/export-sample",
+      "category": "admin",
+      "read_only": true,
+      "description": "Stratified in-flight history sample for the replay-drift gate (issue #798). Returns at most per_workflow non-terminal executions PER registered workflow type, across every shard, alongside a portable manifest reporting how many were sampled versus the in-flight population so truncation is never silent. Admin-only. Read-only: SELECT-only, no state transition and no event appended. An unreachable shard degrades the manifest to partial and names the shard rather than failing the request.",
+      "params": [
+        {
+          "name": "per_workflow",
+          "in": "query",
+          "required": false,
+          "description": "Maximum executions to sample per workflow type (default 50, clamped to 500). The effective value is echoed in filters.per_workflow."
+        },
+        {
+          "name": "states",
+          "in": "query",
+          "required": false,
+          "description": "Comma-separated non-terminal states to sample (default RUNNING,PAUSED). SUSPENDED is accepted as an alias for RUNNING. A terminal or unknown state returns 400 rather than a silently-empty sample."
+        },
+        {
+          "name": "state",
+          "in": "query",
+          "required": false,
+          "description": "Alias for states."
+        },
+        {
+          "name": "workflow_name",
+          "in": "query",
+          "required": false,
+          "description": "Restrict the sample to a single workflow type."
+        },
+        {
+          "name": "order",
+          "in": "query",
+          "required": false,
+          "description": "Which end of each type's in-flight population to sample: oldest (default) or newest."
+        },
+        {
+          "name": "shard_id",
+          "in": "query",
+          "required": false,
+          "description": "Restrict to a single shard."
+        },
+        {
+          "name": "payload_policy",
+          "in": "query",
+          "required": false,
+          "description": "Payload inclusion: full, redacted (default), or omit. full additionally applies the admin-gated read-path decode (issue #608)."
+        },
+        {
+          "name": "max_bytes",
+          "in": "query",
+          "required": false,
+          "description": "Per-execution export size ceiling; an over-size history is reported in failures and omitted from exports."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "observed_at",
+          "payload_policy",
+          "filters",
+          "manifest",
+          "exports",
+          "failures",
+          "shard_coverage"
+        ],
+        "notes": "manifest is the portable coverage record the CLI writes verbatim into the bundle as harvest-sample-manifest.json; it carries status, states, per_workflow[] (workflow_name/sampled/in_flight_total), sampled_total, in_flight_total, inspected_shards and unavailable_shards. A workflow type whose entire sample failed the size ceiling still appears with sampled 0 and its real in_flight_total, so an operator can never mistake an empty export for an empty in-flight population. Each entry in exports is a replay HistorySnapshot, byte-compatible with WorkflowReplayer::replay_bundle."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid filter value: a terminal or unknown state, a non-numeric per_workflow or shard_id, or an unknown order."
+        },
+        {
+          "status": 401,
+          "description": "Caller is not a Harvest admin."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/external-handoffs",
       "category": "external_activity",
       "read_only": true,

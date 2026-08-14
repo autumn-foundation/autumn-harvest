@@ -3328,6 +3328,46 @@ struct HistoryBatchExportResponse {
     shard_coverage: ExternalHandoffShardCoverage,
 }
 
+/// Parsed `GET /admin/history/export-sample` query (issue #798).
+#[derive(Debug, Clone)]
+struct HistorySampleExportQuery {
+    payload_policy: HistoryPayloadPolicy,
+    max_bytes: usize,
+    workflow_name: Option<String>,
+    /// Already normalized to a non-terminal set by
+    /// [`autumn_harvest::replay_sample::normalize_sample_states`].
+    states: Vec<String>,
+    per_workflow: usize,
+    order: autumn_harvest::replay_sample::SampleOrder,
+    shard_id: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+struct HistorySampleExportResponse {
+    status: String,
+    observed_at: chrono::DateTime<chrono::Utc>,
+    payload_policy: HistoryPayloadPolicy,
+    filters: HistorySampleExportFiltersResponse,
+    /// The portable coverage record written verbatim into the bundle as
+    /// `harvest-sample-manifest.json` (issue #798, AC2).
+    manifest: autumn_harvest::replay_sample::SampleManifest,
+    exports: Vec<HistoryExportDocument>,
+    failures: Vec<HistoryExportFailure>,
+    shard_coverage: ExternalHandoffShardCoverage,
+}
+
+#[derive(Debug, Serialize)]
+struct HistorySampleExportFiltersResponse {
+    workflow_name: Option<String>,
+    states: Vec<String>,
+    /// The **effective** (clamped) per-type cap, so an over-large request is
+    /// visibly bounded rather than silently honoured.
+    per_workflow: usize,
+    order: &'static str,
+    shard_id: Option<i32>,
+    max_bytes: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct HistoryBatchExportFiltersResponse {
     workflow_name: Option<String>,
@@ -3379,6 +3419,83 @@ struct HistoryExportCandidate {
     // single-execution export). `parent_id` lives in no `WorkflowEvent`.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
     parent_id: Option<uuid::Uuid>,
+    // Issue #798: the per-execution `context_headers`, carried into the export
+    // document so a header-branching workflow replays against the SAME ambient
+    // headers the live run saw. Headers live in no `WorkflowEvent`, so without
+    // this a replayed run sees an empty map and a workflow that branches on
+    // `ctx.header(..)` — or embeds one in an activity input — reports a FALSE
+    // divergence. Parity with the single-execution export and the DB canary.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+    context_headers: Option<serde_json::Value>,
+}
+
+/// One in-flight execution selected by the stratified sample query (issue #798).
+///
+/// Deliberately *not* the batch-export candidate: the sample query omits the
+/// `harvest_events` join that `HISTORY_EXPORT_CANDIDATES_SQL` needs for
+/// `last_history_event_at` (a per-execution `MAX()` over the whole event log),
+/// keeping the sample cheap enough to run against a large in-flight fleet. It
+/// instead carries `started_at` (the stratification key) and `in_flight_total`
+/// (the per-shard population of this workflow type, for AC2 coverage).
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct HistorySampleCandidate {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    workflow_name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    workflow_id: String,
+    #[diesel(sql_type = diesel::sql_types::Int4)]
+    shard_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    started_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
+    execution_timeout: Option<chrono::Duration>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    parent_id: Option<uuid::Uuid>,
+    // Issue #798: the per-execution `context_headers`, carried into the export
+    // document so a header-branching workflow replays against the SAME ambient
+    // headers the live run saw. Headers live in no `WorkflowEvent`, so without
+    // this a replayed run sees an empty map and a workflow that branches on
+    // `ctx.header(..)` — or embeds one in an activity input — reports a FALSE
+    // divergence. Parity with the single-execution export and the DB canary.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+    context_headers: Option<serde_json::Value>,
+    /// `COUNT(*) OVER (PARTITION BY workflow_name)` — the in-flight population
+    /// of this workflow type **on this shard**. Summed across shards to give
+    /// the AC2 coverage denominator.
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    in_flight_total: i64,
+}
+
+impl HistorySampleCandidate {
+    /// Reuse the whole batch-export pipeline (payload policy, #608 decoding,
+    /// `max_bytes`, failure reporting) rather than forking it.
+    ///
+    /// `last_history_event_at` is only ever a sort/filter key in the batch
+    /// export — it is never carried into the export document — so populating it
+    /// from `started_at` costs nothing and keeps one export path.
+    fn into_export_candidate(self) -> HistoryExportCandidate {
+        HistoryExportCandidate {
+            id: self.id,
+            workflow_name: self.workflow_name,
+            workflow_id: self.workflow_id,
+            shard_id: self.shard_id,
+            state: self.state,
+            last_history_event_at: self.started_at,
+            execution_timeout: self.execution_timeout,
+            deadline_at: self.deadline_at,
+            parent_id: self.parent_id,
+            // Issue #798: the ambient headers the live run saw. Without these a
+            // header-branching workflow replays against an empty map and the
+            // gate reports a divergence the candidate build did not cause.
+            context_headers: self.context_headers,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -4843,6 +4960,15 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         )
         .route("/admin/metrics", get(prometheus_metrics))
         .route("/admin/history/exports", get(export_workflow_histories))
+        // Stratified in-flight sample export for the replay-drift gate
+        // (issue #798). Admin-gated: it returns workflow histories in bulk,
+        // including payloads under `payload_policy=full`. (The older
+        // `/admin/history/exports` sibling predates this posture and is left
+        // as-is; tightening an existing route's auth is out of scope here.)
+        .route(
+            "/admin/history/export-sample",
+            get(export_workflow_history_sample).route_layer(require_admin.clone()),
+        )
         .route("/admin/external-handoffs", get(list_external_handoffs))
         .route(
             "/admin/external-handoffs/{token}",
@@ -5908,6 +6034,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/admin/queues/{queue_name}/resume"),
         ("GET", "/admin/metrics"),
         ("GET", "/admin/history/exports"),
+        ("GET", "/admin/history/export-sample"),
         ("GET", "/admin/external-handoffs"),
         ("GET", "/admin/external-handoffs/{token}"),
         // ── completion triggers (issue #517) ──────────────────────────────────
@@ -7323,6 +7450,20 @@ pub const fn management_api_response_fields()
                 "observed_at",
                 "payload_policy",
                 "filters",
+                "exports",
+                "failures",
+                "shard_coverage",
+            ]),
+        ),
+        (
+            "GET",
+            "/admin/history/export-sample",
+            Some(&[
+                "status",
+                "observed_at",
+                "payload_policy",
+                "filters",
+                "manifest",
                 "exports",
                 "failures",
                 "shard_coverage",
@@ -9540,6 +9681,79 @@ fn parse_history_batch_export_query(
     Ok(query)
 }
 
+/// Parse `GET /admin/history/export-sample` (issue #798).
+///
+/// Every rejection is a `400` with a reason — never a silently-dropped filter
+/// that would produce a smaller-than-requested sample and a falsely-green gate.
+fn parse_history_sample_export_query(
+    pairs: &[(String, String)],
+) -> Result<HistorySampleExportQuery, AutumnError> {
+    use autumn_harvest::replay_sample::{SampleOrder, clamp_per_workflow, normalize_sample_states};
+
+    let mut payload_policy = HistoryPayloadPolicy::Redacted;
+    let mut max_bytes = DEFAULT_HISTORY_EXPORT_MAX_BYTES;
+    let mut workflow_name = None;
+    let mut raw_states: Vec<String> = Vec::new();
+    let mut per_workflow = autumn_harvest::replay_sample::DEFAULT_PER_WORKFLOW_SAMPLE;
+    let mut order = SampleOrder::default();
+    let mut shard_id = None;
+
+    for (key, value) in pairs {
+        match key.as_str() {
+            "payload_policy" | "payload-policy" => {
+                payload_policy = value.parse().map_err(AutumnError::bad_request_msg)?;
+            }
+            "max_bytes" | "max-bytes" => {
+                max_bytes = parse_history_max_bytes(value)?;
+            }
+            "workflow_name" | "workflow-name" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    workflow_name = Some(trimmed.to_string());
+                }
+            }
+            "state" | "states" => {
+                for raw in value.split(',') {
+                    let trimmed = raw.trim();
+                    if !trimmed.is_empty() {
+                        raw_states.push(trimmed.to_string());
+                    }
+                }
+            }
+            "per_workflow" | "per-workflow" => {
+                let parsed = value.parse::<usize>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid per_workflow '{value}'"))
+                })?;
+                per_workflow = clamp_per_workflow(parsed);
+            }
+            "order" => {
+                order = SampleOrder::parse(value).map_err(AutumnError::bad_request_msg)?;
+            }
+            "shard_id" | "shard-id" | "shard" => {
+                shard_id = Some(value.parse::<i32>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid shard_id '{value}'"))
+                })?);
+            }
+            _ => {}
+        }
+    }
+
+    // A terminal or unknown state is rejected here rather than silently
+    // dropped: the gate replays *in-flight* histories, so a request for
+    // `COMPLETED` is a caller error, not an empty result set.
+    let states = normalize_sample_states(&raw_states).map_err(AutumnError::bad_request_msg)?;
+
+    Ok(HistorySampleExportQuery {
+        payload_policy,
+        max_bytes,
+        workflow_name,
+        states,
+        per_workflow,
+        order,
+        shard_id,
+    })
+}
+
 fn parse_history_max_bytes(value: &str) -> Result<usize, AutumnError> {
     let parsed = value
         .parse::<usize>()
@@ -9701,6 +9915,55 @@ async fn export_workflow_histories(
                     TARGET_WORKFLOW,
                     None,
                     "GET /admin/history/exports",
+                    None,
+                    outcome,
+                    None,
+                )
+                .await;
+            }
+            Json(response).into_response()
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+/// `GET /admin/history/export-sample` — stratified in-flight sample export for
+/// the replay-drift gate (issue #798).
+///
+/// Read-only: SELECT-only over `harvest_workflow_executions` / `harvest_events`,
+/// no state transition, no event appended, no task claimed.
+async fn export_workflow_history_sample(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(pairs): Query<Vec<(String, String)>>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> axum::response::Response {
+    let query = match parse_history_sample_export_query(&pairs) {
+        Ok(query) => query,
+        Err(error) => return error.into_response(),
+    };
+    // Read-path payload decoding (issue #608): Full policy only, one audit row
+    // per request — identical treatment to the batch export (AC3).
+    let decoder = if query.payload_policy == HistoryPayloadPolicy::Full {
+        read_path_decoder(&api_state, extension_session(maybe_session)).await
+    } else {
+        None
+    };
+    let mut outcome = LossyDecodeOutcome::default();
+    match load_history_sample_from_shards(&api_state, &query, decoder.as_ref(), &mut outcome).await
+    {
+        Ok(response) => {
+            if decoder.is_some() {
+                // No live connection is held here: the per-shard loads are
+                // scoped inside `load_history_sample_from_shards`, so the
+                // pool-acquiring audit branch is safe (PR #936 review).
+                audit_decoded_read(
+                    &api_state,
+                    None,
+                    &headers,
+                    TARGET_WORKFLOW,
+                    None,
+                    "GET /admin/history/export-sample",
                     None,
                     outcome,
                     None,
@@ -33043,7 +33306,13 @@ fn export_history_for_candidate(
             exported_at: chrono::Utc::now(),
             payload_policy: query.payload_policy,
             max_bytes: Some(query.max_bytes),
-            context_headers: None,
+            // Issue #798: carry the execution's own ambient headers so a
+            // header-branching workflow replays against what the live run saw
+            // instead of an empty map (which would be a FALSE divergence).
+            context_headers: candidate.context_headers.as_ref().and_then(|value| {
+                serde_json::from_value::<std::collections::HashMap<String, String>>(value.clone())
+                    .ok()
+            }),
             // Issue #772: carry the deadline-aware replay metadata (the batch
             // candidate query now SELECTs `execution_timeout`/`deadline_at`) so a
             // batch-exported deadline-aware history round-trips its continue-as-new
@@ -33231,14 +33500,15 @@ SELECT
     COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) AS last_history_event_at,
     w.execution_timeout AS execution_timeout,
     w.deadline_at AS deadline_at,
-    w.parent_id AS parent_id
+    w.parent_id AS parent_id,
+    w.context_headers AS context_headers
 FROM harvest_workflow_executions w
 LEFT JOIN harvest_events e
     ON e.workflow_exec_id = w.id
 WHERE ($1::TEXT IS NULL OR w.workflow_name = $1::TEXT)
   AND (cardinality($2::TEXT[]) = 0 OR w.state = ANY($2::TEXT[]))
 GROUP BY w.id, w.workflow_name, w.workflow_id, w.shard_id, w.state, w.completed_at, w.started_at,
-         w.created_at, w.execution_timeout, w.deadline_at, w.parent_id
+         w.created_at, w.execution_timeout, w.deadline_at, w.parent_id, w.context_headers
 HAVING ($3::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) >= $3::TIMESTAMPTZ)
    AND ($4::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) < $4::TIMESTAMPTZ)
 ORDER BY last_history_event_at DESC, w.id DESC
@@ -33269,6 +33539,433 @@ async fn load_history_export_candidates(
         .load(conn)
         .await
         .map_err(database_error)
+}
+
+// ---------------------------------------------------------------------------
+// Stratified in-flight sample export (issue #798)
+// ---------------------------------------------------------------------------
+
+/// Take at most `$3` in-flight executions **per workflow type**, oldest first,
+/// and report each type's full in-flight population on this shard.
+///
+/// One statement, two window functions:
+/// * `ROW_NUMBER() OVER (PARTITION BY workflow_name …)` performs the
+///   stratification — without it a plain `LIMIT` returns the noisiest workflow
+///   type's rows and nothing else, which is the exact failure this route
+///   exists to prevent.
+/// * `COUNT(*) OVER (PARTITION BY workflow_name)` reports the population the
+///   sample was drawn from. Computing it in the *same* statement is what makes
+///   `sampled <= in_flight_total` true by construction — a second query could
+///   observe a different snapshot and report a sample larger than its own
+///   population (AC2).
+///
+/// Deliberately no `harvest_events` join: the batch export needs one for
+/// `last_history_event_at`, but that column is only ever a sort key there and
+/// is never carried into the export document, so the sample orders by the
+/// indexed `started_at` instead and stays cheap on a large in-flight fleet.
+///
+/// Two clauses in the `WHERE` are load-bearing beyond the caller's filters:
+/// * `w.shard_id = $4::INT4` — two **logical** shards may share one physical
+///   database, so a fan-out that omitted it would run this statement twice over
+///   the same rows: `in_flight_total` would double (corrupting the very
+///   denominator AC2 exists to state honestly) and every execution would be
+///   sampled twice, halving real per-type coverage. Mirrors the same predicate
+///   on `execution::COUNT_WHERE_CLAUSE` and `schedule_run_state_summary`.
+/// * `NOT starts_with(w.workflow_name, '__harvest_canary_probe')` — the built-in
+///   liveness canary (issue #796) is engine-internal and is registered by no
+///   user gate binary, so a sampled probe would land in `blocked` and pin the
+///   gate at exit 2 on every deployment that enables it. `starts_with`, not
+///   `LIKE '…%'`: the prefix is underscore-heavy and `_` is a single-character
+///   `LIKE` wildcard, so a `LIKE` form would over-match real workflow names.
+///   The literal mirrors `canary::CANARY_WORKFLOW_NAME_PREFIX`, kept in sync by
+///   `the_canary_exclusion_literal_matches_the_canary_prefix_constant`.
+const HISTORY_SAMPLE_CANDIDATES_OLDEST_SQL: &str = r"
+WITH ranked AS (
+    SELECT
+        w.id AS id,
+        w.workflow_name AS workflow_name,
+        w.workflow_id AS workflow_id,
+        w.shard_id AS shard_id,
+        w.state AS state,
+        w.started_at AS started_at,
+        w.execution_timeout AS execution_timeout,
+        w.deadline_at AS deadline_at,
+        w.parent_id AS parent_id,
+        w.context_headers AS context_headers,
+        ROW_NUMBER() OVER (
+            PARTITION BY w.workflow_name
+            ORDER BY w.started_at ASC, w.id ASC
+        ) AS rn,
+        COUNT(*) OVER (PARTITION BY w.workflow_name) AS in_flight_total
+    FROM harvest_workflow_executions w
+    WHERE w.shard_id = $4::INT4
+      AND w.state = ANY($1::TEXT[])
+      AND ($2::TEXT IS NULL OR w.workflow_name = $2::TEXT)
+      AND NOT starts_with(w.workflow_name, '__harvest_canary_probe')
+)
+SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
+       execution_timeout, deadline_at, parent_id, context_headers, in_flight_total
+FROM ranked
+WHERE rn <= $3
+ORDER BY workflow_name ASC, rn ASC
+";
+
+/// Newest-first variant of [`HISTORY_SAMPLE_CANDIDATES_OLDEST_SQL`].
+///
+/// A separate constant because `ORDER BY` direction cannot be bound as a
+/// parameter, and interpolating it would be a SQL-injection seam. The two
+/// statements differ **only** in the `ROW_NUMBER()` window's sort direction.
+const HISTORY_SAMPLE_CANDIDATES_NEWEST_SQL: &str = r"
+WITH ranked AS (
+    SELECT
+        w.id AS id,
+        w.workflow_name AS workflow_name,
+        w.workflow_id AS workflow_id,
+        w.shard_id AS shard_id,
+        w.state AS state,
+        w.started_at AS started_at,
+        w.execution_timeout AS execution_timeout,
+        w.deadline_at AS deadline_at,
+        w.parent_id AS parent_id,
+        w.context_headers AS context_headers,
+        ROW_NUMBER() OVER (
+            PARTITION BY w.workflow_name
+            ORDER BY w.started_at DESC, w.id DESC
+        ) AS rn,
+        COUNT(*) OVER (PARTITION BY w.workflow_name) AS in_flight_total
+    FROM harvest_workflow_executions w
+    WHERE w.shard_id = $4::INT4
+      AND w.state = ANY($1::TEXT[])
+      AND ($2::TEXT IS NULL OR w.workflow_name = $2::TEXT)
+      AND NOT starts_with(w.workflow_name, '__harvest_canary_probe')
+)
+SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
+       execution_timeout, deadline_at, parent_id, context_headers, in_flight_total
+FROM ranked
+WHERE rn <= $3
+ORDER BY workflow_name ASC, rn ASC
+";
+
+const fn history_sample_candidates_sql(
+    order: autumn_harvest::replay_sample::SampleOrder,
+) -> &'static str {
+    match order {
+        autumn_harvest::replay_sample::SampleOrder::Oldest => HISTORY_SAMPLE_CANDIDATES_OLDEST_SQL,
+        autumn_harvest::replay_sample::SampleOrder::Newest => HISTORY_SAMPLE_CANDIDATES_NEWEST_SQL,
+    }
+}
+
+/// Load one **logical shard's** sample candidates.
+///
+/// `shard_id` is the logical shard being inspected, not a caller filter — the
+/// caller's `--shard-id` is applied by skipping shards in the fan-out. It is
+/// bound separately because a connection can serve more than one logical shard
+/// (see the predicate's rationale on `HISTORY_SAMPLE_CANDIDATES_OLDEST_SQL`).
+async fn load_history_sample_candidates(
+    conn: &mut AsyncPgConnection,
+    filters: &HistorySampleExportQuery,
+    shard_id: i32,
+) -> HarvestResult<Vec<HistorySampleCandidate>> {
+    let per_workflow = i64::try_from(filters.per_workflow).unwrap_or(i64::MAX);
+    diesel::sql_query(history_sample_candidates_sql(filters.order))
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(filters.states.clone())
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+            filters.workflow_name.clone(),
+        )
+        .bind::<diesel::sql_types::BigInt, _>(per_workflow)
+        .bind::<diesel::sql_types::Integer, _>(shard_id)
+        .load(conn)
+        .await
+        .map_err(database_error)
+}
+
+#[derive(Debug, Default)]
+struct HistorySampleExportWork {
+    /// Reused wholesale so the sample export shares one export pipeline with
+    /// the batch export (payload policy, #608 decoding, `max_bytes`, failures).
+    batch: HistoryBatchExportWork,
+    /// One entry per shard: the in-flight population per workflow type on that
+    /// shard. Summed into the manifest denominator after the fan-out.
+    per_shard_population: Vec<Vec<autumn_harvest::replay_sample::SampleWorkflowCoverage>>,
+    /// Sample rows from every shard, globally re-stratified before export.
+    sample_rows: Vec<HistorySampleCandidate>,
+}
+
+/// Extract the per-workflow-type in-flight population from one shard's rows.
+///
+/// The window `COUNT(*)` is constant within a workflow-name partition, so the
+/// first row per name carries the whole population for that shard — including
+/// the part beyond `per_workflow` that this shard did not return.
+fn shard_population(
+    rows: &[HistorySampleCandidate],
+) -> Vec<autumn_harvest::replay_sample::SampleWorkflowCoverage> {
+    let mut seen: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for row in rows {
+        seen.entry(row.workflow_name.as_str())
+            .or_insert_with(|| u64::try_from(row.in_flight_total).unwrap_or(0));
+    }
+    seen.into_iter()
+        .map(|(workflow_name, in_flight_total)| {
+            autumn_harvest::replay_sample::SampleWorkflowCoverage {
+                workflow_name: workflow_name.to_string(),
+                // Filled in after export from the documents actually
+                // written, so a size-limit failure is never counted as a
+                // sample.
+                sampled: 0,
+                in_flight_total,
+            }
+        })
+        .collect()
+}
+
+/// Re-apply the per-type cap **globally** after the cross-shard union.
+///
+/// Each shard already returned its own top-`per_workflow`, so the union is a
+/// superset of the global top-`per_workflow` (an execution in the global top-N
+/// is necessarily in its own shard's top-N). Re-sorting by the same key and
+/// truncating therefore yields exactly the global stratified sample, and the
+/// per-type cap in AC1 is a fleet-wide cap rather than a per-shard one.
+///
+/// `MAX_SAMPLE_TOTAL` additionally bounds the whole response; the resulting
+/// shortfall is visible in the manifest as `sampled < in_flight_total` (AC2).
+fn stratify_sample_rows(
+    rows: &mut Vec<HistorySampleCandidate>,
+    per_workflow: usize,
+    order: autumn_harvest::replay_sample::SampleOrder,
+) {
+    let newest = order == autumn_harvest::replay_sample::SampleOrder::Newest;
+    rows.sort_by(|left, right| {
+        left.workflow_name.cmp(&right.workflow_name).then_with(|| {
+            let by_time = left
+                .started_at
+                .cmp(&right.started_at)
+                .then_with(|| left.id.cmp(&right.id));
+            if newest { by_time.reverse() } else { by_time }
+        })
+    });
+
+    // Spread the global budget across types instead of letting the
+    // alphabetically-earliest ones drink it dry.
+    //
+    // Rows are sorted by `workflow_name` first, so a naive running `total`
+    // guard hands the whole `MAX_SAMPLE_TOTAL` budget to the types that sort
+    // first and leaves the rest with ZERO fixtures — while the manifest still
+    // reports `complete` (its status is shard-derived, not coverage-derived)
+    // and the gate exits 0. That is a silent false pass: a release certified
+    // against workflow types the gate never looked at. It is the same "noisy
+    // type crowds out the quiet ones" failure the per-type cap exists to
+    // prevent, reintroduced on the alphabetical axis, and it triggers at
+    // `types * per_workflow > MAX_SAMPLE_TOTAL` — i.e. 41 types at the default
+    // `per_workflow = 50`.
+    //
+    // Giving every type an equal floor is a no-op whenever the global budget
+    // does not bind (`MAX_SAMPLE_TOTAL / types >= per_workflow`), so the common
+    // case is unchanged.
+    let type_count = rows
+        .iter()
+        .map(|row| row.workflow_name.as_str())
+        .dedup_count_sorted();
+    let effective_per_workflow = if type_count == 0 {
+        per_workflow
+    } else {
+        per_workflow.min((autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL / type_count).max(1))
+    };
+
+    let mut taken_for_name = 0usize;
+    let mut total = 0usize;
+    let mut current: Option<&str> = None;
+    let mut keep = Vec::with_capacity(rows.len());
+    for row in rows.iter() {
+        if current != Some(row.workflow_name.as_str()) {
+            current = Some(row.workflow_name.as_str());
+            taken_for_name = 0;
+        }
+        keep.push(
+            taken_for_name < effective_per_workflow
+                && total < autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL,
+        );
+        if *keep.last().unwrap_or(&false) {
+            taken_for_name += 1;
+            total += 1;
+        }
+    }
+    let mut iter = keep.into_iter();
+    rows.retain(|_| iter.next().unwrap_or(false));
+}
+
+/// Count distinct adjacent values in an already-sorted iterator.
+///
+/// A tiny local helper so `stratify_sample_rows` can size the per-type budget
+/// without allocating a set over every candidate row.
+trait DedupCountSorted<'a> {
+    fn dedup_count_sorted(self) -> usize;
+}
+
+impl<'a, I: Iterator<Item = &'a str>> DedupCountSorted<'a> for I {
+    fn dedup_count_sorted(self) -> usize {
+        let mut count = 0usize;
+        let mut previous: Option<&'a str> = None;
+        for value in self {
+            if previous != Some(value) {
+                count += 1;
+                previous = Some(value);
+            }
+        }
+        count
+    }
+}
+
+async fn collect_history_sample_candidates_from_shards(
+    pool: &HarvestDbPool,
+    query: &HistorySampleExportQuery,
+    work: &mut HistorySampleExportWork,
+) {
+    for (shard, shard_pool) in pool.iter_shards() {
+        let shard_id = shard.as_i32();
+        if query.shard_id.is_some_and(|target| target != shard_id) {
+            continue;
+        }
+        work.batch.saw_requested_shard = true;
+
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                work.batch.note_unavailable(shard_id, error.to_string());
+                continue;
+            }
+        };
+        work.batch.inspected_shards.push(shard_id);
+
+        let rows = match load_history_sample_candidates(&mut conn, query, shard_id).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                work.batch.note_unavailable(shard_id, error.to_string());
+                continue;
+            }
+        };
+        if !rows.is_empty() {
+            work.batch.matched_shards.push(shard_id);
+        }
+        work.per_shard_population.push(shard_population(&rows));
+        work.sample_rows.extend(rows);
+    }
+}
+
+async fn export_sampled_history_candidates(
+    pool: &HarvestDbPool,
+    query: &HistorySampleExportQuery,
+    work: &mut HistorySampleExportWork,
+    decoder: Option<&PayloadCodecs>,
+    outcome: &mut LossyDecodeOutcome,
+) {
+    stratify_sample_rows(&mut work.sample_rows, query.per_workflow, query.order);
+    let single_query = HistoryExportQuery {
+        payload_policy: query.payload_policy,
+        max_bytes: query.max_bytes,
+    };
+    let rows = std::mem::take(&mut work.sample_rows);
+    for row in rows {
+        let candidate = row.into_export_candidate();
+        export_history_candidate(
+            pool,
+            &candidate,
+            &single_query,
+            &mut work.batch,
+            decoder,
+            outcome,
+        )
+        .await;
+    }
+}
+
+/// Merge the per-shard populations and count what was actually exported.
+///
+/// A workflow type whose entire sample failed the size limit still appears with
+/// `sampled: 0` and its real `in_flight_total`, so an operator can never mistake
+/// "nothing was exported for this type" for "this type has nothing in flight"
+/// (AC2).
+fn build_sample_manifest(
+    query: &HistorySampleExportQuery,
+    work: &HistorySampleExportWork,
+) -> autumn_harvest::replay_sample::SampleManifest {
+    let mut per_workflow =
+        autumn_harvest::replay_sample::merge_coverage(&work.per_shard_population);
+
+    let mut exported: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for document in &work.batch.exports {
+        *exported.entry(document.workflow_name.as_str()).or_insert(0) += 1;
+    }
+    for entry in &mut per_workflow {
+        entry.sampled = exported
+            .get(entry.workflow_name.as_str())
+            .copied()
+            .unwrap_or(0);
+    }
+
+    let sampled_total = per_workflow.iter().map(|entry| entry.sampled).sum();
+    let in_flight_total = per_workflow.iter().map(|entry| entry.in_flight_total).sum();
+
+    autumn_harvest::replay_sample::SampleManifest {
+        generated_at: chrono::Utc::now(),
+        status: autumn_harvest::replay_sample::SampleStatus::from_counts(
+            work.batch.inspected_shards.len(),
+            work.batch.unavailable_shards.len(),
+        ),
+        states: query.states.clone(),
+        per_workflow,
+        sampled_total,
+        in_flight_total,
+        unavailable_shards: work
+            .batch
+            .unavailable_shards
+            .iter()
+            .map(|shard| format!("shard {}: {}", shard.shard_id, shard.reason))
+            .collect(),
+        inspected_shards: work.batch.inspected_shards.clone(),
+    }
+}
+
+async fn load_history_sample_from_shards(
+    api_state: &HarvestApiState,
+    query: &HistorySampleExportQuery,
+    decoder: Option<&PayloadCodecs>,
+    outcome: &mut LossyDecodeOutcome,
+) -> Result<HistorySampleExportResponse, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut work = HistorySampleExportWork::default();
+
+    collect_history_sample_candidates_from_shards(&pool, query, &mut work).await;
+    export_sampled_history_candidates(&pool, query, &mut work, decoder, outcome).await;
+    if let Some(shard_id) = query.shard_id
+        && !work.batch.saw_requested_shard
+    {
+        work.batch
+            .note_unavailable(shard_id, "shard pool is not configured".to_string());
+    }
+    work.batch.normalize_coverage();
+
+    let manifest = build_sample_manifest(query, &work);
+    Ok(HistorySampleExportResponse {
+        status: work.batch.status(),
+        observed_at: chrono::Utc::now(),
+        payload_policy: query.payload_policy,
+        filters: HistorySampleExportFiltersResponse {
+            workflow_name: query.workflow_name.clone(),
+            states: query.states.clone(),
+            per_workflow: query.per_workflow,
+            order: query.order.as_str(),
+            shard_id: query.shard_id,
+            max_bytes: query.max_bytes,
+        },
+        manifest,
+        exports: work.batch.exports,
+        failures: work.batch.failures,
+        shard_coverage: ExternalHandoffShardCoverage {
+            inspected: work.batch.inspected_shards,
+            matched: work.batch.matched_shards,
+            unavailable: work.batch.unavailable_shards,
+        },
+    })
 }
 
 fn sort_history_export_candidates(candidates: &mut [HistoryExportCandidate]) {
@@ -41890,6 +42587,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_id: None,
+            context_headers: None,
         }
     }
 
@@ -41929,6 +42627,529 @@ mod tests {
         assert!(
             !sql.contains("COALESCE(completed_at, started_at, created_at) >="),
             "updated windows must not be based only on workflow row timestamps"
+        );
+    }
+
+    // ── Stratified in-flight sample export (issue #798) ───────────────────────
+
+    fn sample_row(
+        workflow_name: &str,
+        seq: u128,
+        started_at: chrono::DateTime<chrono::Utc>,
+        in_flight_total: i64,
+    ) -> HistorySampleCandidate {
+        HistorySampleCandidate {
+            id: uuid::Uuid::from_u128(seq),
+            workflow_name: workflow_name.to_string(),
+            workflow_id: format!("{workflow_name}-{seq}"),
+            shard_id: 0,
+            state: "RUNNING".to_string(),
+            started_at,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_id: None,
+            context_headers: None,
+            in_flight_total,
+        }
+    }
+
+    fn sample_base() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-05-08T00:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// AC1: the per-type cap is applied **per workflow name**, so a noisy type
+    /// can never crowd a quiet one out of the sample — the exact failure a
+    /// plain global `LIMIT` produces.
+    #[test]
+    fn stratify_sample_rows_caps_each_workflow_type_independently() {
+        let base = sample_base();
+        let mut rows = Vec::new();
+        for index in 0..5u128 {
+            rows.push(sample_row(
+                "noisy",
+                index,
+                base + chrono::Duration::seconds(i64::try_from(index).expect("fits")),
+                5,
+            ));
+        }
+        rows.push(sample_row(
+            "quiet",
+            100,
+            base + chrono::Duration::hours(1),
+            1,
+        ));
+
+        stratify_sample_rows(
+            &mut rows,
+            2,
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+        );
+
+        assert_eq!(rows.len(), 3, "2 noisy + 1 quiet");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.workflow_name == "noisy")
+                .count(),
+            2
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.workflow_name == "quiet")
+                .count(),
+            1,
+            "the quiet type must survive the noisy type's volume"
+        );
+    }
+
+    /// AC1: the cap is re-applied **globally** after the cross-shard union, so
+    /// two shards each returning their own top-N cannot yield 2N.
+    #[test]
+    fn stratify_sample_rows_reapplies_the_cap_across_the_shard_union() {
+        let base = sample_base();
+        let mut rows = vec![
+            // Shard 0's own top-3.
+            sample_row("wf", 1, base, 3),
+            sample_row("wf", 2, base + chrono::Duration::seconds(2), 3),
+            sample_row("wf", 3, base + chrono::Duration::seconds(4), 3),
+            // Shard 1's own top-3, interleaved in time.
+            sample_row("wf", 4, base + chrono::Duration::seconds(1), 3),
+            sample_row("wf", 5, base + chrono::Duration::seconds(3), 3),
+            sample_row("wf", 6, base + chrono::Duration::seconds(5), 3),
+        ];
+
+        stratify_sample_rows(
+            &mut rows,
+            3,
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+        );
+
+        assert_eq!(rows.len(), 3, "the union must be re-truncated to the cap");
+        // Oldest-first across the union, not shard-0-first.
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_u128()).collect::<Vec<_>>(),
+            vec![1, 4, 2]
+        );
+    }
+
+    #[test]
+    fn stratify_sample_rows_honours_newest_order() {
+        let base = sample_base();
+        let mut rows = vec![
+            sample_row("wf", 1, base, 3),
+            sample_row("wf", 2, base + chrono::Duration::seconds(2), 3),
+            sample_row("wf", 3, base + chrono::Duration::seconds(4), 3),
+        ];
+
+        stratify_sample_rows(
+            &mut rows,
+            2,
+            autumn_harvest::replay_sample::SampleOrder::Newest,
+        );
+
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_u128()).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+    }
+
+    /// The global `MAX_SAMPLE_TOTAL` budget must be spread across workflow
+    /// types, not consumed alphabetically by whichever types sort first.
+    ///
+    /// Rows arrive sorted by `workflow_name`, so a naive running `total` guard
+    /// hands the whole budget to the alphabetically-earliest types and leaves the
+    /// rest with **zero** fixtures — while the manifest still reports `complete`
+    /// (its status is shard-derived) and the gate exits `0`. That is a silent
+    /// false pass: a release certified against a fleet the gate never looked at.
+    /// It is the same "noisy type crowds out the quiet ones" failure the
+    /// per-type stratification exists to prevent, on the alphabetical axis.
+    #[test]
+    fn stratify_sample_rows_spreads_the_global_cap_across_every_type() {
+        let base = sample_base();
+        let per_workflow = 50usize;
+        // 60 types x 50 in flight = 3000 candidates against a 2000 budget, so
+        // the global cap genuinely binds.
+        let type_count = 60usize;
+        let mut rows = Vec::new();
+        for type_index in 0..type_count {
+            for row_index in 0..per_workflow {
+                let id = u128::try_from(type_index * 1000 + row_index).expect("fits");
+                rows.push(sample_row(
+                    &format!("wf_type_{type_index:02}"),
+                    id,
+                    base + chrono::Duration::seconds(i64::try_from(row_index).expect("fits")),
+                    i64::try_from(per_workflow).expect("fits"),
+                ));
+            }
+        }
+
+        stratify_sample_rows(
+            &mut rows,
+            per_workflow,
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+        );
+
+        let mut sampled_per_type: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for row in &rows {
+            *sampled_per_type
+                .entry(row.workflow_name.clone())
+                .or_insert(0) += 1;
+        }
+
+        assert!(
+            rows.len() <= autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL,
+            "the global cap must still hold: {} rows",
+            rows.len()
+        );
+        assert_eq!(
+            sampled_per_type.len(),
+            type_count,
+            "every in-flight workflow type must get at least one fixture, or the \
+             gate is blind to it while reporting a clean run: {:?}",
+            sampled_per_type
+                .iter()
+                .filter(|(_, count)| **count == 0)
+                .collect::<Vec<_>>()
+        );
+        let smallest = sampled_per_type.values().copied().min().unwrap_or(0);
+        assert!(
+            smallest > 0,
+            "no type may be starved to zero coverage: {sampled_per_type:?}"
+        );
+    }
+
+    /// When the global cap does **not** bind, per-type sampling is unchanged.
+    #[test]
+    fn stratify_sample_rows_leaves_the_per_type_cap_alone_under_the_global_budget() {
+        let base = sample_base();
+        let mut rows = Vec::new();
+        for type_index in 0..3u128 {
+            for row_index in 0..10u128 {
+                rows.push(sample_row(
+                    &format!("wf_{type_index}"),
+                    type_index * 100 + row_index,
+                    base + chrono::Duration::seconds(i64::try_from(row_index).expect("fits")),
+                    10,
+                ));
+            }
+        }
+
+        stratify_sample_rows(
+            &mut rows,
+            4,
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+        );
+
+        assert_eq!(rows.len(), 12, "3 types x the per-type cap of 4");
+    }
+
+    /// The window `COUNT(*)` is constant within a workflow-name partition, so
+    /// the population is read once per name — including the part beyond the cap
+    /// that the shard did not return (AC2).
+    #[test]
+    fn shard_population_reports_the_full_partition_count_per_type() {
+        let base = sample_base();
+        let rows = vec![
+            sample_row("alpha", 1, base, 40),
+            sample_row("alpha", 2, base + chrono::Duration::seconds(1), 40),
+            sample_row("beta", 3, base, 2),
+        ];
+
+        let population = shard_population(&rows);
+        assert_eq!(population.len(), 2);
+        let alpha = population
+            .iter()
+            .find(|entry| entry.workflow_name == "alpha")
+            .expect("alpha");
+        assert_eq!(alpha.in_flight_total, 40, "not the 2 rows returned");
+        assert_eq!(
+            alpha.sampled, 0,
+            "sampled is filled in from the documents actually exported"
+        );
+        let beta = population
+            .iter()
+            .find(|entry| entry.workflow_name == "beta")
+            .expect("beta");
+        assert_eq!(beta.in_flight_total, 2);
+    }
+
+    #[test]
+    fn shard_population_of_no_rows_is_empty() {
+        assert!(shard_population(&[]).is_empty());
+    }
+
+    /// Two logical shards may share one physical database — a supported
+    /// topology this repo scopes for everywhere else (`COUNT_WHERE_CLAUSE`,
+    /// `schedule_run_state_summary`, `non_terminal_counts_by_workflow_name` all
+    /// carry `WHERE shard_id = $N`).
+    ///
+    /// Without the predicate the cross-shard fan-out runs the same statement
+    /// twice against the same rows, which corrupts the manifest in both
+    /// directions at once: `in_flight_total` is doubled (the denominator AC2
+    /// exists to state honestly becomes a lie), and every execution is sampled
+    /// twice, halving real per-type coverage while the count looks unchanged.
+    #[test]
+    fn history_sample_sql_scopes_to_one_logical_shard() {
+        for order in [
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+            autumn_harvest::replay_sample::SampleOrder::Newest,
+        ] {
+            let sql = history_sample_candidates_sql(order);
+            assert!(
+                sql.contains("w.shard_id = $4::INT4"),
+                "a shard-scoped fan-out must filter by shard, or two logical \
+                 shards sharing a database double-count: {sql}"
+            );
+        }
+    }
+
+    /// The built-in liveness canary (issue #796) is engine-internal: no user
+    /// gate binary registers `__harvest_canary_probe*`, so sampling one would
+    /// land it in `blocked` and pin the gate at exit 2 forever on any
+    /// deployment with the canary enabled.
+    ///
+    /// `starts_with`, not `LIKE '…%'` — the prefix is underscore-heavy and `_`
+    /// is a single-character wildcard in `LIKE`, so a `LIKE` form over-matches
+    /// real workflow names. Mirrors `execution::COUNT_WHERE_CLAUSE`.
+    #[test]
+    fn history_sample_sql_excludes_the_liveness_canary() {
+        for order in [
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+            autumn_harvest::replay_sample::SampleOrder::Newest,
+        ] {
+            let sql = history_sample_candidates_sql(order);
+            assert!(
+                sql.contains("NOT starts_with(w.workflow_name, '__harvest_canary_probe')"),
+                "engine-internal canary probes must never enter a user gate \
+                 bundle: {sql}"
+            );
+            assert!(
+                !sql.contains("LIKE '__harvest_canary_probe"),
+                "LIKE would over-match: `_` is a wildcard: {sql}"
+            );
+        }
+    }
+
+    /// The literal above must track the constant it mirrors, or the exclusion
+    /// silently stops matching when the prefix changes.
+    #[test]
+    fn the_canary_exclusion_literal_matches_the_canary_prefix_constant() {
+        assert_eq!(
+            autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX,
+            "__harvest_canary_probe",
+            "update the SQL literal in both HISTORY_SAMPLE_CANDIDATES_*_SQL"
+        );
+    }
+
+    fn sample_query() -> HistorySampleExportQuery {
+        HistorySampleExportQuery {
+            payload_policy: HistoryPayloadPolicy::Full,
+            max_bytes: 1_000_000,
+            workflow_name: None,
+            states: vec!["RUNNING".to_string()],
+            per_workflow: 50,
+            order: autumn_harvest::replay_sample::SampleOrder::Oldest,
+            shard_id: None,
+        }
+    }
+
+    /// AC2, the load-bearing half: a workflow type whose **entire** sample
+    /// failed to export (every candidate blew the per-execution size ceiling)
+    /// must still appear in the manifest with `sampled: 0` and its **real**
+    /// `in_flight_total`.
+    ///
+    /// The failure mode this pins is the worst one a coverage record can have.
+    /// If such a type were dropped from `per_workflow` instead, the manifest
+    /// would read as though the type has nothing in flight — an operator would
+    /// see a clean gate and no row, and conclude the type was covered. Stating
+    /// `sampled: 0, in_flight_total: 40` is the honest answer: "there are forty
+    /// of these running and this gate verified none of them."
+    #[test]
+    fn a_type_whose_whole_sample_failed_to_export_still_reports_its_population() {
+        let base = sample_base();
+        // Both types are in flight and were sampled, but the export step
+        // produced nothing at all (e.g. every candidate exceeded `max_bytes`).
+        // `exports` stays empty; `failures` is what the route reports separately.
+        let work = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[
+                sample_row("exported_fine", 1, base, 3),
+                sample_row("all_exports_failed", 2, base, 40),
+            ])],
+            ..Default::default()
+        };
+        assert!(work.batch.exports.is_empty());
+
+        let manifest = build_sample_manifest(&sample_query(), &work);
+
+        let failed = manifest
+            .per_workflow
+            .iter()
+            .find(|entry| entry.workflow_name == "all_exports_failed")
+            .expect(
+                "a type whose exports all failed must NOT be dropped from the \
+                 manifest — a missing row reads as 'nothing in flight'",
+            );
+        assert_eq!(failed.sampled, 0);
+        assert_eq!(
+            failed.in_flight_total, 40,
+            "the population is the truth even when the sample is empty"
+        );
+
+        assert_eq!(manifest.sampled_total, 0);
+        assert_eq!(
+            manifest.in_flight_total, 43,
+            "the denominator sums every type's real population"
+        );
+        assert!(
+            manifest.is_truncated(),
+            "0 sampled of 43 in flight is the definition of truncated"
+        );
+    }
+
+    /// The complement: `sampled` counts the documents actually exported, per
+    /// type, not the rows the query returned. Without this, a partial export
+    /// failure would inflate `sampled` and the manifest would overstate the
+    /// gate's coverage.
+    #[test]
+    fn sampled_counts_exported_documents_per_type_not_candidate_rows() {
+        let base = sample_base();
+        let work = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[
+                sample_row("alpha", 1, base, 9),
+                sample_row("beta", 2, base, 4),
+            ])],
+            batch: HistoryBatchExportWork {
+                exports: vec![
+                    sample_export_document("alpha", 1),
+                    sample_export_document("alpha", 2),
+                    sample_export_document("beta", 3),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let manifest = build_sample_manifest(&sample_query(), &work);
+        let by_name: std::collections::BTreeMap<&str, &_> = manifest
+            .per_workflow
+            .iter()
+            .map(|entry| (entry.workflow_name.as_str(), entry))
+            .collect();
+
+        assert_eq!(by_name["alpha"].sampled, 2);
+        assert_eq!(by_name["alpha"].in_flight_total, 9);
+        assert_eq!(by_name["beta"].sampled, 1);
+        assert_eq!(by_name["beta"].in_flight_total, 4);
+        assert_eq!(manifest.sampled_total, 3);
+        assert_eq!(manifest.in_flight_total, 13);
+    }
+
+    fn sample_export_document(workflow_name: &str, seq: u128) -> HistoryExportDocument {
+        HistoryExportDocument {
+            schema: "harvest.history.export".to_string(),
+            version: 1,
+            workflow_name: workflow_name.to_string(),
+            workflow_id: None,
+            execution_id: autumn_harvest::ExecutionId::from_uuid(uuid::Uuid::from_u128(seq)),
+            shard_id: 0,
+            exported_at: sample_base(),
+            event_count: 0,
+            status: autumn_harvest::history_export::HistoryExportStatus {
+                state: "RUNNING".to_string(),
+                terminal: false,
+            },
+            payload_policy: HistoryPayloadPolicy::Full,
+            size_limit: autumn_harvest::history_export::HistoryExportSizeLimit {
+                max_bytes: 1_000_000,
+                actual_bytes: 128,
+                truncated: false,
+                truncation_behavior: "reject".to_string(),
+            },
+            events: Vec::new(),
+            context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+        }
+    }
+
+    /// The stratification window is what makes the sample per-type; a plain
+    /// `LIMIT` would silently regress it to a global top-N.
+    #[test]
+    fn history_sample_sql_stratifies_and_counts_the_population() {
+        for order in [
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+            autumn_harvest::replay_sample::SampleOrder::Newest,
+        ] {
+            let sql = history_sample_candidates_sql(order);
+            assert!(
+                sql.contains("ROW_NUMBER() OVER (\n            PARTITION BY w.workflow_name"),
+                "the sample must be stratified per workflow type"
+            );
+            assert!(
+                sql.contains("COUNT(*) OVER (PARTITION BY w.workflow_name) AS in_flight_total"),
+                "the population must be computed in the same statement as the sample"
+            );
+            assert!(
+                sql.contains("w.state = ANY($1::TEXT[])"),
+                "states must be bound, never interpolated"
+            );
+            assert!(
+                !sql.contains("harvest_events"),
+                "the sample must not join the event log"
+            );
+        }
+        assert!(
+            history_sample_candidates_sql(autumn_harvest::replay_sample::SampleOrder::Oldest)
+                .contains("ORDER BY w.started_at ASC")
+        );
+        assert!(
+            history_sample_candidates_sql(autumn_harvest::replay_sample::SampleOrder::Newest)
+                .contains("ORDER BY w.started_at DESC")
+        );
+    }
+
+    #[test]
+    fn history_sample_query_defaults_to_the_in_flight_states() {
+        let query = parse_history_sample_export_query(&[]).expect("defaults parse");
+        assert_eq!(
+            query.states,
+            vec!["PAUSED".to_string(), "RUNNING".to_string()]
+        );
+        assert_eq!(
+            query.per_workflow,
+            autumn_harvest::replay_sample::DEFAULT_PER_WORKFLOW_SAMPLE
+        );
+        assert_eq!(query.payload_policy, HistoryPayloadPolicy::Redacted);
+        assert_eq!(
+            query.order,
+            autumn_harvest::replay_sample::SampleOrder::Oldest
+        );
+    }
+
+    #[test]
+    fn history_sample_query_rejects_terminal_and_unknown_states() {
+        for bad in ["COMPLETED", "FAILED", "NOT_A_STATE"] {
+            assert!(
+                parse_history_sample_export_query(&[("states".to_string(), bad.to_string())])
+                    .is_err(),
+                "'{bad}' must be rejected, never silently dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn history_sample_query_clamps_per_workflow() {
+        let query = parse_history_sample_export_query(&[(
+            "per_workflow".to_string(),
+            "1000000".to_string(),
+        )])
+        .expect("clamped, not rejected");
+        assert_eq!(
+            query.per_workflow,
+            autumn_harvest::replay_sample::MAX_PER_WORKFLOW_SAMPLE
         );
     }
 

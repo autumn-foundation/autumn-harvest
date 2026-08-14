@@ -958,6 +958,61 @@ enum HistoryCommand {
         #[arg(long, value_name = "PATH")]
         output_file: Option<PathBuf>,
     },
+    /// Export a stratified sample of IN-FLIGHT histories as a replay bundle.
+    ///
+    /// Takes at most `--per-workflow` non-terminal executions per registered
+    /// workflow type across every shard and writes one JSON fixture per
+    /// execution into `--output-dir`, alongside a
+    /// `harvest-sample-manifest.json` reporting how many were sampled versus
+    /// how many are actually in flight. Feed the directory to
+    /// `WorkflowReplayer::replay_bundle` in CI to block promotion of a build
+    /// that would diverge on in-flight work (issue #798).
+    ExportSample {
+        /// Directory to write the replay bundle into. Created if absent.
+        #[arg(long, value_name = "DIR")]
+        output_dir: PathBuf,
+        /// Maximum executions to sample per workflow type (clamped to 500).
+        #[arg(long, default_value_t = autumn_harvest::replay_sample::DEFAULT_PER_WORKFLOW_SAMPLE)]
+        per_workflow: usize,
+        /// Non-terminal states to sample. Repeatable or comma-separated.
+        /// Defaults to RUNNING,PAUSED. A terminal state is rejected.
+        #[arg(long, value_name = "STATE")]
+        states: Vec<String>,
+        /// Restrict the sample to a single registered workflow type.
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Which end of each type's in-flight population to sample.
+        #[arg(long, value_enum, default_value = "oldest")]
+        order: HistorySampleOrder,
+        /// Restrict inspection to one shard.
+        #[arg(long)]
+        shard_id: Option<i32>,
+        /// Payload policy. `full` emits sensitive replay fixtures; `redacted` is safer for sharing.
+        #[arg(long, value_enum, default_value = "redacted")]
+        payload_policy: HistoryExportPayloadPolicy,
+        /// Maximum serialized size per exported history in bytes.
+        #[arg(long)]
+        max_bytes: Option<usize>,
+    },
+}
+
+/// Which end of each workflow type's in-flight population to sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum HistorySampleOrder {
+    /// The longest-running in-flight executions — the ones most likely to span
+    /// a code change, and therefore the highest-signal drift sample.
+    Oldest,
+    /// The most recently started in-flight executions.
+    Newest,
+}
+
+impl HistorySampleOrder {
+    const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Oldest => "oldest",
+            Self::Newest => "newest",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -2652,7 +2707,18 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     if let Some(notice) = fanout_partial_notice(&response) {
         eprintln!("{notice}");
     }
-    if let Some(path) = history_output_file(&cli) {
+    if let Some(dir) = history_sample_output_dir(&cli) {
+        // Issue #798: the sample export writes a replay BUNDLE (one fixture per
+        // sampled execution plus the coverage manifest), not a single blob, so
+        // the directory can be fed straight to `WorkflowReplayer::replay_bundle`.
+        // `-o json` still prints the raw response for scripting.
+        let summary = write_history_sample_bundle(&response, dir)?;
+        if cli.output == OutputFormat::Json {
+            println!("{rendered}");
+        } else {
+            print!("{summary}");
+        }
+    } else if let Some(path) = history_output_file(&cli) {
         fs::write(path, &rendered).map_err(|source| CliError::WriteOutput {
             path: path.display().to_string(),
             source,
@@ -2719,6 +2785,296 @@ fn history_output_file(cli: &Cli) -> Option<&Path> {
         } => output_file.as_deref(),
         _ => None,
     }
+}
+
+// ── replay-drift sample bundle (issue #798) ─────────────────────────────────
+
+fn history_sample_output_dir(cli: &Cli) -> Option<&Path> {
+    match &cli.command {
+        Commands::History {
+            command: HistoryCommand::ExportSample { output_dir, .. },
+        } => Some(output_dir.as_path()),
+        _ => None,
+    }
+}
+
+/// One file to write into the replay bundle.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BundleFile {
+    /// File name, relative to the bundle directory.
+    pub name: String,
+    /// Serialized JSON contents.
+    pub contents: String,
+}
+
+/// Split a sample-export response into the files that make up a replay bundle.
+///
+/// Pure: no filesystem access, so the naming, manifest placement, and
+/// collision handling are unit-testable without a temp directory.
+///
+/// The manifest is written under the reserved
+/// [`SampleManifest::FILE_NAME`](autumn_harvest::replay_sample::SampleManifest::FILE_NAME)
+/// so `replay_bundle` reads it as coverage instead of trying to replay it as a
+/// fixture.
+///
+/// # Errors
+/// Returns [`CliError::InvalidInput`] when the response is not a sample-export
+/// body (missing `exports` array or `manifest` object) — better than writing a
+/// silently-empty bundle that a CI gate would then pass or fail for the wrong
+/// reason.
+pub fn history_sample_bundle_files(response: &Value) -> Result<Vec<BundleFile>, CliError> {
+    let exports = response
+        .get("exports")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliError::InvalidInput(
+                "sample export response is missing an `exports` array".to_string(),
+            )
+        })?;
+    let manifest = response.get("manifest").filter(|value| value.is_object());
+    let Some(manifest) = manifest else {
+        return Err(CliError::InvalidInput(
+            "sample export response is missing a `manifest` object".to_string(),
+        ));
+    };
+
+    let mut files = Vec::with_capacity(exports.len() + 1);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (index, export) in exports.iter().enumerate() {
+        let workflow_name = export
+            .get("workflow_name")
+            .and_then(Value::as_str)
+            .unwrap_or("workflow");
+        let execution_id = export
+            .get("execution_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let mut name =
+            autumn_harvest::replay_sample::fixture_file_name(workflow_name, execution_id);
+        // Sanitization can, in principle, map two distinct names onto one file.
+        // Overwriting would silently shrink the bundle and make the gate verify
+        // fewer fixtures than the manifest claims, so disambiguate instead.
+        if !seen.insert(name.clone()) {
+            name = format!("{index}-{name}");
+            seen.insert(name.clone());
+        }
+        files.push(BundleFile {
+            name,
+            contents: serde_json::to_string_pretty(export).map_err(|error| {
+                CliError::InvalidInput(format!("failed to serialize sample fixture: {error}"))
+            })?,
+        });
+    }
+
+    files.push(BundleFile {
+        name: autumn_harvest::replay_sample::SampleManifest::FILE_NAME.to_string(),
+        contents: serde_json::to_string_pretty(manifest).map_err(|error| {
+            CliError::InvalidInput(format!("failed to serialize sample manifest: {error}"))
+        })?,
+    });
+    Ok(files)
+}
+
+/// Render the operator-facing coverage table for a sample export.
+///
+/// Pure and separate from the write so the "how much of the fleet did this
+/// verify?" answer (AC2) is testable without touching disk.
+#[must_use]
+pub fn render_history_sample_summary(response: &Value, dir: &Path) -> String {
+    let manifest = response.get("manifest");
+    let status = manifest
+        .and_then(|manifest| manifest.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let sampled_total = manifest
+        .and_then(|manifest| manifest.get("sampled_total"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let in_flight_total = manifest
+        .and_then(|manifest| manifest.get("in_flight_total"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "wrote {sampled_total} fixture(s) to {} (coverage: {status})",
+        dir.display()
+    );
+    let _ = writeln!(
+        out,
+        "sampled {sampled_total} of {in_flight_total} in-flight execution(s)"
+    );
+
+    if let Some(rows) = manifest
+        .and_then(|manifest| manifest.get("per_workflow"))
+        .and_then(Value::as_array)
+        && !rows.is_empty()
+    {
+        out.push_str("\nWORKFLOW                                 SAMPLED  IN FLIGHT  TRUNCATED\n");
+        for row in rows {
+            let name = row
+                .get("workflow_name")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let sampled = row.get("sampled").and_then(Value::as_u64).unwrap_or(0);
+            let total = row
+                .get("in_flight_total")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let truncated = if sampled < total { "yes" } else { "no" };
+            let _ = writeln!(out, "{name:<40} {sampled:>7}  {total:>9}  {truncated}");
+        }
+    }
+
+    // A partial sample is a lower bound: an operator must not read a green gate
+    // over it as "the whole fleet replays clean".
+    if status != "complete" {
+        out.push_str("\nWARNING: shard coverage is ");
+        out.push_str(status);
+        out.push_str("; this bundle is a LOWER BOUND on the in-flight fleet.\n");
+        if let Some(unavailable) = manifest
+            .and_then(|manifest| manifest.get("unavailable_shards"))
+            .and_then(Value::as_array)
+        {
+            for shard in unavailable {
+                if let Some(reason) = shard.as_str() {
+                    let _ = writeln!(out, "  unavailable: {reason}");
+                }
+            }
+        }
+    }
+    if sampled_total < in_flight_total {
+        out.push_str(
+            "NOTE: the sample is truncated; a clean gate verifies the SAMPLE, not the fleet.\n",
+        );
+    }
+
+    // A redacted bundle is refused by the replay gate (it rewrites the very
+    // activity inputs replay compares against, so every fixture would report a
+    // false divergence). The CLI default is `redacted`, so an operator who omits
+    // the flag writes an unusable bundle. Say so here, at write time, rather than
+    // letting them discover it as an exit-2 wall of BLOCKED lines later.
+    if bundle_is_redacted(response) {
+        out.push_str(
+            "\nWARNING: this bundle was exported with --payload-policy redacted, which the \
+             replay-drift gate REFUSES (redaction rewrites the activity inputs replay compares \
+             against). Re-export with `--payload-policy full`, and treat the result as \
+             production data.\n",
+        );
+    }
+    out
+}
+
+/// Whether `response` declares a redacted payload policy.
+///
+/// Reads the response's own top-level `payload_policy`, which the sample-export
+/// route echoes back from the request. That is authoritative and present even
+/// when `exports` is empty, so it beats sniffing the individual fixtures.
+///
+/// Absent or unrecognized reads as *not* redacted: a legacy response, or a
+/// future policy value, must never produce a spurious warning about a bundle the
+/// gate would happily replay.
+fn bundle_is_redacted(response: &Value) -> bool {
+    response.get("payload_policy").and_then(Value::as_str) == Some("redacted")
+}
+
+/// Write a replay bundle to `dir`, returning the operator summary.
+///
+/// # Errors
+/// Returns [`CliError::WriteOutput`] when the directory or a fixture cannot be
+/// written, or [`CliError::InvalidInput`] when the response is not a
+/// sample-export body.
+fn write_history_sample_bundle(response: &Value, dir: &Path) -> Result<String, CliError> {
+    let files = history_sample_bundle_files(response)?;
+    fs::create_dir_all(dir).map_err(|source| CliError::WriteOutput {
+        path: dir.display().to_string(),
+        source,
+    })?;
+    clear_stale_bundle(dir)?;
+    for file in &files {
+        let path = dir.join(&file.name);
+        fs::write(&path, &file.contents).map_err(|source| CliError::WriteOutput {
+            path: path.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(render_history_sample_summary(response, dir))
+}
+
+/// Remove a previous bundle's fixtures from `dir` so a re-export replaces it.
+///
+/// A fixture's file name embeds its execution id, so re-exporting does not
+/// overwrite the previous run's fixtures — it accumulates on top of them. The
+/// manifest has a fixed name and *is* overwritten, so the two end up describing
+/// different things: the manifest counts this run's sample while the directory
+/// holds every run's, and `replay_bundle` walks every `*.json` it finds. The
+/// gate would then verify executions that finished hours ago and report coverage
+/// numbers that never described them.
+///
+/// Scoped narrowly, because this deletes files in a path the caller chose:
+/// * The manifest must be present — that is the marker identifying a directory
+///   this CLI wrote. A directory holding `*.json` with no manifest is somebody
+///   else's and is **refused**, not cleaned; `--output-dir .` must never eat a
+///   user's files because they mistyped a path.
+/// * Only top-level `*.json` entries are removed. Subdirectories and every
+///   non-`.json` file are left alone.
+///
+/// # Errors
+/// [`CliError::InvalidInput`] when `dir` holds JSON that is not a Harvest
+/// bundle; [`CliError::WriteOutput`] when an entry cannot be read or removed.
+fn clear_stale_bundle(dir: &Path) -> Result<(), CliError> {
+    let manifest_name = autumn_harvest::replay_sample::SampleManifest::FILE_NAME;
+    let mut json_entries = Vec::new();
+    let mut has_manifest = false;
+
+    let entries = fs::read_dir(dir).map_err(|source| CliError::WriteOutput {
+        path: dir.display().to_string(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| CliError::WriteOutput {
+            path: dir.display().to_string(),
+            source,
+        })?;
+        // `file_type` does not follow symlinks, so a symlinked directory is not
+        // mistaken for a file (and is left alone either way).
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_name().to_string_lossy() == manifest_name {
+            has_manifest = true;
+        } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("json") {
+            // Exactly the predicate `ReplayVerifier`'s bundle walk uses
+            // (`testing::collect_fixture_files`). If the two disagreed — say one
+            // accepted `.JSON` and the other did not — a stale fixture could
+            // survive the clean and still be replayed by the gate, which is the
+            // whole failure this function exists to prevent.
+            json_entries.push(path);
+        }
+    }
+
+    if json_entries.is_empty() {
+        return Ok(());
+    }
+    if !has_manifest {
+        return Err(CliError::InvalidInput(format!(
+            "{} already contains {} .json file(s) but no {manifest_name}, so it is \
+             not a bundle written by this command. Refusing to overwrite it — \
+             point --output-dir at an empty or previously-exported directory.",
+            dir.display(),
+            json_entries.len(),
+        )));
+    }
+
+    for path in json_entries {
+        fs::remove_file(&path).map_err(|source| CliError::WriteOutput {
+            path: path.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(())
 }
 
 // ── det-check (issue #778) ──────────────────────────────────────────────────
@@ -6627,6 +6983,52 @@ fn history_request(command: &HistoryCommand) -> ApiRequest {
 
             ApiRequest::get(format!(
                 "/admin/history/exports?{}",
+                encode_query_params(&params)
+            ))
+        }
+        HistoryCommand::ExportSample {
+            output_dir: _,
+            per_workflow,
+            states,
+            workflow_name,
+            order,
+            shard_id,
+            payload_policy,
+            max_bytes,
+        } => {
+            let mut params: Vec<(&'static str, String)> = Vec::new();
+            if let Some(value) = workflow_name {
+                params.push(("workflow_name", value.clone()));
+            }
+            // Repeatable AND comma-separated: `--states RUNNING --states PAUSED`
+            // and `--states RUNNING,PAUSED` must mean the same thing, so a CI
+            // recipe copied from either idiom samples the same population.
+            let joined = states
+                .iter()
+                .flat_map(|value| value.split(','))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            if !joined.is_empty() {
+                params.push(("states", joined));
+            }
+            // Always sent: the effective per-type cap and payload policy are the
+            // two knobs that decide what the gate actually verified, so they are
+            // explicit on the wire rather than left to a server-side default the
+            // operator cannot see in the request log.
+            params.push(("per_workflow", per_workflow.to_string()));
+            params.push(("order", order.as_wire().to_string()));
+            if let Some(value) = shard_id {
+                params.push(("shard_id", value.to_string()));
+            }
+            params.push(("payload_policy", payload_policy.as_wire().to_string()));
+            if let Some(value) = max_bytes {
+                params.push(("max_bytes", value.to_string()));
+            }
+
+            ApiRequest::get(format!(
+                "/admin/history/export-sample?{}",
                 encode_query_params(&params)
             ))
         }
@@ -11837,5 +12239,285 @@ mod shard_placement_tests {
             Some(&serde_json::json!("order-42"))
         );
         assert_eq!(body.get("residency_key"), Some(&serde_json::json!("eu")));
+    }
+}
+
+#[cfg(test)]
+mod replay_sample_bundle_tests {
+    //! Bundle-writer tests for `harvest history export-sample` (issue #798).
+    //!
+    //! The split into `history_sample_bundle_files` (which files, named how) and
+    //! `render_history_sample_summary` (the coverage table) keeps both pure, so
+    //! the two things a CI operator depends on — that every sampled fixture is
+    //! written under a name `replay_bundle` will read, and that truncation is
+    //! stated out loud — are testable without touching a filesystem.
+    use super::*;
+    use serde_json::json;
+
+    fn sample_response() -> Value {
+        json!({
+            "status": "complete",
+            "payload_policy": "redacted",
+            "manifest": {
+                "generated_at": "2026-01-01T00:00:00Z",
+                "status": "complete",
+                "states": ["PAUSED", "RUNNING"],
+                "per_workflow": [
+                    { "workflow_name": "noisy", "sampled": 3, "in_flight_total": 700 },
+                    { "workflow_name": "quiet", "sampled": 2, "in_flight_total": 2 }
+                ],
+                "sampled_total": 5,
+                "in_flight_total": 702,
+                "unavailable_shards": [],
+                "inspected_shards": [0]
+            },
+            "exports": [
+                { "workflow_name": "noisy", "execution_id": "11111111-1111-4111-8111-111111111111", "events": [] },
+                { "workflow_name": "quiet", "execution_id": "22222222-2222-4222-8222-222222222222", "events": [] }
+            ],
+            "failures": []
+        })
+    }
+
+    #[test]
+    fn bundle_writes_one_fixture_per_export_plus_the_manifest() {
+        let files = history_sample_bundle_files(&sample_response()).expect("bundle files");
+        assert_eq!(files.len(), 3, "2 fixtures + 1 manifest");
+
+        let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
+        assert!(names.contains(&"noisy--11111111-1111-4111-8111-111111111111.json"));
+        assert!(names.contains(&"quiet--22222222-2222-4222-8222-222222222222.json"));
+        assert!(
+            names.contains(&autumn_harvest::replay_sample::SampleManifest::FILE_NAME),
+            "the manifest must use the reserved name so replay_bundle reads it as \
+             coverage rather than replaying it as a fixture: {names:?}"
+        );
+    }
+
+    /// Every written fixture must be exactly what the replay harness reads, or
+    /// the gate blocks on a harness error instead of verifying anything.
+    #[test]
+    fn each_fixture_deserializes_as_a_replay_snapshot_shape() {
+        let files = history_sample_bundle_files(&sample_response()).expect("bundle files");
+        for file in files
+            .iter()
+            .filter(|file| file.name != autumn_harvest::replay_sample::SampleManifest::FILE_NAME)
+        {
+            let parsed: Value = serde_json::from_str(&file.contents).expect("valid JSON");
+            assert!(parsed.get("workflow_name").is_some(), "{}", file.name);
+            assert!(parsed.get("events").is_some(), "{}", file.name);
+        }
+    }
+
+    #[test]
+    fn manifest_round_trips_into_the_core_type() {
+        let files = history_sample_bundle_files(&sample_response()).expect("bundle files");
+        let manifest = files
+            .iter()
+            .find(|file| file.name == autumn_harvest::replay_sample::SampleManifest::FILE_NAME)
+            .expect("manifest present");
+        let parsed: autumn_harvest::replay_sample::SampleManifest =
+            serde_json::from_str(&manifest.contents)
+                .expect("the written manifest must deserialize as the core SampleManifest");
+        assert_eq!(parsed.sampled_total, 5);
+        assert_eq!(parsed.in_flight_total, 702);
+        assert!(parsed.is_truncated());
+    }
+
+    /// Two workflow names that sanitize to the same file name must not silently
+    /// overwrite each other — that would make the bundle smaller than the
+    /// manifest claims, so the gate would verify fewer fixtures than reported.
+    #[test]
+    fn colliding_fixture_names_are_disambiguated_never_overwritten() {
+        let response = json!({
+            "manifest": { "status": "complete", "sampled_total": 2, "in_flight_total": 2,
+                          "per_workflow": [], "states": [], "unavailable_shards": [],
+                          "inspected_shards": [0], "generated_at": "2026-01-01T00:00:00Z" },
+            "exports": [
+                { "workflow_name": "a/b", "execution_id": "same-id", "events": [] },
+                { "workflow_name": "a:b", "execution_id": "same-id", "events": [] }
+            ]
+        });
+        let files = history_sample_bundle_files(&response).expect("bundle files");
+        let fixture_names: Vec<&str> = files
+            .iter()
+            .map(|file| file.name.as_str())
+            .filter(|name| *name != autumn_harvest::replay_sample::SampleManifest::FILE_NAME)
+            .collect();
+        assert_eq!(fixture_names.len(), 2);
+        assert_ne!(
+            fixture_names[0], fixture_names[1],
+            "a sanitization collision must be disambiguated: {fixture_names:?}"
+        );
+    }
+
+    /// A non-sample body must fail loudly rather than write an empty bundle a
+    /// gate would then evaluate for the wrong reason.
+    #[test]
+    fn a_non_sample_response_is_rejected_not_written_as_an_empty_bundle() {
+        assert!(history_sample_bundle_files(&json!({ "error": "nope" })).is_err());
+        assert!(history_sample_bundle_files(&json!({ "exports": [] })).is_err());
+        assert!(
+            history_sample_bundle_files(&json!({ "manifest": { "status": "complete" } })).is_err()
+        );
+    }
+
+    #[test]
+    fn summary_reports_per_type_coverage_and_names_truncation() {
+        let summary = render_history_sample_summary(&sample_response(), Path::new("/tmp/fixtures"));
+        assert!(summary.contains("/tmp/fixtures"), "{summary}");
+        assert!(summary.contains("sampled 5 of 702"), "{summary}");
+        assert!(summary.contains("noisy"), "{summary}");
+        assert!(summary.contains("700"), "{summary}");
+        assert!(
+            summary.contains("NOTE: the sample is truncated"),
+            "AC2: truncation must be stated, never implied: {summary}"
+        );
+    }
+
+    /// A partial shard read makes the bundle a LOWER BOUND. A green gate over
+    /// it must not read as "the fleet replays clean", so the warning is loud.
+    #[test]
+    fn summary_warns_loudly_on_partial_shard_coverage() {
+        let mut response = sample_response();
+        response["manifest"]["status"] = json!("partial");
+        response["manifest"]["unavailable_shards"] = json!(["shard 1: connection refused"]);
+
+        let summary = render_history_sample_summary(&response, Path::new("./fixtures"));
+        assert!(summary.contains("WARNING"), "{summary}");
+        assert!(summary.contains("LOWER BOUND"), "{summary}");
+        assert!(summary.contains("shard 1: connection refused"), "{summary}");
+    }
+
+    #[test]
+    fn summary_of_a_complete_untruncated_sample_carries_no_warning() {
+        let response = json!({
+            "manifest": { "status": "complete", "sampled_total": 4, "in_flight_total": 4,
+                          "per_workflow": [{ "workflow_name": "wf", "sampled": 4, "in_flight_total": 4 }],
+                          "states": ["RUNNING"], "unavailable_shards": [], "inspected_shards": [0],
+                          "generated_at": "2026-01-01T00:00:00Z" },
+            "exports": []
+        });
+        let summary = render_history_sample_summary(&response, Path::new("./fixtures"));
+        assert!(!summary.contains("WARNING"), "{summary}");
+        assert!(!summary.contains("NOTE:"), "{summary}");
+    }
+
+    /// The CLI default is `redacted`, and the replay gate REFUSES a redacted
+    /// bundle. An operator who omits `--payload-policy full` must find that out
+    /// here — at the moment they write the bundle — not later, as an exit-2 wall
+    /// of BLOCKED lines against a bundle they can no longer re-export (the fleet
+    /// has moved on).
+    #[test]
+    fn summary_warns_that_a_redacted_bundle_is_refused_by_the_gate() {
+        let summary = render_history_sample_summary(&sample_response(), Path::new("./fixtures"));
+        assert!(summary.contains("WARNING"), "{summary}");
+        assert!(summary.contains("redacted"), "{summary}");
+        assert!(
+            summary.contains("--payload-policy full"),
+            "the warning must name the fix, not just the problem: {summary}"
+        );
+    }
+
+    /// The complement: a `full` bundle is exactly what the gate wants, so it
+    /// must carry no policy warning at all. Without this, the warning above
+    /// could be unconditional and still pass.
+    #[test]
+    fn summary_of_a_full_bundle_carries_no_payload_policy_warning() {
+        let mut response = sample_response();
+        response["payload_policy"] = json!("full");
+        let summary = render_history_sample_summary(&response, Path::new("./fixtures"));
+        assert!(
+            !summary.contains("--payload-policy full"),
+            "a full bundle must not be told to re-export as full: {summary}"
+        );
+    }
+
+    /// Re-exporting into a directory that already holds a bundle must replace
+    /// it, not accumulate on top of it.
+    ///
+    /// Fixture names embed the execution id, so a second export does not
+    /// overwrite the first — it *adds* to it. The manifest, however, has a fixed
+    /// name and IS overwritten. The two then disagree: the manifest says
+    /// "sampled 1", the directory holds two fixtures, and the gate replays both.
+    /// The stale one is an execution that may have completed hours ago, so the
+    /// gate silently verifies a population the coverage record never described.
+    #[test]
+    fn re_exporting_replaces_a_stale_bundle_rather_than_accumulating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut first = sample_response();
+        first["exports"] = json!([
+            { "workflow_name": "old", "execution_id": "11111111-1111-4111-8111-111111111111", "events": [] }
+        ]);
+        write_history_sample_bundle(&first, dir.path()).expect("first export");
+
+        let mut second = sample_response();
+        second["exports"] = json!([
+            { "workflow_name": "new", "execution_id": "22222222-2222-4222-8222-222222222222", "events": [] }
+        ]);
+        write_history_sample_bundle(&second, dir.path()).expect("second export");
+
+        // Enumerated exactly the way `ReplayVerifier`'s bundle walk does, so
+        // this counts what the gate would actually replay.
+        let fixtures: Vec<String> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("json"))
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .filter(|name| name != autumn_harvest::replay_sample::SampleManifest::FILE_NAME)
+            .collect();
+
+        assert_eq!(
+            fixtures.len(),
+            1,
+            "a stale fixture must not survive a re-export — the gate would \
+             replay an execution the fresh manifest never counted: {fixtures:?}"
+        );
+        assert!(fixtures[0].starts_with("new--"), "{fixtures:?}");
+    }
+
+    /// The replace above must never reach a directory this CLI did not write.
+    /// Refusing beats guessing: `--output-dir .` should not delete a user's
+    /// JSON files because they happened to pick the wrong path.
+    #[test]
+    fn a_directory_of_foreign_json_is_refused_not_cleaned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("important.json"), "{}").expect("write");
+
+        let error = write_history_sample_bundle(&sample_response(), dir.path())
+            .expect_err("a non-bundle directory must not be silently emptied");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("not a bundle") || rendered.contains("--output-dir"),
+            "the error must tell the operator what to do: {rendered}"
+        );
+        assert!(
+            dir.path().join("important.json").exists(),
+            "a foreign file must survive"
+        );
+    }
+
+    /// A response that predates the field (or uses a policy this CLI does not
+    /// know) must not be accused of being redacted — a spurious warning on a
+    /// perfectly replayable bundle trains operators to ignore the real one.
+    #[test]
+    fn an_absent_or_unknown_payload_policy_is_not_reported_as_redacted() {
+        let mut response = sample_response();
+        response
+            .as_object_mut()
+            .expect("object")
+            .remove("payload_policy");
+        assert!(!bundle_is_redacted(&response));
+
+        response["payload_policy"] = json!("some-future-policy");
+        assert!(!bundle_is_redacted(&response));
+
+        response["payload_policy"] = json!("redacted");
+        assert!(bundle_is_redacted(&response));
     }
 }

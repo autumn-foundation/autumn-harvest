@@ -100,6 +100,9 @@ tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tracing-subscriber = "0.3"
+# Issue #798: the export -> bundle -> drift-gate end-to-end test writes a real
+# bundle directory and feeds it to `WorkflowReplayer::replay_bundle`.
+tempfile = "3"
 
 [lints]
 workspace = true

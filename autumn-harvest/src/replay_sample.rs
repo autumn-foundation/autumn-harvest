@@ -1,0 +1,525 @@
+//! Stratified in-flight history sampling for the replay-drift gate (issue #798).
+//!
+//! Replay determinism is harvest's load-bearing production invariant: a code
+//! change that alters the command sequence of a `#[workflow]` function
+//! terminally fails every in-flight execution whose recorded history no longer
+//! matches. This module carries the **pure** vocabulary shared by the three
+//! parties in the gate loop, so the wire shape cannot drift between them:
+//!
+//! 1. the management API (`GET /admin/history/export-sample`) — which *produces*
+//!    a stratified, cross-shard sample of currently non-terminal executions,
+//! 2. the `harvest` CLI — which *writes* the sample to a bundle directory
+//!    alongside a [`SampleManifest`], and
+//! 3. [`crate::testing::ReplayVerifier::replay_bundle`] — which *reads* that
+//!    bundle back and gates CI on any divergence.
+//!
+//! Nothing here touches the database, so every rule below is unit-testable
+//! without Postgres.
+//!
+//! # Why "in flight" is a narrower set than it looks
+//!
+//! Issue #798 specifies a default state set of `RUNNING,SUSPENDED,PAUSED`, but
+//! `SUSPENDED` is **not a persisted state** — the `harvest_workflow_executions`
+//! state `CHECK` constraint forbids it, and a workflow parked on a timer,
+//! signal, activity, or child workflow keeps `state = 'RUNNING'` with a
+//! detached `worker_id`. [`normalize_sample_states`] therefore accepts
+//! `SUSPENDED` as a documented **alias for `RUNNING`**, so the issue's literal
+//! default resolves to the correct non-terminal set, [`IN_FLIGHT_STATES`].
+//!
+//! Terminal states are rejected outright rather than silently sampled: the gate
+//! exists to protect runs that still need to resume, and a terminal execution
+//! can never resume.
+
+use serde::{Deserialize, Serialize};
+
+/// The persisted non-terminal states — the executions the drift gate protects.
+///
+/// `PAUSED` (issue #383) is a non-terminal *active* state and must be
+/// enumerated everywhere in-flight runs are, so it sits alongside `RUNNING`
+/// rather than being silently omitted.
+pub const IN_FLIGHT_STATES: &[&str] = &["RUNNING", "PAUSED"];
+
+/// Default number of executions sampled per registered workflow type.
+pub const DEFAULT_PER_WORKFLOW_SAMPLE: usize = 50;
+
+/// Upper bound on `per_workflow`, so one request cannot ask for an unbounded
+/// slice of the fleet.
+pub const MAX_PER_WORKFLOW_SAMPLE: usize = 500;
+
+/// Upper bound on the total number of histories one sample request returns,
+/// across every workflow type and every shard.
+pub const MAX_SAMPLE_TOTAL: usize = 2_000;
+
+/// How the stratified sample orders candidates within each workflow type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleOrder {
+    /// Oldest in-flight executions first (the default).
+    ///
+    /// This is the risk-weighted choice: the longer a run has been in flight,
+    /// the more of its history was recorded by *older* code, so it is the most
+    /// likely to diverge against a candidate build — and the most expensive to
+    /// lose, since it has the most work already invested.
+    #[default]
+    Oldest,
+    /// Most recently started executions first.
+    Newest,
+}
+
+impl SampleOrder {
+    /// The wire/query-parameter spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Oldest => "oldest",
+            Self::Newest => "newest",
+        }
+    }
+
+    /// Parse a query-parameter value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when `value` is not a known ordering.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "oldest" => Ok(Self::Oldest),
+            "newest" => Ok(Self::Newest),
+            other => Err(format!(
+                "unknown sample_order '{other}'; expected one of [\"oldest\", \"newest\"]"
+            )),
+        }
+    }
+}
+
+/// Cross-shard completeness of a sample.
+///
+/// A sample drawn while a shard was unreachable covers less than the fleet.
+/// That is reported, never hidden — an operator gating a deploy needs to know
+/// the difference between "no drift" and "no drift *in the part we could see*".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleStatus {
+    /// Every expected shard was inspected.
+    Complete,
+    /// At least one shard was inspected and at least one was unreachable.
+    Partial,
+    /// No shard could be inspected.
+    Unavailable,
+}
+
+impl SampleStatus {
+    /// Derive the status from the inspected / unavailable shard counts.
+    #[must_use]
+    pub const fn from_counts(inspected: usize, unavailable: usize) -> Self {
+        if unavailable == 0 {
+            Self::Complete
+        } else if inspected == 0 {
+            Self::Unavailable
+        } else {
+            Self::Partial
+        }
+    }
+
+    /// Whether every expected shard was inspected.
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+/// Per-workflow-type sample coverage: how many were sampled, out of how many
+/// are actually in flight.
+///
+/// This is the anti-silent-truncation record required by issue #798 AC2. An
+/// operator reading `sampled: 50, in_flight_total: 4000` knows the gate
+/// verified a slice, not the fleet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SampleWorkflowCoverage {
+    /// The registered workflow type name.
+    pub workflow_name: String,
+    /// How many executions of this type the sample actually contains.
+    pub sampled: u64,
+    /// How many executions of this type were in flight when the sample was
+    /// drawn, across every inspected shard.
+    pub in_flight_total: u64,
+}
+
+impl SampleWorkflowCoverage {
+    /// Whether the in-flight population exceeded what was sampled.
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.sampled < self.in_flight_total
+    }
+}
+
+/// The bundle manifest written alongside the exported histories.
+///
+/// [`crate::testing::ReplayVerifier::replay_bundle`] reads this back so the CI
+/// gate can report — and optionally enforce — the coverage the sample actually
+/// achieved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SampleManifest {
+    /// When the sample was drawn.
+    pub generated_at: chrono::DateTime<chrono::Utc>,
+    /// Cross-shard completeness of the sample.
+    pub status: SampleStatus,
+    /// The normalized non-terminal states the sample was drawn from.
+    pub states: Vec<String>,
+    /// Per-workflow-type coverage, sorted by workflow name.
+    pub per_workflow: Vec<SampleWorkflowCoverage>,
+    /// Total histories in the bundle.
+    pub sampled_total: u64,
+    /// Total in-flight executions across every inspected shard.
+    pub in_flight_total: u64,
+    /// Human-readable reasons for each shard that could not be inspected.
+    pub unavailable_shards: Vec<String>,
+    /// The shard ids that were successfully inspected.
+    pub inspected_shards: Vec<i32>,
+}
+
+impl SampleManifest {
+    /// The file name the manifest is written under inside a bundle directory.
+    ///
+    /// Deliberately not `manifest.json`: the bundle is a flat directory of
+    /// `*.json` history fixtures, and the replay gate walks every `*.json` file
+    /// in it. A distinctive, greppable name means the manifest can be excluded
+    /// by name with zero risk of colliding with a real fixture.
+    pub const FILE_NAME: &'static str = "harvest-sample-manifest.json";
+
+    /// Whether every expected shard was inspected.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.status.is_complete()
+    }
+
+    /// Whether any workflow type's in-flight population exceeded its sample.
+    #[must_use]
+    pub const fn is_truncated(&self) -> bool {
+        self.sampled_total < self.in_flight_total
+    }
+}
+
+/// Normalize a caller-supplied set of execution states into the persisted
+/// non-terminal states to sample.
+///
+/// * An empty input yields [`IN_FLIGHT_STATES`].
+/// * `SUSPENDED` is accepted as an alias for `RUNNING` (a parked run's
+///   persisted state *is* `RUNNING`; see the module docs).
+/// * Terminal states are rejected — replaying terminal executions is explicitly
+///   out of scope for the drift gate.
+/// * Matching is case-insensitive; the result is deduplicated and sorted so a
+///   given request always produces the same query and the same manifest.
+///
+/// # Errors
+///
+/// Returns a human-readable message when a state is terminal or unknown. The
+/// caller maps this to `400 Bad Request` — an unrecognized state is never
+/// silently dropped, which would narrow the sample without telling anyone.
+pub fn normalize_sample_states<S: AsRef<str>>(raw: &[S]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    let push = |state: &str, out: &mut Vec<String>| {
+        if !out.iter().any(|existing| existing == state) {
+            out.push(state.to_string());
+        }
+    };
+
+    for entry in raw {
+        for token in entry.as_ref().split(',') {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let upper = trimmed.to_ascii_uppercase();
+            match upper.as_str() {
+                // `SUSPENDED` is not a persisted state; a parked run is RUNNING.
+                "SUSPENDED" | "RUNNING" => push("RUNNING", &mut out),
+                "PAUSED" => push("PAUSED", &mut out),
+                other if crate::erase::is_terminal_state(other) => {
+                    return Err(format!(
+                        "state '{trimmed}' is terminal; the replay-drift gate samples only \
+                         non-terminal executions (one of {IN_FLIGHT_STATES:?}, or the \
+                         'SUSPENDED' alias for RUNNING)"
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "unknown workflow state '{trimmed}'; expected one of {IN_FLIGHT_STATES:?} \
+                         (or the 'SUSPENDED' alias for RUNNING)"
+                    ));
+                }
+            }
+        }
+    }
+
+    if out.is_empty() {
+        out = IN_FLIGHT_STATES.iter().map(|s| (*s).to_string()).collect();
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Clamp a caller-supplied `per_workflow` into `1..=MAX_PER_WORKFLOW_SAMPLE`.
+///
+/// Clamping (rather than rejecting) mirrors the existing batch-export `limit`
+/// handling: an over-large request is bounded, and the manifest's coverage
+/// numbers make the bound visible.
+#[must_use]
+pub const fn clamp_per_workflow(requested: usize) -> usize {
+    if requested < 1 {
+        1
+    } else if requested > MAX_PER_WORKFLOW_SAMPLE {
+        MAX_PER_WORKFLOW_SAMPLE
+    } else {
+        requested
+    }
+}
+
+/// Merge per-shard coverage rows into one fleet-wide, name-sorted view.
+///
+/// A workflow type observed on several shards has its `sampled` and
+/// `in_flight_total` summed, so `in_flight_total` is the true cross-shard
+/// population rather than whichever shard answered last.
+#[must_use]
+pub fn merge_coverage(per_shard: &[Vec<SampleWorkflowCoverage>]) -> Vec<SampleWorkflowCoverage> {
+    let mut merged: std::collections::BTreeMap<String, SampleWorkflowCoverage> =
+        std::collections::BTreeMap::new();
+    for shard in per_shard {
+        for row in shard {
+            let entry =
+                merged
+                    .entry(row.workflow_name.clone())
+                    .or_insert_with(|| SampleWorkflowCoverage {
+                        workflow_name: row.workflow_name.clone(),
+                        sampled: 0,
+                        in_flight_total: 0,
+                    });
+            entry.sampled = entry.sampled.saturating_add(row.sampled);
+            entry.in_flight_total = entry.in_flight_total.saturating_add(row.in_flight_total);
+        }
+    }
+    merged.into_values().collect()
+}
+
+/// Build a filesystem-safe fixture file name for one sampled execution.
+///
+/// The execution id is a UUID and therefore inherently safe; the workflow name
+/// is registry-supplied but is sanitized anyway so a hostile or merely awkward
+/// workflow name can never escape the bundle directory (`../`, absolute paths,
+/// path separators, NUL) when the CLI writes the file.
+#[must_use]
+pub fn fixture_file_name(workflow_name: &str, execution_id: &str) -> String {
+    let mut safe: String = workflow_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    if safe.is_empty() {
+        safe.push_str("workflow");
+    }
+    let safe_id: String = execution_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(64)
+        .collect();
+    format!("{safe}--{safe_id}.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_states_default_to_the_in_flight_set() {
+        let states = normalize_sample_states::<&str>(&[]).unwrap();
+        assert_eq!(states, vec!["PAUSED".to_string(), "RUNNING".to_string()]);
+    }
+
+    #[test]
+    fn suspended_is_an_alias_for_running() {
+        // Issue #798's literal default is RUNNING,SUSPENDED,PAUSED. SUSPENDED is
+        // not a persisted state, so it must fold into RUNNING rather than either
+        // erroring or silently matching nothing.
+        let states = normalize_sample_states(&["RUNNING,SUSPENDED,PAUSED"]).unwrap();
+        assert_eq!(states, vec!["PAUSED".to_string(), "RUNNING".to_string()]);
+    }
+
+    #[test]
+    fn suspended_alone_resolves_to_running() {
+        let states = normalize_sample_states(&["SUSPENDED"]).unwrap();
+        assert_eq!(states, vec!["RUNNING".to_string()]);
+    }
+
+    #[test]
+    fn states_are_case_insensitive_and_deduplicated() {
+        let states = normalize_sample_states(&["running", "RUNNING", " Paused "]).unwrap();
+        assert_eq!(states, vec!["PAUSED".to_string(), "RUNNING".to_string()]);
+    }
+
+    #[test]
+    fn terminal_states_are_rejected_with_a_specific_message() {
+        for terminal in [
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "CONTINUED_AS_NEW",
+            "TERMINATED",
+        ] {
+            let err = normalize_sample_states(&[terminal]).unwrap_err();
+            assert!(err.contains("terminal"), "{terminal}: {err}");
+        }
+    }
+
+    #[test]
+    fn unknown_states_are_rejected_never_silently_dropped() {
+        let err = normalize_sample_states(&["RUNNING", "NOT_A_STATE"]).unwrap_err();
+        assert!(err.contains("NOT_A_STATE"), "{err}");
+    }
+
+    #[test]
+    fn per_workflow_is_clamped_into_range() {
+        assert_eq!(clamp_per_workflow(0), 1);
+        assert_eq!(clamp_per_workflow(1), 1);
+        assert_eq!(clamp_per_workflow(50), 50);
+        assert_eq!(
+            clamp_per_workflow(MAX_PER_WORKFLOW_SAMPLE),
+            MAX_PER_WORKFLOW_SAMPLE
+        );
+        assert_eq!(
+            clamp_per_workflow(MAX_PER_WORKFLOW_SAMPLE + 1),
+            MAX_PER_WORKFLOW_SAMPLE
+        );
+        assert_eq!(clamp_per_workflow(usize::MAX), MAX_PER_WORKFLOW_SAMPLE);
+    }
+
+    #[test]
+    fn coverage_truncation_is_reported() {
+        let full = SampleWorkflowCoverage {
+            workflow_name: "wf".into(),
+            sampled: 10,
+            in_flight_total: 10,
+        };
+        assert!(!full.truncated());
+        let partial = SampleWorkflowCoverage {
+            workflow_name: "wf".into(),
+            sampled: 10,
+            in_flight_total: 4000,
+        };
+        assert!(partial.truncated());
+    }
+
+    #[test]
+    fn merge_sums_across_shards_and_sorts_by_name() {
+        let shard0 = vec![
+            SampleWorkflowCoverage {
+                workflow_name: "zeta".into(),
+                sampled: 2,
+                in_flight_total: 9,
+            },
+            SampleWorkflowCoverage {
+                workflow_name: "alpha".into(),
+                sampled: 3,
+                in_flight_total: 5,
+            },
+        ];
+        let shard1 = vec![SampleWorkflowCoverage {
+            workflow_name: "alpha".into(),
+            sampled: 1,
+            in_flight_total: 7,
+        }];
+
+        let merged = merge_coverage(&[shard0, shard1]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].workflow_name, "alpha");
+        assert_eq!(merged[0].sampled, 4, "sampled sums across shards");
+        assert_eq!(
+            merged[0].in_flight_total, 12,
+            "in-flight population sums across shards"
+        );
+        assert_eq!(merged[1].workflow_name, "zeta");
+    }
+
+    #[test]
+    fn merge_of_nothing_is_empty() {
+        assert!(merge_coverage(&[]).is_empty());
+        assert!(merge_coverage(&[vec![]]).is_empty());
+    }
+
+    #[test]
+    fn status_is_derived_from_shard_counts() {
+        assert_eq!(SampleStatus::from_counts(2, 0), SampleStatus::Complete);
+        assert_eq!(SampleStatus::from_counts(1, 1), SampleStatus::Partial);
+        assert_eq!(SampleStatus::from_counts(0, 2), SampleStatus::Unavailable);
+        assert!(SampleStatus::from_counts(2, 0).is_complete());
+        assert!(!SampleStatus::from_counts(1, 1).is_complete());
+    }
+
+    #[test]
+    fn sample_order_round_trips_and_rejects_unknown() {
+        assert_eq!(SampleOrder::parse("oldest").unwrap(), SampleOrder::Oldest);
+        assert_eq!(SampleOrder::parse(" NEWEST ").unwrap(), SampleOrder::Newest);
+        assert_eq!(SampleOrder::default(), SampleOrder::Oldest);
+        assert_eq!(SampleOrder::Oldest.as_str(), "oldest");
+        assert!(SampleOrder::parse("random").is_err());
+    }
+
+    #[test]
+    fn fixture_file_names_cannot_escape_the_bundle_directory() {
+        let name = fixture_file_name("../../etc/passwd", "abc-123");
+        assert!(!name.contains('/'), "{name}");
+        assert!(!name.contains(".."), "{name}");
+        // Each of the six `.`/`/` characters maps to `_`; the trailing UUID keeps
+        // the whole file name unique even when two workflow names sanitize alike.
+        assert_eq!(name, "______etc_passwd--abc-123.json");
+    }
+
+    #[test]
+    fn fixture_file_names_survive_awkward_workflow_names() {
+        assert_eq!(fixture_file_name("", "id"), "workflow--id.json");
+        assert_eq!(fixture_file_name("a b:c", "id"), "a_b_c--id.json");
+        // A long name is bounded so the path stays writable on every platform.
+        let long = fixture_file_name(&"x".repeat(500), &"y".repeat(500));
+        assert!(long.len() <= 64 + 2 + 64 + 5, "{}", long.len());
+    }
+
+    #[test]
+    fn manifest_file_name_is_distinct_from_a_plausible_fixture_name() {
+        assert!(
+            std::path::Path::new(SampleManifest::FILE_NAME)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        );
+        assert!(SampleManifest::FILE_NAME.starts_with("harvest-"));
+    }
+
+    #[test]
+    fn manifest_round_trips_through_json() {
+        let manifest = SampleManifest {
+            generated_at: chrono::Utc::now(),
+            status: SampleStatus::Partial,
+            states: vec!["RUNNING".into()],
+            per_workflow: vec![SampleWorkflowCoverage {
+                workflow_name: "wf".into(),
+                sampled: 1,
+                in_flight_total: 2,
+            }],
+            sampled_total: 1,
+            in_flight_total: 2,
+            unavailable_shards: vec!["shard 1: down".into()],
+            inspected_shards: vec![0],
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(json.contains("\"status\":\"partial\""), "{json}");
+        let back: SampleManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, manifest);
+        assert!(back.is_truncated());
+        assert!(!back.is_complete());
+    }
+}

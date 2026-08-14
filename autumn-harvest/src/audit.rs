@@ -403,6 +403,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         RouteClass::ReadOnly,
     ),
     ("GET /admin/history/exports", RouteClass::ReadOnly),
+    ("GET /admin/history/export-sample", RouteClass::ReadOnly),
     ("GET /admin/external-handoffs", RouteClass::ReadOnly),
     ("GET /admin/external-handoffs/{token}", RouteClass::ReadOnly),
     // Admission gates (issue #377)
@@ -810,6 +811,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/debounce",
     "GET /admin/start-throttle",
     "GET /admin/history/exports",
+    "GET /admin/history/export-sample",
     "GET /admin/external-handoffs",
     "GET /admin/external-handoffs/{token}",
     "GET /admin/schedules",
@@ -979,6 +981,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     // Workflow-type handler reachability (issue #520): read-only.
     ("GET /admin/workflow-types/reachability", None),
     ("GET /admin/history/exports", None),
+    ("GET /admin/history/export-sample", None),
     ("GET /admin/external-handoffs", None),
     ("GET /admin/external-handoffs/{token}", None),
     // Schedule management

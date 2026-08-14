@@ -652,7 +652,9 @@ The determinism rule catalog is an early-stage guardrail, not the final proof of
 1. **Determinism check** (this catalog): catch obvious footguns before any workflow has history.
 2. **Schema-contract check** ([issue #794](https://github.com/autumn-foundation/autumn-harvest/issues/794)): catch backward-incompatible *payload* changes — the sibling hazard to non-deterministic code — before they DLQ in-flight runs. See [the guide](workflow-schema-contract-guide.md).
 3. **History export** ([issue #169](https://github.com/autumn-foundation/autumn-harvest/issues/169)): export event histories from staging as replay fixtures.
-4. **WorkflowReplayer** (`autumn_harvest::testing::WorkflowReplayer`): verify the new code replays all exported fixtures without divergence.
+4. **WorkflowReplayer** (`autumn_harvest::testing::WorkflowReplayer`): verify the new code replays all exported fixtures without divergence. Two flavours, for two different populations:
+   - **Curated *completed* fixtures**, replayed strictly — `ReplayVerifier::verify_dir`. See [`replay-verify.md`](replay-verify.md).
+   - **A live *in-flight* sample**, replayed frontier-tolerantly — `harvest history export-sample` + `WorkflowReplayer::replay_bundle` ([issue #798](https://github.com/autumn-foundation/autumn-harvest/issues/798)). This is the one that answers "will the executions running *right now* survive this deploy?", and it is the layer that catches a regression the curated fixtures happen not to cover. See [`replay-drift-gate.md`](replay-drift-gate.md).
 5. **Patch gate** (`ctx.patched()` / `ctx.deprecate_patch()`, with `ctx.version()` as the multi-version escape hatch): fence intentional non-determinism across deploys behind `ctx.patched(id)` for the common two-state change, deprecate the gate with `ctx.deprecate_patch(id)` once pre-patch runs have drained, and delete it after the marker-bearing runs drain too. Reach for `ctx.version()` only when a gate needs more than two concurrent versions.
 6. **Build-id routing** (`WorkerConfig::with_build_id`): gate new executions on the new build until compatibility is declared.
 

@@ -640,6 +640,24 @@ impl WorkflowReplayer {
         self
     }
 
+    /// Replay an exported in-flight history bundle and return an aggregate
+    /// [`ReplayDriftReport`] (issue #798).
+    ///
+    /// Convenience entry point for callers already holding a
+    /// [`WorkflowReplayer`]; it delegates to [`ReplayVerifier::replay_bundle`],
+    /// which owns the bundle walk, concurrency budget, and per-fixture timeout.
+    /// Use [`ReplayVerifier`] directly to configure those, plus
+    /// `allow_unregistered`, `allow_empty_bundle`, or
+    /// `require_complete_coverage`.
+    pub async fn replay_bundle(&self, dir: impl AsRef<std::path::Path>) -> ReplayDriftReport {
+        // Same module, so the verifier's private fields are reachable — no need
+        // for a public setter that would only ever serve this delegation.
+        let mut verifier = ReplayVerifier::new();
+        verifier.handlers.clone_from(&self.handlers);
+        verifier.state = self.state.clone();
+        verifier.replay_bundle(dir).await
+    }
+
     /// Register a batch of workflows from a `workflows![]` macro call.
     ///
     /// ```rust,no_run
@@ -2243,6 +2261,325 @@ fn github_escape(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// ReplayDriftReport  — in-flight replay-drift gate (issue #798)
+// ---------------------------------------------------------------------------
+
+/// One fixture whose replay diverged from its recorded history.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReplayDrift {
+    /// The execution whose history diverged.
+    pub execution_id: Option<ExecutionId>,
+    /// The registered workflow type the history belongs to.
+    pub workflow_name: String,
+    /// The category of divergence.
+    ///
+    /// A workflow function that returned an error during replay (rather than
+    /// diverging on a command) is reported as [`NonDeterminismKind::Unknown`]
+    /// with a `workflow error:` prefixed [`first_divergence`](Self::first_divergence);
+    /// it is still a gate failure, because the candidate code could not replay
+    /// that history.
+    pub kind: NonDeterminismKind,
+    /// Human-readable description of the first divergence encountered.
+    pub first_divergence: String,
+    /// The fixture file the divergence came from, so an operator can open it.
+    #[serde(serialize_with = "serialize_path")]
+    pub fixture_path: std::path::PathBuf,
+}
+
+/// One fixture that could not be replayed at all (a harness-side problem, not a
+/// determinism verdict).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReplayBlocked {
+    /// The fixture file that could not be processed.
+    #[serde(serialize_with = "serialize_path")]
+    pub fixture_path: std::path::PathBuf,
+    /// Workflow name from the fixture (empty when the file was unparseable).
+    pub workflow_name: String,
+    /// Execution ID from the fixture (`None` when the file was unparseable).
+    pub execution_id: Option<ExecutionId>,
+    /// Why the fixture could not be replayed.
+    pub reason: HarnessErrorKind,
+}
+
+/// Aggregate result of replaying an exported in-flight history bundle
+/// (issue #798), shaped for a CI release gate.
+///
+/// Produced by [`ReplayVerifier::replay_bundle`] and
+/// [`WorkflowReplayer::replay_bundle`].
+///
+/// # Reading the verdict
+///
+/// Use [`exit_code`](Self::exit_code) (or [`is_clean`](Self::is_clean)) rather
+/// than checking `diverged.is_empty()` by hand — the latter reports "no drift"
+/// for a bundle that contained no fixtures at all, which is the one failure
+/// mode a release gate must never have.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReplayDriftReport {
+    /// Total fixtures discovered in the bundle (excluding the manifest).
+    pub total: usize,
+    /// Fixtures that replayed with no divergence.
+    pub succeeded: usize,
+    /// Fixtures whose replay diverged from the recorded history.
+    pub diverged: Vec<ReplayDrift>,
+    /// Fixtures that could not be replayed (unparseable, unregistered, timeout).
+    pub blocked: Vec<ReplayBlocked>,
+    /// Fixtures skipped because `allow_unregistered` was set.
+    pub skipped: usize,
+    /// Coverage claimed by the bundle's manifest, when it has one.
+    pub coverage: Option<crate::replay_sample::SampleManifest>,
+    /// Whether an empty bundle was explicitly permitted.
+    pub allow_empty_bundle: bool,
+    /// Whether incomplete cross-shard coverage blocks the gate.
+    pub require_complete_coverage: bool,
+}
+
+impl ReplayDriftReport {
+    /// Project a [`BatchReplayReport`] into the drift-gate shape.
+    fn from_batch(
+        batch: BatchReplayReport,
+        coverage: Option<crate::replay_sample::SampleManifest>,
+        allow_empty_bundle: bool,
+        require_complete_coverage: bool,
+    ) -> Self {
+        let mut diverged = Vec::new();
+        let mut blocked = Vec::new();
+
+        for result in batch.results {
+            match result.status {
+                FixtureStatus::Passed | FixtureStatus::Skipped { .. } => {}
+                FixtureStatus::Failed(ReplayStatus::NonDeterminismDetected {
+                    kind,
+                    expected,
+                    actual,
+                    event_index,
+                }) => diverged.push(ReplayDrift {
+                    execution_id: result.execution_id,
+                    workflow_name: result.workflow_name,
+                    kind,
+                    first_divergence: format!(
+                        "at event {event_index}: expected {expected}, got {actual}"
+                    ),
+                    fixture_path: result.path,
+                }),
+                // A workflow function that errored during replay is still a gate
+                // failure — the candidate code could not replay that history —
+                // but it is not a command-sequence divergence, so it carries the
+                // `Unknown` kind and a distinguishable message.
+                FixtureStatus::Failed(ReplayStatus::WorkflowFailed { error, event_index }) => {
+                    diverged.push(ReplayDrift {
+                        execution_id: result.execution_id,
+                        workflow_name: result.workflow_name,
+                        kind: NonDeterminismKind::Unknown,
+                        first_divergence: format!(
+                            "workflow error: at event {event_index}: {error}"
+                        ),
+                        fixture_path: result.path,
+                    });
+                }
+                FixtureStatus::Failed(ReplayStatus::ReplaySucceeded) => {
+                    // Unreachable: `replay_fixture_file` only wraps non-success
+                    // statuses in `Failed`. Counted as success rather than
+                    // silently dropped so the totals always reconcile.
+                    debug_assert!(false, "ReplaySucceeded must not be wrapped in Failed");
+                }
+                FixtureStatus::HarnessError(reason) => blocked.push(ReplayBlocked {
+                    fixture_path: result.path,
+                    workflow_name: result.workflow_name,
+                    execution_id: result.execution_id,
+                    reason,
+                }),
+            }
+        }
+
+        Self {
+            total: batch.fixtures_total,
+            succeeded: batch.succeeded,
+            diverged,
+            blocked,
+            skipped: batch.skipped,
+            coverage,
+            allow_empty_bundle,
+            require_complete_coverage,
+        }
+    }
+
+    /// Whether the bundle contained no fixtures.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// Whether the bundle's manifest reports incomplete cross-shard coverage.
+    ///
+    /// `false` when the bundle carries no manifest — an unclaimed coverage is
+    /// not a *failed* coverage claim.
+    #[must_use]
+    pub fn has_incomplete_coverage(&self) -> bool {
+        self.coverage
+            .as_ref()
+            .is_some_and(|manifest| !manifest.is_complete())
+    }
+
+    /// Whether an opted-in `require_complete_coverage` claim is unsatisfied.
+    ///
+    /// Deliberately stricter than [`has_incomplete_coverage`](Self::has_incomplete_coverage),
+    /// and the distinction is the whole point of the flag. That method answers
+    /// "did the bundle *claim* partial coverage?", so an absent manifest is
+    /// correctly `false` — nothing was claimed, so no claim failed.
+    ///
+    /// This method answers the operator's question instead: "was complete
+    /// coverage *proven*?" A caller who sets `require_complete_coverage` has said
+    /// they will not certify a build against a partial read of the fleet, and a
+    /// bundle with **no** manifest proves nothing — the sample may have missed an
+    /// entire shard. Reading an absent manifest as "complete" would hand that
+    /// caller a green build precisely when the evidence went missing (a lost or
+    /// unparseable manifest, a hand-assembled directory), which is the one
+    /// outcome the flag exists to prevent. So the absence of proof fails closed.
+    ///
+    /// `read_bundle_manifest` is intentionally fail-open — a missing or corrupt
+    /// manifest yields `None` rather than an error — so a corrupt manifest and a
+    /// missing one are indistinguishable here, and both fail closed.
+    #[must_use]
+    pub const fn coverage_claim_unsatisfied(&self) -> bool {
+        if !self.require_complete_coverage {
+            return false;
+        }
+        match self.coverage.as_ref() {
+            // No proof of coverage at all: fail closed.
+            None => true,
+            Some(manifest) => !manifest.is_complete(),
+        }
+    }
+
+    /// Whether the gate passes.
+    ///
+    /// True when every fixture replayed without divergence **and** the bundle
+    /// actually verified something. An empty bundle is deliberately *not* clean
+    /// — see [`ReplayVerifier::allow_empty_bundle`] — and neither is a bundle
+    /// with a knowingly-partial sample when
+    /// [`require_complete_coverage`](ReplayVerifier::require_complete_coverage)
+    /// is set.
+    ///
+    /// This always agrees with [`exit_code`](Self::exit_code): `is_clean()` is
+    /// true exactly when `exit_code()` is `0`.
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.exit_code() == 0
+    }
+
+    /// Process exit code for a CI step.
+    ///
+    /// | Code | Meaning |
+    /// |------|---------|
+    /// | `0` | Every fixture replayed cleanly |
+    /// | `1` | One or more fixtures diverged — a determinism regression |
+    /// | `2` | One or more fixtures could not be replayed (dominates over `1`, because a gate that did not fully run cannot be trusted — mirrors [`CiReport::exit_code`]) |
+    /// | `3` | The bundle contained no fixtures, so nothing was verified |
+    /// | `4` | `require_complete_coverage` is set and complete coverage was not proven — the sample is knowingly incomplete, **or** the bundle carries no readable manifest at all |
+    #[must_use]
+    pub const fn exit_code(&self) -> i32 {
+        if !self.blocked.is_empty() {
+            return 2;
+        }
+        if !self.diverged.is_empty() {
+            return 1;
+        }
+        if self.is_empty() && !self.allow_empty_bundle {
+            return 3;
+        }
+        if self.coverage_claim_unsatisfied() {
+            return 4;
+        }
+        0
+    }
+}
+
+impl std::fmt::Display for ReplayDriftReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "harvest replay-drift: {} fixture(s) — {} clean, {} diverged, {} blocked, {} skipped",
+            self.total,
+            self.succeeded,
+            self.diverged.len(),
+            self.blocked.len(),
+            self.skipped,
+        )?;
+
+        if let Some(coverage) = &self.coverage {
+            writeln!(
+                f,
+                "  coverage: {} of {} in-flight execution(s) sampled across {} shard(s) [{}]",
+                coverage.sampled_total,
+                coverage.in_flight_total,
+                coverage.inspected_shards.len(),
+                if coverage.is_complete() {
+                    "complete"
+                } else {
+                    "PARTIAL"
+                },
+            )?;
+            for shard in &coverage.unavailable_shards {
+                writeln!(f, "    unavailable: {shard}")?;
+            }
+        }
+
+        for drift in &self.diverged {
+            writeln!(
+                f,
+                "  DRIFT  {} [{}] {} — {}",
+                drift.workflow_name,
+                drift.kind,
+                drift
+                    .execution_id
+                    .map_or_else(|| "<unknown>".to_string(), |id| id.to_string()),
+                drift.first_divergence,
+            )?;
+            writeln!(f, "         {}", drift.fixture_path.display())?;
+        }
+        for blocked in &self.blocked {
+            writeln!(
+                f,
+                "  BLOCKED  {} — {}",
+                blocked.fixture_path.display(),
+                blocked.reason,
+            )?;
+        }
+
+        if self.is_empty() && !self.allow_empty_bundle {
+            writeln!(
+                f,
+                "  ERROR: the bundle contained no fixtures — nothing was verified. \
+                 Check the export step, or pass allow_empty_bundle(true) if the fleet \
+                 is legitimately idle."
+            )?;
+        }
+        if self.coverage_claim_unsatisfied() {
+            // Name which of the two failure modes occurred: "a shard was
+            // unreachable" and "the manifest is missing or unreadable" call for
+            // completely different operator actions.
+            if self.coverage.is_none() {
+                writeln!(
+                    f,
+                    "  ERROR: require_complete_coverage is set, but the bundle carries no \
+                     readable coverage manifest ({}), so complete coverage could not be \
+                     proven. Re-export the bundle with `harvest history export-sample \
+                     --output-dir <dir>`.",
+                    crate::replay_sample::SampleManifest::FILE_NAME
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "  ERROR: the sample is incomplete (a shard could not be inspected) \
+                     and require_complete_coverage is set."
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ReplayVerifier
 // ---------------------------------------------------------------------------
 
@@ -2275,6 +2612,12 @@ pub struct ReplayVerifier {
     timeout: std::time::Duration,
     allow_unregistered: bool,
     fixtures_dir: Option<std::path::PathBuf>,
+    /// Drift-gate policy (issue #798): treat a bundle with zero fixtures as
+    /// clean instead of refusing to certify it.
+    allow_empty_bundle: bool,
+    /// Drift-gate policy (issue #798): refuse to certify a bundle whose manifest
+    /// reports that a shard could not be inspected.
+    require_complete_coverage: bool,
 }
 
 impl Default for ReplayVerifier {
@@ -2296,6 +2639,8 @@ impl ReplayVerifier {
             timeout: std::time::Duration::from_secs(60),
             allow_unregistered: false,
             fixtures_dir: None,
+            allow_empty_bundle: false,
+            require_complete_coverage: false,
         }
     }
 
@@ -2360,6 +2705,87 @@ impl ReplayVerifier {
         self
     }
 
+    /// Treat a bundle containing zero fixtures as clean (default: `false`).
+    ///
+    /// The drift gate refuses to certify an empty bundle by default, because a
+    /// gate that passes vacuously is worse than no gate: a typo'd
+    /// `--output-dir`, a failed export, or a filter that matched nothing would
+    /// all report "green" while verifying nothing at all.
+    ///
+    /// Set this when a fleet legitimately has no executions in flight (a fresh
+    /// environment, or a workflow type that is only triggered on demand).
+    #[must_use]
+    pub const fn allow_empty_bundle(mut self, allow: bool) -> Self {
+        self.allow_empty_bundle = allow;
+        self
+    }
+
+    /// Refuse to certify a bundle whose manifest reports incomplete cross-shard
+    /// coverage (default: `false`).
+    ///
+    /// A sample drawn while a shard was unreachable covers less than the fleet,
+    /// so "no drift" means "no drift in the part we could see". By default that
+    /// is reported but not enforced — the export is an explicit *sample*. Turn
+    /// this on for a release gate that must not go green on a knowingly-partial
+    /// read of the fleet.
+    ///
+    /// Has no effect on a bundle with no
+    /// [`SampleManifest`](crate::replay_sample::SampleManifest); see
+    /// [`replay_bundle`](Self::replay_bundle) for how a manifest-less bundle is
+    /// treated.
+    #[must_use]
+    pub const fn require_complete_coverage(mut self, require: bool) -> Self {
+        self.require_complete_coverage = require;
+        self
+    }
+
+    /// Replay an exported **in-flight** history bundle and return an aggregate
+    /// [`ReplayDriftReport`] suitable for gating a deploy (issue #798).
+    ///
+    /// `dir` is a bundle produced by
+    /// `harvest history export-sample --output-dir <dir>`: a flat directory of
+    /// `*.json` [`HistorySnapshot`] fixtures plus a
+    /// [`SampleManifest`](crate::replay_sample::SampleManifest) carrying the
+    /// coverage the sample achieved. The manifest is read (and excluded from the
+    /// fixture walk) automatically; a directory without one still replays, and
+    /// [`ReplayDriftReport::coverage`] is simply `None`.
+    ///
+    /// # How this differs from [`verify_dir`](Self::verify_dir)
+    ///
+    /// `verify_dir` replays **strictly**: the workflow must consume its entire
+    /// recorded history. That is right for captured *completed* histories, and
+    /// wrong for this gate — a healthy **in-flight** execution parks at its
+    /// recorded frontier, which strict replay classifies as non-determinism. A
+    /// strict gate over sampled in-flight runs would therefore be false-red on
+    /// every fixture. `replay_bundle` replays frontier-tolerantly instead, so a
+    /// parked run is clean while a genuine mid-history divergence still fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::testing::ReplayVerifier;
+    /// # async fn example() {
+    /// let report = ReplayVerifier::new()
+    ///     // .register(workflows![onboarding, refund_saga, billing])
+    ///     .replay_bundle("./fixtures/in-flight")
+    ///     .await;
+    ///
+    /// println!("{report}");
+    /// std::process::exit(report.exit_code());
+    /// # }
+    /// ```
+    pub async fn replay_bundle(&self, dir: impl AsRef<std::path::Path>) -> ReplayDriftReport {
+        let dir = dir.as_ref();
+        let batch = self.replay_dir(dir, FixtureReplayMode::InFlight).await;
+        let coverage = read_bundle_manifest(dir).await;
+        ReplayDriftReport::from_batch(
+            batch,
+            coverage,
+            self.allow_empty_bundle,
+            self.require_complete_coverage,
+        )
+    }
+
     /// Walk the directory set by [`fixtures_dir`](Self::fixtures_dir) and replay all
     /// `*.json` fixtures.
     ///
@@ -2385,6 +2811,17 @@ impl ReplayVerifier {
     ///
     /// Panics if the internal semaphore is closed, which cannot happen under normal use.
     pub async fn verify_dir(&self, dir: &std::path::Path) -> BatchReplayReport {
+        self.replay_dir(dir, FixtureReplayMode::Strict).await
+    }
+
+    /// Shared directory-replay engine behind [`verify_dir`](Self::verify_dir) and
+    /// [`replay_bundle`](Self::replay_bundle) — one walker, one concurrency
+    /// budget, one aggregation, two replay modes.
+    async fn replay_dir(
+        &self,
+        dir: &std::path::Path,
+        mode: FixtureReplayMode,
+    ) -> BatchReplayReport {
         let files = match collect_json_files(dir).await {
             Ok(f) => f,
             Err(e) => {
@@ -2432,7 +2869,8 @@ impl ReplayVerifier {
 
             tasks.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
-                replay_fixture_file(&handlers, state, &path, timeout, allow_unregistered).await
+                replay_fixture_file(&handlers, state, &path, timeout, allow_unregistered, mode)
+                    .await
             }));
         }
 
@@ -2478,6 +2916,30 @@ impl ReplayVerifier {
     }
 }
 
+/// Read a bundle's coverage manifest, if it has one.
+///
+/// A missing or unparseable manifest is not an error: a hand-assembled bundle
+/// (or one produced before the manifest existed) still replays, it just carries
+/// no coverage claim. `require_complete_coverage` likewise cannot be satisfied
+/// or violated by a manifest that is not there.
+async fn read_bundle_manifest(
+    dir: &std::path::Path,
+) -> Option<crate::replay_sample::SampleManifest> {
+    let path = dir.join(crate::replay_sample::SampleManifest::FILE_NAME);
+    let raw = tokio::fs::read_to_string(&path).await.ok()?;
+    match serde_json::from_str(&raw) {
+        Ok(manifest) => Some(manifest),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "harvest: ignoring unparseable replay-sample manifest",
+            );
+            None
+        }
+    }
+}
+
 /// Recursively collect `*.json` files under `dir`.
 ///
 /// Returns `Err` if the top-level `dir` cannot be read so the caller can
@@ -2499,7 +2961,14 @@ async fn collect_json_files(
                 if let Ok(file_type) = entry.file_type().await {
                     if file_type.is_dir() {
                         dirs_to_visit.push(path);
-                    } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    } else if path.extension().and_then(|s| s.to_str()) == Some("json")
+                        // A replay-drift bundle (issue #798) carries its coverage
+                        // manifest alongside the fixtures. It is not a history, so
+                        // replaying it would produce a spurious harness error and
+                        // fail the gate for a well-formed bundle.
+                        && path.file_name().and_then(|s| s.to_str())
+                            != Some(crate::replay_sample::SampleManifest::FILE_NAME)
+                    {
                         files.push(path);
                     }
                 }
@@ -2511,6 +2980,113 @@ async fn collect_json_files(
     Ok(files)
 }
 
+/// The two export-document fields the fixture guard consults.
+///
+/// Deliberately a *side* struct parsed from the same fixture JSON rather than
+/// two more fields on [`HistorySnapshot`]: both are properties of how a history
+/// was *exported*, not inputs the replay itself consumes, so putting them on the
+/// snapshot would force every hand-built fixture in the workspace to declare
+/// export metadata it has no notion of.
+///
+/// Every field is `#[serde(default)]`, so a hand-built fixture (or a legacy
+/// export produced before these fields existed) parses to all-`None` and is
+/// treated as replayable.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct FixtureGuardFields {
+    #[serde(default)]
+    payload_policy: Option<crate::history_export::HistoryPayloadPolicy>,
+    #[serde(default)]
+    status: Option<crate::history_export::HistoryExportStatus>,
+}
+
+/// Why a fixture cannot be honestly replayed by `mode`, or `None` if it can.
+///
+/// Pure and separate from the replay so the "would this verdict be a lie?"
+/// decision is unit-testable without touching disk or running a workflow.
+///
+/// Both cases return a *harness error* rather than a divergence, because in
+/// neither case did the candidate build do anything wrong — the bundle is simply
+/// not evaluable. Telling an operator "your code regressed" when the real problem
+/// is a stripped payload or a mis-aimed directory is the worst outcome a gate can
+/// produce, so each message names the concrete fix.
+///
+/// A fixture that declares neither field (a legacy export, or a fixture built by
+/// hand in Rust) is treated as replayable — hand-built fixtures carry real
+/// inputs, and refusing them would break every existing directory fixture.
+fn unreplayable_fixture_reason(
+    guard: &FixtureGuardFields,
+    mode: FixtureReplayMode,
+) -> Option<String> {
+    use crate::history_export::HistoryPayloadPolicy;
+
+    // Redaction rewrites payload-bearing fields in place. Both replay paths run
+    // with `strict_replay = true`, so `match_activity_strict` compares the
+    // redacted stub against the input the workflow computes -> divergence on
+    // every fixture that passes a non-trivial activity input.
+    if guard.payload_policy == Some(HistoryPayloadPolicy::Redacted) {
+        return Some(
+            "fixture was exported with payload_policy=redacted, which rewrites \
+             activity inputs and outputs and therefore cannot be replayed \
+             (every fixture would report a false divergence); re-export the \
+             bundle with `--payload-policy full`"
+                .to_string(),
+        );
+    }
+
+    // A bundle aimed at the wrong gate: each mode's verdict for the other's
+    // population is misleading rather than merely wrong.
+    if let Some(status) = guard.status.as_ref() {
+        match mode {
+            FixtureReplayMode::InFlight if status.terminal => {
+                return Some(format!(
+                    "fixture is a terminal execution (state={}), but the \
+                     replay-drift gate replays in-flight executions; use \
+                     `ReplayVerifier::verify_dir` for completed histories",
+                    status.state
+                ));
+            }
+            FixtureReplayMode::Strict if !status.terminal => {
+                return Some(format!(
+                    "fixture is an in-flight execution (state={}), but \
+                     `verify_dir` replays completed histories strictly and would \
+                     report a false divergence; use \
+                     `ReplayVerifier::replay_bundle` for an in-flight bundle",
+                    status.state
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// How a directory fixture is replayed.
+///
+/// The two modes exist because the two gates protect different populations, and
+/// the correct verdict for a parked workflow is the opposite in each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixtureReplayMode {
+    /// Strict replay — the workflow must consume its entire recorded history and
+    /// reach a terminal outcome. A suspension means the code issued a command
+    /// with no matching history event.
+    ///
+    /// Used by [`ReplayVerifier::verify_dir`] / [`ReplayVerifier::verify_all`],
+    /// whose fixtures are captured **completed** histories.
+    Strict,
+    /// Frontier-tolerant replay — a workflow that parks at the end of its
+    /// recorded history replayed cleanly.
+    ///
+    /// Used by [`ReplayVerifier::replay_bundle`] (issue #798), whose fixtures are
+    /// **in-flight** (non-terminal) executions. Such a run *always* suspends at
+    /// its recorded frontier — that is its correct outcome, not a divergence — so
+    /// a strict gate over this population would be false-red on every fixture.
+    /// A genuine mid-history divergence still fails in this mode: it surfaces as
+    /// `WorkflowOutcome::Failed { non_deterministic_details: Some(_) }`, and
+    /// leftover unconsumed history at completion is still caught.
+    InFlight,
+}
+
 /// Replay a single fixture file and return a [`FixtureResult`].
 async fn replay_fixture_file(
     handlers: &HashMap<String, WorkflowHandlerFn>,
@@ -2518,6 +3094,7 @@ async fn replay_fixture_file(
     path: &std::path::Path,
     timeout: std::time::Duration,
     allow_unregistered: bool,
+    mode: FixtureReplayMode,
 ) -> FixtureResult {
     // Read file.
     let json = match tokio::fs::read_to_string(path).await {
@@ -2551,6 +3128,28 @@ async fn replay_fixture_file(
 
     let workflow_name = snapshot.workflow_name.clone();
     let execution_id = snapshot.execution_id;
+
+    // Refuse a fixture this gate cannot honestly evaluate, BEFORE replaying it.
+    //
+    // Both checks exist to stop the gate returning a *confidently wrong* verdict:
+    // a redacted fixture would diverge on every activity input, and a fixture
+    // aimed at the other gate would be judged in the wrong replay mode. Either
+    // way the operator would be told something false about their code. A harness
+    // error (exit 2) is the honest answer, and it names the fix.
+    //
+    // The two fields consulted are export-document metadata, not replay inputs,
+    // so they are parsed from the same JSON via a side struct rather than living
+    // on `HistorySnapshot`. A fixture that declares neither (hand-built, or a
+    // legacy export) parses to all-`None` and is treated as replayable.
+    let guard: FixtureGuardFields = serde_json::from_str(&json).unwrap_or_default();
+    if let Some(reason) = unreplayable_fixture_reason(&guard, mode) {
+        return FixtureResult {
+            path: path.to_owned(),
+            workflow_name,
+            execution_id: Some(execution_id),
+            status: FixtureStatus::HarnessError(HarnessErrorKind::InvalidFixture(reason)),
+        };
+    }
 
     // Check handler registration.
     if !handlers.contains_key(&workflow_name) {
@@ -2607,8 +3206,14 @@ async fn replay_fixture_file(
         history_policy: crate::context::WorkflowHistoryPolicy::default(),
     };
 
-    let replay_result =
-        tokio::time::timeout(timeout, replayer.replay_from_snapshot(snapshot)).await;
+    let replay_result = match mode {
+        FixtureReplayMode::Strict => {
+            tokio::time::timeout(timeout, replayer.replay_from_snapshot(snapshot)).await
+        }
+        FixtureReplayMode::InFlight => {
+            tokio::time::timeout(timeout, replayer.replay_canary_snapshot(snapshot)).await
+        }
+    };
 
     let Ok(report) = replay_result else {
         return FixtureResult {
