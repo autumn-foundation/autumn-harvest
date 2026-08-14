@@ -273,6 +273,26 @@ written into the bundle and why the value must come from your CI config.
 Leaving it unset makes `ctx.build_id()` report `None` during replay, which is
 correct only if your deployment does not set a build id at all.
 
+### Deadline-sensitive workflows
+
+A workflow that calls `ctx.should_continue_as_new()` (issue #772) consults the
+execution's live `deadline_at`, and that value **moves**: pausing an execution
+(issue #383) suspends the SLA clock, and resuming it pushes the deadline forward
+by the pause span.
+
+The export is careful about this. Candidate discovery and the per-fixture
+history fetch are separate round-trips, so an execution resumed between them
+would otherwise be exported with a history from *after* the resume and a
+deadline from *before* it. That pairing reports less remaining budget than the
+live worker actually had, so the checkpoint fraction can trip during replay and
+emit a `ContinueAsNew` the recorded history cannot contain — a divergence your
+candidate build did not cause.
+
+The exporter therefore re-reads the deadline immediately after loading each
+history, so the two always describe the same moment. Nothing is required of you;
+it is noted here because it explains why a paused-and-resumed execution is safe
+to include in a sample rather than something you need to filter out.
+
 The two in-process gates need no configuration here: the [replay canary] and the
 replay-diagnosis endpoint both run *inside* the deployed candidate, so they
 thread that process's own configured build id automatically.

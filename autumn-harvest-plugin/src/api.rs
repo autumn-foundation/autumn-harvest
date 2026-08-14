@@ -33509,6 +33509,56 @@ async fn export_selected_history_candidates(
     }
 }
 
+/// Re-read the execution's **mutable** deadline metadata, so a fixture pairs a
+/// history and a deadline observed at the same point in the execution's life.
+///
+/// `deadline_at` is the one candidate field that moves after discovery: pause
+/// (#383) suspends the SLA clock and resume pushes `deadline_at` forward by the
+/// pause span. Candidate discovery and the per-candidate fetch are separate
+/// round-trips with the whole export loop between them (up to `MAX_SAMPLE_TOTAL`
+/// candidates), so a `PAUSED` execution resumed inside that window leaves the
+/// discovery-time value *stale and earlier* than the history it is paired with.
+///
+/// That direction is the harmful one. `should_continue_as_new()` (#772) reads
+/// the live shifted `deadline_at`, and an earlier deadline reports **less**
+/// remaining budget — so replay can trip the checkpoint fraction and emit
+/// `ContinueAsNew` where the resumed live worker, seeing the extended deadline,
+/// did not. A sampled execution is non-terminal by definition, so its recorded
+/// history can never contain that command: the gate reports a divergence the
+/// candidate build did not cause and goes falsely red.
+///
+/// Calling this *after* the history load is therefore not merely a narrower
+/// window — it flips the residual READ COMMITTED race into the safe direction. A
+/// deadline fresher than the history makes the checkpoint **less** likely to
+/// fire, which always matches a history carrying no `ContinueAsNew`.
+///
+/// `execution_timeout` is re-read alongside it because it is the fallback the
+/// same deadline branch uses; it is not known to be mutated after start, but
+/// reading both from one row is cheaper to reason about than justifying why one
+/// of the pair is exempt.
+async fn reload_execution_deadline(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> Result<
+    Option<(
+        Option<chrono::Duration>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )>,
+    diesel::result::Error,
+> {
+    use autumn_harvest::schema::harvest_workflow_executions::dsl;
+
+    dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .select((dsl::execution_timeout, dsl::deadline_at))
+        .first::<(
+            Option<chrono::Duration>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        )>(conn)
+        .await
+        .optional()
+}
+
 async fn export_history_candidate(
     pool: &HarvestDbPool,
     candidate: &HistoryExportCandidate,
@@ -33546,7 +33596,44 @@ async fn export_history_candidate(
             return;
         }
     };
-    match export_history_for_candidate(candidate, history.events, query, decoder, outcome) {
+    // Read *after* the history (see `reload_execution_deadline`): pairing a
+    // newer history with the discovery-time deadline is what makes the gate
+    // falsely red, and reading last flips the residual race the safe way.
+    let refreshed = match reload_execution_deadline(&mut conn, exec_id).await {
+        Ok(Some((execution_timeout, deadline_at))) => {
+            let mut refreshed = candidate.clone();
+            refreshed.execution_timeout = execution_timeout;
+            refreshed.deadline_at = deadline_at;
+            refreshed
+        }
+        // The row vanished between the two reads — retention collected the
+        // execution *and* its events in one transaction, so the history in hand
+        // describes something that no longer exists. Fail the candidate rather
+        // than shipping a fixture for it: `export_failures` then blocks the gate
+        // at rung 2 instead of letting a silently biased bundle exit 0.
+        Ok(None) => {
+            work.note_dropped_candidate(
+                shard_id,
+                &exec_id,
+                "execution row disappeared between its history load and deadline refresh",
+            );
+            return;
+        }
+        // Same treatment as the history-load error immediately above: a
+        // candidate we selected but cannot export soundly is a failure, not a
+        // silent omission.
+        Err(error) => {
+            work.failures.push(HistoryExportFailure {
+                execution_id: Some(exec_id.to_string()),
+                shard_id,
+                reason: format!("failed to refresh execution deadline: {error}"),
+                actual_bytes: None,
+                max_bytes: None,
+            });
+            return;
+        }
+    };
+    match export_history_for_candidate(&refreshed, history.events, query, decoder, outcome) {
         Ok(document) => work.exports.push(document),
         Err(HistoryExportError::SizeLimitExceeded {
             actual_bytes,
@@ -42731,6 +42818,126 @@ mod tests {
         autumn_web::migrate::run_pending(&database_url, autumn_harvest::MIGRATIONS)
             .expect("failed to run Harvest migrations");
         Some((database_url, container))
+    }
+
+    // ── #798 round 14: the exported deadline is re-read, never trusted ──────
+
+    /// Candidate discovery and the per-candidate history fetch are separate
+    /// round-trips, and `deadline_at` moves in between when a `PAUSED`
+    /// execution resumes (#383 shifts it forward by the pause span). A fixture
+    /// carrying the stale, *earlier* value reports less remaining budget than
+    /// the live worker saw, so `should_continue_as_new()` (#772) can fire in
+    /// replay and emit a `ContinueAsNew` the recorded history cannot contain —
+    /// a false divergence that blocks an unchanged candidate build.
+    ///
+    /// This drives the export with a candidate whose deadline is deliberately
+    /// wrong. The exported document must carry the row's *current* value, which
+    /// is only true if the export re-reads it rather than trusting the
+    /// discovery-time copy.
+    #[tokio::test]
+    async fn the_exported_deadline_is_re_read_not_taken_from_the_stale_candidate() {
+        let Some((database_url, _container)) = setup_workflow_result_database().await else {
+            return;
+        };
+        let pool = workflow_result_test_pool(&database_url);
+        let mut conn = pool.get().await.expect("conn");
+
+        let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+        // Unique per run: the active-uniqueness index spans
+        // (workflow_name, workflow_id) and this row is left RUNNING.
+        let workflow_id = format!("deadline-{exec_id}");
+        // Whole seconds: Postgres `timestamptz` is microsecond-precision, so a
+        // nanosecond-precision `Utc::now()` would not round-trip exactly and the
+        // comparison below would fail on precision rather than on staleness.
+        let started_at = chrono::DateTime::from_timestamp(
+            (chrono::Utc::now() - chrono::Duration::hours(2)).timestamp(),
+            0,
+        )
+        .expect("valid timestamp");
+        // The value a resume left behind: an hour further out than discovery saw.
+        let fresh_deadline = started_at + chrono::Duration::hours(3);
+        let fresh_timeout = chrono::Duration::hours(3);
+
+        diesel::sql_query(
+            "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, run_id, shard_id, state, input, \
+              queue_name, started_at, execution_timeout, deadline_at, workflow_attempt) \
+             VALUES ($1, 'deadline_wf', $5, gen_random_uuid(), 0, 'RUNNING', \
+                     '{}'::jsonb, 'default', $2, $3, $4, 1)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(started_at)
+        .bind::<diesel::sql_types::Interval, _>(fresh_timeout)
+        .bind::<diesel::sql_types::Timestamptz, _>(fresh_deadline)
+        .bind::<diesel::sql_types::Text, _>(workflow_id.clone())
+        .execute(&mut conn)
+        .await
+        .expect("insert execution");
+
+        autumn_harvest::store::append_events(
+            &mut conn,
+            exec_id,
+            &[autumn_harvest::WorkflowEvent::workflow_started(
+                serde_json::json!({}),
+                started_at,
+            )],
+            1,
+        )
+        .await
+        .expect("append history");
+
+        // What discovery captured *before* the resume: an hour too early.
+        let stale_deadline = fresh_deadline - chrono::Duration::hours(1);
+        let candidate = HistoryExportCandidate {
+            id: exec_id.as_uuid(),
+            workflow_name: "deadline_wf".to_string(),
+            workflow_id: workflow_id.clone(),
+            shard_id: 0,
+            state: "RUNNING".to_string(),
+            last_history_event_at: started_at,
+            execution_timeout: Some(fresh_timeout),
+            deadline_at: Some(stale_deadline),
+            parent_id: None,
+            context_headers: None,
+            queue_name: "default".to_string(),
+        };
+
+        let mut work = HistoryBatchExportWork::default();
+        let mut outcome = LossyDecodeOutcome::default();
+        export_history_candidate(
+            &HarvestDbPool::single(pool.clone()),
+            &candidate,
+            &HistoryExportQuery {
+                payload_policy: autumn_harvest::HistoryPayloadPolicy::Full,
+                max_bytes: autumn_harvest::DEFAULT_HISTORY_EXPORT_MAX_BYTES,
+            },
+            &mut work,
+            None,
+            &mut outcome,
+        )
+        .await;
+
+        assert!(
+            work.failures.is_empty(),
+            "export must succeed: {:?}",
+            work.failures
+        );
+        assert_eq!(work.exports.len(), 1, "exactly one document expected");
+        // Indexed rather than `.first()`: `use super::*` pulls diesel's
+        // `FirstDsl` into scope and it wins method resolution on a `Vec`.
+        let document = &work.exports[0];
+        assert_eq!(
+            document.deadline_at,
+            Some(fresh_deadline),
+            "the fixture must carry the row's CURRENT deadline; carrying the stale \
+             discovery-time value makes should_continue_as_new() fire in replay and \
+             falsely blocks an unchanged candidate"
+        );
+        assert_ne!(
+            document.deadline_at,
+            Some(stale_deadline),
+            "the stale candidate value must not survive into the fixture"
+        );
     }
 
     #[test]
