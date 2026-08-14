@@ -146,11 +146,13 @@ needs to act:
 |---|---|
 | `total` / `succeeded` | Fixtures replayed, and how many were clean. |
 | `diverged` | `Vec<ReplayDrift>` — one per drifting execution, each carrying `execution_id`, `workflow_name`, `kind: NonDeterminismKind`, and `first_divergence`. |
-| `blocked` | Fixtures the harness could not evaluate (unparseable, or an unregistered workflow type). |
+| `blocked` | Fixtures the harness could not evaluate (unparseable, an unregistered workflow type, a redacted export, or offloaded payload references). |
 | `skipped` | Orphan fixtures, when `allow_unregistered(true)` is set. |
 | `coverage` | The parsed `SampleManifest`, when the bundle carries one. |
 | `is_clean()` | `exit_code() == 0`. Always agrees with `exit_code()`. |
 | `exit_code()` | See the table below. |
+| `zero_coverage_types()` | Workflow types the manifest reports as having in-flight work but sampled **zero** times. |
+| `fixture_count_disagrees_with_manifest()` | The bundle holds a different number of fixtures than the manifest declares. |
 
 ### Exit codes
 
@@ -158,14 +160,33 @@ needs to act:
 |---|---|
 | `0` | Clean — promote. |
 | `1` | At least one execution diverged. **Do not promote.** |
-| `2` | A fixture blocked the gate (unparseable, or an unregistered workflow type). Dominates `1`. |
-| `3` | The bundle was **empty** and `allow_empty_bundle(false)` (the default). |
-| `4` | `require_complete_coverage(true)` and complete coverage was not proven — the manifest reports partial shard coverage, **or** the bundle carries no readable manifest. |
+| `2` | The gate could not fully run. Dominates `1`. Either a fixture blocked it (unparseable, an unregistered workflow type, a redacted bundle, or a fixture carrying offloaded payload references) **or** the bundle holds a different number of fixtures than its manifest declares. |
+| `3` | Nothing was verified and `allow_empty_bundle(false)` (the default) — the bundle was empty, **or** every fixture in it was skipped. |
+| `4` | `require_complete_coverage(true)` and complete coverage was not proven — the manifest reports partial shard coverage, the bundle carries no readable manifest, **or** a workflow type with in-flight work was sampled zero times. |
+
+Rungs `2`, `3` and `4` all exist for the same reason: a gate that reports green
+having verified less than you think is worse than no gate. Each is a distinct way
+that can happen, so each names the concrete fix in the report body rather than
+collapsing into a bare non-zero.
+
+Exit `2` covers a bundle the gate cannot *honestly evaluate*, and reports it as a
+harness error rather than drift. A redacted export and a fixture carrying
+large-payload claim-check envelopes ([issue #524](https://github.com/autumn-foundation/autumn-harvest/issues/524))
+would both compare the candidate's real inputs against stand-in values and report
+a determinism regression that does not exist — a false red on a clean deploy. Re-export
+with `--payload-policy full`, and either sample a workflow whose payloads stay under
+the offload threshold or raise `payload_offload_threshold` for the exported window.
+A fixture count that disagrees with the manifest means files went missing after the
+export (a truncated artifact upload, a partial copy): every surviving fixture may
+replay cleanly while the gate certifies a strict subset of what was sampled.
 
 Exit code `3` is deliberate. A gate that passes because it pointed at an empty
 or mistyped directory is worse than no gate at all — it reports green having
-verified nothing. If your fleet is legitimately idle (a fresh environment,
-a pre-production deploy window), opt out explicitly:
+verified nothing. The same applies when every fixture was *skipped*: with
+`allow_unregistered(true)` set and none of the sampled types registered on the
+gate binary, the bundle is non-empty but no workflow ran. If your fleet is
+legitimately idle (a fresh environment, a pre-production deploy window), opt out
+explicitly:
 
 ```rust
 ReplayVerifier::new()
@@ -178,7 +199,11 @@ ReplayVerifier::new()
 Exit code `4` is the opposite knob: turn it on when a partial cross-shard read
 must not count as a pass. It **fails closed** — a bundle carrying no readable
 manifest at all also exits `4`, because "complete coverage was not proven" is
-the honest reading of missing evidence:
+the honest reading of missing evidence. It also catches a subtler hole: a
+workflow type the manifest reports as having in-flight work but **zero** sampled
+fixtures (starved by the global sample cap, say). Every fixture present replays
+clean and the shard status reads `complete`, so nothing else notices that an
+entire workflow type went unverified:
 
 ```rust
 ReplayVerifier::new()
@@ -187,6 +212,24 @@ ReplayVerifier::new()
     .replay_bundle(&dir)
     .await
 ```
+
+### Match the deployment's history policy
+
+`continue_as_new_threshold` is a **deployment** setting, and a workflow branching
+on `ctx.should_continue_as_new()` takes a different path under a different
+threshold. Replaying with the default while your fleet runs another value tests
+code your fleet never executes, so pass the same policy the deployment uses:
+
+```rust
+ReplayVerifier::new()
+    .register(workflows![billing_checkout, onboarding])
+    .with_history_policy(deployment_history_policy())   // the same value HarvestBuilder gets
+    .replay_bundle(&dir)
+    .await
+```
+
+`WorkflowReplayer::with_history_policy` carries through to `replay_bundle` too,
+so a caller that already holds a configured replayer keeps its policy.
 
 ---
 
