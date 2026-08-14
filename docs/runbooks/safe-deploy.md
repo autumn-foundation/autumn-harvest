@@ -327,10 +327,16 @@ old pods failing perfectly good new-build work.
 |---|---|---|
 | `harvest.task.capability_miss{outcome="released"}` rising, then falling to zero | Normal deploy skew, self-healing | None. Confirm it returns to zero once the rollout completes. |
 | `harvest.task.capability_miss{outcome="released"}` sustained past the rollout | Some pods are stuck on the old build, or the new handler never shipped to part of the fleet | Finish/roll back the deploy; check the fleet's build IDs. |
-| `harvest.task.capability_miss{outcome="escalated"}` non-zero | **No live worker on that queue registers the handler.** Executions are now failing. | Page. Ship the handler, or accept the failures deliberately. |
+| `harvest.task.capability_miss{outcome="escalated"}` non-zero | **No live worker on that queue registers the handler.** The task was offered around the queue for its whole redelivery budget and nobody took it. Executions are now failing. | Page. Ship the handler, or accept the failures deliberately. |
+| `harvest.task.capability_miss{outcome="escalated_never_offered"}` non-zero | Executions are failing, but the task was failed on its **first** claim after **zero** releases — either `capability_miss_max_redeliveries = 0`, or a worker-session pin (#606) whose host lacks the handler. **This is not evidence the fleet lacks the handler**; a capable worker may be live and idle the whole time. | Ticket. Read the `no_capable_worker:` reason on a failed execution — its parenthetical names which of the two causes applies. |
 
-The alert `harvest_no_capable_worker` (starter pack) fires on the escalation
-signal; see [`harvest-alerts.md`](harvest-alerts.md#harvest_no_capable_worker)
+The two escalation outcomes are deliberately separate label values because they
+carry **opposite** conclusions. `escalated` is fleet evidence and fires the
+page-severity `harvest_no_capable_worker`; `escalated_never_offered` is evidence
+about one config knob or one task's pin and fires the ticket-severity
+`harvest_capability_miss_never_offered`. See
+[`harvest-alerts.md`](harvest-alerts.md#harvest_no_capable_worker) and
+[`harvest_capability_miss_never_offered`](harvest-alerts.md#harvest_capability_miss_never_offered)
 for the full triage.
 
 ### Sizing the budget

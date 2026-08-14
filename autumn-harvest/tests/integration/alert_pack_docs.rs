@@ -26,6 +26,7 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_workflow_history_bloat",
     "harvest_scanner_stalled",
     "harvest_no_capable_worker",
+    "harvest_capability_miss_never_offered",
     "harvest_capability_miss_release_sustained",
 ];
 
@@ -495,6 +496,51 @@ fn capability_miss_released_outcome_never_pages() {
         "the page-severity capability-miss rule must still page on escalation: {paging:?}"
     );
 
+    // Half 1b: ...and must page ONLY on true budget exhaustion. Two escalation
+    // causes fail the execution on its FIRST claim after ZERO releases -- a
+    // `capability_miss_max_redeliveries = 0` config, and a task pinned to a
+    // worker session (#606) whose host lacks the handler. Neither supports this
+    // rule's whole narrative ("no live worker on this queue registers the
+    // handler"): a capable peer may be live and idle on the queue the entire
+    // time, and this rule's `first_action` sends on-call to
+    // `GET /admin/workflow-types/reachability`, which then reports `in_use` and
+    // contradicts the page they are holding.
+    //
+    // They record `outcome="escalated_never_offered"` for that reason. PromQL
+    // `=` is exact string equality, so the selector above already excludes it --
+    // pin that a future regex/prefix matcher (`outcome=~"escalated.*"`) cannot
+    // silently re-conflate them.
+    assert!(
+        paging
+            .iter()
+            .all(|expr| !expr.contains("escalated_never_offered")),
+        "the page-severity rule must not select the never-offered outcome: those \
+         tasks were failed without ever being offered to a peer, so they are not \
+         evidence the fleet lacks the handler: {paging:?}"
+    );
+    assert!(
+        paging.iter().all(|expr| !expr.contains("=~")),
+        "the escalation selector must stay an exact match: a regex matcher on \
+         `outcome` would re-admit escalated_never_offered into the page: {paging:?}"
+    );
+
+    // Half 1c: ...but the never-offered escalations must not be SILENT either --
+    // they fail executions. They get their own ticket-severity rule.
+    let never_offered = rule_exprs("harvest_capability_miss_never_offered");
+    assert!(
+        never_offered
+            .iter()
+            .any(|expr| expr.contains("outcome=\"escalated_never_offered\"")),
+        "the never-offered rule must select its own outcome: {never_offered:?}"
+    );
+    assert!(
+        never_offered
+            .iter()
+            .all(|expr| !expr.contains("outcome=\"escalated\"")),
+        "...and must not double-count the budget-exhausted escalations the \
+         paging rule already owns: {never_offered:?}"
+    );
+
     // Half 2: the sustained-release rule must hold, not fire on a single sample.
     let sustained = rule_exprs("harvest_capability_miss_release_sustained");
     let expr = sustained
@@ -514,6 +560,35 @@ fn capability_miss_released_outcome_never_pages() {
         !expr.contains("increase("),
         "an increase(...[15m]) > 0 form fires on a single release anywhere in the window -- i.e. \
          on every routine deploy -- which is exactly what this rule exists not to do: {expr}"
+    );
+
+    // Half 2b: `min_over_time` alone does NOT deliver the 15m hold it looks
+    // like it does. Prometheus range functions skip subquery steps that have no
+    // sample rather than treating them as zero, so on a series that was CREATED
+    // by this very deploy -- the exact scenario, since a brand-new
+    // (queue, task_type) capability-miss series appears the first time a new
+    // handler is rolled out -- the earlier steps are simply absent and the min
+    // is taken over only the few samples that exist. A routine deploy with one
+    // release burst then satisfies `== 1` within ~3 minutes (a 5m `rate` stays
+    // positive for 5m after the last release), firing the very ticket this rule
+    // was split out to suppress.
+    //
+    // The window must therefore also be asserted PRESENT, not just positive.
+    assert!(
+        expr.contains("count_over_time("),
+        "min_over_time over a subquery silently ignores steps with no sample, so a \
+         newly-created series can satisfy it in minutes; the expression must also \
+         require a full 15m of samples (count_over_time(...) >= 15): {expr}"
+    );
+    assert!(
+        expr.contains(">= 15"),
+        "the presence guard must require the whole 15m window (>= 15 one-minute \
+         steps), otherwise it is not a hold: {expr}"
+    );
+    // Both halves are load-bearing and must be ANDed, not alternatives.
+    assert!(
+        expr.contains(" and "),
+        "the positivity and presence guards must both hold: {expr}"
     );
 }
 

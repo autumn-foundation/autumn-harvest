@@ -1046,10 +1046,48 @@
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_no_capable_worker"
     },
     {
+      "id": "harvest_capability_miss_never_offered",
+      "status": "enforceable",
+      "signal_source": "ADR-0001/#138 counter harvest.task.capability_miss{queue, task_type, outcome} (issue #804).",
+      "default_threshold": "Ticket on ANY non-zero rate of outcome=escalated_never_offered over 5m.",
+      "severity": "ticket",
+      "owner_persona": "release on-call",
+      "description": "A capability miss (issue #804) escalated on the task's FIRST claim, failing the execution without ever offering it to a peer. Two causes reach this, and the `no_capable_worker:` reason on the execution row names which: (a) WorkerConfig::capability_miss_max_redeliveries is 0 -- the documented pre-#804 fail-fast rollback switch, so any capability skew fails executions immediately; or (b) the task is pinned to a worker session (issue #606) whose host does not register the handler, and the claim gate (session_id IS NULL OR sticky_worker_id) means no other worker can ever claim it. Deliberately NOT the page-severity harvest_no_capable_worker: because the task was released ZERO times, this is NOT evidence that the fleet lacks the handler -- a capable worker may be live and idle on the queue the whole time. Executions ARE failing, so it is not silent either; it is a ticket because the cause is one config knob or one task's pin rather than a fleet-wide capability gap, and one of the two is a switch an operator deliberately flipped.",
+      "first_action": "Read the `error` column of a failed execution (GET /api/harvest/workflows?state=FAILED, grep `no_capable_worker:`): the parenthetical names the cause -- either `capability-miss redelivery is disabled` or `pinned to worker session {id}`. Do NOT start from workflow-types/reachability here; `in_use` is the EXPECTED answer and does not contradict this alert.",
+      "dependencies": [
+        {
+          "ref": "#804",
+          "status": "shipped",
+          "surface": "METRIC_TASK_CAPABILITY_MISS / harvest.task.capability_miss{queue, task_type, outcome}"
+        },
+        {
+          "ref": "#606",
+          "status": "shipped",
+          "surface": "worker sessions -- harvest_task_queue.session_id hard-pins a task to its acquiring host"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "outcome is bounded to exactly released|escalated|escalated_never_offered. This rule owns the never-offered value ONLY; the fleet-exhaustion page (harvest_no_capable_worker) selects outcome=\"escalated\" with an exact matcher, so the two cannot overlap. Keep the matcher exact: an `outcome=~\"escalated.*\"` regex on either rule would re-conflate them and page on a cause that carries the opposite conclusion.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (queue, task_type) (increase(harvest_task_capability_miss_total{outcome=\"escalated_never_offered\"}[5m])) > 0"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/workflows?state=FAILED (the no_capable_worker: reason names the cause; these runs are NOT dead-lettered)",
+        "GET /api/harvest/admin/config (confirm the effective capability_miss_max_redeliveries -- 0 disables redelivery entirely)",
+        "GET /api/harvest/workers (for the session-pinned cause, find the host holding the session and confirm which build it runs)"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_capability_miss_never_offered"
+    },
+    {
       "id": "harvest_capability_miss_release_sustained",
       "status": "enforceable",
       "signal_source": "ADR-0001/#138 counter harvest.task.capability_miss{queue, task_type, outcome} (issue #804).",
-      "default_threshold": "released rate continuously non-zero for 15m",
+      "default_threshold": "released rate continuously non-zero across a FULL 15m window (>= 15 one-minute samples, all positive)",
       "severity": "ticket",
       "owner_persona": "release on-call",
       "description": "Tasks are being repeatedly released for a capability miss (issue #804) and have been for a sustained window. A brief burst of released samples is the EXPECTED, self-healing signature of a rolling deploy that introduces a new workflow or activity type: the claim is handed back for a capable peer and no execution is failed. Sustained releases mean the skew is not resolving \u2014 a rollout stalled or was rolled back halfway, a heterogeneous pool permanently lacks the handler on some pods, or the capable pod set is too small. Nothing is failing yet (that is harvest_no_capable_worker, which pages), but every released task is paying a backoff interval of added latency, and the redelivery budget is being consumed. Ticket, not a page.",
@@ -1073,11 +1111,11 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "SUSTAINED, not any-single-event. The pack schema carries no `for:` field, so the hold lives in the expression: the subquery asserts the released rate was non-zero at EVERY 1m step across the 15m window. An `increase(...[15m]) > 0` form would instead fire on a single release anywhere in the window \u2014 i.e. on every routine deploy \u2014 which is exactly what this rule must not do.",
+        "notes": "SUSTAINED, not any-single-event. The pack schema carries no `for:` field, so the hold lives in the expression, and it needs BOTH halves. min_over_time asserts the released rate was non-zero at every 1m step; count_over_time asserts the window is actually FULL. The second half is not redundant: Prometheus range functions skip subquery steps that have no sample rather than reading them as zero, so on a series created by this very deploy (the normal case -- a new (queue, task_type) capability-miss series appears the first time a new handler rolls out) min_over_time would be taken over only the handful of samples that exist and could be satisfied within ~3 minutes, firing on the routine deploy this rule exists to ignore. An `increase(...[15m]) > 0` form is worse still: it fires on a single release anywhere in the window.",
         "expressions": [
           {
             "kind": "promql",
-            "expr": "min_over_time((sum by (queue, task_type) (rate(harvest_task_capability_miss_total{outcome=\"released\"}[5m])) > bool 0)[15m:1m]) == 1"
+            "expr": "min_over_time((sum by (queue, task_type) (rate(harvest_task_capability_miss_total{outcome=\"released\"}[5m])) > bool 0)[15m:1m]) == 1 and count_over_time((sum by (queue, task_type) (rate(harvest_task_capability_miss_total{outcome=\"released\"}[5m])) > bool 0)[15m:1m]) >= 15"
           }
         ]
       },

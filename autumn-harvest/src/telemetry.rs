@@ -500,8 +500,9 @@ pub const METRIC_TASK_QUARANTINED: &str = "harvest.task.quarantined";
 ///   `workflow` / `activity`; note a *local-activity* or activity-scheduling miss
 ///   is raised while processing a **workflow** task, so it reports
 ///   `task_type="workflow"` — the log line carries the handler kind separately).
-/// - `outcome` (= [`METRIC_LABEL_OUTCOME`]): [`CAPABILITY_MISS_OUTCOME_RELEASED`]
-///   or [`CAPABILITY_MISS_OUTCOME_ESCALATED`] (bounded).
+/// - `outcome` (= [`METRIC_LABEL_OUTCOME`]): [`CAPABILITY_MISS_OUTCOME_RELEASED`],
+///   [`CAPABILITY_MISS_OUTCOME_ESCALATED`], or
+///   [`CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED`] (bounded).
 ///
 ///
 /// The `outcome` dimension is a deliberate bounded **superset** of the label
@@ -520,12 +521,45 @@ pub const METRIC_TASK_CAPABILITY_MISS: &str = "harvest.task.capability_miss";
 /// released back to `PENDING` for a capable peer to pick up (issue #804).
 pub const CAPABILITY_MISS_OUTCOME_RELEASED: &str = "released";
 
-/// `outcome` label value on [`METRIC_TASK_CAPABILITY_MISS`]: escalated.
+/// `outcome` label value on [`METRIC_TASK_CAPABILITY_MISS`]: escalated after
+/// the redelivery budget was **exhausted** (issue #804).
 ///
-/// The redelivery budget was exhausted and the task fell through to the
-/// terminal-failure / dead-letter path with a `no_capable_worker:` reason
-/// (issue #804).
+/// This is the *fleet-exhaustion* signal, and the only escalation cause that
+/// supports the conclusion "no live worker on this queue registers the
+/// handler": the task was offered to peers
+/// `WorkerConfig::capability_miss_max_redeliveries` times, with capped
+/// exponential backoff between each, and no capable worker ever claimed it.
+/// It is what the page-severity `harvest_no_capable_worker` rule selects.
+///
+/// Escalations where the task was **never offered to a peer at all** report
+/// [`CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED`] instead — see there for
+/// why conflating the two is an operator-misdirection bug, not a cosmetic one.
 pub const CAPABILITY_MISS_OUTCOME_ESCALATED: &str = "escalated";
+
+/// `outcome` label value on [`METRIC_TASK_CAPABILITY_MISS`]: escalated on the
+/// **first** claim, without the task ever having been offered to a peer
+/// (issue #804).
+///
+/// Two configurations reach this, both of which fail the execution after
+/// **zero** releases:
+///
+/// - `capability_miss_max_redeliveries = 0` — the documented pre-#804
+///   fail-fast rollback switch.
+/// - The task is pinned to a worker session (issue #606) whose host does not
+///   register the handler. Releasing it "for a capable peer" is false by
+///   construction: the claim gate `session_id IS NULL OR sticky_worker_id = $1`
+///   means no other worker can ever claim it.
+///
+/// Kept separate from [`CAPABILITY_MISS_OUTCOME_ESCALATED`] because the two
+/// carry **opposite** operator conclusions. Budget exhaustion is evidence about
+/// the *fleet*; a never-offered escalation is evidence about one config knob or
+/// one task's pin, and a capable worker may well be live and idle on the queue
+/// the whole time. Recording both under one value would page
+/// `harvest_no_capable_worker`, whose `first_action` sends on-call to
+/// `GET /admin/workflow-types/reachability` — which returns `in_use` and
+/// directly contradicts the page — and whose runbook would advise raising a
+/// budget that provably cannot help either cause.
+pub const CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED: &str = "escalated_never_offered";
 
 /// Counter: incremented each time an activity's circuit breaker trips open
 /// (closed → open) or re-opens after a failed half-open probe (issue #369).
@@ -2470,7 +2504,11 @@ pub trait MetricsRecorder: Send + Sync {
     /// `harvest.task.capability_miss{queue, task_type, outcome}`.
     ///
     /// `task_type` is `"workflow"` / `"activity"`; `outcome` is
-    /// [`CAPABILITY_MISS_OUTCOME_RELEASED`] / [`CAPABILITY_MISS_OUTCOME_ESCALATED`].
+    /// [`CAPABILITY_MISS_OUTCOME_RELEASED`],
+    /// [`CAPABILITY_MISS_OUTCOME_ESCALATED`] (budget exhausted — the
+    /// fleet-exhaustion signal that pages), or
+    /// [`CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED`] (failed on the first
+    /// claim without ever being offered to a peer).
     /// All three labels are bounded; per ADR-0001 §7 `execution.id` is never a
     /// metric label (and is not a parameter here, so it cannot become one).
     fn record_task_capability_miss(&self, queue: &str, task_type: &str, outcome: &str) {
@@ -4377,13 +4415,31 @@ mod tests {
         // (`harvest.schedule.fire_attempts{outcome}`,
         // `harvest.workflow.terminal{outcome}`).
         //
-        // Exactly two values, both compile-time constants — no caller-supplied
+        // Exactly three values, all compile-time constants — no caller-supplied
         // string can widen the cardinality.
         assert_eq!(CAPABILITY_MISS_OUTCOME_RELEASED, "released");
         assert_eq!(CAPABILITY_MISS_OUTCOME_ESCALATED, "escalated");
-        assert_ne!(
+        assert_eq!(
+            CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED,
+            "escalated_never_offered"
+        );
+
+        let all = [
             CAPABILITY_MISS_OUTCOME_RELEASED,
-            CAPABILITY_MISS_OUTCOME_ESCALATED
+            CAPABILITY_MISS_OUTCOME_ESCALATED,
+            CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED,
+        ];
+        let distinct: std::collections::BTreeSet<&str> = all.iter().copied().collect();
+        assert_eq!(distinct.len(), all.len(), "outcome values must be distinct");
+
+        // PromQL `=` is exact string equality, so the paging rule's
+        // `outcome="escalated"` selector excludes the never-offered value ONLY
+        // while that value is not itself `escalated`. Pin the non-prefix
+        // relationship the alert pack depends on: a future rename to something
+        // like `escalated` + a suffix matcher would silently re-conflate them.
+        assert_ne!(
+            CAPABILITY_MISS_OUTCOME_ESCALATED,
+            CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED
         );
     }
 

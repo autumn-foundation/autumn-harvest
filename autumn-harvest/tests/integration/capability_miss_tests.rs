@@ -55,8 +55,8 @@ use autumn_harvest::schema::{
     harvest_dead_letters, harvest_task_queue, harvest_workflow_executions,
 };
 use autumn_harvest::telemetry::{
-    CAPABILITY_MISS_OUTCOME_ESCALATED, CAPABILITY_MISS_OUTCOME_RELEASED, MetricsRecorder,
-    TelemetryConfig,
+    CAPABILITY_MISS_OUTCOME_ESCALATED, CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED,
+    CAPABILITY_MISS_OUTCOME_RELEASED, MetricsRecorder, TelemetryConfig,
 };
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{
@@ -1066,7 +1066,7 @@ async fn session_pinned_capability_miss_escalates_immediately() {
     );
 
     assert_eq!(
-        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED),
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED),
         1,
         "the pinned task escalates on the first miss"
     );
@@ -1074,6 +1074,22 @@ async fn session_pinned_capability_miss_escalates_immediately() {
         metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_RELEASED),
         0,
         "a session-pinned task must never be released: no peer can claim it"
+    );
+
+    // The metric must agree with the reason string, or the page and the error
+    // column tell an operator two different stories. `harvest_no_capable_worker`
+    // is severity `page` and selects `outcome="escalated"` exactly; its whole
+    // narrative is "no live worker on this queue registers the handler", which
+    // the reason above explicitly refuses to claim for a pinned task. Recording
+    // the paging value here would page on-call and then send them to
+    // `GET /admin/workflow-types/reachability`, which reports `in_use` and
+    // contradicts the page they are holding.
+    assert_eq!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED),
+        0,
+        "a session-pinned escalation must NOT record the fleet-exhaustion value \
+         that pages harvest_no_capable_worker: the task was never offered to a \
+         peer, so it is not evidence the fleet lacks the handler"
     );
 }
 

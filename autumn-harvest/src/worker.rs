@@ -3979,6 +3979,30 @@ impl EscalationCause {
             None => Self::BudgetExhausted,
         }
     }
+
+    /// The `outcome` label value this cause records on
+    /// [`crate::telemetry::METRIC_TASK_CAPABILITY_MISS`].
+    ///
+    /// The split is by **operator conclusion**, not by cause count. Budget
+    /// exhaustion is the only cause that actually offered the task around the
+    /// queue (`capability_miss_max_redeliveries` times, with backoff between
+    /// each), so it is the only one that supports "no live worker on this queue
+    /// registers the handler" — the conclusion the page-severity
+    /// `harvest_no_capable_worker` rule exists to assert.
+    ///
+    /// The other two escalate on the FIRST claim after zero releases, where a
+    /// capable worker may be live and idle on the queue the whole time. They
+    /// share one value because they share that conclusion (and the recovery:
+    /// reset the named executions); the reason string on the execution row is
+    /// what tells the two apart during triage.
+    const fn outcome_label(self) -> &'static str {
+        match self {
+            Self::BudgetExhausted => crate::telemetry::CAPABILITY_MISS_OUTCOME_ESCALATED,
+            Self::ZeroBudgetFailFast | Self::SessionPinned(_) => {
+                crate::telemetry::CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED
+            }
+        }
+    }
 }
 
 /// Build the terminal error recorded when a capability miss escalates
@@ -14670,6 +14694,10 @@ async fn handle_capability_miss(
             Ok(TaskDispatchOutcome::Released)
         }
         CapabilityMissAction::Escalate => {
+            // Resolve the cause ONCE and derive the reason string, the metric
+            // label, and the log line from it, so the three can never tell an
+            // operator different stories about the same escalation.
+            let cause = EscalationCause::resolve(max_redeliveries, task.session_id);
             let reason = no_capable_worker_reason(&detail, max_redeliveries, task.session_id);
             // Recorded BEFORE the terminal write, deliberately. This counter is
             // what the page-severity `harvest_no_capable_worker` rule selects
@@ -14684,10 +14712,14 @@ async fn handle_capability_miss(
             // final by the time it is emitted. A stranded row is re-claimed
             // later and escalates again, so the counter is at-least-once rather
             // than exactly-once — the right trade for a paging signal.
+            //
+            // The label is cause-specific: only budget exhaustion actually
+            // offered the task around the queue, so only it may page the
+            // fleet-exhaustion rule. See `EscalationCause::outcome_label`.
             metrics.record_task_capability_miss(
                 &task.queue_name,
                 &task.task_type,
-                crate::telemetry::CAPABILITY_MISS_OUTCOME_ESCALATED,
+                cause.outcome_label(),
             );
             fail_task_and_execution(conn, task, worker_id, &reason).await?;
             // The message must match the branch, not just carry a field naming
@@ -14695,10 +14727,16 @@ async fn handle_capability_miss(
             // no capable worker (see `no_capable_worker_reason`), and logging it
             // as such sends whoever is reading logs after a page to look for a
             // missing deploy that may not exist.
-            let message = if task.session_id.is_some() {
-                "escalated task: pinned to a worker session whose host does not register the handler"
-            } else {
-                "escalated task: no capable worker on this queue registers the handler"
+            let message = match cause {
+                EscalationCause::SessionPinned(_) => {
+                    "escalated task: pinned to a worker session whose host does not register the handler"
+                }
+                EscalationCause::ZeroBudgetFailFast => {
+                    "escalated task: capability-miss redelivery is disabled (capability_miss_max_redeliveries = 0), so the task was never offered to a peer"
+                }
+                EscalationCause::BudgetExhausted => {
+                    "escalated task: no capable worker on this queue registers the handler"
+                }
             };
             tracing::error!(
                 task_id = %task.id,
@@ -14710,6 +14748,7 @@ async fn handle_capability_miss(
                 max_redeliveries,
                 session_pinned = task.session_id.is_some(),
                 session_id = ?task.session_id,
+                outcome = cause.outcome_label(),
                 "{message}"
             );
             Err(HarvestError::HandlerNotRegistered {
@@ -22089,6 +22128,86 @@ mod tests {
              pinned task, so the pin is the actionable cause: {both}"
         );
         assert!(!both.contains(ZERO_BUDGET_ESCALATION_MARKER), "{both}");
+    }
+
+    /// The cause-specific *reason string* is not enough on its own: the paging
+    /// signal is the **metric**, and it was still recording one shared
+    /// `outcome="escalated"` for all three causes.
+    ///
+    /// `harvest_no_capable_worker` is severity `page` and its entire narrative
+    /// — description, `first_action`, runbook — is the fleet-wide conclusion
+    /// "no live worker on this queue registers the handler". Recording a
+    /// never-offered escalation under the same label value pages that rule for
+    /// a task that was failed on its FIRST claim without ever being offered to
+    /// a peer, while a capable worker may be live and idle on the queue the
+    /// whole time. On-call is then sent to
+    /// `GET /admin/workflow-types/reachability`, which reports `in_use` and
+    /// contradicts the page they are holding.
+    ///
+    /// So the label must split exactly where the *conclusion* splits: budget
+    /// exhaustion is evidence about the fleet; the other two are evidence about
+    /// one config knob or one task's pin.
+    #[test]
+    fn escalation_cause_outcome_label_separates_never_offered_from_budget_exhaustion() {
+        use crate::telemetry::{
+            CAPABILITY_MISS_OUTCOME_ESCALATED, CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED,
+        };
+
+        // Only budget exhaustion actually offered the task around the queue.
+        assert_eq!(
+            EscalationCause::BudgetExhausted.outcome_label(),
+            CAPABILITY_MISS_OUTCOME_ESCALATED,
+            "budget exhaustion is the fleet-exhaustion signal and keeps the \
+             value the paging rule selects"
+        );
+
+        // Both zero-offer causes report the same, distinct value: they share an
+        // operator conclusion ("this task was never offered to a peer, so draw
+        // no conclusion about the fleet") even though their fixes differ, and
+        // the reason string already tells them apart for whoever triages.
+        assert_eq!(
+            EscalationCause::ZeroBudgetFailFast.outcome_label(),
+            CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED,
+        );
+        assert_eq!(
+            EscalationCause::SessionPinned(uuid::Uuid::new_v4()).outcome_label(),
+            CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED,
+        );
+
+        // The whole point: the paging value must not be reachable from a cause
+        // that released the task zero times.
+        for cause in [
+            EscalationCause::ZeroBudgetFailFast,
+            EscalationCause::SessionPinned(uuid::Uuid::new_v4()),
+        ] {
+            assert_ne!(
+                cause.outcome_label(),
+                CAPABILITY_MISS_OUTCOME_ESCALATED,
+                "{cause:?} never offered the task to a peer, so it must not page \
+                 harvest_no_capable_worker"
+            );
+        }
+
+        // And the label must agree with the reason string's own claim, so the
+        // metric and the error column can never tell an operator two different
+        // stories about the same escalation.
+        let detail = "no activity handler registered for 'transcode'";
+        for (max, session) in [
+            (0_u32, None),
+            (50, Some(uuid::Uuid::new_v4())),
+            (0, Some(uuid::Uuid::new_v4())),
+        ] {
+            let reason = no_capable_worker_reason(detail, max, session);
+            assert!(
+                !reason.contains("no live worker on this queue has the handler"),
+                "reason must not assert the fleet-wide conclusion: {reason}"
+            );
+            assert_eq!(
+                EscalationCause::resolve(max, session).outcome_label(),
+                CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED,
+                "...and the metric must agree with it: {reason}"
+            );
+        }
     }
 
     #[test]

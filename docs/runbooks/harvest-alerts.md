@@ -2039,6 +2039,17 @@ through to the normal terminal-failure path with a stable, greppable
 `no_capable_worker:` reason. Escalation means **no live worker on that queue
 registers the handler at all** — executions are being failed.
 
+That conclusion is only sound because the task was *offered around the queue*
+for its whole budget first. Two escalation causes fail an execution on its
+**first** claim after **zero** releases — a `capability_miss_max_redeliveries = 0`
+config, and a task pinned to a worker session (#606) whose host lacks the
+handler — and for those, a capable worker may be live and idle the entire time.
+They report a **different** outcome value, `escalated_never_offered`, and fire
+the ticket-severity
+[`harvest_capability_miss_never_offered`](#harvest_capability_miss_never_offered)
+instead. This page selects `outcome="escalated"` with an exact matcher, so if
+you are holding it, the fleet-wide conclusion below *is* supported.
+
 **Worker-fleet contract.** All workers polling a given queue should register the
 same handler set. Harvest no longer punishes a *transient* mismatch (it is
 released and retried), but a *durable* one is still fatal, only later and with a
@@ -2050,7 +2061,8 @@ route work.
 | --- | --- | --- |
 | `outcome="released"`, brief burst during a deploy | Capability skew mid-rollout | None — self-heals as the rollout completes |
 | `outcome="released"`, sustained > ~15m | Rollout stalled, or a pod set permanently lacks the handler | Ticket — see [`harvest_capability_miss_release_sustained`](#harvest_capability_miss_release_sustained) |
-| `outcome="escalated"`, any | No capable worker exists; executions failing | Page — see *Triage steps* |
+| `outcome="escalated"`, any | Budget exhausted: no capable worker exists; executions failing | Page — see *Triage steps* |
+| `outcome="escalated_never_offered"`, any | Executions failing, but released **zero** times: a `0` budget, or a session pin. Draw **no** fleet-wide conclusion | Ticket — see [`harvest_capability_miss_never_offered`](#harvest_capability_miss_never_offered) |
 
 Distinct from two adjacent signals, deliberately:
 
@@ -2085,21 +2097,27 @@ Distinct from two adjacent signals, deliberately:
    — it will be empty, and that emptiness is not evidence the alert is spurious.
 
    The `error` distinguishes the **three** escalation causes, which have
-   different fixes — read it before acting on steps 1–3. **Only the first
-   supports a fleet-wide conclusion**; in the other two the task was released
-   *zero* times, so a capable worker may well exist and simply never have been
-   asked, and `reachability` reporting `in_use` at step 1 is expected rather
-   than contradictory:
+   different fixes. **Only the first reaches this alert.** The other two report
+   `outcome="escalated_never_offered"` and fire the ticket-severity
+   [`harvest_capability_miss_never_offered`](#harvest_capability_miss_never_offered)
+   instead — they are listed here so that, if you arrive at a `no_capable_worker:`
+   error from a log or a support ticket rather than from this page, you can tell
+   which alert should have fired and which triage to follow:
 
-   | `error` says | Cause | Fix |
-   | --- | --- | --- |
-   | `escalated after N capability-miss redeliveries; no live worker on this queue has the handler` | The task was genuinely offered around the queue N times and nobody took it. | Deploy the handler / finish the rollout. Steps 1–3 apply as written. |
-   | `escalated immediately after 0 redeliveries: capability-miss redelivery is disabled (capability_miss_max_redeliveries = 0) …` | Redelivery is switched off, so the task was failed on its first claim by a single incapable worker and never offered to a peer. | Raise `capability_miss_max_redeliveries` off `0`. Steps 1–3 may find nothing wrong — this is a config, not a missing deploy. |
-   | `escalated immediately after 0 redeliveries: task is pinned to worker session {id} …` | The task is hard-pinned to one host (#606) and could never be offered to a peer at all. | Go to the pinned host, not the fleet — see *Likely causes*. Raising the budget is a **guaranteed no-op** here. |
+   | `error` says | Cause | Alert | Fix |
+   | --- | --- | --- | --- |
+   | `escalated after N capability-miss redeliveries; no live worker on this queue has the handler` | The task was genuinely offered around the queue N times and nobody took it. | **This page** | Deploy the handler / finish the rollout. Steps 1–3 apply as written. |
+   | `escalated immediately after 0 redeliveries: capability-miss redelivery is disabled (capability_miss_max_redeliveries = 0) …` | Redelivery is switched off, so the task was failed on its first claim by a single incapable worker and never offered to a peer. | Ticket: `harvest_capability_miss_never_offered` | Raise `capability_miss_max_redeliveries` off `0`. Steps 1–3 may find nothing wrong — this is a config, not a missing deploy. |
+   | `escalated immediately after 0 redeliveries: task is pinned to worker session {id} …` | The task is hard-pinned to one host (#606) and could never be offered to a peer at all. | Ticket: `harvest_capability_miss_never_offered` | Go to the pinned host, not the fleet. Raising the budget is a **guaranteed no-op** here. |
 
-   The matching worker log carries a `session_pinned` boolean and, when set, a
+   The matching worker log carries a `session_pinned` boolean, an `outcome`
+   field holding the same value as the metric label, and (when pinned) a
    `session_id`, so the same three-way split is greppable in logs as well as in
    the execution's `error`.
+
+   If this page is firing, you are in row 1 by construction: the alert selects
+   `outcome="escalated"` with an exact matcher. Rows 2–3 are here for
+   cross-reference only.
 
 ### Likely causes
 
@@ -2143,13 +2161,15 @@ Distinct from two adjacent signals, deliberately:
   queue that `reachability` reports as `in_use`, that is the cause — raise
   `capability_miss_max_redeliveries` rather than treating it as a lost handler.
 
-  **Check the `error` first, though.** Escalation on an `in_use` queue has two
-  *other* causes that raising the budget cannot fix, and both say so in the
-  `error` (see the three-cause table in *Triage steps*): a **session-pinned**
-  task, where a larger budget is a guaranteed no-op because the pin bypasses it
-  entirely, and a **zero budget**, where the knob is already the problem.
-  Probabilistic exhaustion is the diagnosis only when the `error` names a
-  non-zero redelivery count.
+  This is the *only* false positive for this alert. The two other causes of an
+  escalation on an `in_use` queue — a **session-pinned** task and a **zero
+  budget**, both of which raising the budget cannot fix — no longer reach this
+  rule at all: they report `outcome="escalated_never_offered"` and fire the
+  ticket-severity
+  [`harvest_capability_miss_never_offered`](#harvest_capability_miss_never_offered).
+  If this page is firing, the `error` names a non-zero redelivery count, so
+  probabilistic exhaustion is the right diagnosis and raising the budget is the
+  right fix.
 
 ### Safe actions
 
@@ -2184,6 +2204,101 @@ worker appears. Escalate to the team owning the deploy if
 supposed to be live — that indicates a handler was removed while in-flight work
 still needed it, and the executions cannot make progress until the handler is
 redeployed.
+
+## harvest_capability_miss_never_offered
+
+**A capability miss failed an execution on its FIRST claim, without ever
+offering it to a peer.** This is the ticket-severity sibling of
+[`harvest_no_capable_worker`](#harvest_no_capable_worker) for the escalations
+that carry the *opposite* conclusion. Read that section first for the mechanism.
+
+Normally a capability miss is released back to `PENDING` for a capable peer, and
+escalation only happens after the per-task redelivery budget is spent — which is
+real evidence that no live worker on that queue registers the handler. **This
+rule fires when the task was released zero times**, so that conclusion is not
+supported: a capable worker may be live and idle on the queue the entire time.
+
+Two causes reach it, and the `no_capable_worker:` reason on the execution row
+names which:
+
+| Reason contains | Cause | Fix |
+|---|---|---|
+| `capability-miss redelivery is disabled (capability_miss_max_redeliveries = 0)` | Redelivery is switched off, so any capability skew fails executions immediately. `0` is the documented pre-#804 fail-fast behaviour. | Raise `WorkerConfig::with_capability_miss_max_redeliveries` off `0` (default `5`). |
+| `pinned to worker session {id}` | The task is pinned to a worker session (issue #606) whose host does not register the handler. The claim gate (`session_id IS NULL OR sticky_worker_id`) means no other worker can *ever* claim it, so releasing it "for a capable peer" would be false. | Deploy the handler to the host holding that session. Raising the budget **cannot** help — the pin outranks it. |
+
+Ticket, not a page: the cause is one config knob or one task's pin, not a
+fleet-wide capability gap, and one of the two is a switch an operator
+deliberately flipped. Executions *are* failing, though, so it is not silent
+either.
+
+### Triage steps
+
+1. **Read the reason, not the fleet.** `GET /api/harvest/workflows?state=FAILED`
+   and grep `no_capable_worker:`. The parenthetical names the cause — match it
+   against the table above. These runs are **not** dead-lettered; the reason is
+   on the execution row.
+2. **Do not start from reachability here.** Unlike
+   [`harvest_no_capable_worker`](#harvest_no_capable_worker), a verdict of
+   `in_use` from `GET /api/harvest/admin/workflow-types/reachability` is the
+   **expected** answer and does not contradict this alert — the handler exists
+   somewhere, the task simply never got offered to whoever has it.
+3. For the **disabled-redelivery** cause, confirm the effective setting:
+   `GET /api/harvest/admin/config` (issue #695). If it is `0`, that is the whole
+   explanation.
+4. For the **session-pinned** cause, take the `session_id` from the reason
+   string and find its host, then check what build that host runs:
+   `GET /api/harvest/workers`.
+5. Check whether the fleet-exhaustion page is *also* firing
+   (`harvest_no_capable_worker`). If both are firing, treat that one first — it
+   is the stronger signal and the recovery is a superset.
+
+### Likely causes
+
+- **`capability_miss_max_redeliveries` was set to `0`**, usually as a rollback
+  switch during an incident where #804's release behaviour was itself suspected.
+  Every capability miss then fails an execution immediately, which is exactly
+  the pre-#804 behaviour this feature exists to remove.
+- **A worker session (#606) outlived a deploy**: the session was acquired on a
+  host that has since been left behind by a rollout, and the pinned activities
+  reference a handler that host does not have.
+- **A session was acquired on a heterogeneous pool** where only some pods
+  register the session's activity handlers.
+
+### False positives
+
+- **A deliberate `0` budget during a controlled rollback.** If an operator has
+  intentionally disabled redelivery, this alert is reporting the accepted cost
+  of that decision, not a new fault. Silence it for the duration of the rollback
+  rather than reacting to it.
+- **A single stale session at the tail of a deploy.** One pinned task failing as
+  the last old pod drains is a bounded, self-limiting event; the executions are
+  recoverable by reset and the rule clears when the session ends.
+- This rule says **nothing** about whether the queue has a capable worker. Do
+  not conclude a handler is missing fleet-wide from it — that is
+  [`harvest_no_capable_worker`](#harvest_no_capable_worker), which pages.
+
+### Safe actions
+
+- **Raise the budget off `0`** (`WorkerConfig::with_capability_miss_max_redeliveries`,
+  default `5`) once the reason for disabling it has passed. This fixes the
+  disabled-redelivery cause outright and cannot make anything worse: a task that
+  a capable peer claims is a task that never fails.
+- **Deploy the handler to the session's host** for the pinned cause, or drain
+  that host so no new sessions are acquired on it.
+- **Reset the failed executions** once a capable worker (or the pinned host) has
+  the handler: `POST /api/harvest/workflows/{id}/reset`. Escalation writes no
+  dead-letter entry, so reset — not DLQ replay — is the recovery.
+- Do **not** raise the budget expecting it to fix the *session-pinned* cause. It
+  is a provable no-op: a pinned task escalates on its first miss at any budget.
+
+### Escalation criteria
+
+Escalate to a page if `harvest_no_capable_worker` starts firing for the same
+`queue` / `task_type` — that is genuine fleet exhaustion and a different, larger
+problem. Escalate to the team owning the workflow if session-pinned escalations
+persist after the responsible host has been redeployed: a session that outlives
+its host's build indicates the session lease (issue #606) is outlasting the
+deploy cadence, which is a topology problem rather than a capability one.
 
 ## harvest_capability_miss_release_sustained
 

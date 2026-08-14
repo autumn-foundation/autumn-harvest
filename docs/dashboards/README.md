@@ -141,6 +141,7 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_queue_paused_too_long` | Queues & workers | Paused queues (dispatch held) | [runbook](../runbooks/harvest-alerts.md#harvest_queue_paused_too_long) |
 | `harvest_scanner_stalled` | Background control loops (scanner liveness) | Scanner tick rate | [runbook](../runbooks/harvest-alerts.md#harvest_scanner_stalled) |
 | `harvest_no_capable_worker` | DLQ & quarantine | Capability misses (handler not registered) | [runbook](../runbooks/harvest-alerts.md#harvest_no_capable_worker) |
+| `harvest_capability_miss_never_offered` | DLQ & quarantine | Capability misses (handler not registered) | [runbook](../runbooks/harvest-alerts.md#harvest_capability_miss_never_offered) |
 | `harvest_capability_miss_release_sustained` | DLQ & quarantine | Capability misses (handler not registered) | [runbook](../runbooks/harvest-alerts.md#harvest_capability_miss_release_sustained) |
 
 ### Readiness-style alerts (no native metric)
