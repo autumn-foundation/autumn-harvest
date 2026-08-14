@@ -825,6 +825,49 @@ pub async fn run_workflow(
 ///
 /// [`Default`] is the library defaults plus no offload threshold, which is
 /// byte-for-byte the behavior of every caller that does not configure limits.
+/// Register a candidate's declarative handlers onto a replay context.
+///
+/// Mirrors the live worker's own registration loop so the two cannot drift; see
+/// [`ReplayDeclarativeHandlers`] for why replay must do this at all.
+#[cfg(any(test, feature = "testing"))]
+fn register_declarative_handlers(ctx: &WorkflowContext, handlers: ReplayDeclarativeHandlers<'_>) {
+    for h in handlers.queries {
+        ctx.register_declarative_query_handler(h);
+    }
+    for h in handlers.updates {
+        ctx.register_declarative_update_handler(h);
+    }
+}
+
+/// The candidate build's declarative `#[query]` / `#[update]` handlers, carried
+/// into a replay context (issue #798).
+///
+/// Same class of problem as [`ReplayPayloadLimits`], and the same fix. The live
+/// worker registers a workflow's declarative handlers **before any workflow code
+/// runs**, and [`WorkflowContext::list_query_names`] merges the declarative map
+/// into its result — so a workflow that branches on which handlers exist, or
+/// that dispatches a query, observes them. They live in no `WorkflowEvent`, so a
+/// pure-history replay cannot recover them, and both replay entry points
+/// previously invoked with empty declarative registries.
+///
+/// That is wrong in both directions. A candidate that **keeps** a registration
+/// the recorded run had is the false-RED direction: replay takes the other
+/// branch and reports drift on code nobody changed, blocking a good release. A
+/// candidate that **adds or removes** one is the false-GREEN direction: the
+/// branch the promoted worker will take was never exercised.
+///
+/// Borrowed rather than owned so a caller can pass a registry it already holds,
+/// and `Copy` so threading it through the three entry points costs nothing. The
+/// [`Default`] is two empty slices, which is byte-for-byte the behavior of every
+/// caller that registers none.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReplayDeclarativeHandlers<'a> {
+    /// Declarative query handlers to register before the workflow body runs.
+    pub queries: &'a [&'a crate::info::QueryHandlerInfo],
+    /// Declarative update handlers to register before the workflow body runs.
+    pub updates: &'a [&'a crate::info::UpdateHandlerInfo],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplayPayloadLimits {
     /// Caps activity inputs at schedule time.
@@ -920,6 +963,11 @@ pub async fn run_workflow_strict(
     // them; leaving them at the library defaults makes the gate answer the wrong
     // question when the candidate build changes a cap or an offload threshold.
     payload_limits: ReplayPayloadLimits,
+    // Issue #798 (Codex round 21): the candidate's declarative `#[query]` /
+    // `#[update]` handlers. The live worker registers these before any workflow
+    // code runs and `ctx.list_query_names()` surfaces them, so a workflow that
+    // branches on their presence replays down the wrong path without them.
+    declarative_handlers: ReplayDeclarativeHandlers<'_>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
@@ -939,6 +987,11 @@ pub async fn run_workflow_strict(
         )
         .with_payload_offload_threshold(payload_limits.offload_threshold)
         .with_metrics(metrics);
+
+    // Mirror the live worker: register declarative handlers before any workflow
+    // code runs, so a body that branches on `ctx.list_query_names()` sees the
+    // candidate's registrations rather than an empty registry.
+    register_declarative_handlers(&ctx, declarative_handlers);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
 
@@ -980,6 +1033,11 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
     // them; leaving them at the library defaults makes the gate answer the wrong
     // question when the candidate build changes a cap or an offload threshold.
     payload_limits: ReplayPayloadLimits,
+    // Issue #798 (Codex round 21): the candidate's declarative `#[query]` /
+    // `#[update]` handlers. The live worker registers these before any workflow
+    // code runs and `ctx.list_query_names()` surfaces them, so a workflow that
+    // branches on their presence replays down the wrong path without them.
+    declarative_handlers: ReplayDeclarativeHandlers<'_>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
@@ -1000,6 +1058,11 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
         )
         .with_payload_offload_threshold(payload_limits.offload_threshold)
         .with_metrics(metrics);
+
+    // Mirror the live worker: register declarative handlers before any workflow
+    // code runs, so a body that branches on `ctx.list_query_names()` sees the
+    // candidate's registrations rather than an empty registry.
+    register_declarative_handlers(&ctx, declarative_handlers);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
 
@@ -1229,6 +1292,11 @@ pub(crate) async fn run_workflow_canary(
     // them; leaving them at the library defaults makes the gate answer the wrong
     // question when the candidate build changes a cap or an offload threshold.
     payload_limits: ReplayPayloadLimits,
+    // Issue #798 (Codex round 21): the candidate's declarative `#[query]` /
+    // `#[update]` handlers. The live worker registers these before any workflow
+    // code runs and `ctx.list_query_names()` surfaces them, so a workflow that
+    // branches on their presence replays down the wrong path without them.
+    declarative_handlers: ReplayDeclarativeHandlers<'_>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_canary_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
@@ -1248,6 +1316,11 @@ pub(crate) async fn run_workflow_canary(
         )
         .with_payload_offload_threshold(payload_limits.offload_threshold)
         .with_metrics(metrics);
+
+    // Mirror the live worker: register declarative handlers before any workflow
+    // code runs, so a body that branches on `ctx.list_query_names()` sees the
+    // candidate's registrations rather than an empty registry.
+    register_declarative_handlers(&ctx, declarative_handlers);
 
     let span = tracing::info_span!(
         "harvest.workflow.execute",

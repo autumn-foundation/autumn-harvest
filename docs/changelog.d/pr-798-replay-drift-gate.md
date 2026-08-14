@@ -35,3 +35,50 @@
 **(A) The aggregate byte budget did not bound the *first* fixture.** `MAX_SAMPLE_RESPONSE_BYTES` (64 MiB) is checked *before* each fetch — a document's size is not knowable until it is loaded — so peak retained bytes are "the budget plus at most one document". That is a bound only if one document is itself bounded, and the constant's own doc comment asserted exactly that ("bounding a single oversized export is what `max_bytes` itself is for"). It was not true: `parse_history_max_bytes` imposes no upper bound, so a caller could set `max_bytes` to 10 GB, the budget would start at zero, and the first candidate would therefore always be fetched **and retained** at whatever size it happened to be — a single multi-gigabyte history exhausting a shared management API despite the aggregate cap. Fixed with a ceiling on the sample route's own parser (`parse_sample_max_bytes`): a `max_bytes` above the response budget is **rejected with a 400** naming the ceiling and pointing at the single-execution export route. Peak retained is now bounded at twice the budget rather than by caller input. Rejected rather than silently clamped for two reasons: a per-document limit larger than the entire response budget is *incoherent* (such a document could never be returned within that budget), and a quiet clamp would resurface later as a mystifying per-candidate size failure naming a number the operator never set. **Scoped to the sample route deliberately** — the single-execution and batch export routes predate #798, return a different shape, and carry no aggregate budget for a per-document limit to be coherent against; `parse_history_max_bytes` is untouched, so their contract is unchanged. The round-9 escapability argument survives: the documented remedy for a *size-truncated* bundle is to narrow the export (fewer states, one shard, a **lower** `--max-bytes`), never to raise it, and the sample route is new in this PR so no caller depended on the old ceiling-free contract. The `MAX_SAMPLE_RESPONSE_BYTES` doc comment — which stated the false claim — is corrected. Tests: `sample_max_bytes_above_the_response_budget_is_rejected` (rejects `budget + 1`, names both the parameter and the ceiling, and pins that exactly-at-the-ceiling stays legal) and `every_accepted_sample_query_bounds_one_document_by_the_response_budget`, which states the bound as an invariant over a range of inputs rather than a single example. Falsified by restoring `parse_history_max_bytes` on the route: the money test then fails at its `expect_err` because the parser accepts an unbounded per-document limit.
 
 **(B) The gate replayed under the library's payload limits, not the candidate's.** Both replay entry points — `run_workflow_strict` and `run_workflow_canary` (the in-flight gate's own path) — built their `WorkflowContext` without `.with_payload_caps(...)` or `.with_payload_offload_threshold(...)`, so every fixture replayed under the 2 MiB library defaults regardless of what the candidate build configures. Payload caps (#252) and the offload threshold (#524) are **candidate configuration** in exactly the same category as `build_id` and `history_policy`, which this PR already threads for precisely this reason: they live in no `WorkflowEvent`, and the live worker supplies its own from `BuiltHarvest`. The consequence is bidirectional, and the false-GREEN half is the P1: a candidate that **lowers** a cap replays clean here and then rejects the very in-flight executions the gate sampled with `PayloadTooLarge` once promoted; a candidate that configures an **offload threshold** is the mirror image, where an over-threshold payload is offloaded rather than capped and the gate reports drift the promoted worker would never hit. The cap is consulted only where a dispatch is not already in recorded history (`HistoryMatch::NoMatch`) — i.e. at the frontier, which is exactly where an in-flight fixture parks, so this is the common shape rather than an edge case. Fixed by threading the limits as **one** value, `executor::ReplayPayloadLimits` (three caps + the offload threshold, `Default` = the library values so every existing caller is byte-for-byte unaffected), through **both** replay paths rather than only the canary one Codex named — a single carry-through site, the same lesson the round-10 `FixtureReplayDefaults` struct encoded. Surfaced as `with_payload_caps(max_activity_input, max_signal_payload, max_workflow_input)` and `with_payload_offload_threshold(Option<u64>)` on both `WorkflowReplayer` and `ReplayVerifier`. `max_activity_result` is deliberately absent: it is enforced by the worker after an activity returns, never by `WorkflowContext`, so it cannot affect a replay and accepting it would imply a guarantee that does not exist. The struct shape paid for itself immediately — the compiler rejected the `WorkflowReplayer::replay_bundle` delegation site (round 10's own carry-through point) with a missing-field error rather than letting the setting be silently dropped on that path. **Family checked rather than assumed:** the other values the worker threads and these replay paths do not were each verified against `executor::is_replay_significant_command`, which explicitly excludes `RecordLog` (#790), `SetCurrentDetails` (#593) and `UpsertSearchAttributes` — so the log policy and the current-details cap cannot alter a replay's command stream, and the #620 activity retry/timeout defaults govern what the *worker* does with a dispatched command rather than what replay reconstructs. Declarative query/update handler registration is a genuine sibling gap but a different family (handler registration, not worker limits) and pre-existing — flagged rather than folded into this change. Tests: `candidate_activity_input_cap_reaches_the_replay_context` (money test — a frontier dispatch whose input sits between the candidate cap and the library default is reported rather than certified), `omitting_the_candidate_cap_certifies_the_oversized_input` (the control proving the assertion is carried by the cap and not by a broken fixture), `candidate_offload_threshold_reaches_the_replay_context` (the false-RED direction), and `replay_verifier_carries_the_candidate_payload_caps` (the gate's own public surface, which an embedder's gate binary builds directly). Falsified by dropping the two builder calls from the replay contexts: the money test then reports `diverged.len() == 0` — the gate certifying a build that will reject the executions it just sampled. **No new `WorkflowEvent` variant, no migration** — replay-context configuration only.
+
+**Post-review hardening, round 21 (Codex, one P1 + one P2).** **(P1) A
+present-but-unreadable coverage manifest now blocks the gate.**
+`read_bundle_manifest` collapsed three distinct outcomes into `Option`: a
+well-formed manifest, an absent one, and one that exists but cannot be read or
+parsed. The last two both yielded `None`, and every manifest-derived guard reads
+through `Option::is_some_and` — so a manifest truncated in artifact transfer
+silently disabled the rung-`2` fixture-count cross-check, the rung-`2`
+export-shortfall check (`export_failures` / `truncated_by_size`), and the rung-`3`
+partial-shard check all at once, letting the surviving fixtures replay to a green
+exit `0`. Verified against the code before fixing: the file's *presence* is the
+bundle asserting it is an exporter product, so an unreadable manifest is damaged
+evidence, whereas an absent one legitimately means a hand-assembled bundle that
+makes no coverage claim — a distinction the existing round-18 rationale already
+relies on for `emptiness_is_contradicted`. Fixed with a three-state
+`BundleManifest { Present, Absent, Unreadable }`; only a genuine
+`io::ErrorKind::NotFound` is fail-open, so a permissions or partial-read failure
+now blocks too, not just a parse failure. New `ReplayDriftReport`
+`manifest_unreadable: Option<String>` field and `manifest_is_unreadable()`
+accessor, rendered in the report body. Blocks at rung **`2`** ("the gate could not
+fully run") rather than rung `4`, deliberately: rung `4` is gated on the opt-in
+`require_complete_coverage`, so a verdict there would have left the *default* gate
+green — which is the hole. The pre-existing
+`require_complete_coverage_fails_closed_on_a_corrupt_manifest` test consequently
+moves from exit `4` to exit `2` (rung 2 dominates), which is strictly stricter: it
+now fails without the flag as well. **(P2) Replay now registers the candidate's
+declarative `#[query]` / `#[update]` handlers.** The exact family flagged as
+"genuine but separate" in the round-20 reply, now closed. The live worker
+registers a workflow's declarative handlers before any workflow code runs, and
+`WorkflowContext::list_query_names` merges the declarative map into its result, so
+a workflow branching on which handlers exist genuinely observes them — the same
+candidate-configuration-not-in-any-`WorkflowEvent` shape as round 20's payload
+caps. Both replay paths (`run_workflow_strict` / `_advancing_clock` **and**
+`run_workflow_canary`) invoked with empty declarative registries, so keeping a
+registration was a false RED (drift reported on unchanged code, blocking a good
+release) and adding or removing one was a false GREEN (the promoted worker's
+branch never exercised). New `ReplayDeclarativeHandlers<'a>` carrier threaded
+through all three entry points and applied via a shared
+`register_declarative_handlers` helper that mirrors the live worker's own
+registration loop; `WorkflowReplayer` and `ReplayVerifier` gain `queries(...)` /
+`updates(...)`, and `FixtureReplayDefaults` carries them so `replay_bundle`
+inherits them. Both fixes falsified by neutering them and capturing the exact
+failures (the default gate returning to exit `0` on a damaged bundle; a clean
+fixture reporting `1 diverged`). **No new `WorkflowEvent` variant, no migration.**
+Docs: new "Declarative query and update handlers" section plus an
+unreadable-manifest paragraph and exit-code table row in
+`docs/replay-drift-gate.md`.

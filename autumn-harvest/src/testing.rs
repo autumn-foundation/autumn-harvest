@@ -474,6 +474,39 @@ pub struct WorkflowReplayer {
     /// only a frontier dispatch consults these. Defaults to the library values,
     /// so a caller that does not set them is unaffected.
     payload_limits: crate::executor::ReplayPayloadLimits,
+    /// The candidate's declarative `#[query]` / `#[update]` handlers (issue #798).
+    ///
+    /// Registered onto the replay context before the workflow body runs, exactly
+    /// as the live worker does. Owned rather than borrowed so a builder can be
+    /// constructed and moved freely; the executor borrows from these at the call
+    /// site. Empty by default, which is byte-for-byte the pre-fix behavior.
+    ///
+    /// See [`ReplayDeclarativeHandlers`](crate::executor::ReplayDeclarativeHandlers)
+    /// for why a replay that omits them answers the wrong question.
+    declarative_queries: Vec<crate::info::QueryHandlerInfo>,
+    /// The candidate's declarative update handlers. See `declarative_queries`.
+    declarative_updates: Vec<crate::info::UpdateHandlerInfo>,
+}
+
+/// Owned borrows of a replayer's declarative handlers.
+///
+/// The executor takes `&[&QueryHandlerInfo]` (mirroring the live worker's own
+/// signature), but the replayer stores owned `Vec`s so a builder can be moved
+/// freely. This is the bridge: it holds the reference vectors alive across the
+/// executor call so the borrowed slices stay valid.
+struct DeclarativeHandlerRefs<'a> {
+    queries: Vec<&'a crate::info::QueryHandlerInfo>,
+    updates: Vec<&'a crate::info::UpdateHandlerInfo>,
+}
+
+impl<'a> DeclarativeHandlerRefs<'a> {
+    /// Borrow as the executor's parameter shape.
+    fn as_params(&'a self) -> crate::executor::ReplayDeclarativeHandlers<'a> {
+        crate::executor::ReplayDeclarativeHandlers {
+            queries: &self.queries,
+            updates: &self.updates,
+        }
+    }
 }
 
 impl Default for WorkflowReplayer {
@@ -527,6 +560,8 @@ impl WorkflowReplayer {
             execution_id: None,
             history_policy: crate::context::WorkflowHistoryPolicy::default(),
             payload_limits: crate::executor::ReplayPayloadLimits::default(),
+            declarative_queries: Vec::new(),
+            declarative_updates: Vec::new(),
         }
     }
 
@@ -693,6 +728,35 @@ impl WorkflowReplayer {
         self
     }
 
+    /// Register the **candidate's** declarative `#[query]` handlers on the replay
+    /// context (issue #798).
+    ///
+    /// The live worker registers these before any workflow code runs, and
+    /// `ctx.list_query_names()` surfaces them, so a workflow that branches on
+    /// which handlers exist replays down the wrong branch without them. Pass the
+    /// same `queries![...]` collection the candidate build registers.
+    #[must_use]
+    pub fn queries(mut self, queries: Vec<crate::info::QueryHandlerInfo>) -> Self {
+        self.declarative_queries = queries;
+        self
+    }
+
+    /// Register the **candidate's** declarative `#[update]` handlers on the
+    /// replay context (issue #798). See [`queries`](Self::queries).
+    #[must_use]
+    pub fn updates(mut self, updates: Vec<crate::info::UpdateHandlerInfo>) -> Self {
+        self.declarative_updates = updates;
+        self
+    }
+
+    /// Borrow the configured declarative handlers for an executor call.
+    fn declarative_handlers(&self) -> DeclarativeHandlerRefs<'_> {
+        DeclarativeHandlerRefs {
+            queries: self.declarative_queries.iter().collect(),
+            updates: self.declarative_updates.iter().collect(),
+        }
+    }
+
     /// Set the `execution_id` threaded into the replayed `WorkflowContext` on the
     /// raw [`replay_from_events`](Self::replay_from_events) path (issue #698).
     ///
@@ -837,6 +901,12 @@ impl WorkflowReplayer {
             // payload limits: dropping them here would replay the bundle under
             // the library defaults and certify a cap-lowering build.
             payload_limits: self.payload_limits,
+            // Codex round 21 extended it again to the candidate's declarative
+            // handlers: dropping them replays with an empty registry, so a
+            // workflow branching on `ctx.list_query_names()` takes the other
+            // branch and is reported as drift it never had.
+            declarative_queries: self.declarative_queries.clone(),
+            declarative_updates: self.declarative_updates.clone(),
         };
         verifier.replay_bundle(dir).await
     }
@@ -984,6 +1054,9 @@ impl WorkflowReplayer {
             };
         };
 
+        // Issue #798 (Codex round 21): borrow the candidate's declarative
+        // handlers for the duration of the executor call.
+        let declarative = self.declarative_handlers();
         let exec_id = snapshot.execution_id;
         // Issue #698: the workflow type name (mechanism 1 — the handler-lookup key)
         // applied to the replayed context via `.with_workflow_name(...)`.
@@ -1037,6 +1110,11 @@ impl WorkflowReplayer {
                 // that lowers a cap breaks the very in-flight runs the gate
                 // sampled, and the library default would certify it.
                 self.payload_limits,
+                // Issue #798 (Codex round 21): the candidate's declarative
+                // `#[query]`/`#[update]` handlers. The live worker registers
+                // these before the body runs, so a workflow that branches on
+                // `ctx.list_query_names()` needs them to replay the same path.
+                declarative.as_params(),
             )
             .await
         } else {
@@ -1068,6 +1146,11 @@ impl WorkflowReplayer {
                 // that lowers a cap breaks the very in-flight runs the gate
                 // sampled, and the library default would certify it.
                 self.payload_limits,
+                // Issue #798 (Codex round 21): the candidate's declarative
+                // `#[query]`/`#[update]` handlers. The live worker registers
+                // these before the body runs, so a workflow that branches on
+                // `ctx.list_query_names()` needs them to replay the same path.
+                declarative.as_params(),
             )
             .await
         };
@@ -1134,6 +1217,9 @@ impl WorkflowReplayer {
             };
         };
 
+        // Issue #798 (Codex round 21): borrow the candidate's declarative
+        // handlers for the duration of the executor call.
+        let declarative = self.declarative_handlers();
         let exec_id = snapshot.execution_id;
         // Issue #698: the workflow type name (mechanism 1 — the handler-lookup key).
         let workflow_name = snapshot.workflow_name.clone();
@@ -1172,6 +1258,9 @@ impl WorkflowReplayer {
             // cap — so the library default here is what turns a cap-lowering
             // build into a false GREEN.
             self.payload_limits,
+            // Issue #798 (Codex round 21): the candidate's declarative handlers
+            // (see the strict path). This is the in-flight gate's own call.
+            declarative.as_params(),
         )
         .await;
         outcome_to_report(exec_id, total_events, outcome, true)
@@ -1253,6 +1342,9 @@ impl WorkflowReplayer {
         // Issue #798: a raw-events fixture carries no `queue_name` either, so use
         // the replayer's global (`with_queue_name`) when set.
         let queue_name = self.queue_name.clone();
+        // Issue #798 (Codex round 21): borrow the candidate's declarative
+        // handlers for the duration of the executor call.
+        let declarative = self.declarative_handlers();
         let exec_id = self.execution_id.unwrap_or_default();
         let events = match self.maybe_inflate(events).await {
             Ok(e) => e,
@@ -1304,6 +1396,11 @@ impl WorkflowReplayer {
                 // that lowers a cap breaks the very in-flight runs the gate
                 // sampled, and the library default would certify it.
                 self.payload_limits,
+                // Issue #798 (Codex round 21): the candidate's declarative
+                // `#[query]`/`#[update]` handlers. The live worker registers
+                // these before the body runs, so a workflow that branches on
+                // `ctx.list_query_names()` needs them to replay the same path.
+                declarative.as_params(),
             )
             .await
         } else {
@@ -1334,6 +1431,11 @@ impl WorkflowReplayer {
                 // that lowers a cap breaks the very in-flight runs the gate
                 // sampled, and the library default would certify it.
                 self.payload_limits,
+                // Issue #798 (Codex round 21): the candidate's declarative
+                // `#[query]`/`#[update]` handlers. The live worker registers
+                // these before the body runs, so a workflow that branches on
+                // `ctx.list_query_names()` needs them to replay the same path.
+                declarative.as_params(),
             )
             .await
         };
@@ -2611,6 +2713,15 @@ pub struct ReplayDriftReport {
     pub skipped: usize,
     /// Coverage claimed by the bundle's manifest, when it has one.
     pub coverage: Option<crate::replay_sample::SampleManifest>,
+    /// Why the bundle's manifest could not be read, when it was present but
+    /// unreadable.
+    ///
+    /// `None` covers both a well-formed manifest and a legitimately absent one —
+    /// see [`BundleManifest`] for why those two share a verdict and this one does
+    /// not. When set, the gate blocks at rung `2`: every manifest-derived guard
+    /// is unenforceable, so the gate cannot claim to have fully run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_unreadable: Option<String>,
     /// Whether an empty bundle was explicitly permitted.
     pub allow_empty_bundle: bool,
     /// Whether incomplete cross-shard coverage blocks the gate.
@@ -2621,10 +2732,15 @@ impl ReplayDriftReport {
     /// Project a [`BatchReplayReport`] into the drift-gate shape.
     fn from_batch(
         batch: BatchReplayReport,
-        coverage: Option<crate::replay_sample::SampleManifest>,
+        manifest: BundleManifest,
         allow_empty_bundle: bool,
         require_complete_coverage: bool,
     ) -> Self {
+        let (coverage, manifest_unreadable) = match manifest {
+            BundleManifest::Present(m) => (Some(*m), None),
+            BundleManifest::Absent => (None, None),
+            BundleManifest::Unreadable(reason) => (None, Some(reason)),
+        };
         let mut diverged = Vec::new();
         let mut blocked = Vec::new();
 
@@ -2682,6 +2798,7 @@ impl ReplayDriftReport {
             blocked,
             skipped: batch.skipped,
             coverage,
+            manifest_unreadable,
             allow_empty_bundle,
             require_complete_coverage,
         }
@@ -2856,6 +2973,26 @@ impl ReplayDriftReport {
             .is_some_and(crate::replay_sample::SampleManifest::is_incomplete_export)
     }
 
+    /// Whether the bundle's manifest was present but could not be read.
+    ///
+    /// A blocking condition in its own right, and deliberately **not** folded
+    /// into [`has_incomplete_coverage`](Self::has_incomplete_coverage) or
+    /// [`coverage_claim_unsatisfied`](Self::coverage_claim_unsatisfied): both of
+    /// those answer questions about what a manifest *said*, and the whole
+    /// problem here is that nothing can be read from it.
+    ///
+    /// This blocks at rung `2` rather than rung `4` because rung `4` is gated on
+    /// the opt-in [`require_complete_coverage`](ReplayVerifier::require_complete_coverage).
+    /// An unreadable manifest disables the rung-`2` and rung-`3` guards for
+    /// *every* caller, including the default gate that set no flags, so a verdict
+    /// that only fires under an opt-in would leave the common case green.
+    ///
+    /// An **absent** manifest is not this — see [`BundleManifest`].
+    #[must_use]
+    pub const fn manifest_is_unreadable(&self) -> bool {
+        self.manifest_unreadable.is_some()
+    }
+
     /// Whether the gate passes.
     ///
     /// True when every fixture replayed without divergence **and** the bundle
@@ -2878,7 +3015,7 @@ impl ReplayDriftReport {
     /// |------|---------|
     /// | `0` | Every fixture replayed cleanly |
     /// | `1` | One or more fixtures diverged — a determinism regression |
-    /// | `2` | The gate could not fully run: a fixture failed to replay, the bundle holds a different number of fixtures than its manifest declares, **or** the export itself delivered fewer fixtures than the sample selected (dominates over `1`, because a gate that did not fully run cannot be trusted — mirrors [`CiReport::exit_code`]) |
+    /// | `2` | The gate could not fully run: a fixture failed to replay, the bundle's manifest was present but unreadable, the bundle holds a different number of fixtures than its manifest declares, **or** the export itself delivered fewer fixtures than the sample selected (dominates over `1`, because a gate that did not fully run cannot be trusted — mirrors [`CiReport::exit_code`]) |
     /// | `3` | Nothing was verified — the bundle was empty, or every fixture was skipped. [`allow_empty_bundle`](ReplayVerifier::allow_empty_bundle) opts out, but **not** when the bundle's manifest reports incomplete shard coverage: an export that could not read the fleet is empty too, and certifying a release against it is a false green |
     /// | `4` | `require_complete_coverage` is set and complete coverage was not proven — the sample is knowingly incomplete, a workflow type with in-flight work was sampled zero times, **or** the bundle carries no readable manifest at all |
     ///
@@ -2893,6 +3030,7 @@ impl ReplayDriftReport {
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         if !self.blocked.is_empty()
+            || self.manifest_is_unreadable()
             || self.fixture_count_disagrees_with_manifest()
             || self.export_is_incomplete()
         {
@@ -2928,6 +3066,20 @@ impl ReplayDriftReport {
     /// and a fixture count that disagrees with the manifest — sit next to the
     /// coverage numbers they qualify, and so `fmt` itself stays readable.
     fn fmt_coverage(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Rendered before the early return: an unreadable manifest yields no
+        // `coverage` to print, and it is precisely the case an operator must not
+        // mistake for "this bundle simply made no claim".
+        if let Some(reason) = &self.manifest_unreadable {
+            writeln!(
+                f,
+                "  MANIFEST UNREADABLE: the bundle carries a coverage manifest that \
+                 {reason}. Its presence means this bundle came from the exporter, so \
+                 the claim it recorded was damaged rather than never made — and every \
+                 manifest-derived check (fixture count, export shortfall, shard \
+                 coverage) is unenforceable. Re-export the sample, or re-fetch the \
+                 artifact if it was truncated in transfer."
+            )?;
+        }
         let Some(coverage) = &self.coverage else {
             return Ok(());
         };
@@ -3182,6 +3334,14 @@ struct FixtureReplayDefaults {
     /// certifies a cap-lowering build that will then reject the very in-flight
     /// runs it sampled.
     payload_limits: crate::executor::ReplayPayloadLimits,
+    /// The candidate's declarative `#[query]` / `#[update]` handlers (issue #798).
+    ///
+    /// Like the build id and payload limits, authoritative rather than a
+    /// fallback: the bundle describes executions, not the runtime that will
+    /// resume them, so the candidate's registrations come from the caller.
+    declarative_queries: Vec<crate::info::QueryHandlerInfo>,
+    /// See `declarative_queries`.
+    declarative_updates: Vec<crate::info::UpdateHandlerInfo>,
 }
 
 impl Default for ReplayVerifier {
@@ -3296,6 +3456,39 @@ impl ReplayVerifier {
     #[must_use]
     pub const fn with_payload_offload_threshold(mut self, threshold: Option<u64>) -> Self {
         self.replay_defaults.payload_limits.offload_threshold = threshold;
+        self
+    }
+
+    /// Register the **candidate's** declarative `#[query]` handlers on every
+    /// fixture's replay context (issue #798).
+    ///
+    /// The live worker registers a workflow's declarative handlers *before any
+    /// workflow code runs*, and `ctx.list_query_names()` merges them into its
+    /// result — so a workflow that branches on which handlers exist, or that
+    /// dispatches a query, observes them. They live in no `WorkflowEvent`, so
+    /// replay cannot recover them from a fixture and the gate must be told.
+    ///
+    /// Like [`with_build_id`](Self::with_build_id), this is **not** a fixture
+    /// fallback: pass the same `queries![...]` collection the build you are about
+    /// to deploy registers.
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::testing::ReplayVerifier;
+    /// # use autumn_harvest::info::QueryHandlerInfo;
+    /// # fn make_queries() -> Vec<QueryHandlerInfo> { vec![] }
+    /// let verifier = ReplayVerifier::new().queries(make_queries());
+    /// ```
+    #[must_use]
+    pub fn queries(mut self, queries: Vec<crate::info::QueryHandlerInfo>) -> Self {
+        self.replay_defaults.declarative_queries = queries;
+        self
+    }
+
+    /// Register the **candidate's** declarative `#[update]` handlers on every
+    /// fixture's replay context (issue #798). See [`queries`](Self::queries).
+    #[must_use]
+    pub fn updates(mut self, updates: Vec<crate::info::UpdateHandlerInfo>) -> Self {
+        self.replay_defaults.declarative_updates = updates;
         self
     }
 
@@ -3414,6 +3607,12 @@ impl ReplayVerifier {
     /// fixture walk) automatically; a directory without one still replays, and
     /// [`ReplayDriftReport::coverage`] is simply `None`.
     ///
+    /// A manifest that is **present but unreadable** is a different case and
+    /// blocks the gate at exit `2`. Its presence means the bundle claims to be an
+    /// exporter product, so an unreadable one is damaged evidence rather than an
+    /// absent claim — and every manifest-derived guard would otherwise switch
+    /// itself off silently. See [`ReplayDriftReport::manifest_is_unreadable`].
+    ///
     /// # How this differs from [`verify_dir`](Self::verify_dir)
     ///
     /// `verify_dir` replays **strictly**: the workflow must consume its entire
@@ -3441,10 +3640,10 @@ impl ReplayVerifier {
     pub async fn replay_bundle(&self, dir: impl AsRef<std::path::Path>) -> ReplayDriftReport {
         let dir = dir.as_ref();
         let batch = self.replay_dir(dir, FixtureReplayMode::InFlight).await;
-        let coverage = read_bundle_manifest(dir).await;
+        let manifest = read_bundle_manifest(dir).await;
         ReplayDriftReport::from_batch(
             batch,
-            coverage,
+            manifest,
             self.allow_empty_bundle,
             self.require_complete_coverage,
         )
@@ -3590,26 +3789,74 @@ impl ReplayVerifier {
     }
 }
 
-/// Read a bundle's coverage manifest, if it has one.
+/// The outcome of looking for a bundle's coverage manifest.
 ///
-/// A missing or unparseable manifest is not an error: a hand-assembled bundle
-/// (or one produced before the manifest existed) still replays, it just carries
-/// no coverage claim. `require_complete_coverage` likewise cannot be satisfied
-/// or violated by a manifest that is not there.
-async fn read_bundle_manifest(
-    dir: &std::path::Path,
-) -> Option<crate::replay_sample::SampleManifest> {
+/// Three states, not two, because "the file is not there" and "the file is there
+/// but I could not read it" are different facts about the bundle and call for
+/// opposite verdicts.
+enum BundleManifest {
+    /// A well-formed manifest. The bundle carries a coverage claim.
+    Present(Box<crate::replay_sample::SampleManifest>),
+    /// No manifest file at all.
+    ///
+    /// Deliberately **not** an error. The exporter always writes one, so an
+    /// absent manifest means the bundle did not come from the exporter — a
+    /// hand-assembled directory of fixtures, which is a supported way to drive
+    /// the gate. It simply makes no coverage claim, so there is nothing to
+    /// verify and nothing to contradict.
+    Absent,
+    /// The manifest **exists** but could not be read or parsed.
+    ///
+    /// The opposite situation from [`Absent`](Self::Absent), and the reason this
+    /// is a three-state enum. The file's presence is the bundle asserting *"I am
+    /// an exporter product and here is my record of what I sampled"*. If that
+    /// record is truncated, corrupted in transfer, or unreadable, the assertion
+    /// stands but the evidence is gone — and every manifest-derived guard reads
+    /// through `Option::is_some_and`, so a `None` silently turns each one off:
+    ///
+    /// * the `sampled_total` fixture-count cross-check (rung `2`)
+    /// * the `export_failures` / `truncated_by_size` shortfall check (rung `2`)
+    /// * the `status` / `unavailable_shards` partial-shard check (rung `3`)
+    ///
+    /// The surviving fixtures would then replay to a green exit `0`: a release
+    /// certified against an export whose own record of what it did was lost.
+    Unreadable(String),
+}
+
+/// Read a bundle's coverage manifest.
+///
+/// Distinguishes a missing manifest (fail-open — a hand-assembled bundle carries
+/// no coverage claim) from a present-but-unreadable one (fail-closed — the claim
+/// existed and was damaged). See [`BundleManifest`] for why that distinction is
+/// load-bearing rather than pedantic.
+async fn read_bundle_manifest(dir: &std::path::Path) -> BundleManifest {
     let path = dir.join(crate::replay_sample::SampleManifest::FILE_NAME);
-    let raw = tokio::fs::read_to_string(&path).await.ok()?;
-    match serde_json::from_str(&raw) {
-        Ok(manifest) => Some(manifest),
+    let raw = match tokio::fs::read_to_string(&path).await {
+        Ok(raw) => raw,
+        // Only a genuine "not there" is fail-open. A permissions error, a
+        // partial read, or any other I/O failure means the file exists in some
+        // form we could not consume — evidence we were meant to have and do not.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return BundleManifest::Absent;
+        }
         Err(error) => {
             tracing::warn!(
                 path = %path.display(),
                 %error,
-                "harvest: ignoring unparseable replay-sample manifest",
+                "harvest: replay-sample manifest is present but unreadable",
             );
-            None
+            return BundleManifest::Unreadable(format!("could not be read: {error}"));
+        }
+    };
+    match serde_json::from_str(&raw) {
+        Ok(manifest) => BundleManifest::Present(Box::new(manifest)),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "harvest: replay-sample manifest is present but unparseable",
+            );
+            BundleManifest::Unreadable(format!("could not be parsed: {error}"))
         }
     }
 }
@@ -4012,6 +4259,11 @@ fn fixture_replayer(
         // than a fallback — the bundle describes executions, not the runtime that
         // will resume them, so the candidate's limits come from the caller.
         payload_limits: defaults.payload_limits,
+        // Issue #798 (Codex round 21): same authoritative treatment — the live
+        // worker registers these before any workflow code runs, so a replay that
+        // omits them is not replaying the candidate.
+        declarative_queries: defaults.declarative_queries.clone(),
+        declarative_updates: defaults.declarative_updates.clone(),
     }
 }
 

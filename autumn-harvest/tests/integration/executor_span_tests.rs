@@ -252,6 +252,7 @@ fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
             autumn_harvest::context::WorkflowHistoryPolicy::default(),
             // Issue #798: library-default payload limits for this span test.
             autumn_harvest::executor::ReplayPayloadLimits::default(),
+            autumn_harvest::executor::ReplayDeclarativeHandlers::default(),
         ));
 
     // 1. Span must be named correctly.

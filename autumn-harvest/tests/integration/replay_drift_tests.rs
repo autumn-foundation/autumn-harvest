@@ -153,6 +153,26 @@ fn write(dir: &Path, name: &str, contents: &str) {
     std::fs::write(dir.join(name), contents).unwrap();
 }
 
+/// A manifest claiming complete, untruncated, failure-free coverage.
+fn complete_manifest(workflow_name: &str, sampled: u64, in_flight_total: u64) -> SampleManifest {
+    SampleManifest {
+        generated_at: Utc::now(),
+        status: SampleStatus::Complete,
+        states: vec!["RUNNING".into(), "PAUSED".into()],
+        per_workflow: vec![SampleWorkflowCoverage {
+            workflow_name: workflow_name.into(),
+            sampled,
+            in_flight_total,
+        }],
+        sampled_total: sampled,
+        in_flight_total,
+        unavailable_shards: vec![],
+        inspected_shards: vec![0],
+        truncated_by_size: false,
+        export_failures: 0,
+    }
+}
+
 // ===========================================================================
 // AC4 — the money test: in-flight histories replay CLEAN
 // ===========================================================================
@@ -677,6 +697,14 @@ async fn require_complete_coverage_fails_closed_without_a_manifest() {
 }
 
 /// Same fail-closed rule when the manifest exists but cannot be parsed.
+///
+/// The rung moved from `4` to `2` in Codex round 21, and the move is the point:
+/// a corrupt manifest disables the rung-`2` and rung-`3` guards for *every*
+/// caller, so blocking only under the opt-in `require_complete_coverage` left the
+/// default gate green on a damaged bundle. Rung `2` ("the gate could not fully
+/// run") both describes it correctly and dominates rung `4`, so this bundle is
+/// now refused whether or not the flag is set — see
+/// `corrupt_manifest_blocks_the_default_gate`.
 #[tokio::test]
 async fn require_complete_coverage_fails_closed_on_a_corrupt_manifest() {
     let dir = tempfile::tempdir().unwrap();
@@ -696,7 +724,11 @@ async fn require_complete_coverage_fails_closed_on_a_corrupt_manifest() {
         !strict.is_clean(),
         "a truncated manifest is not proof of complete coverage: {strict}"
     );
-    assert_eq!(strict.exit_code(), 4);
+    assert_eq!(
+        strict.exit_code(),
+        2,
+        "an unreadable manifest blocks at rung 2, which dominates rung 4: {strict}"
+    );
 }
 
 // ===========================================================================
@@ -2417,4 +2449,244 @@ async fn replay_verifier_carries_the_candidate_payload_caps() {
         1,
         "ReplayVerifier::with_payload_caps must reach the fixture replay context: {report}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Codex round 21 — a present-but-unreadable manifest must block the gate
+// ---------------------------------------------------------------------------
+
+/// A manifest that is **present but unreadable** must block the *default* gate.
+///
+/// This is a different case from an absent manifest, and the distinction is the
+/// whole fix. An **absent** manifest means the bundle did not come from the
+/// exporter at all (a hand-assembled directory), which stays deliberately
+/// supported — it simply carries no coverage claim. A manifest that **exists**
+/// asserts the opposite: this bundle *is* an exporter product. If it cannot be
+/// read, the claim it carried was damaged in transit, and every manifest-derived
+/// guard silently evaporates:
+///
+/// * `sampled_total` — the fixture-count cross-check (rung `2`)
+/// * `export_failures` / `truncated_by_size` — the export-shortfall check (rung `2`)
+/// * `status` / `unavailable_shards` — the partial-shard check (rung `3`)
+///
+/// All three read through `Option::is_some_and`, so a `None` coverage turns each
+/// into `false` and the surviving fixtures replay to a green exit `0`. That is a
+/// release certified against an export whose own record of what it did was lost.
+///
+/// Rung `2` ("the gate could not fully run") is the right verdict rather than
+/// rung `4`: rung `4` is gated on the opt-in `require_complete_coverage`, so a
+/// default gate would still exit `0` — which is precisely the hole.
+#[tokio::test]
+async fn corrupt_manifest_blocks_the_default_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
+    // A manifest truncated mid-transfer: present, well-named, unparseable.
+    write(
+        dir.path(),
+        SampleManifest::FILE_NAME,
+        "{\"generated_at\":\"2026-01-01T00:00:00Z\",\"status\":\"comp",
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", canonical_workflow)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        !report.is_clean(),
+        "a damaged coverage claim must not certify a release: {report}"
+    );
+    assert_eq!(
+        report.exit_code(),
+        2,
+        "an unreadable manifest means the gate could not fully run: {report}"
+    );
+    assert!(
+        report.manifest_unreadable.is_some(),
+        "the report must name the unreadable manifest: {report}"
+    );
+    // The failure must be legible in the rendered report, not just the code.
+    let rendered = report.to_string();
+    assert!(
+        rendered.contains("manifest"),
+        "the rendered report must explain the block: {rendered}"
+    );
+}
+
+/// The absent-manifest path must stay fail-open — the fix must not turn every
+/// hand-assembled bundle into a blocked gate.
+///
+/// This is the regression guard for the deliberate support decision the
+/// unreadable-manifest fix sits next to: "no manifest" is a bundle that makes no
+/// coverage claim, not a bundle whose claim was lost.
+#[tokio::test]
+async fn absent_manifest_still_replays_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
+    // Deliberately no manifest written.
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", canonical_workflow)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.is_clean(),
+        "a bundle that makes no coverage claim still replays: {report}"
+    );
+    assert_eq!(report.exit_code(), 0);
+    assert!(
+        report.manifest_unreadable.is_none(),
+        "an absent manifest is not an unreadable one: {report}"
+    );
+}
+
+/// A well-formed manifest must not be mistaken for a damaged one.
+#[tokio::test]
+async fn readable_manifest_is_not_reported_as_unreadable() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
+    write(
+        dir.path(),
+        SampleManifest::FILE_NAME,
+        &serde_json::to_string(&complete_manifest("wf", 1, 1)).unwrap(),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", canonical_workflow)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(report.is_clean(), "{report}");
+    assert!(report.manifest_unreadable.is_none(), "{report}");
+    assert!(report.coverage.is_some(), "{report}");
+}
+
+// ---------------------------------------------------------------------------
+// Codex round 21 — replay must register the candidate's declarative handlers
+// ---------------------------------------------------------------------------
+
+/// A workflow that branches on whether a declarative query handler is
+/// registered.
+///
+/// The live worker registers a workflow's declarative `#[query]` / `#[update]`
+/// handlers *before any workflow code runs* (`executor.rs`, "Auto-register
+/// declarative handlers before any workflow code runs"), and
+/// `ctx.list_query_names()` merges the declarative map into its result. So this
+/// branch is genuinely observable from workflow code — the same class as the
+/// payload caps fixed in round 20: **candidate configuration that lives in no
+/// `WorkflowEvent`**, which replay must mirror or it is not replaying the
+/// candidate at all.
+fn query_branching_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Branch on the candidate's registered declarative handlers.
+        let step = if ctx.list_query_names().iter().any(|n| n == "progress") {
+            "step_one"
+        } else {
+            "step_two"
+        };
+        ctx.execute_activity_raw(step, Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+// The `Result` is not optional: this fn is stored as a `QueryHandlerFn`, whose
+// signature the engine fixes. A handler that happens never to fail still has to
+// match it.
+#[allow(clippy::unnecessary_wraps)]
+fn progress_query(_ctx: &WorkflowContext, _args: Value) -> Result<Value, String> {
+    Ok(Value::String("running".into()))
+}
+
+fn progress_query_info() -> autumn_harvest::info::QueryHandlerInfo {
+    autumn_harvest::info::QueryHandlerInfo {
+        name: "progress",
+        workflow: "wf",
+        module: "replay_drift_tests",
+        input_type_hint: "()",
+        output_type_hint: "String",
+        handler: progress_query,
+        description: None,
+        arg_schema: None,
+        response_schema: None,
+    }
+}
+
+/// The gate must replay with the candidate's declarative query handlers
+/// registered, or it false-reports drift on unchanged code.
+///
+/// The recorded history was produced by a live worker that had `progress`
+/// registered, so it scheduled `step_one`. Replaying the *same* workflow with an
+/// empty declarative registry takes the `else` branch and schedules `step_two` —
+/// reported as drift on a workflow nobody changed (a false RED that blocks a
+/// good release).
+#[tokio::test]
+async fn candidate_declarative_query_handlers_are_registered_during_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    // History recorded by a worker where `progress` WAS registered → step_one.
+    let exec_id = ExecutionId::new();
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "step_one".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+    ];
+    write(dir.path(), "a.json", &snapshot_json("wf", exec_id, events));
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", query_branching_workflow)
+        .queries(vec![progress_query_info()])
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.is_clean(),
+        "replay with the candidate's declarative handlers must not report drift \
+         on unchanged code: {report}"
+    );
+    assert_eq!(report.exit_code(), 0, "{report}");
+}
+
+/// The mirror image: without the candidate's handlers, the same fixture takes
+/// the other branch.
+///
+/// This is the falsifying control — it proves the test above is actually
+/// exercising the registration and not passing for an unrelated reason. It also
+/// pins the false-GREEN direction: a candidate that *removed* the registration
+/// genuinely drifts, and the gate must still say so.
+#[tokio::test]
+async fn removing_a_declarative_handler_is_still_reported_as_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let exec_id = ExecutionId::new();
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "step_one".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+    ];
+    write(dir.path(), "a.json", &snapshot_json("wf", exec_id, events));
+
+    // Candidate dropped the `progress` query → takes the `step_two` branch.
+    let report = ReplayVerifier::new()
+        .register_fn("wf", query_branching_workflow)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        !report.is_clean(),
+        "dropping a declarative handler changes the command stream and must \
+         surface as drift: {report}"
+    );
+    assert_eq!(report.exit_code(), 1, "{report}");
 }

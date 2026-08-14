@@ -177,7 +177,7 @@ needs to act:
 |---|---|
 | `0` | Clean — promote. |
 | `1` | At least one execution diverged. **Do not promote.** |
-| `2` | The gate could not fully run. Dominates `1`. A fixture blocked it (unparseable, an unregistered workflow type, a redacted bundle, or a fixture carrying offloaded payload references or undecoded codec envelopes); the bundle holds a different number of fixtures than its manifest declares; **or** the export itself delivered fewer fixtures than the sample selected (it hit the response byte budget, or individual selected candidates failed to fetch). |
+| `2` | The gate could not fully run. Dominates `1`. A fixture blocked it (unparseable, an unregistered workflow type, a redacted bundle, or a fixture carrying offloaded payload references or undecoded codec envelopes); the bundle's manifest was present but unreadable; the bundle holds a different number of fixtures than its manifest declares; **or** the export itself delivered fewer fixtures than the sample selected (it hit the response byte budget, or individual selected candidates failed to fetch). |
 | `3` | Nothing was verified and `allow_empty_bundle(false)` (the default) — the bundle was empty, **or** every fixture in it was skipped. Also returned *despite* `allow_empty_bundle(true)` when the bundle's manifest reports incomplete shard coverage: an export that could not read the fleet is empty too, so the opt-out does not apply to it. |
 | `4` | `require_complete_coverage(true)` and complete coverage was not proven — the manifest reports partial shard coverage, the bundle carries no readable manifest, **or** a workflow type with in-flight work was sampled zero times. |
 
@@ -196,6 +196,19 @@ a determinism regression that does not exist — a false red on a clean deploy. 
 with `--payload-policy full`; either sample a workflow whose payloads stay under
 the offload threshold or raise `payload_offload_threshold` for the exported window;
 and on an encrypted deployment enable read-path decoding (see *Payloads and secrets*).
+An **unreadable manifest** is the same class and blocks for the same reason. A
+bundle with *no* manifest is fine — a hand-assembled directory of fixtures makes
+no coverage claim, and the gate replays it normally. But a manifest that is
+*present* asserts that this bundle came from the exporter, so one that cannot be
+read or parsed is damaged evidence rather than an absent claim. Every
+manifest-derived check reads through it — the fixture-count cross-check, the
+export-shortfall check, and the shard-coverage check — so silently ignoring it
+switches all three off at once and the surviving fixtures replay to a green
+`0`. Re-export the sample, or re-fetch the artifact if it was truncated in
+transfer. This blocks at `2` rather than `4` on purpose: `4` only fires under
+`require_complete_coverage(true)`, so gating it there would leave the default
+gate green on a damaged bundle.
+
 A fixture count that disagrees with the manifest means files went missing after the
 export (a truncated artifact upload, a partial copy): every surviving fixture may
 replay cleanly while the gate certifies a strict subset of what was sampled.
@@ -328,6 +341,35 @@ setting here on purpose: the worker enforces it after an activity returns, never
 `WorkflowContext`, so it cannot affect a replay.
 
 `WorkflowReplayer` carries the same two builders through to `replay_bundle`.
+
+### Declarative query and update handlers
+
+Same class again, and the same fix. The live worker registers a workflow's
+declarative `#[query]` / `#[update]` handlers **before any workflow code runs**,
+and `ctx.list_query_names()` merges them into its result — so a workflow that
+branches on which handlers exist, or that dispatches a query, can observe them.
+They live in no `WorkflowEvent`, so replay cannot recover them from a fixture:
+
+```rust
+ReplayVerifier::new()
+    .register(workflows![billing_checkout, onboarding])
+    .queries(queries![checkout_progress, onboarding_status])
+    .updates(updates![apply_discount])
+    .replay_bundle(&dir)
+    .await
+```
+
+Pass the same collections the candidate build registers. Leaving them unset
+replays with an empty declarative registry, which is correct only if your
+deployment registers none. Both directions bite here too:
+
+* **Keeping a registration the recorded run had is the false-RED direction.**
+  Replay takes the other branch and reports drift on a workflow nobody changed,
+  blocking a good release.
+* **Adding or removing one is the false-GREEN direction.** The branch the
+  promoted worker will actually take was never exercised by the gate.
+
+`WorkflowReplayer` carries both builders through to `replay_bundle`.
 
 ### Deadline-sensitive workflows
 
