@@ -722,17 +722,26 @@ candidate build*, so a determinism regression is caught before the artifact is
 promoted at all:
 
 ```bash
-# In CI, against staging (read-only credential is sufficient):
-harvest history export-sample --per-workflow 50 --output-dir ./fixtures/in-flight
+# In CI, against staging (read-only credential is sufficient).
+# --payload-policy full is REQUIRED: the CLI defaults to `redacted`, and the
+# gate REFUSES a redacted bundle (redaction rewrites the very activity inputs
+# replay compares against), so omitting it exits 2 on every fixture. Treat the
+# bundle as production data.
+harvest history export-sample \
+  --payload-policy full \
+  --per-workflow 50 \
+  --output-dir ./fixtures/in-flight
 
 # Then, in your own ~15-line gate binary linked against the candidate build:
 cargo run --release --bin replay-drift-gate -- ./fixtures/in-flight
 ```
 
 Exit `0` = promote. Exit `1` = an in-flight execution would diverge — gate the
-change with `ctx.patched(...)` and re-run. Exit `3` = the bundle was empty (a
-gate that verified nothing is never a pass; opt out with
-`allow_empty_bundle(true)` only for a genuinely idle fleet).
+change with `ctx.patched(...)` and re-run. Exit `2` = the gate could not fully
+run (a redacted bundle, a fixture that failed to replay, or an export that
+delivered fewer fixtures than it selected) — fix the export, never override.
+Exit `3` = the bundle was empty (a gate that verified nothing is never a pass;
+opt out with `allow_empty_bundle(true)` only for a genuinely idle fleet).
 
 The export is `SELECT`-only and safe against production. The per-type
 stratification (`--per-workflow`) means a noisy workflow type cannot crowd every

@@ -679,6 +679,55 @@ async fn unreachable_shard_degrades_the_manifest_to_partial() {
     );
 }
 
+/// A shard whose **connection succeeds but whose query fails** must not be
+/// counted as inspected.
+///
+/// This is the distinct sibling of the unreachable-shard case above: there the
+/// failure happens at `acquire_conn`, here it happens one step later. Counting
+/// the shard the moment its connection is acquired puts it in *both* the
+/// inspected and unavailable lists, and `SampleStatus::from_counts` reads
+/// `inspected == 0` as its "unavailable" signal — so a single-shard deployment
+/// whose query fails would report `partial` while naming one supposedly
+/// inspected shard, overstating coverage in the very record the gate uses to
+/// decide whether coverage was proven.
+///
+/// The fault is injected by dropping the table the sample query reads, which
+/// leaves the connection perfectly healthy.
+#[tokio::test]
+async fn a_shard_whose_query_fails_is_not_counted_as_inspected() {
+    let (urls, _guard) = setup_shards(1).await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&urls[0])
+        .await
+        .expect("shard connect");
+    conn.batch_execute("DROP TABLE harvest_workflow_executions CASCADE")
+        .await
+        .expect("drop the table the sample query reads");
+
+    let app = build_app(&urls);
+    let (status, body) = get_json(&app, SAMPLE_ROUTE).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a failing shard query degrades, never 500s: {body}"
+    );
+    let manifest = manifest_of(&body);
+    assert!(
+        manifest.inspected_shards.is_empty(),
+        "a shard whose query failed was never successfully inspected: {body}"
+    );
+    assert_eq!(
+        manifest.status,
+        autumn_harvest::replay_sample::SampleStatus::Unavailable,
+        "the only shard failed, so coverage is unavailable — not partial: {body}"
+    );
+    assert!(
+        !manifest.unavailable_shards.is_empty(),
+        "the failing shard must be named: {body}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AC3 — payload policy
 // ---------------------------------------------------------------------------

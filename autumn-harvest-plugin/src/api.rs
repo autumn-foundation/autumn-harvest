@@ -33840,8 +33840,6 @@ async fn collect_history_sample_candidates_from_shards(
                 continue;
             }
         };
-        work.batch.inspected_shards.push(shard_id);
-
         let rows = match load_history_sample_candidates(&mut conn, query, shard_id).await {
             Ok(rows) => rows,
             Err(error) => {
@@ -33849,6 +33847,14 @@ async fn collect_history_sample_candidates_from_shards(
                 continue;
             }
         };
+        // Recorded only once the query succeeded. Counting a shard as inspected
+        // the moment its connection was acquired puts a failed shard in *both*
+        // lists, and `SampleStatus::from_counts` reads `inspected == 0` as its
+        // "unavailable" signal — so on a single-shard deployment a failing query
+        // would report `partial` (with one shard supposedly inspected) instead
+        // of `unavailable`, understating the outage in the very record the gate
+        // uses to decide whether coverage was proven.
+        work.batch.inspected_shards.push(shard_id);
         if !rows.is_empty() {
             work.batch.matched_shards.push(shard_id);
         }
@@ -33989,6 +33995,12 @@ fn build_sample_manifest(
             .collect(),
         inspected_shards: work.batch.inspected_shards.clone(),
         truncated_by_size: work.truncated_by_size,
+        // A selected candidate that failed to export produces a failure instead
+        // of a document, so `sampled_total` above counts only the survivors and
+        // therefore agrees exactly with the bundle. Carrying the count is the
+        // only way the gate can tell that the sample it replayed is a subset of
+        // the sample that was chosen.
+        export_failures: work.batch.failures.len() as u64,
     }
 }
 
@@ -43167,6 +43179,52 @@ mod tests {
             ..Default::default()
         };
         assert!(!build_sample_manifest(&sample_query(), &untruncated).truncated_by_size);
+    }
+
+    /// A candidate the sample selected but the export could not fetch (over
+    /// `max_bytes`, unreadable shard) must reach the manifest as a count.
+    ///
+    /// This is the one shortfall no other manifest field can express: the failed
+    /// candidate produces no document, so `sampled_total` counts only survivors
+    /// and agrees *exactly* with the fixture count in the bundle. Without this
+    /// count the gate replays a biased subset — biased against the largest
+    /// histories — and exits `0`.
+    #[test]
+    fn manifest_reports_candidates_the_export_dropped() {
+        let base = sample_base();
+        let mut work = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[sample_row("wf", 1, base, 3)])],
+            ..Default::default()
+        };
+        work.batch.failures.push(HistoryExportFailure {
+            execution_id: Some(uuid::Uuid::from_u128(1).to_string()),
+            shard_id: 0,
+            reason: "history exceeds max_bytes".to_string(),
+            actual_bytes: Some(20_000_000),
+            max_bytes: Some(10_000_000),
+        });
+
+        let manifest = build_sample_manifest(&sample_query(), &work);
+
+        assert_eq!(
+            manifest.export_failures, 1,
+            "a dropped candidate must be counted on the manifest"
+        );
+        assert!(
+            manifest.is_incomplete_export(),
+            "the gate reads this predicate, so it must follow from the count"
+        );
+
+        // Control: a clean export claims no shortfall.
+        let clean = HistorySampleExportWork {
+            per_shard_population: vec![shard_population(&[sample_row("wf", 1, base, 3)])],
+            ..Default::default()
+        };
+        assert_eq!(
+            build_sample_manifest(&sample_query(), &clean).export_failures,
+            0
+        );
+        assert!(!build_sample_manifest(&sample_query(), &clean).is_incomplete_export());
     }
 
     /// The complement: `sampled` counts the documents actually exported, per

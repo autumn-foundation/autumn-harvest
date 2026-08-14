@@ -2518,6 +2518,20 @@ impl ReplayDriftReport {
         })
     }
 
+    /// Whether the export delivered fewer fixtures than the sample selected.
+    ///
+    /// See [`SampleManifest::is_incomplete_export`]. A bundle with no manifest
+    /// reports `false` here — the absence of a manifest is rung `4`'s business
+    /// (unproven coverage), not a claim that the export fell short.
+    ///
+    /// [`SampleManifest::is_incomplete_export`]: crate::replay_sample::SampleManifest::is_incomplete_export
+    #[must_use]
+    pub fn export_is_incomplete(&self) -> bool {
+        self.coverage
+            .as_ref()
+            .is_some_and(crate::replay_sample::SampleManifest::is_incomplete_export)
+    }
+
     /// Whether the gate passes.
     ///
     /// True when every fixture replayed without divergence **and** the bundle
@@ -2540,12 +2554,24 @@ impl ReplayDriftReport {
     /// |------|---------|
     /// | `0` | Every fixture replayed cleanly |
     /// | `1` | One or more fixtures diverged — a determinism regression |
-    /// | `2` | The gate could not fully run: a fixture failed to replay, **or** the bundle holds a different number of fixtures than its manifest declares (dominates over `1`, because a gate that did not fully run cannot be trusted — mirrors [`CiReport::exit_code`]) |
+    /// | `2` | The gate could not fully run: a fixture failed to replay, the bundle holds a different number of fixtures than its manifest declares, **or** the export itself delivered fewer fixtures than the sample selected (dominates over `1`, because a gate that did not fully run cannot be trusted — mirrors [`CiReport::exit_code`]) |
     /// | `3` | Nothing was verified — the bundle was empty, or every fixture was skipped |
     /// | `4` | `require_complete_coverage` is set and complete coverage was not proven — the sample is knowingly incomplete, a workflow type with in-flight work was sampled zero times, **or** the bundle carries no readable manifest at all |
+    ///
+    /// The rung-`2` export-shortfall condition is deliberately *unconditional* —
+    /// unlike rung `4`, it does not wait for
+    /// [`require_complete_coverage`](ReplayVerifier::require_complete_coverage).
+    /// Rung `4` is about the sample the operator **asked for** being a slice of
+    /// the fleet, which is the gate's normal mode and only a failure if they say
+    /// so. This is about the bundle being a silent, biased subset of *that
+    /// slice*, which nobody opted into and which no amount of reading the report
+    /// would reveal to a CI step that only inspects the exit code.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
-        if !self.blocked.is_empty() || self.fixture_count_disagrees_with_manifest() {
+        if !self.blocked.is_empty()
+            || self.fixture_count_disagrees_with_manifest()
+            || self.export_is_incomplete()
+        {
             return 2;
         }
         if !self.diverged.is_empty() {
@@ -2607,6 +2633,18 @@ impl ReplayDriftReport {
                  budget, so this bundle is smaller than the sample that was requested. \
                  Narrow the export (fewer states, a single shard, a lower max_bytes) \
                  rather than raising --per-workflow."
+            )?;
+        }
+        if coverage.export_failures > 0 {
+            writeln!(
+                f,
+                "    EXPORT DROPPED {} SELECTED CANDIDATE(S): the sample chose them but \
+                 the export could not produce a fixture (over max_bytes, or the shard \
+                 became unreadable), so this bundle is a biased subset — biased against \
+                 the largest histories, which are the longest-running and the most likely \
+                 to span the change under test. Re-export with a higher --max-bytes, or \
+                 narrow the sample until every selected candidate fits.",
+                coverage.export_failures,
             )?;
         }
         if self.fixture_count_disagrees_with_manifest() {

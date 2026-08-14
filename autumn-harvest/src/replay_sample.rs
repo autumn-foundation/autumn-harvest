@@ -212,6 +212,22 @@ pub struct SampleManifest {
     /// reads back as `false` rather than failing the whole bundle.
     #[serde(default)]
     pub truncated_by_size: bool,
+    /// How many candidates the sample *selected* but the export could not
+    /// produce a fixture for — a history over `max_bytes`, or a shard that
+    /// became unreadable between selection and fetch.
+    ///
+    /// Load-bearing, because no other field can express it. The export records
+    /// a failure instead of a document and continues, so
+    /// [`sampled_total`](Self::sampled_total) counts only the *survivors* and
+    /// therefore agrees exactly with the fixture count in the bundle. Without
+    /// this the gate replays a silently smaller, biased sample — biased against
+    /// the largest histories, which are the longest-running and so the most
+    /// likely to span the code change under test — and reports it as a pass.
+    ///
+    /// `#[serde(default)]` so a manifest written before this field existed
+    /// reads back as `0` rather than failing the whole bundle.
+    #[serde(default)]
+    pub export_failures: u64,
 }
 
 impl SampleManifest {
@@ -233,6 +249,29 @@ impl SampleManifest {
     #[must_use]
     pub const fn is_truncated(&self) -> bool {
         self.sampled_total < self.in_flight_total
+    }
+
+    /// Whether the bundle holds **fewer fixtures than the sample selected**.
+    ///
+    /// Deliberately distinct from [`is_truncated`](Self::is_truncated). That
+    /// method reports the *intended* truncation of drawing `per_workflow` out of
+    /// a larger population — the normal, documented mode of the gate, and never
+    /// on its own a reason to fail. This one reports that the export could not
+    /// deliver even the slice it chose, which is an *unplanned* shortfall the
+    /// gate must not certify a build against.
+    ///
+    /// Both causes are the same defect from the gate's point of view — the
+    /// verified set is a silent, biased subset of the requested one — so they
+    /// share one predicate rather than two rungs a caller could handle
+    /// inconsistently:
+    ///
+    /// * [`truncated_by_size`](Self::truncated_by_size) — the export hit
+    ///   [`MAX_SAMPLE_RESPONSE_BYTES`] and stopped early.
+    /// * [`export_failures`](Self::export_failures) — individual selected
+    ///   candidates could not be fetched.
+    #[must_use]
+    pub const fn is_incomplete_export(&self) -> bool {
+        self.truncated_by_size || self.export_failures > 0
     }
 }
 
@@ -551,6 +590,7 @@ mod tests {
             unavailable_shards: vec!["shard 1: down".into()],
             inspected_shards: vec![0],
             truncated_by_size: false,
+            export_failures: 0,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         assert!(json.contains("\"status\":\"partial\""), "{json}");
@@ -579,6 +619,63 @@ mod tests {
         });
         let manifest: SampleManifest = serde_json::from_value(legacy).unwrap();
         assert!(!manifest.truncated_by_size);
+        assert_eq!(
+            manifest.export_failures, 0,
+            "a pre-#798 manifest must read back as a complete export, not block \
+             every legacy bundle"
+        );
+        assert!(!manifest.is_incomplete_export());
+    }
+
+    /// The two shortfall causes are different defects with different fixes, but
+    /// the gate must treat them identically: either one means the bundle is a
+    /// silent subset of the slice the sample chose.
+    #[test]
+    fn incomplete_export_covers_both_a_size_cut_and_dropped_candidates() {
+        let base = SampleManifest {
+            generated_at: chrono::Utc::now(),
+            status: SampleStatus::Complete,
+            states: vec!["RUNNING".into()],
+            per_workflow: vec![],
+            sampled_total: 10,
+            in_flight_total: 10,
+            unavailable_shards: vec![],
+            inspected_shards: vec![0],
+            truncated_by_size: false,
+            export_failures: 0,
+        };
+        assert!(
+            !base.is_incomplete_export(),
+            "a clean export must not be flagged"
+        );
+
+        let size_cut = SampleManifest {
+            truncated_by_size: true,
+            ..base.clone()
+        };
+        assert!(size_cut.is_incomplete_export());
+
+        let dropped = SampleManifest {
+            export_failures: 1,
+            ..base.clone()
+        };
+        assert!(dropped.is_incomplete_export());
+
+        // Orthogonal to ordinary (intended) truncation: sampling a slice of a
+        // larger population is the gate's normal mode and is NOT a shortfall.
+        let intended_slice = SampleManifest {
+            sampled_total: 10,
+            in_flight_total: 4_000,
+            ..base
+        };
+        assert!(
+            intended_slice.is_truncated(),
+            "10 of 4000 is truncated coverage"
+        );
+        assert!(
+            !intended_slice.is_incomplete_export(),
+            "intended truncation must never be confused with an export shortfall"
+        );
     }
 
     /// The aggregate response budget must actually bound the count cap.

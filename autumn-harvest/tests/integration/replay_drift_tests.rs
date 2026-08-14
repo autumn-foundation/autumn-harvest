@@ -437,6 +437,7 @@ async fn bundle_manifest_coverage_is_surfaced_on_the_report() {
         unavailable_shards: vec![],
         inspected_shards: vec![0],
         truncated_by_size: false,
+        export_failures: 0,
     };
     write(
         dir.path(),
@@ -463,6 +464,127 @@ async fn bundle_manifest_coverage_is_surfaced_on_the_report() {
     );
 }
 
+/// The export stops accumulating once it hits the aggregate byte budget, so a
+/// bundle can be *smaller than the sample the operator asked for* even though
+/// every shard was reachable and every fixture present replays clean.
+///
+/// Recording that on the manifest is not enough on its own: a CI gate reads the
+/// exit code, not the rendered report, so a size-cut bundle that exits `0`
+/// certifies the build against a quietly-trimmed subset. The bytes are dropped
+/// in export order, so what goes missing is the *tail* of each type's
+/// risk-ordered slice — precisely the executions the `oldest` default exists to
+/// prioritise.
+#[tokio::test]
+async fn a_size_truncated_bundle_blocks_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
+
+    let manifest = SampleManifest {
+        generated_at: Utc::now(),
+        status: SampleStatus::Complete,
+        states: vec!["RUNNING".into()],
+        per_workflow: vec![SampleWorkflowCoverage {
+            workflow_name: "wf".into(),
+            sampled: 1,
+            in_flight_total: 1,
+        }],
+        sampled_total: 1,
+        in_flight_total: 1,
+        unavailable_shards: vec![],
+        inspected_shards: vec![0],
+        truncated_by_size: true,
+        export_failures: 0,
+    };
+    write(
+        dir.path(),
+        SampleManifest::FILE_NAME,
+        &serde_json::to_string(&manifest).unwrap(),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", canonical_workflow)
+        .replay_bundle(dir.path())
+        .await;
+
+    // Every fixture that IS present replays clean — the gate must still refuse.
+    assert!(
+        report.diverged.is_empty(),
+        "no divergence was planted: {report}"
+    );
+    assert_eq!(
+        report.exit_code(),
+        2,
+        "a size-truncated export did not fully run the gate: {report}"
+    );
+    assert!(
+        !report.is_clean(),
+        "a size-truncated bundle must never read as clean: {report}"
+    );
+}
+
+/// A candidate the sample *selected* can still fail to export — it exceeds
+/// `max_bytes`, or its shard becomes unreadable between selection and fetch.
+/// The export records the failure and moves on, so the bundle silently holds
+/// fewer fixtures than the sample chose.
+///
+/// This is the false-GREEN the manifest exists to prevent, and the count check
+/// alone cannot see it: the manifest's `sampled_total` counts *survivors*, so it
+/// agrees with the bundle exactly. Without a dedicated signal the gate replays a
+/// biased subset — biased against the largest histories, which are the longest
+/// running and therefore the most likely to span the code change under test —
+/// and exits `0`.
+#[tokio::test]
+async fn an_export_that_dropped_candidates_blocks_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
+
+    let manifest = SampleManifest {
+        generated_at: Utc::now(),
+        status: SampleStatus::Complete,
+        states: vec!["RUNNING".into()],
+        per_workflow: vec![SampleWorkflowCoverage {
+            workflow_name: "wf".into(),
+            // The survivor count agrees with the bundle, which is exactly why
+            // the fixture-count check cannot catch this.
+            sampled: 1,
+            in_flight_total: 1,
+        }],
+        sampled_total: 1,
+        in_flight_total: 1,
+        unavailable_shards: vec![],
+        inspected_shards: vec![0],
+        truncated_by_size: false,
+        export_failures: 1,
+    };
+    write(
+        dir.path(),
+        SampleManifest::FILE_NAME,
+        &serde_json::to_string(&manifest).unwrap(),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", canonical_workflow)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.diverged.is_empty(),
+        "no divergence was planted: {report}"
+    );
+    assert!(
+        !report.fixture_count_disagrees_with_manifest(),
+        "the survivor count agrees with the bundle, so only a dedicated \
+         export-failure signal can catch this: {report}"
+    );
+    assert_eq!(
+        report.exit_code(),
+        2,
+        "an export that dropped selected candidates did not fully run the \
+         gate: {report}"
+    );
+    assert!(!report.is_clean(), "{report}");
+}
+
 /// A bundle exported while a shard was unreachable covers less than the fleet.
 /// The gate must be able to refuse to go green on a knowingly-partial sample.
 #[tokio::test]
@@ -484,6 +606,7 @@ async fn partial_shard_coverage_can_block_the_gate() {
         unavailable_shards: vec!["shard 1: connection refused".into()],
         inspected_shards: vec![0],
         truncated_by_size: false,
+        export_failures: 0,
     };
     write(
         dir.path(),
@@ -761,6 +884,7 @@ async fn a_divergence_outranks_the_coverage_rungs() {
         unavailable_shards: vec!["shard 1: connection refused".into()],
         inspected_shards: vec![0],
         truncated_by_size: false,
+        export_failures: 0,
     };
     write(
         dir.path(),
@@ -966,6 +1090,7 @@ async fn a_bundle_missing_manifest_declared_fixtures_blocks_the_gate() {
         unavailable_shards: vec![],
         inspected_shards: vec![0],
         truncated_by_size: false,
+        export_failures: 0,
     };
     write(
         dir.path(),
@@ -1071,6 +1196,7 @@ async fn a_workflow_type_sampled_zero_times_fails_a_complete_coverage_claim() {
         unavailable_shards: vec![],
         inspected_shards: vec![0],
         truncated_by_size: false,
+        export_failures: 0,
     };
     write(
         dir.path(),

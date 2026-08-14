@@ -2971,6 +2971,26 @@ pub fn render_history_sample_summary(response: &Value, dir: &Path) -> String {
         );
     }
 
+    // A candidate the sample SELECTED but the export could not fetch. Reported
+    // separately from the byte-budget cut above because the fix differs: this
+    // one is per-document (`--max-bytes`), that one is request-wide. Both make
+    // the bundle a subset of the chosen slice, and both make the gate exit 2.
+    let dropped = manifest
+        .and_then(|manifest| manifest.get("export_failures"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if dropped > 0 {
+        let _ = write!(
+            out,
+            "\nWARNING: the export could not fetch {dropped} candidate(s) the sample \
+             selected (over --max-bytes, or an unreadable shard), so this bundle is a \
+             BIASED subset — biased against the largest histories, which are the \
+             longest-running and the most likely to span your change. The replay gate \
+             will refuse it (exit 2). Raise --max-bytes, or narrow the sample until \
+             every selected candidate fits.\n",
+        );
+    }
+
     // A redacted bundle is refused by the replay gate (it rewrites the very
     // activity inputs replay compares against, so every fixture would report a
     // false divergence). The CLI default is `redacted`, so an operator who omits
@@ -12490,6 +12510,45 @@ mod replay_sample_bundle_tests {
         );
     }
 
+    /// A candidate the sample selected but the export could not fetch must be
+    /// reported at write time.
+    ///
+    /// The count is otherwise invisible: the failed candidate produces no
+    /// document, so `sampled_total` counts only survivors and matches the file
+    /// count exactly. An operator reading a summary that says "4 of 4 sampled"
+    /// would reasonably believe the bundle is whole.
+    #[test]
+    fn summary_warns_that_the_export_dropped_selected_candidates() {
+        let mut response = sample_response();
+        response["manifest"]["export_failures"] = json!(2);
+
+        let summary = render_history_sample_summary(&response, Path::new("./fixtures"));
+        assert!(
+            summary.contains("could not fetch 2 candidate(s)"),
+            "the count must be named: {summary}"
+        );
+        assert!(
+            summary.contains("BIASED subset"),
+            "the consequence must be named, not just the cause: {summary}"
+        );
+        assert!(
+            summary.contains("--max-bytes"),
+            "the fix must be named: {summary}"
+        );
+        // The two shortfall causes are reported independently.
+        assert!(
+            !summary.contains("response byte budget"),
+            "a dropped candidate is not a byte-budget cut: {summary}"
+        );
+    }
+
+    /// Control: a clean export must not claim it dropped anything.
+    #[test]
+    fn summary_of_a_clean_export_does_not_claim_dropped_candidates() {
+        let summary = render_history_sample_summary(&sample_response(), Path::new("./fixtures"));
+        assert!(!summary.contains("BIASED subset"), "{summary}");
+    }
+
     /// A manifest written before `truncated_by_size` existed must not warn.
     #[test]
     fn summary_of_a_legacy_manifest_without_the_size_flag_does_not_warn() {
@@ -12502,6 +12561,10 @@ mod replay_sample_bundle_tests {
         });
         let summary = render_history_sample_summary(&response, Path::new("./fixtures"));
         assert!(!summary.contains("response byte budget"), "{summary}");
+        assert!(
+            !summary.contains("BIASED subset"),
+            "a legacy manifest predates export_failures too, so it must not warn: {summary}"
+        );
     }
 
     /// The CLI default is `redacted`, and the replay gate REFUSES a redacted

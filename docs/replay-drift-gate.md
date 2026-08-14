@@ -160,7 +160,7 @@ needs to act:
 |---|---|
 | `0` | Clean — promote. |
 | `1` | At least one execution diverged. **Do not promote.** |
-| `2` | The gate could not fully run. Dominates `1`. Either a fixture blocked it (unparseable, an unregistered workflow type, a redacted bundle, or a fixture carrying offloaded payload references) **or** the bundle holds a different number of fixtures than its manifest declares. |
+| `2` | The gate could not fully run. Dominates `1`. A fixture blocked it (unparseable, an unregistered workflow type, a redacted bundle, or a fixture carrying offloaded payload references); the bundle holds a different number of fixtures than its manifest declares; **or** the export itself delivered fewer fixtures than the sample selected (it hit the response byte budget, or individual selected candidates failed to fetch). |
 | `3` | Nothing was verified and `allow_empty_bundle(false)` (the default) — the bundle was empty, **or** every fixture in it was skipped. |
 | `4` | `require_complete_coverage(true)` and complete coverage was not proven — the manifest reports partial shard coverage, the bundle carries no readable manifest, **or** a workflow type with in-flight work was sampled zero times. |
 
@@ -307,7 +307,7 @@ onboarding                                    13        106  no
 NOTE: the sample is truncated; a clean gate verifies the SAMPLE, not the fleet.
 ```
 
-Three failure modes the manifest exists to prevent:
+Four failure modes the manifest exists to prevent:
 
 * **Silent truncation.** `sampled: 50, in_flight_total: 4021` is stated, never
   implied. A workflow type whose entire sample failed the per-execution size
@@ -330,6 +330,27 @@ Three failure modes the manifest exists to prevent:
   *unplanned* resource limit. Raising `--per-workflow` makes it strictly worse —
   narrow the export instead (fewer states, a single `--shard-id`, a lower
   `--max-bytes`).
+* **A silently *biased* export.** A candidate the sample *selected* can still
+  fail to export — its history exceeds `--max-bytes`, or its shard becomes
+  unreadable between selection and fetch. The export records the failure and
+  moves on, so the bundle holds fewer fixtures than the sample chose.
+
+  This one is invisible to every other field, which is why it gets its own:
+  `sampled_total` counts only the **survivors**, so it agrees with the file
+  count exactly and the bundle looks whole. `export_failures` carries the
+  count, and the gate exits `2` on it. The bias is not random — it is against
+  the *largest* histories, which are the longest-running and therefore the most
+  likely to span the change you are gating, so the executions most worth
+  replaying are exactly the ones dropped. Raise `--max-bytes`, or narrow the
+  sample until every selected candidate fits.
+
+Both shortfall causes — the byte-budget cut and dropped candidates — are read
+through one predicate, `SampleManifest::is_incomplete_export()`, and both fail
+the gate **unconditionally**. They do not wait for
+`require_complete_coverage(true)`: that flag is about the sample you *asked for*
+being a slice of the fleet, which is the gate's normal mode and only a failure
+if you say so. These are about the bundle being a silent subset of *that slice*,
+which nobody opted into.
 
 ### Raising confidence
 
