@@ -486,6 +486,25 @@ pub struct WorkflowReplayer {
     declarative_queries: Vec<crate::info::QueryHandlerInfo>,
     /// The candidate's declarative update handlers. See `declarative_queries`.
     declarative_updates: Vec<crate::info::UpdateHandlerInfo>,
+    /// Per-workflow `#[workflow(max_input_bytes = …)]` overrides (issue #798,
+    /// Codex round 22), keyed by workflow type name.
+    ///
+    /// The same class as `payload_limits` above, one level finer. The live worker
+    /// does not apply a single fleet-wide workflow-input cap: it resolves the
+    /// effective cap **per workflow type**, raising the registry default by that
+    /// workflow's own declared override —
+    /// `workflow.max_input_bytes.map_or(global, |per| per.max(global))`
+    /// (`worker.rs`). A gate that applies only the global cap therefore replays a
+    /// cap-raising workflow under a cap the promoted worker will not enforce: a
+    /// frontier dispatch that the worker accepts is rejected here with
+    /// `PayloadTooLarge`, which is the false-RED direction — drift reported on a
+    /// workflow nobody changed, blocking a good release.
+    ///
+    /// Populated from [`register`](Self::register), which already receives the
+    /// full [`WorkflowInfo`] and previously kept only `name → handler`. Empty for
+    /// [`register_fn`](Self::register_fn) (a bare fn pointer carries no override),
+    /// which resolves to the global cap — byte-for-byte the pre-fix behavior.
+    workflow_input_caps: HashMap<String, u64>,
 }
 
 /// Owned borrows of a replayer's declarative handlers.
@@ -562,6 +581,7 @@ impl WorkflowReplayer {
             payload_limits: crate::executor::ReplayPayloadLimits::default(),
             declarative_queries: Vec::new(),
             declarative_updates: Vec::new(),
+            workflow_input_caps: HashMap::new(),
         }
     }
 
@@ -757,6 +777,34 @@ impl WorkflowReplayer {
         }
     }
 
+    /// Resolve the payload limits for one workflow type (issue #798, round 22).
+    ///
+    /// Mirrors the live worker's own arithmetic verbatim:
+    ///
+    /// ```text
+    /// workflow.max_input_bytes.map_or(registry.max_workflow_input_bytes,
+    ///                                 |per| per.max(registry.max_workflow_input_bytes))
+    /// ```
+    ///
+    /// so the declared override **raises** the global cap and never lowers it.
+    /// Reproducing the worker's expression — rather than an arguably-nicer rule —
+    /// is the whole point: a gate is only trustworthy if its cap is the cap the
+    /// promoted worker enforces, including where that expression is surprising.
+    /// (`0` means "no cap" by the crate-wide convention, and `per.max(0) == per`
+    /// narrows it; that quirk is the worker's, and a gate that "fixed" it here
+    /// would answer a question about a worker that does not exist.)
+    ///
+    /// A workflow with no declared override, or one registered via
+    /// [`register_fn`](Self::register_fn), resolves to the global limits
+    /// unchanged.
+    fn payload_limits_for(&self, workflow_name: &str) -> crate::executor::ReplayPayloadLimits {
+        let mut limits = self.payload_limits;
+        if let Some(&per) = self.workflow_input_caps.get(workflow_name) {
+            limits.max_workflow_input = per.max(limits.max_workflow_input);
+        }
+        limits
+    }
+
     /// Set the `execution_id` threaded into the replayed `WorkflowContext` on the
     /// raw [`replay_from_events`](Self::replay_from_events) path (issue #698).
     ///
@@ -907,6 +955,10 @@ impl WorkflowReplayer {
             // branch and is reported as drift it never had.
             declarative_queries: self.declarative_queries.clone(),
             declarative_updates: self.declarative_updates.clone(),
+            // Codex round 22 extended it once more to the per-workflow input-cap
+            // overrides: dropping them replays a cap-raising workflow under the
+            // global cap the promoted worker will not enforce for it.
+            workflow_input_caps: self.workflow_input_caps.clone(),
         };
         verifier.replay_bundle(dir).await
     }
@@ -922,6 +974,13 @@ impl WorkflowReplayer {
     #[must_use]
     pub fn register(mut self, workflows: Vec<WorkflowInfo>) -> Self {
         for wf in workflows {
+            // Issue #798 (Codex round 22): retain the per-workflow input-cap
+            // override. The live worker raises its global cap by this value for
+            // this workflow type; dropping it replayed a cap-raising workflow
+            // under a cap the promoted worker never enforces.
+            if let Some(per) = wf.max_input_bytes {
+                self.workflow_input_caps.insert(wf.name.to_string(), per);
+            }
             self.handlers.insert(wf.name.to_string(), wf.handler);
         }
         self
@@ -1061,6 +1120,10 @@ impl WorkflowReplayer {
         // Issue #698: the workflow type name (mechanism 1 — the handler-lookup key)
         // applied to the replayed context via `.with_workflow_name(...)`.
         let workflow_name = snapshot.workflow_name.clone();
+        // Issue #798 (Codex round 22): resolve the cap for THIS workflow type,
+        // raising the global by its declared override exactly as the worker does.
+        // Bound before `workflow_name` is moved into the executor call below.
+        let payload_limits = self.payload_limits_for(&workflow_name);
         let events = match self.maybe_inflate(snapshot.events).await {
             Ok(e) => e,
             Err(error) => {
@@ -1109,7 +1172,7 @@ impl WorkflowReplayer {
                 // limits, for the same reason as the build id above — a build
                 // that lowers a cap breaks the very in-flight runs the gate
                 // sampled, and the library default would certify it.
-                self.payload_limits,
+                payload_limits,
                 // Issue #798 (Codex round 21): the candidate's declarative
                 // `#[query]`/`#[update]` handlers. The live worker registers
                 // these before the body runs, so a workflow that branches on
@@ -1145,7 +1208,7 @@ impl WorkflowReplayer {
                 // limits, for the same reason as the build id above — a build
                 // that lowers a cap breaks the very in-flight runs the gate
                 // sampled, and the library default would certify it.
-                self.payload_limits,
+                payload_limits,
                 // Issue #798 (Codex round 21): the candidate's declarative
                 // `#[query]`/`#[update]` handlers. The live worker registers
                 // these before the body runs, so a workflow that branches on
@@ -1223,6 +1286,8 @@ impl WorkflowReplayer {
         let exec_id = snapshot.execution_id;
         // Issue #698: the workflow type name (mechanism 1 — the handler-lookup key).
         let workflow_name = snapshot.workflow_name.clone();
+        // Issue #798 (Codex round 22): per-workflow-type cap; see the strict path.
+        let payload_limits = self.payload_limits_for(&workflow_name);
         let total_events = snapshot.events.len();
         let input = extract_input(&snapshot.events);
 
@@ -1257,7 +1322,7 @@ impl WorkflowReplayer {
             // parks at the frontier — exactly where a fresh dispatch consults the
             // cap — so the library default here is what turns a cap-lowering
             // build into a false GREEN.
-            self.payload_limits,
+            payload_limits,
             // Issue #798 (Codex round 21): the candidate's declarative handlers
             // (see the strict path). This is the in-flight gate's own call.
             declarative.as_params(),
@@ -1338,6 +1403,8 @@ impl WorkflowReplayer {
         // `ctx.info().execution_id` in a command-affecting value.
         let (name, &handler) = self.handlers.iter().next().unwrap();
         let workflow_name = name.clone();
+        // Issue #798 (Codex round 22): per-workflow-type cap; see the strict path.
+        let payload_limits = self.payload_limits_for(&workflow_name);
         let workflow_id = self.workflow_id.clone();
         // Issue #798: a raw-events fixture carries no `queue_name` either, so use
         // the replayer's global (`with_queue_name`) when set.
@@ -1395,7 +1462,7 @@ impl WorkflowReplayer {
                 // limits, for the same reason as the build id above — a build
                 // that lowers a cap breaks the very in-flight runs the gate
                 // sampled, and the library default would certify it.
-                self.payload_limits,
+                payload_limits,
                 // Issue #798 (Codex round 21): the candidate's declarative
                 // `#[query]`/`#[update]` handlers. The live worker registers
                 // these before the body runs, so a workflow that branches on
@@ -1430,7 +1497,7 @@ impl WorkflowReplayer {
                 // limits, for the same reason as the build id above — a build
                 // that lowers a cap breaks the very in-flight runs the gate
                 // sampled, and the library default would certify it.
-                self.payload_limits,
+                payload_limits,
                 // Issue #798 (Codex round 21): the candidate's declarative
                 // `#[query]`/`#[update]` handlers. The live worker registers
                 // these before the body runs, so a workflow that branches on
@@ -3342,6 +3409,14 @@ struct FixtureReplayDefaults {
     declarative_queries: Vec<crate::info::QueryHandlerInfo>,
     /// See `declarative_queries`.
     declarative_updates: Vec<crate::info::UpdateHandlerInfo>,
+    /// Per-workflow `#[workflow(max_input_bytes = …)]` overrides, keyed by
+    /// workflow type name (issue #798, Codex round 22).
+    ///
+    /// Populated by [`ReplayVerifier::register`] from the registered
+    /// [`WorkflowInfo`](crate::info::WorkflowInfo)s. Carried per fixture because
+    /// the live worker resolves this cap per workflow type, not fleet-wide; see
+    /// `WorkflowReplayer::payload_limits_for`.
+    workflow_input_caps: HashMap<String, u64>,
 }
 
 impl Default for ReplayVerifier {
@@ -3496,6 +3571,14 @@ impl ReplayVerifier {
     #[must_use]
     pub fn register(mut self, workflows: Vec<crate::info::WorkflowInfo>) -> Self {
         for wf in workflows {
+            // Issue #798 (Codex round 22): retain the per-workflow input-cap
+            // override so each fixture replays under the cap the promoted worker
+            // resolves for *its* workflow type, not one bundle-wide value.
+            if let Some(per) = wf.max_input_bytes {
+                self.replay_defaults
+                    .workflow_input_caps
+                    .insert(wf.name.to_string(), per);
+            }
             self.handlers.insert(wf.name.to_string(), wf.handler);
         }
         self
@@ -4264,6 +4347,10 @@ fn fixture_replayer(
         // omits them is not replaying the candidate.
         declarative_queries: defaults.declarative_queries.clone(),
         declarative_updates: defaults.declarative_updates.clone(),
+        // Issue #798 (Codex round 22): the per-workflow input-cap overrides the
+        // verifier retained from `register`. Each fixture resolves its own cap
+        // from this map by workflow type, mirroring the live worker.
+        workflow_input_caps: defaults.workflow_input_caps.clone(),
     }
 }
 

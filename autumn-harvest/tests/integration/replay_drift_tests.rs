@@ -2690,3 +2690,232 @@ async fn removing_a_declarative_handler_is_still_reported_as_drift() {
     );
     assert_eq!(report.exit_code(), 1, "{report}");
 }
+
+// ---------------------------------------------------------------------------
+// Codex round 22 — per-workflow candidate config must not be applied bundle-wide
+//
+// One family, two members: configuration the live worker resolves *by workflow
+// type* but which replay previously applied to every fixture uniformly.
+//
+//   1. declarative handlers — `worker.rs` narrows both registries with
+//      `filter(|h| h.workflow == wf_name)` before building the context.
+//   2. the workflow-input cap — `worker.rs` resolves
+//      `workflow.max_input_bytes.map_or(global, |per| per.max(global))`.
+//
+// A gate is handed the candidate's *whole* registry, so applying it unfiltered
+// replays a context the promoted worker will never construct.
+// ---------------------------------------------------------------------------
+
+/// The same `progress` query name, but declared on a *different* workflow type.
+fn foreign_progress_query_info() -> autumn_harvest::info::QueryHandlerInfo {
+    autumn_harvest::info::QueryHandlerInfo {
+        name: "progress",
+        // Note: NOT "wf" — this handler belongs to another workflow in the same
+        // `queries![…]` collection, exactly as a real multi-workflow candidate
+        // build would hand the gate.
+        workflow: "other_wf",
+        module: "replay_drift_tests",
+        input_type_hint: "()",
+        output_type_hint: "String",
+        handler: progress_query,
+        description: None,
+        arg_schema: None,
+        response_schema: None,
+    }
+}
+
+/// A handler belonging to another workflow must not be registered on this one
+/// (false-RED direction).
+///
+/// The recording worker filtered by workflow type, so `wf` never saw
+/// `other_wf`'s `progress` query and scheduled `step_two`. Replaying with the
+/// candidate's whole registry unfiltered puts that foreign handler on `wf`'s
+/// context, flips the branch to `step_one`, and reports drift on a workflow
+/// nobody changed — blocking a good release.
+#[tokio::test]
+async fn foreign_workflow_declarative_handler_is_not_registered_during_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    // History from a worker that correctly filtered: `wf` saw no `progress`.
+    let exec_id = ExecutionId::new();
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "step_two".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+    ];
+    write(dir.path(), "a.json", &snapshot_json("wf", exec_id, events));
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", query_branching_workflow)
+        // The candidate's whole registry — this entry targets `other_wf`.
+        .queries(vec![foreign_progress_query_info()])
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.is_clean(),
+        "a declarative handler declared on another workflow type must not be \
+         registered on this one: {report}"
+    );
+    assert_eq!(report.exit_code(), 0, "{report}");
+}
+
+/// The false-GREEN direction, and the reason the filter is load-bearing rather
+/// than cosmetic.
+///
+/// The candidate genuinely **dropped** `wf`'s own `progress` handler, but kept a
+/// same-named one on `other_wf`. The promoted worker will filter, show `wf`
+/// nothing, and take the `step_two` branch — a real drift from the recorded
+/// `step_one`. Registering unfiltered lets the foreign handler stand in for the
+/// deleted one, the replay still matches history, and the gate certifies a build
+/// that changed behavior.
+#[tokio::test]
+async fn dropping_a_handler_is_still_drift_when_another_workflow_keeps_the_name() {
+    let dir = tempfile::tempdir().unwrap();
+    // History from the OLD build, where `wf` did have its own `progress`.
+    let exec_id = ExecutionId::new();
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "step_one".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+    ];
+    write(dir.path(), "a.json", &snapshot_json("wf", exec_id, events));
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", query_branching_workflow)
+        // Candidate dropped `wf`'s own handler; only `other_wf` keeps the name.
+        .queries(vec![foreign_progress_query_info()])
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        !report.is_clean(),
+        "a same-named handler on another workflow must not mask the removal of \
+         this workflow's own handler: {report}"
+    );
+    assert_eq!(report.exit_code(), 1, "{report}");
+}
+
+/// A workflow that records a large side-effect value, then parks on an activity.
+///
+/// `max_workflow_input` caps side-effect values as well as child-workflow inputs
+/// (`WorkflowContext::with_payload_caps`), and the cap is only consulted at the
+/// frontier — which is exactly where an in-flight fixture lands, so this is the
+/// shape the gate actually samples.
+fn big_side_effect_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _recorded: String = ctx
+            .side_effect("big", || "x".repeat(4096))
+            .map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw("step", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// Build a `WorkflowInfo` carrying a per-workflow input-cap override.
+///
+/// Written as a literal rather than via `#[workflow]` so the test can set
+/// `max_input_bytes` directly — the macro attribute and this field are the same
+/// value, and the literal keeps the cap under test visible at the call site.
+fn capped_wf_info(max_input_bytes: Option<u64>) -> autumn_harvest::info::WorkflowInfo {
+    autumn_harvest::info::WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
+        name: "wf",
+        module: "replay_drift_tests",
+        handler: big_side_effect_workflow,
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+        mcp: false,
+    }
+}
+
+/// A `#[workflow(max_input_bytes = …)]` override must raise the cap for *that*
+/// workflow during replay, exactly as the live worker raises it.
+///
+/// The worker resolves `per.max(global)` per workflow type. A gate that applies
+/// only the global cap rejects a frontier dispatch the promoted worker will
+/// happily accept — `PayloadTooLarge` reported as drift on a workflow nobody
+/// changed.
+#[tokio::test]
+async fn per_workflow_input_cap_override_is_applied_during_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let exec_id = ExecutionId::new();
+    // In-flight: parked with only the start event recorded, so the side effect
+    // below is a frontier dispatch and the cap is genuinely consulted.
+    write(
+        dir.path(),
+        "a.json",
+        &snapshot_json("wf", exec_id, vec![started_event()]),
+    );
+
+    let report = ReplayVerifier::new()
+        // Global cap far below the 4 KiB side-effect value...
+        .with_payload_caps(1024, 1024, 1024)
+        // ...raised for this workflow type by its own declared override.
+        .register(vec![capped_wf_info(Some(1_000_000))])
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.is_clean(),
+        "the workflow's own max_input_bytes override must raise the replay cap \
+         the way the live worker does: {report}"
+    );
+    assert_eq!(report.exit_code(), 0, "{report}");
+}
+
+/// The falsifying control: with no declared override the global cap binds, and
+/// the same fixture legitimately fails.
+///
+/// This proves the test above passes *because* the override is applied and not
+/// for some unrelated reason — and pins the direction that must keep working: a
+/// candidate whose global cap is genuinely too low is still caught.
+#[tokio::test]
+async fn without_an_override_the_global_input_cap_still_binds() {
+    let dir = tempfile::tempdir().unwrap();
+    let exec_id = ExecutionId::new();
+    write(
+        dir.path(),
+        "a.json",
+        &snapshot_json("wf", exec_id, vec![started_event()]),
+    );
+
+    let report = ReplayVerifier::new()
+        .with_payload_caps(1024, 1024, 1024)
+        // Same workflow, same fixture — only the override is gone.
+        .register(vec![capped_wf_info(None)])
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        !report.is_clean(),
+        "with no per-workflow override the global cap must still bind: {report}"
+    );
+}

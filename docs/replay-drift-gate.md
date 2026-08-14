@@ -371,6 +371,43 @@ deployment registers none. Both directions bite here too:
 
 `WorkflowReplayer` carries both builders through to `replay_bundle`.
 
+Pass the **whole** collection — every workflow's handlers, exactly as the
+candidate build registers them. The gate filters by workflow type per fixture,
+the way the live worker does (`filter(|h| h.workflow == wf_name)`), so a
+`progress` query declared on `onboarding` is never registered on
+`billing_checkout`'s replay context. Without that filter a same-named handler on
+another workflow both flips branches on unchanged code (false RED) and stands in
+for a handler the candidate genuinely deleted (false GREEN).
+
+### Per-workflow payload cap overrides
+
+`with_payload_caps` sets the deployment's **global** caps, but the live worker
+does not enforce one fleet-wide workflow-input cap. It raises the global by each
+workflow's own declared override:
+
+```text
+workflow.max_input_bytes.map_or(global, |per| per.max(global))
+```
+
+So a workflow carrying `#[workflow(max_input_bytes = "8MiB")]` runs under 8 MiB
+even when the builder's global is 2 MiB. Register workflows with
+[`register`](https://docs.rs/autumn-harvest) (which takes the full
+`WorkflowInfo`) rather than `register_fn` and the gate picks each fixture's cap up
+automatically:
+
+```rust
+ReplayVerifier::new()
+    .with_payload_caps(max_activity_input, max_signal_payload, max_workflow_input)
+    .register(workflows![billing_checkout, onboarding])  // carries max_input_bytes
+    .replay_bundle(&dir)
+    .await
+```
+
+`register_fn` takes a bare fn pointer, which carries no override, so those
+workflows replay under the global cap. Applying only the global cap to a
+cap-raising workflow rejects a frontier dispatch the promoted worker will accept
+— `PayloadTooLarge` reported as drift on a workflow nobody changed.
+
 ### Deadline-sensitive workflows
 
 A workflow that calls `ctx.should_continue_as_new()` (issue #772) consults the

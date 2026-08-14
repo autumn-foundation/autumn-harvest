@@ -82,3 +82,49 @@ fixture reporting `1 diverged`). **No new `WorkflowEvent` variant, no migration.
 Docs: new "Declarative query and update handlers" section plus an
 unreadable-manifest paragraph and exit-code table row in
 `docs/replay-drift-gate.md`.
+
+**Post-review hardening, round 22 (two Codex P2s, one family): per-workflow
+candidate configuration was applied bundle-wide.** Both findings are the same
+shape — configuration the live worker resolves **by workflow type**, which the
+replay path applied uniformly to every fixture. A gate is handed the candidate's
+*whole* registry, so applying it unfiltered replays a context the promoted worker
+will never construct. **(P2) Declarative handlers are now filtered by workflow
+type.** `worker.rs` narrows both registries with
+`filter(|h| h.workflow == wf_name)` before building the context; round 21's
+`register_declarative_handlers` installed every handler on every replay context.
+That fails in both directions: false RED (the recorded history came from a worker
+that *did* filter, so the unfiltered replay takes the other branch and reports
+drift on unchanged code) and false GREEN (a candidate that genuinely **dropped**
+this workflow's own handler is masked when a same-named handler survives on
+another workflow — replay still sees the name, still matches history, and
+certifies the build). Fixed at the single choke point rather than at each of the
+three call sites, reading the name off the context (`ctx.workflow_type()`, set by
+every entry point via `.with_workflow_name(…)`) so the value filtered on is by
+construction the one `ctx.info().workflow_type` reports to the body. **(P2) The
+per-workflow `#[workflow(max_input_bytes = …)]` override is now applied.** The
+worker does not enforce a single fleet-wide workflow-input cap: it resolves
+`workflow.max_input_bytes.map_or(global, |per| per.max(global))` per workflow type
+(`worker.rs`), so a gate holding only the global cap rejects a frontier dispatch
+the promoted worker accepts — `PayloadTooLarge` reported as drift on a workflow
+nobody changed. `WorkflowReplayer`/`ReplayVerifier::register` now retain the
+override they already received on the full `WorkflowInfo` (previously keeping only
+`name → handler`) into a `workflow_input_caps` map, and a new
+`payload_limits_for(workflow_name)` resolves each fixture's effective limits by
+reproducing the worker's expression verbatim — including where that expression is
+surprising (`0` means "no cap" crate-wide and `per.max(0) == per` narrows it; that
+quirk is the worker's, and a gate that "fixed" it would answer a question about a
+worker that does not exist). `register_fn` (a bare fn pointer carries no override)
+resolves to the global cap, byte-for-byte the pre-fix behavior. `FixtureReplayDefaults`
+carries the map so `replay_bundle` and the `WorkflowReplayer → ReplayVerifier`
+delegation both inherit it. Each fix falsified by neutering it and capturing the
+exact failure: dropping the filter flipped the branch
+(`expected ActivityScheduled(step_one), got ActivityScheduled(step_two)`) and let
+the false-GREEN control certify a removed handler; dropping the per-workflow cap
+produced `payload too large: SideEffectValue for workflow 'wf' exceeded cap of
+1024 bytes (observed 4098 bytes)` — precisely the false RED the worker would never
+emit. Four new tests in `tests/integration/replay_drift_tests.rs`
+(`foreign_workflow_declarative_handler_is_not_registered_during_replay`,
+`dropping_a_handler_is_still_drift_when_another_workflow_keeps_the_name`,
+`per_workflow_input_cap_override_is_applied_during_replay`, and the falsifying
+control `without_an_override_the_global_input_cap_still_binds`). **No new
+`WorkflowEvent` variant, no migration.**

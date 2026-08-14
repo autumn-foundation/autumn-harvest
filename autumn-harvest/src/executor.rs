@@ -806,6 +806,36 @@ pub async fn run_workflow(
 /// Mirrors the live worker's own registration loop so the two cannot drift; see
 /// [`ReplayDeclarativeHandlers`] for why replay must do this at all.
 ///
+/// **Filters by workflow type**, exactly as the worker does. `worker.rs` narrows
+/// both registries to the dispatched execution's own type before building the
+/// context:
+///
+/// ```text
+/// let wf_name = prepared.execution.workflow_name.as_str();
+/// registry.query_handlers.iter().filter(|h| h.workflow == wf_name)
+/// registry.update_handlers.iter().filter(|h| h.workflow == wf_name)
+/// ```
+///
+/// A gate is handed the candidate's *whole* `queries![…]` / `updates![…]`
+/// collection — every workflow's handlers — so registering them unfiltered puts
+/// another workflow's `progress` query on this workflow's context. A workflow
+/// that branches on [`WorkflowContext::list_query_names`] then sees a name the
+/// promoted worker will never show it, and fails in **both** directions:
+///
+/// - false RED — the recorded history came from a worker that *did* filter, so
+///   the unfiltered replay takes the other branch and reports drift on a
+///   workflow nobody changed, blocking a good release;
+/// - false GREEN — a candidate that genuinely **dropped** this workflow's own
+///   handler is masked when a same-named handler survives on another workflow:
+///   replay still sees the name, still matches history, and certifies a build
+///   whose promoted worker will take the other branch.
+///
+/// Filtering here rather than at each of the three call sites keeps
+/// the mirror at one choke point that cannot be forgotten. The name is read off
+/// the context (every entry point sets it via `.with_workflow_name(…)`) rather
+/// than passed again, so the value filtered on is by construction the same one
+/// `ctx.info().workflow_type` reports to the workflow body.
+///
 /// Deliberately **not** `#[cfg(any(test, feature = "testing"))]`: two of its
 /// three callers — `run_workflow_strict` and `run_workflow_canary` — are
 /// ungated `pub` entry points, so gating this helper made the crate fail to
@@ -814,10 +844,11 @@ pub async fn run_workflow(
 /// [`ReplayPayloadLimits`] structs, and the ungated
 /// `WorkflowContext::register_declarative_{query,update}_handler` it calls.
 fn register_declarative_handlers(ctx: &WorkflowContext, handlers: ReplayDeclarativeHandlers<'_>) {
-    for h in handlers.queries {
+    let wf_name = ctx.workflow_type();
+    for h in handlers.queries.iter().filter(|h| h.workflow == wf_name) {
         ctx.register_declarative_query_handler(h);
     }
-    for h in handlers.updates {
+    for h in handlers.updates.iter().filter(|h| h.workflow == wf_name) {
         ctx.register_declarative_update_handler(h);
     }
 }
