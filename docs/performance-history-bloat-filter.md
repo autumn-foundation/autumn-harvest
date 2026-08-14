@@ -204,6 +204,103 @@ beyond the buffer-cost fix itself.
 cargo test -p autumn-harvest-plugin --test history_bloat_integration
 ```
 
+## Verification against the real production entry point
+
+The measurements above (TL;DR, Profile, The fix) all isolate the WHERE-clause
+predicate as a **standalone scalar query** — `SELECT (SELECT COUNT(*) ...
+WHERE workflow_exec_id = '<one hardcoded execution id>') >= N`. Postgres
+plans that as an `InitPlan`: the subquery has no outer-row reference at all
+(no `FROM harvest_workflow_executions` in the query), so it is evaluated
+*once* and the boolean result reused. The real production code embeds the
+identical predicate as `WHERE ... EXISTS (SELECT 1 FROM harvest_events WHERE
+workflow_exec_id = harvest_workflow_executions.id ORDER BY event_id OFFSET
+N-1 LIMIT 1)` — correlated to the outer row, and non-hoistable into a
+semi-join because of the `ORDER BY ... OFFSET ... LIMIT` inside. Postgres
+must plan that as a genuine `SubPlan`, re-executed once per outer candidate
+row that survives the rest of the `WHERE` clause — a structurally different
+execution shape the single-row synthetic benchmark never exercises (PR #1173
+review, [discussion_r3786205954][pr-1173-r3786205954]).
+
+To answer that directly, `autumn-harvest-plugin/tests/real_query_probe.rs`
+drives `GET /workflows?min_history_events=10000` and `GET
+/workflows?history_bloat_min_events=10000` through the actual
+`harvest_api_router` (`tower::ServiceExt::oneshot`, no network port bound,
+but a real `axum::Router` handling a real `Request` through the real
+`load_workflows`/`load_history_bloat_workflows` handlers) against a
+persistent copy of the identical 5.3M-row / 5,015-execution fixture used
+above, comparing the pre-fix commit (`dd47715`, unbounded `COUNT(*)`,
+checked out into a separate `git worktree`) against the current bounded-`EXISTS`
+code.
+
+**A methodological correction found along the way, reported for the same
+reason the harness bug above is:** the first attempt at this comparison ran
+the two configurations back-to-back against the same physical database with
+no explicit `VACUUM` between them, and produced a result that flatly
+contradicted the single-row hypothesis (the bounded form reading *more*
+total buffers than the unbounded form). `pg_stat_statements.total_buffers`
+(`shared_blks_hit + shared_blks_read`) is a count of buffer *accesses*, not
+wall-clock time, and is not affected by OS-page-cache or `shared_buffers`
+warmth — but it *is* affected by the Postgres **visibility map**: an Index
+Only Scan on a page whose visibility-map bit isn't set must still fetch the
+heap page to check tuple visibility (`Heap Fetches` > 0 in `EXPLAIN`), and
+that bit is set by `VACUUM` (or autovacuum, on its own schedule) rather than
+being an inherent property of the query plan. The two configurations were
+measured with autovacuum having had different amounts of time to run since
+the last state change, which changed each side's heap-fetch count by enough
+to reverse the apparent direction of the result — a real, deterministic,
+buffer-counted effect, just not the effect being measured. Running `VACUUM
+ANALYZE harvest_workflow_executions; VACUUM ANALYZE harvest_events;`
+immediately before *each* measurement (so both sides start from an
+identical, fully-vacuumed visibility-map state) and re-running in both
+measurement orders reproduced identical, order-independent numbers:
+
+| Query param | Endpoint handler | Before (unbounded `COUNT(*)`) | After (bounded `EXISTS`) | Reduction |
+|---|---|---:|---:|---:|
+| `min_history_events=10000` | `load_workflows` | 79,350 total buffers | 27,642 total buffers | **65.16%** |
+| `history_bloat_min_events=10000` | `load_history_bloat_workflows` | 128,145 total buffers | 76,438 total buffers | **40.35%** |
+
+Both clear the ≥20% impact floor. Both were reproduced twice in reversed
+measurement order with identical results (`docs/perf-artifacts/history-bloat-filter/real-endpoint-before-unfixed.txt`,
+`real-endpoint-after-fixed.txt`).
+
+These percentages are meaningfully smaller than the 99.76% headline number
+above — expected, not contradictory: the single-row number is the *best
+case* for the one specific 448,175-event execution the WHERE-clause fix
+helps the most, while the real-endpoint number is the *aggregate* cost
+across the full realistic candidate population the endpoint actually scans
+(5,000 small/healthy executions plus 15 bloated ones). Isolating the
+WHERE-clause predicate alone as a genuine correlated `SubPlan` — the same
+`EXISTS`/`COUNT(*)` forms above, embedded against the full outer table with
+no other endpoint-specific filters or columns — makes this explicit:
+
+```sql
+-- both wrapped in `SELECT count(*) FROM (... ) sub` to force full
+-- materialization rather than stopping at the first match
+SELECT id FROM harvest_workflow_executions
+WHERE (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= 10000;  -- before: 74,461 total buffers
+SELECT id FROM harvest_workflow_executions
+WHERE EXISTS (SELECT 1 FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id ORDER BY event_id OFFSET 9999 LIMIT 1);  -- after: 22,754 total buffers (69.44% reduction)
+```
+
+(`docs/perf-artifacts/history-bloat-filter/correlated-before-count-star.explain.txt`,
+`correlated-after-bounded-exists.explain.txt`.) Notably, the **absolute**
+buffer savings is nearly identical across all three real-scan measurements
+(~51,707–51,708 buffers) — the same underlying WHERE-clause fix contributing
+the same fixed savings regardless of what other filters/columns each
+endpoint layers on top; the *percentage* differs only because
+`history_bloat_min_events` has a higher base cost (it carries its own
+mandatory non-terminal-state filter and an additional `history_event_count`
+projection) than `min_history_events` does.
+
+```bash
+# Reproduce: create+seed a persistent fixture DB (see the harness script for
+# the exact seeding SQL), VACUUM ANALYZE it, then:
+REAL_QUERY_PERF_DB_URL=postgres://postgres:postgres@127.0.0.1:5432/<fixture-db> \
+  cargo test -p autumn-harvest-plugin --test real_query_probe -- --ignored --nocapture
+```
+
+[pr-1173-r3786205954]: https://github.com/autumn-foundation/autumn-harvest/pull/1173#discussion_r3786205954
+
 ## Write cost
 
 None. This is a read-only query rewrite — no schema change, no migration, no

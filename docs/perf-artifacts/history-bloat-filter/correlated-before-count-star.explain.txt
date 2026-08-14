@@ -1,0 +1,25 @@
+                                                                                     QUERY PLAN                                                                                     
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=1656555.68..1656555.69 rows=1 width=8) (actual time=912.383..912.385 rows=1 loops=1)
+   Buffers: shared hit=27486 read=46975 written=3
+   ->  Seq Scan on harvest_workflow_executions  (cost=0.00..1656551.50 rows=1672 width=0) (actual time=192.752..912.337 rows=15 loops=1)
+         Filter: ((SubPlan 1) >= 10000)
+         Rows Removed by Filter: 5000
+         Buffers: shared hit=27486 read=46975 written=3
+         SubPlan 1
+           ->  Aggregate  (cost=330.28..330.29 rows=1 width=8) (actual time=0.166..0.166 rows=1 loops=5015)
+                 Buffers: shared hit=27453 read=46911 written=3
+                 ->  Index Only Scan using idx_harvest_events_history_page on harvest_events  (cost=0.56..315.56 rows=5886 width=0) (actual time=0.004..0.125 rows=1066 loops=5015)
+                       Index Cond: (workflow_exec_id = harvest_workflow_executions.id)
+                       Heap Fetches: 0
+                       Buffers: shared hit=27453 read=46911 written=3
+ Planning:
+   Buffers: shared hit=729 read=2
+ Planning Time: 1.830 ms
+ JIT:
+   Functions: 11
+   Options: Inlining true, Optimization true, Expressions true, Deforming true
+   Timing: Generation 0.324 ms, Inlining 54.957 ms, Optimization 8.991 ms, Emission 11.810 ms, Total 76.082 ms
+ Execution Time: 927.440 ms
+(21 rows)
+

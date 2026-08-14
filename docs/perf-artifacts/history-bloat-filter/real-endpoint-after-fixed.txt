@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.89s
+     Running tests/real_query_probe.rs (target/debug/deps/real_query_probe-4b07d0e220de1d30)
+
+running 1 test
+GET /workflows?min_history_events=10000 -> 200 OK in 140.256568ms
+GET /workflows?history_bloat_min_events=10000 -> 200 OK in 831.274834ms
+
+=== pg_stat_statements snapshot (real endpoint queries) ===
+calls=1   total_buffers=76438      shared_blks_read=46166      query=SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workflow_executions"."run_id", "harvest_workflow_executions"."shard_id", "harvest_workflow_executions"."state", "harvest_workflow_executions"."input", "harv
+calls=1   total_buffers=27642      shared_blks_read=37         query=SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workflow_executions"."run_id", "harvest_workflow_executions"."shard_id", "harvest_workflow_executions"."state", "harvest_workflow_executions"."input", "harv
+=== end snapshot ===
+test probe_real_endpoint_query_cost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+
