@@ -106,6 +106,19 @@ live run of a *different* type can enter this one via
 and that edge is a static call-graph fact the report cannot observe — the same
 limitation already documented for activity-type reachability.
 
+> **Partial static answer (issue #802).** A workflow can opt in to declaring the
+> activities it dispatches and the workflow types it references — children, and
+> cross-type `continue_as_new_as` targets, since `children` is checked by name
+> against the workflow catalog — via `#[workflow(activities = [send_email],
+> children = [generate_report])]`, and deploy-time preflight then
+> fails when a declared name is not registered. That makes deleting a *declared*
+> handler a preflight failure rather than a runtime dead letter. It is
+> **opt-in and declaration-based, not a call-graph analysis**: it says nothing about
+> an activity no workflow declared, and it can go stale in the other direction (a
+> declaration left behind after the dispatch was removed fails the deploy until the
+> declaration is deleted too). See
+> [Chapter 10 — Operating the service](../getting-started/10-operations.md#catching-a-forgotten-registration-before-rollout).
+
 The canonical shape is a win-back loop (`churned → trial → churned`): a fleet
 with many live `churned` runs and momentarily zero `trial` runs reports
 `trial_subscription: safe_to_remove`. Deleting that handler arms every future

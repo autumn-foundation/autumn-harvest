@@ -374,6 +374,15 @@ fn emit_workflow_companion(
                 // its `start` tool through `trigger_dag_run` rather than the
                 // generic `start_workflow` path.
                 mcp: #mcp,
+                // Issue #802 targets the IMPERATIVE path: a `#[dag]` already
+                // declares its activity references structurally, and preflight
+                // validates those through `dag_unregistered_activity_failures`.
+                // Opting the shadow `WorkflowInfo` in as well would make the
+                // workflow pass re-report the same misses, doubling every DAG
+                // failure in `details.failures`. Mirrors
+                // `DagInfo::as_workflow_info`.
+                declared_activities: ::std::option::Option::None,
+                declared_children: ::std::option::Option::None,
             }
         }
     }

@@ -72,6 +72,8 @@ fn delay_workflow<'a>(
 fn delay_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![autumn_harvest::info::WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "delay_workflow",
             module: "delayed_start_tests",

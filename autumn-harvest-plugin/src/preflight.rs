@@ -757,6 +757,77 @@ fn dag_unregistered_activity_failures<'a>(
     failures
 }
 
+/// Collect preflight failures for a workflow's **opt-in** declared dependencies
+/// (issue #802).
+///
+/// A workflow that never opted in carries `None` on both fields, and `None`
+/// yields an empty name list to walk — that is the zero-false-positive guarantee
+/// (AC4): an unopted-in workflow can never contribute a failure, regardless of
+/// what is registered. `Some(&[])` is distinct from `None` on the wire and at
+/// the macro layer, but resolves identically here: an explicit "this workflow
+/// depends on nothing" has nothing to check. The up-front `filter` is a
+/// short-circuit for the common all-legacy catalog, not the guarantee itself.
+///
+/// Ordering is imposed here rather than inherited: `registry().workflows` is a
+/// `HashMap`, so without sorting the operator-facing `details.failures` list
+/// would reshuffle between calls. Workflows are sorted by name; within a
+/// workflow, activities are reported before children, each in declaration order.
+/// Duplicate declarations report their miss once.
+fn workflow_unregistered_dependency_failures<'a>(
+    workflows: impl IntoIterator<Item = &'a autumn_harvest::WorkflowInfo>,
+    is_registered_activity: impl Fn(&str) -> bool,
+    is_registered_workflow: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    // Only workflows that actually opted in can contribute, so filter before
+    // sorting — an all-legacy catalog does no work beyond the scan.
+    let mut opted_in: Vec<&autumn_harvest::WorkflowInfo> = workflows
+        .into_iter()
+        .filter(|info| info.declared_activities.is_some() || info.declared_children.is_some())
+        .collect();
+    opted_in.sort_by_key(|info| info.name);
+
+    let mut failures = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for info in opted_in {
+        let workflow = info.name;
+        // Activities and children resolve against separate catalogs but are
+        // otherwise identical, so walk them through one loop keyed by the
+        // catalog predicate and the noun used in the operator-facing message.
+        for (declared, kind, is_registered) in [
+            (
+                info.declared_activities,
+                "activity",
+                &is_registered_activity as &dyn Fn(&str) -> bool,
+            ),
+            (
+                info.declared_children,
+                "child workflow",
+                &is_registered_workflow as &dyn Fn(&str) -> bool,
+            ),
+        ] {
+            for name in declared.unwrap_or_default() {
+                let failure = if name.trim().is_empty() {
+                    // The macro rejects a blank name at compile time, so this is
+                    // only reachable through the fluent builder — report it as
+                    // the authoring error it is, not as "unregistered ''".
+                    format!("workflow '{workflow}' declares an empty {kind} name")
+                } else if is_registered(name) {
+                    continue;
+                } else {
+                    format!("workflow '{workflow}' references unregistered {kind} '{name}'")
+                };
+                // A duplicate declaration is an authoring smell, not an error —
+                // the operator should still see each miss exactly once.
+                if seen.insert(failure.clone()) {
+                    failures.push(failure);
+                }
+            }
+        }
+    }
+    failures
+}
+
 fn check_catalog_consistency(api_state: &HarvestApiState) -> PreflightCheckResult {
     let Ok(runtime) = api_state.runtime() else {
         return check(
@@ -778,6 +849,13 @@ fn check_catalog_consistency(api_state: &HarvestApiState) -> PreflightCheckResul
             .map(|dag| (dag.name.as_str(), dag.definition.tasks())),
         |name| runtime.registry().activities.contains_key(name),
     );
+    // Issue #802: opt-in declared dependencies. A workflow that never declared
+    // any contributes nothing, so this is a pure addition for existing catalogs.
+    failures.extend(workflow_unregistered_dependency_failures(
+        runtime.registry().workflows.values(),
+        |name| runtime.registry().activities.contains_key(name),
+        |name| runtime.registry().workflows.contains_key(name),
+    ));
     for activity in runtime.registry().activities.values() {
         if activity.default_queue == Some("") {
             failures.push(format!(
@@ -800,8 +878,16 @@ fn check_catalog_consistency(api_state: &HarvestApiState) -> PreflightCheckResul
         } else {
             "registered catalog contains unresolved workflow runtime references"
         },
-        (status == PreflightStatus::Fail)
-            .then_some("Fix the affected registration before starting workflows."),
+        // Names both branches: preflight does not read workflow bodies, so it
+        // cannot tell "you forgot to register the handler" (a runtime hazard)
+        // from "you left a stale declaration behind" (cosmetic). Failing closed
+        // is correct, but the operator needs to know the fix is one line either
+        // way — the generic "fix the registration" wording named only the first.
+        (status == PreflightStatus::Fail).then_some(
+            "Register the named handler in activities![…] / workflows![…], or — if the \
+             workflow no longer references it — delete the stale entry from its declared \
+             dependencies.",
+        ),
         Vec::new(),
         json!({
             "workflow_count": runtime.registry().workflows.len(),
@@ -2114,6 +2200,447 @@ mod tests {
                     .to_string()
             ]
         );
+    }
+
+    // ── Issue #802 — opt-in declared workflow dependencies ────────────────
+    //
+    // These drive the pure helper directly (the `dag_unregistered_activity_failures`
+    // pattern), so they need no database and run under the CI step
+    // `cargo test -p autumn-harvest-plugin --lib`. `preflight_integration.rs` is
+    // on the `ci_run_coverage` ALLOWLIST as debt and does NOT run in CI, so a
+    // DB-gated test would be compile-checked only.
+    mod declared_deps {
+        use std::collections::HashSet;
+
+        use autumn_harvest::prelude::*;
+        use autumn_harvest::{ActivityInfo, WorkflowInfo};
+
+        use super::super::{
+            PreflightStatus, check_catalog_consistency, workflow_unregistered_dependency_failures,
+        };
+        use crate::api::HarvestApiState;
+
+        // A minimal real workflow — its `_info()` supplies a genuine
+        // `WorkflowHandlerFn` so tests mutate the two declaration fields on the
+        // real type instead of hand-rolling a 20-field literal (mirrors the
+        // sqlite crate's `feature_gate_tests::base_wf_info`).
+        #[workflow]
+        #[allow(clippy::unused_async)]
+        async fn base_wf(_ctx: &WorkflowContext, input: ()) -> Result<(), String> {
+            // `let () = input;` rather than `_input`: the macro's dispatch shim
+            // reads the binding, which trips `clippy::used_underscore_binding`
+            // (mirrors `transactional_activity_tests::happy_txn_workflow`).
+            let () = input;
+            Ok(())
+        }
+
+        // Ditto for a real `ActivityHandlerFn`.
+        #[activity]
+        #[allow(clippy::unused_async)]
+        async fn base_act(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+            Ok(n)
+        }
+
+        fn activity_named(name: &'static str) -> ActivityInfo {
+            let mut info = base_act_info();
+            info.name = name;
+            info
+        }
+
+        /// The operator-facing `details.failures` list, as plain strings.
+        fn failure_strings(result: &super::super::PreflightCheckResult) -> Vec<String> {
+            result.details["failures"]
+                .as_array()
+                .expect("details.failures must be an array")
+                .iter()
+                .map(|v| v.as_str().unwrap_or_default().to_string())
+                .collect()
+        }
+
+        fn wf(
+            name: &'static str,
+            activities: Option<&'static [&'static str]>,
+            children: Option<&'static [&'static str]>,
+        ) -> WorkflowInfo {
+            let mut info = base_wf_info();
+            info.name = name;
+            info.declared_activities = activities;
+            info.declared_children = children;
+            info
+        }
+
+        fn failures_for(
+            workflows: &[WorkflowInfo],
+            registered_activities: &[&str],
+            registered_workflows: &[&str],
+        ) -> Vec<String> {
+            let acts: HashSet<&str> = registered_activities.iter().copied().collect();
+            let wfs: HashSet<&str> = registered_workflows.iter().copied().collect();
+            workflow_unregistered_dependency_failures(
+                workflows,
+                |name| acts.contains(name),
+                |name| wfs.contains(name),
+            )
+        }
+
+        #[test]
+        fn ac6a_flags_a_declared_activity_that_is_not_registered() {
+            let workflows = [wf("onboarding", Some(&["send_emial"]), None)];
+            assert_eq!(
+                failures_for(&workflows, &["send_email"], &["onboarding"]),
+                vec![
+                    "workflow 'onboarding' references unregistered activity 'send_emial'"
+                        .to_string()
+                ]
+            );
+        }
+
+        #[test]
+        fn ac6b_flags_a_declared_child_that_is_not_registered() {
+            let workflows = [wf("onboarding", None, Some(&["generate_reprot"]))];
+            assert_eq!(
+                failures_for(&workflows, &[], &["onboarding", "generate_report"]),
+                vec![
+                    "workflow 'onboarding' references unregistered child workflow 'generate_reprot'"
+                        .to_string()
+                ]
+            );
+        }
+
+        #[test]
+        fn ac6c_passes_when_every_declared_dependency_resolves() {
+            let workflows = [wf(
+                "onboarding",
+                Some(&["send_email", "charge_card"]),
+                Some(&["generate_report"]),
+            )];
+            assert!(
+                failures_for(
+                    &workflows,
+                    &["send_email", "charge_card"],
+                    &["onboarding", "generate_report"],
+                )
+                .is_empty()
+            );
+        }
+
+        #[test]
+        fn ac6d_a_workflow_that_never_opted_in_is_never_flagged() {
+            // The zero-false-positive guarantee: `None` is skipped outright, so
+            // an empty registry cannot produce a failure for it.
+            let workflows = [wf("legacy", None, None)];
+            assert!(failures_for(&workflows, &[], &[]).is_empty());
+        }
+
+        #[test]
+        fn intent_pin_an_explicitly_empty_declaration_resolves_trivially() {
+            // INTENT PIN, not evidence: `Some(&[])` and `None` both yield zero
+            // failures *by construction* here, so this cannot fail under any
+            // implementation of the helper. The load-bearing `Some(&[])` vs
+            // `None` distinction is proven where it is actually observable — at
+            // the macro layer by `workflow_empty_declaration_is_opt_in_not_absent`
+            // and on the wire by
+            // `registered_workflow_record_distinguishes_empty_declaration_from_absent`.
+            let workflows = [wf("noop", Some(&[]), Some(&[]))];
+            assert!(failures_for(&workflows, &[], &[]).is_empty());
+        }
+
+        #[test]
+        fn two_workflows_missing_the_same_activity_are_each_reported() {
+            // Dedup is keyed on the whole failure STRING, not the bare name —
+            // keying on the name alone would silently swallow the second
+            // workflow's miss and under-report the blast radius of a forgotten
+            // registration, which is exactly what this check exists to size.
+            let workflows = [
+                wf("alpha", Some(&["gone"]), None),
+                wf("beta", Some(&["gone"]), None),
+            ];
+            assert_eq!(
+                failures_for(&workflows, &[], &[]),
+                vec![
+                    "workflow 'alpha' references unregistered activity 'gone'".to_string(),
+                    "workflow 'beta' references unregistered activity 'gone'".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn a_repeated_missing_reference_is_reported_once() {
+            // A duplicate in the declaration is an authoring smell, not an
+            // error; the operator should still see each miss exactly once.
+            let workflows = [wf("onboarding", Some(&["missing", "missing"]), None)];
+            assert_eq!(
+                failures_for(&workflows, &[], &[]),
+                vec![
+                    "workflow 'onboarding' references unregistered activity 'missing'".to_string()
+                ]
+            );
+        }
+
+        #[test]
+        fn a_blank_declared_name_is_reported_as_such() {
+            // A blank name can never resolve; report it as the authoring error
+            // it is rather than as a confusing "unregistered ''".
+            let workflows = [wf("onboarding", Some(&["   "]), Some(&[""]))];
+            assert_eq!(
+                failures_for(&workflows, &[], &[]),
+                vec![
+                    "workflow 'onboarding' declares an empty activity name".to_string(),
+                    "workflow 'onboarding' declares an empty child workflow name".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn failures_are_ordered_deterministically_by_workflow_name() {
+            // `registry().workflows` is a HashMap, so the helper must impose its
+            // own order or the operator-facing list reshuffles between calls.
+            let workflows = [
+                wf("zeta", Some(&["missing_z"]), None),
+                wf("alpha", Some(&["missing_a"]), None),
+                wf("mid", Some(&["missing_m"]), None),
+            ];
+            assert_eq!(
+                failures_for(&workflows, &[], &[]),
+                vec![
+                    "workflow 'alpha' references unregistered activity 'missing_a'".to_string(),
+                    "workflow 'mid' references unregistered activity 'missing_m'".to_string(),
+                    "workflow 'zeta' references unregistered activity 'missing_z'".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn a_workflow_may_declare_itself_as_a_child() {
+            // Self-recursion is legal (`spawn_child_workflow` of one's own type);
+            // the name resolves against the registry like any other.
+            let workflows = [wf("recursive", None, Some(&["recursive"]))];
+            assert!(failures_for(&workflows, &[], &["recursive"]).is_empty());
+        }
+
+        #[test]
+        fn activities_and_children_resolve_against_separate_catalogs() {
+            // An activity name registered only as a WORKFLOW (and vice versa)
+            // must still fail — the two namespaces are distinct.
+            let workflows = [wf(
+                "x",
+                Some(&["only_a_workflow"]),
+                Some(&["only_an_activity"]),
+            )];
+            assert_eq!(
+                failures_for(&workflows, &["only_an_activity"], &["only_a_workflow"]),
+                vec![
+                    "workflow 'x' references unregistered activity 'only_a_workflow'".to_string(),
+                    "workflow 'x' references unregistered child workflow 'only_an_activity'"
+                        .to_string(),
+                ]
+            );
+        }
+
+        // ── Success metric: 100% precision for opted-in, 0 false positives ────
+        //
+        // Asserting one example proves neither claim. This drives a mixed
+        // catalog and asserts the failure set EXACTLY: every genuine miss is
+        // reported (recall) and nothing else is (precision), with the
+        // non-opted-in rows present precisely so a regression that stopped
+        // skipping `None` would show up as extra entries.
+        // ── AC2/AC3 wiring: the helper is actually reached by the check, and
+        // its strings land in `details.failures` with the right verdict ───────
+        //
+        // Pure: `check_catalog_consistency` reads only `api_state.runtime()`, so
+        // no storage pool (and no database) is installed.
+        fn api_state_with(
+            workflows: Vec<WorkflowInfo>,
+            activities: Vec<ActivityInfo>,
+        ) -> HarvestApiState {
+            use std::sync::Arc;
+
+            use autumn_harvest::retention::RetentionConfig;
+            use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
+            use autumn_harvest::shard::ShardRouter;
+            use autumn_harvest::worker::HandlerRegistry;
+
+            use crate::api::{HarvestApiRuntime, HarvestRetentionRuntime};
+
+            let runtime = HarvestApiRuntime::new(
+                Arc::new(HandlerRegistry::new(workflows, activities)),
+                Arc::new(DagCatalog::new()),
+                Arc::new(Vec::new()),
+                None,
+                vec!["default".to_string()],
+                SchedulerMonitor::offline(),
+                HarvestRetentionRuntime::disabled(RetentionConfig::default()),
+                ShardRouter::single(),
+            );
+            let state = HarvestApiState::new();
+            state.install(runtime);
+            state
+        }
+
+        #[test]
+        fn ac3_catalog_consistency_fails_and_names_the_unresolved_reference() {
+            let state = api_state_with(
+                vec![wf(
+                    "onboarding",
+                    Some(&["send_emial"]),
+                    Some(&["missing_child"]),
+                )],
+                Vec::new(),
+            );
+
+            let result = check_catalog_consistency(&state);
+
+            assert_eq!(result.status, PreflightStatus::Fail);
+            let failures = failure_strings(&result);
+            assert!(
+                failures.contains(
+                    &"workflow 'onboarding' references unregistered activity 'send_emial'"
+                        .to_string()
+                ),
+                "missing activity must be named in details.failures: {failures:?}"
+            );
+            assert!(
+                failures.contains(
+                    &"workflow 'onboarding' references unregistered child workflow 'missing_child'"
+                        .to_string()
+                ),
+                "missing child must be named in details.failures: {failures:?}"
+            );
+        }
+
+        #[test]
+        fn ac3_catalog_consistency_passes_for_a_complete_opted_in_catalog() {
+            let state = api_state_with(
+                vec![
+                    wf("onboarding", Some(&["send_email"]), Some(&["child_wf"])),
+                    wf("child_wf", None, None),
+                ],
+                vec![activity_named("send_email")],
+            );
+
+            let result = check_catalog_consistency(&state);
+
+            assert_eq!(
+                result.status,
+                PreflightStatus::Pass,
+                "details: {}",
+                result.details
+            );
+        }
+
+        #[test]
+        fn ac2_declared_dep_failures_coexist_with_preexisting_failures() {
+            // The new failures must be APPENDED to the pre-existing ones, never
+            // replace them: `failures.extend(..)` written as `failures = ..`
+            // would silently drop every DAG / empty-default-queue failure the
+            // check already reports, and no other test would notice.
+            let mut empty_queue_activity = activity_named("bad_queue_act");
+            empty_queue_activity.default_queue = Some("");
+            let state = api_state_with(
+                vec![wf("onboarding", Some(&["send_emial"]), None)],
+                vec![empty_queue_activity],
+            );
+
+            let result = check_catalog_consistency(&state);
+
+            assert_eq!(result.status, PreflightStatus::Fail);
+            let failures = failure_strings(&result);
+            assert!(
+                failures.contains(
+                    &"workflow 'onboarding' references unregistered activity 'send_emial'"
+                        .to_string()
+                ),
+                "the new declared-dependency failure must be present: {failures:?}"
+            );
+            assert!(
+                failures.contains(
+                    &"activity 'bad_queue_act' declares an empty default queue".to_string()
+                ),
+                "the pre-existing failure must NOT be clobbered: {failures:?}"
+            );
+        }
+
+        #[test]
+        fn ac3_mixed_catalog_failure_set_is_exact_through_the_real_check() {
+            // The success metric (100% precision, ZERO false positives) claimed
+            // of the pure helper, re-asserted through the operator-facing
+            // entry point over a real `HashMap`-backed registry — which is also
+            // the only place the name sort is exercised against genuinely
+            // nondeterministic iteration order.
+            let state = api_state_with(
+                vec![
+                    wf("complete", Some(&["act_ok"]), Some(&["wf_ok"])),
+                    wf("missing_act", Some(&["act_ok", "act_gone"]), None),
+                    wf("missing_child", None, Some(&["wf_gone"])),
+                    wf("empty_decl", Some(&[]), Some(&[])),
+                    wf("legacy_a", None, None),
+                    wf("legacy_b", None, None),
+                    wf("wf_ok", None, None),
+                ],
+                vec![activity_named("act_ok")],
+            );
+
+            let result = check_catalog_consistency(&state);
+
+            assert_eq!(result.status, PreflightStatus::Fail);
+            assert_eq!(
+                failure_strings(&result),
+                vec![
+                    "workflow 'missing_act' references unregistered activity 'act_gone'"
+                        .to_string(),
+                    "workflow 'missing_child' references unregistered child workflow 'wf_gone'"
+                        .to_string(),
+                ],
+                "exactly the two genuine misses, in workflow-name order — no false \
+                 positives from the four non-offending workflows"
+            );
+        }
+
+        #[test]
+        fn ac4_catalog_consistency_is_unchanged_for_a_workflow_that_never_opted_in() {
+            // Same empty activity catalog as the failing case above — the ONLY
+            // difference is that this workflow declared nothing.
+            let state = api_state_with(vec![wf("legacy", None, None)], Vec::new());
+
+            let result = check_catalog_consistency(&state);
+
+            assert_eq!(
+                result.status,
+                PreflightStatus::Pass,
+                "a non-opted-in workflow must never fail preflight: {}",
+                result.details
+            );
+        }
+
+        #[test]
+        fn success_metric_exact_failure_set_over_a_mixed_catalog() {
+            let workflows = [
+                // opted in, fully registered → contributes nothing
+                wf("complete", Some(&["act_ok"]), Some(&["wf_ok"])),
+                // opted in, one missing activity
+                wf("missing_act", Some(&["act_ok", "act_gone"]), None),
+                // opted in, one missing child
+                wf("missing_child", None, Some(&["wf_gone"])),
+                // opted in with an empty list → contributes nothing
+                wf("empty_decl", Some(&[]), Some(&[])),
+                // NOT opted in, and nothing it could reference is registered
+                wf("legacy_a", None, None),
+                wf("legacy_b", None, None),
+            ];
+
+            let failures = failures_for(&workflows, &["act_ok"], &["wf_ok"]);
+
+            assert_eq!(
+                failures,
+                vec![
+                    "workflow 'missing_act' references unregistered activity 'act_gone'"
+                        .to_string(),
+                    "workflow 'missing_child' references unregistered child workflow 'wf_gone'"
+                        .to_string(),
+                ],
+                "exactly the two genuine misses — no false positives, no missed detections"
+            );
+        }
     }
 
     // ── Issue #780 — declarative DAG node compensation ─────────────────────

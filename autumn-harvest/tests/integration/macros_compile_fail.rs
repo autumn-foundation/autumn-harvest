@@ -38,5 +38,10 @@ fn compile_fail_cases() {
     t.compile_fail("tests/compile_fail/dag_invalid_execution_timeout.rs");
     t.compile_fail("tests/compile_fail/dag_invalid_sla.rs");
     t.compile_fail("tests/compile_fail/dag_unsupported_attribute.rs");
+    t.compile_fail("tests/compile_fail/workflow_blank_dependency_name.rs");
+    t.compile_fail("tests/compile_fail/workflow_invalid_dependency_entry.rs");
+    t.compile_fail("tests/compile_fail/workflow_dependency_string_container.rs");
+    t.compile_fail("tests/compile_fail/workflow_dependency_paren_container.rs");
+    t.compile_fail("tests/compile_fail/workflow_unsupported_attribute.rs");
     t.pass("tests/compile_fail/suppressed_guardrails.rs");
 }

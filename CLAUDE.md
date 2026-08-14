@@ -424,7 +424,18 @@ Supported `#[activity]` attribute keys:
 
 Duration strings: `"30s"`, `"5m"`, `"1h"`. Parsed via Harvest core's local `task_duration()` helper.
 
-`#[workflow]` takes no attributes in Phase 1.
+Supported `#[workflow]` attribute keys (all optional):
+- `execution_timeout = "30m"` / `chain_execution_timeout = "7d"` / `sla = "2h"` — duration strings
+- `concurrency(key = "input.tenant_id", limit = 10)` — per-key concurrency (issue #247)
+- `debounce(key = …, window = …, max_wait = …)` / `batch(…)` / `throttle(rate = "100/m", …)` — admission policies
+- `max_input_bytes = 4_194_304` — per-workflow payload cap raiser (issue #252)
+- `owner = "team"` / `runbook = "url"` / `severity = "page"` / `description = "…"` — ops metadata
+- `retry = RetryPolicy::exponential(3, Duration::from_secs(1))` — workflow-level retry (issue #523)
+- `mcp` / `mcp = true` — expose as an MCP tool (issue #597)
+- `activities = [send_email, charge_card]` / `children = [generate_report]` — opt-in declared
+  dependencies, resolved against the registered activity/workflow catalogs at deploy-time
+  preflight (issue #802; see `docs/getting-started/10-operations.md`)
+- `allow_nondeterministic_apis` — suppress the determinism guardrails for this function
 
 ### Embedder Primitives — SignalWithStart (issue #244)
 

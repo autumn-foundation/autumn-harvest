@@ -93,6 +93,8 @@ async fn test_replay_canary_api_endpoint() {
 
 fn activity_wf_info() -> autumn_harvest::info::WorkflowInfo {
     autumn_harvest::info::WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "activity_wf",
         module: module_path!(),

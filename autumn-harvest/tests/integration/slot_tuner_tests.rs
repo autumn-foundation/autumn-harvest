@@ -110,6 +110,8 @@ fn slow_activity<'a>(
 fn build_registry(telemetry: Arc<TelemetryConfig>) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "slot_tuner_slow_workflow",
             module: "slot_tuner_tests",

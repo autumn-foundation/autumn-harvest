@@ -205,6 +205,8 @@ fn workflow_info(
     handler: autumn_harvest::info::WorkflowHandlerFn,
 ) -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "activity_info_tests",

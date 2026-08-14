@@ -12,6 +12,8 @@ use autumn_harvest::info::WorkflowInfo;
 #[test]
 fn workflow_info_has_concurrency_fields() {
     let info = WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "run_report",
         module: "my_app::workflows",
@@ -41,6 +43,8 @@ fn workflow_info_has_concurrency_fields() {
 #[test]
 fn workflow_info_with_concurrency_policy() {
     let info = WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "run_report",
         module: "my_app::workflows",

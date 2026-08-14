@@ -220,6 +220,8 @@ async fn wait_for_workflow_task_parked(conn: &mut AsyncPgConnection, exec_id: Ex
 
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "child_policy_tests",
@@ -250,6 +252,8 @@ fn wf_info_with_concurrency(
     concurrency: ConcurrencyPolicy,
 ) -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "child_policy_tests",

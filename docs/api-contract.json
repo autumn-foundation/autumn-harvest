@@ -3759,7 +3759,7 @@
       "category": "discovery",
       "read_only": true,
       "idempotency": "Safe",
-      "description": "List all registered workflow types with their optional JSON Schema, description, and schema fields. Returns a sorted JSON array of RegisteredWorkflowRecord objects. Workflows without a published schema have null input_schema/output_schema/error_schema fields (issue #373).",
+      "description": "List all registered workflow types with their optional JSON Schema, description, and schema fields. Returns a sorted JSON array of RegisteredWorkflowRecord objects. Workflows without a published schema have null input_schema/output_schema/error_schema fields (issue #373). Each record also carries the workflow's opt-in declared dependencies as declared_activities/declared_children string arrays; both keys are OMITTED (not null) for a workflow that did not opt in, and an empty array is a meaningful, distinct 'declares no dependencies' assertion (issue #802).",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -3774,7 +3774,7 @@
       "category": "discovery",
       "read_only": true,
       "idempotency": "Safe",
-      "description": "Fetch the RegisteredWorkflowRecord for a single registered workflow type by name. Returns 404 when the name is unknown (issue #373).",
+      "description": "Fetch the RegisteredWorkflowRecord for a single registered workflow type by name, including its opt-in declared_activities/declared_children dependency declaration when present (issue #802). Returns 404 when the name is unknown (issue #373).",
       "params": [
         {
           "name": "name",

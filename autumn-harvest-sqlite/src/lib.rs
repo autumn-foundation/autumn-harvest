@@ -323,7 +323,11 @@
 //!   is unaffected either way), `owner` / `runbook_url` / `severity` (#372),
 //!   `description` + `input_schema` / `output_schema` / `error_schema` (#373 —
 //!   HTTP-edge discovery/validation, and this backend has no HTTP edge), `mcp` (#597
-//!   — HTTP-edge MCP tool exposure), and `module` (diagnostics).
+//!   — HTTP-edge MCP tool exposure), `declared_activities` / `declared_children`
+//!   (#802 — an opt-in dependency declaration consumed only by the Postgres plugin's
+//!   `catalog_consistency` deploy-time preflight check and its `/workflows/registered`
+//!   discovery endpoint, neither of which this backend has; the core execution path
+//!   never reads either field), and `module` (diagnostics).
 //! - **HONORED:** `name` (the registration key) and `handler` (the dispatch fn).
 //!
 //! Honoring the rejected features (execution-timeout enforcement, workflow-level

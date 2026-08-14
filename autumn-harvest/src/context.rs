@@ -15572,6 +15572,8 @@ mod tests {
     async fn continue_as_new_as_takes_the_type_from_workflow_info() {
         let ctx = WorkflowContext::new_test();
         let info = crate::info::WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "paid_subscription",
             module: "app::phases",
@@ -22037,6 +22039,8 @@ mod tests {
 
     fn make_workflow_info(name: &'static str) -> crate::info::WorkflowInfo {
         crate::info::WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name,
             module: "test",

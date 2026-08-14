@@ -40415,6 +40415,8 @@ mod tests {
     fn dag_registration_marker_is_separate_from_workflow_registry() {
         let registry = Arc::new(HandlerRegistry::new(
             vec![autumn_harvest::WorkflowInfo {
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "workflow_only",
                 module: "tests",
@@ -42823,6 +42825,8 @@ mod tests {
         Arc::new(HandlerRegistry::new(
             vec![
                 autumn_harvest::WorkflowInfo {
+                    declared_activities: None,
+                    declared_children: None,
                     mcp: false,
                     name: "schema_wf",
                     module: "tests",
@@ -42846,6 +42850,8 @@ mod tests {
                     retry_policy: None,
                 },
                 autumn_harvest::WorkflowInfo {
+                    declared_activities: None,
+                    declared_children: None,
                     mcp: false,
                     name: "no_schema_wf",
                     module: "tests",
@@ -44839,6 +44845,8 @@ mod tests {
         sla: Option<std::time::Duration>,
     ) -> autumn_harvest::WorkflowInfo {
         autumn_harvest::WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name,
             module: "tests",

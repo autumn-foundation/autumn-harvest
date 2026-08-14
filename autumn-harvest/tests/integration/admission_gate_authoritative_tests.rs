@@ -1652,6 +1652,8 @@ async fn scheduled_start_blocked_by_gate_records_admission_blocked() {
     );
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: wf_name,
             module: "admission_gate_authoritative_tests",

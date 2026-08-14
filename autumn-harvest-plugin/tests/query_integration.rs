@@ -151,6 +151,8 @@ fn continue_as_new_workflow<'a>(
 
 fn progress_info() -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "progress_wf",
         module: "tests",
@@ -176,6 +178,8 @@ fn progress_info() -> WorkflowInfo {
 
 fn continue_as_new_info() -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "continue_as_new_wf",
         module: "tests",
@@ -241,6 +245,8 @@ fn deadline_probe_workflow<'a>(
 
 fn deadline_probe_info() -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "deadline_probe_wf",
         module: "tests",
@@ -266,6 +272,8 @@ fn deadline_probe_info() -> WorkflowInfo {
 
 fn spin_info() -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "spin_wf",
         module: "tests",

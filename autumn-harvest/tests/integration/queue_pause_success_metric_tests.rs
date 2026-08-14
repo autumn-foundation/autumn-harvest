@@ -101,6 +101,8 @@ fn held_workflow_handler(
 
 fn registry() -> Arc<HandlerRegistry> {
     let wf = WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "held_workflow",
         module: "queue_pause_success_metric_tests",

@@ -19548,6 +19548,8 @@ mod tests {
     #[test]
     fn handler_registry_indexes_by_name() {
         let wf = WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "onboarding",
             module: "app::workflows",
@@ -22315,6 +22317,8 @@ mod tests {
     /// Minimal registered workflow type for the #803 target-resolution tests.
     fn can803_wf_info(name: &'static str) -> WorkflowInfo {
         WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name,
             module: "app::phases",

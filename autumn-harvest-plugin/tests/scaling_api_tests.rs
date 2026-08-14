@@ -106,6 +106,8 @@ fn build_two_shard_pool(shard0_url: &str, shard1_url: &str) -> HarvestDbPool {
 
 fn workflow_info() -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "echo_workflow",
         module: "tests",

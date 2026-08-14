@@ -333,6 +333,8 @@ fn canary_activity_handler(
 pub fn canary_workflow_info(workflow_name: String, per_probe_timeout: Duration) -> WorkflowInfo {
     let name: &'static str = Box::leak(workflow_name.into_boxed_str());
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         name,
         module: "autumn_harvest_plugin::canary",
         handler: canary_workflow_handler,

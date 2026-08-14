@@ -1228,6 +1228,8 @@ async fn randomized_cancel_by_id_continue_as_new_race_zero_misdeliveries() {
 
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "workflow_id_targeted_tests",
