@@ -1,25 +1,29 @@
-                                                                                QUERY PLAN                                                                                
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Aggregate  (cost=1582967.75..1582967.76 rows=1 width=8) (actual time=137.768..137.770 rows=1 loops=1)
-   Buffers: shared hit=19835 read=2919
-   ->  Seq Scan on harvest_workflow_executions  (cost=0.00..1582961.48 rows=2508 width=0) (actual time=115.170..137.737 rows=15 loops=1)
+-- correlated-after-bounded-exists --
+                                                                          QUERY PLAN                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=1705859.14..1705859.15 rows=1 width=8) (actual rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=19268 read=2897
+   ->  Seq Scan on public.harvest_workflow_executions  (cost=0.00..1705852.87 rows=2508 width=0) (actual rows=15 loops=1)
          Filter: (SubPlan 1)
          Rows Removed by Filter: 5000
-         Buffers: shared hit=19835 read=2919
+         Buffers: shared hit=19268 read=2897
          SubPlan 1
-           ->  Limit  (cost=315.56..315.62 rows=1 width=8) (actual time=0.013..0.013 rows=0 loops=5015)
-                 Buffers: shared hit=19834 read=2823
-                 ->  Index Only Scan using idx_harvest_events_exec on harvest_events  (cost=0.56..315.56 rows=5886 width=8) (actual time=0.004..0.011 rows=72 loops=5015)
-                       Index Cond: (workflow_exec_id = harvest_workflow_executions.id)
+           ->  Limit  (cost=340.07..340.12 rows=1 width=8) (actual rows=0 loops=5015)
+                 Output: 1, harvest_events.event_id
+                 Buffers: shared hit=19267 read=2801
+                 ->  Index Only Scan using idx_harvest_events_exec on public.harvest_events  (cost=0.56..340.07 rows=6372 width=8) (actual rows=72 loops=5015)
+                       Output: 1, harvest_events.event_id
+                       Index Cond: (harvest_events.workflow_exec_id = harvest_workflow_executions.id)
                        Heap Fetches: 0
-                       Buffers: shared hit=19834 read=2823
+                       Buffers: shared hit=19267 read=2801
+ Query Identifier: -2630596437307874071
  Planning:
-   Buffers: shared hit=664 read=96 dirtied=1
- Planning Time: 2.018 ms
+   Buffers: shared hit=666 read=94
+ Planning Time: 2.182 ms
  JIT:
    Functions: 12
    Options: Inlining true, Optimization true, Expressions true, Deforming true
-   Timing: Generation 0.305 ms, Inlining 49.995 ms, Optimization 7.933 ms, Emission 10.961 ms, Total 69.193 ms
- Execution Time: 151.960 ms
-(21 rows)
+ Execution Time: 153.777 ms
+(24 rows)
 

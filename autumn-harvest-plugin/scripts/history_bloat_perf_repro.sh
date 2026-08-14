@@ -114,8 +114,15 @@ FROM harvest_workflow_executions e
 CROSS JOIN LATERAL generate_series(1, 50000 + (abs((('x' || substr(md5(e.workflow_id), 1, 8))::bit(32)::int)::bigint) % 400000)) AS ev(i)
 WHERE e.workflow_name = 'poll_loop';
 
-ANALYZE harvest_events;
-ANALYZE harvest_workflow_executions;
+-- VACUUM (not just ANALYZE) sets the visibility map. An un-vacuumed table
+-- can make an Index Only Scan's "Heap Fetches" count differ from run to run
+-- purely based on autovacuum timing, independent of query shape -- this bit
+-- the real-endpoint measurement in PR #1173 review (see
+-- docs/performance-history-bloat-filter.md "Verification against the real
+-- production entry point" and real_query_probe.rs). VACUUM here so every
+-- capture below reads from matched, deterministic visibility-map state.
+VACUUM ANALYZE harvest_events;
+VACUUM ANALYZE harvest_workflow_executions;
 SQL
 
 # Pick one representative execution from each cohort — the bloated one with
@@ -171,6 +178,23 @@ capture "after-bounded-exists-healthy" \
 # fall back to a Seq Scan even though the bound is present.
 capture "after-bounded-exists-no-order-by-bloated" \
   "SELECT EXISTS (SELECT 1 FROM harvest_events WHERE workflow_exec_id = '${BLOATED_ID}' OFFSET $((THRESHOLD - 1)) LIMIT 1) AS result;"
+
+# Isolated correlated-SubPlan comparison against the FULL outer table (no
+# other endpoint-specific filters/columns) -- substantiates the
+# "docs/performance-history-bloat-filter.md#verification-against-the-real-production-entry-point"
+# per-scan buffer-count claim. Wrapped in `SELECT count(*) FROM (...) sub` to
+# force full materialization of the WHERE-clause predicate across every row
+# rather than stopping at the first match. These are the SAME two queries
+# that produced the committed
+# `correlated-before-count-star.explain.txt`/`correlated-after-bounded-exists.explain.txt`
+# artifacts -- capturing them here means a script rerun after a fixture or
+# query change regenerates ALL committed evidence from one code path, so a
+# stale manually-captured artifact can never sit alongside freshly
+# regenerated ones (PR #1173 review, discussion_r3787605008).
+capture "correlated-before-count-star" \
+  "SELECT count(*) FROM (SELECT id FROM harvest_workflow_executions WHERE (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= ${THRESHOLD}) sub;"
+capture "correlated-after-bounded-exists" \
+  "SELECT count(*) FROM (SELECT id FROM harvest_workflow_executions WHERE EXISTS (SELECT 1 FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id ORDER BY event_id OFFSET $((THRESHOLD - 1)) LIMIT 1)) sub;"
 
 echo "== pg_stat_statements snapshot (requires the extension) =="
 psql "$DB_URL" -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;" >/dev/null 2>&1 || true
