@@ -1686,6 +1686,182 @@ async fn a_codec_encrypted_fixture_blocks_the_gate_instead_of_reporting_drift() 
     );
 }
 
+/// The money test for the contradicted-emptiness rule (Codex round-18 P1).
+///
+/// `allow_empty_bundle(true)` is the right setting for a fleet that may
+/// legitimately be idle. But an **export outage** produces an empty bundle too:
+/// every shard query failing yields zero fixtures and a manifest whose status is
+/// `unavailable`. From the fixture count alone the two are identical.
+///
+/// Neither existing rung catches it. Rung 2's `export_is_incomplete` is
+/// `truncated_by_size || export_failures > 0`, and a *total* outage selects no
+/// candidates — so nothing failed to fetch and no size ceiling was hit. Rung 4
+/// reads the status but only under `require_complete_coverage`, off by default.
+///
+/// Honoring the opt-out therefore exits 0 on a bundle that inspected nothing —
+/// a release certified against zero workflows, the worst verdict this gate can
+/// produce.
+#[tokio::test]
+async fn an_empty_bundle_from_a_failed_export_is_not_licensed_by_allow_empty_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    // No fixtures, and a manifest reporting that no shard could be read.
+    let manifest = SampleManifest {
+        generated_at: Utc::now(),
+        status: SampleStatus::Unavailable,
+        states: vec!["RUNNING".into()],
+        per_workflow: vec![],
+        sampled_total: 0,
+        in_flight_total: 0,
+        unavailable_shards: vec!["shard 0: connection refused".into()],
+        inspected_shards: vec![],
+        truncated_by_size: false,
+        export_failures: 0,
+    };
+    write(
+        dir.path(),
+        SampleManifest::FILE_NAME,
+        &serde_json::to_string(&manifest).unwrap(),
+    );
+
+    let report = ReplayVerifier::new()
+        .allow_empty_bundle(true)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.emptiness_is_contradicted(),
+        "an `unavailable` manifest contradicts the claim that the fleet is idle"
+    );
+    assert_eq!(
+        report.exit_code(),
+        3,
+        "an export outage must not be certified as an idle fleet: {report}"
+    );
+    assert!(
+        format!("{report}").contains("did not read the whole fleet"),
+        "the operator must be told the manifest is what voided the opt-out: {report}"
+    );
+}
+
+/// A **partial** read is the same defect as a total one when nothing was
+/// verified: the shards that were reachable held no in-flight work, but the
+/// unreachable ones are exactly where the drift would have been.
+#[tokio::test]
+async fn an_empty_bundle_from_a_partial_export_is_not_licensed_either() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = SampleManifest {
+        generated_at: Utc::now(),
+        status: SampleStatus::Partial,
+        states: vec!["RUNNING".into()],
+        per_workflow: vec![],
+        sampled_total: 0,
+        in_flight_total: 0,
+        unavailable_shards: vec!["shard 1: connection refused".into()],
+        inspected_shards: vec![0],
+        truncated_by_size: false,
+        export_failures: 0,
+    };
+    write(
+        dir.path(),
+        SampleManifest::FILE_NAME,
+        &serde_json::to_string(&manifest).unwrap(),
+    );
+
+    let report = ReplayVerifier::new()
+        .allow_empty_bundle(true)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(
+        report.exit_code(),
+        3,
+        "a half-read fleet is not a proven-idle fleet: {report}"
+    );
+}
+
+/// The complement, so the fix does not simply break the flag it is tightening:
+/// a genuinely idle fleet — every shard read, nothing in flight — still exits 0
+/// under the opt-out.
+#[tokio::test]
+async fn an_empty_bundle_with_complete_coverage_is_still_licensed() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = SampleManifest {
+        generated_at: Utc::now(),
+        status: SampleStatus::Complete,
+        states: vec!["RUNNING".into()],
+        per_workflow: vec![],
+        sampled_total: 0,
+        in_flight_total: 0,
+        unavailable_shards: vec![],
+        inspected_shards: vec![0],
+        truncated_by_size: false,
+        export_failures: 0,
+    };
+    write(
+        dir.path(),
+        SampleManifest::FILE_NAME,
+        &serde_json::to_string(&manifest).unwrap(),
+    );
+
+    let report = ReplayVerifier::new()
+        .allow_empty_bundle(true)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        !report.emptiness_is_contradicted(),
+        "complete coverage does not contradict an idle fleet"
+    );
+    assert_eq!(
+        report.exit_code(),
+        0,
+        "a genuinely idle fleet must still pass: {report}"
+    );
+}
+
+/// The scope boundary: a bundle with **no manifest** keeps the opt-out.
+///
+/// The exporter writes the manifest unconditionally — alongside the fixtures,
+/// and even when it produced none (see `build_bundle_files`). So a
+/// Harvest-produced bundle always carries one, and "no manifest" means the
+/// bundle did not come from the exporter: a hand-assembled directory, or a gate
+/// binary pointed at the wrong path. That is not the export-outage case, and
+/// `require_complete_coverage(true)` is the lever for an operator who wants
+/// absent evidence to fail closed.
+///
+/// This pins the boundary so a future tightening cannot silently swallow the
+/// documented opt-out along with the bug.
+#[tokio::test]
+async fn an_empty_bundle_with_no_manifest_keeps_the_opt_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = ReplayVerifier::new()
+        .allow_empty_bundle(true)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        !report.emptiness_is_contradicted(),
+        "no manifest is no contradiction — it is simply no evidence"
+    );
+    assert_eq!(
+        report.exit_code(),
+        0,
+        "an absent manifest is not the export-outage case: {report}"
+    );
+
+    // ...and the operator who *does* want proof has a lever that fails closed.
+    let demanded = ReplayVerifier::new()
+        .allow_empty_bundle(true)
+        .require_complete_coverage(true)
+        .replay_bundle(dir.path())
+        .await;
+    assert_eq!(
+        demanded.exit_code(),
+        4,
+        "require_complete_coverage must still fail closed on absent evidence: {demanded}"
+    );
+}
+
 /// An in-flight-looking history whose activity input is an **erasure
 /// tombstone** (issue #495) standing in for the real payload.
 fn erased_snapshot_json(workflow_name: &str) -> String {

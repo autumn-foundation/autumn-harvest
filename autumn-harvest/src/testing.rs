@@ -2654,6 +2654,52 @@ impl ReplayDriftReport {
             .is_some_and(|manifest| !manifest.is_complete())
     }
 
+    /// Whether the bundle's own manifest **contradicts** the claim that the
+    /// fleet is idle.
+    ///
+    /// [`allow_empty_bundle`](ReplayVerifier::allow_empty_bundle) exists for a
+    /// fleet that is legitimately idle. But a bundle is also empty when the
+    /// *exporter* could not read the fleet — a total shard outage produces zero
+    /// fixtures too, and the two are indistinguishable from the fixture count
+    /// alone. Honoring the opt-out unconditionally lets that outage exit `0`: a
+    /// release certified against nothing at all, the single worst verdict this
+    /// gate can produce.
+    ///
+    /// Note that neither existing rung catches it. Rung `2`'s
+    /// [`export_is_incomplete`](Self::export_is_incomplete) is
+    /// `truncated_by_size || export_failures > 0`, and a *total* shard outage
+    /// selects no candidates at all — so there are no per-candidate fetch
+    /// failures to count and no size ceiling to hit, and both are `0`/`false`.
+    /// Rung `4` reads the status but only under
+    /// [`require_complete_coverage`](ReplayVerifier::require_complete_coverage),
+    /// which is off by default. The manifest says `unavailable`, and nothing
+    /// looks.
+    ///
+    /// So this consults exactly that: a manifest reporting anything other than
+    /// complete coverage contradicts "the fleet is idle", because the export
+    /// never saw the whole fleet to make that claim about.
+    ///
+    /// A bundle with **no** manifest reports `false` — the opt-out still
+    /// applies. That is deliberate and is why this asks whether emptiness is
+    /// *contradicted* rather than whether it is *proven*:
+    ///
+    /// * The exporter writes the manifest unconditionally, alongside the
+    ///   fixtures and even when it produced none. So a Harvest-produced bundle
+    ///   always carries one, and "no manifest" means the bundle did not come
+    ///   from the exporter — a hand-assembled directory, or a gate binary
+    ///   pointed at the wrong path. Absent-manifest is therefore not the
+    ///   export-outage case this guards.
+    /// * An operator who wants the stronger "prove coverage or fail" rule
+    ///   already has [`require_complete_coverage`](ReplayVerifier::require_complete_coverage),
+    ///   whose [`coverage_claim_unsatisfied`](Self::coverage_claim_unsatisfied)
+    ///   *does* fail closed on an absent manifest. Applying that rule here
+    ///   unconditionally would override an opt-out the caller set explicitly,
+    ///   on evidence that does not exist, in a case the finding does not cover.
+    #[must_use]
+    pub fn emptiness_is_contradicted(&self) -> bool {
+        self.has_incomplete_coverage()
+    }
+
     /// Whether an opted-in `require_complete_coverage` claim is unsatisfied.
     ///
     /// Deliberately stricter than [`has_incomplete_coverage`](Self::has_incomplete_coverage),
@@ -2747,7 +2793,7 @@ impl ReplayDriftReport {
     /// | `0` | Every fixture replayed cleanly |
     /// | `1` | One or more fixtures diverged — a determinism regression |
     /// | `2` | The gate could not fully run: a fixture failed to replay, the bundle holds a different number of fixtures than its manifest declares, **or** the export itself delivered fewer fixtures than the sample selected (dominates over `1`, because a gate that did not fully run cannot be trusted — mirrors [`CiReport::exit_code`]) |
-    /// | `3` | Nothing was verified — the bundle was empty, or every fixture was skipped |
+    /// | `3` | Nothing was verified — the bundle was empty, or every fixture was skipped. [`allow_empty_bundle`](ReplayVerifier::allow_empty_bundle) opts out, but **not** when the bundle's manifest reports incomplete shard coverage: an export that could not read the fleet is empty too, and certifying a release against it is a false green |
     /// | `4` | `require_complete_coverage` is set and complete coverage was not proven — the sample is knowingly incomplete, a workflow type with in-flight work was sampled zero times, **or** the bundle carries no readable manifest at all |
     ///
     /// The rung-`2` export-shortfall condition is deliberately *unconditional* —
@@ -2771,7 +2817,13 @@ impl ReplayDriftReport {
         }
         // `verified_nothing` subsumes the empty bundle: both replayed zero
         // workflows, so both are the same non-answer.
-        if self.verified_nothing() && !self.allow_empty_bundle {
+        //
+        // The opt-out is void when the bundle's own manifest contradicts it: an
+        // export that could not read the fleet is empty too, and exiting 0 on
+        // one certifies a release against nothing. See
+        // `emptiness_is_contradicted`.
+        let empty_is_licensed = self.allow_empty_bundle && !self.emptiness_is_contradicted();
+        if self.verified_nothing() && !empty_is_licensed {
             return 3;
         }
         if self.coverage_claim_unsatisfied() {
@@ -2857,8 +2909,22 @@ impl ReplayDriftReport {
     /// Each branch names the concrete operator action, because both are harness
     /// failures rather than statements about the candidate build.
     fn fmt_errors(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.verified_nothing() && !self.allow_empty_bundle {
-            if self.is_empty() {
+        let empty_is_licensed = self.allow_empty_bundle && !self.emptiness_is_contradicted();
+        if self.verified_nothing() && !empty_is_licensed {
+            if self.allow_empty_bundle {
+                writeln!(
+                    f,
+                    "  ERROR: nothing was verified, and the bundle's manifest reports \
+                     coverage {:?} over {} unreachable shard(s) — the export did not read \
+                     the whole fleet, so an export outage cannot be told apart from an \
+                     idle fleet. allow_empty_bundle(true) does not apply when the bundle \
+                     itself says coverage was incomplete. Fix the export and re-run.",
+                    self.coverage.as_ref().map(|manifest| manifest.status),
+                    self.coverage
+                        .as_ref()
+                        .map_or(0, |manifest| manifest.unavailable_shards.len()),
+                )?;
+            } else if self.is_empty() {
                 writeln!(
                     f,
                     "  ERROR: the bundle contained no fixtures — nothing was verified. \
@@ -3176,6 +3242,15 @@ impl ReplayVerifier {
     ///
     /// Set this when a fleet legitimately has no executions in flight (a fresh
     /// environment, or a workflow type that is only triggered on demand).
+    ///
+    /// This opt-out is **void when the bundle's own manifest reports incomplete
+    /// shard coverage**: an export that could not read the fleet produces zero
+    /// fixtures too, so honoring the flag there would certify a release against
+    /// an export outage. See
+    /// [`ReplayDriftReport::emptiness_is_contradicted`]. A bundle with no
+    /// manifest is unaffected — use
+    /// [`require_complete_coverage`](Self::require_complete_coverage) to demand
+    /// positive proof of coverage.
     #[must_use]
     pub const fn allow_empty_bundle(mut self, allow: bool) -> Self {
         self.allow_empty_bundle = allow;

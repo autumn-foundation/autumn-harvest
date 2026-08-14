@@ -178,7 +178,7 @@ needs to act:
 | `0` | Clean — promote. |
 | `1` | At least one execution diverged. **Do not promote.** |
 | `2` | The gate could not fully run. Dominates `1`. A fixture blocked it (unparseable, an unregistered workflow type, a redacted bundle, or a fixture carrying offloaded payload references or undecoded codec envelopes); the bundle holds a different number of fixtures than its manifest declares; **or** the export itself delivered fewer fixtures than the sample selected (it hit the response byte budget, or individual selected candidates failed to fetch). |
-| `3` | Nothing was verified and `allow_empty_bundle(false)` (the default) — the bundle was empty, **or** every fixture in it was skipped. |
+| `3` | Nothing was verified and `allow_empty_bundle(false)` (the default) — the bundle was empty, **or** every fixture in it was skipped. Also returned *despite* `allow_empty_bundle(true)` when the bundle's manifest reports incomplete shard coverage: an export that could not read the fleet is empty too, so the opt-out does not apply to it. |
 | `4` | `require_complete_coverage(true)` and complete coverage was not proven — the manifest reports partial shard coverage, the bundle carries no readable manifest, **or** a workflow type with in-flight work was sampled zero times. |
 
 Rungs `2`, `3` and `4` all exist for the same reason: a gate that reports green
@@ -215,6 +215,14 @@ ReplayVerifier::new()
     .replay_bundle(&dir)
     .await
 ```
+
+This opt-out is **void when the manifest reports incomplete shard coverage**. A
+total export outage produces zero fixtures too, and from the fixture count alone
+it is indistinguishable from an idle fleet — so honouring the flag there would
+certify a release against nothing at all. A bundle with *no* manifest keeps the
+opt-out (the exporter always writes one, so a manifest-less bundle did not come
+from it); use `require_complete_coverage(true)` if you want absent evidence to
+fail closed too.
 
 Exit code `4` is the opposite knob: turn it on when a partial cross-shard read
 must not count as a pass. It **fails closed** — a bundle carrying no readable
@@ -555,9 +563,15 @@ statically; this gate catches a *control-flow* change by actually replaying.
 
 **Exit 3, "bundle is empty".** The directory has no fixtures. Either the export
 step did not run, the path is wrong, or the fleet is genuinely idle. Check
-`harvest-sample-manifest.json` — if `sampled_total` is `0` and
-`in_flight_total` is `0`, the fleet is idle and `allow_empty_bundle(true)` is
-the right answer.
+`harvest-sample-manifest.json` — if `sampled_total` is `0`, `in_flight_total`
+is `0` **and `status` is `complete`**, the fleet is idle and
+`allow_empty_bundle(true)` is the right answer.
+
+If `status` is `partial` or `unavailable`, it is not: the export could not read
+the whole fleet, so "nothing in flight" is a statement about the shards it did
+reach. `allow_empty_bundle(true)` will *not* suppress exit `3` in that case —
+fix the export (see `unavailable_shards` in the manifest for the reason) and
+re-run.
 
 **Exit 2, "unregistered workflow".** The bundle contains a workflow type your
 gate binary does not register. Either add it to the `workflows![…]` list, or —
