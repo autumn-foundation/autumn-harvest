@@ -244,5 +244,14 @@ name = "claim_bench"
 required-features = ["db"]
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `info::validate_against_schema` (issue #373's boundary validator). No
+# feature requirement: the function is unconditional, so this measures the
+# same code every deployment runs on the HTTP start/signal/update path when a
+# schema is published. See `benches/schema_validate_profile.rs`.
+[[bench]]
+name = "schema_validate_profile"
+harness = false
+
 [lints]
 workspace = true
