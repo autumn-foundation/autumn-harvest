@@ -33765,11 +33765,12 @@ fn stratify_sample_rows(
         .iter()
         .map(|row| row.workflow_name.as_str())
         .dedup_count_sorted();
-    let effective_per_workflow = if type_count == 0 {
-        per_workflow
-    } else {
-        per_workflow.min((autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL / type_count).max(1))
-    };
+    // `checked_div` rather than a `type_count == 0` guard around `/`: an empty
+    // row set means no type binds the global budget, so the caller's
+    // `per_workflow` stands unchanged.
+    let effective_per_workflow = autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL
+        .checked_div(type_count)
+        .map_or(per_workflow, |share| per_workflow.min(share.max(1)));
 
     let mut taken_for_name = 0usize;
     let mut total = 0usize;

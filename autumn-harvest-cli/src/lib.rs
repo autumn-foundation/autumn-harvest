@@ -3028,30 +3028,52 @@ fn clear_stale_bundle(dir: &Path) -> Result<(), CliError> {
     let mut json_entries = Vec::new();
     let mut has_manifest = false;
 
-    let entries = fs::read_dir(dir).map_err(|source| CliError::WriteOutput {
-        path: dir.display().to_string(),
-        source,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|source| CliError::WriteOutput {
-            path: dir.display().to_string(),
+    // Walk exactly what the gate replays. `testing::collect_json_files`
+    // DESCENDS SUBDIRECTORIES, so a top-level-only clean would leave a nested
+    // fixture in place while the gate still replayed it — the new manifest
+    // would describe only the fresh top-level fixtures, and the stale nested
+    // one would surface as unrelated drift. That is precisely the false verdict
+    // this function exists to prevent, so the two walks must agree on depth as
+    // well as on the extension predicate.
+    let mut dirs_to_visit = vec![dir.to_path_buf()];
+    while let Some(current) = dirs_to_visit.pop() {
+        let at_top_level = current == dir;
+        let entries = fs::read_dir(&current).map_err(|source| CliError::WriteOutput {
+            path: current.display().to_string(),
             source,
         })?;
-        // `file_type` does not follow symlinks, so a symlinked directory is not
-        // mistaken for a file (and is left alone either way).
-        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        if entry.file_name().to_string_lossy() == manifest_name {
-            has_manifest = true;
-        } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("json") {
-            // Exactly the predicate `ReplayVerifier`'s bundle walk uses
-            // (`testing::collect_fixture_files`). If the two disagreed — say one
-            // accepted `.JSON` and the other did not — a stale fixture could
-            // survive the clean and still be replayed by the gate, which is the
-            // whole failure this function exists to prevent.
-            json_entries.push(path);
+        for entry in entries {
+            let entry = entry.map_err(|source| CliError::WriteOutput {
+                path: current.display().to_string(),
+                source,
+            })?;
+            let path = entry.path();
+            // `file_type` does not follow symlinks, so a symlinked directory is
+            // neither descended nor mistaken for a file.
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                dirs_to_visit.push(path);
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let is_manifest = entry.file_name().to_string_lossy() == manifest_name;
+            if is_manifest {
+                // Only a TOP-LEVEL manifest marks this directory as our bundle;
+                // a nested one is just a file we happen to skip (the replay walk
+                // excludes the reserved name at any depth, so it is never
+                // replayed and never needs deleting).
+                if at_top_level {
+                    has_manifest = true;
+                }
+                continue;
+            }
+            if path.extension().and_then(std::ffi::OsStr::to_str) == Some("json") {
+                json_entries.push(path);
+            }
         }
     }
 
@@ -12479,6 +12501,62 @@ mod replay_sample_bundle_tests {
              replay an execution the fresh manifest never counted: {fixtures:?}"
         );
         assert!(fixtures[0].starts_with("new--"), "{fixtures:?}");
+    }
+
+    /// A stale fixture in a SUBDIRECTORY must not survive a re-export either.
+    ///
+    /// `testing::collect_json_files` descends subdirectories, so a top-level-only
+    /// clean leaves a nested fixture that the gate still replays — against a
+    /// manifest that never counted it. The result is drift reported for an
+    /// execution the operator did not sample, i.e. a false red on a healthy
+    /// build, which is the exact verdict this whole feature exists to avoid.
+    #[test]
+    fn re_exporting_replaces_a_stale_fixture_nested_in_a_subdirectory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut first = sample_response();
+        first["exports"] = json!([
+            { "workflow_name": "old", "execution_id": "11111111-1111-4111-8111-111111111111", "events": [] }
+        ]);
+        write_history_sample_bundle(&first, dir.path()).expect("first export");
+
+        // Simulate a fixture that ended up one level down (a hand-copied file,
+        // or a bundle laid out by an older/other tool).
+        let nested = dir.path().join("shard-1");
+        fs::create_dir_all(&nested).expect("nested dir");
+        fs::write(nested.join("stale--33333333.json"), "{}").expect("nested fixture");
+
+        let mut second = sample_response();
+        second["exports"] = json!([
+            { "workflow_name": "new", "execution_id": "22222222-2222-4222-8222-222222222222", "events": [] }
+        ]);
+        write_history_sample_bundle(&second, dir.path()).expect("second export");
+
+        // Count what the gate would replay: recursive, `*.json`, manifest
+        // excluded at any depth — the `collect_json_files` predicate.
+        let mut found = Vec::new();
+        let mut stack = vec![dir.path().to_path_buf()];
+        while let Some(current) = stack.pop() {
+            for entry in fs::read_dir(&current).expect("read dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("json")
+                    && path.file_name().and_then(std::ffi::OsStr::to_str)
+                        != Some(autumn_harvest::replay_sample::SampleManifest::FILE_NAME)
+                {
+                    found.push(path.display().to_string());
+                }
+            }
+        }
+
+        assert_eq!(
+            found.len(),
+            1,
+            "a nested stale fixture must not survive a re-export — the gate \
+             walks subdirectories and would replay it: {found:?}"
+        );
+        assert!(found[0].contains("new--"), "{found:?}");
     }
 
     /// The replace above must never reach a directory this CLI did not write.
