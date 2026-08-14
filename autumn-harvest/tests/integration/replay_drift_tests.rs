@@ -1686,6 +1686,110 @@ async fn a_codec_encrypted_fixture_blocks_the_gate_instead_of_reporting_drift() 
     );
 }
 
+/// An in-flight-looking history whose activity input is an **erasure
+/// tombstone** (issue #495) standing in for the real payload.
+fn erased_snapshot_json(workflow_name: &str) -> String {
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "step_one".into(),
+            input: autumn_harvest::erase::erasure_tombstone(),
+            queue: "default".into(),
+        },
+    ];
+    snapshot_json(workflow_name, ExecutionId::new(), events)
+}
+
+/// The money test for the erasure guard (Codex round-16 P2).
+///
+/// A bundle acquires an erased fixture two ways, and the second needs no race:
+/// the sample export selects an execution in flight and it completes and is
+/// erased before the sequential per-candidate fetch reaches it; or the **batch**
+/// export, which has no in-flight restriction, exports a terminal execution —
+/// exactly the population erasure is allowed to touch.
+///
+/// Either way the payload is gone irreversibly, so replaying it compares the
+/// candidate's real inputs against scrubbed placeholders. That is a false red
+/// (drift that does not exist) or, worse, a clean result certifying nothing.
+/// It must be a harness error (exit 2).
+#[tokio::test]
+async fn an_erased_fixture_blocks_the_gate_instead_of_reporting_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "erased.json", &erased_snapshot_json("wf"));
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", payload_bearing_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(
+        report.total, 1,
+        "the fixture still counts in the denominator"
+    );
+    assert!(
+        report.diverged.is_empty(),
+        "an erased payload is NOT a determinism regression: {:?}",
+        report.diverged
+    );
+    assert_eq!(
+        report.blocked.len(),
+        1,
+        "expected a harness error: {report}"
+    );
+    assert_eq!(
+        report.exit_code(),
+        2,
+        "a bundle this gate cannot honestly evaluate must not read as drift: {report}"
+    );
+
+    let reason = report.blocked[0].reason.to_string();
+    assert!(
+        reason.contains("erased"),
+        "the reason must name the cause: {reason}"
+    );
+    assert!(
+        reason.contains("#495"),
+        "the reason must point at the erasure feature: {reason}"
+    );
+}
+
+/// The guard keys on a tombstone in a **payload field**, not on the string
+/// appearing anywhere in the document. A workflow whose own data happens to
+/// mention the marker is perfectly replayable, and blocking it would be a new
+/// false red invented by the fix for the old one.
+#[tokio::test]
+async fn a_payload_that_merely_mentions_the_tombstone_key_still_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "step_one".into(),
+            // The key occurs as ordinary *data*, not as the payload field's
+            // own object key — exactly what a workflow logging about erasure
+            // would carry.
+            input: serde_json::json!({ "note": "_harvest_erased is set by #495" }),
+            queue: "default".into(),
+        },
+    ];
+    write(
+        dir.path(),
+        "mentions.json",
+        &snapshot_json("wf", ExecutionId::new(), events),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", payload_bearing_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.blocked.is_empty(),
+        "a mere mention of the key is not an erased payload: {report}"
+    );
+}
+
 /// A fixture whose payload carries the issue #608 **undecodable marker** — the
 /// per-field graceful degrade a lossy decode writes when it *tried* and failed
 /// (unknown codec, bad base64, codec error, invalid JSON).

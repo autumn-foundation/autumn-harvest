@@ -3571,6 +3571,73 @@ fn offloaded_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<St
 /// [`is_codec_envelope`](crate::payload_codec::is_codec_envelope), the crate's
 /// own authoritative shape check, so this can never drift from what the decoder
 /// recognises.
+/// Refuse a fixture whose payloads were **erased** (issue #495) rather than
+/// exported.
+///
+/// The third member of the opaque-payload family, alongside
+/// [`offloaded_fixture_reason`] and [`codec_opaque_fixture_reason`]: in all
+/// three the fixture holds something that is not the payload, so replaying it
+/// compares the candidate's real inputs against a placeholder. Erasure is the
+/// one that cannot be undone — the plaintext is gone by design — so the answer
+/// is never "decode it", only "do not certify a release against it".
+///
+/// Two ways a bundle acquires one, and the second needs no race at all:
+/// * The sample export selects an execution while it is in flight, and it
+///   completes and is erased before the (sequential) per-candidate fetch
+///   reaches it. The candidate row still reads `RUNNING`, so nothing upstream
+///   notices.
+/// * The **batch** export has no in-flight restriction, and erasure is
+///   terminal-only — so the executions it exports are exactly the ones eligible
+///   for erasure. No timing window is required.
+///
+/// Guarding here rather than only at export covers both, plus a hand-curated
+/// bundle and a fixture erased *after* it was written. Reported as a harness
+/// error (exit 2), never skipped: a silently dropped fixture shrinks coverage
+/// while the manifest still claims it, which is the one failure this gate must
+/// not have.
+fn erased_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<String> {
+    // Cheap reject first: no tombstone key anywhere in the document means no
+    // erased payload, and skips the per-event walk for every healthy fixture.
+    if !json.contains(crate::erase::ERASURE_TOMBSTONE_KEY) {
+        return None;
+    }
+
+    let mut tombstones = 0usize;
+    for value in snapshot
+        .events
+        .iter()
+        .filter_map(|event| serde_json::to_value(event).ok())
+    {
+        let Some(data) = value.get("data").and_then(Value::as_object) else {
+            continue;
+        };
+        for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
+            let Some(field) = data.get(key) else { continue };
+            if field
+                .as_object()
+                .is_some_and(|obj| obj.contains_key(crate::erase::ERASURE_TOMBSTONE_KEY))
+            {
+                tombstones += 1;
+            }
+        }
+    }
+    if tombstones == 0 {
+        // The key occurred inside payload *data* rather than as a tombstone in
+        // a payload field — a workflow whose own JSON happens to mention it.
+        // Not erased; replay it normally.
+        return None;
+    }
+
+    Some(format!(
+        "fixture carries {tombstones} erased-payload tombstone(s) (issue #495) instead of \
+         the real payloads, so replaying it would compare the candidate's real inputs \
+         against scrubbed placeholders — reporting drift that does not exist, or a clean \
+         result that certifies nothing. Erasure is irreversible, so re-export a sample \
+         that excludes this execution (it is terminal, and the gate verifies in-flight \
+         work) rather than trying to recover the payloads."
+    ))
+}
+
 fn codec_opaque_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<String> {
     use crate::payload_codec::{CODEC_ENVELOPE_KEY, UNDECODABLE_MARKER_KEY};
 
@@ -3800,6 +3867,7 @@ async fn replay_fixture_file(
     if let Some(reason) = unreplayable_fixture_reason(&guard, mode)
         .or_else(|| offloaded_fixture_reason(&json, &snapshot))
         .or_else(|| codec_opaque_fixture_reason(&json, &snapshot))
+        .or_else(|| erased_fixture_reason(&json, &snapshot))
     {
         return FixtureResult {
             path: path.to_owned(),
