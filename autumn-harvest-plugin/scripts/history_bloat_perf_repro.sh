@@ -67,6 +67,18 @@ INSERT INTO harvest_workflow_executions (id, workflow_name, workflow_id, shard_i
 SELECT gen_random_uuid(), 'poll_loop', 'bloated-' || i, 0, 'RUNNING', '{}'::jsonb, 'default'
 FROM generate_series(1, 15) AS s(i);
 
+-- The per-row event count is derived deterministically from `md5(workflow_id)`
+-- so re-runs reproduce identical counts. `('x' || hex)::bit(32)::int` gives a
+-- SIGNED 32-bit interpretation of the hash bits -- roughly half of all hashes
+-- have the high bit set and cast to a NEGATIVE int, which would make `% N`
+-- (Postgres preserves the sign of the dividend) negative too, collapsing the
+-- lower bound below zero and silently seeding a zero-event row via an empty
+-- `generate_series` instead of the intended range. Casting to `bigint` before
+-- `abs()` avoids the one remaining edge case (`abs(int4 MIN)` overflows int4;
+-- it fits comfortably in bigint), so the modulus operand is always
+-- non-negative and the intended [lower, lower+N) range is honored for every
+-- hash. See PR #1173 review discussion for the measured impact of the bug
+-- this replaced (~46% of rows in both cohorts previously got zero events).
 INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp)
 SELECT
     e.id,
@@ -83,7 +95,7 @@ SELECT
     END,
     NOW() - ((80 - ev.i) || ' seconds')::interval
 FROM harvest_workflow_executions e
-CROSS JOIN LATERAL generate_series(1, 5 + (('x' || substr(md5(e.workflow_id), 1, 8))::bit(32)::int % 75)) AS ev(i)
+CROSS JOIN LATERAL generate_series(1, 5 + (abs((('x' || substr(md5(e.workflow_id), 1, 8))::bit(32)::int)::bigint) % 75)) AS ev(i)
 WHERE e.workflow_name = 'order_flow';
 
 INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp)
@@ -97,9 +109,9 @@ SELECT
         jsonb_build_object('type','MarkerRecorded','data',jsonb_build_object(
             'name','poll_iteration', 'details', jsonb_build_object('iteration', ev.i, 'batch', jsonb_build_array(1,2,3,4,5))))
     END,
-    NOW() - (((50000 + (('x' || substr(md5(e.workflow_id), 1, 8))::bit(32)::int % 400000)) - ev.i) || ' seconds')::interval
+    NOW() - (((50000 + (abs((('x' || substr(md5(e.workflow_id), 1, 8))::bit(32)::int)::bigint) % 400000)) - ev.i) || ' seconds')::interval
 FROM harvest_workflow_executions e
-CROSS JOIN LATERAL generate_series(1, 50000 + (('x' || substr(md5(e.workflow_id), 1, 8))::bit(32)::int % 400000)) AS ev(i)
+CROSS JOIN LATERAL generate_series(1, 50000 + (abs((('x' || substr(md5(e.workflow_id), 1, 8))::bit(32)::int)::bigint) % 400000)) AS ev(i)
 WHERE e.workflow_name = 'poll_loop';
 
 ANALYZE harvest_events;

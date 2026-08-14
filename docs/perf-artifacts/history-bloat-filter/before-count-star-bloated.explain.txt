@@ -1,47 +1,47 @@
 -- before-count-star-bloated --
                                                                                             QUERY PLAN                                                                                             
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Result  (cost=102568.38..102568.39 rows=1 width=1) (actual rows=1 loops=1)
+ Result  (cost=187917.21..187917.22 rows=1 width=1) (actual rows=1 loops=1)
    Output: ($1 >= 10000)
-   Buffers: shared hit=13581 read=72392
+   Buffers: shared hit=13578 read=145015
    InitPlan 1 (returns $1)
-     ->  Finalize Aggregate  (cost=102568.37..102568.38 rows=1 width=8) (actual rows=1 loops=1)
+     ->  Finalize Aggregate  (cost=187917.20..187917.21 rows=1 width=8) (actual rows=1 loops=1)
            Output: count(*)
-           Buffers: shared hit=13581 read=72392
-           ->  Gather  (cost=102568.15..102568.36 rows=2 width=8) (actual rows=3 loops=1)
+           Buffers: shared hit=13578 read=145015
+           ->  Gather  (cost=187916.98..187917.19 rows=2 width=8) (actual rows=3 loops=1)
                  Output: (PARTIAL count(*))
                  Workers Planned: 2
                  Workers Launched: 2
-                 Buffers: shared hit=13581 read=72392
-                 ->  Partial Aggregate  (cost=101568.15..101568.16 rows=1 width=8) (actual rows=1 loops=3)
+                 Buffers: shared hit=13578 read=145015
+                 ->  Partial Aggregate  (cost=186916.98..186916.99 rows=1 width=8) (actual rows=1 loops=3)
                        Output: PARTIAL count(*)
-                       Buffers: shared hit=13581 read=72392
+                       Buffers: shared hit=13578 read=145015
                        Worker 0:  actual rows=1 loops=1
                          JIT:
                            Functions: 4
                            Options: Inlining false, Optimization false, Expressions true, Deforming true
-                         Buffers: shared hit=4564 read=22272
+                         Buffers: shared hit=4696 read=46679
                        Worker 1:  actual rows=1 loops=1
                          JIT:
                            Functions: 4
                            Options: Inlining false, Optimization false, Expressions true, Deforming true
-                         Buffers: shared hit=4478 read=21503
-                       ->  Parallel Seq Scan on public.harvest_events  (cost=0.00..101075.41 rows=197097 width=0) (actual rows=149392 loops=3)
+                         Buffers: shared hit=4358 read=44000
+                       ->  Parallel Seq Scan on public.harvest_events  (cost=0.00..186437.50 rows=191793 width=0) (actual rows=149392 loops=3)
                              Output: harvest_events.id, harvest_events.workflow_exec_id, harvest_events.event_id, harvest_events.event_type, harvest_events.event_data, harvest_events."timestamp"
-                             Filter: (harvest_events.workflow_exec_id = '12464aab-c16a-4ae4-b7e5-441859fd9760'::uuid)
-                             Rows Removed by Filter: 817106
-                             Buffers: shared hit=13581 read=72392
-                             Worker 0:  actual rows=150144 loops=1
-                               Buffers: shared hit=4564 read=22272
-                             Worker 1:  actual rows=143897 loops=1
-                               Buffers: shared hit=4478 read=21503
- Query Identifier: 8527770558938623551
+                             Filter: (harvest_events.workflow_exec_id = '08f9adbe-ec53-4782-b4eb-fabbca7bea6b'::uuid)
+                             Rows Removed by Filter: 1632578
+                             Buffers: shared hit=13578 read=145015
+                             Worker 0:  actual rows=147968 loops=1
+                               Buffers: shared hit=4696 read=46679
+                             Worker 1:  actual rows=139183 loops=1
+                               Buffers: shared hit=4358 read=44000
+ Query Identifier: -2396632734901249955
  Planning:
-   Buffers: shared hit=212
- Planning Time: 0.698 ms
+   Buffers: shared hit=237
+ Planning Time: 0.732 ms
  JIT:
    Functions: 15
    Options: Inlining false, Optimization false, Expressions true, Deforming true
- Execution Time: 153.711 ms
+ Execution Time: 265.096 ms
 (42 rows)
 

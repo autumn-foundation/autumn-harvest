@@ -1,22 +1,22 @@
 -- after-bounded-exists-no-order-by-bloated --
                                                        QUERY PLAN                                                        
 -------------------------------------------------------------------------------------------------------------------------
- Result  (cost=2583.73..2583.74 rows=1 width=1) (actual rows=1 loops=1)
+ Result  (cost=4897.20..4897.21 rows=1 width=1) (actual rows=1 loops=1)
    Output: $0
-   Buffers: shared hit=295 read=42871
+   Buffers: shared hit=295 read=88323
    InitPlan 1 (returns $0)
-     ->  Limit  (cost=2583.47..2583.73 rows=1 width=4) (actual rows=1 loops=1)
+     ->  Limit  (cost=4896.71..4897.20 rows=1 width=4) (actual rows=1 loops=1)
            Output: 1
-           Buffers: shared hit=295 read=42871
-           ->  Seq Scan on public.harvest_events  (cost=0.00..122218.79 rows=473032 width=4) (actual rows=10000 loops=1)
+           Buffers: shared hit=295 read=88323
+           ->  Seq Scan on public.harvest_events  (cost=0.00..225419.80 rows=460303 width=4) (actual rows=10000 loops=1)
                  Output: 1
-                 Filter: (harvest_events.workflow_exec_id = '12464aab-c16a-4ae4-b7e5-441859fd9760'::uuid)
-                 Rows Removed by Filter: 1434083
-                 Buffers: shared hit=295 read=42871
- Query Identifier: -3661517514735695829
+                 Filter: (harvest_events.workflow_exec_id = '08f9adbe-ec53-4782-b4eb-fabbca7bea6b'::uuid)
+                 Rows Removed by Filter: 2956744
+                 Buffers: shared hit=295 read=88323
+ Query Identifier: 7097635273166486898
  Planning:
-   Buffers: shared hit=206
- Planning Time: 0.891 ms
- Execution Time: 171.039 ms
+   Buffers: shared hit=231
+ Planning Time: 1.035 ms
+ Execution Time: 335.605 ms
 (17 rows)
 

@@ -1,22 +1,22 @@
 -- after-bounded-exists-healthy --
                                                                      QUERY PLAN                                                                     
 ----------------------------------------------------------------------------------------------------------------------------------------------------
- Result  (cost=506.97..506.98 rows=1 width=1) (actual rows=1 loops=1)
+ Result  (cost=956.75..956.76 rows=1 width=1) (actual rows=1 loops=1)
    Output: $0
-   Buffers: shared hit=2 read=2
+   Buffers: shared hit=2 read=3
    InitPlan 1 (returns $0)
-     ->  Limit  (cost=503.36..506.97 rows=1 width=8) (actual rows=0 loops=1)
+     ->  Limit  (cost=952.83..956.75 rows=1 width=8) (actual rows=0 loops=1)
            Output: 1, harvest_events.event_id
-           Buffers: shared hit=2 read=2
-           ->  Index Only Scan using idx_harvest_events_exec on public.harvest_events  (cost=0.43..503.36 rows=139 width=8) (actual rows=5 loops=1)
+           Buffers: shared hit=2 read=3
+           ->  Index Only Scan using idx_harvest_events_exec on public.harvest_events  (cost=0.56..952.83 rows=243 width=8) (actual rows=5 loops=1)
                  Output: 1, harvest_events.event_id
-                 Index Cond: (harvest_events.workflow_exec_id = '7f1cc85d-5619-4b1a-b924-322b1a0568a8'::uuid)
+                 Index Cond: (harvest_events.workflow_exec_id = '832d7fb4-9c77-4faa-b43e-5f4e963ff220'::uuid)
                  Heap Fetches: 0
-                 Buffers: shared hit=2 read=2
- Query Identifier: -8425713694116032582
+                 Buffers: shared hit=2 read=3
+ Query Identifier: 2227093904254062132
  Planning:
-   Buffers: shared hit=238
- Planning Time: 0.906 ms
- Execution Time: 0.091 ms
+   Buffers: shared hit=263
+ Planning Time: 1.199 ms
+ Execution Time: 0.104 ms
 (17 rows)
 
