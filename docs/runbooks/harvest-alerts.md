@@ -2032,12 +2032,22 @@ window, some pods have the handler and some do not, and tasks bounce until they
 land on a new pod. Nothing is lost, and the counter reports
 `outcome="released"`.
 
-The page is `outcome="escalated"`. Each release increments a per-task
-`capability_misses` counter with capped exponential backoff; once it reaches
+The page is `outcome="escalated"`. Each release backs the task off (capped
+exponential, 1 s doubling to 30 s) and records the releasing worker in the
+task's **distinct-miss set**; once that set would exceed
 `WorkerConfig::capability_miss_max_redeliveries` (default **5**) the task falls
 through to the normal terminal-failure path with a stable, greppable
 `no_capable_worker:` reason. Escalation means **no live worker on that queue
 registers the handler at all** — executions are being failed.
+
+The budget counts *distinct* workers, not total releases, precisely so that one
+incapable pod repeatedly winning the claim race cannot page you while a capable
+peer is live: a repeat miss by a worker already in the set backs off but
+consumes no budget. Reaching this page therefore means `N + 1` **different**
+workers each failed to resolve the handler. (A secondary absolute ceiling of
+`10 ×` the budget on total releases exists only for a fleet smaller than the
+budget, where the distinct set can never grow that far; it escalates with the
+same `escalated` outcome.)
 
 That conclusion is only sound because the task was *offered around the queue*
 for its whole budget first. Two escalation causes fail an execution on its

@@ -448,6 +448,21 @@ pub struct TaskQueueItem {
     /// consume neither.
     #[serde(default)]
     pub capability_misses: i32,
+    /// Distinct worker ids that have missed this task (issue #804).
+    ///
+    /// The redelivery budget is consumed **per distinct worker**: a repeat miss
+    /// by a worker already in this set still backs off and still increments
+    /// `capability_misses`, but does not consume budget. Without that, one
+    /// incapable worker winning the claim race `N + 1` times in a row could
+    /// terminally fail a run while a capable peer was live — the released task
+    /// is eligible to every worker again and the claim query has no capability
+    /// filter.
+    ///
+    /// Cleared by exactly the paths that reset `capability_misses`, so the two
+    /// stay consistent. Bounded in practice by the budget + 1, since exceeding
+    /// it escalates.
+    #[serde(default)]
+    pub capability_miss_workers: Vec<String>,
 }
 
 /// Insert struct for enqueuing a new task.

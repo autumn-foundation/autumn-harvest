@@ -10288,6 +10288,7 @@ mod tests {
             wake_requested: false,
             session_id: None,
             capability_misses: 0,
+            capability_miss_workers: Vec::new(),
         }
     }
 

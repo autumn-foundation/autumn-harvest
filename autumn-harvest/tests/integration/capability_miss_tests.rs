@@ -400,6 +400,31 @@ async fn dead_letter_errors(url: &str, exec_id: ExecutionId) -> Vec<String> {
         .expect("load dead letters")
 }
 
+/// Seed a task row's distinct-miss set as if `workers` had each already claimed
+/// and released it (issue #804 round 6).
+///
+/// The redelivery budget is consumed per DISTINCT worker, so an all-incapable
+/// *fleet* is what exhausts it — a single worker bouncing never can. Seeding the
+/// prior set models the fleet without standing up N worker runtimes, and drives
+/// the real decision path: `resolve_capability_miss` reads this column back off
+/// the claimed row.
+async fn seed_prior_missing_workers(url: &str, exec_id: ExecutionId, workers: &[&str]) {
+    let mut conn = connect(url).await;
+    let owned: Vec<String> = workers.iter().map(|w| (*w).to_string()).collect();
+    let misses = i32::try_from(owned.len()).expect("small");
+    diesel::update(
+        harvest_task_queue::table
+            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid()))),
+    )
+    .set((
+        harvest_task_queue::capability_miss_workers.eq(owned),
+        harvest_task_queue::capability_misses.eq(misses),
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed prior missing workers");
+}
+
 /// Poll until at least one task row for `exec_id` reports `capability_misses >= want`.
 async fn wait_for_capability_misses(
     url: &str,
@@ -894,9 +919,14 @@ async fn activity_capability_miss_is_released_for_a_capable_peer() {
 // AC3 + AC5 — bounded release: escalate when no capable worker ever appears.
 // ---------------------------------------------------------------------------
 
-/// With **zero** capable workers the release must not loop forever. After the
-/// configured budget the task escalates through the ordinary terminal-failure
-/// path, tagged with the greppable `no_capable_worker:` prefix.
+/// With **zero** capable workers the release must not loop forever. Once the
+/// budget's worth of DISTINCT workers have each missed the task, the next one
+/// escalates through the ordinary terminal-failure path, tagged with the
+/// greppable `no_capable_worker:` prefix.
+///
+/// The budget is consumed per distinct worker (issue #804 round 6), so it is an
+/// all-incapable *fleet* that exhausts it. Three prior workers are seeded onto
+/// the row and this test's worker is the fourth — one past a budget of 3.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capability_miss_escalates_after_the_budget_with_no_capable_worker() {
     let (url, _container) = setup_db().await;
@@ -910,9 +940,14 @@ async fn capability_miss_escalates_after_the_budget_with_no_capable_worker() {
         Q_ESCALATE,
     )
     .await;
+    // A budget of 3 that three distinct workers have already spent.
+    seed_prior_missing_workers(
+        &url,
+        exec_id,
+        &["pod-a-incapable", "pod-b-incapable", "pod-c-incapable"],
+    )
+    .await;
 
-    // Budget 3 → releases at misses 1 and 2 (backoff 1s then 2s), escalation on
-    // the third claim. Bounded well inside the test timeout.
     let metrics = Arc::new(CapabilityMetrics::default());
     let worker = build_worker(
         "worker-no-capable-peer",
@@ -955,9 +990,10 @@ async fn capability_miss_escalates_after_the_budget_with_no_capable_worker() {
         "escalation appends the ordinary WorkflowFailed event, got {history:?}"
     );
 
-    // AC5 — released exactly N times, escalated exactly once, with the distinct
-    // outcome. The knob is named `capability_miss_max_redeliveries`, so a budget
-    // of N grants N releases and escalates on the N+1th claim.
+    // AC5 — escalated exactly once, with the fleet-exhaustion outcome. The knob
+    // is named `capability_miss_max_redeliveries`, so a budget of N grants N
+    // DISTINCT-worker releases and escalates on the N+1th distinct worker. This
+    // worker is the fourth against a budget of 3, so it never releases at all.
     assert_eq!(
         metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED),
         1,
@@ -966,8 +1002,9 @@ async fn capability_miss_escalates_after_the_budget_with_no_capable_worker() {
     );
     assert_eq!(
         metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_RELEASED),
-        3,
-        "budget 3 must grant exactly three redeliveries before escalating, got {:?}",
+        0,
+        "the budget was already spent by three distinct peers, so the fourth \
+         must escalate on its first claim rather than release again, got {:?}",
         metrics.samples()
     );
 
@@ -987,6 +1024,103 @@ async fn capability_miss_escalates_after_the_budget_with_no_capable_worker() {
         tasks.iter().all(|t| t.crash_strikes == 0),
         "crash strikes must stay at zero across the whole release cycle (AC4)"
     );
+}
+
+/// **Issue #804 round-6 P1.** One incapable worker repeatedly winning the claim
+/// race must never exhaust the redelivery budget.
+///
+/// The release backoff makes the task eligible to *every* worker again — the
+/// one that just released it included — and the claim query has no capability
+/// filter. Under plain total-miss accounting, `budget + 1` consecutive wins by
+/// a single incapable pod terminally failed the run, which during a rolling
+/// deploy is exactly the outage #804 exists to prevent: a capable peer is live
+/// and idle the whole time, it just keeps losing a coin flip.
+///
+/// The budget is therefore consumed per DISTINCT worker. This test runs a
+/// single incapable worker against a budget of 2 and lets it bounce the task
+/// far past that budget: the distinct set stays at one entry, so it releases
+/// every time and never escalates.
+///
+/// Falsifiable — verified by reverting `capability_miss_decision` to the
+/// total-miss bound and re-running: with a budget of 2 the task escalates on
+/// the third claim, so it never accrues a fourth miss and the row is gone.
+/// `wait_for_capability_misses` times out rather than the `RUNNING` assertion
+/// firing, but the cause is the same terminal failure this test exists to
+/// forbid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_incapable_worker_cannot_exhaust_the_shared_redelivery_budget() {
+    // Budget 2. Backoff is 1s, 2s, 4s, 8s..., so waiting for 4 total misses
+    // takes ~7s and puts the task two claims past a budget that a single
+    // worker would previously have exhausted.
+    const BUDGET: u32 = 2;
+    const MISSES: i32 = 4;
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "never_registered_wf",
+        serde_json::json!({}),
+        Q_ESCALATE,
+    )
+    .await;
+
+    let metrics = Arc::new(CapabilityMetrics::default());
+    let worker = build_worker(
+        "the-one-incapable-pod",
+        &[Q_ESCALATE],
+        build_registry(
+            vec![workflow_info("some_other_wf", decoy_workflow)],
+            vec![],
+            Arc::clone(&metrics),
+        ),
+        BUDGET,
+    );
+
+    let task = with_worker_running(&worker, &pool, async {
+        wait_for_capability_misses(&url, exec_id, MISSES, Duration::from_secs(90)).await
+    })
+    .await;
+
+    // The distinct set is the budget's unit of account, and one worker only
+    // ever contributes one entry however many times it bounces the task.
+    assert_eq!(
+        task.capability_miss_workers,
+        vec!["the-one-incapable-pod".to_string()],
+        "a repeat miss by the same worker must not grow the distinct set"
+    );
+    assert!(
+        task.capability_misses >= MISSES,
+        "the total counter still advances on every bounce (it drives the \
+         backoff and the absolute ceiling), got {}",
+        task.capability_misses
+    );
+
+    // The headline: the run is untouched. Under the old accounting it would
+    // have been terminally failed after `BUDGET + 1` claims.
+    let execution = load_execution(&url, exec_id).await;
+    assert_eq!(
+        execution.state, "RUNNING",
+        "a single incapable worker must never terminally fail a run that a \
+         capable peer could still pick up; error was {:?}",
+        execution.error
+    );
+    assert_eq!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED),
+        0,
+        "no escalation may be recorded, got {:?}",
+        metrics.samples()
+    );
+    assert!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_RELEASED)
+            >= usize::try_from(MISSES).expect("small"),
+        "every bounce releases, got {:?}",
+        metrics.samples()
+    );
+    // AC4 stays true throughout: a capability miss is never a crash.
+    assert_eq!(metrics.quarantine_count(), 0);
 }
 
 // ---------------------------------------------------------------------------

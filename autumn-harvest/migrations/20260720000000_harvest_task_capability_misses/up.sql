@@ -31,3 +31,24 @@
 -- adjacently-tagged event JSON contract, no replay-determinism impact.
 ALTER TABLE harvest_task_queue
     ADD COLUMN IF NOT EXISTS capability_misses INT NOT NULL DEFAULT 0;
+
+-- issue #804 (review round 6): the DISTINCT workers that have missed this task.
+--
+-- `capability_misses` alone is a *shared* budget: the release backoff makes the
+-- task eligible to every worker again -- including the one that just released
+-- it -- and the claim query has no capability filter, so one incapable worker
+-- winning the claim race N+1 times in a row exhausted the budget and terminally
+-- failed the run even while a capable peer was live. That is the exact
+-- rolling-deploy outage #804 exists to prevent.
+--
+-- The budget is therefore consumed per DISTINCT worker: a repeat miss by a
+-- worker already in this set does not consume one (it still backs off and still
+-- increments `capability_misses`, which drives the backoff and the absolute
+-- ceiling). `capability_misses` remains the absolute termination guarantee for
+-- a fleet too small to ever grow this set to the budget.
+--
+-- Bounded in practice by `capability_miss_max_redeliveries + 1` entries, since
+-- exceeding the budget escalates. Cleared by exactly the same paths that reset
+-- `capability_misses`, so the two counters stay consistent.
+ALTER TABLE harvest_task_queue
+    ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';

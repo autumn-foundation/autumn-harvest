@@ -299,18 +299,27 @@ the right pod for this task.
 > replays them normally: no new event variant is introduced, the event JSON
 > contract is unchanged, and replay determinism is unaffected (AC7).
 
-**The release is bounded.** Each release increments a per-task
-`capability_misses` counter — reset to `0` by every path that proves the
-claiming worker *was* capable (an activity requeue, a clean continuation, and
-the workflow park), so it measures *consecutive* misses. Once a claim would
-exceed `WorkerConfig::capability_miss_max_redeliveries` (default **5**) the task
-**escalates** through the ordinary terminal-failure path — a `WorkflowFailed`
+**The release is bounded — per distinct worker.** Each release records the
+releasing worker in the task's distinct-miss set and backs the task off. Both
+the set and the total counter are reset by every path that proves the claiming
+worker *was* capable (an activity requeue, a clean continuation, and the
+workflow park), so they measure *consecutive* misses. Once a claim would grow
+that set beyond `WorkerConfig::capability_miss_max_redeliveries` (default **5**)
+the task **escalates** through the ordinary terminal-failure path — a `WorkflowFailed`
 event and a `FAILED` execution row, **not** a dead-letter entry — with a
 greppable reason:
 
 ```
 no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 5 capability-miss redeliveries; no live worker on this queue has the handler)
 ```
+
+Counting *distinct* workers rather than total releases is what stops a single
+incapable pod from exhausting the shared budget by repeatedly winning the claim
+race on its own released row — otherwise a capable peer could sit live and idle
+while the run was failed underneath it. A repeat miss by a worker already in the
+set backs off but consumes no budget. A secondary absolute ceiling of `10 ×` the
+budget on total releases covers the one case a distinct-worker budget cannot: a
+fleet smaller than the budget, where the set can never grow far enough.
 
 That bound is what keeps a genuinely-missing handler — a workflow type deleted
 or renamed in the new build with runs still in flight — from bouncing around

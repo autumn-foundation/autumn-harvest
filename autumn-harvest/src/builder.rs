@@ -3066,8 +3066,8 @@ pub struct WorkerConfig {
     /// poison pills are re-queued indefinitely — the legacy retry-loop
     /// behaviour).
     pub poison_pill_threshold: i32,
-    /// Maximum number of times a task may be **released** back to `PENDING`
-    /// because the claiming worker had no handler registered for its
+    /// Maximum number of **distinct workers** that may release a task back to
+    /// `PENDING` because they had no handler registered for its
     /// workflow/activity type, before it is escalated to the terminal-failure /
     /// dead-letter path with a `no_capable_worker:` reason (issue #804).
     ///
@@ -3079,12 +3079,31 @@ pub struct WorkerConfig {
     /// rather than terminally failing the execution, which makes the routine
     /// mid-rolling-deploy window blameless.
     ///
-    /// Each release increments the task's `capability_misses` and defers it by
-    /// a capped exponential backoff (1 s doubling to 30 s), so the budget buys
-    /// a dwell window comfortably longer than a pod flip. The counter is reset
-    /// to `0` by every path that proves the claiming worker *was* capable, so
-    /// it measures **consecutive** misses — the same semantics
-    /// [`poison_pill_threshold`] has for crashes.
+    /// Each release defers the task by a capped exponential backoff (1 s
+    /// doubling to 30 s), so the budget buys a dwell window comfortably longer
+    /// than a pod flip.
+    ///
+    /// # The budget is per distinct worker
+    ///
+    /// The backoff makes a released task eligible to *every* worker again — the
+    /// one that just released it included. If the budget counted total
+    /// releases, one incapable worker winning the claim race `N + 1` times in a
+    /// row would terminally fail a run while a capable peer sat live and idle,
+    /// which is the very outage this setting exists to prevent. So the task
+    /// records the **set** of workers that have missed it
+    /// (`capability_miss_workers`), and a repeat miss by a worker already in
+    /// that set is free: it still backs off, but consumes no budget.
+    ///
+    /// A secondary absolute ceiling of `10 ×` this value on *total* releases
+    /// terminates the degenerate case a distinct-worker budget cannot reach —
+    /// a fleet smaller than the budget, where the distinct set can never grow
+    /// far enough. Reaching it while a capable peer is live means that peer
+    /// lost the claim race that many times consecutively, which is vanishingly
+    /// unlikely; the sustained-release alert fires long before it.
+    ///
+    /// Both the set and the total are reset by every path that proves the
+    /// claiming worker *was* capable, so they measure **consecutive** misses —
+    /// the same semantics [`poison_pill_threshold`] has for crashes.
     ///
     /// Defaults to **5**. Set to `0` to escalate on the **first** miss (the
     /// pre-#804 fail-fast behaviour) — note this is *not* an "unlimited
@@ -5062,7 +5081,7 @@ mod tests {
         let config = WorkerConfig::default().with_capability_miss_max_redeliveries(0);
         assert_eq!(config.capability_miss_max_redeliveries, 0);
         assert_eq!(
-            crate::worker::capability_miss_decision(1, config.capability_miss_max_redeliveries),
+            crate::worker::capability_miss_decision(1, 1, config.capability_miss_max_redeliveries),
             crate::worker::CapabilityMissAction::Escalate
         );
     }

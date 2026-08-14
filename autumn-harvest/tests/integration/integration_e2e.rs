@@ -323,7 +323,11 @@ const LEGACY_INIT_SQL: &str = concat!(
     // issue #804: `TaskQueueItem` (what `claim_task`'s `RETURNING
     // harvest_task_queue.*` deserializes into) references capability_misses on
     // every claim, so the legacy start path's enqueue+claim needs it too.
-    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_misses INT NOT NULL DEFAULT 0;\n"
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_misses INT NOT NULL DEFAULT 0;\n",
+    // issue #804 (round 6): `TaskQueueItem` selects the companion distinct-misser
+    // set on the same claim, so omitting it fails the legacy path's claim exactly
+    // as omitting `capability_misses` would.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return

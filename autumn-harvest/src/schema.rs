@@ -239,6 +239,10 @@ diesel::table! {
         /// reason. Deliberately separate from `attempt` (retry budget) and
         /// `crash_strikes` (poison-pill quarantine).
         capability_misses -> Int4,
+        /// Issue #804: the DISTINCT worker ids that have missed this task. The
+        /// redelivery budget is consumed per entry, so one incapable worker
+        /// repeatedly winning the claim race cannot exhaust it.
+        capability_miss_workers -> Array<Text>,
     }
 }
 

@@ -3845,16 +3845,44 @@ pub enum CapabilityMissAction {
     Escalate,
 }
 
+/// Multiplier turning the distinct-worker budget into an **absolute** ceiling on
+/// total capability-miss releases for one task (issue #804).
+///
+/// The primary bound counts *distinct* incapable workers, which is what stops a
+/// single worker from consuming the whole budget by repeatedly winning the claim
+/// race. But a fleet smaller than the budget can never grow the distinct set
+/// past its own size, so the distinct bound alone would let a lone incapable
+/// worker bounce a task forever — violating AC3's "release is bounded". This
+/// multiplier supplies that termination guarantee.
+///
+/// It is deliberately generous. Reaching it *while a capable peer is live*
+/// requires that peer to lose the claim race `budget * MULTIPLIER` consecutive
+/// times (2⁻⁵⁰ for the default budget against an even two-worker split), so it
+/// effectively never fires when a capable worker exists — while a genuinely
+/// capability-less fleet still terminates, at the 30 s backoff cap, in bounded
+/// time rather than bouncing indefinitely.
+pub const CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER: i32 = 10;
+
 /// Decide whether a capability miss releases the task for a peer or escalates
 /// to the terminal-failure path (issue #804).
 ///
-/// `misses_after_increment` is the value the release UPDATE would persist to
-/// `harvest_task_queue.capability_misses`, so the **first** miss on a task
-/// arrives here as `1`.
+/// Two bounds, both must hold to release:
+///
+/// * `distinct_workers_after` — how many **distinct** workers will have missed
+///   this task after recording this one. This is the primary budget. A repeat
+///   miss by a worker already in the set does not move it, so no single
+///   incapable worker can exhaust the budget by winning the claim race over and
+///   over (the released task is eligible to every worker again, and the claim
+///   query has no capability filter).
+/// * `misses_after_increment` — the total-release value the UPDATE would
+///   persist to `harvest_task_queue.capability_misses`, so the **first** miss on
+///   a task arrives here as `1`. Bounded by
+///   [`CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER`] × the budget, which is what
+///   terminates a fleet too small to ever grow the distinct set to the budget.
 ///
 /// The budget is a **count of permitted redeliveries**, not a threshold to
-/// reach: `max_redeliveries = N` allows exactly `N` releases and escalates on
-/// the `N + 1`th claim, so escalation fires at `>` rather than `>=`. This is
+/// reach: `max_redeliveries = N` allows exactly `N` distinct-worker releases and
+/// escalates on the `N + 1`th, so escalation fires at `>` rather than `>=`. This is
 /// deliberately *not* the `>=` shape of
 /// [`crate::poison_pill::quarantine_decision`] — that knob is named
 /// `poison_pill_threshold` ("reach it and act"), whereas this one is named for
@@ -3883,6 +3911,7 @@ pub enum CapabilityMissAction {
 /// operator, a backfill, or a test seed.
 #[must_use]
 pub const fn capability_miss_decision(
+    distinct_workers_after: i32,
     misses_after_increment: i32,
     max_redeliveries: u32,
 ) -> CapabilityMissAction {
@@ -3902,11 +3931,20 @@ pub const fn capability_miss_decision(
     } else {
         max_redeliveries.cast_signed()
     };
-    if misses_after_increment > budget {
-        CapabilityMissAction::Escalate
-    } else {
-        CapabilityMissAction::Release
+    // PRIMARY bound: distinct incapable workers. A repeat miss by a worker
+    // already known to be incapable for this task does not move this number,
+    // so no single worker can consume the budget by winning the claim race
+    // repeatedly (issue #804, Codex round-6 P1).
+    if distinct_workers_after > budget {
+        return CapabilityMissAction::Escalate;
     }
+    // ABSOLUTE bound: total releases. The distinct bound alone cannot terminate
+    // a fleet SMALLER than the budget, so this is what keeps AC3's "bounded
+    // release" true for e.g. a single incapable worker.
+    if misses_after_increment > budget.saturating_mul(CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER) {
+        return CapabilityMissAction::Escalate;
+    }
+    CapabilityMissAction::Release
 }
 
 /// Capped exponential backoff before a capability-missed task becomes
@@ -4066,6 +4104,86 @@ pub fn no_capable_worker_reason(
     }
 }
 
+/// Scan `commands` for the first one whose **persistence** resolves a handler
+/// this worker does not register (issue #804), returning `(kind, name)`.
+///
+/// This is the pre-pass that runs in `process_workflow_task` *ahead of the
+/// terminal telemetry*, mirroring the three in-transaction checks:
+///
+/// | Command | Persist site | Registry |
+/// |---|---|---|
+/// | `ScheduleActivity` | `persist_scheduled_activities` | `activities` |
+/// | `StartChildWorkflow` | `persist_all_started_child_workflows`, `persist_child_timeout_race` | `workflows` |
+/// | `SpawnDetachedChildWorkflow` | `create_detached_child_executions` | `workflows` |
+///
+/// Those checks stay in place as the authoritative all-or-nothing guard inside
+/// the transaction; this pre-pass exists so the miss is detected *before*
+/// `record_workflow_completed` / `harvest.workflow.terminal` (#519) are emitted.
+/// Without it, every capability-miss redelivery of a terminal decision rolls the
+/// transaction back but leaves a spurious `terminal{outcome="completed"}`
+/// increment behind for an execution that is still `RUNNING` — the success-rate
+/// SLO would count one logical run many times over.
+///
+/// `RunLocalActivity` is deliberately **absent**: it is resolved during
+/// *execution* (already ahead of the telemetry) and that site is replay-aware —
+/// a local activity whose result is already recorded replays without touching
+/// the registry at all. Flagging it here would release a task that this worker
+/// could have replayed perfectly well.
+///
+/// The match is **exhaustive with no wildcard arm** on purpose: adding a
+/// `WorkflowCommand` variant is a compile error here until someone decides
+/// whether persisting it needs a registered handler. This is the same
+/// coverage-guard pattern as `WorkerConfigView::from_worker_config` (#695) and
+/// `ShardRouter::parts` (#697).
+fn first_persist_capability_miss(
+    registry: &HandlerRegistry,
+    commands: &[WorkflowCommand],
+) -> Option<(&'static str, String)> {
+    for cmd in commands {
+        match cmd {
+            WorkflowCommand::ScheduleActivity { name, .. } => {
+                if !registry.activities.contains_key(name.as_str()) {
+                    return Some((CapabilityMissKind::Activity.as_str(), name.clone()));
+                }
+            }
+            WorkflowCommand::StartChildWorkflow { workflow_name, .. }
+            | WorkflowCommand::SpawnDetachedChildWorkflow { workflow_name, .. } => {
+                if !registry.workflows.contains_key(workflow_name.as_str()) {
+                    return Some((CapabilityMissKind::Workflow.as_str(), workflow_name.clone()));
+                }
+            }
+            // Every remaining variant persists without resolving a handler.
+            // `RunLocalActivity` is checked at execution time instead (see the
+            // doc comment above); the rest are bookkeeping, waits, timers,
+            // external-workflow verbs, mutex ops, or terminal markers.
+            WorkflowCommand::WaitForActivity { .. }
+            | WorkflowCommand::StartTimer { .. }
+            | WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordSideEffect { .. }
+            | WorkflowCommand::ScheduleExternalActivity { .. }
+            | WorkflowCommand::WaitForSignal { .. }
+            | WorkflowCommand::Complete { .. }
+            | WorkflowCommand::Fail { .. }
+            | WorkflowCommand::ContinueAsNew { .. }
+            | WorkflowCommand::RunLocalActivity { .. }
+            | WorkflowCommand::RecordUpdateResult { .. }
+            | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::RecordLog { .. }
+            | WorkflowCommand::SignalExternalWorkflow { .. }
+            | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+            | WorkflowCommand::AwaitExternalWorkflow { .. }
+            | WorkflowCommand::CancelRaceLosers { .. }
+            | WorkflowCommand::ArmTimer { .. }
+            | WorkflowCommand::CancelTimer { .. }
+            | WorkflowCommand::AcquireMutex { .. }
+            | WorkflowCommand::ReleaseMutex { .. } => {}
+        }
+    }
+    None
+}
+
 /// Should this task be released for a capable peer at all, or escalated
 /// immediately regardless of the redelivery budget (issue #804)?
 ///
@@ -4081,29 +4199,67 @@ pub const fn capability_miss_releasable(session_id: Option<uuid::Uuid>) -> bool 
     session_id.is_none()
 }
 
+/// Outcome of [`resolve_capability_miss`] (issue #804).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityMissResolution {
+    /// Release the claim for a peer, or escalate to terminal failure.
+    pub action: CapabilityMissAction,
+    /// Value the release UPDATE will persist to `capability_misses`.
+    pub total_after: i32,
+    /// How many distinct workers will have missed this task afterwards. Equal
+    /// to `distinct_before` when this worker had already missed it.
+    pub distinct_after: i32,
+    /// `true` when this worker is not yet in the task's distinct-miss set, so
+    /// the release must append it.
+    pub worker_is_new: bool,
+}
+
 /// Resolve what to do about a capability miss on a claimed task (issue #804).
 ///
-/// Pure decision function: takes the task's persisted consecutive-miss count
-/// **before** this miss, the configured budget, and whether the task is
-/// session-pinned; returns the action plus the count that will be persisted.
+/// Pure decision function: takes the distinct workers that have already missed
+/// this task, the persisted total-miss count **before** this miss, the claiming
+/// worker's id, the configured budget, and whether the task is session-pinned.
+///
+/// The claiming worker's id is load-bearing: the budget is consumed **per
+/// distinct worker**, so a worker that has already missed this task can miss it
+/// again for free. Without that, the backoff — which makes the task eligible to
+/// every worker again, this one included — let one incapable worker exhaust the
+/// whole budget by winning the claim race repeatedly, terminally failing a run
+/// while a capable peer was live.
 ///
 /// Split out from the async dispatch path so the whole release-vs-escalate
-/// policy — budget arithmetic, the session carve-out, and the `0`-budget
+/// policy — both budget bounds, the session carve-out, and the `0`-budget
 /// fail-fast — is unit-testable with no database and no worker.
 #[must_use]
-pub const fn resolve_capability_miss(
+pub fn resolve_capability_miss(
+    distinct_workers_before: &[String],
     misses_before: i32,
+    worker_id: &str,
     max_redeliveries: u32,
     session_id: Option<uuid::Uuid>,
-) -> (CapabilityMissAction, i32) {
-    let misses_after = misses_before.saturating_add(1);
+) -> CapabilityMissResolution {
+    let total_after = misses_before.saturating_add(1);
+    let worker_is_new = !distinct_workers_before.iter().any(|w| w == worker_id);
+    let distinct_before = i32::try_from(distinct_workers_before.len()).unwrap_or(i32::MAX);
+    let distinct_after = if worker_is_new {
+        distinct_before.saturating_add(1)
+    } else {
+        distinct_before
+    };
     if !capability_miss_releasable(session_id) {
-        return (CapabilityMissAction::Escalate, misses_after);
+        return CapabilityMissResolution {
+            action: CapabilityMissAction::Escalate,
+            total_after,
+            distinct_after,
+            worker_is_new,
+        };
     }
-    (
-        capability_miss_decision(misses_after, max_redeliveries),
-        misses_after,
-    )
+    CapabilityMissResolution {
+        action: capability_miss_decision(distinct_after, total_after, max_redeliveries),
+        total_after,
+        distinct_after,
+        worker_is_new,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7530,7 +7686,13 @@ async fn requeue_parent_on_transient_ingest_conflict(
     // the type reaches it too, and letting it zero the counter would restart the
     // consecutive-miss budget on a path that proves nothing about capability —
     // weakening the escalation bound. Restore what the row had on claim.
-    queue::restore_capability_misses(conn, task.id, task.capability_misses).await?;
+    queue::restore_capability_misses(
+        conn,
+        task.id,
+        task.capability_misses,
+        &task.capability_miss_workers,
+    )
+    .await?;
     queue::wake_workflow_task(conn, exec_id).await?;
     Ok(())
 }
@@ -13968,6 +14130,31 @@ async fn process_workflow_task(
         clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
     }
 
+    // Issue #804 (Codex round-6 P2): detect a capability miss on this cycle's
+    // commands BEFORE any terminal telemetry is emitted.
+    //
+    // The authoritative all-or-nothing checks live inside the persistence
+    // transaction (`persist_scheduled_activities`,
+    // `persist_all_started_child_workflows`, `create_detached_child_executions`),
+    // but by the time they fire, `record_workflow_completed` and
+    // `harvest.workflow.terminal` (#519) have already been recorded. Rolling the
+    // transaction back then leaves the execution `RUNNING` with a spurious
+    // `terminal{outcome="completed"}` increment behind — and because a
+    // capability miss is *repeatable* (every redelivery re-runs the same
+    // decision), one logical run would be counted once per redelivery,
+    // corrupting the success-rate SLO. Gating here returns the typed error to
+    // `dispatch_task`, which releases the claim for a capable peer with the
+    // telemetry never touched.
+    //
+    // Placed before the history-cap check's DB round-trips too, so an incapable
+    // worker releases the task without paying for work a capable peer will redo.
+    if let Some((kind, name)) = first_persist_capability_miss(
+        registry,
+        update_result_command_source(&outcome, &pending_cmds),
+    ) {
+        return Err(HarvestError::HandlerNotRegistered { kind, name });
+    }
+
     let terminal_parent_close_cascade_events = if matches!(
         &outcome,
         WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }
@@ -14648,8 +14835,14 @@ async fn handle_capability_miss(
     name: &str,
     max_redeliveries: u32,
 ) -> HarvestResult<TaskDispatchOutcome> {
-    let (action, misses_after) =
-        resolve_capability_miss(task.capability_misses, max_redeliveries, task.session_id);
+    let resolution = resolve_capability_miss(
+        &task.capability_miss_workers,
+        task.capability_misses,
+        worker_id,
+        max_redeliveries,
+        task.session_id,
+    );
+    let (action, misses_after) = (resolution.action, resolution.total_after);
     let detail = format!("no {kind} handler registered for '{name}'");
 
     match action {
@@ -14687,6 +14880,8 @@ async fn handle_capability_miss(
                 handler_kind = kind,
                 handler = name,
                 capability_misses = misses_after,
+                distinct_incapable_workers = resolution.distinct_after,
+                worker_is_new_misser = resolution.worker_is_new,
                 max_redeliveries,
                 backoff_secs = delay.as_secs(),
                 "released task for a capable peer: no handler registered on this worker"
@@ -21847,7 +22042,7 @@ mod tests {
         // REDELIVERIES are granted, so a budget of 5 releases misses 1..=5.
         for misses in 1..=5 {
             assert_eq!(
-                capability_miss_decision(misses, 5),
+                capability_miss_decision(misses, misses, 5),
                 CapabilityMissAction::Release,
                 "miss {misses} of 5 must release for a capable peer",
             );
@@ -21864,13 +22059,13 @@ mod tests {
             let bound = i32::try_from(budget).expect("test budgets fit in i32");
             for misses in 1..=bound {
                 assert_eq!(
-                    capability_miss_decision(misses, budget),
+                    capability_miss_decision(misses, misses, budget),
                     CapabilityMissAction::Release,
                     "budget {budget} must grant redelivery {misses}",
                 );
             }
             assert_eq!(
-                capability_miss_decision(bound + 1, budget),
+                capability_miss_decision(bound + 1, bound + 1, budget),
                 CapabilityMissAction::Escalate,
                 "budget {budget} must escalate on claim {}",
                 bound + 1
@@ -21881,11 +22076,11 @@ mod tests {
     #[test]
     fn capability_miss_decision_escalates_over_the_bound() {
         assert_eq!(
-            capability_miss_decision(6, 5),
+            capability_miss_decision(6, 6, 5),
             CapabilityMissAction::Escalate
         );
         assert_eq!(
-            capability_miss_decision(i32::MAX, 5),
+            capability_miss_decision(i32::MAX, i32::MAX, 5),
             CapabilityMissAction::Escalate
         );
     }
@@ -21895,7 +22090,7 @@ mod tests {
         // `0` is the documented rollback switch: no redeliveries allowed, so the
         // very first capability miss takes the pre-#804 terminal-failure path.
         assert_eq!(
-            capability_miss_decision(1, 0),
+            capability_miss_decision(1, 1, 0),
             CapabilityMissAction::Escalate
         );
     }
@@ -21905,15 +22100,15 @@ mod tests {
         // Defensive: the column is NOT NULL DEFAULT 0 and only ever incremented,
         // but a hand-edited/corrupt row must not silently disable escalation.
         assert_eq!(
-            capability_miss_decision(0, 5),
+            capability_miss_decision(0, 0, 5),
             CapabilityMissAction::Release
         );
         assert_eq!(
-            capability_miss_decision(-1, 5),
+            capability_miss_decision(-1, -1, 5),
             CapabilityMissAction::Release
         );
         assert_eq!(
-            capability_miss_decision(0, 0),
+            capability_miss_decision(0, 0, 0),
             CapabilityMissAction::Escalate
         );
     }
@@ -21957,7 +22152,7 @@ mod tests {
 
         let releases = (1..=i32::try_from(budget).expect("small budget") + 1)
             .take_while(|misses| {
-                capability_miss_decision(*misses, budget) == CapabilityMissAction::Release
+                capability_miss_decision(*misses, *misses, budget) == CapabilityMissAction::Release
             })
             .count();
         assert_eq!(
@@ -22217,23 +22412,262 @@ mod tests {
         assert_eq!(CapabilityMissKind::Activity.as_str(), "activity");
     }
 
+    /// Build a registry knowing exactly `workflow` and `activity` by name.
+    fn registry_knowing(workflow: &'static str, activity: &'static str) -> HandlerRegistry {
+        HandlerRegistry::new(
+            vec![WorkflowInfo {
+                declared_activities: None,
+                declared_children: None,
+                mcp: false,
+                name: workflow,
+                module: "test",
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            }],
+            vec![ActivityInfo {
+                name: activity,
+                module: "test",
+                default_retry_policy: None,
+                default_start_to_close: None,
+                default_heartbeat_timeout: None,
+                default_schedule_to_start: None,
+                default_schedule_to_close: None,
+                default_queue: None,
+                max_concurrent: None,
+                concurrency_key: None,
+                is_local: false,
+                max_input_bytes: None,
+                max_result_bytes: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
+                rate_limit_key_expr: None,
+                circuit_breaker: None,
+                requires: None,
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            }],
+        )
+    }
+
+    /// A `ScheduleActivity` command naming `name`, with every optional field
+    /// at its default. Only `name` is load-bearing for the pre-pass.
+    fn schedule_activity_cmd(name: &str) -> WorkflowCommand {
+        let (result_tx, _rx) = tokio::sync::oneshot::channel();
+        WorkflowCommand::ScheduleActivity {
+            activity_id: crate::types::ActivityExecId::new(),
+            name: name.to_string(),
+            input: serde_json::Value::Null,
+            queue: String::new(),
+            retry_policy_override: None,
+            start_to_close_override: None,
+            session_id: None,
+            session_worker_id: None,
+            schedule_to_start_override: None,
+            result_tx,
+        }
+    }
+
+    /// A `StartChildWorkflow` command naming `workflow_name`.
+    fn start_child_cmd(workflow_name: &str) -> WorkflowCommand {
+        let (result_tx, _rx) = tokio::sync::oneshot::channel();
+        WorkflowCommand::StartChildWorkflow {
+            child_id: crate::types::ExecutionId::new(),
+            workflow_name: workflow_name.to_string(),
+            input: serde_json::Value::Null,
+            result_tx,
+        }
+    }
+
+    #[test]
+    fn persist_capability_miss_finds_each_handler_bearing_command() {
+        // Issue #804 (Codex round-6 P2): the three commands whose PERSISTENCE
+        // resolves a handler must all be caught by the pre-pass that runs
+        // *ahead* of the terminal telemetry, mirroring the in-transaction
+        // checks in persist_scheduled_activities /
+        // persist_all_started_child_workflows / create_detached_child_executions.
+        let registry = registry_knowing("known_wf", "known_act");
+
+        assert_eq!(
+            first_persist_capability_miss(&registry, &[schedule_activity_cmd("missing_act")]),
+            Some((
+                CapabilityMissKind::Activity.as_str(),
+                "missing_act".to_string()
+            )),
+        );
+
+        assert_eq!(
+            first_persist_capability_miss(&registry, &[start_child_cmd("missing_wf")]),
+            Some((
+                CapabilityMissKind::Workflow.as_str(),
+                "missing_wf".to_string()
+            )),
+        );
+
+        let unknown_detached = WorkflowCommand::SpawnDetachedChildWorkflow {
+            child_id: crate::types::ExecutionId::new(),
+            workflow_name: "missing_detached".to_string(),
+            input: serde_json::Value::Null,
+            parent_close_policy: crate::types::ParentClosePolicy::Abandon,
+        };
+        assert_eq!(
+            first_persist_capability_miss(&registry, std::slice::from_ref(&unknown_detached)),
+            Some((
+                CapabilityMissKind::Workflow.as_str(),
+                "missing_detached".to_string()
+            )),
+        );
+    }
+
+    #[test]
+    fn persist_capability_miss_is_silent_when_every_handler_is_registered() {
+        let registry = registry_knowing("known_wf", "known_act");
+        let commands = vec![
+            schedule_activity_cmd("known_act"),
+            start_child_cmd("known_wf"),
+            WorkflowCommand::SetCurrentDetails {
+                value: "step 1".to_string(),
+                explicit_clear: false,
+            },
+        ];
+        assert_eq!(first_persist_capability_miss(&registry, &commands), None);
+    }
+
+    #[test]
+    fn persist_capability_miss_ignores_local_activities() {
+        // RunLocalActivity is resolved DURING execution (before any terminal
+        // telemetry), and that site is replay-aware: a local activity whose
+        // result is already recorded replays without ever touching the
+        // registry. Flagging it here would release the task on a worker that
+        // could have replayed the recorded result perfectly well -- a
+        // regression, not a fix. So the pre-pass deliberately skips it.
+        let registry = registry_knowing("known_wf", "known_act");
+        let (result_tx, _rx) = tokio::sync::oneshot::channel();
+        let commands = vec![WorkflowCommand::RunLocalActivity {
+            activity_id: crate::types::ActivityExecId::new(),
+            name: "missing_local".to_string(),
+            input: serde_json::Value::Null,
+            start_to_close: None,
+            retry_policy: None,
+            result_tx,
+            already_scheduled: false,
+            failed_attempts: 0,
+            last_error: None,
+        }];
+        assert_eq!(first_persist_capability_miss(&registry, &commands), None);
+    }
+
+    #[test]
+    fn persist_capability_miss_reports_the_first_miss_in_command_order() {
+        // All-or-nothing dispatch: the batch is rejected on the FIRST miss, so
+        // the reported name is deterministic regardless of how many commands
+        // in the batch are unresolvable.
+        let registry = registry_knowing("known_wf", "known_act");
+        let commands = vec![
+            start_child_cmd("first_missing"),
+            schedule_activity_cmd("second_missing"),
+        ];
+        assert_eq!(
+            first_persist_capability_miss(&registry, &commands),
+            Some((
+                CapabilityMissKind::Workflow.as_str(),
+                "first_missing".to_string()
+            )),
+        );
+    }
+
     #[test]
     fn resolve_capability_miss_releases_then_escalates_at_the_bound() {
-        // Default budget of 5: misses 1..=5 release, the 6th claim escalates.
-        // The returned count is what gets persisted, so it must be the
-        // POST-increment value (the release SQL does `+ 1` in the same UPDATE).
-        for before in 0..5 {
+        // Default budget of 5 against a fleet of DISTINCT incapable workers:
+        // misses 1..=5 release, the 6th distinct worker escalates. The returned
+        // count is what gets persisted, so it must be the POST-increment value
+        // (the release SQL does `+ 1` in the same UPDATE).
+        let fleet: Vec<String> = (0..6).map(|i| format!("worker-{i}")).collect();
+        for before in 0..5_i32 {
+            let seen_count = usize::try_from(before).expect("non-negative");
+            let r =
+                resolve_capability_miss(&fleet[..seen_count], before, &fleet[seen_count], 5, None);
             assert_eq!(
-                resolve_capability_miss(before, 5, None),
+                (r.action, r.total_after),
                 (CapabilityMissAction::Release, before + 1),
-                "miss {} of 5 must release",
+                "miss {} of 5 (by a NEW worker) must release",
                 before + 1
             );
         }
+        let r = resolve_capability_miss(&fleet[..5], 5, &fleet[5], 5, None);
         assert_eq!(
-            resolve_capability_miss(5, 5, None),
+            (r.action, r.total_after),
             (CapabilityMissAction::Escalate, 6),
-            "the 6th claim exhausts the default budget of 5 redeliveries"
+            "a 6th DISTINCT incapable worker exhausts the default budget of 5"
+        );
+    }
+
+    #[test]
+    fn capability_miss_budget_is_not_consumed_twice_by_the_same_worker() {
+        // Issue #804 (Codex round-6 P1): the backoff makes a released task
+        // eligible to EVERY worker again, including the one that just released
+        // it, and the claim query has no capability filter. Under plain
+        // total-miss accounting, six consecutive claim-race wins by ONE
+        // incapable worker terminally failed the run while a capable peer was
+        // live — the exact rolling-deploy outage #804 exists to prevent.
+        //
+        // The budget is therefore consumed per DISTINCT worker: a repeat miss
+        // by a worker already known to be incapable for this task is free.
+        let noisy = "incapable-pod-1".to_string();
+        let seen = vec![noisy.clone()];
+        for total_before in 1..40 {
+            let r = resolve_capability_miss(&seen, total_before, &noisy, 5, None);
+            assert_eq!(
+                r.action,
+                CapabilityMissAction::Release,
+                "repeat miss #{total_before} by the SAME worker must not consume budget"
+            );
+            assert_eq!(
+                r.distinct_after, 1,
+                "the distinct-worker set must not grow on a repeat"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_miss_total_ceiling_bounds_a_single_worker_bounce() {
+        // The distinct budget alone cannot terminate a fleet SMALLER than the
+        // budget (a lone incapable worker never grows the distinct set past 1),
+        // so AC3's "bounded release" needs an absolute ceiling as well. It is a
+        // generous multiple of the budget: reaching it while a capable peer is
+        // live requires that peer to lose the claim race that many times in a
+        // row, which is vanishingly unlikely, while a genuinely capability-less
+        // fleet still terminates rather than bouncing forever.
+        let lone = "only-pod".to_string();
+        let seen = vec![lone.clone()];
+        let ceiling = 5 * CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER;
+
+        let r = resolve_capability_miss(&seen, ceiling - 1, &lone, 5, None);
+        assert_eq!(
+            r.action,
+            CapabilityMissAction::Release,
+            "one below the ceiling still releases"
+        );
+
+        let r = resolve_capability_miss(&seen, ceiling, &lone, 5, None);
+        assert_eq!(
+            r.action,
+            CapabilityMissAction::Escalate,
+            "the total ceiling terminates a lone-incapable-worker bounce"
         );
     }
 
@@ -22242,8 +22676,9 @@ mod tests {
         // `0` is the pre-#804 fail-fast behaviour, NOT an unlimited-release
         // switch — releasing forever would let a genuinely-unregistered type
         // bounce around the fleet indefinitely.
+        let r = resolve_capability_miss(&[], 0, "w1", 0, None);
         assert_eq!(
-            resolve_capability_miss(0, 0, None),
+            (r.action, r.total_after),
             (CapabilityMissAction::Escalate, 1)
         );
     }
@@ -22257,14 +22692,16 @@ mod tests {
         // window before surfacing the real condition.
         let session = Some(uuid::Uuid::new_v4());
         assert!(!capability_miss_releasable(session));
+        let r = resolve_capability_miss(&[], 0, "w1", 5, session);
         assert_eq!(
-            resolve_capability_miss(0, 5, session),
+            (r.action, r.total_after),
             (CapabilityMissAction::Escalate, 1),
             "a session-pinned task must escalate on the FIRST miss"
         );
         // ...and the un-pinned control still releases with the same budget.
+        let r = resolve_capability_miss(&[], 0, "w1", 5, None);
         assert_eq!(
-            resolve_capability_miss(0, 5, None),
+            (r.action, r.total_after),
             (CapabilityMissAction::Release, 1)
         );
     }
@@ -22272,8 +22709,9 @@ mod tests {
     #[test]
     fn resolve_capability_miss_tolerates_a_saturating_persisted_count() {
         // A pathological persisted value must not panic on overflow.
+        let r = resolve_capability_miss(&["w1".to_string()], i32::MAX, "w1", 5, None);
         assert_eq!(
-            resolve_capability_miss(i32::MAX, 5, None),
+            (r.action, r.total_after),
             (CapabilityMissAction::Escalate, i32::MAX)
         );
     }
@@ -22300,12 +22738,12 @@ mod tests {
         // The exact shape flagged in review: a budget at or above the column's
         // maximum cannot bound a saturated counter by comparison alone.
         assert_eq!(
-            capability_miss_decision(i32::MAX, i32::MAX.cast_unsigned()),
+            capability_miss_decision(i32::MAX, i32::MAX, i32::MAX.cast_unsigned()),
             CapabilityMissAction::Escalate,
             "a saturated counter must escalate even when the budget is i32::MAX"
         );
         assert_eq!(
-            capability_miss_decision(i32::MAX, u32::MAX),
+            capability_miss_decision(i32::MAX, i32::MAX, u32::MAX),
             CapabilityMissAction::Escalate,
             "a budget above the column's range is clamped, not wrapped, and still \
              must not authorise an overflowing increment"
@@ -22314,19 +22752,20 @@ mod tests {
         // is where the guard starts: persisting it would make the NEXT `+ 1`
         // unrepresentable.
         assert_eq!(
-            capability_miss_decision(i32::MAX - 1, u32::MAX),
+            capability_miss_decision(i32::MAX - 1, i32::MAX - 1, u32::MAX),
             CapabilityMissAction::Release,
             "the guard must fire only at the ceiling, not one short of it"
         );
         // End to end through the real entry point.
+        let r = resolve_capability_miss(&["w1".to_string()], i32::MAX, "w1", u32::MAX, None);
         assert_eq!(
-            resolve_capability_miss(i32::MAX, u32::MAX, None),
+            (r.action, r.total_after),
             (CapabilityMissAction::Escalate, i32::MAX),
             "the persisted-count path must reach the same verdict"
         );
         // A normal budget is completely unaffected.
         assert_eq!(
-            capability_miss_decision(3, 5),
+            capability_miss_decision(3, 3, 5),
             CapabilityMissAction::Release,
             "the ceiling guard must not perturb ordinary budgets"
         );
@@ -23199,6 +23638,7 @@ mod tests {
             wake_requested: false,
             session_id: None,
             capability_misses: 0,
+            capability_miss_workers: Vec::new(),
         }
     }
 

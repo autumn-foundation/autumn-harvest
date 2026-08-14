@@ -1512,6 +1512,10 @@ struct PendingRequeueChangeset {
     /// ran it). Keeps the counter measuring *consecutive* capability misses,
     /// the same semantics `crash_strikes` above has.
     capability_misses: i32,
+    /// Issue #804 (round 6): cleared alongside `capability_misses` so the
+    /// distinct-worker set and the total counter can never disagree about
+    /// whether the streak was broken.
+    capability_miss_workers: Vec<String>,
     scheduled_at: chrono::DateTime<Utc>,
     error: Option<String>,
 }
@@ -1525,6 +1529,7 @@ impl PendingRequeueChangeset {
             last_heartbeat_at: None,
             crash_strikes: 0,
             capability_misses: 0,
+            capability_miss_workers: Vec::new(),
             scheduled_at: next_run,
             error: Some(previous_error),
         }
@@ -1936,6 +1941,10 @@ struct CleanContinuationChangeset {
     last_heartbeat_at: Option<chrono::DateTime<Utc>>,
     crash_strikes: i32,
     capability_misses: i32,
+    /// Issue #804 (round 6): cleared alongside `capability_misses` so the
+    /// distinct-worker set and the total counter can never disagree about
+    /// whether the streak was broken.
+    capability_miss_workers: Vec<String>,
     scheduled_at: chrono::DateTime<Utc>,
 }
 
@@ -1948,6 +1957,7 @@ impl CleanContinuationChangeset {
             last_heartbeat_at: None,
             crash_strikes: 0,
             capability_misses: 0,
+            capability_miss_workers: Vec::new(),
             scheduled_at,
         }
     }
@@ -2080,6 +2090,10 @@ pub const fn release_task_for_capability_miss_query() -> &'static str {
          attempt = GREATEST(attempt - 1, 0), \
          crash_strikes = 0, \
          capability_misses = capability_misses + 1, \
+         capability_miss_workers = CASE \
+             WHEN $2 = ANY(capability_miss_workers) THEN capability_miss_workers \
+             ELSE array_append(capability_miss_workers, $2) \
+         END, \
          scheduled_at = NOW() + make_interval(secs => $3), \
          sticky_worker_id = NULL, \
          sticky_until = NULL, \
@@ -2139,7 +2153,12 @@ pub const fn release_task_for_capability_miss_query() -> &'static str {
 #[must_use]
 pub const fn restore_capability_misses_query() -> &'static str {
     "UPDATE harvest_task_queue \
-     SET capability_misses = GREATEST(capability_misses, $2) \
+     SET capability_misses = GREATEST(capability_misses, $2), \
+         capability_miss_workers = CASE \
+             WHEN cardinality(capability_miss_workers) >= cardinality($3::TEXT[]) \
+                 THEN capability_miss_workers \
+             ELSE $3::TEXT[] \
+         END \
      WHERE id = $1"
 }
 
@@ -2159,6 +2178,13 @@ pub const fn restore_capability_misses_query() -> &'static str {
 /// higher count wins and is never clobbered back down. In the ordinary case
 /// nothing touched the row and the pre-park value is restored exactly.
 ///
+/// The distinct-worker set (issue #804 round 6) is restored under the same
+/// monotone rule, expressed on cardinality: a peer that recorded a miss in the
+/// gap produced a set at least as large as the pre-park one, and clobbering it
+/// back would hand that peer's budget unit back. Comparing cardinality rather
+/// than membership keeps the statement a single UPDATE; the two sets can only
+/// differ by appends in this window, so the larger one is the newer one.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
@@ -2166,14 +2192,16 @@ pub async fn restore_capability_misses(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     misses: i32,
+    workers: &[String],
 ) -> HarvestResult<()> {
     // Nothing to restore, and `GREATEST(x, 0)` is a no-op anyway.
-    if misses <= 0 {
+    if misses <= 0 && workers.is_empty() {
         return Ok(());
     }
     diesel::sql_query(restore_capability_misses_query())
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Integer, _>(misses)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(workers.to_vec())
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -2398,6 +2426,7 @@ const fn park_workflow_task_sticky_query() -> &'static str {
              sticky_until = NOW() + $3, \
              sticky_timeout = $3, \
              capability_misses = 0, \
+             capability_miss_workers = '{}', \
              wake_requested = FALSE \
          FROM candidate \
          WHERE t.id = candidate.id \
@@ -2421,6 +2450,7 @@ const fn park_workflow_task_query() -> &'static str {
              sticky_until = NULL, \
              sticky_timeout = NULL, \
              capability_misses = 0, \
+             capability_miss_workers = '{}', \
              wake_requested = FALSE \
          FROM candidate \
          WHERE t.id = candidate.id \
@@ -3668,6 +3698,12 @@ mod tests {
                 sql.contains("capability_misses = 0"),
                 "parking must reset the capability-miss budget: {sql}"
             );
+            assert!(
+                sql.contains("capability_miss_workers = '{}'"),
+                "parking must clear the DISTINCT-worker set as well, or a task \
+                 a capable worker handled would keep every prior misser and \
+                 escalate early on the next deploy: {sql}"
+            );
         }
     }
 
@@ -3722,6 +3758,33 @@ mod tests {
         );
     }
 
+    /// The distinct-worker set must grow **idempotently** (issue #804 round 6).
+    ///
+    /// The budget is consumed per distinct worker precisely so that one
+    /// incapable worker cannot exhaust it by repeatedly winning the claim race
+    /// on its own released row. A blind `array_append` would defeat that: the
+    /// same worker would add an entry per bounce and the set would grow past
+    /// the budget just as fast as the plain counter did.
+    #[test]
+    fn capability_miss_release_query_appends_the_worker_only_once() {
+        let sql = release_task_for_capability_miss_query();
+        assert!(
+            sql.contains("$2 = ANY(capability_miss_workers)"),
+            "a repeat miss by the same worker must be recognised, not appended \
+             again: {sql}"
+        );
+        assert!(
+            sql.contains("array_append(capability_miss_workers, $2)"),
+            "a NEW worker must be recorded so it consumes one budget unit: {sql}"
+        );
+        // $2 is the claiming worker id, already bound for the ownership guard.
+        assert!(
+            sql.contains("AND worker_id = $2"),
+            "the appended id must be the SAME id the ownership guard checks, \
+             or the set would record a worker that never held the claim: {sql}"
+        );
+    }
+
     /// The release must leave the task row's `error` column **untouched**.
     ///
     /// `error` is the failure-reporting channel for a task that genuinely ran
@@ -3759,6 +3822,12 @@ mod tests {
         assert!(
             !sql.contains("capability_misses = $2"),
             "a bare assignment would clobber a fresher peer increment: {sql}"
+        );
+        assert!(
+            sql.contains("cardinality(capability_miss_workers) >= cardinality($3::TEXT[])"),
+            "the distinct-worker set must be restored under the same monotone \
+             rule as the counter, or a peer's increment in the gap is handed \
+             its budget unit back: {sql}"
         );
         assert!(sql.contains("WHERE id = $1"), "{sql}");
     }
