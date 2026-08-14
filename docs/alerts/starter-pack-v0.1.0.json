@@ -1029,15 +1029,11 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "outcome is bounded to exactly released|escalated, and task_type to workflow|activity, so both are safe to group by. Alert on escalated; released is a companion capacity/deploy-skew signal, not a page on its own.",
+        "notes": "outcome is bounded to exactly released|escalated, and task_type to workflow|activity, so both are safe to group by. This PAGING rule carries ONLY the escalated expression. A `released` sample is the benign, self-healing signature of capability skew during a rolling deploy and must never page; the sustained-release signal is the separate ticket-severity rule harvest_capability_miss_release_sustained.",
         "expressions": [
           {
             "kind": "promql",
             "expr": "sum by (queue, task_type) (increase(harvest_task_capability_miss_total{outcome=\"escalated\"}[5m])) > 0"
-          },
-          {
-            "kind": "promql",
-            "expr": "sum by (queue, task_type) (increase(harvest_task_capability_miss_total{outcome=\"released\"}[15m])) > 0"
           }
         ]
       },
@@ -1048,6 +1044,49 @@
         "GET /api/harvest/dead-letters?queue={queue} (escalated runs are FAILED with a no_capable_worker: reason on the execution row; they are NOT dead-lettered)"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_no_capable_worker"
+    },
+    {
+      "id": "harvest_capability_miss_release_sustained",
+      "status": "enforceable",
+      "signal_source": "ADR-0001/#138 counter harvest.task.capability_miss{queue, task_type, outcome} (issue #804).",
+      "default_threshold": "released rate continuously non-zero for 15m",
+      "severity": "ticket",
+      "owner_persona": "release on-call",
+      "description": "Tasks are being repeatedly released for a capability miss (issue #804) and have been for a sustained window. A brief burst of released samples is the EXPECTED, self-healing signature of a rolling deploy that introduces a new workflow or activity type: the claim is handed back for a capable peer and no execution is failed. Sustained releases mean the skew is not resolving \u2014 a rollout stalled or was rolled back halfway, a heterogeneous pool permanently lacks the handler on some pods, or the capable pod set is too small. Nothing is failing yet (that is harvest_no_capable_worker, which pages), but every released task is paying a backoff interval of added latency, and the redelivery budget is being consumed. Ticket, not a page.",
+      "first_action": "Compare build_id / deployment_name across GET /api/harvest/workers for the affected queue: the pods that lack the handler are the ones to finish rolling or roll back.",
+      "dependencies": [
+        {
+          "ref": "#804",
+          "status": "shipped",
+          "surface": "METRIC_TASK_CAPABILITY_MISS / harvest.task.capability_miss{queue, task_type, outcome}"
+        },
+        {
+          "ref": "#520",
+          "status": "shipped",
+          "surface": "GET /admin/workflow-types/reachability (which workflow types have live executions but no registered handler)"
+        },
+        {
+          "ref": "#774",
+          "status": "shipped",
+          "surface": "GET /admin/queue-coverage (which queues have no live worker at all)"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "SUSTAINED, not any-single-event. The pack schema carries no `for:` field, so the hold lives in the expression: the subquery asserts the released rate was non-zero at EVERY 1m step across the 15m window. An `increase(...[15m]) > 0` form would instead fire on a single release anywhere in the window \u2014 i.e. on every routine deploy \u2014 which is exactly what this rule must not do.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "min_over_time((sum by (queue, task_type) (rate(harvest_task_capability_miss_total{outcome=\"released\"}[5m])) > bool 0)[15m:1m]) == 1"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/workers (compare build_id / deployment_name for the affected queue)",
+        "GET /api/harvest/admin/workflow-types/reachability (issue #520 \u2014 a verdict of orphaned means no worker anywhere registers the type)",
+        "GET /api/harvest/admin/queue-coverage (issue #774 \u2014 confirm the queue has any live worker at all)"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_capability_miss_release_sustained"
     }
   ]
 }

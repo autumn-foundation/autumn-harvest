@@ -2035,9 +2035,9 @@ land on a new pod. Nothing is lost, and the counter reports
 The page is `outcome="escalated"`. Each release increments a per-task
 `capability_misses` counter with capped exponential backoff; once it reaches
 `WorkerConfig::capability_miss_max_redeliveries` (default **5**) the task falls
-through to the normal terminal-failure / dead-letter path with a stable,
-greppable `no_capable_worker:` reason. Escalation means **no live worker on that
-queue registers the handler at all** — executions are being failed.
+through to the normal terminal-failure path with a stable, greppable
+`no_capable_worker:` reason. Escalation means **no live worker on that queue
+registers the handler at all** — executions are being failed.
 
 **Worker-fleet contract.** All workers polling a given queue should register the
 same handler set. Harvest no longer punishes a *transient* mismatch (it is
@@ -2049,7 +2049,7 @@ route work.
 | Signal | Meaning | Action |
 | --- | --- | --- |
 | `outcome="released"`, brief burst during a deploy | Capability skew mid-rollout | None — self-heals as the rollout completes |
-| `outcome="released"`, sustained > ~15m | Rollout stalled, or a pod set permanently lacks the handler | Finish/roll back the deploy; check `GET /workers` |
+| `outcome="released"`, sustained > ~15m | Rollout stalled, or a pod set permanently lacks the handler | Ticket — see [`harvest_capability_miss_release_sustained`](#harvest_capability_miss_release_sustained) |
 | `outcome="escalated"`, any | No capable worker exists; executions failing | Page — see *Triage steps* |
 
 Distinct from two adjacent signals, deliberately:
@@ -2103,9 +2103,10 @@ Distinct from two adjacent signals, deliberately:
 ### False positives
 
 - **A brief `released` burst during any deploy that adds a type is expected and
-  benign.** Do not page on `released`; it is a capacity/skew *companion* signal.
-  The `> 0 for 15m` expression in the pack exists to catch a rollout that never
-  finished, not a rollout in progress.
+  benign.** This paging rule therefore selects `outcome="escalated"` only. The
+  sustained-release signal is a separate, ticket-severity rule
+  ([`harvest_capability_miss_release_sustained`](#harvest_capability_miss_release_sustained))
+  that exists to catch a rollout which never finished, not one in progress.
 - A single-worker development fleet restarting mid-task will show one or two
   `released` samples as the task is re-claimed. Harmless.
 - Escalation is **probabilistic, not exhaustive**: because releases have no
@@ -2151,3 +2152,100 @@ worker appears. Escalate to the team owning the deploy if
 supposed to be live — that indicates a handler was removed while in-flight work
 still needed it, and the executions cannot make progress until the handler is
 redeployed.
+
+## harvest_capability_miss_release_sustained
+
+**What to do when capability-miss releases will not settle.** This is the
+ticket-severity sibling of [`harvest_no_capable_worker`](#harvest_no_capable_worker).
+Read that section first for the mechanism — this one covers only the
+`outcome="released"` half.
+
+A *release* is the benign outcome: a worker claimed a task whose workflow or
+activity type it has no handler for, and handed the claim straight back to
+`PENDING` for a capable peer (issue #804). No execution is failed, no event is
+appended, nothing is lost. A short burst of releases is the **expected**
+signature of a rolling deploy that introduces a new type.
+
+This rule fires only when releases are **sustained**: the released rate was
+non-zero at every step across a 15-minute window. That means the skew is not
+resolving on its own. Nothing has failed yet — but each released task pays a
+backoff interval of added latency (1 s, 2 s, 4 s, 8 s, 16 s at the default
+budget), and its per-task redelivery budget is being spent. Left alone, this
+becomes `harvest_no_capable_worker`, which pages.
+
+Ticket, not a page: work is still making progress and the fix is a deploy
+action, not an incident action.
+
+### Triage steps
+
+1. Compare builds actually polling the queue: `GET /api/harvest/workers`. Group
+   by `build_id` / `deployment_name`. The pods that lack the handler are the
+   ones to finish rolling forward or roll back.
+2. Confirm the handler exists *somewhere*:
+   `GET /api/harvest/admin/workflow-types/reachability` (issue #520). A verdict
+   of `in_use` means at least one live worker registers it, so this is genuinely
+   partial skew and not a removed handler. A verdict of `orphaned` means no
+   worker registers it at all — treat that as
+   [`harvest_no_capable_worker`](#harvest_no_capable_worker) and expect
+   escalation shortly.
+3. Confirm the queue is covered at all:
+   `GET /api/harvest/admin/queue-coverage` (issue #774). An uncovered queue is a
+   different (and simpler) failure — see `harvest_queue_uncovered`.
+4. Check the escalation counter is still flat:
+   `sum by (queue, task_type) (increase(harvest_task_capability_miss_total{outcome="escalated"}[5m]))`.
+   Any non-zero value means budgets are now being exhausted and this has already
+   graduated to a page.
+
+### Likely causes
+
+- A rolling deploy that introduces a new workflow or activity type is **stalled
+  mid-rollout** — paused, blocked on a failing readiness probe, or waiting on a
+  manual promotion gate.
+- A deploy was **rolled back halfway**, leaving a mixed fleet where the capable
+  pods were removed but the tasks they created remain.
+- A **heterogeneous worker pool** shares one queue but registers different
+  handler subsets. This is a standing misconfiguration, not a transient one:
+  give each handler subset its own queue instead of relying on redelivery to
+  route work.
+- The **capable pod set is too small** relative to the incapable one, so a
+  released task usually lands on another incapable worker. Releases stay
+  non-zero even though the fleet is technically capable.
+
+### False positives
+
+- **A deploy that legitimately takes longer than 15 minutes** — a large fleet, a
+  slow canary soak, or a deliberately staged rollout — will hold this rule true
+  for the duration and clear on its own. Correlate against the rollout's own
+  progress before acting.
+- A **queue that is intentionally heterogeneous** and whose owners have accepted
+  the latency cost will keep this rule permanently true. That is a real standing
+  cost, not a false alarm — split the queue or silence the rule for it
+  deliberately.
+- This rule says nothing about failure. If it is firing and
+  `harvest_no_capable_worker` is not, **no execution has been failed**.
+
+### Safe actions
+
+- **Complete or roll back the deploy.** This is the fix in the overwhelming
+  majority of cases; the rule clears once every pod polling the queue registers
+  the handler.
+- **Scale up the capable pod set** so a released task is more likely to land on
+  it before its budget runs out.
+- **Split the queue** if the pool is intentionally heterogeneous: give each
+  handler subset its own queue. This removes the class of problem rather than
+  tuning around it.
+- **Raise the budget** (`WorkerConfig::with_capability_miss_max_redeliveries`) if
+  your rollouts legitimately outlast the default dwell window. This buys time
+  before escalation; it does not reduce the release rate this rule measures.
+- Do **not** silence this by removing the released outcome from the metric — it
+  is the only signal that distinguishes "deploying" from "broken" before
+  executions start failing.
+
+### Escalation criteria
+
+Escalate to a page if `harvest_no_capable_worker` starts firing for the same
+`queue` / `task_type`: budgets are now being exhausted and executions are being
+terminally failed. Escalate to the team owning the deploy if
+`GET /admin/workflow-types/reachability` reports `orphaned` for a type that is
+supposed to be live — a handler was removed while in-flight work still needed
+it, and those executions cannot make progress until it is redeployed.

@@ -26,6 +26,7 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_workflow_history_bloat",
     "harvest_scanner_stalled",
     "harvest_no_capable_worker",
+    "harvest_capability_miss_release_sustained",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -430,6 +431,89 @@ fn scanner_stalled_retention_expression_cannot_fire_during_the_startup_hour() {
         notes.contains("RESTART SEMANTICS"),
         "the notes must record why the startup gate needs no resets()/uptime term, so the \
          reset-aware increase() argument is not re-derived on every review"
+    );
+}
+
+/// Issue #804, Codex review: the capability-miss counter is deliberately
+/// two-outcome. `outcome="escalated"` means a task exhausted its redelivery
+/// budget and an execution was FAILED — that is the page. `outcome="released"`
+/// means a worker handed a claim back for a capable peer and NOTHING failed;
+/// it is the expected, self-healing signature of the transient window in a
+/// rolling deploy that introduces a new workflow or activity type.
+///
+/// Every rule in this pack carries a single `severity`, so every expression on
+/// a rule fires at that severity. Putting a `released` expression on the
+/// `page`-severity rule therefore pages on exactly the benign outcome the
+/// rule's own notes call "not a page" — one incapable pod releasing one task
+/// during a routine deploy is enough. Worse, an `increase(...[15m]) > 0` form
+/// tests whether ANY release happened in the window, not whether releases
+/// stayed sustained, so it cannot express "the skew is not resolving" either.
+///
+/// The sustained-release signal lives on its own ticket-severity rule with the
+/// hold in the expression (the pack schema has no `for:` field). Pin both
+/// halves textually — a future "fold these two back together" pass must not
+/// reintroduce a rule that pages on every deploy.
+#[test]
+fn capability_miss_released_outcome_never_pages() {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+
+    let rule_exprs = |id: &str| -> Vec<String> {
+        let rule = rules
+            .iter()
+            .find(|rule| rule["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("{id} alert must exist"));
+        assert_eq!(
+            rule["severity"].as_str(),
+            Some(if id == "harvest_no_capable_worker" {
+                "page"
+            } else {
+                "ticket"
+            }),
+            "{id} severity is load-bearing for this pin"
+        );
+        rule["prometheus"]["expressions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{id} must carry PromQL expressions"))
+            .iter()
+            .filter_map(|expr| expr["expr"].as_str())
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+
+    // Half 1: the PAGING rule must carry no `released` expression at all.
+    let paging = rule_exprs("harvest_no_capable_worker");
+    assert!(
+        paging.iter().all(|expr| !expr.contains("released")),
+        "the page-severity capability-miss rule must not select outcome=\"released\" -- a single \
+         release during a rolling deploy would page on the benign, self-healing outcome: {paging:?}"
+    );
+    assert!(
+        paging
+            .iter()
+            .any(|expr| expr.contains("outcome=\"escalated\"")),
+        "the page-severity capability-miss rule must still page on escalation: {paging:?}"
+    );
+
+    // Half 2: the sustained-release rule must hold, not fire on a single sample.
+    let sustained = rule_exprs("harvest_capability_miss_release_sustained");
+    let expr = sustained
+        .first()
+        .expect("the sustained-release rule must carry an expression");
+    assert!(
+        expr.contains("outcome=\"released\""),
+        "the sustained-release rule must select the released outcome: {expr}"
+    );
+    assert!(
+        expr.contains("min_over_time(") && expr.contains("[15m:"),
+        "the hold must live in the expression (the pack schema has no `for:` field): a subquery \
+         asserting the rate was non-zero at EVERY step is what distinguishes `still skewed` from \
+         `one release happened`: {expr}"
+    );
+    assert!(
+        !expr.contains("increase("),
+        "an increase(...[15m]) > 0 form fires on a single release anywhere in the window -- i.e. \
+         on every routine deploy -- which is exactly what this rule exists not to do: {expr}"
     );
 }
 

@@ -18577,6 +18577,13 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
         // rather than waiting for the expired lease of the hung worker.
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<chrono::Utc>>),
+        // Reaching this path PROVES the claiming worker was capable: the
+        // handler was found and invoked, and ran long enough to exceed
+        // `workflow_task_timeout` (issue #494). `capability_misses` counts
+        // CONSECUTIVE misses, so an intervening capable dispatch must reset it
+        // or a later incapable claim inherits the stale streak and escalates
+        // the workflow early (issue #804).
+        dsl::capability_misses.eq(0),
     ))
     .execute(&mut conn)
     .await

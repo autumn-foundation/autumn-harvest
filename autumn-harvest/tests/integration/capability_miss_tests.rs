@@ -1228,6 +1228,70 @@ async fn a_capable_worker_that_parks_resets_the_capability_miss_budget() {
     assert_eq!(load_execution(&url, exec_id).await.state, "RUNNING");
 }
 
+/// The **workflow-task-timeout** re-pend (#494) must reset the budget too.
+///
+/// Reaching `reset_timed_out_workflow_task` proves capability just as firmly as
+/// a park does — more so, in fact: the handler was resolved, invoked, and ran
+/// long enough to blow `workflow_task_timeout`. A worker that cannot find the
+/// handler releases in microseconds and never reaches this path.
+///
+/// Without the reset, a workflow that absorbs some misses during a deploy and
+/// then has one slow decision cycle inherits the stale streak, and a single
+/// later incapable claim can push it straight over the bound — escalating a run
+/// whose handler is demonstrably live and merely slow. That is the same
+/// cumulative-counter failure the park reset exists to prevent, reached by a
+/// different door.
+///
+/// Driven against the real `pub` entry point, so the assertion cannot drift
+/// from the statement the way a SQL-shape test could.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timed_out_workflow_task_reset_clears_the_capability_miss_budget() {
+    let (url, _container) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+
+    let exec_id = seed_workflow(&mut conn, "timeout_reset_wf", serde_json::json!({}), Q_NOOP).await;
+    let task_id = load_tasks(&url, exec_id).await[0].id;
+
+    // The exact state the #494 timeout handler acts on: claimed by *this*
+    // worker, with misses already absorbed during an earlier deploy window.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+            SET state = 'RUNNING', worker_id = 'slow-but-capable', started_at = NOW(), \
+                capability_misses = 4 \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("seed a claimed, previously-missed task");
+    assert_eq!(load_task(&url, task_id).await.capability_misses, 4);
+
+    autumn_harvest::worker::reset_timed_out_workflow_task(&pool, task_id, "slow-but-capable").await;
+
+    let task = load_task(&url, task_id).await;
+    assert_eq!(
+        task.state, "PENDING",
+        "the timed-out task must be re-pended for any worker to re-claim"
+    );
+    assert_eq!(
+        task.capability_misses, 0,
+        "the handler was found and invoked, so the CONSECUTIVE-miss streak must \
+         restart clean; inheriting it would let one later incapable claim escalate \
+         a run whose handler is live"
+    );
+    assert!(
+        task.worker_id.is_none(),
+        "ownership must be released so any worker can re-claim: {:?}",
+        task.worker_id
+    );
+    assert_eq!(
+        load_execution(&url, exec_id).await.state,
+        "RUNNING",
+        "a timeout re-pend must not terminate the execution"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Release is idempotent against a stolen claim.
 // ---------------------------------------------------------------------------
