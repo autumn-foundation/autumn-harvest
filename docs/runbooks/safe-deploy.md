@@ -287,15 +287,26 @@ the new build is enqueued by a new pod and can be claimed by an old one.
 
 **What happens now.** A worker that claims a task whose handler it does not
 register **releases the claim** back to `PENDING` for a capable peer, with
-capped-exponential backoff (1s, 2s, 4s, 8s, 16s, then 30s). Nothing is
-appended to the execution's history and the execution stays `RUNNING` — the
-old pod is healthy, it simply is not the right pod for this task.
+capped-exponential backoff (1s, 2s, 4s, 8s, 16s, then a 30s cap — the default
+budget of 5 reaches 16s). The release itself touches only `harvest_task_queue`
+and the execution stays `RUNNING` — the old pod is healthy, it simply is not
+the right pod for this task.
+
+> A workflow task woken by a **due timer or a pending signal** has already
+> durably ingested that `TimerFired`/`SignalReceived` before the handler lookup
+> runs, so a release is not always a literal no-op on `harvest_events`. Those
+> are genuine wake facts any worker would have appended, and a capable peer
+> replays them normally: no new event variant is introduced, the event JSON
+> contract is unchanged, and replay determinism is unaffected (AC7).
 
 **The release is bounded.** Each release increments a per-task
-`capability_misses` counter. Once it reaches
-`WorkerConfig::capability_miss_max_redeliveries` (default **5**) the task
-**escalates** through the ordinary terminal-failure path with a greppable
-reason:
+`capability_misses` counter — reset to `0` by every path that proves the
+claiming worker *was* capable (an activity requeue, a clean continuation, and
+the workflow park), so it measures *consecutive* misses. Once a claim would
+exceed `WorkerConfig::capability_miss_max_redeliveries` (default **5**) the task
+**escalates** through the ordinary terminal-failure path — a `WorkflowFailed`
+event and a `FAILED` execution row, **not** a dead-letter entry — with a
+greppable reason:
 
 ```
 no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 5 capability-miss redeliveries; no live worker on this queue has the handler)
@@ -325,13 +336,20 @@ for the full triage.
 ### Sizing the budget
 
 `capability_miss_max_redeliveries` (default 5) is a *redelivery* budget, not a
-time budget, but the backoff makes it dwell. A budget of `N` permits `N - 1`
-releases and escalates on the `N`th claim, so the default allows four releases
-whose backoffs sum to **15 s** (1 + 2 + 4 + 8) of queue dwell before escalation
-— that is the *minimum* window a capable peer has to appear, measured **on a
-single worker**. In a fleet, releases are consumed by whichever worker claims
-next, so a wide fleet of incapable workers burns the budget in fewer seconds of
-wall clock. Raise it if your rollouts are slow or your fleet is wide:
+time budget, but the backoff makes it dwell. A budget of `N` grants exactly `N`
+releases and escalates on the `N + 1`th claim, so the default allows five
+releases whose backoffs sum to **31 s** (1 + 2 + 4 + 8 + 16) of queue dwell
+before escalation — that is the *minimum* window a capable peer has to appear,
+measured **on a single worker**. In a fleet, releases are consumed by whichever
+worker claims next, so a wide fleet of incapable workers burns the budget in
+fewer seconds of wall clock.
+
+Escalation is also **probabilistic, not exhaustive**: a release carries no
+affinity, so in an `M`-incapable / `1`-capable fleet a task can in principle
+exhaust its budget without the capable worker ever winning a claim. Raise the
+budget if your rollouts are slow, your fleet is wide, or you replace the first
+pod of a large fleet (the widest skew ratio, and exactly when a newly-added
+workflow type is first enqueued):
 
 ```rust
 WorkerConfig::default().with_capability_miss_max_redeliveries(20)
@@ -345,7 +363,8 @@ pre-#804 fail-fast behaviour.
 - **Not a poison pill (#367).** A capability miss is a clean "wrong pod", not a
   crash. It never increments `crash_strikes`, never consumes the task's retry
   budget (`attempt` is restored on release), and never produces a `PoisonPill`
-  dead-letter row. `harvest_task_quarantined` and `harvest_no_capable_worker`
+  dead-letter row — escalation writes no dead-letter row at all. The `harvest.task.quarantined` metric and the
+  `harvest_no_capable_worker` alert
   are therefore mutually exclusive diagnoses.
 - **Not a hung body (#494).** The workflow-task timeout strike counter is
   untouched — a released task never ran a handler at all.

@@ -2039,13 +2039,28 @@ pub async fn defer_rate_limited_task(
 /// SQL for [`release_task_for_capability_miss`], exposed for no-DB shape tests
 /// (issue #804).
 ///
-/// `$1` = task id, `$2` = the releasing worker's id, `$3` = the new
-/// `scheduled_at` (backoff), `$4` = the diagnostic recorded in `error`.
+/// `$1` = task id, `$2` = the releasing worker's id, `$3` = the backoff in
+/// seconds, `$4` = the diagnostic recorded in `error` when the row has none.
 ///
 /// One statement, guarded on `state = 'RUNNING' AND worker_id = $2` so it can
 /// only ever undo *this* worker's own claim — a concurrent poison-pill reclaim
 /// that already took the row simply matches 0 rows here (mirrors
 /// [`crate::queue_pause::release_claim`]).
+///
+/// Two details that are load-bearing rather than incidental:
+///
+/// - **The backoff is computed from the DB clock** (`NOW() + make_interval`),
+///   not the host clock. `claim_task` compares `scheduled_at` against Postgres
+///   `NOW()`, and this module already tolerates up to
+///   [`IMMEDIATE_SCHEDULE_SKEW_SECS`] of host/DB skew — which would swallow the
+///   first three backoffs whole. Unlike an ordinary retry (where firing early
+///   is harmless), the backoff is the only thing spacing redeliveries out
+///   across a rolling deploy, so it must not be defeatable by clock skew.
+/// - **`error` is preserved when already set** (`COALESCE(error, $4)`).
+///   `ActivityContext::previous_failure()` reads this column, so clobbering it
+///   would hand the next attempt an infrastructure string instead of the real
+///   downstream failure it is meant to branch on. A first-claim miss on a row
+///   with no prior failure still records the diagnostic for triage.
 #[must_use]
 pub const fn release_task_for_capability_miss_query() -> &'static str {
     "UPDATE harvest_task_queue \
@@ -2056,8 +2071,8 @@ pub const fn release_task_for_capability_miss_query() -> &'static str {
          attempt = GREATEST(attempt - 1, 0), \
          crash_strikes = 0, \
          capability_misses = capability_misses + 1, \
-         scheduled_at = $3, \
-         error = $4, \
+         scheduled_at = NOW() + make_interval(secs => $3), \
+         error = COALESCE(error, $4), \
          sticky_worker_id = NULL, \
          sticky_until = NULL, \
          sticky_timeout = NULL, \
@@ -2115,13 +2130,15 @@ pub async fn release_task_for_capability_miss(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     worker_id: &str,
-    scheduled_at: DateTime<Utc>,
+    backoff: StdDuration,
     reason: &str,
 ) -> HarvestResult<bool> {
+    // Bounded by `capability_miss_backoff`'s 30s cap; the clamp is defensive.
+    let backoff_secs = f64::min(backoff.as_secs_f64(), 3600.0);
     let released = diesel::sql_query(release_task_for_capability_miss_query())
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
-        .bind::<diesel::sql_types::Timestamptz, _>(scheduled_at)
+        .bind::<diesel::sql_types::Double, _>(backoff_secs)
         .bind::<diesel::sql_types::Text, _>(reason)
         .execute(conn)
         .await
@@ -2294,6 +2311,18 @@ pub async fn park_workflow_task(
 /// SQL for [`park_workflow_task`] when a sticky hint is supplied. Extracted as
 /// a `const fn` so its shape (the `candidate`/`updated` CTE split that captures
 /// `wake_requested` before clearing it) is unit-testable without a database.
+///
+/// Parking resets `capability_misses` (issue #804). A workflow task row is
+/// long-lived — it is reused for the entire execution — and parking is the
+/// dominant suspension path (activity, signal, child workflow, mutex; only a
+/// timer suspension goes through [`reschedule_task`]). It is reached only
+/// AFTER the handler lookup in `process_workflow_task` succeeded, so a park is
+/// proof that a capable worker handled this row and the consecutive-miss
+/// budget must start clean. Without this the counter would be cumulative over
+/// the execution's whole life, so a long-lived entity workflow would escalate
+/// during a later, unrelated deploy while a capable worker is demonstrably
+/// live. `primary_repend_workflow_task_query` needs no equivalent reset: the
+/// parked state it matches is produced only here.
 const fn park_workflow_task_sticky_query() -> &'static str {
     "WITH candidate AS ( \
          SELECT id, wake_requested FROM harvest_task_queue \
@@ -2307,6 +2336,7 @@ const fn park_workflow_task_sticky_query() -> &'static str {
              sticky_worker_id = $2, \
              sticky_until = NOW() + $3, \
              sticky_timeout = $3, \
+             capability_misses = 0, \
              wake_requested = FALSE \
          FROM candidate \
          WHERE t.id = candidate.id \
@@ -2329,6 +2359,7 @@ const fn park_workflow_task_query() -> &'static str {
              sticky_worker_id = NULL, \
              sticky_until = NULL, \
              sticky_timeout = NULL, \
+             capability_misses = 0, \
              wake_requested = FALSE \
          FROM candidate \
          WHERE t.id = candidate.id \
@@ -3555,6 +3586,31 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn park_queries_reset_the_capability_miss_counter() {
+        // `capability_misses` counts CONSECUTIVE misses: a task a capable
+        // worker has actually processed must start its next deploy with a full
+        // budget. Parking is the dominant success path for a workflow task
+        // (claim -> run a decision cycle -> suspend on an activity/timer/
+        // signal), and it is only ever reached AFTER the handler lookup in
+        // `process_workflow_task` succeeded — so a park is proof a capable
+        // worker handled this row.
+        //
+        // Without this, a long-lived execution that absorbed k misses during
+        // one deploy carries them forever and escalates after only `budget - k`
+        // misses during the next — failing a healthy run during a routine
+        // deploy, which is the exact outcome issue #804 exists to prevent.
+        for sql in [
+            park_workflow_task_query(),
+            park_workflow_task_sticky_query(),
+        ] {
+            assert!(
+                sql.contains("capability_misses = 0"),
+                "parking must reset the capability-miss budget: {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn capability_miss_release_query_is_ownership_guarded() {
         let sql = release_task_for_capability_miss_query();
         assert!(
@@ -3703,14 +3759,24 @@ mod tests {
 
         let changeset =
             PendingRequeueChangeset::new(chrono::Utc::now(), "some retryable error".to_string());
+
+        // The VALUE is the whole point: a non-zero reset would silently make the
+        // counter cumulative and escalate healthy runs on a later deploy. A
+        // column-presence assertion alone survives a `0 -> 7` mutation.
+        assert_eq!(
+            changeset.capability_misses, 0,
+            "the shared pending-requeue changeset must reset capability_misses to 0 \
+             (a capable worker ran the handler)"
+        );
+        assert_eq!(changeset.crash_strikes, 0);
+
         let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
             .set(&changeset);
         let debug = debug_query::<Pg, _>(&query).to_string();
 
         assert!(
             debug.contains("\"capability_misses\" = "),
-            "the shared pending-requeue changeset must reset capability_misses \
-             (a capable worker ran the handler): {debug}"
+            "the reset must reach the generated SQL, not just the struct: {debug}"
         );
     }
 
@@ -3731,6 +3797,19 @@ mod tests {
         use diesel::pg::Pg;
 
         let changeset = CleanContinuationChangeset::new(chrono::Utc::now());
+
+        // Assert the VALUES, not just that the columns appear: a `0 -> n`
+        // mutation is invisible to a column-presence check but silently makes
+        // both counters cumulative rather than consecutive.
+        assert_eq!(
+            changeset.capability_misses, 0,
+            "capability-miss streak must reset to 0 on a clean continuation (issue #804)"
+        );
+        assert_eq!(
+            changeset.crash_strikes, 0,
+            "poison-pill streak must reset to 0 on a clean continuation (issue #367)"
+        );
+
         let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
             .set(&changeset);
         let debug = debug_query::<Pg, _>(&query).to_string();

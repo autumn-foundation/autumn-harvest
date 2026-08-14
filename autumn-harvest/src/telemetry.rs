@@ -496,7 +496,10 @@ pub const METRIC_TASK_QUARANTINED: &str = "harvest.task.quarantined";
 /// Labeled by:
 /// - `queue` (= [`METRIC_LABEL_QUEUE`]): the task queue name (bounded).
 /// - `task_type` (= [`METRIC_LABEL_TASK_TYPE`]): `"workflow"` or `"activity"`
-///   (bounded — `CapabilityMissKind::as_str`).
+///   (the owning task row's `task_type`, bounded by the DB CHECK constraint to
+///   `workflow` / `activity`; note a *local-activity* or activity-scheduling miss
+///   is raised while processing a **workflow** task, so it reports
+///   `task_type="workflow"` — the log line carries the handler kind separately).
 /// - `outcome` (= [`METRIC_LABEL_OUTCOME`]): [`CAPABILITY_MISS_OUTCOME_RELEASED`]
 ///   or [`CAPABILITY_MISS_OUTCOME_ESCALATED`] (bounded).
 ///

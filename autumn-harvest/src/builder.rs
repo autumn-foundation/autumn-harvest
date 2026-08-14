@@ -3457,12 +3457,15 @@ impl WorkerConfig {
     ///
     /// A task claimed by a worker with no handler registered for its
     /// workflow/activity type is released back to `PENDING` for a capable peer,
-    /// with capped exponential backoff. After `budget` such releases it is
-    /// escalated to the terminal-failure / dead-letter path with a
-    /// `no_capable_worker:` reason.
+    /// with capped exponential backoff. A budget of `N` grants exactly `N`
+    /// releases; the `N + 1`th claim escalates to the ordinary terminal-failure
+    /// path with a `no_capable_worker:` reason on the execution row. (That path
+    /// writes no dead-letter entry.)
     ///
     /// Raise this if your rollouts legitimately take longer than the default
-    /// dwell window (~1 minute of accumulated backoff at the default); this
+    /// dwell window — the five backoffs the default grants sum to ~31 s
+    /// (1 + 2 + 4 + 8 + 16) on a single worker, and less in wall-clock terms on
+    /// a wide fleet, where incapable peers consume releases in parallel. This
     /// trades a longer time-to-detect for fewer spurious escalations.
     ///
     /// `0` escalates on the **first** miss — the pre-#804 fail-fast behaviour.

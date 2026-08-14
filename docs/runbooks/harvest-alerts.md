@@ -2052,9 +2052,10 @@ route work.
 | `outcome="released"`, sustained > ~15m | Rollout stalled, or a pod set permanently lacks the handler | Finish/roll back the deploy; check `GET /workers` |
 | `outcome="escalated"`, any | No capable worker exists; executions failing | Page — see *Triage steps* |
 
-Distinct from two adjacent alerts, deliberately:
+Distinct from two adjacent signals, deliberately:
 
-- `harvest_task_quarantined` (issue #367) is a worker **process crash**
+- `harvest.task.quarantined` (issue #367, a metric — there is no quarantine
+  alert in the starter pack) counts a worker **process crash**
   (panic/OOM/segfault). A clean "handler not registered" miss is not a crash and
   **never** increments `crash_strikes`, so a capability miss can never trip
   poison-pill quarantine.
@@ -2070,14 +2071,18 @@ Distinct from two adjacent alerts, deliberately:
    registered handler anywhere in the fleet — the exact condition escalation
    reports.
 2. Confirm the queue has any live worker at all:
-   `GET /api/harvest/admin/queues/coverage` (issue #774). An uncovered queue is
+   `GET /api/harvest/admin/queue-coverage` (issue #774). An uncovered queue is
    a different (and simpler) failure — see `harvest_queue_uncovered`.
 3. Identify which builds are actually polling the affected queue:
    `GET /api/harvest/workers`. Compare `build_id` / `deployment_name` against
    the build you expect to carry the new handler.
-4. Read the escalated tasks:
-   `GET /api/harvest/dead-letters?queue={queue}` — their `error` begins with
-   `no_capable_worker:` and names the missing workflow/activity type.
+4. Read the escalated executions:
+   `GET /api/harvest/workflows?state=FAILED` — the `error` of an escalated run
+   begins with `no_capable_worker:` and names the missing workflow/activity
+   type. **Escalation does not write a dead-letter row**: it routes through the
+   ordinary terminal-failure path (`WorkflowFailed` + the execution row's
+   `error`), which is not the DLQ. Do not look in `GET /dead-letters` for these
+   — it will be empty, and that emptiness is not evidence the alert is spurious.
 
 ### Likely causes
 
@@ -2106,8 +2111,10 @@ Distinct from two adjacent alerts, deliberately:
 - Escalation is **probabilistic, not exhaustive**: because releases have no
   affinity, a task can in principle exhaust its budget on incapable workers while
   a capable peer exists but never happened to claim it. Backoff makes this
-  progressively unlikely (the dwell window widens to ~30 s per redelivery, far
-  longer than a pod flip), but if you see escalation on a queue that
+  progressively unlikely — each redelivery waits longer than the last (1s, 2s,
+  4s, 8s, 16s at the default budget of 5, ~31 s of total dwell; the curve caps
+  at 30 s per redelivery for larger budgets) — but if you see escalation on a
+  queue that
   `reachability` reports as `in_use`, that is the cause — raise
   `capability_miss_max_redeliveries` rather than treating it as a lost handler.
 
@@ -2122,11 +2129,14 @@ Distinct from two adjacent alerts, deliberately:
   your rollouts legitimately take longer than the default dwell window. This
   trades a longer time-to-detect for fewer spurious escalations; it does not
   make a genuinely missing handler survivable.
-- **Redrive escalated tasks after the fix lands**:
-  `POST /api/harvest/dead-letters/{id}/replay`, or the bulk
-  `POST /dead-letters/replay` filtered to the affected queue. Escalation uses the
-  ordinary terminal-failure path, so redrive works exactly as it does for any
-  other DLQ entry.
+- **Re-run escalated executions after the fix lands.** Escalation seals the run
+  through the ordinary terminal-failure path — a `WorkflowFailed` event and a
+  `FAILED` execution row — and writes **no** dead-letter entry, so the DLQ
+  redrive routes do not apply. Recover an escalated run the way you would any
+  other terminal failure: re-start it, or fork it from history with
+  `POST /api/harvest/workflows/{id}/reset` (issue #148). Find them with
+  `GET /api/harvest/workflows?state=FAILED` and match the `no_capable_worker:`
+  prefix on `error`.
 - Do **not** set `capability_miss_max_redeliveries` to `0` to "turn the feature
   off". `0` means *escalate on the first miss* — the pre-#804 behavior, which is
   strictly worse during a deploy.

@@ -3802,7 +3802,13 @@ const CAPABILITY_MISS_BACKOFF_BASE_SECS: u64 = 1;
 /// running.
 const CAPABILITY_MISS_BACKOFF_CAP_SECS: u64 = 30;
 
-/// Which claim-time handler lookup missed, as a **bounded** metric label
+/// Which claim-time handler lookup missed.
+///
+/// This names the *handler kind* and feeds the escalation reason string and
+/// the structured log line. It is deliberately NOT the metric label: the
+/// `task_type` label carries the owning task row's own kind (bounded by the DB
+/// CHECK constraint), which differs here for a local-activity or
+/// activity-scheduling miss — both are raised while processing a workflow task
 /// (issue #804).
 ///
 /// Exactly two values, ever — `task_type` on
@@ -3844,8 +3850,17 @@ pub enum CapabilityMissAction {
 ///
 /// `misses_after_increment` is the value the release UPDATE would persist to
 /// `harvest_task_queue.capability_misses`, so the **first** miss on a task
-/// arrives here as `1`. Escalation fires at `>=`, mirroring
-/// [`crate::poison_pill::quarantine_decision`].
+/// arrives here as `1`.
+///
+/// The budget is a **count of permitted redeliveries**, not a threshold to
+/// reach: `max_redeliveries = N` allows exactly `N` releases and escalates on
+/// the `N + 1`th claim, so escalation fires at `>` rather than `>=`. This is
+/// deliberately *not* the `>=` shape of
+/// [`crate::poison_pill::quarantine_decision`] — that knob is named
+/// `poison_pill_threshold` ("reach it and act"), whereas this one is named for
+/// the number of redeliveries it grants. Under `>=` a budget of 5 would permit
+/// only four releases, and [`no_capable_worker_reason`] would misreport the
+/// count it names in the terminal error.
 ///
 /// `max_redeliveries == 0` escalates on the first miss — the documented
 /// rollback switch that restores the pre-#804 "fail terminally on first claim
@@ -3867,7 +3882,7 @@ pub const fn capability_miss_decision(
     } else {
         max_redeliveries.cast_signed()
     };
-    if misses_after_increment >= budget {
+    if misses_after_increment > budget {
         CapabilityMissAction::Escalate
     } else {
         CapabilityMissAction::Release
@@ -6484,12 +6499,17 @@ async fn persist_all_started_child_workflows(
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
 ) -> HarvestResult<()> {
+    // Capability miss (#804): this worker cannot resolve the CHILD's handler,
+    // so releasing the parent's task lets a capable peer persist the decision.
+    // Terminally failing the parent here would turn a rolling deploy that
+    // introduces a new child type into a lost parent execution. Checked for
+    // every child before any is inserted, so the dispatch stays all-or-nothing.
     for child in children {
         if !registry.workflows.contains_key(&child.workflow_name) {
-            return Err(HarvestError::Config(format!(
-                "no workflow handler registered for '{}'",
-                child.workflow_name
-            )));
+            return Err(HarvestError::HandlerNotRegistered {
+                kind: CapabilityMissKind::Workflow.as_str(),
+                name: child.workflow_name.clone(),
+            });
         }
     }
 
@@ -6999,11 +7019,13 @@ async fn persist_child_timeout_race(
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
 ) -> HarvestResult<()> {
+    // Capability miss (#804): release the parent's task for a capable peer
+    // rather than terminally failing it because the child type is unknown here.
     if !registry.workflows.contains_key(&child.workflow_name) {
-        return Err(HarvestError::Config(format!(
-            "no workflow handler registered for '{}'",
-            child.workflow_name
-        )));
+        return Err(HarvestError::HandlerNotRegistered {
+            kind: CapabilityMissKind::Workflow.as_str(),
+            name: child.workflow_name.clone(),
+        });
     }
 
     let parent_exec_id = execution_id_from_uuid(parent_execution.id);
@@ -7891,6 +7913,21 @@ async fn create_detached_child_executions(
     commands: &[WorkflowCommand],
     execute_span: &tracing::Span,
 ) -> HarvestResult<()> {
+    // Capability miss (#804): pre-validate EVERY detached child's handler before
+    // inserting any of them, so a miss on the second child cannot leave the
+    // first already created. Releasing the parent's task lets a capable peer
+    // persist the whole batch instead of terminally failing the parent.
+    for cmd in commands {
+        if let WorkflowCommand::SpawnDetachedChildWorkflow { workflow_name, .. } = cmd
+            && !registry.workflows.contains_key(workflow_name.as_str())
+        {
+            return Err(HarvestError::HandlerNotRegistered {
+                kind: CapabilityMissKind::Workflow.as_str(),
+                name: workflow_name.clone(),
+            });
+        }
+    }
+
     // Provenance ref for every detached child is the parent execution id (#740).
     let parent_exec_id_str = parent_execution.id.to_string();
     for cmd in commands {
@@ -7903,12 +7940,6 @@ async fn create_detached_child_executions(
         else {
             continue;
         };
-
-        if !registry.workflows.contains_key(workflow_name.as_str()) {
-            return Err(HarvestError::Config(format!(
-                "no workflow handler registered for '{workflow_name}'"
-            )));
-        }
 
         // Idempotent: skip if already created (crash-restart replay).
         let already_exists: bool = harvest_workflow_executions::table
@@ -14457,16 +14488,12 @@ async fn handle_capability_miss(
             // Back off before the next redelivery so the dwell window outlasts a
             // pod flip: without it the budget would be spent in milliseconds by
             // the same incapable worker re-claiming its own released row.
+            // The backoff is applied against the DB clock inside the release
+            // statement, so host/Postgres skew cannot swallow it.
             let delay = capability_miss_backoff(task.capability_misses);
-            let scheduled_at = chrono::Utc::now() + delay;
-            let released = queue::release_task_for_capability_miss(
-                conn,
-                task.id,
-                worker_id,
-                scheduled_at,
-                &detail,
-            )
-            .await?;
+            let released =
+                queue::release_task_for_capability_miss(conn, task.id, worker_id, delay, &detail)
+                    .await?;
             if !released {
                 // A concurrent poison-pill reclaim (or an operator action) took
                 // the row out from under this claim. Nothing to do and nothing
@@ -21569,9 +21596,9 @@ mod tests {
     #[test]
     fn capability_miss_decision_releases_under_the_bound() {
         // `misses_after_increment` is the value the release UPDATE will persist,
-        // so the first miss arrives here as 1. With the default budget of 5 the
-        // first four misses release for a peer.
-        for misses in 1..=4 {
+        // so the first miss arrives here as 1. The budget names how many
+        // REDELIVERIES are granted, so a budget of 5 releases misses 1..=5.
+        for misses in 1..=5 {
             assert_eq!(
                 capability_miss_decision(misses, 5),
                 CapabilityMissAction::Release,
@@ -21581,11 +21608,31 @@ mod tests {
     }
 
     #[test]
-    fn capability_miss_decision_escalates_at_and_over_the_bound() {
-        assert_eq!(
-            capability_miss_decision(5, 5),
-            CapabilityMissAction::Escalate
-        );
+    fn capability_miss_decision_permits_exactly_the_configured_redeliveries() {
+        // The public knob is named `capability_miss_max_redeliveries`, so a
+        // budget of N must grant exactly N releases and escalate on the N+1th
+        // claim. This deliberately differs from `poison_pill::quarantine_decision`,
+        // whose knob is a *threshold* (reach it -> act).
+        for budget in [1_u32, 3, 5, 20] {
+            let bound = i32::try_from(budget).expect("test budgets fit in i32");
+            for misses in 1..=bound {
+                assert_eq!(
+                    capability_miss_decision(misses, budget),
+                    CapabilityMissAction::Release,
+                    "budget {budget} must grant redelivery {misses}",
+                );
+            }
+            assert_eq!(
+                capability_miss_decision(bound + 1, budget),
+                CapabilityMissAction::Escalate,
+                "budget {budget} must escalate on claim {}",
+                bound + 1
+            );
+        }
+    }
+
+    #[test]
+    fn capability_miss_decision_escalates_over_the_bound() {
         assert_eq!(
             capability_miss_decision(6, 5),
             CapabilityMissAction::Escalate
@@ -21650,11 +21697,32 @@ mod tests {
     #[test]
     fn capability_miss_default_budget_dwell_outlasts_a_pod_flip() {
         // The success metric depends on a released task still being PENDING
-        // while a rolling deploy replaces pods. Summing the backoff of the four
-        // releases the default budget allows gives the minimum queue dwell
+        // while a rolling deploy replaces pods. Summing the backoff of every
+        // release the default budget grants gives the minimum queue dwell
         // before escalation.
-        let dwell: Duration = (0..4).map(capability_miss_backoff).sum();
-        assert_eq!(dwell, Duration::from_secs(1 + 2 + 4 + 8));
+        //
+        // The release count is DERIVED from the shipped default rather than
+        // hard-coded, so a change to either the budget default or the
+        // release/escalate boundary moves this number instead of silently
+        // leaving the assertion stale.
+        let budget = WorkerConfig::default().capability_miss_max_redeliveries;
+        assert_eq!(budget, 5, "the shipped default the dwell is derived from");
+
+        let releases = (1..=i32::try_from(budget).expect("small budget") + 1)
+            .take_while(|misses| {
+                capability_miss_decision(*misses, budget) == CapabilityMissAction::Release
+            })
+            .count();
+        assert_eq!(
+            releases, 5,
+            "a budget of {budget} must grant {budget} redeliveries"
+        );
+
+        let dwell: Duration = (0..i32::try_from(releases).expect("small"))
+            .map(capability_miss_backoff)
+            .sum();
+        assert_eq!(dwell, Duration::from_secs(1 + 2 + 4 + 8 + 16));
+        assert_eq!(dwell, Duration::from_secs(31));
     }
 
     #[test]
@@ -21666,8 +21734,9 @@ mod tests {
         );
         assert!(reason.contains("no workflow handler registered for 'wf'"));
         assert!(
-            reason.contains('5'),
-            "reason must name the redelivery budget that was exhausted: {reason}"
+            reason.contains("after 5 capability-miss redeliveries"),
+            "reason must name the exact redelivery budget that was exhausted \
+             (a single-char containment check cannot catch an off-by-one): {reason}"
         );
     }
 
@@ -21680,10 +21749,10 @@ mod tests {
 
     #[test]
     fn resolve_capability_miss_releases_then_escalates_at_the_bound() {
-        // Default budget of 5: misses 1..4 release, the 5th escalates. The
-        // returned count is what gets persisted, so it must be the
+        // Default budget of 5: misses 1..=5 release, the 6th claim escalates.
+        // The returned count is what gets persisted, so it must be the
         // POST-increment value (the release SQL does `+ 1` in the same UPDATE).
-        for before in 0..4 {
+        for before in 0..5 {
             assert_eq!(
                 resolve_capability_miss(before, 5, None),
                 (CapabilityMissAction::Release, before + 1),
@@ -21692,9 +21761,9 @@ mod tests {
             );
         }
         assert_eq!(
-            resolve_capability_miss(4, 5, None),
-            (CapabilityMissAction::Escalate, 5),
-            "the 5th miss exhausts the default budget"
+            resolve_capability_miss(5, 5, None),
+            (CapabilityMissAction::Escalate, 6),
+            "the 6th claim exhausts the default budget of 5 redeliveries"
         );
     }
 
