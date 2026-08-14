@@ -243,6 +243,8 @@ async fn test_same_shard_live_cancel() {
     let caller_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
 
     let canceller_info = WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "canceller_workflow",
         module: "cross_workflow_cancel_tests",
@@ -266,6 +268,8 @@ async fn test_same_shard_live_cancel() {
         retry_policy: None,
     };
     let target_info = WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "long_running_target_workflow",
         module: "cross_workflow_cancel_tests",
@@ -390,6 +394,8 @@ async fn test_already_terminal_target_is_no_op_success() {
     let built = HarvestBuilder::new()
         .workflows(vec![
             WorkflowInfo {
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "canceller_workflow",
                 module: "cross_workflow_cancel_tests",
@@ -413,6 +419,8 @@ async fn test_already_terminal_target_is_no_op_success() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "instant_complete_workflow",
                 module: "cross_workflow_cancel_tests",
@@ -548,6 +556,8 @@ async fn test_grace_window_expiry_unknown_target() {
 
     let built = HarvestBuilder::new()
         .workflows(vec![WorkflowInfo {
+            declared_activities: None,
+            declared_children: None,
             mcp: false,
             name: "canceller_expecting_failure",
             module: "cross_workflow_cancel_tests",
@@ -663,6 +673,8 @@ async fn test_cross_shard_cancel_via_outbox() {
     let built = HarvestBuilder::new()
         .workflows(vec![
             WorkflowInfo {
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "canceller_workflow",
                 module: "cross_workflow_cancel_tests",
@@ -686,6 +698,8 @@ async fn test_cross_shard_cancel_via_outbox() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                declared_activities: None,
+                declared_children: None,
                 mcp: false,
                 name: "long_running_target_workflow",
                 module: "cross_workflow_cancel_tests",

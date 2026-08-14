@@ -1,0 +1,5 @@
+error: expected an activity/workflow name — a bare identifier (`send_email`), a path (`billing::charge_card`), or a string literal (`"send_email"`)
+ --> tests/compile_fail/workflow_invalid_dependency_entry.rs:7:26
+  |
+7 | #[workflow(activities = [42])]
+  |                          ^^

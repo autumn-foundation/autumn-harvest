@@ -223,6 +223,13 @@ Missing migrations, unreachable shard, no worker for a required queue, stale
 workers, disabled scheduler path for registered schedules, DLQ read failure, or
 an admin API mounted without the expected auth boundary.
 
+A `catalog_consistency` failure means the registration itself is inconsistent —
+a DAG or an opted-in workflow references an activity or child workflow that is
+not registered in this process. Read the named references out of
+`details.failures`; the fix is to add the handler to `activities![…]` /
+`workflows![…]`, or to delete the now-stale declaration. See
+[Chapter 10 — Operating the service](../getting-started/10-operations.md#catching-a-forgotten-registration-before-rollout).
+
 ### False positives
 
 Warning-only reports can be expected during deploys when workers are draining.

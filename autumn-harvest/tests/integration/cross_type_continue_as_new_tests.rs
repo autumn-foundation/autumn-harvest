@@ -115,6 +115,8 @@ fn phase_two_awaits_signal<'a>(
 
 fn wf(name: &'static str, handler: WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name,
         module: "cross_type_continue_as_new_tests",

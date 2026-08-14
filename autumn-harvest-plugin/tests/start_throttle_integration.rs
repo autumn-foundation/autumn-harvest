@@ -73,6 +73,8 @@ fn dummy_workflow<'a>(
 
 fn throttled_info(rate: &str, burst: f64) -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "sync_tenant",
         module: "tests",

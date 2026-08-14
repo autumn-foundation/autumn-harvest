@@ -209,6 +209,8 @@ fn two_shard_router() -> ShardRouter {
 
 fn workflow_info() -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "echo_workflow",
         module: "tests",

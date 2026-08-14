@@ -61,6 +61,8 @@ async fn setup_database_url_with_migrations() -> (String, ContainerAsync<Postgre
 
 fn workflow_info() -> WorkflowInfo {
     WorkflowInfo {
+        declared_activities: None,
+        declared_children: None,
         mcp: false,
         name: "test_workflow",
         module: "tests",
