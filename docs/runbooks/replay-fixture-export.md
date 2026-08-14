@@ -5,6 +5,15 @@ the new binary can replay representative stored histories before it meets
 production. Determinism bugs are cheaper when they are trapped in CI instead of
 left to haunt an on-call rotation.
 
+> **For in-flight executions, use the replay-drift gate instead.** This runbook
+> covers *curated* fixtures of **completed** histories, replayed **strictly**.
+> To answer "will the executions running *right now* survive this deploy?", use
+> [`docs/replay-drift-gate.md`](../replay-drift-gate.md) (issue #798), which
+> samples the in-flight population automatically and replays it
+> frontier-tolerantly. A healthy in-flight run parks at its recorded frontier,
+> which strict replay reports as a divergence — so pointing the strict tooling
+> below at active histories is false-red on every one of them.
+
 ## Export One Execution
 
 Full-payload exports are accepted by `WorkflowReplayer::replay_from_json` and
@@ -47,7 +56,7 @@ Useful filters:
 | Filter | Purpose |
 | --- | --- |
 | `--workflow-name` | Limit to one workflow type. |
-| `--state-group active` | Sample histories that may still replay after deploy. |
+| `--state-group active` | Non-terminal histories. **Not for the strict replay gate below** — see the note at the top; use `harvest history export-sample` and `replay_bundle` for these. |
 | `--state-group terminal` | Sample completed/failed/cancelled histories for regression CI. |
 | `--updated-after` / `--updated-before` | Bound by latest history event timestamp, falling back to execution row time only when no event exists. |
 | `--shard-id` | Re-export one shard after a partial batch. |
@@ -130,8 +139,17 @@ harvest-replay \
 Release checklist:
 
 1. Export recent terminal histories with `--payload-policy full`.
-2. Export a smaller active-history sample if the release changes replay-heavy
-   code paths.
-3. Fail the gate on any partial shard coverage unless explicitly waived.
-4. Run `WorkflowReplayer` or `harvest-replay` against every full fixture.
+2. Run the **in-flight** replay-drift gate — `harvest history export-sample
+   --payload-policy full --output-dir ./fixtures/in-flight` followed by
+   `replay_bundle` in your own binary. That covers the executions this deploy
+   can actually break; see [`docs/replay-drift-gate.md`](../replay-drift-gate.md).
+   Do **not** substitute an `--state-group active` batch export here: the strict
+   replay in step 4 is false-red on every in-flight history.
+3. Fail the gate on any partial shard coverage unless explicitly waived. The
+   drift gate has a flag for this — `require_complete_coverage(true)`, which also
+   fails closed when the bundle carries no coverage manifest at all.
+4. Run `WorkflowReplayer` or `harvest-replay` against every full **terminal**
+   fixture.
 5. Keep redacted exports for operator debugging; keep full exports private.
+   A drift-gate bundle must be `full` (the gate refuses a redacted one), so treat
+   it as production data and keep it inside the CI job.
