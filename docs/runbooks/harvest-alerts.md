@@ -2391,7 +2391,15 @@ action, not an incident action.
 4. Check the escalation counter is still flat:
    `sum by (queue, task_type) (increase(harvest_task_capability_miss_total{outcome="escalated"}[5m]))`.
    Any non-zero value means budgets are now being exhausted and this has already
-   graduated to a page.
+   graduated to a page. **A zero here is not proof of zero escalations**: a
+   `(queue, task_type)` series that has never escalated is created by its first
+   escalation *already at 1*, and `increase` reports last-minus-first, so that
+   first sample reads as 0. Cross-check with the set-difference arm the alert
+   itself carries —
+   `sum by (queue, task_type) (harvest_task_capability_miss_total{outcome="escalated"} unless harvest_task_capability_miss_total{outcome="escalated"} offset 5m)`
+   — or, authoritatively, with `GET /api/harvest/workflows?state=FAILED` filtered
+   on the `no_capable_worker:` reason, which does not depend on scrape timing at
+   all.
 
 ### Likely causes
 

@@ -590,6 +590,50 @@ fn capability_miss_released_outcome_never_pages() {
         expr.contains(" and "),
         "the positivity and presence guards must both hold: {expr}"
     );
+
+    // Half 3: `increase(...) > 0` cannot see the FIRST sample of a new series.
+    //
+    // The adapter creates a counter by incrementing it, so a
+    // (queue, task_type, outcome) series that has never fired appears in the
+    // scrape already at 1 -- there is no preceding zero sample. `increase`
+    // needs two points and reports `last - first`, so every point in the
+    // window reads 1 and the delta is 0. The first escalation on a series is
+    // therefore invisible, and if it is also the ONLY one, the rule never
+    // fires at all.
+    //
+    // That is exactly the scenario these two rules exist for: a new handler
+    // rolls out, no worker registers it, and the very first escalated task
+    // creates the series. A low-volume queue can escalate exactly once.
+    //
+    // Zero-initialising the label sets at worker startup is the usual remedy
+    // and is NOT sufficient here: the zero must be *scraped* before the
+    // increment, and both never-offered causes (a
+    // `capability_miss_max_redeliveries = 0` rollback switch, and a
+    // session-pinned task) escalate on the task's FIRST claim, which can land
+    // inside the same scrape interval as worker startup. The detection has to
+    // live in the expression.
+    for (id, outcome) in [
+        ("harvest_no_capable_worker", "escalated"),
+        (
+            "harvest_capability_miss_never_offered",
+            "escalated_never_offered",
+        ),
+    ] {
+        let exprs = rule_exprs(id);
+        let joined = exprs.join(" ");
+        assert!(
+            joined.contains("offset 5m"),
+            "{id} must also detect a series that did not exist one window ago, or the              first escalation on a brand-new (queue, task_type) series is invisible to              `increase`: {exprs:?}"
+        );
+        assert!(
+            joined.contains("unless"),
+            "{id}'s new-series detection must be an `unless ... offset` set difference              (present now, absent a window ago), not a value comparison: {exprs:?}"
+        );
+        assert!(
+            joined.contains(&format!("outcome=\"{outcome}\"")),
+            "{id}'s new-series arm must select its own outcome: {exprs:?}"
+        );
+    }
 }
 
 fn read_pack() -> Value {

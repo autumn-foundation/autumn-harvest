@@ -1029,11 +1029,11 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "outcome is bounded to exactly released|escalated, and task_type to workflow|activity, so both are safe to group by. This PAGING rule carries ONLY the escalated expression. A `released` sample is the benign, self-healing signature of capability skew during a rolling deploy and must never page; the sustained-release signal is the separate ticket-severity rule harvest_capability_miss_release_sustained.",
+        "notes": "outcome is bounded to exactly released|escalated, and task_type to workflow|activity, so both are safe to group by. This PAGING rule carries ONLY the escalated expression. A `released` sample is the benign, self-healing signature of capability skew during a rolling deploy and must never page; the sustained-release signal is the separate ticket-severity rule harvest_capability_miss_release_sustained. The `or ... unless ... offset 5m` arm is not redundant: the adapter creates a counter by incrementing it, so a (queue, task_type, outcome) series that has never fired appears in the scrape already at 1 with no preceding zero sample. `increase` reports last-minus-first over the window, which is 0 for a series whose every sample reads 1, so the FIRST escalation on a new series is invisible to the increase arm -- and on a low-volume queue it may be the only one. The second arm is a set difference (present now, absent one window ago) that catches exactly that first sample and stops matching once the series is a window old. Zero-initialising the label sets at worker startup was considered and rejected: the zero has to be SCRAPED before the increment, and both never-offered causes escalate on a task's first claim, which can land inside the same scrape interval as worker startup.",
         "expressions": [
           {
             "kind": "promql",
-            "expr": "sum by (queue, task_type) (increase(harvest_task_capability_miss_total{outcome=\"escalated\"}[5m])) > 0"
+            "expr": "(sum by (queue, task_type) (increase(harvest_task_capability_miss_total{outcome=\"escalated\"}[5m])) > 0) or (sum by (queue, task_type) (harvest_task_capability_miss_total{outcome=\"escalated\"} unless harvest_task_capability_miss_total{outcome=\"escalated\"} offset 5m) > 0)"
           }
         ]
       },
@@ -1068,11 +1068,11 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "outcome is bounded to exactly released|escalated|escalated_never_offered. This rule owns the never-offered value ONLY; the fleet-exhaustion page (harvest_no_capable_worker) selects outcome=\"escalated\" with an exact matcher, so the two cannot overlap. Keep the matcher exact: an `outcome=~\"escalated.*\"` regex on either rule would re-conflate them and page on a cause that carries the opposite conclusion.",
+        "notes": "outcome is bounded to exactly released|escalated|escalated_never_offered. This rule owns the never-offered value ONLY; the fleet-exhaustion page (harvest_no_capable_worker) selects outcome=\"escalated\" with an exact matcher, so the two cannot overlap. Keep the matcher exact: an `outcome=~\"escalated.*\"` regex on either rule would re-conflate them and page on a cause that carries the opposite conclusion. The `or ... unless ... offset 5m` arm is not redundant: the adapter creates a counter by incrementing it, so a (queue, task_type, outcome) series that has never fired appears in the scrape already at 1 with no preceding zero sample. `increase` reports last-minus-first over the window, which is 0 for a series whose every sample reads 1, so the FIRST escalation on a new series is invisible to the increase arm -- and on a low-volume queue it may be the only one. The second arm is a set difference (present now, absent one window ago) that catches exactly that first sample and stops matching once the series is a window old. Zero-initialising the label sets at worker startup was considered and rejected: the zero has to be SCRAPED before the increment, and both never-offered causes escalate on a task's first claim, which can land inside the same scrape interval as worker startup.",
         "expressions": [
           {
             "kind": "promql",
-            "expr": "sum by (queue, task_type) (increase(harvest_task_capability_miss_total{outcome=\"escalated_never_offered\"}[5m])) > 0"
+            "expr": "(sum by (queue, task_type) (increase(harvest_task_capability_miss_total{outcome=\"escalated_never_offered\"}[5m])) > 0) or (sum by (queue, task_type) (harvest_task_capability_miss_total{outcome=\"escalated_never_offered\"} unless harvest_task_capability_miss_total{outcome=\"escalated_never_offered\"} offset 5m) > 0)"
           }
         ]
       },
