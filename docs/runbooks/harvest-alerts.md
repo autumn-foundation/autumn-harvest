@@ -2043,22 +2043,27 @@ registers the handler at all** — executions are being failed.
 The budget counts *distinct* workers, not total releases, precisely so that one
 incapable pod repeatedly winning the claim race cannot page you while a capable
 peer is live: a repeat miss by a worker already in the set backs off but
-consumes no budget. Reaching this page therefore means `N + 1` **different**
-workers each failed to resolve the handler. (A secondary absolute ceiling of
-`10 ×` the budget on total releases exists only for a fleet smaller than the
-budget, where the distinct set can never grow that far; it escalates with the
-same `escalated` outcome.)
+consumes no budget. Reaching this page via that bound therefore means `N + 1`
+**different** workers each failed to resolve the handler.
 
-That conclusion is only sound because the task was *offered around the queue*
-for its whole budget first. Two escalation causes fail an execution on its
-**first** claim after **zero** releases — a `capability_miss_max_redeliveries = 0`
-config, and a task pinned to a worker session (#606) whose host lacks the
-handler — and for those, a capable worker may be live and idle the entire time.
-They report a **different** outcome value, `escalated_never_offered`, and fire
-the ticket-severity
+A secondary **absolute ceiling** of `10 ×` the budget on *total* releases also
+escalates with the same `escalated` outcome. It exists for a fleet smaller than
+the budget, where the distinct set can never grow far enough to trip the primary
+bound — with one worker it is the *only* bound reachable, so routing it elsewhere
+would mean a single-worker deployment never pages for a genuinely missing
+handler. Its reason string names the real release count and the distinct count
+(`spread across only D distinct worker(s)`) rather than the budget, so it is
+distinguishable in triage; see the four-way table in step 4.
+
+Those conclusions are sound because the task was *offered around the queue*
+first. Two escalation causes fail an execution on its **first** claim after
+**zero** releases — a `capability_miss_max_redeliveries = 0` config, and a task
+pinned to a worker session (#606) whose host lacks the handler — and for those, a
+capable worker may be live and idle the entire time. They report a **different**
+outcome value, `escalated_never_offered`, and fire the ticket-severity
 [`harvest_capability_miss_never_offered`](#harvest_capability_miss_never_offered)
 instead. This page selects `outcome="escalated"` with an exact matcher, so if
-you are holding it, the fleet-wide conclusion below *is* supported.
+you are holding it, the task genuinely bounced around the queue first.
 
 **Worker-fleet contract.** All workers polling a given queue should register the
 same handler set. Harvest no longer punishes a *transient* mismatch (it is
@@ -2106,8 +2111,8 @@ Distinct from two adjacent signals, deliberately:
    `error`), which is not the DLQ. Do not look in `GET /dead-letters` for these
    — it will be empty, and that emptiness is not evidence the alert is spurious.
 
-   The `error` distinguishes the **three** escalation causes, which have
-   different fixes. **Only the first reaches this alert.** The other two report
+   The `error` distinguishes the **four** escalation causes, which have
+   different fixes. **Only the first two reach this alert.** The other two report
    `outcome="escalated_never_offered"` and fire the ticket-severity
    [`harvest_capability_miss_never_offered`](#harvest_capability_miss_never_offered)
    instead — they are listed here so that, if you arrive at a `no_capable_worker:`
@@ -2116,17 +2121,30 @@ Distinct from two adjacent signals, deliberately:
 
    | `error` says | Cause | Alert | Fix |
    | --- | --- | --- | --- |
-   | `escalated after N capability-miss redeliveries; no live worker on this queue has the handler` | The task was genuinely offered around the queue N times and nobody took it. | **This page** | Deploy the handler / finish the rollout. Steps 1–3 apply as written. |
+   | `escalated after N capability-miss redeliveries; no live worker on this queue has the handler` | `N + 1` **distinct** workers each missed the task. The queue really was swept. | **This page** | Deploy the handler / finish the rollout. Steps 1–3 apply as written. |
+   | `escalated after R capability-miss redeliveries spread across only D distinct worker(s), hitting the absolute release ceiling …` | The task bounced `R` times but across **fewer** distinct workers than the budget allows — typically a small (often single-worker) fleet, which can only ever escalate this way. | **This page** | Check those `D` workers first (step 3), *then* the fleet. See the note below. |
    | `escalated immediately after 0 redeliveries: capability-miss redelivery is disabled (capability_miss_max_redeliveries = 0) …` | Redelivery is switched off, so the task was failed on its first claim by a single incapable worker and never offered to a peer. | Ticket: `harvest_capability_miss_never_offered` | Raise `capability_miss_max_redeliveries` off `0`. Steps 1–3 may find nothing wrong — this is a config, not a missing deploy. |
    | `escalated immediately after 0 redeliveries: task is pinned to worker session {id} …` | The task is hard-pinned to one host (#606) and could never be offered to a peer at all. | Ticket: `harvest_capability_miss_never_offered` | Go to the pinned host, not the fleet. Raising the budget is a **guaranteed no-op** here. |
 
-   The matching worker log carries a `session_pinned` boolean, an `outcome`
-   field holding the same value as the metric label, and (when pinned) a
-   `session_id`, so the same three-way split is greppable in logs as well as in
-   the execution's `error`.
+   The matching worker log carries a `session_pinned` boolean, a
+   `distinct_incapable_workers` count, an `outcome` field holding the same value
+   as the metric label, and (when pinned) a `session_id`, so the same four-way
+   split is greppable in logs as well as in the execution's `error`.
 
-   If this page is firing, you are in row 1 by construction: the alert selects
-   `outcome="escalated"` with an exact matcher. Rows 2–3 are here for
+   **Row 2 (release ceiling) has a second reading.** It fires when the *absolute*
+   bound (`10 ×` the budget in total releases) trips while the distinct-misser
+   set stayed within budget. The likely cause is still a missing handler on the
+   workers that actually claimed it — but it can also mean a capable peer kept
+   losing the claim race to an incapable one. It pages anyway because a
+   single-worker deployment can trip *no other bound*, so ticketing it would mean
+   such a deployment never pages for a genuinely missing handler. Losing `10 ×
+   budget` consecutive races across ~25 minutes of backoff is not a realistic
+   steady state, so treat row 2 as a real handler outage first and check
+   `distinct_incapable_workers` against `GET /api/harvest/workers` to rule out
+   the race reading.
+
+   If this page is firing, you are in row 1 or 2 by construction: the alert
+   selects `outcome="escalated"` with an exact matcher. Rows 3–4 are here for
    cross-reference only.
 
 ### Likely causes

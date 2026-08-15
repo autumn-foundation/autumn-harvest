@@ -321,6 +321,20 @@ set backs off but consumes no budget. A secondary absolute ceiling of `10 ×` th
 budget on total releases covers the one case a distinct-worker budget cannot: a
 fleet smaller than the budget, where the set can never grow far enough.
 
+The ceiling escalates with a **different reason string**, because it supports a
+weaker conclusion — the releases were concentrated in fewer workers than the
+budget allows, so the whole queue was never swept:
+
+```
+no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 51 capability-miss redeliveries spread across only 1 distinct worker(s), hitting the absolute release ceiling of 10x capability_miss_max_redeliveries = 5; ...)
+```
+
+It still fires the page-severity alert: with a single worker it is the *only*
+bound reachable, so ticketing it would mean a one-pod deployment never pages for
+a genuinely missing handler. Check the named `distinct_incapable_workers` count
+against `GET /api/harvest/workers` before concluding the whole queue lacks the
+handler.
+
 That bound is what keeps a genuinely-missing handler — a workflow type deleted
 or renamed in the new build with runs still in flight — from bouncing around
 the fleet forever. It is a *deploy-skew absorber*, not a substitute for
@@ -336,7 +350,7 @@ old pods failing perfectly good new-build work.
 |---|---|---|
 | `harvest.task.capability_miss{outcome="released"}` rising, then falling to zero | Normal deploy skew, self-healing | None. Confirm it returns to zero once the rollout completes. |
 | `harvest.task.capability_miss{outcome="released"}` sustained past the rollout | Some pods are stuck on the old build, or the new handler never shipped to part of the fleet | Finish/roll back the deploy; check the fleet's build IDs. |
-| `harvest.task.capability_miss{outcome="escalated"}` non-zero | **No live worker on that queue registers the handler.** The task was offered around the queue for its whole redelivery budget and nobody took it. Executions are now failing. | Page. Ship the handler, or accept the failures deliberately. |
+| `harvest.task.capability_miss{outcome="escalated"}` non-zero | The task was offered around the queue and nobody took it. Executions are now failing. Two sub-cases, told apart by the reason string: `N + 1` **distinct** workers each missed it (**no live worker on that queue registers the handler**), or the absolute release ceiling tripped with **fewer** distinct workers than the budget — likely the same conclusion on a small fleet, but check those workers first. | Page. Ship the handler, or accept the failures deliberately. |
 | `harvest.task.capability_miss{outcome="escalated_never_offered"}` non-zero | Executions are failing, but the task was failed on its **first** claim after **zero** releases — either `capability_miss_max_redeliveries = 0`, or a worker-session pin (#606) whose host lacks the handler. **This is not evidence the fleet lacks the handler**; a capable worker may be live and idle the whole time. | Ticket. Read the `no_capable_worker:` reason on a failed execution — its parenthetical names which of the two causes applies. |
 
 The two escalation outcomes are deliberately separate label values because they

@@ -2148,66 +2148,6 @@ pub const fn release_task_for_capability_miss_query() -> &'static str {
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
-/// SQL for [`restore_capability_misses`]. Extracted as a `const fn` so the
-/// monotone `GREATEST` guard is unit-testable without a database.
-#[must_use]
-pub const fn restore_capability_misses_query() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET capability_misses = GREATEST(capability_misses, $2), \
-         capability_miss_workers = CASE \
-             WHEN cardinality(capability_miss_workers) >= cardinality($3::TEXT[]) \
-                 THEN capability_miss_workers \
-             ELSE $3::TEXT[] \
-         END \
-     WHERE id = $1"
-}
-
-/// Put back a `capability_misses` value that [`park_workflow_task`] zeroed on a
-/// path which is *not* proof the parking worker was capable (issue #804).
-///
-/// Only [`crate::worker::requeue_parent_on_transient_ingest_conflict`] needs
-/// this: it parks from inside the wake-event ingest, which runs before the
-/// handler lookup, so a worker with no handler for the type can reach it. The
-/// reset lives in the shared park SQL that every legitimate post-lookup caller
-/// also uses, so this restores the value rather than parameterising a query
-/// with ten correct callers.
-///
-/// `GREATEST` makes the restore **monotone**, which is what makes it safe
-/// against the narrow window between the park and this statement: if a peer
-/// claimed the freshly-parked row and recorded its own miss in that gap, its
-/// higher count wins and is never clobbered back down. In the ordinary case
-/// nothing touched the row and the pre-park value is restored exactly.
-///
-/// The distinct-worker set (issue #804 round 6) is restored under the same
-/// monotone rule, expressed on cardinality: a peer that recorded a miss in the
-/// gap produced a set at least as large as the pre-park one, and clobbering it
-/// back would hand that peer's budget unit back. Comparing cardinality rather
-/// than membership keeps the statement a single UPDATE; the two sets can only
-/// differ by appends in this window, so the larger one is the newer one.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] on update failure.
-pub async fn restore_capability_misses(
-    conn: &mut AsyncPgConnection,
-    task_id: Uuid,
-    misses: i32,
-    workers: &[String],
-) -> HarvestResult<()> {
-    // Nothing to restore, and `GREATEST(x, 0)` is a no-op anyway.
-    if misses <= 0 && workers.is_empty() {
-        return Ok(());
-    }
-    diesel::sql_query(restore_capability_misses_query())
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Integer, _>(misses)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(workers.to_vec())
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    Ok(())
-}
-
 pub async fn release_task_for_capability_miss(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
@@ -2340,6 +2280,45 @@ pub async fn park_workflow_task(
     task_id: Uuid,
     sticky: Option<StickyHint<'_>>,
 ) -> HarvestResult<bool> {
+    park_workflow_task_inner(conn, task_id, sticky, true).await
+}
+
+/// [`park_workflow_task`] for the one caller whose park is **not** proof that
+/// the parking worker can run this task (issue #804).
+///
+/// [`crate::worker::requeue_parent_on_transient_ingest_conflict`] (issue #779)
+/// parks from inside the wake-event ingest, which runs *before* the handler
+/// lookup in `process_workflow_task`. A worker with no handler for the type
+/// reaches it too, so zeroing the capability-miss accounting there would
+/// restart the redelivery budget on a path that proves nothing about
+/// capability — weakening the escalation bound the release contract depends on.
+///
+/// The preservation is expressed as the *absence* of the two SET assignments in
+/// the same statement that parks the row, so the row is never observably
+/// zeroed. Restoring the values in a follow-up UPDATE would be wrong: the park
+/// commits in autocommit mode, so a peer can claim the freshly-parked row and
+/// record its own miss (or a capable peer can park and legitimately reset it)
+/// in the gap, and no single-statement merge of two whole snapshots is monotone
+/// against both of those.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure, and
+/// [`crate::error::HarvestError::NotFound`] when the task is not `RUNNING`.
+pub async fn park_workflow_task_preserving_capability_misses(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    sticky: Option<StickyHint<'_>>,
+) -> HarvestResult<bool> {
+    park_workflow_task_inner(conn, task_id, sticky, false).await
+}
+
+async fn park_workflow_task_inner(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    sticky: Option<StickyHint<'_>>,
+    reset_capability_misses: bool,
+) -> HarvestResult<bool> {
     use diesel::deserialize::QueryableByName;
     use diesel::sql_types::Bool;
 
@@ -2359,7 +2338,7 @@ pub async fn park_workflow_task(
     // gap this mechanism exists to close.
     let rows: Vec<WakeRequestedRow> = if let Some(hint) = sticky {
         let timeout = hint.chrono_timeout()?;
-        diesel::sql_query(park_workflow_task_sticky_query())
+        diesel::sql_query(park_workflow_task_sticky_query(reset_capability_misses))
             .bind::<diesel::sql_types::Uuid, _>(task_id)
             .bind::<diesel::sql_types::Text, _>(hint.worker_id)
             .bind::<diesel::sql_types::Interval, _>(timeout)
@@ -2372,7 +2351,7 @@ pub async fn park_workflow_task(
         // would refresh sticky_until from the stored sticky_timeout column and
         // re-pin the execution to the old worker even though the current worker
         // is running with sticky routing disabled.
-        diesel::sql_query(park_workflow_task_query())
+        diesel::sql_query(park_workflow_task_query(reset_capability_misses))
             .bind::<diesel::sql_types::Uuid, _>(task_id)
             .load(conn)
             .await
@@ -2404,59 +2383,108 @@ pub async fn park_workflow_task(
 /// demonstrably live. `primary_repend_workflow_task_query` needs no equivalent
 /// reset: the parked state it matches is produced only here.
 ///
-/// **One caller is *not* proof of capability** and must therefore undo this
-/// reset itself: [`crate::worker::requeue_parent_on_transient_ingest_conflict`]
-/// (issue #779) parks from inside the wake-event ingest, which runs *before*
-/// the handler lookup. A worker with no handler for the type can reach it, so
-/// letting it zero the counter would restart the consecutive-miss budget on a
-/// path that proves nothing — weakening the escalation bound the release
-/// contract depends on. That caller restores the pre-park value with
-/// [`restore_capability_misses`] immediately afterwards.
-const fn park_workflow_task_sticky_query() -> &'static str {
-    "WITH candidate AS ( \
-         SELECT id, wake_requested FROM harvest_task_queue \
-         WHERE id = $1 AND task_type = 'workflow' AND state = 'RUNNING' \
-         FOR UPDATE \
-     ), \
-     updated AS ( \
-         UPDATE harvest_task_queue t \
-         SET worker_id = NULL, \
-             started_at = NULL, \
-             sticky_worker_id = $2, \
-             sticky_until = NOW() + $3, \
-             sticky_timeout = $3, \
-             capability_misses = 0, \
-             capability_miss_workers = '{}', \
-             wake_requested = FALSE \
-         FROM candidate \
-         WHERE t.id = candidate.id \
-         RETURNING candidate.wake_requested AS had_wake_requested \
-     ) \
-     SELECT had_wake_requested FROM updated"
+/// **One caller is *not* proof of capability** and therefore passes
+/// `reset_capability_misses = false`:
+/// [`crate::worker::requeue_parent_on_transient_ingest_conflict`] (issue #779)
+/// parks from inside the wake-event ingest, which runs *before* the handler
+/// lookup. A worker with no handler for the type can reach it, so letting it
+/// zero the counter would restart the consecutive-miss budget on a path that
+/// proves nothing — weakening the escalation bound the release contract depends
+/// on. Preserving is expressed as the *absence* of the two SET assignments in
+/// this same statement rather than a follow-up restore UPDATE, because the park
+/// commits in autocommit mode: a peer can claim the freshly-parked row and
+/// record its own miss — or a capable peer can park and legitimately reset it —
+/// before a second statement lands, and no single-statement merge of two whole
+/// snapshots is monotone against both.
+const fn park_workflow_task_sticky_query(reset_capability_misses: bool) -> &'static str {
+    if reset_capability_misses {
+        "WITH candidate AS ( \
+             SELECT id, wake_requested FROM harvest_task_queue \
+             WHERE id = $1 AND task_type = 'workflow' AND state = 'RUNNING' \
+             FOR UPDATE \
+         ), \
+         updated AS ( \
+             UPDATE harvest_task_queue t \
+             SET worker_id = NULL, \
+                 started_at = NULL, \
+                 sticky_worker_id = $2, \
+                 sticky_until = NOW() + $3, \
+                 sticky_timeout = $3, \
+                 capability_misses = 0, \
+                 capability_miss_workers = '{}', \
+                 wake_requested = FALSE \
+             FROM candidate \
+             WHERE t.id = candidate.id \
+             RETURNING candidate.wake_requested AS had_wake_requested \
+         ) \
+         SELECT had_wake_requested FROM updated"
+    } else {
+        "WITH candidate AS ( \
+             SELECT id, wake_requested FROM harvest_task_queue \
+             WHERE id = $1 AND task_type = 'workflow' AND state = 'RUNNING' \
+             FOR UPDATE \
+         ), \
+         updated AS ( \
+             UPDATE harvest_task_queue t \
+             SET worker_id = NULL, \
+                 started_at = NULL, \
+                 sticky_worker_id = $2, \
+                 sticky_until = NOW() + $3, \
+                 sticky_timeout = $3, \
+                 wake_requested = FALSE \
+             FROM candidate \
+             WHERE t.id = candidate.id \
+             RETURNING candidate.wake_requested AS had_wake_requested \
+         ) \
+         SELECT had_wake_requested FROM updated"
+    }
 }
 
-/// SQL for [`park_workflow_task`] when no sticky hint is supplied.
-const fn park_workflow_task_query() -> &'static str {
-    "WITH candidate AS ( \
-         SELECT id, wake_requested FROM harvest_task_queue \
-         WHERE id = $1 AND task_type = 'workflow' AND state = 'RUNNING' \
-         FOR UPDATE \
-     ), \
-     updated AS ( \
-         UPDATE harvest_task_queue t \
-         SET worker_id = NULL, \
-             started_at = NULL, \
-             sticky_worker_id = NULL, \
-             sticky_until = NULL, \
-             sticky_timeout = NULL, \
-             capability_misses = 0, \
-             capability_miss_workers = '{}', \
-             wake_requested = FALSE \
-         FROM candidate \
-         WHERE t.id = candidate.id \
-         RETURNING candidate.wake_requested AS had_wake_requested \
-     ) \
-     SELECT had_wake_requested FROM updated"
+/// SQL for [`park_workflow_task`] when no sticky hint is supplied. See
+/// [`park_workflow_task_sticky_query`] for the `reset_capability_misses`
+/// contract.
+const fn park_workflow_task_query(reset_capability_misses: bool) -> &'static str {
+    if reset_capability_misses {
+        "WITH candidate AS ( \
+             SELECT id, wake_requested FROM harvest_task_queue \
+             WHERE id = $1 AND task_type = 'workflow' AND state = 'RUNNING' \
+             FOR UPDATE \
+         ), \
+         updated AS ( \
+             UPDATE harvest_task_queue t \
+             SET worker_id = NULL, \
+                 started_at = NULL, \
+                 sticky_worker_id = NULL, \
+                 sticky_until = NULL, \
+                 sticky_timeout = NULL, \
+                 capability_misses = 0, \
+                 capability_miss_workers = '{}', \
+                 wake_requested = FALSE \
+             FROM candidate \
+             WHERE t.id = candidate.id \
+             RETURNING candidate.wake_requested AS had_wake_requested \
+         ) \
+         SELECT had_wake_requested FROM updated"
+    } else {
+        "WITH candidate AS ( \
+             SELECT id, wake_requested FROM harvest_task_queue \
+             WHERE id = $1 AND task_type = 'workflow' AND state = 'RUNNING' \
+             FOR UPDATE \
+         ), \
+         updated AS ( \
+             UPDATE harvest_task_queue t \
+             SET worker_id = NULL, \
+                 started_at = NULL, \
+                 sticky_worker_id = NULL, \
+                 sticky_until = NULL, \
+                 sticky_timeout = NULL, \
+                 wake_requested = FALSE \
+             FROM candidate \
+             WHERE t.id = candidate.id \
+             RETURNING candidate.wake_requested AS had_wake_requested \
+         ) \
+         SELECT had_wake_requested FROM updated"
+    }
 }
 
 /// Wake a parked workflow task for the given execution so replay can continue.
@@ -3634,8 +3662,10 @@ mod tests {
     #[test]
     fn park_workflow_task_queries_capture_wake_requested_before_clearing_it() {
         for sql in [
-            park_workflow_task_query(),
-            park_workflow_task_sticky_query(),
+            park_workflow_task_query(true),
+            park_workflow_task_sticky_query(true),
+            park_workflow_task_query(false),
+            park_workflow_task_sticky_query(false),
         ] {
             assert!(
                 sql.contains("FOR UPDATE"),
@@ -3658,18 +3688,26 @@ mod tests {
 
     #[test]
     fn park_workflow_task_sticky_query_sets_sticky_columns() {
-        let sql = park_workflow_task_sticky_query();
-        assert!(sql.contains("sticky_worker_id = $2"));
-        assert!(sql.contains("sticky_until = NOW() + $3"));
-        assert!(sql.contains("sticky_timeout = $3"));
+        for sql in [
+            park_workflow_task_sticky_query(true),
+            park_workflow_task_sticky_query(false),
+        ] {
+            assert!(sql.contains("sticky_worker_id = $2"));
+            assert!(sql.contains("sticky_until = NOW() + $3"));
+            assert!(sql.contains("sticky_timeout = $3"));
+        }
     }
 
     #[test]
     fn park_workflow_task_query_clears_sticky_columns() {
-        let sql = park_workflow_task_query();
-        assert!(sql.contains("sticky_worker_id = NULL"));
-        assert!(sql.contains("sticky_until = NULL"));
-        assert!(sql.contains("sticky_timeout = NULL"));
+        for sql in [
+            park_workflow_task_query(true),
+            park_workflow_task_query(false),
+        ] {
+            assert!(sql.contains("sticky_worker_id = NULL"));
+            assert!(sql.contains("sticky_until = NULL"));
+            assert!(sql.contains("sticky_timeout = NULL"));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3691,8 +3729,8 @@ mod tests {
         // misses during the next — failing a healthy run during a routine
         // deploy, which is the exact outcome issue #804 exists to prevent.
         for sql in [
-            park_workflow_task_query(),
-            park_workflow_task_sticky_query(),
+            park_workflow_task_query(true),
+            park_workflow_task_sticky_query(true),
         ] {
             assert!(
                 sql.contains("capability_misses = 0"),
@@ -3802,34 +3840,41 @@ mod tests {
     /// operator through the `tracing::info!` on release and the
     /// `harvest.task.capability_miss` counter, so nothing is lost by keeping
     /// it out of a column reserved for real failures.
-    /// The pre-lookup park undo must never *lower* a fresher count.
+    /// The pre-lookup park must preserve the miss accounting *atomically*.
     ///
     /// `park_workflow_task` zeroes `capability_misses`, which is proof-backed
     /// for every caller except the issue #779 transient-ingest-conflict
-    /// re-drive, which runs before the handler lookup. That caller restores the
-    /// pre-park value — but a peer can claim the freshly-parked row and record
-    /// its own miss in the gap, so a plain assignment would clobber a real
-    /// increment back down and hand the task extra budget. `GREATEST` makes the
-    /// restore monotone, so the higher of the two always survives.
+    /// re-drive, which runs before the handler lookup. That caller must keep the
+    /// accounting — and it must do so by simply not writing those columns in the
+    /// park statement itself, never by restoring them afterwards. The park
+    /// commits in autocommit mode (`process_workflow_task` opens its transaction
+    /// much later), so between a zeroing park and any follow-up restore a peer
+    /// can claim the freshly-parked row and record its own miss, or a capable
+    /// peer can park and legitimately reset it — and no single-statement merge of
+    /// two whole snapshots is monotone against both of those. Omitting the SET
+    /// assignments closes the window by construction: the row is never
+    /// observably zeroed at all.
     #[test]
-    fn restore_capability_misses_query_is_monotone() {
-        let sql = restore_capability_misses_query();
-        assert!(
-            sql.contains("GREATEST(capability_misses, $2)"),
-            "a peer's increment recorded between the park and this restore must \
-             win, so the restore may only ever raise the counter: {sql}"
-        );
-        assert!(
-            !sql.contains("capability_misses = $2"),
-            "a bare assignment would clobber a fresher peer increment: {sql}"
-        );
-        assert!(
-            sql.contains("cardinality(capability_miss_workers) >= cardinality($3::TEXT[])"),
-            "the distinct-worker set must be restored under the same monotone \
-             rule as the counter, or a peer's increment in the gap is handed \
-             its budget unit back: {sql}"
-        );
-        assert!(sql.contains("WHERE id = $1"), "{sql}");
+    fn park_preserving_capability_misses_never_writes_the_miss_columns() {
+        for sql in [
+            park_workflow_task_query(false),
+            park_workflow_task_sticky_query(false),
+        ] {
+            assert!(
+                !sql.contains("capability_misses"),
+                "the pre-lookup park must leave the counter untouched in the \
+                 same statement, not zero it and restore it in a second one: {sql}"
+            );
+            assert!(
+                !sql.contains("capability_miss_workers"),
+                "the pre-lookup park must leave the distinct-misser set \
+                 untouched in the same statement: {sql}"
+            );
+            // Everything else a park does must still happen.
+            assert!(sql.contains("worker_id = NULL"), "{sql}");
+            assert!(sql.contains("started_at = NULL"), "{sql}");
+            assert!(sql.contains("wake_requested = FALSE"), "{sql}");
+        }
     }
 
     #[test]
