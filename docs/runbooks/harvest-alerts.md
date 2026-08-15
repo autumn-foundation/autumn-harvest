@@ -2396,10 +2396,16 @@ action, not an incident action.
    escalation *already at 1*, and `increase` reports last-minus-first, so that
    first sample reads as 0. Cross-check with the set-difference arm the alert
    itself carries —
-   `sum by (queue, task_type) (harvest_task_capability_miss_total{outcome="escalated"} unless harvest_task_capability_miss_total{outcome="escalated"} offset 5m)`
+   `sum by (queue, task_type) (max_over_time(harvest_task_capability_miss_total{outcome="escalated"}[5m]) unless max_over_time(harvest_task_capability_miss_total{outcome="escalated"}[1h] offset 5m))`
    — or, authoritatively, with `GET /api/harvest/workflows?state=FAILED` filtered
    on the `no_capable_worker:` reason, which does not depend on scrape timing at
-   all.
+   all. The right-hand side is a **range**, not a bare `offset 5m`, so that a
+   scrape or remote-write outage cannot be mistaken for a newly created series:
+   it asks whether *any* sample existed in the preceding hour. A gap longer than
+   that hour will still read as new — inhibit it with an Alertmanager
+   `inhibit_rule` keyed on your own scrape-health alert (`up == 0` /
+   `TargetDown`), which is deployment-specific and therefore not in the starter
+   pack.
 
 ### Likely causes
 

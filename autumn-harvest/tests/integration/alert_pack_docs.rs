@@ -658,6 +658,27 @@ fn capability_miss_escalation_rules_detect_a_brand_new_series() {
             joined.contains(&format!("outcome=\"{outcome}\"")),
             "{id}'s new-series arm must select its own outcome: {exprs:?}"
         );
+        // The set difference must compare against a RANGE, not a bare instant
+        // `offset 5m` (Codex round-14 P2). A bare offset is empty whenever the
+        // target was unscrapeable for the whole lookback, so a monitoring gap
+        // re-selects an unchanged counter as "new" and pages spuriously. Asking
+        // whether ANY sample exists in the preceding hour tells a genuinely
+        // created series apart from a scrape or remote-write outage.
+        assert!(
+            joined.contains("[1h] offset 5m"),
+            "{id}'s new-series arm must look back over a RANGE (`[1h] offset 5m`), not a               bare instant `offset 5m`: a bare offset makes a scrape gap indistinguishable               from a brand-new series and pages on an unchanged counter: {exprs:?}"
+        );
+        // Both sides of the `unless` must be wrapped identically. A bare
+        // instant selector on the left and `max_over_time` on the right do not
+        // agree on whether `__name__` survives; a mismatch makes `unless` match
+        // nothing, which silently turns the arm into an unconditional `M > 0`.
+        assert_eq!(
+            joined
+                .matches("max_over_time(harvest_task_capability_miss_total")
+                .count(),
+            2,
+            "{id}'s new-series arm must wrap BOTH sides of the `unless` in `max_over_time`               so the label sets stay symmetric -- an asymmetric wrapper makes `unless` match               nothing and degrades the arm to an unconditional `> 0`: {exprs:?}"
+        );
     }
 }
 
