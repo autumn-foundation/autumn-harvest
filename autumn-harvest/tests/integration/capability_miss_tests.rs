@@ -3646,67 +3646,41 @@ async fn seed_claimed_task(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_claim_transferred_inside_the_terminal_write_is_not_failed_by_the_stale_dispatcher() {
+async fn a_claim_transferred_before_the_terminal_write_is_not_failed_by_the_stale_dispatcher() {
     let (url, _container) = setup_db().await;
 
     let (exec_id, task) = seed_claimed_task(&url, "q804-round31", "worker-a").await;
 
-    // Hold the task row's lock on a second connection, so the terminal write
-    // below is forced to queue behind it -- this is the window the finding is
-    // about, staged deterministically instead of raced.
-    let mut holder = connect(&url).await;
-    diesel::sql_query("BEGIN")
-        .execute(&mut holder)
-        .await
-        .expect("begin holder txn");
-    diesel::sql_query("SELECT id FROM harvest_task_queue WHERE id = $1 FOR UPDATE")
-        .bind::<diesel::sql_types::Uuid, _>(task.id)
-        .execute(&mut holder)
-        .await
-        .expect("hold the task row lock");
-
-    let write_url = url.clone();
-    let write_task = task.clone();
-    let writer = tokio::spawn(async move {
-        let mut conn = connect(&write_url).await;
-        let preloaded = preload_failure_history(&mut conn, &write_task).await;
-        commit_terminal_failure_if_still_claimed(
-            &mut conn,
-            &write_task,
-            "worker-a",
-            "no_capable_worker: activity 'charge' is not registered",
-            preloaded,
-            || {},
-        )
-        .await
-        .expect("the guarded write must not error")
-    });
-
-    // It must be blocked on the lock, not finished: if it completed here the
-    // check and the write were never inside one transaction.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(
-        !writer.is_finished(),
-        "the terminal write must queue behind the task row lock, or the ownership \
-         check is not atomic with it"
-    );
-
-    // A poison-pill reclaim / operator action transfers the claim INSIDE the
-    // window, then releases the lock.
+    // A poison-pill reclaim / operator action transfers the claim after the
+    // dispatcher decided to escalate but before it writes. The dispatcher still
+    // holds the row it loaded at claim time -- that snapshot is what makes the
+    // stale write possible, and what the guard has to catch.
+    let mut mover = connect(&url).await;
     diesel::sql_query("UPDATE harvest_task_queue SET worker_id = 'thief' WHERE id = $1")
         .bind::<diesel::sql_types::Uuid, _>(task.id)
-        .execute(&mut holder)
+        .execute(&mut mover)
         .await
         .expect("transfer the claim");
-    diesel::sql_query("COMMIT")
-        .execute(&mut holder)
-        .await
-        .expect("commit the transfer");
 
-    let outcome = tokio::time::timeout(Duration::from_secs(30), writer)
-        .await
-        .expect("the guarded write must unblock once the transfer commits")
-        .expect("writer task");
+    let mut conn = connect(&url).await;
+    let preloaded = preload_failure_history(&mut conn, &task).await;
+    let recorded = Arc::new(Mutex::new(0usize));
+    let recorded_writer = Arc::clone(&recorded);
+    let outcome = commit_terminal_failure_if_still_claimed(
+        &mut conn,
+        &task,
+        "worker-a",
+        "no_capable_worker: activity 'charge' is not registered",
+        preloaded,
+        || {
+            *recorded_writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        },
+    )
+    .await
+    .expect("the guarded write must not error");
+
     assert_eq!(
         outcome,
         TerminalWriteOutcome::ClaimLost,
@@ -3734,17 +3708,33 @@ async fn a_claim_transferred_inside_the_terminal_write_is_not_failed_by_the_stal
         "the new owner's task must not carry the stale dispatcher's reason; got {:?}",
         after.error
     );
+    assert_eq!(
+        *recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        0,
+        "a withdrawn escalation must not fire the page-severity counter"
+    );
 }
 
+/// The guard must never *wait* on the task row (round-32 F1).
+///
+/// `poison_pill::quarantine_orphan` locks the task row first and the execution
+/// row second (via the dead-letter FK and `fail_owning_workflow`), the exact
+/// inverse of the order this commit boundary takes. A blocking `FOR UPDATE`
+/// here would give the two paths a genuine ABBA cycle -- on precisely the pair
+/// that races, since the worker being quarantined is the one whose heartbeat
+/// went stale while it was escalating.
+///
+/// `SKIP LOCKED` removes the waiting edge: a row someone else holds reads as
+/// "not ours right now" and the escalation withdraws. This test proves the
+/// non-blocking part directly -- the write completes *while the lock is still
+/// held*, which a blocking guard could not do.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_claim_still_held_through_the_terminal_write_still_fails_the_task() {
-    // The control for the test above: same staged window, same lock contention,
-    // but nobody takes the claim -- so the escalation must still commit. Without
-    // it, a guard that simply always withdrew would pass the first test and
-    // silently break AC3's boundedness.
+async fn a_task_row_locked_by_a_concurrent_transaction_withdraws_without_waiting() {
     let (url, _container) = setup_db().await;
 
-    let (exec_id, task) = seed_claimed_task(&url, "q804-round31-ok", "worker-a").await;
+    let (exec_id, task) = seed_claimed_task(&url, "q804-round32-skip", "worker-a").await;
 
     let mut holder = connect(&url).await;
     diesel::sql_query("BEGIN")
@@ -3780,22 +3770,150 @@ async fn a_claim_still_held_through_the_terminal_write_still_fails_the_task() {
         .expect("the guarded write must not error")
     });
 
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(
-        !writer.is_finished(),
-        "the write must queue behind the lock"
+    // The lock is STILL HELD here. A blocking guard would sit on it until the
+    // holder commits and blow this timeout; the non-blocking one must answer.
+    let outcome = tokio::time::timeout(Duration::from_secs(10), writer)
+        .await
+        .expect(
+            "the guard must not wait on the task row -- waiting is the ABBA edge \
+             against poison_pill's task -> execution order",
+        )
+        .expect("writer task");
+    assert_eq!(
+        outcome,
+        TerminalWriteOutcome::ClaimLost,
+        "a row held by another transaction must read as a lost claim and withdraw"
     );
 
-    // Release the lock WITHOUT transferring the claim.
     diesel::sql_query("COMMIT")
         .execute(&mut holder)
         .await
         .expect("release the lock");
 
-    let outcome = tokio::time::timeout(Duration::from_secs(30), writer)
-        .await
-        .expect("the guarded write must unblock")
-        .expect("writer task");
+    // Withdrawing wrote nothing, so the task stays claimable/runnable.
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "a withdrawn escalation must append no terminal event; got {history:?}"
+    );
+    assert_eq!(load_execution(&url, exec_id).await.state, "RUNNING");
+    assert_eq!(load_task(&url, task.id).await.state, "RUNNING");
+    assert_eq!(
+        *recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        0,
+        "a withdrawn escalation must not fire the page-severity counter"
+    );
+}
+
+/// A poison-pill requeue hands the row back to the pool with the SAME worker
+/// still eligible to re-claim it (round-32 F3).
+///
+/// `poison_pill::requeue_orphan` sets `PENDING` / `worker_id = NULL` and bumps
+/// `crash_strikes`; nothing stops the original worker from winning the row
+/// again. A guard keyed on `(state, worker_id)` alone would pass for that NEW
+/// claim and let the stale escalation terminally fail work that had just been
+/// legitimately restarted -- which is why the guard also matches
+/// `crash_strikes`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_same_worker_reclaim_after_a_requeue_is_not_failed_by_the_stale_escalation() {
+    let (url, _container) = setup_db().await;
+
+    let (exec_id, task) = seed_claimed_task(&url, "q804-round32-strikes", "worker-a").await;
+    assert_eq!(
+        task.crash_strikes, 0,
+        "the dispatcher's snapshot is the pre-requeue claim"
+    );
+
+    // Requeue (strike bumped), then the SAME worker re-claims it.
+    let mut mover = connect(&url).await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET state = 'RUNNING', worker_id = 'worker-a', crash_strikes = crash_strikes + 1 \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task.id)
+    .execute(&mut mover)
+    .await
+    .expect("requeue then re-claim with the same worker");
+
+    let mut conn = connect(&url).await;
+    let preloaded = preload_failure_history(&mut conn, &task).await;
+    let recorded = Arc::new(Mutex::new(0usize));
+    let recorded_writer = Arc::clone(&recorded);
+    let outcome = commit_terminal_failure_if_still_claimed(
+        &mut conn,
+        &task,
+        "worker-a",
+        "no_capable_worker: activity 'charge' is not registered",
+        preloaded,
+        || {
+            *recorded_writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        },
+    )
+    .await
+    .expect("the guarded write must not error");
+
+    assert_eq!(
+        outcome,
+        TerminalWriteOutcome::ClaimLost,
+        "the strike bump means this is a NEW claim -- matching worker_id alone \
+         would wrongly fail freshly restarted work"
+    );
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "a withdrawn escalation must append no terminal event; got {history:?}"
+    );
+    assert_eq!(load_execution(&url, exec_id).await.state, "RUNNING");
+    let after = load_task(&url, task.id).await;
+    assert_eq!(after.state, "RUNNING");
+    assert!(after.error.is_none());
+    assert_eq!(
+        *recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        0,
+        "a withdrawn escalation must not fire the page-severity counter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_still_held_through_the_terminal_write_still_fails_the_task() {
+    // The control for the three tests above: same guard, same call shape, but
+    // the claim the dispatcher holds is still the live one -- so the escalation
+    // must commit. Without it, a guard that simply always withdrew would pass
+    // all three and silently break AC3's boundedness.
+    let (url, _container) = setup_db().await;
+
+    let (exec_id, task) = seed_claimed_task(&url, "q804-round31-ok", "worker-a").await;
+
+    let mut conn = connect(&url).await;
+    let preloaded = preload_failure_history(&mut conn, &task).await;
+    let recorded = Arc::new(Mutex::new(0usize));
+    let recorded_writer = Arc::clone(&recorded);
+    let outcome = commit_terminal_failure_if_still_claimed(
+        &mut conn,
+        &task,
+        "worker-a",
+        "no_capable_worker: activity 'charge' is not registered",
+        preloaded,
+        || {
+            *recorded_writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        },
+    )
+    .await
+    .expect("the guarded write must not error");
+
     assert_eq!(outcome, TerminalWriteOutcome::Committed);
 
     let history = load_history(&url, exec_id).await;
@@ -3823,5 +3941,84 @@ async fn a_claim_still_held_through_the_terminal_write_still_fails_the_task() {
         1,
         "the page-severity counter must fire exactly once, and only for an \
          escalation that actually committed"
+    );
+}
+
+/// Codex round-31 P1 (second finding): the preloaded `next_event_id` is stale by
+/// the time the terminal write runs, so it must be re-derived under the
+/// execution row's lock.
+///
+/// Round 29 deliberately hoisted the history load OUT of the window between the
+/// escalation's last evidence check and its terminal write. That made the id it
+/// produced older, not fresher: a parallel activity completing in the widened
+/// window consumes the cached id, and appending `WorkflowFailed` at a consumed
+/// id aborts the whole terminal transaction on
+/// `UNIQUE(workflow_exec_id, event_id)`. The row is then left `RUNNING` under a
+/// LIVE incapable worker -- unclaimable, and invisible to orphan reclamation,
+/// which requires a dead heartbeat. That is a *worse* outcome than the
+/// escalation this code exists to perform.
+///
+/// The window is staged directly rather than raced: preload, then append, then
+/// commit.
+#[tokio::test]
+async fn a_terminal_write_appends_at_the_event_id_current_under_the_lock() {
+    let (url, _container) = setup_db().await;
+
+    let (exec_id, task) = seed_claimed_task(&url, "q804-round32", "worker-a").await;
+
+    let mut conn = connect(&url).await;
+    // What the escalation does first (round 29): pay the history read up front.
+    let preloaded = preload_failure_history(&mut conn, &task).await;
+
+    // Exactly the interleaving the finding names: a parallel activity completes
+    // in the window and consumes the id the preload cached. `seed_execution`
+    // appended `WorkflowStarted` at 0, so the preload cached 1.
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::ActivityCompleted {
+            activity_id: autumn_harvest::types::ActivityExecId::new(),
+            output: serde_json::json!("done"),
+        }],
+        1,
+    )
+    .await
+    .expect("the parallel completion must land at the cached id");
+
+    let outcome = commit_terminal_failure_if_still_claimed(
+        &mut conn,
+        &task,
+        "worker-a",
+        "no_capable_worker: activity 'charge' is not registered",
+        preloaded,
+        || {},
+    )
+    .await
+    .expect("the terminal write must not collide with the consumed event id");
+    assert_eq!(outcome, TerminalWriteOutcome::Committed);
+
+    // The escalation actually happened: the run is terminal, not stranded.
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "the terminal event must be appended at the CURRENT id, not the stale \
+         one (AC3 must still terminate); got {history:?}"
+    );
+    // And the parallel completion survived -- the refresh appended after it
+    // rather than colliding with it.
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. })),
+        "the parallel completion must not be clobbered; got {history:?}"
+    );
+    assert_eq!(load_execution(&url, exec_id).await.state, "FAILED");
+    let after = load_task(&url, task.id).await;
+    assert_eq!(
+        after.state, "FAILED",
+        "a collided append would roll the transaction back and strand this row \
+         RUNNING under a live worker, where orphan reclamation cannot see it"
     );
 }

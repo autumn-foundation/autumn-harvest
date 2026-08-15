@@ -6151,8 +6151,18 @@ async fn persist_workflow_failure(
         );
     }
 
+    // Best-effort diagnostics — a failure here must never affect the terminal
+    // write. Each check runs in its own savepoint so a swallowed error cannot
+    // leave the *enclosing* transaction aborted: since issue #804's round-31
+    // commit boundary, this function can run inside
+    // `commit_terminal_failure_if_still_claimed`'s outer transaction, where an
+    // aborted connection would silently downgrade its COMMIT to a ROLLBACK and
+    // report a terminal write that never landed.
     for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
+        let _ = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+            check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await
+        }))
+        .await;
     }
 
     for start in deferred {
@@ -16766,12 +16776,29 @@ pub enum TerminalWriteOutcome {
 /// still let a stale dispatcher terminally fail the **new** owner's task, and
 /// append `WorkflowFailed` to a run that a capable worker had just picked up.
 ///
-/// This makes the check and the write one transaction, with the row's
-/// `FOR UPDATE` lock held from the first to the last: a concurrent transfer
-/// either commits before the lock is taken (and is seen, so nothing is written)
-/// or blocks until this transaction commits (and finds a row that is already
-/// terminal). There is no interleaving in which the guard passes and the write
-/// lands on someone else's claim.
+/// This makes the check and the write one transaction, with the task row's lock
+/// held from the guard to the last write. A concurrent transfer either commits
+/// before the guard runs (and is seen, so nothing is written), holds the row's
+/// lock while the guard runs (and is skipped, so nothing is written — see
+/// [`queue::claim_still_held_for_update`] on why the guard does not *wait*), or
+/// starts after the guard has the lock (and blocks until this transaction
+/// commits, finding a row that is already terminal). There is no interleaving in
+/// which the guard passes and the write lands on someone else's claim.
+///
+/// **The claim, not just the worker.** The guard matches `crash_strikes` as well
+/// as `worker_id`, because [`crate::poison_pill::requeue_orphan`] hands a
+/// reclaimed row back to the pool with the *same* `worker_id` still eligible to
+/// re-claim it. A `(state, worker_id)`-only guard would pass for the new claim
+/// and let this stale escalation terminally fail work that had just been
+/// legitimately restarted.
+///
+/// **Event id.** The preloaded `next_event_id` is re-derived under the execution
+/// row's lock before it is used, because it was read before this transaction
+/// opened and a parallel activity completion may have consumed it. Appending at
+/// a consumed id aborts the terminal transaction on
+/// `UNIQUE(workflow_exec_id, event_id)` and strands the row `RUNNING` under a
+/// live worker (Codex round-31 P1). Round 29's hoist is preserved: the *full*
+/// history load stays outside; only the indexed `MAX(event_id)` runs here.
 ///
 /// **Lock order.** The execution row is locked first, then the task row —
 /// `harvest_task_queue`'s documented order (`enforce_activity_timeout`,
@@ -16803,12 +16830,39 @@ where
     let error = error.to_string();
     Box::pin(
         conn.transaction::<TerminalWriteOutcome, HarvestError, _>(async |conn| {
-            if let Some(exec_id) = preloaded.exec_id() {
-                lock_workflow_execution_row_only(conn, exec_id).await?;
-            }
-            if queue::read_capability_miss_state_for_update(conn, task.id, worker_id)
+            // Lock the execution row FIRST (the documented execution -> task
+            // order) and re-derive the event id under that lock. The preloaded
+            // id was read *before* this transaction opened, so a parallel
+            // activity completing in between has already consumed it; appending
+            // at a consumed id aborts the whole terminal transaction on
+            // `UNIQUE(workflow_exec_id, event_id)` and leaves the row `RUNNING`
+            // under a LIVE incapable worker -- unclaimable, and invisible to
+            // orphan reclamation, which requires a dead heartbeat (issue #804,
+            // Codex round-31 P1).
+            //
+            // This does not undo round 29. What round 29 hoisted out of the
+            // window was the *full* `store::load_history`, whose cost grows with
+            // the history; `next_event_id_for` is an indexed `MAX(event_id)`
+            // whose cost does not, and it takes the same execution-row lock, so
+            // it replaces the explicit lock rather than adding a read.
+            let preloaded = match preloaded {
+                PreloadedFailureHistory::Loaded { exec_id, .. } => {
+                    PreloadedFailureHistory::Loaded {
+                        exec_id,
+                        next_event_id: store::next_event_id_for(conn, exec_id).await?,
+                    }
+                }
+                // Appends nothing, so there is no id to refresh -- but the
+                // execution row is still locked first, for the ordering.
+                other => {
+                    if let Some(exec_id) = other.exec_id() {
+                        lock_workflow_execution_row_only(conn, exec_id).await?;
+                    }
+                    other
+                }
+            };
+            if !queue::claim_still_held_for_update(conn, task.id, worker_id, task.crash_strikes)
                 .await?
-                .is_none()
             {
                 return Ok(TerminalWriteOutcome::ClaimLost);
             }

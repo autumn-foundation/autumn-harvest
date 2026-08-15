@@ -964,3 +964,94 @@ log message, and the test asserts exactly that rather than pretending otherwise.
   fire exactly once. It **passes under the RED patch too**, which is the point:
   a guard that simply always withdrew would satisfy the race test and silently
   break AC3.
+
+## Review round 32
+
+Four findings on the round-31 commit boundary itself: one from Codex, three from
+a concurrency review agent run against the new transaction. Three are real
+correctness bugs *introduced by* round 31; the fourth is a pre-existing hazard
+that round 31 made reachable.
+
+### The event id the terminal write appends at was stale (Codex P1)
+
+Round 29 hoisted the history load OUT of the window between an escalation's last
+evidence check and its terminal write. That made the `next_event_id` it produced
+older, not fresher: an activity completing in the widened window consumes the
+cached id, and appending `WorkflowFailed` at a consumed id aborts the whole
+terminal transaction on `UNIQUE(workflow_exec_id, event_id)`. The row is then
+left `RUNNING` under a **live** incapable worker — unclaimable, and invisible to
+orphan reclamation, which requires a dead heartbeat. That is a strictly worse
+outcome than the escalation this code exists to perform.
+
+`commit_terminal_failure_if_still_claimed` now re-derives the id under the
+execution row's lock, via the existing `store::next_event_id_for`. That function
+already takes the `FOR UPDATE` the ordering wanted anyway, so the fix *replaces*
+the explicit lock rather than adding a read — and round 29's hoist survives
+intact, because only the indexed `MAX(event_id)` runs inside the window, never
+the full history load.
+
+### The guard's `FOR UPDATE` was an ABBA edge against poison-pill (F1)
+
+`poison_pill::quarantine_orphan` locks the **task** row first and the
+**execution** row second (via the dead-letter FK, then `fail_owning_workflow`) —
+the exact inverse of the order this commit boundary takes, and the order
+`harvest_task_queue`'s own convention documents. A blocking `FOR UPDATE` on the
+task row therefore let an escalating dispatcher hold the execution row while
+waiting for a task row a quarantine already held while waiting for the execution
+row: a genuine deadlock cycle, on precisely the pair of paths that race (the
+worker being quarantined is the one whose heartbeat went stale *while it was
+escalating*).
+
+The guard is now `FOR UPDATE SKIP LOCKED`. That removes the waiting edge
+entirely — this transaction never blocks on the task row, so it cannot be part
+of a lock cycle. A row someone else holds simply reads as "not ours right now",
+which the caller treats exactly like a lost claim: withdraw, release, re-decide
+on the next redelivery. Withdrawing is always the safe direction.
+
+### The guard matched the worker, not the claim (F3)
+
+`poison_pill::requeue_orphan` hands a reclaimed row back to the pool with
+`state = PENDING`, `worker_id = NULL` and `crash_strikes` bumped — and nothing
+stops the *original* worker from winning it again. A `(state, worker_id)`-only
+guard passes for that **new** claim, so a stale escalation could terminally fail
+work that had just been legitimately restarted. The guard now also matches
+`crash_strikes`, which is the value the requeue moves; the dispatcher's snapshot
+carries the pre-requeue strike count, so a re-claim reads as a lost claim.
+
+### A best-effort diagnostic could silently downgrade COMMIT to ROLLBACK (F5)
+
+`persist_workflow_failure` runs its deferred unfinished-handler checks with
+`let _ = ...`, which swallows the Rust error but leaves the *connection's*
+transaction aborted. Before round 31 that ran in autocommit and was harmless.
+Inside the new outer transaction it is not: the later COMMIT becomes a ROLLBACK
+and `commit_terminal_failure_if_still_claimed` reports `Committed` for a write
+that never landed. Each check now runs in its own savepoint, so an error is
+contained where it is swallowed.
+
+### Tests
+
+- `queue::tests::commit_boundary_claim_guard_locks_without_waiting_and_keys_on_the_claim`
+  — no-DB shape test pinning `FOR UPDATE`, `SKIP LOCKED`, and all three of
+  `state` / `worker_id` / `crash_strikes`.
+- `a_terminal_write_appends_at_the_event_id_current_under_the_lock` (DB) — the
+  window staged directly: preload, then append an unrelated event at the cached
+  id, then commit. **Confirmed RED** against the pre-fix code with
+  `duplicate key value violates unique constraint "harvest_events_workflow_exec_id_event_id_key"`;
+  GREEN with the re-derivation, and the intervening event is not clobbered.
+- `a_task_row_locked_by_a_concurrent_transaction_withdraws_without_waiting` (DB)
+  — the ABBA-avoidance proof, asserted directly rather than by proxy: the write
+  must complete **while the lock is still held**, which a blocking guard cannot
+  do. **Confirmed RED** with `Elapsed(())` against a blocking `FOR UPDATE`.
+- `a_same_worker_reclaim_after_a_requeue_is_not_failed_by_the_stale_escalation`
+  (DB) — bumps the strike and re-claims with the same worker id. **Confirmed
+  RED** with `left: Committed, right: ClaimLost` against a strike-blind guard.
+- `a_claim_transferred_before_the_terminal_write_is_not_failed_by_the_stale_dispatcher`
+  (DB) — round 31's race test, restaged as a committed transfer now that the
+  guard no longer blocks.
+- `a_claim_still_held_through_the_terminal_write_still_fails_the_task` (DB) —
+  the control, unchanged in intent: a live claim must still commit (AC3
+  boundedness) and fire the counter exactly once. It passes under every RED
+  patch above, which is the point — a guard that always withdrew would satisfy
+  the three withdrawal tests and silently break AC3.
+- All four withdrawal tests also assert the page-severity counter fired **zero**
+  times, pinning that `before_write` runs only for a write that actually lands.
