@@ -2264,6 +2264,98 @@ pub async fn release_task_for_capability_miss(
     Ok(released > 0)
 }
 
+/// SQL for [`reset_capability_misses_after_inline_progress`]. Extracted as a
+/// `const fn` so its shape is unit-testable without a database.
+///
+/// Guarded on the claim (`state = 'RUNNING' AND worker_id = $2`) so a row a
+/// concurrent poison-pill reclaim or operator action already took out from
+/// under this dispatch is never rewritten.
+#[must_use]
+pub const fn reset_capability_misses_after_inline_progress_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET capability_misses = 0, \
+         capability_miss_workers = '{}' \
+     WHERE id = $1 \
+       AND state = 'RUNNING' \
+       AND worker_id = $2"
+}
+
+/// Start the capability-miss budget clean because this dispatch made durable
+/// inline progress (issue #804, Codex round-20 P1).
+///
+/// `capability_misses` / `capability_miss_workers` describe **one frontier** —
+/// the position the workflow is currently stuck at, and therefore the single
+/// handler a claiming worker must register to move it. The park-time reset
+/// ([`park_workflow_task_sticky_query`]) already encodes that: a park is proof a
+/// capable worker handled the row, so the next deploy starts with a full budget.
+///
+/// A workflow task can advance through several local-activity frontiers in ONE
+/// dispatch, though: `process_workflow_task` runs them inline in a loop and only
+/// parks on a *non*-local suspension. Each completion is appended durably, so
+/// the frontier moves permanently — but nothing parked, so the counters kept
+/// describing the frontier that is now behind us. Worker A missing local
+/// activity X and worker B later missing local activity Y then read as "two
+/// distinct workers missed this task", the registry confirms both are live, and
+/// the run is failed terminally even though A may register Y. That conclusion is
+/// the exact opposite of the truth, which is the failure mode issue #804 exists
+/// to prevent.
+///
+/// Resetting here cannot be used to release forever: a *completed* local
+/// activity resolves from history on the next replay
+/// (`HistoryMatch::Matched`) and emits no command, so a given frontier can make
+/// inline progress at most once, and a workflow has a bounded number of
+/// local-activity call sites (itself bounded by the history hard cap). The
+/// budget therefore becomes "per frontier" rather than "per task", which is what
+/// it always meant.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn reset_capability_misses_after_inline_progress(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    let updated = diesel::sql_query(reset_capability_misses_after_inline_progress_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(updated > 0)
+}
+
+/// The two capability-miss columns as they stand **now** (issue #804, Codex
+/// round-20 P1).
+///
+/// `handle_capability_miss` cannot read them off the claimed `TaskQueueItem`:
+/// that snapshot is taken at claim time, and
+/// [`reset_capability_misses_after_inline_progress`] may have rewritten the row
+/// since, from inside this very dispatch. Deciding release-vs-escalate on the
+/// stale snapshot would charge a prior frontier's misses to the current one.
+///
+/// Returns `None` when the row is gone, which callers treat as "fall back to the
+/// snapshot" rather than an error: losing the row is already handled downstream
+/// by the release's own `0 rows affected` path.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn current_capability_miss_state(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+) -> HarvestResult<Option<(i32, Vec<String>)>> {
+    use crate::schema::harvest_task_queue::dsl;
+    let row: Option<(i32, Vec<String>)> = dsl::harvest_task_queue
+        .filter(dsl::id.eq(task_id))
+        .select((dsl::capability_misses, dsl::capability_miss_workers))
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row)
+}
+
 /// Hint for sticky cross-worker routing when parking or enqueueing a task.
 ///
 /// When both fields are set, the task is pinned to `worker_id` for `timeout`
@@ -3812,6 +3904,42 @@ mod tests {
     // -----------------------------------------------------------------------
     // Capability-miss release (issue #804)
     // -----------------------------------------------------------------------
+
+    /// Durable inline progress moves the frontier, so the budget it carried
+    /// belongs to a handler the run no longer needs. Same reset the park path
+    /// performs, at the other point a workflow task demonstrably advances
+    /// (issue #804, Codex round-20 P1).
+    #[test]
+    fn inline_progress_reset_clears_both_capability_miss_columns() {
+        let sql = reset_capability_misses_after_inline_progress_query();
+        assert!(
+            sql.contains("capability_misses = 0"),
+            "inline progress must zero the count: {sql}"
+        );
+        assert!(
+            sql.contains("capability_miss_workers = '{}'"),
+            "clearing the count alone leaves the DISTINCT set describing the \
+             frontier that is now behind us, and that set is what the primary \
+             bound escalates on: {sql}"
+        );
+    }
+
+    /// The reset may only ever rewrite the row this dispatch still holds. A
+    /// concurrent poison-pill reclaim (or an operator action) can take the claim
+    /// mid-dispatch; refunding the budget on a row now owned by someone else
+    /// would hand a fresh budget to a frontier that never advanced.
+    #[test]
+    fn inline_progress_reset_is_guarded_on_this_workers_claim() {
+        let sql = reset_capability_misses_after_inline_progress_query();
+        assert!(
+            sql.contains("state = 'RUNNING'"),
+            "must not resurrect a budget on a row that left RUNNING: {sql}"
+        );
+        assert!(
+            sql.contains("worker_id = $2"),
+            "must not rewrite a row another worker now holds: {sql}"
+        );
+    }
 
     #[test]
     fn park_queries_reset_the_capability_miss_counter() {

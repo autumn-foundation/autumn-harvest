@@ -14158,6 +14158,22 @@ async fn process_workflow_task(
                         return Ok(());
                     }
                 };
+                // Issue #804 (Codex round-20 P1): the local activity resolved
+                // and its events are durably appended, so the workflow's
+                // frontier has moved permanently past it. Every capability miss
+                // recorded before now was recorded against a handler this run no
+                // longer needs, so the next frontier must start with a clean
+                // budget — otherwise a miss on X and a later miss on Y read as
+                // "two distinct workers missed this task" and terminally fail a
+                // run the fleet can still finish.
+                //
+                // Bounded: a completed local activity replays from history
+                // (`HistoryMatch::Matched`) and emits no command, so a frontier
+                // can make inline progress at most once.
+                if !new_events.is_empty() {
+                    queue::reset_capability_misses_after_inline_progress(conn, task.id, worker_id)
+                        .await?;
+                }
                 history_events.extend(new_events);
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
@@ -15719,9 +15735,35 @@ async fn handle_capability_miss(
     // P1). See `read_live_fleet_or_degrade` for why a failure here degrades to
     // an empty set instead of propagating.
     let live_workers = read_live_fleet_or_degrade(conn, task, policy.worker_stale_secs).await;
+    // Issue #804 (Codex round-20 P1): read the counters as they stand NOW, not
+    // off the claim-time snapshot in `task`. One dispatch can resolve several
+    // local-activity frontiers inline, and each resolution resets the budget
+    // (`reset_capability_misses_after_inline_progress`) precisely because the
+    // misses recorded before it were recorded against a handler the run no
+    // longer needs. Deciding on the snapshot would charge those to the frontier
+    // we are actually stuck at now.
+    //
+    // The row is claimed by this worker, so nothing else is mutating these two
+    // columns; a vanished row (`None`) falls back to the snapshot, and the
+    // release's own `0 rows affected` path handles it a few lines below.
+    let (misses_before, distinct_before) =
+        match queue::current_capability_miss_state(conn, task.id).await {
+            Ok(Some(state)) => state,
+            Ok(None) => (task.capability_misses, task.capability_miss_workers.clone()),
+            Err(error) => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    %error,
+                    "failed to re-read the capability-miss counters; falling back to the \
+                     claim-time snapshot, which may over-count if this dispatch made \
+                     durable inline progress"
+                );
+                (task.capability_misses, task.capability_miss_workers.clone())
+            }
+        };
     let resolution = resolve_capability_miss(
-        &task.capability_miss_workers,
-        task.capability_misses,
+        &distinct_before,
+        misses_before,
         worker_id,
         policy.max_redeliveries,
         task.session_id,
@@ -15735,7 +15777,11 @@ async fn handle_capability_miss(
             // the same incapable worker re-claiming its own released row.
             // The backoff is applied against the DB clock inside the release
             // statement, so host/Postgres skew cannot swallow it.
-            let delay = capability_miss_backoff(task.capability_misses);
+            // Scaled off the CURRENT frontier's miss count (issue #804, Codex
+            // round-20 P1), not the claim-time snapshot: a frontier the fleet
+            // has not been asked about yet must start at the base delay rather
+            // than inherit a prior frontier's backoff.
+            let delay = capability_miss_backoff(misses_before);
             // The phase governs both conditional clauses of the release:
             // issue #367's `crash_strikes` may only be cleared by a dispatch
             // that ran the handler to a conclusion (Codex round-12 P1), and

@@ -464,6 +464,44 @@ async fn wait_for_capability_misses(
     .unwrap_or_else(|_| panic!("no task reached capability_misses >= {want} within {timeout:?}"))
 }
 
+/// Wait until `worker_id` has recorded a miss on the task, or the execution
+/// went terminal trying.
+///
+/// The frontier-scoping test cannot wait on `capability_misses` reaching a
+/// count: the whole point of the fix is that the counter RESETS on durable
+/// inline progress, so the target value is identical before and after it. It
+/// also cannot wait on the release alone — under the bug the miss escalates and
+/// the row never returns to `PENDING`, which would surface a crisp accounting
+/// regression as a bare timeout. Waiting on "this worker's miss is resolved,
+/// either way" terminates promptly under both outcomes and lets the assertions
+/// name the difference.
+async fn wait_for_miss_by(
+    url: &str,
+    exec_id: ExecutionId,
+    worker_id: &str,
+    timeout: Duration,
+) -> Option<TaskQueueItem> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(task) = load_tasks(url, exec_id)
+                .await
+                .into_iter()
+                .find(|t| t.capability_miss_workers.iter().any(|w| w == worker_id))
+            {
+                break Some(task);
+            }
+            if autumn_harvest::erase::is_terminal_state(&load_execution(url, exec_id).await.state) {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("worker {worker_id} neither recorded a miss nor sealed the run within {timeout:?}")
+    })
+}
+
 async fn wait_for_state(
     url: &str,
     exec_id: ExecutionId,
@@ -1233,6 +1271,186 @@ async fn a_local_activity_miss_releases_before_committing_its_batch() {
          phase-1 assertion would hold for the wrong reason"
     );
     assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Frontier-scoped miss accounting (issue #804, Codex round-20 P1).
+// ---------------------------------------------------------------------------
+
+const Q_TWO_FRONTIER: &str = "q804-two-frontier";
+
+fn second_frontier_activity(
+    _ctx: &autumn_harvest::ActivityContext,
+    _input: serde_json::Value,
+) -> BoxFut<'_> {
+    Box::pin(async move { Ok(serde_json::json!("second frontier done")) })
+}
+
+/// Two local-activity frontiers in one workflow. The inline drive loop resolves
+/// them in the SAME dispatch without parking, so a worker can clear the first
+/// and still miss the second.
+fn workflow_two_local_frontiers(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.execute_local_activity_raw("first_local", input.clone(), None, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.execute_local_activity_raw("second_local", input, None, None)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+fn local_activity_info_on(
+    name: &'static str,
+    handler: autumn_harvest::info::ActivityHandlerFn,
+    queue: &'static str,
+) -> ActivityInfo {
+    ActivityInfo {
+        is_local: true,
+        default_queue: None,
+        ..activity_info(name, handler, queue)
+    }
+}
+
+/// One member of the deliberately non-nested two-frontier fleet: registers the
+/// shared workflow and exactly ONE of the two local activities.
+///
+/// Budget of 1 throughout, so the distinct-worker bound escalates on the SECOND
+/// distinct misser — conflating the two frontiers therefore fails the run at the
+/// earliest possible point rather than somewhere downstream.
+fn two_frontier_worker(
+    worker_id: &str,
+    local: &'static str,
+    handler: autumn_harvest::info::ActivityHandlerFn,
+    metrics: &Arc<CapabilityMetrics>,
+) -> Arc<Worker> {
+    build_worker(
+        worker_id,
+        &[Q_TWO_FRONTIER],
+        build_registry(
+            vec![workflow_info(
+                "two_frontier_wf",
+                workflow_two_local_frontiers,
+            )],
+            vec![local_activity_info_on(local, handler, Q_TWO_FRONTIER)],
+            Arc::clone(metrics),
+        ),
+        1,
+    )
+}
+
+/// `capability_misses` / `capability_miss_workers` describe ONE frontier — the
+/// position the workflow is currently stuck at. Durable inline progress moves
+/// that position, so every miss recorded before it was recorded against a
+/// *different* handler and must not count against the new one.
+///
+/// The fleet here is deliberately non-nested, which is what makes the run
+/// completable only by successive claims: worker A has `second_local` but not
+/// `first_local`; worker B has `first_local` but not `second_local`. Neither can
+/// finish the run alone, but B can clear frontier 1 and A can then clear
+/// frontier 2 — so a correct engine completes it.
+///
+/// Without frontier scoping, B's miss on `second_local` is added to A's miss on
+/// `first_local`, the registry reports every live worker as having missed "the
+/// task", and the run is terminally failed at a budget of 1 while A — which
+/// registers the handler the run is actually waiting on — is live and polling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_inline_progress_starts_the_next_frontier_with_a_clean_budget() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "two_frontier_wf",
+        serde_json::json!({"n": 20}),
+        Q_TWO_FRONTIER,
+    )
+    .await;
+
+    let metrics = Arc::new(CapabilityMetrics::default());
+    let has_second = || {
+        two_frontier_worker(
+            "worker-has-second",
+            "second_local",
+            second_frontier_activity,
+            &metrics,
+        )
+    };
+
+    // --- Phase 1: A misses frontier 1 (`first_local`). ----------------------
+    let released_a = with_worker_running(&has_second(), &pool, async {
+        wait_for_capability_misses(&url, exec_id, 1, Duration::from_secs(30)).await
+    })
+    .await;
+    assert_released_for_a_peer(&released_a);
+    assert_eq!(
+        released_a.capability_miss_workers,
+        vec!["worker-has-second".to_string()],
+        "phase 1 records A as the misser of frontier 1"
+    );
+
+    // --- Phase 2: B clears frontier 1 durably, then misses frontier 2. ------
+    let has_first = two_frontier_worker(
+        "worker-has-first",
+        "first_local",
+        peer_only_activity,
+        &metrics,
+    );
+
+    let released_b = with_worker_running(&has_first, &pool, async {
+        wait_for_miss_by(&url, exec_id, "worker-has-first", Duration::from_secs(30)).await
+    })
+    .await;
+
+    // The premise: B really did make durable progress before missing.
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::LocalActivityCompleted { .. })),
+        "phase 2's premise is that B durably completed frontier 1 before \
+         missing frontier 2; without that event this test proves nothing: {history:?}"
+    );
+    assert_eq!(
+        load_execution(&url, exec_id).await.state,
+        "RUNNING",
+        "B missed a frontier NO worker has yet been asked about -- A has never \
+         been shown `second_local`. Failing here asserts the exact opposite of \
+         the truth while a capable worker is live"
+    );
+    let released_b = released_b.expect(
+        "B must record a miss and release; a sealed run here IS the bug -- the \
+         miss was charged to the frontier A already missed",
+    );
+    assert_released_for_a_peer(&released_b);
+    assert_eq!(
+        released_b.capability_miss_workers,
+        vec!["worker-has-first".to_string()],
+        "durable inline progress starts a NEW frontier, so the set must hold \
+         only the workers that missed THIS one -- A's miss was at frontier 1"
+    );
+    assert_eq!(
+        released_b.capability_misses, 1,
+        "the count is scoped to the current frontier too, or the configured-total \
+         bound inherits the prior frontier's spend"
+    );
+
+    // --- Phase 3: A replays past frontier 1 and clears frontier 2. ----------
+    let completed = with_worker_running(&has_second(), &pool, async {
+        wait_for_state(&url, exec_id, "COMPLETED", Duration::from_secs(30)).await
+    })
+    .await;
+
+    assert_eq!(
+        completed.output,
+        Some(serde_json::json!("second frontier done")),
+        "A replays past the durably-completed frontier 1 and runs frontier 2"
+    );
+    assert!(
+        dead_letter_errors(&url, exec_id).await.is_empty(),
+        "a run the fleet could finish must never reach the DLQ"
+    );
 }
 
 // ---------------------------------------------------------------------------
