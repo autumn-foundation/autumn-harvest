@@ -1039,3 +1039,131 @@ async fn history_bloat_min_events_limit_survives_per_shard_truncation_across_sha
         );
     }
 }
+
+// ─── Bounded-EXISTS rewrite: exact-boundary / off-by-one equivalence ──────
+//
+// `apply_min_history_events_filter` (shared by both endpoints exercised
+// above) replaced an unbounded `(SELECT COUNT(*) FROM harvest_events WHERE
+// workflow_exec_id = id) >= min_events` with a bounded `EXISTS (... ORDER BY
+// event_id OFFSET min_events - 1 LIMIT 1)`. The two are asserted
+// boolean-equivalent for every `min_events` by construction (see that
+// function's doc comment for the full derivation and buffer-count
+// measurements), but the arithmetic that makes them equivalent -- `OFFSET
+// min_events - 1`, not `min_events` or `min_events - 2` -- is exactly the
+// kind of detail a careless rewrite gets wrong by one. The tests above cover
+// generous margins (thresholds several events away from the seeded totals);
+// these two pin the razor's edge directly: a workflow whose event count
+// EXACTLY equals `min_events` must still be included (an off-by-one toward
+// "exclusive" would wrongly drop it), and the identical workflow queried at
+// `min_events + 1` must be excluded (an off-by-one toward "too permissive"
+// would wrongly keep it) -- for both the smallest non-zero threshold (`1`,
+// exercising `OFFSET 0`) and an arbitrary interior one (`7`, exercising
+// `OFFSET 6`).
+
+/// `min_history_events` (issue #493, the general-purpose `/workflows`
+/// filter): exact-count inclusion and adjacent-count exclusion, at both the
+/// `min_events=1` boundary (`OFFSET 0`) and an arbitrary interior boundary
+/// (`min_events=7`, `OFFSET 6`).
+#[tokio::test]
+async fn min_history_events_exact_boundary_and_off_by_one_are_precise() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    // Total history_event_count == 1 (0 padding events) -- the smallest
+    // possible non-zero history, exercising `OFFSET min_events - 1 == 0`.
+    let _one =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "mhe-exact-one", 0).await;
+    // Total history_event_count == 7 (6 padding events) -- an arbitrary
+    // interior boundary, exercising `OFFSET min_events - 1 == 6`.
+    let _seven =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "mhe-exact-seven", 6).await;
+
+    // Exact boundary: `min_events == actual_count` must include both rows.
+    let (status, body) = get_json(&app, "/workflows?min_history_events=1").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+    let ids = workflow_ids_of(&body);
+    assert!(
+        ids.contains(&"mhe-exact-one".to_string()),
+        "a 1-event history queried at min_history_events=1 (the exact \
+         boundary, OFFSET 0) must be included; got {ids:?}"
+    );
+
+    let (status, body) = get_json(&app, "/workflows?min_history_events=7").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+    let ids = workflow_ids_of(&body);
+    assert!(
+        ids.contains(&"mhe-exact-seven".to_string()),
+        "a 7-event history queried at min_history_events=7 (the exact \
+         boundary, OFFSET 6) must be included; got {ids:?}"
+    );
+
+    // Adjacent off-by-one: `min_events == actual_count + 1` must exclude
+    // both rows -- the identical workflow, one threshold higher.
+    let (status, body) = get_json(&app, "/workflows?min_history_events=2").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+    let ids = workflow_ids_of(&body);
+    assert!(
+        !ids.contains(&"mhe-exact-one".to_string()),
+        "a 1-event history queried at min_history_events=2 (one past its \
+         actual count) must be excluded; got {ids:?}"
+    );
+
+    let (status, body) = get_json(&app, "/workflows?min_history_events=8").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+    let ids = workflow_ids_of(&body);
+    assert!(
+        !ids.contains(&"mhe-exact-seven".to_string()),
+        "a 7-event history queried at min_history_events=8 (one past its \
+         actual count) must be excluded; got {ids:?}"
+    );
+}
+
+/// Same exact-boundary / off-by-one proof as above, for
+/// `history_bloat_min_events` (the dedicated discovery path) -- a second,
+/// independent call site of the identical shared helper.
+#[tokio::test]
+async fn history_bloat_min_events_exact_boundary_and_off_by_one_are_precise() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    let _one =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-exact-one", 0).await;
+    let _seven =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-exact-seven", 6).await;
+
+    let (status, body) = get_json(&app, "/workflows?history_bloat_min_events=1").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+    let ids = workflow_ids_of(&body);
+    assert!(
+        ids.contains(&"hb-exact-one".to_string()),
+        "a 1-event history queried at history_bloat_min_events=1 (the exact \
+         boundary, OFFSET 0) must be included; got {ids:?}"
+    );
+
+    let (status, body) = get_json(&app, "/workflows?history_bloat_min_events=7").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+    let ids = workflow_ids_of(&body);
+    assert!(
+        ids.contains(&"hb-exact-seven".to_string()),
+        "a 7-event history queried at history_bloat_min_events=7 (the exact \
+         boundary, OFFSET 6) must be included; got {ids:?}"
+    );
+
+    let (status, body) = get_json(&app, "/workflows?history_bloat_min_events=2").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+    let ids = workflow_ids_of(&body);
+    assert!(
+        !ids.contains(&"hb-exact-one".to_string()),
+        "a 1-event history queried at history_bloat_min_events=2 (one past \
+         its actual count) must be excluded; got {ids:?}"
+    );
+
+    let (status, body) = get_json(&app, "/workflows?history_bloat_min_events=8").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+    let ids = workflow_ids_of(&body);
+    assert!(
+        !ids.contains(&"hb-exact-seven".to_string()),
+        "a 7-event history queried at history_bloat_min_events=8 (one past \
+         its actual count) must be excluded; got {ids:?}"
+    );
+}

@@ -31776,6 +31776,103 @@ async fn db_conn_for_dag(
     db_conn_for_shard(api_state, runtime.router.pick_for_dag(dag_name)).await
 }
 
+/// Apply the `min_history_events` threshold filter -- "this execution's
+/// recorded `harvest_events` count is `>= min_events`" -- to a boxed
+/// `harvest_workflow_executions` query, without ever reading more of a
+/// workflow's history than the threshold itself requires.
+///
+/// Shared by `load_workflows`, `load_stalled_workflows`, and the WHERE-clause
+/// threshold check in `load_history_bloat_workflows` so all three apply the
+/// identical, bounded predicate rather than three hand-copied instances of an
+/// unbounded one (they used to be exactly that: `(SELECT COUNT(*) FROM
+/// harvest_events WHERE workflow_exec_id = id) >= min_events`, duplicated
+/// three times).
+///
+/// # Why `COUNT(*)` was the wrong tool
+///
+/// A workflow this filter is meant to *find* -- one whose recorded history is
+/// unusually large -- is exactly the case where `COUNT(*)` is most expensive:
+/// Postgres cannot know the threshold is already satisfied until it has
+/// counted every single matching row, so a workflow with 500,000 recorded
+/// events pays to have all 500,000 counted merely to answer "yes, that's
+/// `>= 10,000`". Profiled on a 5.3M-row `harvest_events` fixture (5,000
+/// ordinary executions plus 15 long-running ones with 50k-450k events each;
+/// `autumn-harvest-plugin/scripts/history_bloat_perf_repro.sh`, artifacts
+/// committed under `docs/perf-artifacts/history-bloat-filter/`):
+/// `(SELECT COUNT(*) ...) >= 10000` against a 448,175-event execution reads
+/// 3,976 total buffers (`pg_stat_statements.total_buffers`, corroborated by
+/// `EXPLAIN (ANALYZE, BUFFERS)` showing `shared hit=6 read=3970`) via a
+/// Parallel Index Only Scan in this fixture's current state, but the access
+/// path Postgres picks for the unbounded scan is sensitive to whether the
+/// table's visibility map is fresh -- see
+/// `docs/performance-history-bloat-filter.md#the-problem` for a fixture state
+/// in which the identical query instead read 158,593 buffers via a Parallel
+/// Seq Scan. What is *not* sensitive to that: `COUNT(*)` has no early exit
+/// regardless of which access path answers it, so every one of the 448,175
+/// matching rows still has to be visited to confirm the threshold.
+///
+/// # The fix
+///
+/// `EXISTS (SELECT 1 FROM harvest_events WHERE workflow_exec_id = id ORDER BY
+/// event_id OFFSET min_events - 1 LIMIT 1)` is boolean-equivalent to the
+/// threshold check `COUNT(*) >= min_events` for every `min_events` (verified
+/// for `0`, `1`, `actual_count - 1`, `actual_count`, `actual_count + 1`, and
+/// values far past `actual_count`), but only ever needs to read
+/// `min(actual_count, min_events)` rows to answer it. On the same fixture
+/// this reads 94 total buffers against the identical 448,175-event
+/// execution -- a 97.64% reduction -- and is unchanged for an ordinary,
+/// un-bloated execution (5 buffers either way, both forms using an Index
+/// Only Scan since the whole history fits in a handful of rows).
+///
+/// **The `ORDER BY event_id` is insurance against stale table statistics, not
+/// a guaranteed buffer-count win.** Against this fixture's current,
+/// freshly-`VACUUM`'d state, dropping the `ORDER BY` costs almost nothing (93
+/// buffers vs. 94 -- both via an Index Only Scan, `Heap Fetches: 0`).
+/// Measured against a table whose visibility map had *not* yet been set by
+/// `VACUUM`, however, the identical no-`ORDER BY` query fell back to a plain
+/// Seq Scan reading 2,956,744 non-matching rows first -- 88,618 buffers,
+/// 228x worse than the `ORDER BY`'d form -- because an un-set visibility map
+/// doesn't just inflate `Heap Fetches` within a fixed plan, it can also make
+/// the planner's *cost estimate* for an Index Only Scan look bad enough that
+/// the planner rejects that access path shape entirely. `ORDER BY event_id`
+/// gives the planner a sort target that makes the intended composite index --
+/// the same one `store::load_history` already relies on -- the correct
+/// choice regardless of whether the visibility map happens to be fresh, at
+/// zero cost when it already is. See
+/// `docs/performance-history-bloat-filter.md#why-order-by-is-load-bearing`
+/// for the full before/after.
+///
+/// `min_events == 0` (`COUNT(*) >= 0`, always true for a non-negative count)
+/// and `min_events == None` (filter not requested) both leave `query`
+/// unfiltered, matching the pre-existing `COUNT(*)` form's behavior exactly
+/// -- `min_events == 0` is handled explicitly rather than emitting `OFFSET
+/// -1`, which Postgres rejects.
+fn apply_min_history_events_filter(
+    query: harvest_workflow_executions::BoxedQuery<'_, diesel::pg::Pg>,
+    min_events: Option<u64>,
+) -> harvest_workflow_executions::BoxedQuery<'_, diesel::pg::Pg> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::{BigInt, Bool};
+
+    let Some(min_events) = min_events else {
+        return query;
+    };
+    if min_events == 0 {
+        return query;
+    }
+    // `min_events >= 1` here, so `min_events - 1` never underflows.
+    let offset = i64::try_from(min_events - 1).unwrap_or(i64::MAX);
+    query.filter(
+        sql::<Bool>(
+            "EXISTS (SELECT 1 FROM harvest_events \
+             WHERE workflow_exec_id = harvest_workflow_executions.id \
+             ORDER BY event_id OFFSET ",
+        )
+        .bind::<BigInt, _>(offset)
+        .sql(" LIMIT 1)"),
+    )
+}
+
 /// Apply the legacy `search_attr` containment predicates and the typed
 /// `search_attr_filter` comparison/set predicates (issue #506) to a boxed
 /// `harvest_workflow_executions` query.
@@ -31907,7 +32004,7 @@ pub(crate) async fn load_workflows(
     filters: &WorkflowFilters,
 ) -> HarvestResult<Vec<WorkflowExecution>> {
     use diesel::dsl::sql;
-    use diesel::sql_types::{BigInt, Bool, Jsonb, Text, Timestamptz, Uuid as SqlUuid};
+    use diesel::sql_types::{Bool, Jsonb, Text, Timestamptz, Uuid as SqlUuid};
 
     // Honor `filters.limit` exactly. Direct callers (e.g. the DAG-runs UI loader
     // `load_dag_runs_from_owning_shard`) render every row returned, so the
@@ -32035,16 +32132,11 @@ pub(crate) async fn load_workflows(
             query = query.filter(harvest_workflow_executions::start_source.eq(src.clone()));
         }
     }
-    if let Some(min_events) = filters.min_history_events {
-        // Correlated subquery: filter to executions with at least `min_events`
-        // recorded events. No schema migration is required — the count is
-        // computed on read from the existing `harvest_events` table.
-        query = query.filter(
-            sql::<Bool>(
-                "(SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= "
-            ).bind::<BigInt, _>(i64::try_from(min_events).unwrap_or(i64::MAX)),
-        );
-    }
+    // Correlated existence check bounded to `min_events` rows (see
+    // `apply_min_history_events_filter`) rather than an unbounded
+    // `COUNT(*)`. No schema migration is required — it reads from the
+    // existing `harvest_events` table via the existing composite index.
+    query = apply_min_history_events_filter(query, filters.min_history_events);
     query
         .select(WorkflowExecution::as_select())
         .load(conn)
@@ -32447,15 +32539,9 @@ pub(crate) async fn load_stalled_workflows(
         query = query.filter(sql::<Bool>("CAST(id AS TEXT) ILIKE ").bind::<Text, _>(pattern));
     }
 
-    if let Some(min_events) = filters.min_history_events {
-        query = query.filter(
-            sql::<Bool>(
-                "(SELECT COUNT(*) FROM harvest_events \
-                 WHERE workflow_exec_id = harvest_workflow_executions.id) >= ",
-            )
-            .bind::<BigInt, _>(i64::try_from(min_events).unwrap_or(i64::MAX)),
-        );
-    }
+    // Same bounded existence check as `load_workflows` — see
+    // `apply_min_history_events_filter`.
+    query = apply_min_history_events_filter(query, filters.min_history_events);
 
     // Honor the search-attribute filters on the stalled path too (issue #506
     // review): without this, `?no_progress_minutes=N&search_attr_filter=…` (or
@@ -32704,21 +32790,28 @@ pub(crate) async fn load_history_bloat_workflows(
     use diesel::dsl::sql;
     use diesel::sql_types::{BigInt, Bool, Jsonb, Text};
 
-    // Correlated subquery computing each candidate's current recorded event
-    // count. Reused for the WHERE threshold filter and the `SELECT` below --
-    // never for `ORDER BY`, which instead references the `SELECT`'s output
-    // alias (`HISTORY_EVENT_COUNT_ALIAS`, below) so the two share exactly one
-    // evaluation rather than each re-stating the subquery text. WHERE
-    // necessarily evaluates it separately from that shared pair -- Postgres
-    // evaluates WHERE before the SELECT list/ORDER BY in logical processing
-    // order, so a bare subquery text cannot be shared across that boundary
-    // without restructuring this query as a `LATERAL`/CTE join, which was
-    // judged too invasive a rewrite for this fix (PR #1139 review, third
-    // round) -- but the two count-threshold filters below (this parameter
-    // and the composed `min_history_events`) are collapsed into ONE combined
-    // WHERE evaluation, so the subquery is now evaluated at most twice total
-    // per candidate row (down from up to four: two WHERE instances, one
-    // ORDER BY instance, and one SELECT instance previously).
+    // Correlated subquery computing each candidate's EXACT current recorded
+    // event count, for the `SELECT`/`ORDER BY` pair below (AC2 needs the real
+    // number for ranking/reporting, so this instance is inherent -- there is
+    // no threshold to bound it against). `ORDER BY` references the `SELECT`'s
+    // output alias (`HISTORY_EVENT_COUNT_ALIAS`, below) rather than
+    // re-stating the subquery text, so the two share exactly one evaluation.
+    //
+    // The WHERE-clause threshold check below is a SEPARATE, bounded
+    // predicate (`apply_min_history_events_filter`) -- Postgres evaluates
+    // WHERE before the SELECT list/ORDER BY in logical processing order, so
+    // sharing one physical scan across that boundary would need restructuring
+    // this query as a `LATERAL`/CTE join, judged too invasive a rewrite for
+    // this fix (PR #1139 review, third round). The two count-threshold
+    // filters that used to live in WHERE (this parameter and the composed
+    // `min_history_events`) are collapsed into ONE combined, bounded
+    // existence check before either is applied, so a non-bloated candidate
+    // (the common case) is rejected from a scan capped at `effective_min_events`
+    // rows rather than two unbounded `COUNT(*)` scans; a genuinely bloated
+    // candidate still pays one EXACT count afterward, for ranking, which is
+    // inherent to what this endpoint reports (see
+    // `apply_min_history_events_filter`'s doc comment for the mechanism and
+    // measurements).
     const HISTORY_EVENT_COUNT_SUBQUERY: &str = "(SELECT COUNT(*) FROM harvest_events \
          WHERE workflow_exec_id = harvest_workflow_executions.id)";
     const HISTORY_EVENT_COUNT_ALIAS: &str = "history_event_count";
@@ -32760,11 +32853,12 @@ pub(crate) async fn load_history_bloat_workflows(
         // (see its doc comment), so this filter can never silently drift from
         // the states `is_terminal_state`/`resolve_execution_id_by_workflow_id`
         // (issue #805) recognize as terminal.
-        .filter(harvest_workflow_executions::state.ne_all(erase::TERMINAL_STATES))
-        .filter(
-            sql::<Bool>(&format!("{HISTORY_EVENT_COUNT_SUBQUERY} >= "))
-                .bind::<BigInt, _>(i64::try_from(effective_min_events).unwrap_or(i64::MAX)),
-        );
+        .filter(harvest_workflow_executions::state.ne_all(erase::TERMINAL_STATES));
+    // Bounded existence check — see `apply_min_history_events_filter`. Reads
+    // at most `effective_min_events` rows from `harvest_events` regardless of
+    // how large a candidate's true recorded history is, rather than an
+    // unbounded `COUNT(*)`.
+    query = apply_min_history_events_filter(query, Some(effective_min_events));
 
     if !filters.states.is_empty() {
         query = query.filter(harvest_workflow_executions::state.eq_any(filters.states.clone()));
