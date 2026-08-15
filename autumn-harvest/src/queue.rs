@@ -3910,6 +3910,48 @@ mod tests {
         );
     }
 
+    /// Retiring a frontier must NOT clear the consecutive-failure strike
+    /// counters (issue #804, Codex round-24 P2 — declined, and pinned here so
+    /// the decline is enforced rather than only argued).
+    ///
+    /// Every dispatch of a task that completes one local activity and then
+    /// kills its worker reaches this statement first, so a `crash_strikes = 0`
+    /// here would land on the crashing dispatch too.
+    /// `poison_pill::reclaim_orphaned_tasks` increments from the row's *current*
+    /// value, so the counter could never exceed `1` and the default
+    /// `poison_pill_threshold` of 3 would be unreachable — for the entire class
+    /// of poison that crashes after making some progress. The same holds for
+    /// #494's timeout strike and #782's panic strike, which live off-row but
+    /// are gated by the same `CapabilityMissPhase` rule.
+    ///
+    /// The counters are only ever preserved here, never incremented, so AC4
+    /// holds; genuine progress clears them by the intended route, the clean
+    /// continuation, which fires when the body carries forward to a suspension
+    /// instead of stalling at a later frontier.
+    #[test]
+    fn inline_progress_reset_never_launders_a_crash_strike() {
+        let sql = reset_capability_misses_after_inline_progress_query();
+        assert!(
+            !sql.contains("crash_strikes"),
+            "retiring a frontier is not evidence about worker crashes -- the \
+             crash happens AFTER it, so zeroing here caps the counter at 1 for \
+             any task that crashes post-progress: {sql}"
+        );
+        // Belt and braces: the statement's whole SET clause is the two
+        // capability columns, so no other streak state can be swept in by a
+        // future edit either.
+        let set = sql
+            .split("SET ")
+            .nth(1)
+            .and_then(|s| s.split(" WHERE").next())
+            .expect("statement has a SET ... WHERE shape");
+        assert_eq!(
+            set.matches('=').count(),
+            2,
+            "the reset must assign exactly the two capability columns: {set}"
+        );
+    }
+
     #[test]
     fn park_queries_reset_the_capability_miss_counter() {
         // `capability_misses` counts CONSECUTIVE misses: a task a capable

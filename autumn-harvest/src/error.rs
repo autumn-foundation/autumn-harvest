@@ -1765,6 +1765,51 @@ mod tests {
         );
     }
 
+    /// Durable inline progress at an *earlier* frontier does not license
+    /// clearing any of the three strikes at a *later* mid-body miss (issue
+    /// #804, Codex round-24 P2 — declined, pinned here so the decline is
+    /// enforced rather than only argued).
+    ///
+    /// The scenario: a task with a strike already recorded completes local
+    /// activity 1, then hits an unregistered local activity 2 and is released.
+    /// That release is `DuringHandler`, and it must leave all three counters
+    /// alone.
+    ///
+    /// The progress is real, but it is not evidence about what the counters
+    /// measure, because the crash / hang / panic they track happens *after* the
+    /// frontier that was retired. Worse, it is progress the task makes on
+    /// **every** dispatch: a body that hangs after local activity 1 completes
+    /// that activity every redelivery, so treating it as a streak-breaker makes
+    /// the #494 threshold unreachable for exactly the hang it exists to
+    /// contain — and identically for #367 and #782. It would also let an
+    /// incapable worker that registers local activity 1 but not 2 (the ordinary
+    /// rolling-deploy shape) zero a capable peer's streak on every claim, which
+    /// is the blameless-third-party defeat this whole type exists to prevent.
+    ///
+    /// The counters are preserved, never incremented, so AC4 holds; genuine
+    /// progress still clears them through the clean continuation, which fires
+    /// when the body carries forward to a suspension instead of stalling at a
+    /// later frontier.
+    #[test]
+    fn inline_progress_at_an_earlier_frontier_does_not_clear_any_strike() {
+        let after_progress = CapabilityMissPhase::DuringHandler;
+        assert!(
+            !after_progress.clears_crash_strikes(),
+            "the crash the counter tracks can still be ahead of the retired \
+             frontier, and the progress repeats on every dispatch"
+        );
+        assert!(
+            !after_progress.clears_workflow_timeout_strike(),
+            "a body that hangs AFTER its first local activity completes that \
+             activity on every redelivery, so clearing here makes the #494 \
+             threshold unreachable for exactly that hang"
+        );
+        assert!(
+            !after_progress.clears_panic_strike(),
+            "likewise for a body that panics after its first local activity"
+        );
+    }
+
     #[test]
     fn capability_miss_phase_clears_crash_strikes_only_after_the_handler_ran() {
         // Issue #367's `crash_strikes` counts worker processes this task has

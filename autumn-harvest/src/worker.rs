@@ -2867,6 +2867,37 @@ struct FrontierAccounting<'a> {
 /// (`LocalActivityCompleted`) and retry exhaustion (the
 /// `LocalActivityFailed` + `LocalActivityExhausted` pair). A non-terminal
 /// failure leaves the SAME local activity as the frontier, so it must not reset.
+///
+/// # Why only the capability columns
+///
+/// The three *consecutive-failure* strike states — `crash_strikes` (#367), the
+/// workflow-task-timeout strike (#494) and the panic strike (#782) — are
+/// deliberately **not** cleared here, and a later mid-body capability miss
+/// deliberately preserves them (see [`CapabilityMissPhase::clears_crash_strikes`]
+/// and its two siblings). Retiring a frontier is not evidence about any of
+/// them, because the thing they measure happens *after* it (Codex round-24 P2).
+///
+/// Clearing them here would be self-defeating rather than merely lax. Every
+/// dispatch of a task that completes one local activity and then kills its
+/// worker reaches this commit first, so the zero would land on the crashing
+/// dispatch too; `poison_pill::reclaim_orphaned_tasks` then increments from the
+/// row's *current* value, so `crash_strikes` could never exceed `1` and the
+/// default `poison_pill_threshold` of 3 would be unreachable — for the whole
+/// class of poison that crashes after making some progress. #494 and #782 have
+/// the identical shape: a body that hangs, or panics, after its first local
+/// activity completes that activity on every redelivery.
+///
+/// Clearing at *release* time instead (only when this dispatch made progress)
+/// avoids that, but reintroduces the blameless-third-party laundering the phase
+/// gating exists to prevent: an incapable worker that registers local activity 1
+/// but not local activity 2 — the ordinary rolling-deploy shape — would zero a
+/// capable peer's crash/hang/panic streak on every claim.
+///
+/// The counters are only ever *preserved* here, never incremented, so AC4 holds;
+/// and genuine progress still clears them by the intended route, the clean
+/// continuation ([`crate::queue::CleanContinuationChangeset`]), which fires when
+/// the body actually carries forward to a suspension instead of stalling at a
+/// later frontier.
 async fn append_frontier_resolution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -23807,6 +23838,12 @@ mod tests {
     /// That is precisely the failure the exhaustive `EscalationCause` match was
     /// introduced to prevent, so the ceiling gets its own variant that states
     /// the counts it actually observed.
+    ///
+    /// (The quoted wording above is the round-6 state, kept because it is what
+    /// this test was written against. `BudgetExhausted` reports its real
+    /// persisted counts too since round 23 — but the variants stay separate,
+    /// because the split is about the *conclusion* and the `outcome_label()`,
+    /// not only about which numbers get printed.)
     #[test]
     fn release_ceiling_escalation_reports_its_real_counts_not_a_fleet_conclusion() {
         use crate::telemetry::CAPABILITY_MISS_OUTCOME_ESCALATED;
