@@ -62,9 +62,9 @@ use autumn_harvest::telemetry::{
 };
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{
-    DbPool, HandlerRegistry, NO_CAPABLE_WORKER_PREFIX, SESSION_PINNED_ESCALATION_MARKER,
-    TerminalWriteOutcome, Worker, WorkerRuntimeConfig, commit_terminal_failure_if_still_claimed,
-    preload_failure_history,
+    CapabilityMissPolicy, DbPool, EscalationEvidenceRecheck, HandlerRegistry,
+    NO_CAPABLE_WORKER_PREFIX, SESSION_PINNED_ESCALATION_MARKER, TerminalWriteOutcome, Worker,
+    WorkerRuntimeConfig, commit_terminal_failure_if_still_claimed, preload_failure_history,
 };
 use autumn_harvest::{RetryPolicy, WorkflowContext, store};
 
@@ -3672,6 +3672,9 @@ async fn a_claim_transferred_before_the_terminal_write_is_not_failed_by_the_stal
         "worker-a",
         "no_capable_worker: activity 'charge' is not registered",
         preloaded,
+        // These pin the CLAIM guard specifically; the evidence re-decision has
+        // its own test below.
+        None,
         || {
             *recorded_writer
                 .lock()
@@ -3760,6 +3763,7 @@ async fn a_task_row_locked_by_a_concurrent_transaction_withdraws_without_waiting
             "worker-a",
             "no_capable_worker: activity 'charge' is not registered",
             preloaded,
+            None,
             || {
                 *recorded_writer
                     .lock()
@@ -3850,6 +3854,9 @@ async fn a_same_worker_reclaim_after_a_requeue_is_not_failed_by_the_stale_escala
         "worker-a",
         "no_capable_worker: activity 'charge' is not registered",
         preloaded,
+        // These pin the CLAIM guard specifically; the evidence re-decision has
+        // its own test below.
+        None,
         || {
             *recorded_writer
                 .lock()
@@ -3905,6 +3912,9 @@ async fn a_claim_still_held_through_the_terminal_write_still_fails_the_task() {
         "worker-a",
         "no_capable_worker: activity 'charge' is not registered",
         preloaded,
+        // These pin the CLAIM guard specifically; the evidence re-decision has
+        // its own test below.
+        None,
         || {
             *recorded_writer
                 .lock()
@@ -3991,6 +4001,9 @@ async fn a_terminal_write_appends_at_the_event_id_current_under_the_lock() {
         "worker-a",
         "no_capable_worker: activity 'charge' is not registered",
         preloaded,
+        // These pin the CLAIM guard specifically; the evidence re-decision has
+        // its own test below.
+        None,
         || {},
     )
     .await
@@ -4020,5 +4033,157 @@ async fn a_terminal_write_appends_at_the_event_id_current_under_the_lock() {
         after.state, "FAILED",
         "a collided append would roll the transaction back and strand this row \
          RUNNING under a live worker, where orphan reclamation cannot see it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Codex round-33 P1: the evidence re-decision must happen UNDER the task lock.
+//
+// A peer that re-registers clears itself from `capability_miss_workers` without
+// touching `worker_id` or `crash_strikes`, so the round-31/32 claim guard is
+// blind to it: ownership is unchanged, the guard passes, and the escalation
+// commits -- terminally failing a run the newly-capable peer could serve. These
+// two drive the guard with an evidence recheck attached and stage the clear on
+// either side of the decision.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_re_registers_before_the_lock_withdraws_the_escalation() {
+    let (url, _container) = setup_db().await;
+    let queue = "q804-round33";
+
+    let (exec_id, task) = seed_claimed_task(&url, queue, "worker-a").await;
+    // Both live workers have missed: the evidence supports escalating.
+    seed_live_worker(&url, "worker-a", queue).await;
+    seed_live_worker(&url, "worker-b", queue).await;
+    seed_prior_missing_workers(&url, exec_id, &["worker-a", "worker-b"]).await;
+
+    // worker-b re-registers onto a capable build: registration atomically drops
+    // its stale evidence. Ownership is untouched, so the claim guard cannot see
+    // this -- only an evidence read can.
+    let mut peer = connect(&url).await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET capability_miss_workers = array_remove(capability_miss_workers, 'worker-b') \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task.id)
+    .execute(&mut peer)
+    .await
+    .expect("peer re-registration clears its evidence");
+
+    let mut conn = connect(&url).await;
+    let preloaded = preload_failure_history(&mut conn, &task).await;
+    let recorded = Arc::new(Mutex::new(0usize));
+    let recorded_writer = Arc::clone(&recorded);
+    let outcome = commit_terminal_failure_if_still_claimed(
+        &mut conn,
+        &task,
+        "worker-a",
+        "no_capable_worker: activity 'charge' is not registered",
+        preloaded,
+        Some(EscalationEvidenceRecheck {
+            task: &task,
+            worker_id: "worker-a",
+            policy: CapabilityMissPolicy {
+                max_redeliveries: 2,
+                worker_stale_secs: 600,
+            },
+            frontier_reset_committed: false,
+        }),
+        || {
+            *recorded_writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        },
+    )
+    .await
+    .expect("the guarded write must not error");
+
+    assert!(
+        matches!(outcome, TerminalWriteOutcome::EvidenceChanged(_)),
+        "a peer that became capable before the lock must veto the escalation; got {outcome:?}"
+    );
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "a run a capable peer can serve must not be failed terminally; got {history:?}"
+    );
+    assert_eq!(load_execution(&url, exec_id).await.state, "RUNNING");
+    let after = load_task(&url, task.id).await;
+    assert_eq!(after.state, "RUNNING");
+    assert!(after.error.is_none());
+    assert_eq!(
+        *recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        0,
+        "a withdrawn escalation must not fire the page-severity counter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn evidence_that_still_supports_escalation_under_the_lock_still_commits() {
+    // The control: identical setup and an attached recheck, but nobody becomes
+    // capable -- so the escalation must still commit. Without it, a recheck
+    // that always withdrew would satisfy the test above and silently break
+    // AC3's boundedness.
+    let (url, _container) = setup_db().await;
+    let queue = "q804-round33-ok";
+
+    let (exec_id, task) = seed_claimed_task(&url, queue, "worker-a").await;
+    seed_live_worker(&url, "worker-a", queue).await;
+    seed_live_worker(&url, "worker-b", queue).await;
+    seed_prior_missing_workers(&url, exec_id, &["worker-a", "worker-b"]).await;
+
+    let mut conn = connect(&url).await;
+    let preloaded = preload_failure_history(&mut conn, &task).await;
+    let recorded = Arc::new(Mutex::new(0usize));
+    let recorded_writer = Arc::clone(&recorded);
+    let outcome = commit_terminal_failure_if_still_claimed(
+        &mut conn,
+        &task,
+        "worker-a",
+        "no_capable_worker: activity 'charge' is not registered",
+        preloaded,
+        Some(EscalationEvidenceRecheck {
+            task: &task,
+            worker_id: "worker-a",
+            policy: CapabilityMissPolicy {
+                max_redeliveries: 2,
+                worker_stale_secs: 600,
+            },
+            frontier_reset_committed: false,
+        }),
+        || {
+            *recorded_writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        },
+    )
+    .await
+    .expect("the guarded write must not error");
+
+    assert_eq!(
+        outcome,
+        TerminalWriteOutcome::Committed,
+        "evidence that still names every live worker as incapable must escalate (AC3)"
+    );
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "the escalation must terminate the run; got {history:?}"
+    );
+    assert_eq!(load_execution(&url, exec_id).await.state, "FAILED");
+    assert_eq!(
+        *recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        1,
+        "the page-severity counter must fire exactly once for a committed escalation"
     );
 }

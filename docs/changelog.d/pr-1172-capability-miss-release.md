@@ -1055,3 +1055,64 @@ contained where it is swallowed.
   the three withdrawal tests and silently break AC3.
 - All four withdrawal tests also assert the page-severity counter fired **zero**
   times, pinning that `before_write` runs only for a write that actually lands.
+
+## Review round 33
+
+**The evidence re-decision has to happen under the terminal lock (Codex P1).**
+
+Round 32 made the commit boundary validate the *claim* — `state`, `worker_id`
+and `crash_strikes`, all under the task row's lock. That closes ownership races,
+but it is blind to the one thing the escalation actually rests on: the evidence.
+A peer re-registering onto a capable build clears itself from the task's
+`capability_miss_workers` array (`array_remove`) and touches **neither**
+`worker_id` **nor** `crash_strikes` — so ownership is unchanged, the guard
+passes, and the stale escalation commits, terminally failing a run the
+newly-capable peer could serve. That is the exact AC1/AC2 outcome this whole
+issue exists to prevent.
+
+Rounds 27, 30 and 31 all re-read the evidence, but all of them read it *before*
+the transaction opened. The window between that read and the lock acquisition is
+where a re-registration lands.
+
+The observe-and-re-decide half of `prepare_escalation_commit` is now extracted
+into `revalidate_escalation_evidence`, and the commit boundary runs it **inside**
+its transaction, after the claim guard has pinned the row. That read is the
+authoritative decision; the pre-transaction one is kept purely as a cheap early
+exit that avoids opening a transaction and preloading history when the evidence
+has already moved. Because both halves go through the same helper, they cannot
+drift on how evidence is observed or how a verdict is derived from it. A
+withdrawal at this point returns the new `TerminalWriteOutcome::EvidenceChanged`
+and falls through to the ordinary release arm, exactly like a lost claim.
+
+No new lock edge: the miss state is read from the row already held, and the
+fleet read is an unlocked `SELECT` on `harvest_workers`.
+
+Honest scope. Two things this deliberately does **not** claim:
+
+- The *reason string* is still the one derived outside the transaction, so an
+  escalation that still stands here but for a subtly different cause is reported
+  with the second-most-recent cause. That is a diagnostic nuance, not a
+  correctness gap — the metric label provably cannot move between the two (see
+  round 31's note on `EscalationCause::outcome_label`), and the only thing this
+  re-check changes is *whether* the escalation stands at all.
+- A peer that re-registers *after* the lock is taken blocks on it (the clear is
+  an `UPDATE` of the row we hold) and applies to an already-failed row. That is
+  the irreducible "became capable one microsecond too late" case, and it is
+  bounded and paged rather than silent.
+
+### Tests
+
+- `a_peer_that_re_registers_before_the_lock_withdraws_the_escalation` (DB) —
+  two live workers both named incapable, then `worker-b`'s evidence is cleared
+  the way registration clears it. **Confirmed RED** with
+  `a peer that became capable before the lock must veto the escalation; got Committed`;
+  GREEN with the in-transaction re-check. Asserts no `WorkflowFailed`, the
+  execution still `RUNNING`, the task still claimable, and the page-severity
+  counter at zero.
+- `evidence_that_still_supports_escalation_under_the_lock_still_commits` (DB) —
+  the control: identical setup and an attached re-check, nobody becomes capable,
+  so the escalation must still commit and page. It **passes under the RED
+  patch**, which is the point — a re-check that always withdrew would satisfy
+  the test above and silently break AC3's boundedness.
+- The four round-31/32 claim-guard tests pass `None` for the re-check, so they
+  keep pinning exactly the ownership contract they were written for.

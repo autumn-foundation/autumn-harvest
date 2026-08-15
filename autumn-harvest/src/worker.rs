@@ -16671,6 +16671,54 @@ async fn prepare_escalation_commit(
         task, worker_id, ..
     } = ctx;
     let preloaded = preload_failure_history(conn, task).await;
+    let revalidation = revalidate_escalation_evidence(
+        conn,
+        EscalationEvidenceRecheck {
+            task,
+            worker_id,
+            policy,
+            frontier_reset_committed,
+        },
+    )
+    .await;
+    (preloaded, revalidation)
+}
+
+/// The inputs the escalation's evidence re-decision needs, and nothing else.
+///
+/// Deliberately narrower than [`CapabilityMissCtx`]: the re-decision reads
+/// evidence, so it must not carry a metrics recorder (a re-read is not an
+/// emission point) or the missing-handler detail (which is what was *already*
+/// decided from).
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct EscalationEvidenceRecheck<'a> {
+    /// The claim the dispatcher holds.
+    pub task: &'a TaskQueueItem,
+    /// The worker whose escalation is being re-decided.
+    pub worker_id: &'a str,
+    /// The configured budget and staleness policy.
+    pub policy: CapabilityMissPolicy,
+    /// Whether this dispatch already committed a frontier reset.
+    pub frontier_reset_committed: bool,
+}
+
+/// Re-decide an escalation from freshly-read evidence.
+///
+/// Shared by the pre-transaction check (which avoids opening a transaction at
+/// all when the evidence has already moved) and by the authoritative re-check
+/// inside the terminal transaction, so the two can never drift on how evidence
+/// is observed or how a verdict is derived from it.
+async fn revalidate_escalation_evidence(
+    conn: &mut AsyncPgConnection,
+    recheck: EscalationEvidenceRecheck<'_>,
+) -> EscalationRevalidation {
+    let EscalationEvidenceRecheck {
+        task,
+        worker_id,
+        policy,
+        frontier_reset_committed,
+    } = recheck;
     // The revalidation uses the SAME bracketed observation the decision does
     // (issue #804, Codex round-30 P1). Round 29 re-derived a single miss read
     // here and so reintroduced the round-28 race: a peer re-registering between
@@ -16708,7 +16756,7 @@ async fn prepare_escalation_commit(
     } else {
         &before
     };
-    (preloaded, revalidate_escalation(observed, fresh))
+    revalidate_escalation(observed, fresh)
 }
 
 /// The log line for an escalation, keyed on the cause.
@@ -16760,6 +16808,11 @@ pub enum TerminalWriteOutcome {
     Committed,
     /// The row changed hands. Nothing was written.
     ClaimLost,
+    /// The claim was still ours, but the capability-miss evidence moved under
+    /// the lock — a peer re-registered and is no longer named as incapable, so
+    /// the run this was about to fail terminally now has a worker that can
+    /// serve it. Nothing was written (issue #804, Codex round-33 P1).
+    EvidenceChanged(&'static str),
 }
 
 /// Fail the task and its execution **only if this worker still holds the
@@ -16806,6 +16859,25 @@ pub enum TerminalWriteOutcome {
 /// task). Taking the task row first would invert against them and risk an ABBA
 /// deadlock on exactly the terminal path this guard protects.
 ///
+/// **Evidence, not just ownership.** A peer re-registering clears itself from
+/// the task's `capability_miss_workers` without touching `worker_id` or
+/// `crash_strikes`, so the claim guard above is blind to it: the escalation
+/// would still commit and terminally fail a run the newly-capable peer could
+/// serve (Codex round-33 P1). When `recheck` is `Some`, the escalation is
+/// therefore re-decided from evidence read *under the task lock* — the
+/// authoritative decision. The pre-transaction check in
+/// [`prepare_escalation_commit`] is kept as a cheap early exit, not as the
+/// guarantee. Both read no new locks (the miss state is the row already held;
+/// the fleet read is an unlocked `SELECT`), so adding the re-read introduces no
+/// new lock edge.
+///
+/// Honest scope: the *reason string* is still the one derived outside the
+/// transaction, so an escalation that stands here but for a subtly different
+/// cause is reported with the second-most-recent cause. That is a diagnostic
+/// nuance, not a correctness gap — the metric label cannot move between the two
+/// (see [`EscalationCause::outcome_label`]), and the only thing this re-check
+/// changes is *whether* the escalation stands at all.
+///
 /// `before_write` runs once, after the guard passes and before the write, so a
 /// caller's page-severity counter still fires when the write itself fails
 /// transiently — the case that most needs the page — but never fires for an
@@ -16822,6 +16894,7 @@ pub async fn commit_terminal_failure_if_still_claimed<F>(
     worker_id: &str,
     error: &str,
     preloaded: PreloadedFailureHistory,
+    recheck: Option<EscalationEvidenceRecheck<'_>>,
     before_write: F,
 ) -> HarvestResult<TerminalWriteOutcome>
 where
@@ -16865,6 +16938,17 @@ where
                 .await?
             {
                 return Ok(TerminalWriteOutcome::ClaimLost);
+            }
+            // The claim is ours and pinned. Re-decide the escalation from
+            // evidence read UNDER that lock: ownership does not move when a
+            // peer re-registers, so the guard above cannot see a peer that
+            // cleared itself from `capability_miss_workers` between the
+            // pre-transaction observation and this point.
+            if let Some(recheck) = recheck
+                && let EscalationRevalidation::Withdrawn(reason) =
+                    revalidate_escalation_evidence(conn, recheck).await
+            {
+                return Ok(TerminalWriteOutcome::EvidenceChanged(reason));
             }
             before_write();
             fail_task_and_execution_with_history(conn, task, worker_id, &error, preloaded).await?;
@@ -16955,16 +17039,36 @@ async fn escalate_capability_miss(
     // task around the queue, so only it may page the fleet-exhaustion rule.
     // See `EscalationCause::outcome_label`.
     let outcome_label = cause.outcome_label();
-    let write =
-        commit_terminal_failure_if_still_claimed(conn, task, worker_id, &reason, preloaded, || {
+    let write = commit_terminal_failure_if_still_claimed(
+        conn,
+        task,
+        worker_id,
+        &reason,
+        preloaded,
+        // The authoritative evidence re-decision: read under the task lock,
+        // so a peer that re-registered after the pre-transaction check
+        // cannot be missed (issue #804, Codex round-33 P1).
+        Some(EscalationEvidenceRecheck {
+            task,
+            worker_id,
+            policy,
+            frontier_reset_committed,
+        }),
+        || {
             metrics.record_task_capability_miss(&task.queue_name, &task.task_type, outcome_label);
-        })
-        .await?;
-    if write == TerminalWriteOutcome::ClaimLost {
+        },
+    )
+    .await?;
+    let withdrawn = match write {
+        TerminalWriteOutcome::Committed => None,
+        TerminalWriteOutcome::ClaimLost => Some("claim_lost"),
+        TerminalWriteOutcome::EvidenceChanged(reason) => Some(reason),
+    };
+    if let Some(reason) = withdrawn {
         tracing::info!(
             task_id = %task.id,
             queue = %task.queue_name,
-            reason = "claim_lost",
+            reason,
             "withdrew a capability-miss escalation at the terminal write; releasing instead"
         );
         return Ok(None);
