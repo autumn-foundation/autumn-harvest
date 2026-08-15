@@ -5504,22 +5504,40 @@ impl WorkflowContext {
 
             // Worker crashed after appending `LocalActivityScheduled` (and
             // possibly one or more `LocalActivityFailed` events) but before
-            // recording a terminal event. Re-run with the original `activity_id`
-            // so the idempotency key is stable across the crash.
+            // recording a terminal event — or, for an in-flight fixture sampled
+            // by the #798 drift gate, the local activity is simply mid-retry.
+            // Re-run with the original `activity_id` so the idempotency key is
+            // stable across the crash.
+            //
+            // Issue #798 (Codex round 24): this arm deliberately makes NO inline
+            // non-determinism decision, mirroring the `InProgress` arms of the
+            // signal/child race twins (issue #1048). `replay_canary_snapshot`
+            // sets `strict_replay` as well as `canary_mode`, so an inline
+            // `strict_replay` error here false-reported drift on an ordinary
+            // in-flight shape and blocked promotion. Reaching this arm means the
+            // strict matcher already verified name+input against the recorded
+            // `LocalActivityScheduled` — a genuine divergence returns `Diverged`,
+            // which always errors — so the only thing "wrong" is an absent
+            // terminal, which is the defining property of a non-terminal run.
+            //
+            // Falling through re-parks (suspends), and the executor's
+            // end-of-cycle authority decides: `run_workflow_canary` maps a clean
+            // parked cycle to `Suspended` (→ `ReplaySucceeded`) but still fails
+            // when `history_has_unconsumed_events()`, and `outcome_to_report`
+            // maps `Suspended` to `NonDeterminismDetected` for non-canary strict
+            // replay — so `verify_dir`'s completed-history fixture check keeps
+            // rejecting an incomplete history.
+            //
+            // NOTE: the zero-failure shape never reaches here —
+            // `match_local_activity_strict` maps `failed_attempts: 0` to
+            // `NoMatch`, which `check_strict_replay_no_match` already grants the
+            // canary frontier exception. This arm is the `failed_attempts > 0`
+            // (mid-retry) case.
             HistoryMatch::LocalActivityInProgress {
                 activity_id,
                 failed_attempts,
                 last_error,
             } => {
-                if self.strict_replay {
-                    return Err(self.nd_error(
-                        format!("local activity '{name}' scheduled but terminal not in history"),
-                        self.match_history(|m| i32::try_from(m.position()).ok()),
-                        Some("LocalActivityCompleted".to_string()),
-                        Some("LocalActivityInProgress".to_string()),
-                    ));
-                }
-
                 // Issue #620 (AC8): the retry budget AND per-attempt timeout for
                 // an in-flight local activity must come from the values it was
                 // ORIGINALLY scheduled with — frozen into the
@@ -6533,22 +6551,31 @@ impl WorkflowContext {
             // state when the parent wakes because one of several parallel children
             // completed while this child is still running.
             //
-            // In strict-replay mode (WorkflowReplayer) an incomplete history is
-            // treated as a non-determinism error — callers always provide complete
-            // histories.  In the worker's non-strict replay mode we re-emit the
-            // command carrying the *existing* child_id so the worker can re-park
-            // the parent without creating a duplicate child execution.
+            // We re-emit the command carrying the *existing* child_id so the
+            // worker can re-park the parent without creating a duplicate child
+            // execution.
+            //
+            // Issue #798 (Codex round 24, sibling of the local-activity arm):
+            // this arm deliberately makes NO inline non-determinism decision,
+            // mirroring the `InProgress` arms of the signal/child race twins
+            // (issue #1048). `replay_canary_snapshot` sets `strict_replay` as
+            // well as `canary_mode`, so an inline `strict_replay` error here
+            // false-reported drift on *any* parent parked on a running child —
+            // one of the most common in-flight shapes the #798 gate samples —
+            // and blocked promotion. Reaching this arm means `match_child_workflow`
+            // already verified name+input against the recorded
+            // `ChildWorkflowStarted` (a changed child returns `Diverged`, which
+            // always errors), so the only thing "wrong" is an absent terminal,
+            // which is the defining property of a non-terminal run.
+            //
+            // Falling through re-parks (suspends), and the executor's
+            // end-of-cycle authority decides: `run_workflow_canary` maps a clean
+            // parked cycle to `Suspended` (→ `ReplaySucceeded`) but still fails
+            // when `history_has_unconsumed_events()`, and `outcome_to_report`
+            // maps `Suspended` to `NonDeterminismDetected` for non-canary strict
+            // replay — so `verify_dir`'s completed-history fixture check keeps
+            // rejecting an incomplete history.
             HistoryMatch::ChildInProgress { child_id } => {
-                if self.strict_replay {
-                    return Err(self.nd_error(
-                        format!(
-                            "child workflow '{workflow_name}' started but terminal not in history"
-                        ),
-                        self.match_history(|m| i32::try_from(m.position()).ok()),
-                        Some("ChildWorkflowCompleted".to_string()),
-                        Some("ChildWorkflowInProgress".to_string()),
-                    ));
-                }
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
                     child_id,

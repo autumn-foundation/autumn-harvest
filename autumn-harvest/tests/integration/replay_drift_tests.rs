@@ -26,10 +26,12 @@
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::time::Duration;
 
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::WorkflowHandlerFn;
+use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::replay_sample::{SampleManifest, SampleStatus, SampleWorkflowCoverage};
 use autumn_harvest::testing::{
     HistorySnapshot, NonDeterminismKind, ReplayDriftReport, ReplayVerifier,
@@ -3225,4 +3227,223 @@ async fn per_type_counts_bind_even_without_declared_identities() {
         2,
         "per-type counts must still bind without identities: {report}"
     );
+}
+
+// ===========================================================================
+// Round 24 — an incomplete in-progress branch is in-flight, not drift
+// ===========================================================================
+//
+// `check_strict_replay_no_match` already grants canary replay a frontier
+// exception, and `ActivityInProgress` never raised a strict error at all — it
+// re-emits `WaitForActivity` and parks. But two sibling `*InProgress` arms
+// still made an INLINE non-determinism decision under `strict_replay`, which
+// `replay_canary_snapshot` also sets. Both are ordinary shapes for the exact
+// population #798 samples, so both were false-red:
+//
+//   * `ChildInProgress`        — any parent parked on a running child.
+//   * `LocalActivityInProgress` — a local activity mid-retry (>= 1 recorded
+//     `LocalActivityFailed` and no terminal).
+//
+// Issue #1048 already settled the pattern for this class on the race twins:
+// an `InProgress` arm makes no inline decision, falls through to re-park, and
+// lets the executor's end-of-cycle `history_has_unconsumed_events` authority
+// decide. These two arms are simply the ones #1048 did not reach.
+
+/// Spawns a child workflow, then continues. In-flight histories park at the
+/// `ChildWorkflowStarted` frontier with no terminal.
+fn parent_with_child_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.spawn_child_workflow_raw("child_wf", Value::Null)
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw("step_two", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// Runs a local activity, then continues.
+fn workflow_with_local_activity<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_local_activity_raw("compute", Value::Null, None, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw("step_two", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// A parent parked on a still-running child: `ChildWorkflowStarted` with no
+/// terminal. This is one of the most common in-flight shapes in a real fleet.
+fn in_flight_child_snapshot_json(workflow_name: &str) -> String {
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id: ExecutionId::new(),
+            workflow_name: "child_wf".into(),
+            input: Value::Null,
+        },
+    ];
+    snapshot_json(workflow_name, ExecutionId::new(), events)
+}
+
+/// A local activity genuinely mid-retry: scheduled with a 3-attempt budget,
+/// one recorded failure, **no terminal** — so one attempt is still owed and the
+/// workflow re-parks on it rather than resolving.
+///
+/// Two neighbouring shapes deliberately do NOT reach the
+/// `LocalActivityInProgress` arm's suspension path, and neither is what this
+/// fix is about:
+///
+/// * `failed_attempts == 0` resolves to `NoMatch` inside
+///   `match_local_activity_strict`, which `check_strict_replay_no_match`
+///   already grants the canary frontier exception.
+/// * `failed_attempts >= max_attempts` is *exhaustion*: the arm returns the
+///   recorded `last_error` without re-running the handler, so the workflow
+///   fails for a genuine business reason — faithfully reproducing what the
+///   live worker will do next.
+fn in_flight_local_activity_retry_snapshot_json(workflow_name: &str) -> String {
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        started_event(),
+        WorkflowEvent::LocalActivityScheduled {
+            activity_id,
+            name: "compute".into(),
+            input: Value::Null,
+            // #620: frozen resolution. `resolved: true` makes the recorded
+            // budget authoritative, so replay sees 1 of 3 attempts spent.
+            resolved: true,
+            retry_policy: Some(RetryPolicy::fixed(3, Duration::from_millis(1))),
+            start_to_close_nanos: None,
+        },
+        WorkflowEvent::LocalActivityFailed {
+            activity_id,
+            error: "transient".into(),
+            attempt: 1,
+        },
+    ];
+    snapshot_json(workflow_name, ExecutionId::new(), events)
+}
+
+#[tokio::test]
+async fn a_parent_parked_on_an_in_flight_child_is_not_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &in_flight_child_snapshot_json("wf"));
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", parent_with_child_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(report.total, 1);
+    assert_eq!(
+        report.succeeded, 1,
+        "a parent parked on a running child is in-flight, not drift: {report}"
+    );
+    assert!(
+        report.diverged.is_empty(),
+        "expected zero drift, got: {:?}",
+        report.diverged
+    );
+    assert_eq!(report.exit_code(), 0, "must not block promotion: {report}");
+}
+
+#[tokio::test]
+async fn a_local_activity_mid_retry_is_not_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &in_flight_local_activity_retry_snapshot_json("wf"),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", workflow_with_local_activity as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(report.total, 1);
+    assert_eq!(
+        report.succeeded, 1,
+        "a local activity mid-retry is in-flight, not drift: {report}"
+    );
+    assert!(
+        report.diverged.is_empty(),
+        "expected zero drift, got: {:?}",
+        report.diverged
+    );
+    assert_eq!(report.exit_code(), 0, "must not block promotion: {report}");
+}
+
+/// Drifted parent: a code change now spawns a *different* child than the one
+/// history recorded.
+fn drifted_parent_with_child<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.spawn_child_workflow_raw("some_other_child", Value::Null)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// A genuine divergence must still be caught on the child path — tolerating an
+/// absent terminal must not tolerate a *different* child.
+#[tokio::test]
+async fn a_changed_child_workflow_name_is_still_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.json", &in_flight_child_snapshot_json("wf"));
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", drifted_parent_with_child as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(
+        report.succeeded, 0,
+        "a changed child must not pass: {report}"
+    );
+    assert_eq!(report.diverged.len(), 1, "expected drift: {report}");
+    assert_eq!(report.exit_code(), 1, "must block promotion: {report}");
+}
+
+/// The other half of Codex's ask: the error is **retained** for completed-history
+/// strict replay. `verify_dir` (issue #251) must still reject both shapes — an
+/// incomplete history is a fixture-quality defect there, not a normal state.
+#[tokio::test]
+async fn strict_replay_still_rejects_both_incomplete_shapes() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "child.json",
+        &in_flight_child_snapshot_json("wf_c"),
+    );
+    write(
+        dir.path(),
+        "local.json",
+        &in_flight_local_activity_retry_snapshot_json("wf_l"),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf_c", parent_with_child_workflow as WorkflowHandlerFn)
+        .register_fn("wf_l", workflow_with_local_activity as WorkflowHandlerFn)
+        .verify_dir(dir.path())
+        .await;
+
+    assert_eq!(
+        report.succeeded, 0,
+        "strict replay must still reject an incomplete history: {report:?}"
+    );
+    assert_eq!(report.failed, 2, "both shapes must fail: {report:?}");
 }

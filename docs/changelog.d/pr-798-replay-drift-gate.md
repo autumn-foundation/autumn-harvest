@@ -197,3 +197,46 @@ backed tests in `replay_sample_export_integration.rs`
 the declared identities are exactly the documents the export wrote, so a list of
 merely the right length cannot satisfy the check it strengthens. **No new
 `WorkflowEvent` variant, no migration.**
+
+**Round-24 hardening (Codex P1).** An in-flight fixture parked on a **started-but-
+not-finished child workflow or local activity** was reported as drift and blocked
+promotion. `replay_canary_snapshot` sets `strict_replay` in addition to
+`canary_mode`, and two `HistoryMatch::*InProgress` arms in `context.rs` made an
+**inline** non-determinism decision keyed on `strict_replay` alone: `ChildInProgress`
+(any parent parked on a running child — one of the commonest in-flight shapes a
+fleet has) and `LocalActivityInProgress` (a local activity mid-retry, i.e. with at
+least one recorded `LocalActivityFailed` and no terminal). Codex named the local-
+activity site; the child sibling is the same defect and the broader of the two.
+The sibling `ActivityInProgress` arm never had the guard — it re-emits
+`WaitForActivity` and parks — which is exactly the shape the two outliers should
+have had, and `check_strict_replay_no_match` already granted the canary frontier
+exception for a *new* command past the end of history. Fixed by removing the
+inline decision from both arms so each falls through to re-park, mirroring the
+`InProgress` arms of the signal/child race twins (issue #1048): the executor's
+end-of-cycle authority decides once, after the whole cycle has run —
+`run_workflow_canary` maps a cleanly parked cycle to `Suspended` →
+`ReplaySucceeded` but still fails when `history_has_unconsumed_events()`, so a
+genuine leftover event is still caught. Neither direction is softened: reaching
+one of these arms means the matcher already verified name+input against the
+recorded event, so a *changed* child or activity returns `Diverged` and always
+fails; and `outcome_to_report` maps the same `Suspended` outcome to
+`NonDeterminismDetected` for non-canary strict replay, so `verify_dir`'s
+completed-history fixture check keeps rejecting an incomplete history — the error
+is retained exactly where it is meaningful. Two neighbouring shapes deliberately
+do **not** reach the suspension path and are documented rather than changed: a
+local activity with `failed_attempts == 0` resolves to `NoMatch` inside
+`match_local_activity_strict` (already covered by the frontier exception), and one
+whose recorded failures have **exhausted** its frozen retry budget (issue #620)
+resolves to the recorded error without re-running the handler, so the workflow
+fails for a genuine business reason that faithfully reproduces what the live
+worker does next. Both halves falsified by neutering the fix independently:
+restoring the child guard fails `a_parent_parked_on_an_in_flight_child_is_not_drift`
+(`left: 0, right: 1` — "0 clean, 1 diverged") and restoring the local-activity
+guard fails `a_local_activity_mid_retry_is_not_drift` identically. Tests: four in
+`tests/integration/replay_drift_tests.rs` — the two above, the divergence control
+`a_changed_child_workflow_name_is_still_drift` (a *different* child must still exit
+`1`), and `strict_replay_still_rejects_both_incomplete_shapes`, which pins that
+`verify_dir` fails both shapes so the tolerance is scoped to the in-flight gate.
+Documented in `docs/replay-drift-gate.md` as a table of every started-but-not-
+finished branch the gate treats as in-flight. **No new `WorkflowEvent` variant, no
+migration.**

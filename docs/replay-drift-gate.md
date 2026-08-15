@@ -696,6 +696,43 @@ suspends at its recorded frontier — replaying it strictly would report every
 single one as a false divergence. That is why `replay_bundle` exists alongside
 `verify_dir` rather than replacing it.
 
+### What "frontier-tolerant" covers
+
+A sampled non-terminal history is, by definition, missing the terminal event of
+whatever it is currently parked on. The gate treats every such **started-but-not-
+finished** branch as in-flight, not drift:
+
+| Recorded shape | Treated as |
+|---|---|
+| `ActivityScheduled` with no terminal | parked — re-emits `WaitForActivity` |
+| `ChildWorkflowStarted` with no terminal | parked — re-emits `StartChildWorkflow` with the recorded `child_id` |
+| `LocalActivityScheduled` (+ any `LocalActivityFailed`) with no terminal | parked mid-retry — re-runs with the recorded `activity_id` |
+| `ActivityAwaitingExternal` with no completion | parked on the external system |
+| `ExternalSignalRequested` / `ExternalCancelRequested` / `ExternalAwaitRequested` with no terminal | parked on delivery |
+| A new command past the end of history | the frontier itself |
+
+The decision is **never** made inline at the branch. Each of these re-parks, and
+the executor's end-of-cycle authority (`history_has_unconsumed_events`) decides
+once, after the whole cycle has run: a cleanly parked run is `Suspended` →
+`ReplaySucceeded`, while a genuine leftover event is still non-determinism. This
+is the same rule issue #1048 settled for the signal/child race primitives.
+
+Two things are deliberately **not** softened:
+
+* **A changed branch is still drift.** Reaching a parked branch means the matcher
+  already verified name and input against the recorded event; spawning a
+  *different* child, or scheduling a *different* activity, returns `Diverged`,
+  which always fails.
+* **Strict replay still rejects an incomplete history.** `verify_dir` maps the
+  same suspension to `NonDeterminismDetected`, because there an unfinished
+  history is a fixture-quality defect rather than a normal state.
+
+One shape is worth calling out because it looks like the above but is not: a
+local activity whose recorded failures have already **exhausted** its retry
+budget resolves to that recorded error rather than re-parking, so the workflow
+fails for a genuine business reason. That faithfully reproduces what the live
+worker does next — it is the run's real outcome, not a replay artefact.
+
 ---
 
 ## Where it sits in the deploy ladder
