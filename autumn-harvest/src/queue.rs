@@ -2428,6 +2428,22 @@ pub const fn read_capability_miss_state_query() -> &'static str {
        AND worker_id = $2"
 }
 
+/// SQL for [`read_capability_miss_state_for_update`]. Extracted as a `const fn`
+/// so its shape is unit-testable without a database.
+///
+/// Identical to [`read_capability_miss_state_query`] plus `FOR UPDATE`: the
+/// ownership answer must stay true until the reading transaction commits
+/// (issue #804, Codex round-31 P1), not merely at the instant it was read.
+#[must_use]
+pub const fn read_capability_miss_state_for_update_query() -> &'static str {
+    "SELECT capability_misses, capability_miss_workers \
+     FROM harvest_task_queue \
+     WHERE id = $1 \
+       AND state = 'RUNNING' \
+       AND worker_id = $2 \
+     FOR UPDATE"
+}
+
 /// The task's capability-miss counters **as they stand now**, for the
 /// release-vs-escalate decision (issue #804, Codex round-27 P1).
 ///
@@ -2444,6 +2460,46 @@ pub async fn read_capability_miss_state(
     task_id: Uuid,
     worker_id: &str,
 ) -> HarvestResult<Option<(i32, Vec<String>)>> {
+    read_miss_state_with(conn, read_capability_miss_state_query(), task_id, worker_id).await
+}
+
+/// Like [`read_capability_miss_state`], but takes the row's `FOR UPDATE` lock
+/// (issue #804, Codex round-31 P1).
+///
+/// The unlocked read answers "did this worker own the claim a moment ago",
+/// which is the wrong question immediately before a terminal write: the
+/// terminal transition (`fail_task`) accepts any `PENDING`/`RUNNING` row
+/// regardless of `worker_id`, so re-reading beforehand only narrows the window
+/// in which a poison-pill reclaim or an operator action can transfer the row.
+/// Holding the lock from the check through the caller's commit closes it.
+///
+/// Lock ordering: `harvest_task_queue`'s documented order is **execution row →
+/// task row**, so a caller that also touches the execution row must take that
+/// lock first (see [`crate::worker`]'s escalation commit).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the query fails.
+pub async fn read_capability_miss_state_for_update(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    worker_id: &str,
+) -> HarvestResult<Option<(i32, Vec<String>)>> {
+    read_miss_state_with(
+        conn,
+        read_capability_miss_state_for_update_query(),
+        task_id,
+        worker_id,
+    )
+    .await
+}
+
+async fn read_miss_state_with(
+    conn: &mut AsyncPgConnection,
+    sql: &str,
+    task_id: Uuid,
+    worker_id: &str,
+) -> HarvestResult<Option<(i32, Vec<String>)>> {
     #[derive(diesel::QueryableByName)]
     struct MissStateRow {
         #[diesel(sql_type = diesel::sql_types::Integer)]
@@ -2452,7 +2508,7 @@ pub async fn read_capability_miss_state(
         capability_miss_workers: Vec<String>,
     }
 
-    let rows: Vec<MissStateRow> = diesel::sql_query(read_capability_miss_state_query())
+    let rows: Vec<MissStateRow> = diesel::sql_query(sql)
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .load(conn)
@@ -4185,6 +4241,34 @@ mod tests {
             sql.contains("capability_misses") && sql.contains("capability_miss_workers"),
             "both counters must be refreshed together, or the pair could \
              disagree about the same frontier: {sql}"
+        );
+    }
+
+    /// The COMMIT-boundary re-read must additionally hold the row's lock:
+    /// `fail_task` accepts any `PENDING`/`RUNNING` row regardless of
+    /// `worker_id`, so an unlocked check merely narrows the window in which a
+    /// concurrent reclaim can transfer the row before the terminal write lands.
+    #[test]
+    fn miss_state_commit_read_takes_the_row_lock() {
+        let sql = read_capability_miss_state_for_update_query();
+        assert!(
+            sql.contains("FOR UPDATE"),
+            "the commit-boundary re-read must hold the lock through the caller's \
+             transaction, not just read: {sql}"
+        );
+        // Same ownership guard as the unlocked read: the lock answers "stays
+        // true", the guard answers "is ours".
+        assert!(
+            sql.contains("state = 'RUNNING'") && sql.contains("worker_id = $2"),
+            "the commit-boundary re-read must still be scoped to this worker's \
+             own claim: {sql}"
+        );
+        // And it must otherwise be the SAME query, so the two cannot drift into
+        // disagreeing about what "still ours" means.
+        assert_eq!(
+            sql.replace(" FOR UPDATE", ""),
+            read_capability_miss_state_query(),
+            "the locked read must differ from the unlocked one only by the lock"
         );
     }
 

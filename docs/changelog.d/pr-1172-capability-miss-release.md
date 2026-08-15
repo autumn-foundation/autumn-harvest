@@ -867,3 +867,100 @@ It carries its own control in the same test: feeding the *same* counts through
 an **agreeing** bracket escalates. Without that, the assertion would pass for
 the trivial reason that the budget was never reached, and would keep passing if
 the bracket stopped doing anything.
+
+## Review round 31
+
+Two findings on `68ba2e1`.
+
+### P1 — make the ownership check atomic with the terminal failure
+
+Rounds 27, 28, 29 and 30 each *narrowed* the window between a capability-miss
+escalation's last ownership check and its terminal write — by re-reading the row,
+by keeping the three read outcomes distinct, by hoisting the history load out of
+the way, by bracketing the fleet read. None of them **closed** it, because the
+check and the write remained separate database operations and
+`queue::fail_task` accepts any `PENDING`/`RUNNING` row *regardless of
+`worker_id`*. A poison-pill reclaim or an operator action landing in between
+therefore still let a stale dispatcher terminally fail the **new** owner's task
+and append `WorkflowFailed` to a run a capable worker had just picked up — the
+exact failure issue #804 exists to prevent.
+
+The check and the write are now **one transaction**, with the task row's
+`FOR UPDATE` lock held from the first to the last:
+
+- `queue::read_capability_miss_state_for_update` is the locked sibling of the
+  round-27 unlocked read. A no-DB shape test asserts it differs from the
+  unlocked query **only** by ` FOR UPDATE`, so the two cannot drift about what
+  "still ours" means.
+- `worker::commit_terminal_failure_if_still_claimed` wraps guard + write in one
+  transaction and returns `TerminalWriteOutcome::{Committed, ClaimLost}`. A
+  concurrent transfer either commits before the lock is taken (and is seen, so
+  nothing is written) or blocks until this transaction commits (and finds a row
+  that is already terminal). There is no interleaving in which the guard passes
+  and the write lands on someone else's claim.
+- **Lock order is preserved.** `harvest_task_queue`'s documented order is
+  **execution row → task row**, so the new `lock_workflow_execution_row_only`
+  takes the execution lock first. Locking the task row first would invert
+  against `enforce_activity_timeout` / `finalize_activity_completion` and risk
+  an ABBA deadlock on exactly the terminal path this guard protects. The new
+  helper deliberately does *not* re-load history — that would put the awaited
+  read round 29 hoisted out straight back into the window.
+- The page-severity counter is recorded **after the guard passes and before the
+  write**, via a `before_write` callback, so it still fires when the write
+  itself fails transiently (the case that most needs the page) but never fires
+  for a withdrawn escalation.
+- A lost claim at the write is a **withdrawal**, not an error: it falls through
+  to the same ownership-guarded release path a commit-boundary withdrawal uses,
+  which no-ops on a row we no longer own.
+
+The round-29 `revalidate_escalation` check is kept as the cheap early half —
+it can withdraw before paying for a transaction — but it is no longer the
+guarantee.
+
+### P2 — report the *revalidated* escalation cause
+
+`revalidate_escalation` returned only `Stands`/`Withdrawn`, discarding the fresh
+resolution, so an escalation that still stood was reported from the **obsolete**
+one. The two can both say escalate for *different* causes: a task past the
+absolute release ceiling escalates as `BudgetExhausted` while every live worker
+has missed it, and as `ReleaseCeilingExhausted` the moment a never-tried capable
+peer appears during the commit. Reporting the obsolete cause tells an operator
+"no capable worker on this queue registers the handler" when one demonstrably
+does — sending them to look for a missing deploy that is not missing.
+
+`EscalationRevalidation::Stands` now carries the fresh `CapabilityMissResolution`,
+and the reason string, the metric label and the log line are all derived from it.
+The `resolution` parameter of `escalate_capability_miss` is gone: there is now
+exactly one resolution in scope at the commit, so the obsolete one cannot be
+reached by accident.
+
+Honest scope note: the metric **label** is deliberately shared by the two
+budget-ish causes (both were genuinely offered around the queue), and the two
+inputs that could move it — the session pin and the configured budget — are
+properties of the task and the config, not of the resolution. A revalidation can
+therefore never change the label; what it changes is the reason string and the
+log message, and the test asserts exactly that rather than pretending otherwise.
+
+### Tests
+
+- `queue::tests::miss_state_commit_read_takes_the_row_lock` — no-DB shape test
+  pinning `FOR UPDATE`, the ownership guard, and only-differs-by-the-lock.
+- `worker::tests::the_reported_cause_is_the_revalidated_one_not_the_obsolete_one`
+  — the verdict carries the fresh resolution, the two causes genuinely differ,
+  the obsolete reason makes the claim the fresh evidence contradicts, and both
+  keep the AC5 `no_capable_worker:` prefix.
+- `a_claim_transferred_inside_the_terminal_write_is_not_failed_by_the_stale_dispatcher`
+  (DB) — the race, staged deterministically with the lock-holding pattern the
+  pause / child-timeout suites use: a second connection holds the task row lock,
+  the terminal write queues behind it, the claim is transferred to `thief`
+  inside that window, and the lock is released. **Confirmed RED** against the
+  pre-fix code (`left: Committed, right: ClaimLost` — the stale dispatcher
+  failed the thief's task); GREEN with the guard. Also asserts no
+  `WorkflowFailed` was appended, the execution stayed `RUNNING`, and the new
+  owner's row kept its claim and carries no stale reason.
+- `a_claim_still_held_through_the_terminal_write_still_fails_the_task` (DB) —
+  the control: same staged window, same lock contention, nobody takes the claim,
+  so the escalation must still commit (AC3 boundedness) and the counter must
+  fire exactly once. It **passes under the RED patch too**, which is the point:
+  a guard that simply always withdrew would satisfy the race test and silently
+  break AC3.
