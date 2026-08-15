@@ -1541,6 +1541,7 @@ fn make_snapshot(name: &str, exec_id: ExecutionId, events: Vec<WorkflowEvent>) -
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     }
 }
 
@@ -3084,6 +3085,7 @@ async fn json_replay_threads_snapshot_execution_timeout_for_deadline_history() {
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     };
     let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
     // The exported JSON must carry the deadline budget at the top level so it
@@ -3126,6 +3128,7 @@ async fn json_replay_legacy_snapshot_without_fields_falls_back_to_global_timeout
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     };
     let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
     assert!(
@@ -4414,6 +4417,7 @@ async fn replay_from_json_succeeds_with_unchanged_workflow() {
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     };
     let json = serde_json::to_string(&snapshot).expect("serialization must succeed");
 
@@ -4443,6 +4447,7 @@ async fn replay_from_json_detects_non_determinism() {
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     };
     let json = serde_json::to_string(&snapshot).expect("serialization must succeed");
 
@@ -4637,6 +4642,7 @@ async fn replay_activity_with_changed_input_detects_non_determinism() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -6020,6 +6026,7 @@ async fn replay_detached_spawn_returns_recorded_child_id() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -6054,6 +6061,7 @@ async fn replay_detached_spawn_request_cancel_policy_succeeds() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -6081,6 +6089,7 @@ async fn replay_detached_spawn_policy_mismatch_detects_non_determinism() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -6110,6 +6119,7 @@ async fn replay_detached_spawn_then_activity_succeeds() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -6156,6 +6166,7 @@ async fn replay_reordered_detached_spawn_detects_non_determinism() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -6222,6 +6233,7 @@ async fn replay_backwards_compat_awaited_child_workflow() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -6301,6 +6313,7 @@ async fn replay_succeeds_for_recorded_side_effect() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -6349,6 +6362,7 @@ async fn replay_detects_side_effect_drift() {
             deadline_at: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
         })
         .await;
 
@@ -8474,6 +8488,7 @@ async fn parent_aware_child_replays_clean_through_export_document_round_trip() {
         deadline_at: None,
         parent_execution_id: Some(parent),
         workflow_id: None,
+        queue_name: None,
     })
     .expect("full export should fit under the limit");
     let json = serde_json::to_string(&document).expect("export serialises");
@@ -8519,6 +8534,7 @@ async fn parent_aware_child_diverges_through_export_document_without_parent() {
         deadline_at: None,
         parent_execution_id: None,
         workflow_id: None,
+        queue_name: None,
     })
     .expect("full export should fit under the limit");
     let json = serde_json::to_string(&document).expect("export serialises");
@@ -8636,6 +8652,7 @@ async fn workflow_type_and_id_replay_clean_through_export_document_round_trip() 
         workflow_name: "identity_wf".to_string(),
         // Issue #698: the business id rides the export document (mechanism 2).
         workflow_id: Some("cart-42".to_string()),
+        queue_name: None,
         execution_id: exec_id,
         shard_id: 0,
         state: "COMPLETED".to_string(),
@@ -8684,6 +8701,7 @@ async fn workflow_id_diverges_through_export_document_when_id_is_dropped() {
         // Deliberately drop the business id: the recorded input still says
         // "cart-42", so replay must diverge.
         workflow_id: None,
+        queue_name: None,
         execution_id: exec_id,
         shard_id: 0,
         state: "COMPLETED".to_string(),

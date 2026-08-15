@@ -711,6 +711,132 @@ fn history_export_batch_maps_filters_to_admin_route() {
     assert_eq!(request.body, None);
 }
 
+/// Issue #798: the sample export maps onto the stratified admin route with the
+/// per-type cap, the caller-specified non-terminal states, and the payload
+/// policy — the three inputs a CI drift gate actually varies.
+#[test]
+fn history_export_sample_maps_to_the_stratified_admin_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "history",
+        "export-sample",
+        "--per-workflow",
+        "25",
+        "--states",
+        "RUNNING",
+        "--workflow-name",
+        "billing_checkout",
+        "--order",
+        "newest",
+        "--shard-id",
+        "2",
+        "--payload-policy",
+        "full",
+        "--max-bytes",
+        "1048576",
+        "--output-dir",
+        "./fixtures",
+    ])
+    .expect("sample export args should parse");
+    let request = cli
+        .api_request()
+        .expect("sample export request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/history/export-sample?workflow_name=billing_checkout&states=RUNNING\
+         &per_workflow=25&order=newest&shard_id=2&payload_policy=full&max_bytes=1048576"
+    );
+    assert_eq!(request.body, None);
+}
+
+/// Omitting every optional flag must still send the two defaults the AC names
+/// (`per_workflow=50`, redacted payloads) — never an unbounded request.
+#[test]
+fn history_export_sample_defaults_are_explicit_on_the_wire() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "history",
+        "export-sample",
+        "--output-dir",
+        "./fixtures",
+    ])
+    .expect("sample export args should parse");
+    let request = cli
+        .api_request()
+        .expect("sample export request should build");
+
+    assert_eq!(
+        request.path,
+        "/admin/history/export-sample?per_workflow=50&order=oldest&payload_policy=redacted"
+    );
+}
+
+/// Repeating `--states` accumulates rather than overwriting, so
+/// `--states RUNNING --states PAUSED` is not silently narrowed to one state.
+#[test]
+fn history_export_sample_accumulates_repeated_states() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "history",
+        "export-sample",
+        "--states",
+        "RUNNING",
+        "--states",
+        "PAUSED",
+        "--output-dir",
+        "./fixtures",
+    ])
+    .expect("sample export args should parse");
+    let request = cli
+        .api_request()
+        .expect("sample export request should build");
+
+    // `,` is deliberately left unencoded by `query_encode`, matching every other
+    // repeatable/comma-separated management-API param.
+    assert!(
+        request.path.contains("states=RUNNING,PAUSED"),
+        "repeated --states must accumulate: {}",
+        request.path
+    );
+}
+
+/// The comma-separated idiom must produce the identical wire shape as the
+/// repeated-flag idiom, so a CI recipe copied from either samples the same
+/// population.
+#[test]
+fn history_export_sample_comma_separated_states_match_repeated_flags() {
+    let repeated = Cli::try_parse_from([
+        "harvest",
+        "history",
+        "export-sample",
+        "--states",
+        "RUNNING",
+        "--states",
+        "PAUSED",
+        "--output-dir",
+        "./fixtures",
+    ])
+    .expect("parse")
+    .api_request()
+    .expect("build");
+    let comma = Cli::try_parse_from([
+        "harvest",
+        "history",
+        "export-sample",
+        "--states",
+        "RUNNING,PAUSED",
+        "--output-dir",
+        "./fixtures",
+    ])
+    .expect("parse")
+    .api_request()
+    .expect("build");
+
+    assert_eq!(repeated.path, comma.path);
+}
+
 #[test]
 fn handoff_list_maps_filters_to_management_api_request() {
     let cli = Cli::try_parse_from([

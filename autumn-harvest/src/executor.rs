@@ -801,6 +801,135 @@ pub async fn run_workflow(
     outcome
 }
 
+/// Register a candidate's declarative handlers onto a replay context.
+///
+/// Mirrors the live worker's own registration loop so the two cannot drift; see
+/// [`ReplayDeclarativeHandlers`] for why replay must do this at all.
+///
+/// **Filters by workflow type**, exactly as the worker does. `worker.rs` narrows
+/// both registries to the dispatched execution's own type before building the
+/// context:
+///
+/// ```text
+/// let wf_name = prepared.execution.workflow_name.as_str();
+/// registry.query_handlers.iter().filter(|h| h.workflow == wf_name)
+/// registry.update_handlers.iter().filter(|h| h.workflow == wf_name)
+/// ```
+///
+/// A gate is handed the candidate's *whole* `queries![…]` / `updates![…]`
+/// collection — every workflow's handlers — so registering them unfiltered puts
+/// another workflow's `progress` query on this workflow's context. A workflow
+/// that branches on [`WorkflowContext::list_query_names`] then sees a name the
+/// promoted worker will never show it, and fails in **both** directions:
+///
+/// - false RED — the recorded history came from a worker that *did* filter, so
+///   the unfiltered replay takes the other branch and reports drift on a
+///   workflow nobody changed, blocking a good release;
+/// - false GREEN — a candidate that genuinely **dropped** this workflow's own
+///   handler is masked when a same-named handler survives on another workflow:
+///   replay still sees the name, still matches history, and certifies a build
+///   whose promoted worker will take the other branch.
+///
+/// Filtering here rather than at each of the three call sites keeps
+/// the mirror at one choke point that cannot be forgotten. The name is read off
+/// the context (every entry point sets it via `.with_workflow_name(…)`) rather
+/// than passed again, so the value filtered on is by construction the same one
+/// `ctx.info().workflow_type` reports to the workflow body.
+///
+/// Deliberately **not** `#[cfg(any(test, feature = "testing"))]`: two of its
+/// three callers — `run_workflow_strict` and `run_workflow_canary` — are
+/// ungated `pub` entry points, so gating this helper made the crate fail to
+/// build under a bare `--no-default-features`. It matches the gating of
+/// everything it touches: the ungated [`ReplayDeclarativeHandlers`] and
+/// [`ReplayPayloadLimits`] structs, and the ungated
+/// `WorkflowContext::register_declarative_{query,update}_handler` it calls.
+fn register_declarative_handlers(ctx: &WorkflowContext, handlers: ReplayDeclarativeHandlers<'_>) {
+    let wf_name = ctx.workflow_type();
+    for h in handlers.queries.iter().filter(|h| h.workflow == wf_name) {
+        ctx.register_declarative_query_handler(h);
+    }
+    for h in handlers.updates.iter().filter(|h| h.workflow == wf_name) {
+        ctx.register_declarative_update_handler(h);
+    }
+}
+
+/// The candidate build's declarative `#[query]` / `#[update]` handlers, carried
+/// into a replay context (issue #798).
+///
+/// Same class of problem as [`ReplayPayloadLimits`], and the same fix. The live
+/// worker registers a workflow's declarative handlers **before any workflow code
+/// runs**, and [`WorkflowContext::list_query_names`] merges the declarative map
+/// into its result — so a workflow that branches on which handlers exist, or
+/// that dispatches a query, observes them. They live in no `WorkflowEvent`, so a
+/// pure-history replay cannot recover them, and both replay entry points
+/// previously invoked with empty declarative registries.
+///
+/// That is wrong in both directions. A candidate that **keeps** a registration
+/// the recorded run had is the false-RED direction: replay takes the other
+/// branch and reports drift on code nobody changed, blocking a good release. A
+/// candidate that **adds or removes** one is the false-GREEN direction: the
+/// branch the promoted worker will take was never exercised.
+///
+/// Borrowed rather than owned so a caller can pass a registry it already holds,
+/// and `Copy` so threading it through the three entry points costs nothing. The
+/// [`Default`] is two empty slices, which is byte-for-byte the behavior of every
+/// caller that registers none.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReplayDeclarativeHandlers<'a> {
+    /// Declarative query handlers to register before the workflow body runs.
+    pub queries: &'a [&'a crate::info::QueryHandlerInfo],
+    /// Declarative update handlers to register before the workflow body runs.
+    pub updates: &'a [&'a crate::info::UpdateHandlerInfo],
+}
+
+/// The **candidate** worker's payload limits, applied to a replay context.
+///
+/// These live in no `WorkflowEvent`, so a pure-history replay cannot recover
+/// them from a fixture: the live worker supplies its own configured caps from
+/// `BuiltHarvest`. Both replay entry points previously left them at the library
+/// defaults, which makes a replay gate answer the wrong question — the caps are
+/// candidate configuration exactly like `build_id` and `history_policy`, and a
+/// build that changes one is precisely what a gate is asked to vet.
+///
+/// The cap is only consulted where a dispatch is *not* already in recorded
+/// history (`HistoryMatch::NoMatch`), i.e. at the frontier — which is where an
+/// in-flight fixture lands. A candidate that **lowers** a cap is the false-GREEN
+/// direction: replay accepts an input the promoted worker will reject with
+/// `PayloadTooLarge`. A candidate that configures an **offload threshold**
+/// (issue #524) is the false-RED direction: an over-threshold payload is
+/// offloaded rather than capped, so a gate that knows the cap but not the
+/// threshold reports drift that will never happen.
+///
+/// Carried as one value rather than four loose parameters so the two replay
+/// paths (strict and canary) have a single carry-through site and cannot drift
+/// apart — the same reason [`FixtureReplayDefaults`](crate::testing) exists.
+///
+/// [`Default`] is the library defaults plus no offload threshold, which is
+/// byte-for-byte the behavior of every caller that does not configure limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayPayloadLimits {
+    /// Caps activity inputs at schedule time.
+    pub max_activity_input: u64,
+    /// Caps signal payloads.
+    pub max_signal_payload: u64,
+    /// Caps child-workflow inputs and side-effect values.
+    pub max_workflow_input: u64,
+    /// When set, a payload larger than this is offloaded (#524) rather than
+    /// capped, so the cap above is not enforced against it.
+    pub offload_threshold: Option<u64>,
+}
+
+impl Default for ReplayPayloadLimits {
+    fn default() -> Self {
+        Self {
+            max_activity_input: crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+            max_signal_payload: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            max_workflow_input: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            offload_threshold: None,
+        }
+    }
+}
+
 /// Like [`run_workflow`] but runs in strict replay mode.
 ///
 /// Uses [`WorkflowContext::for_replay_strict`] so that activity and local-activity
@@ -840,12 +969,43 @@ pub async fn run_workflow_strict(
     // non-determinism. `workflow_id` is `None` for a raw-events fixture with no id.
     workflow_name: String,
     workflow_id: Option<String>,
+    // Issue #798: the execution's task queue
+    // (`harvest_workflow_executions.queue_name`). The live worker sets it from
+    // the task row via span_meta, but it lives in no `WorkflowEvent`, so a
+    // pure-history replay must apply it here or a workflow that branches
+    // command-affecting control flow on `ctx.queue_name()` — or embeds it in an
+    // activity input — replays under `""` and false-reports non-determinism.
+    // `None` (a legacy fixture that carries no queue) preserves the prior
+    // empty-string default.
+    queue_name: Option<String>,
+    // Issue #798: the build id `ctx.build_id()` reports.
+    //
+    // Unlike every other value threaded here, this is **not** a recorded
+    // per-execution row value. The live worker supplies its *own configured*
+    // `WorkerConfig::build_id` through span_meta — never the execution's
+    // recorded `assigned_build_id` — so for a replay gate the semantically
+    // correct value is the **candidate** build's id (what the worker about to be
+    // promoted will report), supplied uniformly by the caller. Sourcing it from
+    // the fixture would replay under the *old* build's id, hiding exactly the
+    // candidate-only divergence the gate exists to find. `None` (the default)
+    // preserves the prior behavior of reporting no build id.
+    build_id: Option<String>,
     // Issue #614: the runtime registry's history policy
     // (`registry.history_policy()`, threaded by the worker), so a strict/diagnosis
     // replay of a workflow that branches on `ctx.should_continue_as_new()` stays
     // byte-faithful to the live worker rather than silently using the default
     // policy. `WorkflowHistoryPolicy::default()` preserves prior behavior.
     history_policy: WorkflowHistoryPolicy,
+    // Issue #798 (Codex round 20): the **candidate** worker's payload limits.
+    // They live in no `WorkflowEvent`, so a pure-history replay cannot recover
+    // them; leaving them at the library defaults makes the gate answer the wrong
+    // question when the candidate build changes a cap or an offload threshold.
+    payload_limits: ReplayPayloadLimits,
+    // Issue #798 (Codex round 21): the candidate's declarative `#[query]` /
+    // `#[update]` handlers. The live worker registers these before any workflow
+    // code runs and `ctx.list_query_names()` surfaces them, so a workflow that
+    // branches on their presence replays down the wrong path without them.
+    declarative_handlers: ReplayDeclarativeHandlers<'_>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
@@ -854,8 +1014,22 @@ pub async fn run_workflow_strict(
         .with_parent_execution_id(parent_execution_id)
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
+        .with_queue_name(queue_name.unwrap_or_default())
+        .with_build_id(build_id)
         .with_history_policy(history_policy)
+        .with_payload_caps(
+            payload_limits.max_activity_input,
+            0,
+            payload_limits.max_signal_payload,
+            payload_limits.max_workflow_input,
+        )
+        .with_payload_offload_threshold(payload_limits.offload_threshold)
         .with_metrics(metrics);
+
+    // Mirror the live worker: register declarative handlers before any workflow
+    // code runs, so a body that branches on `ctx.list_query_names()` sees the
+    // candidate's registrations rather than an empty registry.
+    register_declarative_handlers(&ctx, declarative_handlers);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
 
@@ -884,9 +1058,24 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
     // [`run_workflow_strict`]).
     workflow_name: String,
     workflow_id: Option<String>,
+    // Issue #798: the execution's task queue (see [`run_workflow_strict`]).
+    queue_name: Option<String>,
+    // Issue #798: the candidate build id (see [`run_workflow_strict`] for why
+    // this is a caller-supplied value rather than one sourced from the fixture).
+    build_id: Option<String>,
     // Issue #614: the runtime registry's history policy (see [`run_workflow_strict`]).
     // `WorkflowHistoryPolicy::default()` preserves prior behavior.
     history_policy: WorkflowHistoryPolicy,
+    // Issue #798 (Codex round 20): the **candidate** worker's payload limits.
+    // They live in no `WorkflowEvent`, so a pure-history replay cannot recover
+    // them; leaving them at the library defaults makes the gate answer the wrong
+    // question when the candidate build changes a cap or an offload threshold.
+    payload_limits: ReplayPayloadLimits,
+    // Issue #798 (Codex round 21): the candidate's declarative `#[query]` /
+    // `#[update]` handlers. The live worker registers these before any workflow
+    // code runs and `ctx.list_query_names()` surfaces them, so a workflow that
+    // branches on their presence replays down the wrong path without them.
+    declarative_handlers: ReplayDeclarativeHandlers<'_>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
@@ -896,8 +1085,22 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
         .with_parent_execution_id(parent_execution_id)
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
+        .with_queue_name(queue_name.unwrap_or_default())
+        .with_build_id(build_id)
         .with_history_policy(history_policy)
+        .with_payload_caps(
+            payload_limits.max_activity_input,
+            0,
+            payload_limits.max_signal_payload,
+            payload_limits.max_workflow_input,
+        )
+        .with_payload_offload_threshold(payload_limits.offload_threshold)
         .with_metrics(metrics);
+
+    // Mirror the live worker: register declarative handlers before any workflow
+    // code runs, so a body that branches on `ctx.list_query_names()` sees the
+    // candidate's registrations rather than an empty registry.
+    register_declarative_handlers(&ctx, declarative_handlers);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
 
@@ -1101,12 +1304,37 @@ pub(crate) async fn run_workflow_canary(
     // non-determinism in the deploy replay canary.
     workflow_name: String,
     workflow_id: Option<String>,
+    // Issue #798: the execution's task queue (see [`run_workflow_strict`]).
+    // `run_canary` sources it from the sampled
+    // `harvest_workflow_executions.queue_name` column so a workflow that branches
+    // on `ctx.queue_name()` does not false-report non-determinism in the deploy
+    // replay canary or the in-flight replay-drift gate.
+    queue_name: Option<String>,
+    // Issue #798: the **candidate** build id (see [`run_workflow_strict`]).
+    //
+    // Deliberately *not* sourced from the sampled row's `assigned_build_id`: the
+    // live worker reports its own configured build, and both this canary and the
+    // in-flight drift gate exist to answer "what will the build I am about to
+    // promote do with these histories?". Replaying under the recorded build
+    // would take the historical branch and report clean for candidate-only code
+    // that diverges on promotion.
+    build_id: Option<String>,
     // Issue #614: the runtime registry's history policy
     // (`registry.history_policy()`, threaded by the worker), so a canary/diagnosis
     // replay of a workflow that branches on `ctx.should_continue_as_new()` stays
     // byte-faithful to the live worker rather than silently using the default
     // policy. `WorkflowHistoryPolicy::default()` preserves prior behavior.
     history_policy: WorkflowHistoryPolicy,
+    // Issue #798 (Codex round 20): the **candidate** worker's payload limits.
+    // They live in no `WorkflowEvent`, so a pure-history replay cannot recover
+    // them; leaving them at the library defaults makes the gate answer the wrong
+    // question when the candidate build changes a cap or an offload threshold.
+    payload_limits: ReplayPayloadLimits,
+    // Issue #798 (Codex round 21): the candidate's declarative `#[query]` /
+    // `#[update]` handlers. The live worker registers these before any workflow
+    // code runs and `ctx.list_query_names()` surfaces them, so a workflow that
+    // branches on their presence replays down the wrong path without them.
+    declarative_handlers: ReplayDeclarativeHandlers<'_>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_canary_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
@@ -1115,8 +1343,22 @@ pub(crate) async fn run_workflow_canary(
         .with_parent_execution_id(parent_execution_id)
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
+        .with_queue_name(queue_name.unwrap_or_default())
+        .with_build_id(build_id)
         .with_history_policy(history_policy)
+        .with_payload_caps(
+            payload_limits.max_activity_input,
+            0,
+            payload_limits.max_signal_payload,
+            payload_limits.max_workflow_input,
+        )
+        .with_payload_offload_threshold(payload_limits.offload_threshold)
         .with_metrics(metrics);
+
+    // Mirror the live worker: register declarative handlers before any workflow
+    // code runs, so a body that branches on `ctx.list_query_names()` sees the
+    // candidate's registrations rather than an empty registry.
+    register_declarative_handlers(&ctx, declarative_handlers);
 
     let span = tracing::info_span!(
         "harvest.workflow.execute",
@@ -1369,6 +1611,12 @@ pub async fn run_workflow_with_state_advancing_clock(
     // Issue #698: thread the spawning parent's execution id so a child workflow
     // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
     .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
+    // Issue #798: thread the worker build id (mirrors the caps sibling
+    // `run_workflow_with_state_history_policy_and_caps`, which already does) so a
+    // `WorkflowTestEnv::with_build_id` run can exercise a build-gated workflow.
+    // Without it this harness path silently drops the configured build and
+    // `ctx.build_id()` reports `None` inside the live run.
+    .with_build_id(span_meta.and_then(|m| m.build_id.clone()))
     .with_metrics(metrics)
     // Issue #790.
     .with_log_policy(workflow_log_policy);

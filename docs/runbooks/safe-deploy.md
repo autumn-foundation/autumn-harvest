@@ -711,9 +711,64 @@ This is the **type-level** reachability question. It is distinct from **build-id
 
 ---
 
+# Runbook: Pre-cutover in-flight replay-drift gate (issue #798)
+
+Run this **before** cutting over — it is the CI-side counterpart to the
+post-deploy replay canary below.
+
+The canary runs *server-side against the deployment*, so by the time it can
+speak the build is already reachable. The drift gate runs *in CI, against the
+candidate build*, so a determinism regression is caught before the artifact is
+promoted at all:
+
+```bash
+# In CI, against staging (read-only credential is sufficient).
+# --payload-policy full is REQUIRED: the CLI defaults to `redacted`, and the
+# gate REFUSES a redacted bundle (redaction rewrites the very activity inputs
+# replay compares against), so omitting it exits 2 on every fixture. Treat the
+# bundle as production data.
+harvest history export-sample \
+  --payload-policy full \
+  --per-workflow 50 \
+  --output-dir ./fixtures/in-flight
+
+# Then, in your own ~15-line gate binary linked against the candidate build:
+cargo run --release --bin replay-drift-gate -- ./fixtures/in-flight
+```
+
+Exit `0` = promote. Exit `1` = an in-flight execution would diverge — gate the
+change with `ctx.patched(...)` and re-run. Exit `2` = the gate could not fully
+run (a redacted bundle, a fixture that failed to replay, or an export that
+delivered fewer fixtures than it selected) — fix the export, never override.
+Exit `3` = the bundle was empty (a gate that verified nothing is never a pass;
+opt out with `allow_empty_bundle(true)` only for a genuinely idle fleet).
+
+The export is `SELECT`-only and safe against production. The per-type
+stratification (`--per-workflow`) means a noisy workflow type cannot crowd every
+other type out of the sample, and the emitted `harvest-sample-manifest.json`
+states `sampled` versus `in_flight_total` per type so a clean gate is never
+mistaken for a fleet-wide guarantee.
+
+Full recipe, exit-code table, coverage semantics, and the payload-policy
+trade-off: [`docs/replay-drift-gate.md`](../replay-drift-gate.md).
+
+**Where this sits in the deploy ladder:** worker drain (#386) → [pre-cutover
+handler-coverage gate](#runbook-pre-cutover-handler-coverage-gate) (#520) →
+[queue-coverage check](#queue-coverage-check--confirm-every-queue-has-a-live-poller-issue-774)
+(#774) → schema contract gate (#794) → **this in-flight drift gate (#798)** →
+[Pre-Deploy Replay Canary](#runbook-pre-deploy-replay-canary) (#512) →
+non-determinism block (#480/#603).
+
+---
+
 # Runbook: Pre-Deploy Replay Canary
 
 Use the deploy-time replay canary to verify that a candidate build is compatible with currently running executions before advancing the build policy or declaring compatibility.
+
+> **Complement, not substitute.** The [in-flight replay-drift gate](#runbook-pre-cutover-in-flight-replay-drift-gate-issue-798)
+> (#798) runs the same class of check in CI *before* promotion; this canary runs
+> server-side *at* deploy time. Run both — the gate blocks a bad artifact, the
+> canary catches anything the sample missed.
 
 **When to use:** before rolling out any new worker deployment where you expect the new code to handle existing in-flight workflow executions (i.e. Scenario A).
 

@@ -3439,6 +3439,83 @@ async fn test_default_env_metadata_in_activity_input_replays_clean() {
     );
 }
 
+/// Records `ctx.queue_name()` into an activity input.
+///
+/// `queue_name` is supplied by the live worker from the claimed task row (the
+/// test env supplies it via `span_meta`) and lives in no `WorkflowEvent` — the same
+/// family as `workflow_name` / `workflow_id` above.
+fn queue_name_in_activity_input_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
+        let out = ctx
+            .execute_activity_raw("record_queue", json!({ "queue": queue }), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "recorded": out }))
+    })
+}
+
+/// Issue #798: a `WorkflowTestEnv` configured via `with_queue_name` that records
+/// `ctx.queue_name()` into an **activity input** must self-check clean.
+///
+/// The live run receives the configured queue via `span_meta`, so without
+/// `replay_check` threading it onto the replay snapshot the self-check replays
+/// under `""`, the recorded activity input no longer matches, and the harness
+/// reports a FALSE non-determinism.
+#[tokio::test]
+async fn test_configured_queue_name_in_activity_input_replays_clean() {
+    let outcome = WorkflowTestEnv::new()
+        .with_queue_name("priority-queue")
+        .mock_activity("record_queue", |input| {
+            // Sanity: the LIVE run recorded the CONFIGURED queue into the input.
+            assert_eq!(
+                input.get("queue").and_then(Value::as_str),
+                Some("priority-queue"),
+                "live run must record the configured queue into the activity input"
+            );
+            Ok(json!("ok"))
+        })
+        .run(queue_name_in_activity_input_workflow, json!(null))
+        .await;
+    outcome.result.clone().expect("workflow should complete");
+
+    let report = outcome
+        .replay_check(queue_name_in_activity_input_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a WorkflowTestEnv configured with a queue that records ctx.queue_name() into an \
+         activity input must replay clean (issue #798):\n{report}"
+    );
+}
+
+/// Regression guard: a default `WorkflowTestEnv` (no `with_queue_name`) recording
+/// `ctx.queue_name()` still self-checks clean — the default `""` is used
+/// consistently on both the live and replay sides.
+#[tokio::test]
+async fn test_default_env_queue_name_in_activity_input_replays_clean() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("record_queue", |input| {
+            assert_eq!(input.get("queue").and_then(Value::as_str), Some(""));
+            Ok(json!("ok"))
+        })
+        .run(queue_name_in_activity_input_workflow, json!(null))
+        .await;
+    outcome.result.clone().expect("workflow should complete");
+
+    let report = outcome
+        .replay_check(queue_name_in_activity_input_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a default WorkflowTestEnv recording ctx.queue_name() into an activity input must \
+         replay clean:\n{report}"
+    );
+}
+
 // ── await_external_workflow coverage (issue #757) ────────────────────────────
 
 /// Awaits an external target and returns its output verbatim.
@@ -3835,4 +3912,84 @@ async fn windowed_fan_out_drives_to_completion() {
         .filter(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
         .count();
     assert_eq!(completed, 10, "all 10 activities completed");
+}
+
+/// A workflow that records its worker's build id into an activity input.
+///
+/// `build_id` is supplied by the live worker from its **own** `WorkerConfig`
+/// (the test env supplies it via `span_meta`) and lives in no `WorkflowEvent`.
+fn build_id_in_activity_input_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let build = ctx.build_id().unwrap_or("<none>").to_string();
+        let out = ctx
+            .execute_activity_raw("record_build", json!({ "build": build }), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "recorded": out }))
+    })
+}
+
+/// Issue #798: a `WorkflowTestEnv` configured via `with_build_id` that records
+/// `ctx.build_id()` into an **activity input** must self-check clean.
+///
+/// This locks the live/replay *symmetry* invariant. The env threads the build id
+/// into the live run via `span_meta`; `replay_check` must thread the same value
+/// onto the replayer (it rides the replayer rather than the snapshot, because
+/// `HistorySnapshot` deliberately carries no build id). Wiring only the live half
+/// would reproduce exactly the `queue_name` bug this family already produced once.
+#[tokio::test]
+async fn test_configured_build_id_in_activity_input_replays_clean() {
+    let outcome = WorkflowTestEnv::new()
+        .with_build_id("v2")
+        .mock_activity("record_build", |input| {
+            // Sanity: the LIVE run recorded the CONFIGURED build into the input.
+            assert_eq!(
+                input.get("build").and_then(Value::as_str),
+                Some("v2"),
+                "live run must record the configured build id into the activity input"
+            );
+            Ok(json!("ok"))
+        })
+        .run(build_id_in_activity_input_workflow, json!(null))
+        .await;
+    outcome.result.clone().expect("workflow should complete");
+
+    let report = outcome
+        .replay_check(build_id_in_activity_input_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a WorkflowTestEnv configured with a build id that records ctx.build_id() into \
+         an activity input must replay clean (issue #798):\n{report}"
+    );
+}
+
+/// Regression guard: a default `WorkflowTestEnv` (no `with_build_id`) recording
+/// `ctx.build_id()` still self-checks clean — `None` is used consistently on both
+/// the live and replay sides, so the default path is unchanged.
+#[tokio::test]
+async fn test_default_env_build_id_in_activity_input_replays_clean() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("record_build", |input| {
+            assert_eq!(
+                input.get("build").and_then(Value::as_str),
+                Some("<none>"),
+                "default env must report no build id on the live side"
+            );
+            Ok(json!("ok"))
+        })
+        .run(build_id_in_activity_input_workflow, json!(null))
+        .await;
+    outcome.result.clone().expect("workflow should complete");
+
+    let report = outcome
+        .replay_check(build_id_in_activity_input_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the default (unset) build id must be used consistently on both sides:\n{report}"
+    );
 }

@@ -246,7 +246,13 @@ fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
             "echo_workflow".to_string(),
             None,
             // Issue #614: default history policy for this span test.
+            // Issue #798: no task queue on this fixture.
+            None,
+            None, // issue #798: candidate build id (unset in this span test)
             autumn_harvest::context::WorkflowHistoryPolicy::default(),
+            // Issue #798: library-default payload limits for this span test.
+            autumn_harvest::executor::ReplayPayloadLimits::default(),
+            autumn_harvest::executor::ReplayDeclarativeHandlers::default(),
         ));
 
     // 1. Span must be named correctly.

@@ -181,6 +181,13 @@ pub mod query;
 pub mod queue_fairness;
 pub mod queue_pause;
 pub mod replay;
+/// Stratified in-flight history sampling for the replay-drift gate (issue #798).
+///
+/// Carries the pure, database-free vocabulary shared by the sample export
+/// (`GET /admin/history/export-sample`), the `harvest history export-sample`
+/// CLI bundle writer, and [`testing::ReplayVerifier::replay_bundle`], so the
+/// bundle wire shape cannot drift between producer and consumer.
+pub mod replay_sample;
 #[cfg(feature = "db")]
 pub mod reset;
 pub mod retention;
@@ -460,7 +467,8 @@ pub use test_generator::TestHarnessGenerator;
 #[cfg(feature = "testing")]
 pub use testing::{
     BatchReplayReport, CiReport, FailOnMode, FixtureResult, FixtureStatus, HarnessErrorKind,
-    ReplayVerifier, ReportFormat, TestRunOutcome, WorkflowTestEnv,
+    ReplayBlocked, ReplayDrift, ReplayDriftReport, ReplayVerifier, ReportFormat, TestRunOutcome,
+    WorkflowTestEnv,
 };
 #[cfg(all(feature = "db", any(test, feature = "testing")))]
 pub use testing::{

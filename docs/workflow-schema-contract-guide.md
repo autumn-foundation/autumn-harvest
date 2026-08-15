@@ -751,6 +751,10 @@ The schema gate is one layer of replay defence-in-depth, not the whole of it:
 1. **`harvest det-check`** — non-deterministic *code* reachable from workflow bodies.
 2. **`harvest schema check`** *(this gate)* — incompatible *payload* changes.
 3. **`WorkflowReplayer` / `harvest-replay`** — replay real exported histories against the new code.
+   The **in-flight** flavour of this layer is the replay-drift gate (#798):
+   `harvest history export-sample` + `WorkflowReplayer::replay_bundle`, which
+   samples the executions running *right now* rather than a curated fixture set.
+   See [`replay-drift-gate.md`](replay-drift-gate.md).
 4. **`ctx.patched()` / `ctx.version()`** — fence a deliberate logic change across deploys.
 5. **Build-id routing (#171)** — pin in-flight executions to the old build during a breaking migration.
 6. **`harvest workflow-types reachability` (#520)** — confirm a handler is safe to delete.
@@ -758,3 +762,8 @@ The schema gate is one layer of replay defence-in-depth, not the whole of it:
 Layers 1 and 2 are static and cheap enough for every PR. Layer 3 is the
 authoritative check, but it needs a recorded history to run against — which is
 exactly why the static gates exist.
+
+Layers 2 and 3 are the pre-cutover pair, and they catch different halves of the
+same deploy hazard: this gate catches a payload *shape* change statically,
+without needing any history; the drift gate catches a control-flow change by
+actually replaying live in-flight work. Neither subsumes the other — run both.

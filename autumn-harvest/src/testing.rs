@@ -259,6 +259,7 @@ impl std::fmt::Display for ReplayReport {
 ///     deadline_at: None,
 ///     parent_execution_id: None,
 ///     workflow_id: None,
+///     queue_name: None,
 /// };
 /// let json = serde_json::to_string(&snapshot).unwrap();
 /// // Store `json` as a fixture file.
@@ -336,6 +337,26 @@ pub struct HistorySnapshot {
     /// [`history_export::HistoryExportDocument::workflow_id`]: crate::history_export::HistoryExportDocument::workflow_id
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
+    /// The execution's task queue (issue #798), sourced from the
+    /// `harvest_workflow_executions.queue_name` column.
+    ///
+    /// The live worker sets `ctx.queue_name()` from the claimed task row, but the
+    /// value lives in no `WorkflowEvent`, so a captured fixture cannot recover it
+    /// from the event log alone — the same family as
+    /// [`context_headers`](Self::context_headers) and
+    /// [`workflow_id`](Self::workflow_id). When `Some`, both replay paths thread
+    /// it into the `WorkflowContext` (preferring it over the replayer's global
+    /// [`with_queue_name`](WorkflowReplayer::with_queue_name)) so a workflow that
+    /// branches command-affecting control flow on `ctx.queue_name()` — or embeds
+    /// it in an activity input — replays deterministically instead of running
+    /// under `""` and false-reporting drift. Serialised at the same top-level name
+    /// as [`history_export::HistoryExportDocument::queue_name`], so an exported
+    /// history round-trips into this snapshot verbatim. `None` (the field absent —
+    /// a legacy snapshot) falls back to the replayer's global.
+    ///
+    /// [`history_export::HistoryExportDocument::queue_name`]: crate::history_export::HistoryExportDocument::queue_name
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +411,33 @@ pub struct WorkflowReplayer {
     /// carries its own `workflow_id` overrides this global. `None` (the default)
     /// models a run without an explicit id.
     workflow_id: Option<String>,
+    /// Effective task queue threaded into the replayed `WorkflowContext`
+    /// (issue #798). `queue_name` is supplied by the live worker from the claimed
+    /// task row and lives in no `WorkflowEvent`, so a fixture that omits it cannot
+    /// recover it; set it with [`with_queue_name`](Self::with_queue_name) so a
+    /// workflow that branches command-affecting control flow on `ctx.queue_name()`
+    /// — or embeds it in an activity input — replays deterministically. A
+    /// [`HistorySnapshot`] that carries its own `queue_name` overrides this
+    /// global. `None` (the default) preserves the empty-string default.
+    queue_name: Option<String>,
+    /// The **candidate** build id threaded into the replayed `WorkflowContext`
+    /// (issue #798), reported by [`WorkflowContext::build_id`].
+    ///
+    /// Unlike every sibling field here, this is deliberately **not** sourced
+    /// from the fixture. The live worker supplies its *own configured*
+    /// [`WorkerConfig::build_id`](crate::builder::WorkerConfig::build_id)
+    /// through span metadata — never the execution's recorded
+    /// `assigned_build_id` — so the value a replay gate needs is the build that
+    /// is *about to be promoted*, applied uniformly to every fixture. Recording
+    /// the exporting worker's build into the snapshot and replaying under it
+    /// would take the **historical** branch, so candidate-only code such as
+    /// `if ctx.build_id() == Some("v2")` would replay clean and the gate would
+    /// report false GREEN on exactly the divergence it exists to catch.
+    ///
+    /// Consequently there is no `HistorySnapshot::build_id` to override this:
+    /// set it with [`with_build_id`](Self::with_build_id). `None` (the default)
+    /// reports no build id, matching a worker with none configured.
+    build_id: Option<String>,
     /// Effective `execution_id` threaded into the replayed `WorkflowContext` on
     /// the raw [`replay_from_events`](Self::replay_from_events) path (issue #698).
     /// `execution_id` is documented as replay-safe (`ctx.info().execution_id`),
@@ -411,6 +459,73 @@ pub struct WorkflowReplayer {
     /// `continue_as_new_deadline_fraction` — replays byte-faithfully to the live
     /// worker instead of surfacing false non-determinism.
     history_policy: crate::context::WorkflowHistoryPolicy,
+    /// The **candidate** worker's payload limits (issue #798, Codex round 20).
+    ///
+    /// Same category as `build_id` and `history_policy` above, and deliberately
+    /// **not** sourced from the fixture: payload caps and the offload threshold
+    /// live in no `WorkflowEvent`, and the live worker supplies its own from
+    /// `BuiltHarvest`. Left at the library defaults, a replay gate answers the
+    /// wrong question — a candidate that *lowers* a cap replays clean here and
+    /// then rejects the sampled in-flight runs with `PayloadTooLarge` once
+    /// promoted (false GREEN), while a candidate that configures an offload
+    /// threshold reports drift that will never happen (false RED).
+    ///
+    /// See [`ReplayPayloadLimits`](crate::executor::ReplayPayloadLimits) for why
+    /// only a frontier dispatch consults these. Defaults to the library values,
+    /// so a caller that does not set them is unaffected.
+    payload_limits: crate::executor::ReplayPayloadLimits,
+    /// The candidate's declarative `#[query]` / `#[update]` handlers (issue #798).
+    ///
+    /// Registered onto the replay context before the workflow body runs, exactly
+    /// as the live worker does. Owned rather than borrowed so a builder can be
+    /// constructed and moved freely; the executor borrows from these at the call
+    /// site. Empty by default, which is byte-for-byte the pre-fix behavior.
+    ///
+    /// See [`ReplayDeclarativeHandlers`](crate::executor::ReplayDeclarativeHandlers)
+    /// for why a replay that omits them answers the wrong question.
+    declarative_queries: Vec<crate::info::QueryHandlerInfo>,
+    /// The candidate's declarative update handlers. See `declarative_queries`.
+    declarative_updates: Vec<crate::info::UpdateHandlerInfo>,
+    /// Per-workflow `#[workflow(max_input_bytes = …)]` overrides (issue #798,
+    /// Codex round 22), keyed by workflow type name.
+    ///
+    /// The same class as `payload_limits` above, one level finer. The live worker
+    /// does not apply a single fleet-wide workflow-input cap: it resolves the
+    /// effective cap **per workflow type**, raising the registry default by that
+    /// workflow's own declared override —
+    /// `workflow.max_input_bytes.map_or(global, |per| per.max(global))`
+    /// (`worker.rs`). A gate that applies only the global cap therefore replays a
+    /// cap-raising workflow under a cap the promoted worker will not enforce: a
+    /// frontier dispatch that the worker accepts is rejected here with
+    /// `PayloadTooLarge`, which is the false-RED direction — drift reported on a
+    /// workflow nobody changed, blocking a good release.
+    ///
+    /// Populated from [`register`](Self::register), which already receives the
+    /// full [`WorkflowInfo`] and previously kept only `name → handler`. Empty for
+    /// [`register_fn`](Self::register_fn) (a bare fn pointer carries no override),
+    /// which resolves to the global cap — byte-for-byte the pre-fix behavior.
+    workflow_input_caps: HashMap<String, u64>,
+}
+
+/// Owned borrows of a replayer's declarative handlers.
+///
+/// The executor takes `&[&QueryHandlerInfo]` (mirroring the live worker's own
+/// signature), but the replayer stores owned `Vec`s so a builder can be moved
+/// freely. This is the bridge: it holds the reference vectors alive across the
+/// executor call so the borrowed slices stay valid.
+struct DeclarativeHandlerRefs<'a> {
+    queries: Vec<&'a crate::info::QueryHandlerInfo>,
+    updates: Vec<&'a crate::info::UpdateHandlerInfo>,
+}
+
+impl<'a> DeclarativeHandlerRefs<'a> {
+    /// Borrow as the executor's parameter shape.
+    fn as_params(&'a self) -> crate::executor::ReplayDeclarativeHandlers<'a> {
+        crate::executor::ReplayDeclarativeHandlers {
+            queries: &self.queries,
+            updates: &self.updates,
+        }
+    }
 }
 
 impl Default for WorkflowReplayer {
@@ -439,6 +554,10 @@ struct SampledExecution {
     // the canary replay so a workflow that branches on `ctx.info().workflow_id`
     // does not false-report non-determinism.
     workflow_id: String,
+    // Issue #798: the sampled row's `queue_name` column, threaded into the canary
+    // replay so a workflow that branches on `ctx.queue_name()` does not
+    // false-report non-determinism.
+    queue_name: String,
 }
 
 impl WorkflowReplayer {
@@ -455,8 +574,14 @@ impl WorkflowReplayer {
             execution_timeout: None,
             parent_execution_id: None,
             workflow_id: None,
+            queue_name: None,
+            build_id: None,
             execution_id: None,
             history_policy: crate::context::WorkflowHistoryPolicy::default(),
+            payload_limits: crate::executor::ReplayPayloadLimits::default(),
+            declarative_queries: Vec::new(),
+            declarative_updates: Vec::new(),
+            workflow_input_caps: HashMap::new(),
         }
     }
 
@@ -529,6 +654,155 @@ impl WorkflowReplayer {
     pub fn with_workflow_id(mut self, workflow_id: impl Into<String>) -> Self {
         self.workflow_id = Some(workflow_id.into());
         self
+    }
+
+    /// Set the task queue threaded into the replayed `WorkflowContext`
+    /// (issue #798).
+    ///
+    /// Required to replay a workflow whose command-affecting control flow branches
+    /// on `ctx.queue_name()` (or embeds it in an activity input): the live worker
+    /// supplies that value from the claimed task row, so it lives in no
+    /// `WorkflowEvent` and a fixture that omits it cannot carry it. Without it the
+    /// replayed context reports `queue_name == ""` and false-reports
+    /// non-determinism against a history recorded on a named queue. A
+    /// [`HistorySnapshot`](HistorySnapshot::queue_name) that carries its own value
+    /// overrides this global. `None` (the default) preserves the empty-string
+    /// default.
+    #[must_use]
+    pub fn with_queue_name(mut self, queue_name: impl Into<String>) -> Self {
+        self.queue_name = Some(queue_name.into());
+        self
+    }
+
+    /// Set the **candidate** build id threaded into the replayed
+    /// `WorkflowContext` (issue #798), reported by
+    /// [`WorkflowContext::build_id`](crate::context::WorkflowContext::build_id).
+    ///
+    /// Pass the build id of the worker you are **about to deploy**, not the one
+    /// that recorded the fixtures. The live worker reports its own configured
+    /// [`WorkerConfig::build_id`](crate::builder::WorkerConfig::build_id) — never
+    /// the execution's recorded `assigned_build_id` — so a replay gate answers
+    /// "what will the candidate do with these in-flight histories?" only when the
+    /// candidate's own id is threaded through every fixture.
+    ///
+    /// Leaving it unset makes `ctx.build_id()` report `None`, so a candidate-only
+    /// branch is unreachable during the gate: the historical path replays clean
+    /// and the gate reports success on code that diverges the moment it is
+    /// promoted. This is why the value is **not** carried on
+    /// [`HistorySnapshot`] — a fixture-sourced build id would reintroduce exactly
+    /// that blind spot.
+    ///
+    /// ```no_run
+    /// # use autumn_harvest::testing::WorkflowReplayer;
+    /// # async fn demo() {
+    /// let report = WorkflowReplayer::new()
+    ///     .with_build_id("v2") // the build about to be promoted
+    ///     .replay_bundle(std::path::Path::new("./bundle"))
+    ///     .await;
+    /// assert!(report.is_clean());
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
+        self.build_id = Some(build_id.into());
+        self
+    }
+
+    /// Apply the **candidate** worker's payload caps to the replay context
+    /// (issue #798).
+    ///
+    /// Bytes, in the order the executor threads them:
+    /// `(max_activity_input, max_signal_payload, max_workflow_input)`. `0` means
+    /// "no cap", matching
+    /// [`WorkflowContext::with_payload_caps`](crate::context::WorkflowContext::with_payload_caps).
+    /// Pass the values the candidate build configures on its `HarvestBuilder`, so
+    /// the gate replays under the limits the promoted worker will actually
+    /// enforce rather than the library defaults.
+    ///
+    /// `max_activity_result` is deliberately absent: it is enforced by the worker
+    /// after an activity returns, never by `WorkflowContext`, so it cannot affect
+    /// a replay and accepting it here would imply a guarantee that does not exist.
+    #[must_use]
+    pub const fn with_payload_caps(
+        mut self,
+        max_activity_input: u64,
+        max_signal_payload: u64,
+        max_workflow_input: u64,
+    ) -> Self {
+        self.payload_limits.max_activity_input = max_activity_input;
+        self.payload_limits.max_signal_payload = max_signal_payload;
+        self.payload_limits.max_workflow_input = max_workflow_input;
+        self
+    }
+
+    /// Apply the **candidate** worker's large-payload offload threshold (#524)
+    /// to the replay context (issue #798).
+    ///
+    /// A payload above the threshold is offloaded rather than capped, so a gate
+    /// that knows the cap but not the threshold reports drift the promoted worker
+    /// would never hit. `None` (the default) models a worker with no
+    /// `PayloadStore` registered.
+    #[must_use]
+    pub const fn with_payload_offload_threshold(mut self, threshold: Option<u64>) -> Self {
+        self.payload_limits.offload_threshold = threshold;
+        self
+    }
+
+    /// Register the **candidate's** declarative `#[query]` handlers on the replay
+    /// context (issue #798).
+    ///
+    /// The live worker registers these before any workflow code runs, and
+    /// `ctx.list_query_names()` surfaces them, so a workflow that branches on
+    /// which handlers exist replays down the wrong branch without them. Pass the
+    /// same `queries![...]` collection the candidate build registers.
+    #[must_use]
+    pub fn queries(mut self, queries: Vec<crate::info::QueryHandlerInfo>) -> Self {
+        self.declarative_queries = queries;
+        self
+    }
+
+    /// Register the **candidate's** declarative `#[update]` handlers on the
+    /// replay context (issue #798). See [`queries`](Self::queries).
+    #[must_use]
+    pub fn updates(mut self, updates: Vec<crate::info::UpdateHandlerInfo>) -> Self {
+        self.declarative_updates = updates;
+        self
+    }
+
+    /// Borrow the configured declarative handlers for an executor call.
+    fn declarative_handlers(&self) -> DeclarativeHandlerRefs<'_> {
+        DeclarativeHandlerRefs {
+            queries: self.declarative_queries.iter().collect(),
+            updates: self.declarative_updates.iter().collect(),
+        }
+    }
+
+    /// Resolve the payload limits for one workflow type (issue #798, round 22).
+    ///
+    /// Mirrors the live worker's own arithmetic verbatim:
+    ///
+    /// ```text
+    /// workflow.max_input_bytes.map_or(registry.max_workflow_input_bytes,
+    ///                                 |per| per.max(registry.max_workflow_input_bytes))
+    /// ```
+    ///
+    /// so the declared override **raises** the global cap and never lowers it.
+    /// Reproducing the worker's expression — rather than an arguably-nicer rule —
+    /// is the whole point: a gate is only trustworthy if its cap is the cap the
+    /// promoted worker enforces, including where that expression is surprising.
+    /// (`0` means "no cap" by the crate-wide convention, and `per.max(0) == per`
+    /// narrows it; that quirk is the worker's, and a gate that "fixed" it here
+    /// would answer a question about a worker that does not exist.)
+    ///
+    /// A workflow with no declared override, or one registered via
+    /// [`register_fn`](Self::register_fn), resolves to the global limits
+    /// unchanged.
+    fn payload_limits_for(&self, workflow_name: &str) -> crate::executor::ReplayPayloadLimits {
+        let mut limits = self.payload_limits;
+        if let Some(&per) = self.workflow_input_caps.get(workflow_name) {
+            limits.max_workflow_input = per.max(limits.max_workflow_input);
+        }
+        limits
     }
 
     /// Set the `execution_id` threaded into the replayed `WorkflowContext` on the
@@ -640,6 +914,55 @@ impl WorkflowReplayer {
         self
     }
 
+    /// Replay an exported in-flight history bundle and return an aggregate
+    /// [`ReplayDriftReport`] (issue #798).
+    ///
+    /// Convenience entry point for callers already holding a
+    /// [`WorkflowReplayer`]; it delegates to [`ReplayVerifier::replay_bundle`],
+    /// which owns the bundle walk, concurrency budget, and per-fixture timeout.
+    /// Use [`ReplayVerifier`] directly to configure those, plus
+    /// `allow_unregistered`, `allow_empty_bundle`, or
+    /// `require_complete_coverage`.
+    pub async fn replay_bundle(&self, dir: impl AsRef<std::path::Path>) -> ReplayDriftReport {
+        // Same module, so the verifier's private fields are reachable — no need
+        // for a public setter that would only ever serve this delegation.
+        let mut verifier = ReplayVerifier::new();
+        verifier.handlers.clone_from(&self.handlers);
+        verifier.state = self.state.clone();
+        // Carry every replay-context value this replayer was configured with
+        // across the delegation. Dropping any of them silently ignores the
+        // corresponding `WorkflowReplayer::with_*` builder call on the bundle
+        // path and replays under a different context — reporting drift for a
+        // workflow that never drifted. Issue #614 established this for
+        // `history_policy`; Codex round-10 P2 extended it to the four
+        // `HistorySnapshot`-metadata fallbacks, which matter for any fixture
+        // that omits the metadata (hand-built, or exported before #698).
+        verifier.replay_defaults = FixtureReplayDefaults {
+            context_headers: self.context_headers.clone(),
+            execution_timeout: self.execution_timeout,
+            parent_execution_id: self.parent_execution_id,
+            workflow_id: self.workflow_id.clone(),
+            queue_name: self.queue_name.clone(),
+            build_id: self.build_id.clone(),
+            history_policy: self.history_policy,
+            // Codex round 20 extended the same rule to the candidate worker's
+            // payload limits: dropping them here would replay the bundle under
+            // the library defaults and certify a cap-lowering build.
+            payload_limits: self.payload_limits,
+            // Codex round 21 extended it again to the candidate's declarative
+            // handlers: dropping them replays with an empty registry, so a
+            // workflow branching on `ctx.list_query_names()` takes the other
+            // branch and is reported as drift it never had.
+            declarative_queries: self.declarative_queries.clone(),
+            declarative_updates: self.declarative_updates.clone(),
+            // Codex round 22 extended it once more to the per-workflow input-cap
+            // overrides: dropping them replays a cap-raising workflow under the
+            // global cap the promoted worker will not enforce for it.
+            workflow_input_caps: self.workflow_input_caps.clone(),
+        };
+        verifier.replay_bundle(dir).await
+    }
+
     /// Register a batch of workflows from a `workflows![]` macro call.
     ///
     /// ```rust,no_run
@@ -651,6 +974,13 @@ impl WorkflowReplayer {
     #[must_use]
     pub fn register(mut self, workflows: Vec<WorkflowInfo>) -> Self {
         for wf in workflows {
+            // Issue #798 (Codex round 22): retain the per-workflow input-cap
+            // override. The live worker raises its global cap by this value for
+            // this workflow type; dropping it replayed a cap-raising workflow
+            // under a cap the promoted worker never enforces.
+            if let Some(per) = wf.max_input_bytes {
+                self.workflow_input_caps.insert(wf.name.to_string(), per);
+            }
             self.handlers.insert(wf.name.to_string(), wf.handler);
         }
         self
@@ -734,12 +1064,19 @@ impl WorkflowReplayer {
             .workflow_id
             .clone()
             .or_else(|| self.workflow_id.clone());
+        // Issue #798: prefer the snapshot's own `queue_name`; fall back to the
+        // replayer's global (set via `with_queue_name`).
+        let queue_name = snapshot
+            .queue_name
+            .clone()
+            .or_else(|| self.queue_name.clone());
         self.replay_from_snapshot_effective(
             snapshot,
             execution_timeout,
             deadline_at,
             parent_execution_id,
             workflow_id,
+            queue_name,
         )
         .await
     }
@@ -757,6 +1094,9 @@ impl WorkflowReplayer {
         deadline_at: Option<chrono::DateTime<chrono::Utc>>,
         parent_execution_id: Option<ExecutionId>,
         workflow_id: Option<String>,
+        // Issue #798: the execution's task queue, so a workflow branching on
+        // `ctx.queue_name()` does not replay under `""`.
+        queue_name: Option<String>,
     ) -> ReplayReport {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
@@ -773,10 +1113,17 @@ impl WorkflowReplayer {
             };
         };
 
+        // Issue #798 (Codex round 21): borrow the candidate's declarative
+        // handlers for the duration of the executor call.
+        let declarative = self.declarative_handlers();
         let exec_id = snapshot.execution_id;
         // Issue #698: the workflow type name (mechanism 1 — the handler-lookup key)
         // applied to the replayed context via `.with_workflow_name(...)`.
         let workflow_name = snapshot.workflow_name.clone();
+        // Issue #798 (Codex round 22): resolve the cap for THIS workflow type,
+        // raising the global by its declared override exactly as the worker does.
+        // Bound before `workflow_name` is moved into the executor call below.
+        let payload_limits = self.payload_limits_for(&workflow_name);
         let events = match self.maybe_inflate(snapshot.events).await {
             Ok(e) => e,
             Err(error) => {
@@ -811,10 +1158,26 @@ impl WorkflowReplayer {
                 parent_execution_id,
                 workflow_name,
                 workflow_id,
+                // Issue #798: the execution's task queue.
+                queue_name,
+                // Issue #798: the candidate build id. Deliberately read from the
+                // replayer (never the fixture): the gate must answer what the build
+                // about to be promoted does, not what the recording build did.
+                self.build_id.clone(),
                 // Issue #614: thread the replayer's history policy so a strict
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
+                // Issue #798 (Codex round 20): the candidate worker's payload
+                // limits, for the same reason as the build id above — a build
+                // that lowers a cap breaks the very in-flight runs the gate
+                // sampled, and the library default would certify it.
+                payload_limits,
+                // Issue #798 (Codex round 21): the candidate's declarative
+                // `#[query]`/`#[update]` handlers. The live worker registers
+                // these before the body runs, so a workflow that branches on
+                // `ctx.list_query_names()` needs them to replay the same path.
+                declarative.as_params(),
             )
             .await
         } else {
@@ -831,10 +1194,26 @@ impl WorkflowReplayer {
                 parent_execution_id,
                 workflow_name,
                 workflow_id,
+                // Issue #798: the execution's task queue.
+                queue_name,
+                // Issue #798: the candidate build id. Deliberately read from the
+                // replayer (never the fixture): the gate must answer what the build
+                // about to be promoted does, not what the recording build did.
+                self.build_id.clone(),
                 // Issue #614: thread the replayer's history policy so a strict
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
+                // Issue #798 (Codex round 20): the candidate worker's payload
+                // limits, for the same reason as the build id above — a build
+                // that lowers a cap breaks the very in-flight runs the gate
+                // sampled, and the library default would certify it.
+                payload_limits,
+                // Issue #798 (Codex round 21): the candidate's declarative
+                // `#[query]`/`#[update]` handlers. The live worker registers
+                // these before the body runs, so a workflow that branches on
+                // `ctx.list_query_names()` needs them to replay the same path.
+                declarative.as_params(),
             )
             .await
         };
@@ -858,18 +1237,25 @@ impl WorkflowReplayer {
             .workflow_id
             .clone()
             .or_else(|| self.workflow_id.clone());
+        // Issue #798: prefer the snapshot's own `queue_name`; fall back to the global.
+        let queue_name = snapshot
+            .queue_name
+            .clone()
+            .or_else(|| self.queue_name.clone());
         self.replay_canary_snapshot_effective(
             snapshot,
             execution_timeout,
             deadline_at,
             parent_execution_id,
             workflow_id,
+            queue_name,
         )
         .await
     }
 
     /// Canary snapshot replay with an explicit per-execution `execution_timeout`
-    /// / live `deadline_at` (issue #772) / spawning-parent id (issue #698).
+    /// / live `deadline_at` (issue #772) / spawning-parent id (issue #698) /
+    /// task queue (issue #798).
     async fn replay_canary_snapshot_effective(
         &self,
         snapshot: HistorySnapshot,
@@ -877,6 +1263,7 @@ impl WorkflowReplayer {
         deadline_at: Option<chrono::DateTime<chrono::Utc>>,
         parent_execution_id: Option<ExecutionId>,
         workflow_id: Option<String>,
+        queue_name: Option<String>,
     ) -> ReplayReport {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
@@ -893,9 +1280,14 @@ impl WorkflowReplayer {
             };
         };
 
+        // Issue #798 (Codex round 21): borrow the candidate's declarative
+        // handlers for the duration of the executor call.
+        let declarative = self.declarative_handlers();
         let exec_id = snapshot.execution_id;
         // Issue #698: the workflow type name (mechanism 1 — the handler-lookup key).
         let workflow_name = snapshot.workflow_name.clone();
+        // Issue #798 (Codex round 22): per-workflow-type cap; see the strict path.
+        let payload_limits = self.payload_limits_for(&workflow_name);
         let total_events = snapshot.events.len();
         let input = extract_input(&snapshot.events);
 
@@ -915,10 +1307,25 @@ impl WorkflowReplayer {
             parent_execution_id,
             workflow_name,
             workflow_id,
+            // Issue #798: the execution's task queue.
+            queue_name,
+            // Issue #798: the candidate build id. Deliberately read from the
+            // replayer (never the fixture): the gate must answer what the build
+            // about to be promoted does, not what the recording build did.
+            self.build_id.clone(),
             // Issue #614: thread the replayer's history policy so a canary replay
             // of a `should_continue_as_new`-branching workflow stays faithful to
             // the live worker (which uses `registry.history_policy()`).
             self.history_policy,
+            // Issue #798 (Codex round 20): the candidate worker's payload limits.
+            // This is the in-flight gate's own path, and an in-flight fixture
+            // parks at the frontier — exactly where a fresh dispatch consults the
+            // cap — so the library default here is what turns a cap-lowering
+            // build into a false GREEN.
+            payload_limits,
+            // Issue #798 (Codex round 21): the candidate's declarative handlers
+            // (see the strict path). This is the in-flight gate's own call.
+            declarative.as_params(),
         )
         .await;
         outcome_to_report(exec_id, total_events, outcome, true)
@@ -996,7 +1403,15 @@ impl WorkflowReplayer {
         // `ctx.info().execution_id` in a command-affecting value.
         let (name, &handler) = self.handlers.iter().next().unwrap();
         let workflow_name = name.clone();
+        // Issue #798 (Codex round 22): per-workflow-type cap; see the strict path.
+        let payload_limits = self.payload_limits_for(&workflow_name);
         let workflow_id = self.workflow_id.clone();
+        // Issue #798: a raw-events fixture carries no `queue_name` either, so use
+        // the replayer's global (`with_queue_name`) when set.
+        let queue_name = self.queue_name.clone();
+        // Issue #798 (Codex round 21): borrow the candidate's declarative
+        // handlers for the duration of the executor call.
+        let declarative = self.declarative_handlers();
         let exec_id = self.execution_id.unwrap_or_default();
         let events = match self.maybe_inflate(events).await {
             Ok(e) => e,
@@ -1032,10 +1447,27 @@ impl WorkflowReplayer {
                 self.parent_execution_id,
                 workflow_name,
                 workflow_id,
+                // Issue #798: the replayer's global queue (a raw-events fixture
+                // carries no snapshot to override it).
+                queue_name,
+                // Issue #798: the candidate build id. Deliberately read from the
+                // replayer (never the fixture): the gate must answer what the build
+                // about to be promoted does, not what the recording build did.
+                self.build_id.clone(),
                 // Issue #614: thread the replayer's history policy so a strict
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
+                // Issue #798 (Codex round 20): the candidate worker's payload
+                // limits, for the same reason as the build id above — a build
+                // that lowers a cap breaks the very in-flight runs the gate
+                // sampled, and the library default would certify it.
+                payload_limits,
+                // Issue #798 (Codex round 21): the candidate's declarative
+                // `#[query]`/`#[update]` handlers. The live worker registers
+                // these before the body runs, so a workflow that branches on
+                // `ctx.list_query_names()` needs them to replay the same path.
+                declarative.as_params(),
             )
             .await
         } else {
@@ -1052,10 +1484,25 @@ impl WorkflowReplayer {
                 self.parent_execution_id,
                 workflow_name,
                 workflow_id,
+                queue_name,
+                // Issue #798: the candidate build id. Deliberately read from the
+                // replayer (never the fixture): the gate must answer what the build
+                // about to be promoted does, not what the recording build did.
+                self.build_id.clone(),
                 // Issue #614: thread the replayer's history policy so a strict
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
+                // Issue #798 (Codex round 20): the candidate worker's payload
+                // limits, for the same reason as the build id above — a build
+                // that lowers a cap breaks the very in-flight runs the gate
+                // sampled, and the library default would certify it.
+                payload_limits,
+                // Issue #798 (Codex round 21): the candidate's declarative
+                // `#[query]`/`#[update]` handlers. The live worker registers
+                // these before the body runs, so a workflow that branches on
+                // `ctx.list_query_names()` needs them to replay the same path.
+                declarative.as_params(),
             )
             .await
         };
@@ -1165,6 +1612,8 @@ impl WorkflowReplayer {
         let meta = load_workflow_name_and_headers(conn, exec_id).await?;
 
         let workflow_id = Some(meta.workflow_id.clone());
+        // Issue #798: the row's own task queue.
+        let queue_name = Some(meta.queue_name.clone());
         let snapshot = HistorySnapshot {
             workflow_name: meta.workflow_name,
             execution_id: exec_id,
@@ -1177,6 +1626,8 @@ impl WorkflowReplayer {
             parent_execution_id: meta.parent_execution_id,
             // Issue #698: the row's own business `workflow_id`.
             workflow_id: workflow_id.clone(),
+            // Issue #798: the row's own task queue.
+            queue_name: queue_name.clone(),
         };
         Ok(self
             .replay_from_snapshot_effective(
@@ -1185,6 +1636,7 @@ impl WorkflowReplayer {
                 meta.deadline_at,
                 meta.parent_execution_id,
                 workflow_id,
+                queue_name,
             )
             .await)
     }
@@ -1218,7 +1670,7 @@ impl WorkflowReplayer {
 
         let mut all_executions = Vec::new();
         for (shard_id, executions) in query_results {
-            for (id, name, created, headers, exec_timeout, deadline_at, parent_id, wf_id) in
+            for (id, name, created, headers, exec_timeout, deadline_at, parent_id, wf_id, queue) in
                 executions
             {
                 all_executions.push(SampledExecution {
@@ -1234,6 +1686,8 @@ impl WorkflowReplayer {
                     parent_execution_id: parent_id.map(crate::types::ExecutionId::from_uuid),
                     // Issue #698: the sampled row's business `workflow_id` column.
                     workflow_id: wf_id,
+                    // Issue #798: the sampled row's task queue.
+                    queue_name: queue,
                 });
             }
         }
@@ -1286,15 +1740,17 @@ impl WorkflowReplayer {
                                     parent_execution_id: exec.parent_execution_id,
                                     // Issue #698: the sampled row's own business id.
                                     workflow_id: Some(exec.workflow_id.clone()),
+                                    // Issue #798: the sampled row's own task queue.
+                                    queue_name: Some(exec.queue_name.clone()),
                                 }
                             }; // `conn` is dropped here
 
-                            // Issue #772 / #698: thread the sampled execution row's
-                            // own `execution_timeout` / live `deadline_at` / parent
-                            // id / business `workflow_id` so the deadline-aware CAN
-                            // branch and a workflow that branches on
-                            // `ctx.info().workflow_id` / `parent_execution_id` both
-                            // replay cleanly.
+                            // Issue #772 / #698 / #798: thread the sampled execution
+                            // row's own `execution_timeout` / live `deadline_at` /
+                            // parent id / business `workflow_id` / task queue so the
+                            // deadline-aware CAN branch and a workflow that branches
+                            // on `ctx.info().workflow_id` / `parent_execution_id` /
+                            // `ctx.queue_name()` all replay cleanly.
                             let report = replayer_ref
                                 .replay_canary_snapshot_effective(
                                     snapshot,
@@ -1302,6 +1758,7 @@ impl WorkflowReplayer {
                                     exec.deadline_at,
                                     exec.parent_execution_id,
                                     Some(exec.workflow_id.clone()),
+                                    Some(exec.queue_name.clone()),
                                 )
                                 .await;
                             Ok::<_, crate::error::HarvestError>(report)
@@ -1430,6 +1887,7 @@ async fn query_running_executions(
         Option<chrono::DateTime<chrono::Utc>>,
         Option<uuid::Uuid>,
         String,
+        String,
     )>,
 > {
     use crate::schema::harvest_workflow_executions::dsl::{
@@ -1463,6 +1921,9 @@ async fn query_running_executions(
             parent_id,
             // Issue #698: thread the business `workflow_id`.
             workflow_id,
+            // Issue #798: thread the execution's task queue, so a canary replay of
+            // a workflow branching on `ctx.queue_name()` does not run under "".
+            queue_name,
         ))
         .order((created_at.desc(), id.desc()))
         .limit(i64::try_from(options.sample_size).unwrap_or(i64::MAX))
@@ -1474,6 +1935,7 @@ async fn query_running_executions(
             Option<chrono::Duration>,
             Option<chrono::DateTime<chrono::Utc>>,
             Option<uuid::Uuid>,
+            String,
             String,
         )>(conn)
         .await
@@ -1593,6 +2055,9 @@ struct DbReplayMeta {
     // Issue #698: the row's business `workflow_id` column, so `replay_from_db`
     // reports the real `ctx.info().workflow_id`.
     workflow_id: String,
+    // Issue #798: the row's `queue_name` column, so `replay_from_db` reports the
+    // real `ctx.queue_name()` instead of "".
+    queue_name: String,
 }
 
 #[cfg(feature = "db")]
@@ -1608,19 +2073,21 @@ async fn load_workflow_name_and_headers(
     use crate::schema::harvest_workflow_executions::dsl::{
         context_headers as context_headers_col, deadline_at as deadline_at_col,
         execution_timeout as execution_timeout_col, harvest_workflow_executions, id as id_col,
-        parent_id as parent_id_col, workflow_id as workflow_id_col, workflow_name,
+        parent_id as parent_id_col, queue_name as queue_name_col, workflow_id as workflow_id_col,
+        workflow_name,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
     let exec_uuid = exec_id.as_uuid();
 
-    let (name, raw_headers, execution_timeout, deadline_at, parent_uuid, workflow_id): (
+    let (name, raw_headers, execution_timeout, deadline_at, parent_uuid, workflow_id, queue_name): (
         String,
         Option<serde_json::Value>,
         Option<chrono::Duration>,
         Option<chrono::DateTime<chrono::Utc>>,
         Option<uuid::Uuid>,
+        String,
         String,
     ) = harvest_workflow_executions
         .filter(id_col.eq(exec_uuid))
@@ -1631,6 +2098,8 @@ async fn load_workflow_name_and_headers(
             deadline_at_col,
             parent_id_col,
             workflow_id_col,
+            // Issue #798: the row's task queue.
+            queue_name_col,
         ))
         .first(conn)
         .await
@@ -1659,6 +2128,8 @@ async fn load_workflow_name_and_headers(
         parent_execution_id: parent_uuid.map(ExecutionId::from_uuid),
         // Issue #698: the row's business `workflow_id`.
         workflow_id,
+        // Issue #798: the row's task queue.
+        queue_name,
     })
 }
 
@@ -2243,6 +2714,803 @@ fn github_escape(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// ReplayDriftReport  — in-flight replay-drift gate (issue #798)
+// ---------------------------------------------------------------------------
+
+/// One fixture whose replay diverged from its recorded history.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReplayDrift {
+    /// The execution whose history diverged.
+    pub execution_id: Option<ExecutionId>,
+    /// The registered workflow type the history belongs to.
+    pub workflow_name: String,
+    /// The category of divergence.
+    ///
+    /// A workflow function that returned an error during replay (rather than
+    /// diverging on a command) is reported as [`NonDeterminismKind::Unknown`]
+    /// with a `workflow error:` prefixed [`first_divergence`](Self::first_divergence);
+    /// it is still a gate failure, because the candidate code could not replay
+    /// that history.
+    pub kind: NonDeterminismKind,
+    /// Human-readable description of the first divergence encountered.
+    pub first_divergence: String,
+    /// The fixture file the divergence came from, so an operator can open it.
+    #[serde(serialize_with = "serialize_path")]
+    pub fixture_path: std::path::PathBuf,
+}
+
+/// One workflow type whose fixtures in the bundle disagree with what the
+/// manifest says the export wrote.
+///
+/// Produced by
+/// [`ReplayDriftReport::bundle_inventory_mismatches`](ReplayDriftReport::bundle_inventory_mismatches).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BundleInventoryMismatch {
+    /// The workflow type the disagreement is about.
+    pub workflow_name: String,
+    /// How many fixtures of this type the manifest says were exported.
+    pub declared: u64,
+    /// How many fixtures of this type the bundle actually holds.
+    pub found: usize,
+    /// Executions the manifest says were exported but which the bundle does not
+    /// contain — histories the gate silently never replayed.
+    ///
+    /// Empty when the manifest carries no identities (a pre-identity export),
+    /// in which case only the counts were comparable.
+    pub missing_execution_ids: Vec<ExecutionId>,
+    /// Executions present in the bundle that the manifest does not list — the
+    /// directory is not the sample the manifest describes.
+    pub unexpected_execution_ids: Vec<ExecutionId>,
+}
+
+/// One fixture that could not be replayed at all (a harness-side problem, not a
+/// determinism verdict).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReplayBlocked {
+    /// The fixture file that could not be processed.
+    #[serde(serialize_with = "serialize_path")]
+    pub fixture_path: std::path::PathBuf,
+    /// Workflow name from the fixture (empty when the file was unparseable).
+    pub workflow_name: String,
+    /// Execution ID from the fixture (`None` when the file was unparseable).
+    pub execution_id: Option<ExecutionId>,
+    /// Why the fixture could not be replayed.
+    pub reason: HarnessErrorKind,
+}
+
+/// Aggregate result of replaying an exported in-flight history bundle
+/// (issue #798), shaped for a CI release gate.
+///
+/// Produced by [`ReplayVerifier::replay_bundle`] and
+/// [`WorkflowReplayer::replay_bundle`].
+///
+/// # Reading the verdict
+///
+/// Use [`exit_code`](Self::exit_code) (or [`is_clean`](Self::is_clean)) rather
+/// than checking `diverged.is_empty()` by hand — the latter reports "no drift"
+/// for a bundle that contained no fixtures at all, which is the one failure
+/// mode a release gate must never have.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReplayDriftReport {
+    /// Total fixtures discovered in the bundle (excluding the manifest).
+    pub total: usize,
+    /// Fixtures that replayed with no divergence.
+    pub succeeded: usize,
+    /// Fixtures whose replay diverged from the recorded history.
+    pub diverged: Vec<ReplayDrift>,
+    /// Fixtures that could not be replayed (unparseable, unregistered, timeout).
+    pub blocked: Vec<ReplayBlocked>,
+    /// Fixtures skipped because `allow_unregistered` was set.
+    pub skipped: usize,
+    /// What the bundle actually held, per workflow type: the execution ids of
+    /// every fixture discovered, whatever its replay outcome.
+    ///
+    /// The bundle-side half of the manifest reconciliation. Recorded for every
+    /// fixture — passed, diverged, skipped, blocked — because presence in the
+    /// directory is the question, not verdict: a fixture that failed to replay
+    /// was still delivered, and counting only the successes would report every
+    /// divergence as *also* a missing file.
+    ///
+    /// A fixture too malformed to yield an execution id contributes nothing
+    /// here; it is already a rung-`2` block in its own right.
+    pub found_execution_ids: std::collections::BTreeMap<String, Vec<ExecutionId>>,
+    /// Coverage claimed by the bundle's manifest, when it has one.
+    pub coverage: Option<crate::replay_sample::SampleManifest>,
+    /// Why the bundle's manifest could not be read, when it was present but
+    /// unreadable.
+    ///
+    /// `None` covers both a well-formed manifest and a legitimately absent one —
+    /// see [`BundleManifest`] for why those two share a verdict and this one does
+    /// not. When set, the gate blocks at rung `2`: every manifest-derived guard
+    /// is unenforceable, so the gate cannot claim to have fully run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_unreadable: Option<String>,
+    /// Whether an empty bundle was explicitly permitted.
+    pub allow_empty_bundle: bool,
+    /// Whether incomplete cross-shard coverage blocks the gate.
+    pub require_complete_coverage: bool,
+}
+
+impl ReplayDriftReport {
+    /// Project a [`BatchReplayReport`] into the drift-gate shape.
+    fn from_batch(
+        batch: BatchReplayReport,
+        manifest: BundleManifest,
+        allow_empty_bundle: bool,
+        require_complete_coverage: bool,
+    ) -> Self {
+        let (coverage, manifest_unreadable) = match manifest {
+            BundleManifest::Present(m) => (Some(*m), None),
+            BundleManifest::Absent => (None, None),
+            BundleManifest::Unreadable(reason) => (None, Some(reason)),
+        };
+        let mut diverged = Vec::new();
+        let mut blocked = Vec::new();
+        let mut found_execution_ids: std::collections::BTreeMap<String, Vec<ExecutionId>> =
+            std::collections::BTreeMap::new();
+
+        for result in batch.results {
+            // Inventory first, and for every status: the question this answers
+            // is "was this history delivered?", which a divergence does not
+            // change. Recorded before the match so no future arm can forget it.
+            if let Some(execution_id) = result.execution_id {
+                found_execution_ids
+                    .entry(result.workflow_name.clone())
+                    .or_default()
+                    .push(execution_id);
+            }
+            match result.status {
+                FixtureStatus::Passed | FixtureStatus::Skipped { .. } => {}
+                FixtureStatus::Failed(ReplayStatus::NonDeterminismDetected {
+                    kind,
+                    expected,
+                    actual,
+                    event_index,
+                }) => diverged.push(ReplayDrift {
+                    execution_id: result.execution_id,
+                    workflow_name: result.workflow_name,
+                    kind,
+                    first_divergence: format!(
+                        "at event {event_index}: expected {expected}, got {actual}"
+                    ),
+                    fixture_path: result.path,
+                }),
+                // A workflow function that errored during replay is still a gate
+                // failure — the candidate code could not replay that history —
+                // but it is not a command-sequence divergence, so it carries the
+                // `Unknown` kind and a distinguishable message.
+                FixtureStatus::Failed(ReplayStatus::WorkflowFailed { error, event_index }) => {
+                    diverged.push(ReplayDrift {
+                        execution_id: result.execution_id,
+                        workflow_name: result.workflow_name,
+                        kind: NonDeterminismKind::Unknown,
+                        first_divergence: format!(
+                            "workflow error: at event {event_index}: {error}"
+                        ),
+                        fixture_path: result.path,
+                    });
+                }
+                FixtureStatus::Failed(ReplayStatus::ReplaySucceeded) => {
+                    // Unreachable: `replay_fixture_file` only wraps non-success
+                    // statuses in `Failed`. Counted as success rather than
+                    // silently dropped so the totals always reconcile.
+                    debug_assert!(false, "ReplaySucceeded must not be wrapped in Failed");
+                }
+                FixtureStatus::HarnessError(reason) => blocked.push(ReplayBlocked {
+                    fixture_path: result.path,
+                    workflow_name: result.workflow_name,
+                    execution_id: result.execution_id,
+                    reason,
+                }),
+            }
+        }
+
+        for ids in found_execution_ids.values_mut() {
+            ids.sort_unstable_by_key(ExecutionId::as_uuid);
+        }
+
+        Self {
+            total: batch.fixtures_total,
+            succeeded: batch.succeeded,
+            diverged,
+            blocked,
+            skipped: batch.skipped,
+            found_execution_ids,
+            coverage,
+            manifest_unreadable,
+            allow_empty_bundle,
+            require_complete_coverage,
+        }
+    }
+
+    /// Whether the bundle contained no fixtures.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// Whether the run replayed **no workflow at all**, whatever the reason.
+    ///
+    /// Broader than [`is_empty`](Self::is_empty): a bundle whose every fixture
+    /// was *skipped* (`allow_unregistered`, a gate binary wired to the wrong
+    /// bundle, or one that registered none of the sampled types) has
+    /// `total > 0` yet verified exactly as much as an empty directory did —
+    /// nothing. Certifying a release on that is the same false pass, so both
+    /// share the empty-bundle rung and the same `allow_empty_bundle` opt-out.
+    #[must_use]
+    pub const fn verified_nothing(&self) -> bool {
+        self.succeeded == 0 && self.diverged.is_empty() && self.blocked.is_empty()
+    }
+
+    /// Whether the manifest declares more fixtures than the bundle contains.
+    ///
+    /// The manifest is the export's own record of what it wrote. If fixtures go
+    /// missing in transit — a truncated CI artifact upload, a partial copy, a
+    /// `.gitignore`d subdirectory — every surviving fixture can replay cleanly
+    /// while the gate silently certifies a strict subset of the sample. Neither
+    /// the divergence rung nor `require_complete_coverage` catches that: the
+    /// manifest's own shard status still reads `complete`, because the *export*
+    /// was complete; it was the *bundle* that lost files afterwards.
+    ///
+    /// A surplus counts too: an unexpected extra fixture means the directory is
+    /// not the bundle the manifest describes, so its verdict is not about the
+    /// sample the operator thinks they took.
+    #[must_use]
+    pub fn fixture_count_disagrees_with_manifest(&self) -> bool {
+        self.coverage.as_ref().is_some_and(|manifest| {
+            // A `sampled_total` that does not even fit a `usize` cannot equal
+            // the count of files actually walked, so a conversion failure is
+            // itself a disagreement rather than a reason to stay silent.
+            !usize::try_from(manifest.sampled_total).is_ok_and(|declared| declared == self.total)
+        })
+    }
+
+    /// Per-workflow-type disagreements between the bundle and the manifest's
+    /// inventory.
+    ///
+    /// [`fixture_count_disagrees_with_manifest`](Self::fixture_count_disagrees_with_manifest)
+    /// compares one number against one number, so it accepts any corruption
+    /// that preserves the *total*. Lose a fixture for workflow `A` while the
+    /// artifact gains a duplicate for workflow `B` and the totals still match:
+    /// both `B` fixtures replay cleanly, the gate exits `0`, and `A` was never
+    /// verified at all. That is the same silent false pass the aggregate check
+    /// exists to prevent, one level down.
+    ///
+    /// So this reconciles at the two finer grains the manifest supports:
+    ///
+    /// * **Per type** — `found` against `declared`, catching a substitution
+    ///   across types that the total hides.
+    /// * **Per execution** — the exact ids, catching a substitution *within* a
+    ///   type, which per-type counts hide in turn. A bundle that swaps one
+    ///   execution of `A` for a duplicate of another `A` matches on every
+    ///   count there is; only identity separates it from the real sample.
+    ///
+    /// The identity comparison is skipped for a manifest that carries no
+    /// [`sampled_execution_ids`](crate::replay_sample::SampleWorkflowCoverage::sampled_execution_ids)
+    /// — a bundle from a pre-identity export makes *no claim* about which
+    /// executions it holds, and reading that as a claim of *none* would report
+    /// every fixture as unexpected on every such bundle. Those degrade to the
+    /// per-type count check, which is still strictly stronger than the total.
+    ///
+    /// A type present in the bundle but absent from the manifest is reported
+    /// with `declared: 0`, and one in the manifest but absent from the bundle
+    /// with `found: 0`; neither can be expressed by comparing only the types
+    /// the two happen to share.
+    #[must_use]
+    pub fn bundle_inventory_mismatches(&self) -> Vec<BundleInventoryMismatch> {
+        let Some(manifest) = self.coverage.as_ref() else {
+            return Vec::new();
+        };
+        let declared: std::collections::BTreeMap<
+            &str,
+            &crate::replay_sample::SampleWorkflowCoverage,
+        > = manifest
+            .per_workflow
+            .iter()
+            .map(|entry| (entry.workflow_name.as_str(), entry))
+            .collect();
+
+        // Union of both sides: a type only one of them knows about is exactly
+        // the case a shared-keys comparison would miss.
+        let names: std::collections::BTreeSet<&str> = declared
+            .keys()
+            .copied()
+            .chain(self.found_execution_ids.keys().map(String::as_str))
+            .collect();
+
+        let mut mismatches = Vec::new();
+        for name in names {
+            let entry = declared.get(name).copied();
+            let empty: Vec<ExecutionId> = Vec::new();
+            let found_ids = self.found_execution_ids.get(name).unwrap_or(&empty);
+            let declared_count = entry.map_or(0, |coverage| coverage.sampled);
+            let count_disagrees =
+                !u64::try_from(found_ids.len()).is_ok_and(|found| found == declared_count);
+
+            // Only compare identities when the manifest actually asserts them.
+            let declared_ids = entry.map_or(&empty, |coverage| &coverage.sampled_execution_ids);
+            // Keyed on the inner UUID because `ExecutionId` is deliberately not
+            // `Ord`; the set difference needs a total order, and a UUID has one.
+            let (missing, unexpected): (Vec<ExecutionId>, Vec<ExecutionId>) =
+                if declared_ids.is_empty() {
+                    (Vec::new(), Vec::new())
+                } else {
+                    let declared_set: std::collections::BTreeSet<uuid::Uuid> =
+                        declared_ids.iter().map(ExecutionId::as_uuid).collect();
+                    let found_set: std::collections::BTreeSet<uuid::Uuid> =
+                        found_ids.iter().map(ExecutionId::as_uuid).collect();
+                    (
+                        declared_set
+                            .difference(&found_set)
+                            .copied()
+                            .map(ExecutionId::from_uuid)
+                            .collect(),
+                        found_set
+                            .difference(&declared_set)
+                            .copied()
+                            .map(ExecutionId::from_uuid)
+                            .collect(),
+                    )
+                };
+
+            if count_disagrees || !missing.is_empty() || !unexpected.is_empty() {
+                mismatches.push(BundleInventoryMismatch {
+                    workflow_name: name.to_string(),
+                    declared: declared_count,
+                    found: found_ids.len(),
+                    missing_execution_ids: missing,
+                    unexpected_execution_ids: unexpected,
+                });
+            }
+        }
+        mismatches
+    }
+
+    /// Whether the bundle's contents disagree with the manifest's inventory.
+    ///
+    /// See [`bundle_inventory_mismatches`](Self::bundle_inventory_mismatches)
+    /// for what is compared and why the total alone is not enough.
+    #[must_use]
+    pub fn bundle_inventory_disagrees_with_manifest(&self) -> bool {
+        !self.bundle_inventory_mismatches().is_empty()
+    }
+
+    /// Whether the bundle's manifest reports incomplete cross-shard coverage.
+    ///
+    /// `false` when the bundle carries no manifest — an unclaimed coverage is
+    /// not a *failed* coverage claim.
+    #[must_use]
+    pub fn has_incomplete_coverage(&self) -> bool {
+        self.coverage
+            .as_ref()
+            .is_some_and(|manifest| !manifest.is_complete())
+    }
+
+    /// Whether the bundle's own manifest **contradicts** the claim that the
+    /// fleet is idle.
+    ///
+    /// [`allow_empty_bundle`](ReplayVerifier::allow_empty_bundle) exists for a
+    /// fleet that is legitimately idle. But a bundle is also empty when the
+    /// *exporter* could not read the fleet — a total shard outage produces zero
+    /// fixtures too, and the two are indistinguishable from the fixture count
+    /// alone. Honoring the opt-out unconditionally lets that outage exit `0`: a
+    /// release certified against nothing at all, the single worst verdict this
+    /// gate can produce.
+    ///
+    /// Note that neither existing rung catches it. Rung `2`'s
+    /// [`export_is_incomplete`](Self::export_is_incomplete) is
+    /// `truncated_by_size || export_failures > 0`, and a *total* shard outage
+    /// selects no candidates at all — so there are no per-candidate fetch
+    /// failures to count and no size ceiling to hit, and both are `0`/`false`.
+    /// Rung `4` reads the status but only under
+    /// [`require_complete_coverage`](ReplayVerifier::require_complete_coverage),
+    /// which is off by default. The manifest says `unavailable`, and nothing
+    /// looks.
+    ///
+    /// So this consults exactly that: a manifest reporting anything other than
+    /// complete coverage contradicts "the fleet is idle", because the export
+    /// never saw the whole fleet to make that claim about.
+    ///
+    /// A bundle with **no** manifest reports `false` — the opt-out still
+    /// applies. That is deliberate and is why this asks whether emptiness is
+    /// *contradicted* rather than whether it is *proven*:
+    ///
+    /// * The exporter writes the manifest unconditionally, alongside the
+    ///   fixtures and even when it produced none. So a Harvest-produced bundle
+    ///   always carries one, and "no manifest" means the bundle did not come
+    ///   from the exporter — a hand-assembled directory, or a gate binary
+    ///   pointed at the wrong path. Absent-manifest is therefore not the
+    ///   export-outage case this guards.
+    /// * An operator who wants the stronger "prove coverage or fail" rule
+    ///   already has [`require_complete_coverage`](ReplayVerifier::require_complete_coverage),
+    ///   whose [`coverage_claim_unsatisfied`](Self::coverage_claim_unsatisfied)
+    ///   *does* fail closed on an absent manifest. Applying that rule here
+    ///   unconditionally would override an opt-out the caller set explicitly,
+    ///   on evidence that does not exist, in a case the finding does not cover.
+    #[must_use]
+    pub fn emptiness_is_contradicted(&self) -> bool {
+        self.has_incomplete_coverage()
+    }
+
+    /// Whether an opted-in `require_complete_coverage` claim is unsatisfied.
+    ///
+    /// Deliberately stricter than [`has_incomplete_coverage`](Self::has_incomplete_coverage),
+    /// and the distinction is the whole point of the flag. That method answers
+    /// "did the bundle *claim* partial coverage?", so an absent manifest is
+    /// correctly `false` — nothing was claimed, so no claim failed.
+    ///
+    /// This method answers the operator's question instead: "was complete
+    /// coverage *proven*?" A caller who sets `require_complete_coverage` has said
+    /// they will not certify a build against a partial read of the fleet, and a
+    /// bundle with **no** manifest proves nothing — the sample may have missed an
+    /// entire shard. Reading an absent manifest as "complete" would hand that
+    /// caller a green build precisely when the evidence went missing (a lost or
+    /// unparseable manifest, a hand-assembled directory), which is the one
+    /// outcome the flag exists to prevent. So the absence of proof fails closed.
+    ///
+    /// `read_bundle_manifest` is intentionally fail-open — a missing or corrupt
+    /// manifest yields `None` rather than an error — so a corrupt manifest and a
+    /// missing one are indistinguishable here, and both fail closed.
+    #[must_use]
+    pub fn coverage_claim_unsatisfied(&self) -> bool {
+        if !self.require_complete_coverage {
+            return false;
+        }
+        // `is_none_or`: no manifest is no proof of coverage at all, so an absent
+        // one fails closed rather than reading as "complete".
+        self.coverage.as_ref().is_none_or(|manifest| {
+            !manifest.is_complete() || !self.zero_coverage_types().is_empty()
+        })
+    }
+
+    /// Workflow types the manifest reports as having in-flight work but **zero**
+    /// sampled fixtures.
+    ///
+    /// Distinct from ordinary truncation, and much worse. `sampled: 50` of
+    /// `in_flight_total: 4000` still replays 50 real executions of that type, so
+    /// a regression in it has 50 chances to surface. `sampled: 0` of
+    /// `in_flight_total: 4000` means the type was **never replayed at all** — the
+    /// gate can say nothing about it, yet the run looks green.
+    ///
+    /// Reachable when the global `MAX_SAMPLE_TOTAL` budget is exhausted by
+    /// earlier types (the per-type floor bottoms out at 1, and beyond
+    /// `MAX_SAMPLE_TOTAL` distinct in-flight types even that cannot be honoured),
+    /// or when every candidate for a type failed the per-execution size ceiling.
+    #[must_use]
+    pub fn zero_coverage_types(&self) -> Vec<&str> {
+        self.coverage.as_ref().map_or_else(Vec::new, |manifest| {
+            manifest
+                .per_workflow
+                .iter()
+                .filter(|coverage| coverage.sampled == 0 && coverage.in_flight_total > 0)
+                .map(|coverage| coverage.workflow_name.as_str())
+                .collect()
+        })
+    }
+
+    /// Whether the export delivered fewer fixtures than the sample selected.
+    ///
+    /// See [`SampleManifest::is_incomplete_export`]. A bundle with no manifest
+    /// reports `false` here — the absence of a manifest is rung `4`'s business
+    /// (unproven coverage), not a claim that the export fell short.
+    ///
+    /// [`SampleManifest::is_incomplete_export`]: crate::replay_sample::SampleManifest::is_incomplete_export
+    #[must_use]
+    pub fn export_is_incomplete(&self) -> bool {
+        self.coverage
+            .as_ref()
+            .is_some_and(crate::replay_sample::SampleManifest::is_incomplete_export)
+    }
+
+    /// Whether the bundle's manifest was present but could not be read.
+    ///
+    /// A blocking condition in its own right, and deliberately **not** folded
+    /// into [`has_incomplete_coverage`](Self::has_incomplete_coverage) or
+    /// [`coverage_claim_unsatisfied`](Self::coverage_claim_unsatisfied): both of
+    /// those answer questions about what a manifest *said*, and the whole
+    /// problem here is that nothing can be read from it.
+    ///
+    /// This blocks at rung `2` rather than rung `4` because rung `4` is gated on
+    /// the opt-in [`require_complete_coverage`](ReplayVerifier::require_complete_coverage).
+    /// An unreadable manifest disables the rung-`2` and rung-`3` guards for
+    /// *every* caller, including the default gate that set no flags, so a verdict
+    /// that only fires under an opt-in would leave the common case green.
+    ///
+    /// An **absent** manifest is not this — see [`BundleManifest`].
+    #[must_use]
+    pub const fn manifest_is_unreadable(&self) -> bool {
+        self.manifest_unreadable.is_some()
+    }
+
+    /// Whether the gate passes.
+    ///
+    /// True when every fixture replayed without divergence **and** the bundle
+    /// actually verified something. An empty bundle is deliberately *not* clean
+    /// — see [`ReplayVerifier::allow_empty_bundle`] — and neither is a bundle
+    /// with a knowingly-partial sample when
+    /// [`require_complete_coverage`](ReplayVerifier::require_complete_coverage)
+    /// is set.
+    ///
+    /// This always agrees with [`exit_code`](Self::exit_code): `is_clean()` is
+    /// true exactly when `exit_code()` is `0`.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.exit_code() == 0
+    }
+
+    /// Process exit code for a CI step.
+    ///
+    /// | Code | Meaning |
+    /// |------|---------|
+    /// | `0` | Every fixture replayed cleanly |
+    /// | `1` | One or more fixtures diverged — a determinism regression |
+    /// | `2` | The gate could not fully run: a fixture failed to replay, the bundle's manifest was present but unreadable, the bundle holds a different number of fixtures than its manifest declares, the bundle's per-type or per-execution inventory disagrees with the manifest, **or** the export itself delivered fewer fixtures than the sample selected (dominates over `1`, because a gate that did not fully run cannot be trusted — mirrors [`CiReport::exit_code`]) |
+    /// | `3` | Nothing was verified — the bundle was empty, or every fixture was skipped. [`allow_empty_bundle`](ReplayVerifier::allow_empty_bundle) opts out, but **not** when the bundle's manifest reports incomplete shard coverage: an export that could not read the fleet is empty too, and certifying a release against it is a false green |
+    /// | `4` | `require_complete_coverage` is set and complete coverage was not proven — the sample is knowingly incomplete, a workflow type with in-flight work was sampled zero times, **or** the bundle carries no readable manifest at all |
+    ///
+    /// The rung-`2` export-shortfall condition is deliberately *unconditional* —
+    /// unlike rung `4`, it does not wait for
+    /// [`require_complete_coverage`](ReplayVerifier::require_complete_coverage).
+    /// Rung `4` is about the sample the operator **asked for** being a slice of
+    /// the fleet, which is the gate's normal mode and only a failure if they say
+    /// so. This is about the bundle being a silent, biased subset of *that
+    /// slice*, which nobody opted into and which no amount of reading the report
+    /// would reveal to a CI step that only inspects the exit code.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        if !self.blocked.is_empty()
+            || self.manifest_is_unreadable()
+            || self.fixture_count_disagrees_with_manifest()
+            || self.bundle_inventory_disagrees_with_manifest()
+            || self.export_is_incomplete()
+        {
+            return 2;
+        }
+        if !self.diverged.is_empty() {
+            return 1;
+        }
+        // `verified_nothing` subsumes the empty bundle: both replayed zero
+        // workflows, so both are the same non-answer.
+        //
+        // The opt-out is void when the bundle's own manifest contradicts it: an
+        // export that could not read the fleet is empty too, and exiting 0 on
+        // one certifies a release against nothing. See
+        // `emptiness_is_contradicted`.
+        let empty_is_licensed = self.allow_empty_bundle && !self.emptiness_is_contradicted();
+        if self.verified_nothing() && !empty_is_licensed {
+            return 3;
+        }
+        if self.coverage_claim_unsatisfied() {
+            return 4;
+        }
+        0
+    }
+}
+
+impl ReplayDriftReport {
+    /// Render the manifest-derived coverage block, or nothing when the bundle
+    /// carries no manifest.
+    ///
+    /// Split out of [`Display`](std::fmt::Display) so the two "the gate did not
+    /// verify what you think it did" lines — a workflow type sampled zero times,
+    /// and a fixture count that disagrees with the manifest — sit next to the
+    /// coverage numbers they qualify, and so `fmt` itself stays readable.
+    fn fmt_coverage(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Rendered before the early return: an unreadable manifest yields no
+        // `coverage` to print, and it is precisely the case an operator must not
+        // mistake for "this bundle simply made no claim".
+        if let Some(reason) = &self.manifest_unreadable {
+            writeln!(
+                f,
+                "  MANIFEST UNREADABLE: the bundle carries a coverage manifest that \
+                 {reason}. Its presence means this bundle came from the exporter, so \
+                 the claim it recorded was damaged rather than never made — and every \
+                 manifest-derived check (fixture count, export shortfall, shard \
+                 coverage) is unenforceable. Re-export the sample, or re-fetch the \
+                 artifact if it was truncated in transfer."
+            )?;
+        }
+        let Some(coverage) = &self.coverage else {
+            return Ok(());
+        };
+        writeln!(
+            f,
+            "  coverage: {} of {} in-flight execution(s) sampled across {} shard(s) [{}]",
+            coverage.sampled_total,
+            coverage.in_flight_total,
+            coverage.inspected_shards.len(),
+            if coverage.is_complete() {
+                "complete"
+            } else {
+                "PARTIAL"
+            },
+        )?;
+        for shard in &coverage.unavailable_shards {
+            writeln!(f, "    unavailable: {shard}")?;
+        }
+        let zero_coverage = self.zero_coverage_types();
+        if !zero_coverage.is_empty() {
+            writeln!(
+                f,
+                "    NOT REPLAYED AT ALL ({} workflow type(s) have in-flight work but were \
+                 sampled zero times): {}",
+                zero_coverage.len(),
+                zero_coverage.join(", "),
+            )?;
+        }
+        if coverage.truncated_by_size {
+            writeln!(
+                f,
+                "    TRUNCATED BY SIZE: the export stopped early on the response byte \
+                 budget, so this bundle is smaller than the sample that was requested. \
+                 Narrow the export (fewer states, a single shard, a lower max_bytes) \
+                 rather than raising --per-workflow."
+            )?;
+        }
+        if coverage.export_failures > 0 {
+            writeln!(
+                f,
+                "    EXPORT DROPPED {} SELECTED CANDIDATE(S): the sample chose them but \
+                 the export could not produce a fixture (over max_bytes, or the shard \
+                 became unreadable), so this bundle is a biased subset — biased against \
+                 the largest histories, which are the longest-running and the most likely \
+                 to span the change under test. Re-export with a higher --max-bytes, or \
+                 narrow the sample until every selected candidate fits.",
+                coverage.export_failures,
+            )?;
+        }
+        if self.fixture_count_disagrees_with_manifest() {
+            writeln!(
+                f,
+                "  BUNDLE INCOMPLETE: manifest declares {} fixture(s) but {} were found — \
+                 the bundle is not the sample the manifest describes (files lost in \
+                 transit?), so this verdict covers only a subset of what was exported",
+                coverage.sampled_total, self.total,
+            )?;
+        }
+        self.fmt_inventory_mismatches(f)?;
+        Ok(())
+    }
+
+    /// Render the per-type / per-execution bundle-vs-manifest disagreements.
+    ///
+    /// Split out from the aggregate line because the operator action differs:
+    /// the total being wrong says "files went missing", while a matching total
+    /// with a mismatched inventory says "the files you have are not the files
+    /// that were exported" — which a re-count would never reveal.
+    fn fmt_inventory_mismatches(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mismatches = self.bundle_inventory_mismatches();
+        if mismatches.is_empty() {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "  BUNDLE INVENTORY MISMATCH: the fixtures present are not the ones the \
+             manifest says were exported, so some in-flight histories were never \
+             replayed even though the totals may agree. Re-export, or re-fetch the \
+             artifact.",
+        )?;
+        for mismatch in mismatches {
+            writeln!(
+                f,
+                "    {}: manifest declares {}, bundle holds {}",
+                mismatch.workflow_name, mismatch.declared, mismatch.found,
+            )?;
+            for execution_id in &mismatch.missing_execution_ids {
+                writeln!(f, "      MISSING    {execution_id}")?;
+            }
+            for execution_id in &mismatch.unexpected_execution_ids {
+                writeln!(f, "      UNEXPECTED {execution_id}")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Render the trailing "this gate did not run" errors: a bundle that
+    /// verified nothing, and an unsatisfied `require_complete_coverage` claim.
+    ///
+    /// Each branch names the concrete operator action, because both are harness
+    /// failures rather than statements about the candidate build.
+    fn fmt_errors(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let empty_is_licensed = self.allow_empty_bundle && !self.emptiness_is_contradicted();
+        if self.verified_nothing() && !empty_is_licensed {
+            if self.allow_empty_bundle {
+                writeln!(
+                    f,
+                    "  ERROR: nothing was verified, and the bundle's manifest reports \
+                     coverage {:?} over {} unreachable shard(s) — the export did not read \
+                     the whole fleet, so an export outage cannot be told apart from an \
+                     idle fleet. allow_empty_bundle(true) does not apply when the bundle \
+                     itself says coverage was incomplete. Fix the export and re-run.",
+                    self.coverage.as_ref().map(|manifest| manifest.status),
+                    self.coverage
+                        .as_ref()
+                        .map_or(0, |manifest| manifest.unavailable_shards.len()),
+                )?;
+            } else if self.is_empty() {
+                writeln!(
+                    f,
+                    "  ERROR: the bundle contained no fixtures — nothing was verified. \
+                     Check the export step, or pass allow_empty_bundle(true) if the fleet \
+                     is legitimately idle."
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "  ERROR: all {} fixture(s) were skipped — no workflow was replayed, so \
+                     nothing was verified. Register the sampled workflow types on this gate \
+                     binary (or point it at the right bundle); pass allow_empty_bundle(true) \
+                     only if verifying nothing is genuinely acceptable.",
+                    self.total,
+                )?;
+            }
+        }
+        if self.coverage_claim_unsatisfied() {
+            // Name which of the two failure modes occurred: "a shard was
+            // unreachable" and "the manifest is missing or unreadable" call for
+            // completely different operator actions.
+            if self.coverage.is_none() {
+                writeln!(
+                    f,
+                    "  ERROR: require_complete_coverage is set, but the bundle carries no \
+                     readable coverage manifest ({}), so complete coverage could not be \
+                     proven. Re-export the bundle with `harvest history export-sample \
+                     --output-dir <dir>`.",
+                    crate::replay_sample::SampleManifest::FILE_NAME
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "  ERROR: the sample is incomplete (a shard could not be inspected) \
+                     and require_complete_coverage is set."
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for ReplayDriftReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "harvest replay-drift: {} fixture(s) — {} clean, {} diverged, {} blocked, {} skipped",
+            self.total,
+            self.succeeded,
+            self.diverged.len(),
+            self.blocked.len(),
+            self.skipped,
+        )?;
+
+        self.fmt_coverage(f)?;
+
+        for drift in &self.diverged {
+            writeln!(
+                f,
+                "  DRIFT  {} [{}] {} — {}",
+                drift.workflow_name,
+                drift.kind,
+                drift
+                    .execution_id
+                    .map_or_else(|| "<unknown>".to_string(), |id| id.to_string()),
+                drift.first_divergence,
+            )?;
+            writeln!(f, "         {}", drift.fixture_path.display())?;
+        }
+        for blocked in &self.blocked {
+            writeln!(
+                f,
+                "  BLOCKED  {} — {}",
+                blocked.fixture_path.display(),
+                blocked.reason,
+            )?;
+        }
+
+        self.fmt_errors(f)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ReplayVerifier
 // ---------------------------------------------------------------------------
 
@@ -2275,6 +3543,78 @@ pub struct ReplayVerifier {
     timeout: std::time::Duration,
     allow_unregistered: bool,
     fixtures_dir: Option<std::path::PathBuf>,
+    /// Drift-gate policy (issue #798): treat a bundle with zero fixtures as
+    /// clean instead of refusing to certify it.
+    allow_empty_bundle: bool,
+    /// Drift-gate policy (issue #798): refuse to certify a bundle whose manifest
+    /// reports that a shard could not be inspected.
+    require_complete_coverage: bool,
+    /// Replay-context values threaded into every fixture's replayer, including
+    /// the issue #614 history policy set by
+    /// [`with_history_policy`](Self::with_history_policy).
+    ///
+    /// The four non-policy fallbacks are not builder-settable on the verifier:
+    /// they exist so a caller who configured them on a `WorkflowReplayer`
+    /// (`with_context_headers`, `with_execution_timeout`,
+    /// `with_parent_execution_id`, `with_workflow_id`) does not silently lose
+    /// them by switching to the bundle path. Configure them there; a fixture
+    /// carrying its own value still overrides.
+    replay_defaults: FixtureReplayDefaults,
+}
+
+/// The replay-context fallbacks a bundle walk threads into every fixture's
+/// per-fixture [`WorkflowReplayer`].
+///
+/// Each is a *fallback*, not an override: a [`HistorySnapshot`] that carries its
+/// own value (every field here is exported by the real #798 export path) wins,
+/// so these only take effect for a hand-built or legacy fixture that omits the
+/// metadata — exactly the contract the equivalent `WorkflowReplayer` globals
+/// document.
+///
+/// Bundled into one struct rather than five more positional parameters so
+/// `replay_fixture_file` stays under the `too_many_arguments` bar and a future
+/// field is a one-line addition instead of another call-site sweep.
+#[derive(Debug, Clone, Default)]
+struct FixtureReplayDefaults {
+    context_headers: HashMap<String, String>,
+    execution_timeout: Option<chrono::Duration>,
+    parent_execution_id: Option<ExecutionId>,
+    workflow_id: Option<String>,
+    queue_name: Option<String>,
+    /// The **candidate** build id (issue #798).
+    ///
+    /// The one field here that is *not* a fixture fallback: no `HistorySnapshot`
+    /// carries a build id, deliberately. The live worker reports its own
+    /// configured build rather than the execution's recorded `assigned_build_id`,
+    /// so a gate must apply the build about to be promoted uniformly to every
+    /// fixture — sourcing it from the fixture would replay the historical branch
+    /// and hide candidate-only drift.
+    build_id: Option<String>,
+    history_policy: crate::context::WorkflowHistoryPolicy,
+    /// The **candidate** worker's payload limits (issue #798, Codex round 20).
+    ///
+    /// Same category as `build_id` above: not a fixture fallback. Payload caps
+    /// and the offload threshold live in no `WorkflowEvent` and the live worker
+    /// supplies its own, so a gate that leaves them at the library defaults
+    /// certifies a cap-lowering build that will then reject the very in-flight
+    /// runs it sampled.
+    payload_limits: crate::executor::ReplayPayloadLimits,
+    /// The candidate's declarative `#[query]` / `#[update]` handlers (issue #798).
+    ///
+    /// Like the build id and payload limits, authoritative rather than a
+    /// fallback: the bundle describes executions, not the runtime that will
+    /// resume them, so the candidate's registrations come from the caller.
+    declarative_queries: Vec<crate::info::QueryHandlerInfo>,
+    /// See `declarative_queries`.
+    declarative_updates: Vec<crate::info::UpdateHandlerInfo>,
+    /// Per-workflow `#[workflow(max_input_bytes = …)]` overrides, keyed by
+    /// workflow type name (issue #798, Codex round 22).
+    ///
+    /// Populated by [`ReplayVerifier::register`] from the registered
+    /// [`WorkflowInfo`](crate::info::WorkflowInfo)s. Carried per fixture because
+    /// the live worker resolves this cap per workflow type, not fleet-wide; see
+    /// `WorkflowReplayer::payload_limits_for`.
+    workflow_input_caps: HashMap<String, u64>,
 }
 
 impl Default for ReplayVerifier {
@@ -2296,13 +3636,147 @@ impl ReplayVerifier {
             timeout: std::time::Duration::from_secs(60),
             allow_unregistered: false,
             fixtures_dir: None,
+            allow_empty_bundle: false,
+            require_complete_coverage: false,
+            replay_defaults: FixtureReplayDefaults::default(),
         }
+    }
+
+    /// Replay fixtures under the deployment's history policy (issue #614).
+    ///
+    /// The live worker evaluates
+    /// [`should_continue_as_new`](crate::context::WorkflowContext::should_continue_as_new)
+    /// with the registry's policy (`registry.history_policy()`). A workflow that
+    /// branches on it emits a *different command* under a different
+    /// `continue_as_new_threshold` — so replaying a bundle under the default
+    /// policy while production runs a customized one reports drift for a
+    /// workflow that never drifted, blocking a healthy deploy.
+    ///
+    /// Pass the same value the deployment's `HarvestBuilder` was given:
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::testing::ReplayVerifier;
+    /// # use autumn_harvest::context::WorkflowHistoryPolicy;
+    /// # async fn demo(policy: WorkflowHistoryPolicy) {
+    /// let report = ReplayVerifier::new()
+    ///     .with_history_policy(policy)
+    ///     .replay_bundle("./fixtures/in-flight")
+    ///     .await;
+    /// # }
+    /// ```
+    ///
+    /// Defaults to [`WorkflowHistoryPolicy::default()`](crate::context::WorkflowHistoryPolicy),
+    /// which is correct for any deployment that never customized it.
+    #[must_use]
+    pub const fn with_history_policy(
+        mut self,
+        history_policy: crate::context::WorkflowHistoryPolicy,
+    ) -> Self {
+        self.replay_defaults.history_policy = history_policy;
+        self
+    }
+
+    /// Set the **candidate** build id threaded into every fixture's replay
+    /// context (issue #798).
+    ///
+    /// Pass the build id of the worker you are **about to deploy**. The live
+    /// worker reports its own configured
+    /// [`WorkerConfig::build_id`](crate::builder::WorkerConfig::build_id) via
+    /// span metadata rather than the execution's recorded `assigned_build_id`,
+    /// so a replay gate only answers "what will the candidate do with these
+    /// in-flight histories?" when the candidate's id reaches every fixture.
+    ///
+    /// Unlike the other replay-context values a bundle threads, this is **not** a
+    /// fixture fallback: no [`HistorySnapshot`] carries a build id, because one
+    /// sourced from the fixture would be the *recording* build and would replay
+    /// the historical branch — reporting clean for candidate-only code that
+    /// diverges on promotion.
+    ///
+    /// Leaving it unset makes `ctx.build_id()` report `None` during the gate.
+    #[must_use]
+    pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
+        self.replay_defaults.build_id = Some(build_id.into());
+        self
+    }
+
+    /// Apply the **candidate** worker's payload caps to every fixture replay
+    /// (issue #798).
+    ///
+    /// Bytes: `(max_activity_input, max_signal_payload, max_workflow_input)`;
+    /// `0` means "no cap". Pass what the candidate build configures on its
+    /// `HarvestBuilder`. Without this the gate replays under the library defaults
+    /// and a build that *lowers* a cap replays clean, then rejects the sampled
+    /// in-flight executions with `PayloadTooLarge` once promoted.
+    #[must_use]
+    pub const fn with_payload_caps(
+        mut self,
+        max_activity_input: u64,
+        max_signal_payload: u64,
+        max_workflow_input: u64,
+    ) -> Self {
+        self.replay_defaults.payload_limits.max_activity_input = max_activity_input;
+        self.replay_defaults.payload_limits.max_signal_payload = max_signal_payload;
+        self.replay_defaults.payload_limits.max_workflow_input = max_workflow_input;
+        self
+    }
+
+    /// Apply the **candidate** worker's large-payload offload threshold (#524)
+    /// to every fixture replay (issue #798).
+    ///
+    /// A payload above the threshold is offloaded rather than capped, so without
+    /// this a gate that knows the cap reports drift the promoted worker would
+    /// never hit. `None` (the default) models a worker with no `PayloadStore`.
+    #[must_use]
+    pub const fn with_payload_offload_threshold(mut self, threshold: Option<u64>) -> Self {
+        self.replay_defaults.payload_limits.offload_threshold = threshold;
+        self
+    }
+
+    /// Register the **candidate's** declarative `#[query]` handlers on every
+    /// fixture's replay context (issue #798).
+    ///
+    /// The live worker registers a workflow's declarative handlers *before any
+    /// workflow code runs*, and `ctx.list_query_names()` merges them into its
+    /// result — so a workflow that branches on which handlers exist, or that
+    /// dispatches a query, observes them. They live in no `WorkflowEvent`, so
+    /// replay cannot recover them from a fixture and the gate must be told.
+    ///
+    /// Like [`with_build_id`](Self::with_build_id), this is **not** a fixture
+    /// fallback: pass the same `queries![...]` collection the build you are about
+    /// to deploy registers.
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::testing::ReplayVerifier;
+    /// # use autumn_harvest::info::QueryHandlerInfo;
+    /// # fn make_queries() -> Vec<QueryHandlerInfo> { vec![] }
+    /// let verifier = ReplayVerifier::new().queries(make_queries());
+    /// ```
+    #[must_use]
+    pub fn queries(mut self, queries: Vec<crate::info::QueryHandlerInfo>) -> Self {
+        self.replay_defaults.declarative_queries = queries;
+        self
+    }
+
+    /// Register the **candidate's** declarative `#[update]` handlers on every
+    /// fixture's replay context (issue #798). See [`queries`](Self::queries).
+    #[must_use]
+    pub fn updates(mut self, updates: Vec<crate::info::UpdateHandlerInfo>) -> Self {
+        self.replay_defaults.declarative_updates = updates;
+        self
     }
 
     /// Register a batch of workflow handlers from a `workflows![…]` collector call.
     #[must_use]
     pub fn register(mut self, workflows: Vec<crate::info::WorkflowInfo>) -> Self {
         for wf in workflows {
+            // Issue #798 (Codex round 22): retain the per-workflow input-cap
+            // override so each fixture replays under the cap the promoted worker
+            // resolves for *its* workflow type, not one bundle-wide value.
+            if let Some(per) = wf.max_input_bytes {
+                self.replay_defaults
+                    .workflow_input_caps
+                    .insert(wf.name.to_string(), per);
+            }
             self.handlers.insert(wf.name.to_string(), wf.handler);
         }
         self
@@ -2360,6 +3834,102 @@ impl ReplayVerifier {
         self
     }
 
+    /// Treat a bundle containing zero fixtures as clean (default: `false`).
+    ///
+    /// The drift gate refuses to certify an empty bundle by default, because a
+    /// gate that passes vacuously is worse than no gate: a typo'd
+    /// `--output-dir`, a failed export, or a filter that matched nothing would
+    /// all report "green" while verifying nothing at all.
+    ///
+    /// Set this when a fleet legitimately has no executions in flight (a fresh
+    /// environment, or a workflow type that is only triggered on demand).
+    ///
+    /// This opt-out is **void when the bundle's own manifest reports incomplete
+    /// shard coverage**: an export that could not read the fleet produces zero
+    /// fixtures too, so honoring the flag there would certify a release against
+    /// an export outage. See
+    /// [`ReplayDriftReport::emptiness_is_contradicted`]. A bundle with no
+    /// manifest is unaffected — use
+    /// [`require_complete_coverage`](Self::require_complete_coverage) to demand
+    /// positive proof of coverage.
+    #[must_use]
+    pub const fn allow_empty_bundle(mut self, allow: bool) -> Self {
+        self.allow_empty_bundle = allow;
+        self
+    }
+
+    /// Refuse to certify a bundle whose manifest reports incomplete cross-shard
+    /// coverage (default: `false`).
+    ///
+    /// A sample drawn while a shard was unreachable covers less than the fleet,
+    /// so "no drift" means "no drift in the part we could see". By default that
+    /// is reported but not enforced — the export is an explicit *sample*. Turn
+    /// this on for a release gate that must not go green on a knowingly-partial
+    /// read of the fleet.
+    ///
+    /// Has no effect on a bundle with no
+    /// [`SampleManifest`](crate::replay_sample::SampleManifest); see
+    /// [`replay_bundle`](Self::replay_bundle) for how a manifest-less bundle is
+    /// treated.
+    #[must_use]
+    pub const fn require_complete_coverage(mut self, require: bool) -> Self {
+        self.require_complete_coverage = require;
+        self
+    }
+
+    /// Replay an exported **in-flight** history bundle and return an aggregate
+    /// [`ReplayDriftReport`] suitable for gating a deploy (issue #798).
+    ///
+    /// `dir` is a bundle produced by
+    /// `harvest history export-sample --output-dir <dir>`: a flat directory of
+    /// `*.json` [`HistorySnapshot`] fixtures plus a
+    /// [`SampleManifest`](crate::replay_sample::SampleManifest) carrying the
+    /// coverage the sample achieved. The manifest is read (and excluded from the
+    /// fixture walk) automatically; a directory without one still replays, and
+    /// [`ReplayDriftReport::coverage`] is simply `None`.
+    ///
+    /// A manifest that is **present but unreadable** is a different case and
+    /// blocks the gate at exit `2`. Its presence means the bundle claims to be an
+    /// exporter product, so an unreadable one is damaged evidence rather than an
+    /// absent claim — and every manifest-derived guard would otherwise switch
+    /// itself off silently. See [`ReplayDriftReport::manifest_is_unreadable`].
+    ///
+    /// # How this differs from [`verify_dir`](Self::verify_dir)
+    ///
+    /// `verify_dir` replays **strictly**: the workflow must consume its entire
+    /// recorded history. That is right for captured *completed* histories, and
+    /// wrong for this gate — a healthy **in-flight** execution parks at its
+    /// recorded frontier, which strict replay classifies as non-determinism. A
+    /// strict gate over sampled in-flight runs would therefore be false-red on
+    /// every fixture. `replay_bundle` replays frontier-tolerantly instead, so a
+    /// parked run is clean while a genuine mid-history divergence still fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::testing::ReplayVerifier;
+    /// # async fn example() {
+    /// let report = ReplayVerifier::new()
+    ///     // .register(workflows![onboarding, refund_saga, billing])
+    ///     .replay_bundle("./fixtures/in-flight")
+    ///     .await;
+    ///
+    /// println!("{report}");
+    /// std::process::exit(report.exit_code());
+    /// # }
+    /// ```
+    pub async fn replay_bundle(&self, dir: impl AsRef<std::path::Path>) -> ReplayDriftReport {
+        let dir = dir.as_ref();
+        let batch = self.replay_dir(dir, FixtureReplayMode::InFlight).await;
+        let manifest = read_bundle_manifest(dir).await;
+        ReplayDriftReport::from_batch(
+            batch,
+            manifest,
+            self.allow_empty_bundle,
+            self.require_complete_coverage,
+        )
+    }
+
     /// Walk the directory set by [`fixtures_dir`](Self::fixtures_dir) and replay all
     /// `*.json` fixtures.
     ///
@@ -2385,6 +3955,17 @@ impl ReplayVerifier {
     ///
     /// Panics if the internal semaphore is closed, which cannot happen under normal use.
     pub async fn verify_dir(&self, dir: &std::path::Path) -> BatchReplayReport {
+        self.replay_dir(dir, FixtureReplayMode::Strict).await
+    }
+
+    /// Shared directory-replay engine behind [`verify_dir`](Self::verify_dir) and
+    /// [`replay_bundle`](Self::replay_bundle) — one walker, one concurrency
+    /// budget, one aggregation, two replay modes.
+    async fn replay_dir(
+        &self,
+        dir: &std::path::Path,
+        mode: FixtureReplayMode,
+    ) -> BatchReplayReport {
         let files = match collect_json_files(dir).await {
             Ok(f) => f,
             Err(e) => {
@@ -2421,6 +4002,7 @@ impl ReplayVerifier {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.concurrency));
         let timeout = self.timeout;
         let allow_unregistered = self.allow_unregistered;
+        let defaults = Arc::new(self.replay_defaults.clone());
         let handlers = Arc::new(self.handlers.clone());
         let state = self.state.clone();
 
@@ -2428,11 +4010,21 @@ impl ReplayVerifier {
         for path in files {
             let sem = Arc::clone(&semaphore);
             let handlers = Arc::clone(&handlers);
+            let defaults = Arc::clone(&defaults);
             let state = state.clone();
 
             tasks.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
-                replay_fixture_file(&handlers, state, &path, timeout, allow_unregistered).await
+                replay_fixture_file(
+                    &handlers,
+                    state,
+                    &path,
+                    timeout,
+                    allow_unregistered,
+                    mode,
+                    &defaults,
+                )
+                .await
             }));
         }
 
@@ -2478,6 +4070,78 @@ impl ReplayVerifier {
     }
 }
 
+/// The outcome of looking for a bundle's coverage manifest.
+///
+/// Three states, not two, because "the file is not there" and "the file is there
+/// but I could not read it" are different facts about the bundle and call for
+/// opposite verdicts.
+enum BundleManifest {
+    /// A well-formed manifest. The bundle carries a coverage claim.
+    Present(Box<crate::replay_sample::SampleManifest>),
+    /// No manifest file at all.
+    ///
+    /// Deliberately **not** an error. The exporter always writes one, so an
+    /// absent manifest means the bundle did not come from the exporter — a
+    /// hand-assembled directory of fixtures, which is a supported way to drive
+    /// the gate. It simply makes no coverage claim, so there is nothing to
+    /// verify and nothing to contradict.
+    Absent,
+    /// The manifest **exists** but could not be read or parsed.
+    ///
+    /// The opposite situation from [`Absent`](Self::Absent), and the reason this
+    /// is a three-state enum. The file's presence is the bundle asserting *"I am
+    /// an exporter product and here is my record of what I sampled"*. If that
+    /// record is truncated, corrupted in transfer, or unreadable, the assertion
+    /// stands but the evidence is gone — and every manifest-derived guard reads
+    /// through `Option::is_some_and`, so a `None` silently turns each one off:
+    ///
+    /// * the `sampled_total` fixture-count cross-check (rung `2`)
+    /// * the `export_failures` / `truncated_by_size` shortfall check (rung `2`)
+    /// * the `status` / `unavailable_shards` partial-shard check (rung `3`)
+    ///
+    /// The surviving fixtures would then replay to a green exit `0`: a release
+    /// certified against an export whose own record of what it did was lost.
+    Unreadable(String),
+}
+
+/// Read a bundle's coverage manifest.
+///
+/// Distinguishes a missing manifest (fail-open — a hand-assembled bundle carries
+/// no coverage claim) from a present-but-unreadable one (fail-closed — the claim
+/// existed and was damaged). See [`BundleManifest`] for why that distinction is
+/// load-bearing rather than pedantic.
+async fn read_bundle_manifest(dir: &std::path::Path) -> BundleManifest {
+    let path = dir.join(crate::replay_sample::SampleManifest::FILE_NAME);
+    let raw = match tokio::fs::read_to_string(&path).await {
+        Ok(raw) => raw,
+        // Only a genuine "not there" is fail-open. A permissions error, a
+        // partial read, or any other I/O failure means the file exists in some
+        // form we could not consume — evidence we were meant to have and do not.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return BundleManifest::Absent;
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "harvest: replay-sample manifest is present but unreadable",
+            );
+            return BundleManifest::Unreadable(format!("could not be read: {error}"));
+        }
+    };
+    match serde_json::from_str(&raw) {
+        Ok(manifest) => BundleManifest::Present(Box::new(manifest)),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "harvest: replay-sample manifest is present but unparseable",
+            );
+            BundleManifest::Unreadable(format!("could not be parsed: {error}"))
+        }
+    }
+}
+
 /// Recursively collect `*.json` files under `dir`.
 ///
 /// Returns `Err` if the top-level `dir` cannot be read so the caller can
@@ -2499,7 +4163,14 @@ async fn collect_json_files(
                 if let Ok(file_type) = entry.file_type().await {
                     if file_type.is_dir() {
                         dirs_to_visit.push(path);
-                    } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    } else if path.extension().and_then(|s| s.to_str()) == Some("json")
+                        // A replay-drift bundle (issue #798) carries its coverage
+                        // manifest alongside the fixtures. It is not a history, so
+                        // replaying it would produce a spurious harness error and
+                        // fail the gate for a well-formed bundle.
+                        && path.file_name().and_then(|s| s.to_str())
+                            != Some(crate::replay_sample::SampleManifest::FILE_NAME)
+                    {
                         files.push(path);
                     }
                 }
@@ -2511,13 +4182,384 @@ async fn collect_json_files(
     Ok(files)
 }
 
+/// The two export-document fields the fixture guard consults.
+///
+/// Deliberately a *side* struct parsed from the same fixture JSON rather than
+/// two more fields on [`HistorySnapshot`]: both are properties of how a history
+/// was *exported*, not inputs the replay itself consumes, so putting them on the
+/// snapshot would force every hand-built fixture in the workspace to declare
+/// export metadata it has no notion of.
+///
+/// Every field is `#[serde(default)]`, so a hand-built fixture (or a legacy
+/// export produced before these fields existed) parses to all-`None` and is
+/// treated as replayable.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct FixtureGuardFields {
+    #[serde(default)]
+    payload_policy: Option<crate::history_export::HistoryPayloadPolicy>,
+    #[serde(default)]
+    status: Option<crate::history_export::HistoryExportStatus>,
+}
+
+/// Why a fixture cannot be honestly replayed by `mode`, or `None` if it can.
+///
+/// Pure and separate from the replay so the "would this verdict be a lie?"
+/// decision is unit-testable without touching disk or running a workflow.
+///
+/// Both cases return a *harness error* rather than a divergence, because in
+/// neither case did the candidate build do anything wrong — the bundle is simply
+/// not evaluable. Telling an operator "your code regressed" when the real problem
+/// is a stripped payload or a mis-aimed directory is the worst outcome a gate can
+/// produce, so each message names the concrete fix.
+///
+/// A fixture that declares neither field (a legacy export, or a fixture built by
+/// hand in Rust) is treated as replayable — hand-built fixtures carry real
+/// inputs, and refusing them would break every existing directory fixture.
+/// Refuse a fixture carrying large-payload **offload reference envelopes**
+/// (issue #524) instead of the real payloads.
+///
+/// The export path loads history with `store::load_history_undecoded`
+/// (deliberately, so an encrypted history is not failed before the payload
+/// policy runs), so on a deployment with a `PayloadStore` registered any payload
+/// over the offload threshold is exported as a claim-check envelope. The
+/// directory-replay path builds its `WorkflowReplayer` with
+/// `payload_offloader: None` and therefore cannot inflate it.
+///
+/// Left unguarded, the candidate workflow computes the *real* input while
+/// history holds the envelope, so `match_activity_strict` diverges on every
+/// affected fixture — the gate would report a determinism regression that does
+/// not exist and block a healthy deploy. That is the same false-red class as a
+/// redacted bundle, and gets the same treatment: a harness error (exit 2) that
+/// names the fix, rather than a confidently wrong "your code drifted".
+///
+/// Applies to both replay modes: an un-inflatable envelope is un-replayable
+/// regardless of which gate is asking, and a fixture with no envelope is
+/// untouched — so this can never turn a genuinely-clean run red.
+fn offloaded_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<String> {
+    // Fast reject on the raw text first: the discriminator is a fixed key, so a
+    // substring miss proves no envelope is present without re-serializing a
+    // single event. Only a hit pays for the structured confirmation below.
+    if !json.contains(crate::payload_store::OFFLOAD_ENVELOPE_KEY) {
+        return None;
+    }
+
+    let offloaded: Vec<String> = snapshot
+        .events
+        .iter()
+        .filter_map(|event| serde_json::to_value(event).ok())
+        .flat_map(|value| crate::payload_store::refs_in_event_value(&value))
+        .map(|reference| reference.blob_key)
+        .collect();
+    if offloaded.is_empty() {
+        // The key appeared in payload *data* rather than as a real envelope
+        // (e.g. a workflow whose own JSON mentions it). Nothing to inflate.
+        return None;
+    }
+
+    Some(format!(
+        "fixture carries {} offloaded payload reference(s) (issue #524) that this \
+         gate cannot inflate, so replaying it would compare the candidate's real \
+         inputs against claim-check envelopes and report drift that does not \
+         exist. Sample a workflow whose payloads stay under the offload \
+         threshold, or raise `payload_offload_threshold` for the exported \
+         window. First blob key: {}",
+        offloaded.len(),
+        offloaded.first().map_or("<unknown>", String::as_str),
+    ))
+}
+
+/// Refuse a fixture whose payloads are still **codec envelopes** (issue #608),
+/// or carry the marker a decode attempt left behind when it failed.
+///
+/// The codec half of [`offloaded_fixture_reason`], and reachable in strictly
+/// more deployments: the export loads history with
+/// `store::load_history_undecoded`, and the plugin's `read_path_decoder`
+/// returns `None` whenever `decode_payloads_on_read` is left at its default
+/// `false` — so on a codec-**encrypting** deployment *every* payload-bearing
+/// field reaches the bundle as ciphertext, not just those over a size
+/// threshold.
+///
+/// The directory-replay path builds its `WorkflowReplayer` with no codec
+/// registry and cannot decode it. Left unguarded, the candidate workflow
+/// computes the real plaintext while history holds the envelope, so
+/// `match_activity_strict` diverges on every affected fixture — a determinism
+/// regression that does not exist, blocking a healthy deploy. Same false-red
+/// class as a redacted or offloaded bundle, same treatment: a harness error
+/// (exit 2) naming the fix.
+///
+/// Two discriminators, because a payload can be opaque for two different
+/// reasons and both are equally un-replayable:
+/// - [`CODEC_ENVELOPE_KEY`](crate::payload_codec::CODEC_ENVELOPE_KEY) — never
+///   decoded (flag off, or the caller was not an admin).
+/// - [`UNDECODABLE_MARKER_KEY`](crate::payload_codec::UNDECODABLE_MARKER_KEY) —
+///   a lossy decode *was* attempted and failed (unknown codec, bad base64,
+///   codec error, invalid JSON), so the plaintext is gone either way.
+///
+/// Scoped to the payload-bearing fields of each event's `data` object — exactly
+/// where the codec transform writes — so business data nested deeper cannot
+/// trip it. Envelope detection delegates to
+/// [`is_codec_envelope`](crate::payload_codec::is_codec_envelope), the crate's
+/// own authoritative shape check, so this can never drift from what the decoder
+/// recognises.
+/// Refuse a fixture whose payloads were **erased** (issue #495) rather than
+/// exported.
+///
+/// The third member of the opaque-payload family, alongside
+/// [`offloaded_fixture_reason`] and [`codec_opaque_fixture_reason`]: in all
+/// three the fixture holds something that is not the payload, so replaying it
+/// compares the candidate's real inputs against a placeholder. Erasure is the
+/// one that cannot be undone — the plaintext is gone by design — so the answer
+/// is never "decode it", only "do not certify a release against it".
+///
+/// Two ways a bundle acquires one, and the second needs no race at all:
+/// * The sample export selects an execution while it is in flight, and it
+///   completes and is erased before the (sequential) per-candidate fetch
+///   reaches it. The candidate row still reads `RUNNING`, so nothing upstream
+///   notices.
+/// * The **batch** export has no in-flight restriction, and erasure is
+///   terminal-only — so the executions it exports are exactly the ones eligible
+///   for erasure. No timing window is required.
+///
+/// Guarding here rather than only at export covers both, plus a hand-curated
+/// bundle and a fixture erased *after* it was written. Reported as a harness
+/// error (exit 2), never skipped: a silently dropped fixture shrinks coverage
+/// while the manifest still claims it, which is the one failure this gate must
+/// not have.
+fn erased_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<String> {
+    // Cheap reject first: no tombstone key anywhere in the document means no
+    // erased payload, and skips the per-event walk for every healthy fixture.
+    if !json.contains(crate::erase::ERASURE_TOMBSTONE_KEY) {
+        return None;
+    }
+
+    let mut tombstones = 0usize;
+    for value in snapshot
+        .events
+        .iter()
+        .filter_map(|event| serde_json::to_value(event).ok())
+    {
+        let Some(data) = value.get("data").and_then(Value::as_object) else {
+            continue;
+        };
+        for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
+            let Some(field) = data.get(key) else { continue };
+            if field
+                .as_object()
+                .is_some_and(|obj| obj.contains_key(crate::erase::ERASURE_TOMBSTONE_KEY))
+            {
+                tombstones += 1;
+            }
+        }
+    }
+    if tombstones == 0 {
+        // The key occurred inside payload *data* rather than as a tombstone in
+        // a payload field — a workflow whose own JSON happens to mention it.
+        // Not erased; replay it normally.
+        return None;
+    }
+
+    Some(format!(
+        "fixture carries {tombstones} erased-payload tombstone(s) (issue #495) instead of \
+         the real payloads, so replaying it would compare the candidate's real inputs \
+         against scrubbed placeholders — reporting drift that does not exist, or a clean \
+         result that certifies nothing. Erasure is irreversible, so re-export a sample \
+         that excludes this execution (it is terminal, and the gate verifies in-flight \
+         work) rather than trying to recover the payloads."
+    ))
+}
+
+fn codec_opaque_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<String> {
+    use crate::payload_codec::{CODEC_ENVELOPE_KEY, UNDECODABLE_MARKER_KEY};
+
+    // Fast reject on the raw text first: both discriminators are fixed keys, so
+    // a substring miss proves neither is present without re-serializing a single
+    // event. Only a hit pays for the structured confirmation below.
+    if !json.contains(CODEC_ENVELOPE_KEY) && !json.contains(UNDECODABLE_MARKER_KEY) {
+        return None;
+    }
+
+    let mut envelopes = 0usize;
+    let mut undecodable = 0usize;
+    for value in snapshot
+        .events
+        .iter()
+        .filter_map(|event| serde_json::to_value(event).ok())
+    {
+        let Some(data) = value.get("data").and_then(Value::as_object) else {
+            continue;
+        };
+        for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
+            let Some(field) = data.get(key) else { continue };
+            if crate::payload_codec::is_codec_envelope(field) {
+                envelopes += 1;
+            } else if field
+                .as_object()
+                .is_some_and(|obj| obj.contains_key(UNDECODABLE_MARKER_KEY))
+            {
+                undecodable += 1;
+            }
+        }
+    }
+    if envelopes == 0 && undecodable == 0 {
+        // The key appeared in payload *data* rather than as a real envelope
+        // (e.g. a workflow whose own JSON mentions it). Nothing to decode.
+        return None;
+    }
+
+    Some(format!(
+        "fixture carries {envelopes} undecoded codec envelope(s) and {undecodable} \
+         undecodable-payload marker(s) (issue #608) instead of the real payloads, so \
+         replaying it would compare the candidate's real inputs against ciphertext and \
+         report drift that does not exist. Re-export with payload decoding enabled \
+         (`HarvestPlugin::decode_payloads_on_read()`, and call the route as an admin), \
+         or run the gate against a deployment with no payload codec registered."
+    ))
+}
+
+fn unreplayable_fixture_reason(
+    guard: &FixtureGuardFields,
+    mode: FixtureReplayMode,
+) -> Option<String> {
+    use crate::history_export::HistoryPayloadPolicy;
+
+    // Redaction rewrites payload-bearing fields in place. Both replay paths run
+    // with `strict_replay = true`, so `match_activity_strict` compares the
+    // redacted stub against the input the workflow computes -> divergence on
+    // every fixture that passes a non-trivial activity input.
+    if guard.payload_policy == Some(HistoryPayloadPolicy::Redacted) {
+        return Some(
+            "fixture was exported with payload_policy=redacted, which rewrites \
+             activity inputs and outputs and therefore cannot be replayed \
+             (every fixture would report a false divergence); re-export the \
+             bundle with `--payload-policy full`"
+                .to_string(),
+        );
+    }
+
+    // A bundle aimed at the wrong gate: each mode's verdict for the other's
+    // population is misleading rather than merely wrong.
+    if let Some(status) = guard.status.as_ref() {
+        match mode {
+            FixtureReplayMode::InFlight if status.terminal => {
+                return Some(format!(
+                    "fixture is a terminal execution (state={}), but the \
+                     replay-drift gate replays in-flight executions; use \
+                     `ReplayVerifier::verify_dir` for completed histories",
+                    status.state
+                ));
+            }
+            FixtureReplayMode::Strict if !status.terminal => {
+                return Some(format!(
+                    "fixture is an in-flight execution (state={}), but \
+                     `verify_dir` replays completed histories strictly and would \
+                     report a false divergence; use \
+                     `ReplayVerifier::replay_bundle` for an in-flight bundle",
+                    status.state
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// How a directory fixture is replayed.
+///
+/// The two modes exist because the two gates protect different populations, and
+/// the correct verdict for a parked workflow is the opposite in each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixtureReplayMode {
+    /// Strict replay — the workflow must consume its entire recorded history and
+    /// reach a terminal outcome. A suspension means the code issued a command
+    /// with no matching history event.
+    ///
+    /// Used by [`ReplayVerifier::verify_dir`] / [`ReplayVerifier::verify_all`],
+    /// whose fixtures are captured **completed** histories.
+    Strict,
+    /// Frontier-tolerant replay — a workflow that parks at the end of its
+    /// recorded history replayed cleanly.
+    ///
+    /// Used by [`ReplayVerifier::replay_bundle`] (issue #798), whose fixtures are
+    /// **in-flight** (non-terminal) executions. Such a run *always* suspends at
+    /// its recorded frontier — that is its correct outcome, not a divergence — so
+    /// a strict gate over this population would be false-red on every fixture.
+    /// A genuine mid-history divergence still fails in this mode: it surfaces as
+    /// `WorkflowOutcome::Failed { non_deterministic_details: Some(_) }`, and
+    /// leftover unconsumed history at completion is still caught.
+    InFlight,
+}
+
 /// Replay a single fixture file and return a [`FixtureResult`].
+/// Build the single-use replayer one bundle fixture is replayed on.
+///
+/// Every replay-context value here is a *fallback* carried from the caller's
+/// builder (Codex round-10 P2): the real #798 export writes `workflow_id`,
+/// `parent_execution_id`, `execution_timeout` and `context_headers` onto the
+/// snapshot, and `replay_from_snapshot` prefers the snapshot's own value — so
+/// these only take effect for a hand-built or legacy fixture that omits the
+/// metadata. Dropping them (as this construction used to) silently ignored
+/// `WorkflowReplayer::with_workflow_id` and friends on the bundle path,
+/// reporting drift for a workflow that never drifted — the same bug class the
+/// issue #614 history-policy carry-through already fixed.
+fn fixture_replayer(
+    handlers: &HashMap<String, WorkflowHandlerFn>,
+    state: SharedState,
+    defaults: &FixtureReplayDefaults,
+) -> WorkflowReplayer {
+    WorkflowReplayer {
+        handlers: handlers.clone(),
+        state,
+        context_headers: defaults.context_headers.clone(),
+        payload_offloader: None,
+        use_advancing_clock: false,
+        metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+        // Issue #772 fallback: a snapshot carrying its own `execution_timeout`
+        // still wins, so a deadline-aware fixture is validated either way.
+        execution_timeout: defaults.execution_timeout,
+        parent_execution_id: defaults.parent_execution_id,
+        workflow_id: defaults.workflow_id.clone(),
+        // Issue #798 fallback: a snapshot carrying its own `queue_name` still
+        // wins, so an exported fixture is validated against its real queue.
+        queue_name: defaults.queue_name.clone(),
+        // Issue #798: NOT a fallback — the candidate build id is authoritative
+        // for every fixture, because no snapshot carries one (by design: a
+        // fixture-sourced build would replay the historical branch and hide the
+        // candidate-only drift this gate exists to catch).
+        build_id: defaults.build_id.clone(),
+        // Issue #698: the directory-fixture path routes through
+        // `replay_from_snapshot`, which always sources `execution_id` from the
+        // snapshot (a required field); no raw-events global override applies.
+        execution_id: None,
+        // Issue #614: the bundle carries no history-policy field (it describes
+        // executions, not the runtime that produced them), so the caller supplies
+        // it via `ReplayVerifier::with_history_policy`. Defaults to the default
+        // policy — unchanged pre-#614 behavior for anyone who never customized it.
+        history_policy: defaults.history_policy,
+        // Issue #798 (Codex round 20): like the build id, authoritative rather
+        // than a fallback — the bundle describes executions, not the runtime that
+        // will resume them, so the candidate's limits come from the caller.
+        payload_limits: defaults.payload_limits,
+        // Issue #798 (Codex round 21): same authoritative treatment — the live
+        // worker registers these before any workflow code runs, so a replay that
+        // omits them is not replaying the candidate.
+        declarative_queries: defaults.declarative_queries.clone(),
+        declarative_updates: defaults.declarative_updates.clone(),
+        // Issue #798 (Codex round 22): the per-workflow input-cap overrides the
+        // verifier retained from `register`. Each fixture resolves its own cap
+        // from this map by workflow type, mirroring the live worker.
+        workflow_input_caps: defaults.workflow_input_caps.clone(),
+    }
+}
+
 async fn replay_fixture_file(
     handlers: &HashMap<String, WorkflowHandlerFn>,
     state: SharedState,
     path: &std::path::Path,
     timeout: std::time::Duration,
     allow_unregistered: bool,
+    mode: FixtureReplayMode,
+    defaults: &FixtureReplayDefaults,
 ) -> FixtureResult {
     // Read file.
     let json = match tokio::fs::read_to_string(path).await {
@@ -2552,6 +4594,32 @@ async fn replay_fixture_file(
     let workflow_name = snapshot.workflow_name.clone();
     let execution_id = snapshot.execution_id;
 
+    // Refuse a fixture this gate cannot honestly evaluate, BEFORE replaying it.
+    //
+    // Both checks exist to stop the gate returning a *confidently wrong* verdict:
+    // a redacted fixture would diverge on every activity input, and a fixture
+    // aimed at the other gate would be judged in the wrong replay mode. Either
+    // way the operator would be told something false about their code. A harness
+    // error (exit 2) is the honest answer, and it names the fix.
+    //
+    // The two fields consulted are export-document metadata, not replay inputs,
+    // so they are parsed from the same JSON via a side struct rather than living
+    // on `HistorySnapshot`. A fixture that declares neither (hand-built, or a
+    // legacy export) parses to all-`None` and is treated as replayable.
+    let guard: FixtureGuardFields = serde_json::from_str(&json).unwrap_or_default();
+    if let Some(reason) = unreplayable_fixture_reason(&guard, mode)
+        .or_else(|| offloaded_fixture_reason(&json, &snapshot))
+        .or_else(|| codec_opaque_fixture_reason(&json, &snapshot))
+        .or_else(|| erased_fixture_reason(&json, &snapshot))
+    {
+        return FixtureResult {
+            path: path.to_owned(),
+            workflow_name,
+            execution_id: Some(execution_id),
+            status: FixtureStatus::HarnessError(HarnessErrorKind::InvalidFixture(reason)),
+        };
+    }
+
     // Check handler registration.
     if !handlers.contains_key(&workflow_name) {
         if allow_unregistered {
@@ -2574,41 +4642,16 @@ async fn replay_fixture_file(
         };
     }
 
-    // Build a single-use replayer and run with timeout.
-    //
-    // Known limitation (issue #772): `execution_timeout` is hardcoded to `None`
-    // here because the directory-fixture format (`HistorySnapshot` JSON) carries
-    // no execution-timeout field, so this path cannot validate
-    // deadline-triggered `continue_as_new` fixtures — `ctx.deadline()` is always
-    // `None` for directory replays. Follow-up: add an optional timeout field to
-    // the snapshot format if directory-driven deadline fixtures are needed. Tests
-    // that need a deadline use `WorkflowReplayer::with_execution_timeout` directly
-    // (see `tests/integration/replayer_tests.rs`).
-    let replayer = WorkflowReplayer {
-        handlers: handlers.clone(),
-        state,
-        context_headers: HashMap::new(),
-        payload_offloader: None,
-        use_advancing_clock: false,
-        metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
-        execution_timeout: None,
-        // Issue #698: the directory-fixture path relies on the snapshot's own
-        // `parent_execution_id` (absent for a legacy fixture); no global override.
-        parent_execution_id: None,
-        // Issue #698: same as parent — the directory-fixture path relies on the
-        // snapshot's own `workflow_id`; no global override.
-        workflow_id: None,
-        // Issue #698: the directory-fixture path routes through
-        // `replay_from_snapshot`, which always sources `execution_id` from the
-        // snapshot (a required field); no raw-events global override applies.
-        execution_id: None,
-        // Issue #614: the directory-fixture path carries no history-policy field,
-        // so it replays under the default policy (unchanged pre-#614 behavior).
-        history_policy: crate::context::WorkflowHistoryPolicy::default(),
-    };
+    let replayer = fixture_replayer(handlers, state, defaults);
 
-    let replay_result =
-        tokio::time::timeout(timeout, replayer.replay_from_snapshot(snapshot)).await;
+    let replay_result = match mode {
+        FixtureReplayMode::Strict => {
+            tokio::time::timeout(timeout, replayer.replay_from_snapshot(snapshot)).await
+        }
+        FixtureReplayMode::InFlight => {
+            tokio::time::timeout(timeout, replayer.replay_canary_snapshot(snapshot)).await
+        }
+    };
 
     let Ok(report) = replay_result else {
         return FixtureResult {
@@ -2787,6 +4830,17 @@ pub struct TestRunOutcome {
     /// self-checks deterministically instead of false-flagging on the live value
     /// vs the replay's empty default. Defaults to `""` (matching the live run).
     workflow_id: String,
+    /// The task queue carried from the producing `WorkflowTestEnv` (issue #798).
+    /// Like `workflow_name`/`workflow_id`, the live run receives it via `span_meta`
+    /// while it lives in no `WorkflowEvent`, so `replay_check` threads it onto the
+    /// replay snapshot — otherwise a workflow that records `ctx.queue_name()` (e.g.
+    /// in an activity input) self-checks against `""` and false-flags
+    /// non-determinism. Defaults to `""` (matching the live run).
+    queue_name: String,
+    /// Issue #798: the configured build id, threaded into the live run via
+    /// span metadata AND onto the replay snapshot, so the harness self-check
+    /// stays symmetric for a build-gated workflow.
+    build_id: Option<String>,
     /// The durable log lines this run would have persisted (issue #790), in
     /// `seq` order and de-duplicated by `seq` — exactly the shape the store's
     /// `UNIQUE (workflow_exec_id, seq)` + `ON CONFLICT DO NOTHING` produces.
@@ -2974,6 +5028,15 @@ impl TestRunOutcome {
             } else {
                 Some(self.workflow_id.clone())
             },
+            // Issue #798: same reasoning as `workflow_id` above — the live run
+            // receives the env's configured queue via span_meta, so a workflow
+            // recording `ctx.queue_name()` (e.g. in an activity input) would
+            // self-check against `""` and false-flag non-determinism without this.
+            queue_name: if self.queue_name.is_empty() {
+                None
+            } else {
+                Some(self.queue_name.clone())
+            },
         };
         let mut replayer = WorkflowReplayer::new()
             .with_shared_state(self.state.clone())
@@ -2984,6 +5047,16 @@ impl TestRunOutcome {
             .with_advancing_timer_clock();
         if let Some(execution_timeout) = self.execution_timeout {
             replayer = replayer.with_execution_timeout(execution_timeout);
+        }
+        // Issue #798: carry the producing env's build id. Unlike `workflow_id` /
+        // `queue_name` above this rides the *replayer*, not the snapshot, because
+        // `HistorySnapshot` deliberately carries no build id (a fixture-sourced
+        // build would be the recording build, hiding candidate-only drift). The
+        // symmetry still matters here: the live run saw this build via span_meta,
+        // so the self-check must replay under it or a build-gated workflow
+        // false-flags non-determinism.
+        if let Some(build_id) = self.build_id.clone() {
+            replayer = replayer.with_build_id(build_id);
         }
         replayer.replay_from_snapshot(snapshot).await
     }
@@ -3073,6 +5146,10 @@ pub struct WorkflowTestEnv {
     /// Task queue name threaded into the `WorkflowContext` so in-context
     /// engine metrics carry a real `queue` label. Defaults to `""`.
     queue_name: String,
+    /// Issue #798: the configured build id, threaded into the live run via
+    /// span metadata AND onto the replay snapshot, so the harness self-check
+    /// stays symmetric for a build-gated workflow.
+    build_id: Option<String>,
     /// Effective `execution_timeout` budget threaded into the `WorkflowContext`
     /// (issue #772) so a run can exercise deadline-aware `should_continue_as_new`.
     /// `None` (the default) matches a workflow with no execution timeout.
@@ -3133,6 +5210,7 @@ impl WorkflowTestEnv {
             child_mocks: HashMap::new(),
             simulated_now: Utc::now(),
             queued_signals: Vec::new(),
+            build_id: None,
             cancellation_reason: None,
             state: empty_shared_state(),
             last_completion_result: None,
@@ -3417,6 +5495,23 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// Set the worker build id for the contexts this env builds (issue #798), so
+    /// a no-DB test can exercise a workflow whose control flow branches on
+    /// `ctx.build_id()` — the build-routing pattern (issue #171) a replay gate
+    /// exists to protect.
+    ///
+    /// Threaded into the live run via span metadata **and** carried onto the
+    /// [`replay_check`](TestRunOutcome::replay_check) snapshot. Both halves are
+    /// load-bearing: setting it on only the live side would make the harness's
+    /// own replay self-check report false non-determinism for a build-gated
+    /// workflow, which is precisely the asymmetry that made `queue_name` a bug.
+    /// Defaults to `None`, matching a worker with no build id configured.
+    #[must_use]
+    pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
+        self.build_id = Some(build_id.into());
+        self
+    }
+
     /// Set the spawning parent's execution id for the contexts this env builds
     /// (issue #698), so a no-DB test can prove `ctx.info().parent_execution_id`
     /// / `ctx.parent_execution_id()` report the configured parent. `None` (the
@@ -3536,6 +5631,11 @@ impl WorkflowTestEnv {
             && self.queue_name.is_empty()
             && self.execution_timeout.is_none()
             && self.parent_execution_id.is_none()
+            // Issue #798: without this a `with_build_id`-only env falls into the
+            // `None` arm and the configured build never reaches the live context,
+            // so `ctx.build_id()` reports `None` on both sides — self-consistent,
+            // but silently ignoring the caller's setting.
+            && self.build_id.is_none()
         {
             None
         } else {
@@ -3549,7 +5649,9 @@ impl WorkflowTestEnv {
                 queue_name: self.queue_name.clone(),
                 is_replay: false,
                 link_traceparent: None,
-                build_id: None,
+                // Issue #798: thread the configured build id so `ctx.build_id()`
+                // reports it inside the live test run (was hardcoded `None`).
+                build_id: self.build_id.clone(),
                 // Issue #772: thread the deadline budget so a live test run can
                 // exercise deadline-aware continue-as-new.
                 execution_timeout: self.execution_timeout,
@@ -3629,6 +5731,12 @@ impl WorkflowTestEnv {
                                 // workflow type / business id for replay_check.
                                 workflow_name: self.workflow_name.clone(),
                                 workflow_id: self.workflow_id.clone(),
+                                // Issue #798: carry the env's task queue so `replay_check`
+                                // self-checks against the same queue the live run saw.
+                                queue_name: self.queue_name.clone(),
+                                // Issue #798: likewise carry the env's build id, so a build-gated
+                                // workflow's self-check replays under the same build the live run saw.
+                                build_id: self.build_id.clone(),
                                 recorded_logs: recorded_logs.into_values().collect(),
                             };
                         }
@@ -3650,6 +5758,12 @@ impl WorkflowTestEnv {
                             // type / business id for replay_check.
                             workflow_name: self.workflow_name.clone(),
                             workflow_id: self.workflow_id.clone(),
+                            // Issue #798: carry the env's task queue so `replay_check`
+                            // self-checks against the same queue the live run saw.
+                            queue_name: self.queue_name.clone(),
+                            // Issue #798: likewise carry the env's build id, so a build-gated
+                            // workflow's self-check replays under the same build the live run saw.
+                            build_id: self.build_id.clone(),
                             recorded_logs: recorded_logs.into_values().collect(),
                         };
                     }
@@ -3683,6 +5797,12 @@ impl WorkflowTestEnv {
             // business id for replay_check.
             workflow_name: self.workflow_name.clone(),
             workflow_id: self.workflow_id.clone(),
+            // Issue #798: carry the env's task queue so `replay_check`
+            // self-checks against the same queue the live run saw.
+            queue_name: self.queue_name.clone(),
+            // Issue #798: likewise carry the env's build id, so a build-gated
+            // workflow's self-check replays under the same build the live run saw.
+            build_id: self.build_id.clone(),
             recorded_logs: recorded_logs.into_values().collect(),
         }
     }
@@ -3753,6 +5873,12 @@ impl WorkflowTestEnv {
             // business id for replay_check.
             workflow_name: self.workflow_name.clone(),
             workflow_id: self.workflow_id.clone(),
+            // Issue #798: carry the env's task queue so `replay_check`
+            // self-checks against the same queue the live run saw.
+            queue_name: self.queue_name.clone(),
+            // Issue #798: likewise carry the env's build id, so a build-gated
+            // workflow's self-check replays under the same build the live run saw.
+            build_id: self.build_id.clone(),
             recorded_logs,
         }
     }

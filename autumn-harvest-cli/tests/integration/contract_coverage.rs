@@ -487,6 +487,11 @@ fn history_export_batch_is_covered() {
     assert_covered(&["history", "export-batch"]);
 }
 
+#[test]
+fn history_export_sample_is_covered() {
+    assert_covered(&["history", "export-sample", "--output-dir", "./fixtures"]);
+}
+
 // ── external handoffs ─────────────────────────────────────────────────────────
 
 #[test]

@@ -108,6 +108,8 @@ mod rate_limit_key_tests;
 mod redrive_tests;
 #[cfg(all(feature = "testing", feature = "db"))]
 mod replay_canary_tests;
+#[cfg(feature = "testing")]
+mod replay_drift_tests;
 mod replay_tests;
 #[cfg(feature = "testing")]
 mod replay_verifier_tests;

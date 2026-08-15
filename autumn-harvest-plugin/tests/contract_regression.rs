@@ -685,6 +685,47 @@ fn timeline_route_is_classified() {
     );
 }
 
+/// The stratified in-flight sample export (issue #798) must be registered in
+/// the management route list AND classified `ReadOnly`, appearing in the route
+/// manifest with no audit operation (`None`) and listed in `EXCLUDED_ROUTES`.
+///
+/// Mirrors `timeline_route_is_classified`: the audit-side mutual cross-check
+/// (`CLASSIFIED_ROUTES` vs `ALL_MUTATION_ROUTES`) stays green if a route is
+/// dropped from BOTH lists, so this pins the route against the live router
+/// registry. Read-only matters twice here: the route feeds a CI gate, and a
+/// misclassification as `Mutating` would make it unreachable to the read-only
+/// operator role (issue #776) that a CI token is most likely to hold.
+#[test]
+fn history_export_sample_route_is_classified() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, EXCLUDED_ROUTES, RouteClass,
+    };
+
+    let route = "GET /admin/history/export-sample";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && matches!(class, RouteClass::ReadOnly)),
+        "{route} must be classified ReadOnly in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+    assert!(
+        ALL_MUTATION_ROUTES
+            .iter()
+            .any(|(r, op)| *r == route && op.is_none()),
+        "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (None)"
+    );
+    assert!(
+        EXCLUDED_ROUTES.contains(&route),
+        "{route} is read-only and must be listed in EXCLUDED_ROUTES"
+    );
+}
+
 /// The ephemeral workflow progress SSE stream (issue #791) must be registered
 /// in the management route list AND classified `ReadOnly` in
 /// `autumn_harvest::audit::CLASSIFIED_ROUTES`, appearing in the route manifest
