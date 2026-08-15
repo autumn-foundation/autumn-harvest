@@ -3447,3 +3447,200 @@ async fn strict_replay_still_rejects_both_incomplete_shapes() {
     );
     assert_eq!(report.failed, 2, "both shapes must fail: {report:?}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Built-in side effects at the in-flight frontier (issue #798, Codex round 25).
+//
+// `ctx.system_now()` / `system_time_now()` / `new_uuid()` / `random_u64()` /
+// `random_f64()` all funnel through `capture_builtin_validated`; `random_range`
+// carries its own copy of the same match. Both resolve a frontier read to
+// `HistoryMatch::NoMatch` — `match_side_effect_event` returns `NoMatch` *only*
+// when `prepare_match()` is false (the cursor is past the end); any other event
+// at the cursor is `Diverged`, handled by a separate arm that fires in all
+// modes. So `NoMatch` here is precisely "this is a fresh live capture", which
+// for an in-flight fixture is the normal case, not drift.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An in-flight history whose recorded work is fully consumed: `step_one` ran to
+/// completion and nothing else is recorded, so the workflow reaches the
+/// **frontier**.
+fn in_flight_at_frontier_snapshot_json(workflow_name: &str) -> String {
+    let id1 = ActivityExecId::new();
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id1,
+            name: "step_one".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id1,
+            output: Value::Null,
+        },
+    ];
+    snapshot_json(workflow_name, ExecutionId::new(), events)
+}
+
+/// Consumes the recorded activity, reads the wall clock at the frontier, then
+/// parks on the next activity — the canonical in-flight shape.
+fn workflow_system_now_then_park<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = ctx.system_now();
+        ctx.execute_activity_raw("step_two", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// The realistic in-flight shape: mint an idempotency key at the frontier, then
+/// park on the next activity.
+fn workflow_new_uuid_then_park<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = ctx.new_uuid();
+        ctx.execute_activity_raw("step_two", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// Same shape through the *separate* `random_range` code path, which carries its
+/// own copy of the frontier match rather than delegating to
+/// `capture_builtin_validated`.
+fn workflow_random_range_then_park<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let _: u32 = ctx.random_range(0..100);
+        ctx.execute_activity_raw("step_two", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+#[tokio::test]
+async fn a_builtin_side_effect_at_the_in_flight_frontier_is_not_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &in_flight_at_frontier_snapshot_json("wf"),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", workflow_system_now_then_park as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(report.total, 1);
+    assert_eq!(
+        report.succeeded, 1,
+        "a wall-clock read at the frontier is a live capture, not drift: {report}"
+    );
+    assert!(
+        report.diverged.is_empty(),
+        "expected zero drift, got: {:?}",
+        report.diverged
+    );
+    assert_eq!(report.exit_code(), 0, "must not block promotion: {report}");
+}
+
+#[tokio::test]
+async fn a_new_uuid_at_the_in_flight_frontier_is_not_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &in_flight_at_frontier_snapshot_json("wf"),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", workflow_new_uuid_then_park as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(
+        report.succeeded, 1,
+        "minting an idempotency key at the frontier is not drift: {report}"
+    );
+    assert_eq!(report.exit_code(), 0, "must not block promotion: {report}");
+}
+
+#[tokio::test]
+async fn a_random_range_at_the_in_flight_frontier_is_not_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &in_flight_at_frontier_snapshot_json("wf"),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", workflow_random_range_then_park as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert_eq!(
+        report.succeeded, 1,
+        "a sampling draw at the frontier is not drift: {report}"
+    );
+    assert_eq!(report.exit_code(), 0, "must not block promotion: {report}");
+}
+
+/// The retained half: strict replay (issue #251 `verify_dir`) must still reject a
+/// built-in read past the end of recorded history.
+///
+/// Asserting on the *reason* — not merely on `failed == 1` — is what makes this a
+/// real guard. The workflow also parks on `step_two`, which strict replay rejects
+/// on its own, so a bare count assertion would stay green even if the built-in
+/// guard were deleted outright. The deferred nd error is drained before that
+/// check (`executor.rs`), so the side-effect message is the one that surfaces —
+/// and only while the guard exists.
+#[tokio::test]
+async fn strict_replay_still_rejects_a_builtin_side_effect_past_end_of_history() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &in_flight_at_frontier_snapshot_json("wf"),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", workflow_system_now_then_park as WorkflowHandlerFn)
+        .verify_dir(dir.path())
+        .await;
+
+    assert_eq!(
+        report.succeeded, 0,
+        "strict replay must still reject a built-in read past end of history: {report:?}"
+    );
+    assert_eq!(
+        report.failed, 1,
+        "expected the strict rejection: {report:?}"
+    );
+    let detail = format!("{:?}", report.results);
+    assert!(
+        detail.contains("SideEffectDrift"),
+        "the strict rejection must be classified as side-effect drift (the built-in \
+         read guard), not merely as parking on step_two: {detail}"
+    );
+}
