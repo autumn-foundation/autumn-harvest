@@ -590,8 +590,33 @@ fn capability_miss_released_outcome_never_pages() {
         expr.contains(" and "),
         "the positivity and presence guards must both hold: {expr}"
     );
+}
 
-    // Half 3: `increase(...) > 0` cannot see the FIRST sample of a new series.
+/// `increase(...) > 0` cannot see the FIRST sample of a brand-new series, so
+/// both escalation rules must also carry set-difference detection (issue #804).
+///
+/// Split out of `capability_miss_released_outcome_never_pages` because it pins a
+/// different property: that one is about which *outcome* may page, this one is
+/// about whether the expression can observe the outcome at all.
+#[test]
+fn capability_miss_escalation_rules_detect_a_brand_new_series() {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+
+    let rule_exprs = |id: &str| -> Vec<String> {
+        rules
+            .iter()
+            .find(|rule| rule["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("{id} alert must exist"))["prometheus"]["expressions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{id} must carry PromQL expressions"))
+            .iter()
+            .filter_map(|expr| expr["expr"].as_str())
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+
+    // `increase(...) > 0` cannot see the FIRST sample of a new series.
     //
     // The adapter creates a counter by incrementing it, so a
     // (queue, task_type, outcome) series that has never fired appears in the
