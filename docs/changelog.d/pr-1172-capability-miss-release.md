@@ -1169,3 +1169,58 @@ the reason string (which correctly uses `distinct_before`). Now
 - The `distinct_before` fix is a consistency change to a tracing field; it is
   covered by the reason-string assertions that already pin the persisted counts,
   and by the field now matching the sibling it always should have.
+
+## Review round 35
+
+Three P2s, two of which are a correction to round 34.
+
+### Round 34 fixed the wrong log line, and broke the right one
+
+Round 34's `distinct_incapable_workers` change landed on the **release** branch,
+not the escalation branch. The two have **opposite** correct answers, so getting
+it backwards broke both directions at once:
+
+- The release branch *does* run the release `UPDATE` that appends this claimant
+  to `capability_miss_workers`, so the post-claim count **is** the durable set —
+  and matches `capability_misses`, reported post-update on the same line. Round
+  34 flipped it to the pre-claim count, so it began under-reporting by one.
+- The escalation branch never runs that `UPDATE`, so the claimant is never
+  appended and the persisted set is the pre-claim count. Round 34 left it on the
+  post-claim count, so the original over-report by one was never fixed.
+
+The misplaced comment was the tell: round 34's justification ("this branch never
+runs the release UPDATE") ended up attached to the branch that does.
+
+Both sites now go through `reported_distinct_workers(&resolution, released)`.
+The two fields also have different Rust types (`i32` vs `usize`) and `tracing`
+accepts either, which is a large part of why the swap compiled silently; the
+helper normalises to one type, so the choice is a deliberate argument rather
+than an incidental field name.
+
+### Registration rewrote terminal history on the startup path
+
+`invalidate_capability_miss_evidence_for_worker` matched every row on the queue
+whose miss array named the re-registering worker — including completed and
+failed ones. `complete_task` does not clear `capability_miss_workers`, so a queue
+with real history accumulates terminal rows still naming past missers, and
+rewriting them is pure cost: a terminal task is never redelivered and never
+escalated, so its array cannot influence any decision.
+
+The cost lands in the worst place. This runs in the same transaction as
+`register_worker`, so the worker is not published to the fleet until it
+finishes, and the `queue_name` indexes are partial to pending rows — so a busy
+queue's startup pays an unindexed scan and bloats the historical table. The
+update is now bounded to `PENDING`/`RUNNING`, the rows the evidence can actually
+affect.
+
+### Tests
+
+- `worker::tests::the_two_branches_report_opposite_distinct_worker_bases` — the
+  pin that would have caught round 34. A tracing field is invisible to every
+  other test in the suite, so the choice is routed through one helper and
+  asserted directly, including that the fixture keeps the two counts distinct so
+  the test cannot pass vacuously. **Confirmed RED** with the round-34 mistake
+  re-applied: `left: 2` / `right: 3`.
+- `queue::tests::registration_invalidates_only_that_workers_miss_evidence` gains
+  a `state IN ('PENDING', 'RUNNING')` assertion. **Confirmed RED** with the
+  filter removed.

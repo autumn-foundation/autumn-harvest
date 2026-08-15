@@ -16566,22 +16566,19 @@ async fn release_capability_miss(
                 crate::telemetry::CAPABILITY_MISS_OUTCOME_RELEASED,
             );
             tracing::info!(
-                    task_id = %task.id,
-                    queue = %task.queue_name,
-                    task_type = %task.task_type,
-                    handler_kind = missing.kind,
-                    handler = missing.name,
-                    capability_misses = resolution.total_after,
-                    // The persisted count, matching `completed_releases` above and the reason
-            // string: this branch never runs the release UPDATE, so the claimant was
-            // never appended to `capability_miss_workers` (Codex round-34 P2).
-            distinct_incapable_workers = resolution.distinct_before,
-                    fleet_evidence = ?resolution.evidence,
-                    worker_is_new_misser = resolution.worker_is_new,
-                    max_redeliveries,
-                    backoff_secs = delay.as_secs(),
-                    "released task for a capable peer: no handler registered on this worker"
-                );
+                task_id = %task.id,
+                queue = %task.queue_name,
+                task_type = %task.task_type,
+                handler_kind = missing.kind,
+                handler = missing.name,
+                capability_misses = resolution.total_after,
+                distinct_incapable_workers = reported_distinct_workers(resolution, true),
+                fleet_evidence = ?resolution.evidence,
+                worker_is_new_misser = resolution.worker_is_new,
+                max_redeliveries,
+                backoff_secs = delay.as_secs(),
+                "released task for a capable peer: no handler registered on this worker"
+            );
             Ok(TaskDispatchOutcome::Released {
                 clears_timeout_strike: missing.phase.clears_workflow_timeout_strike(),
             })
@@ -16777,6 +16774,34 @@ async fn revalidate_escalation_evidence(
         &before
     };
     revalidate_escalation(observed, fresh)
+}
+
+/// Which distinct-worker count a capability-miss log line may report
+/// (issue #804, Codex round-35 P2).
+///
+/// The two branches have **opposite** correct answers, and getting it backwards
+/// is exactly what round 34 did: the release log was flipped to the pre-claim
+/// count it must not use, while the escalation log kept the post-claim count it
+/// must not use. Both now go through here so they cannot drift again.
+///
+/// - `released == true` — the release `UPDATE` ran and appended this claimant to
+///   `capability_miss_workers`, so the post-claim count *is* the durable set,
+///   matching `capability_misses` (also reported post-update) on the same line.
+/// - `released == false` — the escalation branch never runs that `UPDATE`, so
+///   the claimant was never appended. The persisted set is the pre-claim count,
+///   matching `completed_releases` and the reason string on the same line
+///   (Codex round-8 P2).
+///
+/// The two fields also have different Rust types (`i32` vs `usize`), which is
+/// part of why swapping them compiled silently — `tracing` accepts either. The
+/// helper normalises to one type so the choice is a deliberate argument rather
+/// than an incidental field name.
+fn reported_distinct_workers(resolution: &CapabilityMissResolution, released: bool) -> i64 {
+    if released {
+        i64::from(resolution.distinct_after)
+    } else {
+        i64::try_from(resolution.distinct_before).unwrap_or(i64::MAX)
+    }
 }
 
 /// Log an escalation withdrawn at the terminal write, naming why.
@@ -17188,7 +17213,7 @@ async fn escalate_capability_miss(
         handler_kind = missing.kind,
         handler = missing.name,
         completed_releases = resolution.misses_before,
-        distinct_incapable_workers = resolution.distinct_after,
+        distinct_incapable_workers = reported_distinct_workers(&resolution, false),
         fleet_evidence = ?resolution.evidence,
         max_redeliveries,
         session_pinned = task.session_id.is_some(),
@@ -21360,6 +21385,43 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The release and escalation branches must report OPPOSITE distinct-worker
+    /// bases, and round 34 got it backwards on both (issue #804, round-35 P2).
+    ///
+    /// This is the pin that would have caught it: a tracing field is invisible
+    /// to every other test in the suite, so the choice is routed through one
+    /// helper and asserted here.
+    #[test]
+    fn the_two_branches_report_opposite_distinct_worker_bases() {
+        let resolution = CapabilityMissResolution {
+            action: CapabilityMissAction::Escalate,
+            total_after: 6,
+            distinct_after: 3,
+            worker_is_new: true,
+            misses_before: 5,
+            distinct_before: 2,
+            evidence: FleetCapabilityEvidence::AllLiveWorkersMissed,
+        };
+        assert_eq!(
+            reported_distinct_workers(&resolution, true),
+            i64::from(resolution.distinct_after),
+            "the release branch RUNS the UPDATE that appends this claimant, so the \
+             durable set is the post-claim count"
+        );
+        assert_eq!(
+            reported_distinct_workers(&resolution, false),
+            i64::try_from(resolution.distinct_before).unwrap(),
+            "the escalation branch never runs that UPDATE, so the claimant was \
+             never appended and the durable set is the pre-claim count"
+        );
+        assert_ne!(
+            reported_distinct_workers(&resolution, true),
+            reported_distinct_workers(&resolution, false),
+            "if these ever coincide the test proves nothing -- the fixture must \
+             keep the two counts distinct"
+        );
+    }
     use crate::types::ParentClosePolicy;
     use serde_json::Value;
     use tokio::sync::oneshot;

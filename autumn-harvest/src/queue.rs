@@ -2335,11 +2335,21 @@ pub async fn reset_capability_misses_after_inline_progress(
 /// when no fleet evidence is available. Decrementing it here would remove that
 /// bound; removing one stale ID only ever weakens the *fleet* evidence, which
 /// biases toward releasing rather than terminally failing.
+/// **Actionable rows only.** `complete_task` does not clear
+/// `capability_miss_workers`, so a queue with real history accumulates terminal
+/// rows still naming past missers. Rewriting those is pure cost: a terminal task
+/// is never redelivered and never escalated, so its array cannot influence any
+/// decision. Worse, it is cost paid on the *startup* path — this runs in the
+/// same transaction as `register_worker`, so the worker is not published to the
+/// fleet until it finishes, and the `queue_name` indexes are partial to pending
+/// rows (Codex round-35 P2). The `state` filter bounds the scan to the rows the
+/// evidence can actually affect.
 #[must_use]
 pub const fn invalidate_capability_miss_evidence_for_worker_query() -> &'static str {
     "UPDATE harvest_task_queue \
      SET capability_miss_workers = array_remove(capability_miss_workers, $1) \
      WHERE queue_name = ANY($2) \
+       AND state IN ('PENDING', 'RUNNING') \
        AND $1 = ANY(capability_miss_workers)"
 }
 
@@ -4182,6 +4192,12 @@ mod tests {
         assert!(
             sql.contains("$1 = ANY(capability_miss_workers)"),
             "must only touch rows that actually carry this ID's evidence: {sql}"
+        );
+        assert!(
+            sql.contains("state IN ('PENDING', 'RUNNING')"),
+            "must not rewrite terminal history on the startup path -- a completed \
+             task is never redelivered, so its evidence cannot affect any decision, \
+             and this runs inside register_worker's transaction (Codex round-35 P2): {sql}"
         );
     }
 
