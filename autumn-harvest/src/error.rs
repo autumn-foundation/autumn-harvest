@@ -607,7 +607,61 @@ pub enum HarvestError {
         kind: &'static str,
         /// The workflow or activity type name that has no registered handler.
         name: String,
+        /// Where in the dispatch cycle the miss was detected. Decides whether
+        /// the release may clear the issue #494 timeout strike; see
+        /// [`CapabilityMissPhase`].
+        phase: CapabilityMissPhase,
     },
+}
+
+/// Where in a task's dispatch cycle a capability miss (issue #804) was
+/// detected, relative to the workflow handler's own execution.
+///
+/// The distinction exists for exactly one decision: whether releasing the claim
+/// may also clear the execution's issue #494 consecutive-workflow-task-timeout
+/// strike. That strike map answers *"is this workflow body still hanging?"*, so
+/// only a dispatch that actually watched the body reach a conclusion is
+/// entitled to reset it.
+///
+/// Getting this wrong is a two-sided hazard, which is why it is a phase rather
+/// than a blanket rule:
+/// - Always preserving the strike lets a *healthy* workflow accumulate strikes
+///   from post-handler misses it had nothing to do with (its body finished
+///   fine; only persistence found an unregistered child/activity type), so a
+///   single later transient timeout can tip it into poison-pill quarantine.
+/// - Always clearing it lets an incapable worker erase a *genuinely hung*
+///   execution's streak every time it happens to claim the row, so
+///   `poison_pill_threshold` is never reached in a mixed fleet and #494's
+///   protection is silently defeated by a blameless third party.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityMissPhase {
+    /// Detected before the handler was invoked — the workflow-type lookup in
+    /// `process_workflow_task`, or the activity-type lookup in
+    /// `process_activity_task`. The handler never ran.
+    BeforeHandler,
+    /// Detected *while* the workflow body was executing: a local activity
+    /// (issue #98) is resolved inline, mid-suspension, so a worker without its
+    /// handler cannot carry the body forward. The body has **not** returned.
+    DuringHandler,
+    /// Detected after the workflow body returned its commands, while persisting
+    /// the decision — an unregistered activity to schedule, or an unregistered
+    /// child workflow type to start. The body ran to a conclusion inside its
+    /// deadline.
+    AfterHandler,
+}
+
+impl CapabilityMissPhase {
+    /// May a release at this phase clear the issue #494 consecutive-timeout
+    /// strike for the owning execution?
+    ///
+    /// Only [`Self::AfterHandler`]. [`Self::DuringHandler`] is deliberately
+    /// conservative: a mid-body miss is not a completed body, so a workflow
+    /// that hangs *after* its first local activity must not be able to reset
+    /// its own streak on every redelivery.
+    #[must_use]
+    pub const fn clears_workflow_timeout_strike(self) -> bool {
+        matches!(self, Self::AfterHandler)
+    }
 }
 
 /// The Postgres constraint name backing the `harvest_events`
@@ -869,7 +923,23 @@ impl HarvestError {
     #[must_use]
     pub const fn handler_not_registered(&self) -> Option<(&'static str, &str)> {
         match self {
-            Self::HandlerNotRegistered { kind, name } => Some((kind, name.as_str())),
+            Self::HandlerNotRegistered { kind, name, .. } => Some((kind, name.as_str())),
+            _ => None,
+        }
+    }
+
+    /// Where in the dispatch cycle a capability miss (issue #804) was detected,
+    /// or `None` for every other variant.
+    ///
+    /// Split from [`Self::handler_not_registered`] rather than folded into its
+    /// tuple: that predicate is the release-vs-fail interception check and is
+    /// called on the hot error path, while the phase is consulted once, only by
+    /// the dispatch site deciding whether the release may also clear the issue
+    /// #494 timeout strike.
+    #[must_use]
+    pub const fn capability_miss_phase(&self) -> Option<CapabilityMissPhase> {
+        match self {
+            Self::HandlerNotRegistered { phase, .. } => Some(*phase),
             _ => None,
         }
     }
@@ -1513,10 +1583,12 @@ mod tests {
         let wf = HarvestError::HandlerNotRegistered {
             kind: "workflow",
             name: "onboarding".into(),
+            phase: CapabilityMissPhase::BeforeHandler,
         };
         let act = HarvestError::HandlerNotRegistered {
             kind: "activity",
             name: "send_email".into(),
+            phase: CapabilityMissPhase::BeforeHandler,
         };
         assert!(wf.to_string().contains("workflow"));
         assert!(wf.to_string().contains("onboarding"));
@@ -1533,10 +1605,53 @@ mod tests {
         let miss = HarvestError::HandlerNotRegistered {
             kind: "workflow",
             name: "onboarding".into(),
+            phase: CapabilityMissPhase::BeforeHandler,
         };
         assert_eq!(
             miss.handler_not_registered(),
             Some(("workflow", "onboarding"))
+        );
+    }
+
+    #[test]
+    fn capability_miss_phase_clears_the_strike_only_after_the_handler_ran() {
+        // The issue #494 consecutive-workflow-task-timeout strike map answers
+        // "is this workflow body still hanging?". A dispatch may only clear it
+        // if it actually observed the body run to a conclusion.
+        assert!(
+            CapabilityMissPhase::AfterHandler.clears_workflow_timeout_strike(),
+            "the body returned its commands before the miss, so this dispatch \
+             IS evidence the workflow is not hanging"
+        );
+        assert!(
+            !CapabilityMissPhase::BeforeHandler.clears_workflow_timeout_strike(),
+            "the handler never ran, so this dispatch observed nothing"
+        );
+        // Deliberately conservative: an inline local-activity miss happens
+        // MID-body, so the body has NOT returned. Treating it as evidence
+        // would let a workflow that hangs *after* its first local activity
+        // reset its own streak on every redelivery.
+        assert!(
+            !CapabilityMissPhase::DuringHandler.clears_workflow_timeout_strike(),
+            "a mid-body miss is not a completed body"
+        );
+    }
+
+    #[test]
+    fn handler_not_registered_reports_its_phase() {
+        let after = HarvestError::HandlerNotRegistered {
+            kind: "activity",
+            name: "send_email".into(),
+            phase: CapabilityMissPhase::AfterHandler,
+        };
+        assert_eq!(
+            after.capability_miss_phase(),
+            Some(CapabilityMissPhase::AfterHandler)
+        );
+        // Every other variant has no phase at all.
+        assert_eq!(
+            HarvestError::NotFound("nope".into()).capability_miss_phase(),
+            None
         );
     }
 

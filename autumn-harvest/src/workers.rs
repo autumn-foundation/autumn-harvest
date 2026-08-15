@@ -630,11 +630,54 @@ pub async fn fleet_health(
 /// worker" while a capable drainer is a rollback away. A genuinely gone worker
 /// stops heartbeating and ages out of this query on its own, which is the
 /// self-healing behaviour the freshness window already provides.
+/// `build_id` and `labels` come back too, because advertising the queue is
+/// only the *first* of `claim_task`'s gates. The task's own `required_build_id`
+/// (#171) and `required_capabilities` (#522) are checked against these in
+/// [`crate::worker::claim_eligible_workers`]; a worker that fails them can
+/// never claim, so counting it as a possible capable peer would withhold the
+/// redelivery budget forever. Those gates are **not** applied here because they
+/// depend on the task, not the queue — this query answers "who is live on this
+/// queue", and the caller narrows it to "who could claim *this task*".
 #[must_use]
 pub const fn live_workers_on_queue_query() -> &'static str {
-    "SELECT worker_id FROM harvest_workers \
+    "SELECT worker_id, build_id, labels FROM harvest_workers \
      WHERE last_heartbeat_at > NOW() - ($1::bigint * INTERVAL '1 second') \
        AND queues @> to_jsonb($2::text)"
+}
+
+/// A live worker's inputs to `claim_task`'s per-task eligibility gates
+/// (issue #804).
+///
+/// Deliberately just the three columns those gates read, rather than a whole
+/// [`HarvestWorker`]: the capability-miss path runs on every miss, and the
+/// fleet read is pure overhead on the way to a decision.
+#[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct LiveWorker {
+    /// The worker's registered id — the value that lands in a task's
+    /// `capability_miss_workers` set when it misses.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub worker_id: String,
+    /// The worker's build id (#171). Empty for a legacy worker, which may
+    /// claim anything.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub build_id: String,
+    /// The worker's labels, matched against a task's `required_capabilities`
+    /// (#522).
+    #[diesel(sql_type = diesel::sql_types::Jsonb)]
+    pub labels: serde_json::Value,
+}
+
+impl LiveWorker {
+    /// Construct a row without a database, for pure eligibility tests.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn for_test(worker_id: &str, build_id: &str, labels: serde_json::Value) -> Self {
+        Self {
+            worker_id: worker_id.to_owned(),
+            build_id: build_id.to_owned(),
+            labels,
+        }
+    }
 }
 
 /// Worker ids with a fresh heartbeat that advertise `queue_name` (issue #804).
@@ -652,21 +695,14 @@ pub async fn live_workers_on_queue(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
     worker_stale_secs: i64,
-) -> HarvestResult<Vec<String>> {
-    #[derive(diesel::QueryableByName)]
-    struct LiveWorkerRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        worker_id: String,
-    }
-
+) -> HarvestResult<Vec<LiveWorker>> {
     let stale = worker_stale_secs.clamp(0, crate::poison_pill::MAX_WORKER_STALE_SECS);
-    let rows: Vec<LiveWorkerRow> = diesel::sql_query(live_workers_on_queue_query())
+    diesel::sql_query(live_workers_on_queue_query())
         .bind::<diesel::sql_types::BigInt, _>(stale)
         .bind::<diesel::sql_types::Text, _>(queue_name)
         .load(conn)
         .await
-        .map_err(crate::error::database_error)?;
-    Ok(rows.into_iter().map(|r| r.worker_id).collect())
+        .map_err(crate::error::database_error)
 }
 
 // ---------------------------------------------------------------------------

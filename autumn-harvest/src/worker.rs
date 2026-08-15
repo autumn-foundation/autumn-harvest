@@ -30,7 +30,7 @@ use crate::context::{
     empty_shared_state,
 };
 use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
-use crate::error::{HarvestError, HarvestResult};
+use crate::error::{CapabilityMissPhase, HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
 use crate::execution::{
     apply_parent_close_cascade, cancel_workflow_execution_collect,
@@ -2867,6 +2867,9 @@ async fn run_local_activity_inline(
             .ok_or_else(|| HarvestError::HandlerNotRegistered {
                 kind: CapabilityMissKind::Activity.as_str(),
                 name: run.name.clone(),
+                // The workflow body is mid-flight: it suspended on this local
+                // activity and has NOT returned its commands.
+                phase: CapabilityMissPhase::DuringHandler,
             })?;
     // Issue #965: a WASM-backed activity is dispatched through the remote
     // task-queue seam (`process_activity_task`), never inline. `wasm_activity()`
@@ -4060,6 +4063,57 @@ pub enum FleetCapabilityEvidence {
     /// heartbeat interval, …). Trusting a set that cannot even see the claimant
     /// would let a misconfigured registry suppress escalation forever.
     Unavailable,
+}
+
+/// Narrow a queue's live workers to those that could actually **claim this
+/// task** (issue #804, Codex round-10 P2).
+///
+/// Advertising the queue is only `claim_task`'s first gate. It also rejects a
+/// worker whose build is not compatible with the task's `required_build_id`
+/// (#171) and one whose labels do not satisfy its `required_capabilities`
+/// (#522). A worker failing either can never win the claim, so it can never
+/// enter `capability_miss_workers` — and left in the live set it would make
+/// [`fleet_capability_evidence`] answer [`FleetCapabilityEvidence::CapablePeerMayExist`]
+/// *permanently*, withholding the configured distinct-worker budget and leaving
+/// the far larger `10x` total ceiling as the only bound on a task no live
+/// worker can run.
+///
+/// The two predicates are the same helpers the #522 stranded-demand sampler
+/// uses for the same "could this worker claim it?" question
+/// (`BuildCompatibilitySet::is_eligible` and
+/// `eligibility::matches_requirements`), so the two answers cannot drift.
+///
+/// **Unparseable `required_capabilities` keeps the worker.** Excluding on a
+/// value we cannot read would shrink the live set toward empty and fabricate an
+/// `AllLiveWorkersMissed` conclusion — escalating a task a capable peer could
+/// still run. The failure direction is deliberately "release for longer", never
+/// "fail sooner", matching the sampler's own no-false-positive rule.
+#[must_use]
+pub fn claim_eligible_workers(
+    live: &[crate::workers::LiveWorker],
+    compat: &crate::build_routing::BuildCompatibilitySet,
+    required_build_id: Option<&str>,
+    required_capabilities: Option<&serde_json::Value>,
+) -> Vec<String> {
+    // Parsed once, not per worker: the requirement list is a property of the
+    // task. `None` here covers both "no requirement" and "unreadable", which
+    // this function treats identically on purpose (see the doc comment).
+    let reqs = required_capabilities.and_then(|caps| {
+        serde_json::from_value::<Vec<crate::eligibility::Requirement>>(caps.clone()).ok()
+    });
+    live.iter()
+        .filter(|w| {
+            if !compat.is_eligible(&w.build_id, required_build_id) {
+                return false;
+            }
+            reqs.as_ref().is_none_or(|reqs| {
+                let labels: std::collections::HashMap<String, String> =
+                    serde_json::from_value(w.labels.clone()).unwrap_or_default();
+                crate::eligibility::matches_requirements(reqs, &labels)
+            })
+        })
+        .map(|w| w.worker_id.clone())
+        .collect()
 }
 
 /// Classify the live fleet against the workers already known to lack this
@@ -6444,6 +6498,9 @@ async fn persist_scheduled_activities(
             HarvestError::HandlerNotRegistered {
                 kind: CapabilityMissKind::Activity.as_str(),
                 name: scheduled.name.clone(),
+                // Reached only while persisting a decision the body already
+                // produced.
+                phase: CapabilityMissPhase::AfterHandler,
             }
         })?;
 
@@ -7098,6 +7155,7 @@ async fn persist_all_started_child_workflows(
             return Err(HarvestError::HandlerNotRegistered {
                 kind: CapabilityMissKind::Workflow.as_str(),
                 name: child.workflow_name.clone(),
+                phase: CapabilityMissPhase::AfterHandler,
             });
         }
     }
@@ -7614,6 +7672,7 @@ async fn persist_child_timeout_race(
         return Err(HarvestError::HandlerNotRegistered {
             kind: CapabilityMissKind::Workflow.as_str(),
             name: child.workflow_name.clone(),
+            phase: CapabilityMissPhase::AfterHandler,
         });
     }
 
@@ -8527,6 +8586,7 @@ async fn create_detached_child_executions(
             return Err(HarvestError::HandlerNotRegistered {
                 kind: CapabilityMissKind::Workflow.as_str(),
                 name: workflow_name.clone(),
+                phase: CapabilityMissPhase::AfterHandler,
             });
         }
     }
@@ -9393,6 +9453,9 @@ async fn process_activity_task(
         return Err(HarvestError::HandlerNotRegistered {
             kind: CapabilityMissKind::Activity.as_str(),
             name: activity_name.to_owned(),
+            // The activity body never ran. (An activity task carries no
+            // workflow-timeout strike, so the phase is informational here.)
+            phase: CapabilityMissPhase::BeforeHandler,
         });
     };
 
@@ -13332,6 +13395,9 @@ async fn process_workflow_task(
         return Err(HarvestError::HandlerNotRegistered {
             kind: CapabilityMissKind::Workflow.as_str(),
             name: prepared.execution.workflow_name.clone(),
+            // The workflow body never ran, so this dispatch observed nothing
+            // about whether it still hangs.
+            phase: CapabilityMissPhase::BeforeHandler,
         });
     };
 
@@ -14445,7 +14511,14 @@ async fn process_workflow_task(
         registry,
         update_result_command_source(&outcome, &pending_cmds),
     ) {
-        return Err(HarvestError::HandlerNotRegistered { kind, name });
+        return Err(HarvestError::HandlerNotRegistered {
+            kind,
+            name,
+            // Reached only after `drive_workflow` returned an outcome: the body
+            // ran to a conclusion inside its deadline, and only persisting its
+            // commands found an unregistered type.
+            phase: CapabilityMissPhase::AfterHandler,
+        });
     }
 
     let terminal_parent_close_cascade_events = if matches!(
@@ -14995,19 +15068,33 @@ async fn process_workflow_task(
 /// The distinction is load-bearing, not cosmetic. The dispatch site treats a
 /// plain `Ok(())` as evidence the execution made progress and clears the issue
 /// #494 consecutive-workflow-task-timeout strike map for it. A capability-miss
-/// release is *not* that evidence: the handler never ran, so this worker
-/// observed nothing at all about whether the workflow body still hangs.
-/// Collapsing the two would let an incapable worker erase a genuinely hung
-/// execution's hang-detection streak — the mirror image of the argument that
-/// says a capability miss must never *increment* `crash_strikes`.
+/// release is *usually* not that evidence — but whether it is depends on
+/// **where** the miss was detected, which is why `Released` carries the answer
+/// rather than hard-coding one:
+///
+/// - Detected **before or during** the handler (an unregistered workflow type,
+///   or an inline local activity mid-body): this worker observed nothing about
+///   whether the body still hangs, so the strike must survive. Clearing it
+///   would let an incapable worker erase a genuinely hung execution's
+///   hang-detection streak — the mirror image of the argument that says a
+///   capability miss must never *increment* `crash_strikes`.
+/// - Detected **after** the handler returned (persisting its commands found an
+///   unregistered activity or child type): the body *did* run to a conclusion
+///   inside its deadline, so this dispatch is real evidence of health and the
+///   strike must clear. Preserving it would let a healthy workflow accumulate
+///   strikes from misses it had nothing to do with, and a single later
+///   transient timeout could tip it into poison-pill quarantine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskDispatchOutcome {
     /// The handler ran to a normal conclusion for this dispatch cycle.
     Completed,
-    /// A capability miss handed the claim back (or found it already taken), so
-    /// the handler never ran and this dispatch proves nothing about the
-    /// execution's health.
-    Released,
+    /// A capability miss handed the claim back (or found it already taken).
+    Released {
+        /// Did the workflow body reach a conclusion before the miss? Only then
+        /// may the dispatch site clear the issue #494 timeout strike. Sourced
+        /// from [`CapabilityMissPhase::clears_workflow_timeout_strike`].
+        clears_timeout_strike: bool,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15099,12 +15186,18 @@ async fn process_task(
     let Some((kind, name)) = error.handler_not_registered() else {
         return outcome.map(|()| TaskDispatchOutcome::Completed);
     };
+    // Both accessors read the same variant, so the phase is always present here.
+    // Defaulting is unreachable; `BeforeHandler` is the conservative choice
+    // (preserve the strike) if a future variant ever separates them.
+    let phase = error
+        .capability_miss_phase()
+        .unwrap_or(CapabilityMissPhase::BeforeHandler);
     handle_capability_miss(
         &mut conn,
         &task,
         worker_id,
         registry.telemetry().metrics.as_ref(),
-        MissingHandler { kind, name },
+        MissingHandler { kind, name, phase },
         capability_miss_policy,
     )
     .await
@@ -15112,16 +15205,19 @@ async fn process_task(
 
 /// The handler a claiming worker turned out not to register (issue #804).
 ///
-/// Bundles the pair that `HarvestError::handler_not_registered` returns so the
-/// two always travel together: every diagnostic on the miss path — the reason
-/// string, the log fields, and the re-raised error — needs both halves, and
-/// splitting them across argument lists is how they drift apart.
+/// Bundles what `HarvestError::HandlerNotRegistered` carries so the parts always
+/// travel together: every diagnostic on the miss path — the reason string, the
+/// log fields, and the re-raised error — needs all of them, and splitting them
+/// across argument lists is how they drift apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MissingHandler<'a> {
     /// `"workflow"` or `"activity"` — the registry that was consulted.
     pub kind: &'static str,
     /// The registered name the claiming worker looked up and did not find.
     pub name: &'a str,
+    /// Where in the dispatch cycle the miss was detected. Decides whether the
+    /// release may clear the issue #494 timeout strike.
+    pub phase: CapabilityMissPhase,
 }
 
 impl MissingHandler<'_> {
@@ -15166,19 +15262,44 @@ async fn read_live_fleet_or_degrade(
     task: &TaskQueueItem,
     worker_stale_secs: i64,
 ) -> Vec<String> {
-    match crate::workers::live_workers_on_queue(conn, &task.queue_name, worker_stale_secs).await {
+    let live = match crate::workers::live_workers_on_queue(
+        conn,
+        &task.queue_name,
+        worker_stale_secs,
+    )
+    .await
+    {
         Ok(workers) => workers,
         Err(error) => {
             tracing::warn!(
                 task_id = %task.id,
                 queue = %task.queue_name,
                 %error,
-                "could not read the live worker fleet for a capability miss; falling back to the \
-                 configured redelivery budget alone"
+                "could not read the live worker fleet for a capability miss; falling back to \
+                 the configured redelivery budget alone"
             );
-            Vec::new()
+            return Vec::new();
         }
-    }
+    };
+
+    // Narrow to workers that could actually claim THIS task (issue #804,
+    // round-10 P2). A build-incompatible or label-ineligible worker never wins
+    // the claim, so it never joins `capability_miss_workers` and would
+    // otherwise hold the evidence at `CapablePeerMayExist` forever.
+    //
+    // A compat-set read failure degrades to the empty set, matching the #522
+    // sampler: exact-match and legacy-worker rules still apply, so the filter
+    // stays correct for every deployment that has declared no cross-build
+    // compatibility at all.
+    let compat = crate::build_routing::load_compat_set(conn)
+        .await
+        .unwrap_or_default();
+    claim_eligible_workers(
+        &live,
+        &compat,
+        task.required_build_id.as_deref(),
+        task.required_capabilities.as_ref(),
+    )
 }
 
 /// Release a claim taken by a worker with no handler for the task's type, or
@@ -15233,7 +15354,9 @@ async fn handle_capability_miss(
                 // Still `Released`, not `Completed`: this worker observed
                 // nothing about the execution, so it must not be treated as a
                 // clean dispatch (see `TaskDispatchOutcome`).
-                return Ok(TaskDispatchOutcome::Released);
+                return Ok(TaskDispatchOutcome::Released {
+                    clears_timeout_strike: missing.phase.clears_workflow_timeout_strike(),
+                });
             }
             metrics.record_task_capability_miss(
                 &task.queue_name,
@@ -15254,7 +15377,9 @@ async fn handle_capability_miss(
                 backoff_secs = delay.as_secs(),
                 "released task for a capable peer: no handler registered on this worker"
             );
-            Ok(TaskDispatchOutcome::Released)
+            Ok(TaskDispatchOutcome::Released {
+                clears_timeout_strike: missing.phase.clears_workflow_timeout_strike(),
+            })
         }
         CapabilityMissAction::Escalate => {
             escalate_capability_miss(
@@ -15377,6 +15502,7 @@ async fn escalate_capability_miss(
     Err(HarvestError::HandlerNotRegistered {
         kind: missing.kind,
         name: missing.name.to_owned(),
+        phase: missing.phase,
     })
 }
 
@@ -18759,17 +18885,33 @@ impl Worker {
                                 .remove(&exec_id);
                         }
                     }
-                    Ok(Ok(TaskDispatchOutcome::Released)) => {
-                        // Issue #804: a capability-miss release deliberately
-                        // does NOT clear the strike map. The handler never ran,
-                        // so this dispatch is not evidence that the workflow
-                        // body stopped hanging — and clearing it here would let
-                        // an incapable worker reset a genuinely hung
-                        // execution's consecutive-timeout streak every time it
-                        // happened to claim the row, so `poison_pill_threshold`
-                        // would never be reached in a mixed fleet and issue
-                        // #494's protection would be silently defeated by a
-                        // blameless third party.
+                    Ok(Ok(TaskDispatchOutcome::Released {
+                        clears_timeout_strike,
+                    })) => {
+                        // Issue #804: whether a capability-miss release may
+                        // clear the strike map depends on where the miss was
+                        // detected (see `CapabilityMissPhase`).
+                        //
+                        // Pre-/mid-handler: do NOT clear. This dispatch is not
+                        // evidence that the workflow body stopped hanging, and
+                        // clearing here would let an incapable worker reset a
+                        // genuinely hung execution's consecutive-timeout streak
+                        // every time it happened to claim the row, so
+                        // `poison_pill_threshold` would never be reached in a
+                        // mixed fleet and issue #494's protection would be
+                        // silently defeated by a blameless third party.
+                        //
+                        // Post-handler: DO clear. The body returned its
+                        // commands inside its deadline and only persisting them
+                        // found an unregistered type, so this dispatch is
+                        // genuine evidence of health — withholding it would let
+                        // a healthy workflow bank strikes it did not earn.
+                        if clears_timeout_strike && let Some(exec_id) = exec_id_for_timeout {
+                            timeout_strikes
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&exec_id);
+                        }
                     }
                     Ok(Err(error)) => {
                         // Task returned a clean error (not a timeout): clear
@@ -23000,6 +23142,78 @@ mod tests {
         names.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// A worker that advertises the queue but cannot pass the task's *own*
+    /// claim gates must not count as a possible capable peer (issue #804,
+    /// Codex round-10 P2).
+    ///
+    /// `claim_task` rejects a worker whose build is not compatible with the
+    /// task's `required_build_id` (#171) or whose labels do not satisfy its
+    /// `required_capabilities` (#522). Such a worker can never claim, so it can
+    /// never enter `capability_miss_workers` — and if the live set counted it,
+    /// `fleet_capability_evidence` would report `CapablePeerMayExist` *forever*,
+    /// withholding the configured budget and leaving the 10x total ceiling as
+    /// the only bound on a genuinely unhandled task.
+    #[test]
+    fn claim_ineligible_workers_are_excluded_from_the_live_fleet() {
+        let compat = crate::build_routing::BuildCompatibilitySet::default();
+        let caps = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+
+        let live = vec![
+            // Wrong build: `claim_task`'s required_build_id gate rejects it.
+            crate::workers::LiveWorker::for_test(
+                "wrong-build",
+                "v1",
+                serde_json::json!({"gpu": "true"}),
+            ),
+            // Right build, but the label requirement is unmet.
+            crate::workers::LiveWorker::for_test(
+                "wrong-labels",
+                "v2",
+                serde_json::json!({"gpu": "false"}),
+            ),
+            // Satisfies both — the genuine capable-peer candidate.
+            crate::workers::LiveWorker::for_test(
+                "eligible",
+                "v2",
+                serde_json::json!({"gpu": "true"}),
+            ),
+        ];
+
+        assert_eq!(
+            claim_eligible_workers(&live, &compat, Some("v2"), Some(&caps)),
+            ids(&["eligible"]),
+            "only a worker that could actually win the claim is a possible peer"
+        );
+
+        // A task with no build or capability requirement gates nobody out.
+        assert_eq!(
+            claim_eligible_workers(&live, &compat, None, None),
+            ids(&["wrong-build", "wrong-labels", "eligible"]),
+            "an unconstrained task keeps the whole live set"
+        );
+
+        // A legacy worker (empty build_id) may claim anything (#171).
+        let legacy = vec![crate::workers::LiveWorker::for_test(
+            "legacy",
+            "",
+            serde_json::json!({"gpu": "true"}),
+        )];
+        assert_eq!(
+            claim_eligible_workers(&legacy, &compat, Some("v2"), Some(&caps)),
+            ids(&["legacy"])
+        );
+
+        // Unparseable capabilities must not silently exclude the whole fleet:
+        // that would fabricate an `AllLiveWorkersMissed` conclusion and
+        // escalate a task a capable peer could still run.
+        let junk = serde_json::json!("not-a-requirement-list");
+        assert_eq!(
+            claim_eligible_workers(&live, &compat, None, Some(&junk)),
+            ids(&["wrong-build", "wrong-labels", "eligible"]),
+            "an unreadable requirement falls back to keeping the worker"
+        );
+    }
+
     #[test]
     fn fleet_evidence_classifies_the_three_cases() {
         // Every live worker has missed it -> a genuine fleet conclusion.
@@ -23574,6 +23788,46 @@ mod tests {
     /// (organically it never is — 2^31 releases at the 30 s backoff cap is
     /// ~2000 years — but the column is writable by an operator, a backfill, or
     /// a test seed).
+    /// The phase a raise site stamps must reach the dispatch site's strike
+    /// decision unchanged (issue #804, round 10).
+    ///
+    /// Pins the wiring, not the rule: `CapabilityMissPhase`'s own truth table
+    /// lives in `error.rs`. What can silently break *here* is the derivation in
+    /// `handle_capability_miss` — an inverted boolean, or a hard-coded `false`
+    /// reintroducing the pre-round-10 "never clear" behaviour that let a
+    /// healthy workflow bank issue #494 strikes it did not earn.
+    #[test]
+    fn missing_handler_phase_reaches_the_timeout_strike_decision() {
+        for (phase, expected) in [
+            (CapabilityMissPhase::AfterHandler, true),
+            (CapabilityMissPhase::BeforeHandler, false),
+            (CapabilityMissPhase::DuringHandler, false),
+        ] {
+            let missing = MissingHandler {
+                kind: CapabilityMissKind::Activity.as_str(),
+                name: "send_email",
+                phase,
+            };
+            // The exact expression both `Released` construction sites use.
+            assert_eq!(
+                missing.phase.clears_workflow_timeout_strike(),
+                expected,
+                "{phase:?} must {} the strike",
+                if expected { "clear" } else { "preserve" }
+            );
+            // And it must survive the trip through the outcome value.
+            let outcome = TaskDispatchOutcome::Released {
+                clears_timeout_strike: missing.phase.clears_workflow_timeout_strike(),
+            };
+            assert_eq!(
+                outcome,
+                TaskDispatchOutcome::Released {
+                    clears_timeout_strike: expected
+                }
+            );
+        }
+    }
+
     #[test]
     fn capability_miss_decision_escalates_at_the_storage_ceiling() {
         // The exact shape flagged in review: a budget at or above the column's
