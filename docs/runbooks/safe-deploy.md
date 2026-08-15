@@ -449,6 +449,13 @@ incident: the resulting terminal error names the knob, not a missing deploy.
 - **Not a hung body (#494).** The workflow-task timeout strike counter follows
   the same rule for the same reason: a released task that never ran a handler
   is not evidence the body stopped hanging.
+- **Not a panicking body (#782).** The consecutive-workflow-handler-panic strike
+  follows the same rule again. A pre-/mid-handler miss is *non-terminal* — the
+  task is released, not failed — so it must not reset the streak; otherwise a
+  worker that alternates between panicking on the body and missing an
+  unregistered local activity would keep `workflow_panic_max_attempts` out of
+  reach indefinitely. All three counters derive their answer from one question:
+  *did this dispatch watch the handler reach a conclusion?*
 - **Session-pinned tasks (#606) escalate immediately.** A session task is
   hard-pinned to its acquiring host, so "release for a capable peer" is false
   by construction: no other worker can ever claim it. Such a task escalates on

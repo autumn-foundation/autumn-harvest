@@ -4699,6 +4699,44 @@ fn clear_panic_strike(
         .remove(&exec_id);
 }
 
+/// Would a failure carrying `error` clear the issue #782 consecutive-panic
+/// strike for its execution?
+///
+/// `true` for an ordinary error, which terminally fails the execution: the entry
+/// must go or the map leaks one `u32` per such execution.
+///
+/// `false` for a **pre-/mid-handler** capability miss (issue #804), which is
+/// *non-terminal* — `fail_execution_on_error` passes it through un-failed so the
+/// dispatch path can release the task for a capable peer. Clearing there would
+/// let a worker that alternates between panicking on the body and missing an
+/// unregistered local activity reset `workflow_panic_max_attempts` forever
+/// (Codex round-13 P2). The phase rule is owned by
+/// [`CapabilityMissPhase::clears_panic_strike`], so this predicate never
+/// re-derives it.
+const fn failure_clears_panic_strike(error: &HarvestError) -> bool {
+    match error.capability_miss_phase() {
+        Some(phase) => phase.clears_panic_strike(),
+        None => true,
+    }
+}
+
+/// Apply [`failure_clears_panic_strike`] to `result`, mutating the strike map.
+///
+/// Extracted from `fail_workflow_execution_clearing_strikes` so both the
+/// decision *and* its effect on the map are unit-testable without a database
+/// connection.
+fn apply_panic_strike_clear_for_failure<T>(
+    strikes: &std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>,
+    exec_id: uuid::Uuid,
+    result: &HarvestResult<T>,
+) {
+    if let Err(error) = result
+        && failure_clears_panic_strike(error)
+    {
+        clear_panic_strike(strikes, exec_id);
+    }
+}
+
 /// Encode a contained **activity** handler-panic message as the typed
 /// `harvest_activity_failure_v1` envelope carrying the engine-reserved
 /// [`ERROR_TYPE_HANDLER_PANIC`](crate::failure::ERROR_TYPE_HANDLER_PANIC)
@@ -11209,6 +11247,11 @@ async fn fail_execution_on_error<T>(
 /// here or it leaks one `u32` per such execution. The panic re-dispatch path
 /// returns `Ok(())` and is never routed through this wrapper, so its
 /// just-incremented strike is preserved (mirrors `workflow_task_timeout_strikes`).
+///
+/// A pre-/mid-handler capability miss (issue #804) is likewise preserved: it is
+/// non-terminal — `fail_execution_on_error` passes it through so the dispatch
+/// path can release the task — so it is not evidence the body stopped panicking.
+/// See [`failure_clears_panic_strike`].
 async fn fail_workflow_execution_clearing_strikes<T>(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -11217,9 +11260,7 @@ async fn fail_workflow_execution_clearing_strikes<T>(
     workflow_panic_strikes: &std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>,
     exec_id: uuid::Uuid,
 ) -> HarvestResult<T> {
-    if result.is_err() {
-        clear_panic_strike(workflow_panic_strikes, exec_id);
-    }
+    apply_panic_strike_clear_for_failure(workflow_panic_strikes, exec_id, &result);
     fail_execution_on_error(conn, task, worker_id, result).await
 }
 
@@ -23961,6 +24002,99 @@ mod tests {
         assert_eq!(panic_retry_decision(1, 0), PanicRetryDecision::Terminal);
         // max == 1 is terminal on the first strike.
         assert_eq!(panic_retry_decision(1, 1), PanicRetryDecision::Terminal);
+    }
+
+    #[test]
+    fn failure_clears_panic_strike_preserves_pre_and_mid_handler_capability_misses() {
+        // An ordinary error terminally fails the execution here, so the strike
+        // entry must go -- retaining it would leak one `u32` per such execution.
+        assert!(
+            failure_clears_panic_strike(&HarvestError::NotFound("gone".into())),
+            "an ordinary error ends the execution, so its strike entry must be \
+             released"
+        );
+        // A capability miss (issue #804) is NON-terminal on the pre-/mid-handler
+        // phases: `fail_execution_on_error` passes it through un-failed so the
+        // dispatch path can release the task for a capable peer. It observed
+        // nothing about the body, so it must not reset the panic streak.
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+        ] {
+            let miss = HarvestError::HandlerNotRegistered {
+                kind: "activity",
+                name: "send_email".into(),
+                phase,
+            };
+            assert!(
+                !failure_clears_panic_strike(&miss),
+                "a {phase:?} capability miss is released, not failed: clearing \
+                 here lets a worker alternating panics and local-activity misses \
+                 reset `workflow_panic_max_attempts` forever (Codex round-13 P2)"
+            );
+        }
+        // A post-handler miss DID watch the body return its commands, so it is
+        // genuine evidence the panic streak is broken.
+        assert!(
+            failure_clears_panic_strike(&HarvestError::HandlerNotRegistered {
+                kind: "activity",
+                name: "send_email".into(),
+                phase: CapabilityMissPhase::AfterHandler,
+            }),
+            "the body ran to a conclusion without panicking"
+        );
+    }
+
+    #[test]
+    fn apply_panic_strike_clear_for_failure_mutates_the_map_per_phase() {
+        // The decision is only useful if it reaches the map, so exercise the
+        // mutation itself -- no DB connection required.
+        let exec_id = uuid::Uuid::new_v4();
+        let seed = || std::sync::Mutex::new(std::collections::HashMap::from([(exec_id, 2_u32)]));
+
+        // `Ok` never touches the map (a clean cycle clears the strike through
+        // the panic gate, not through this failure path).
+        let strikes = seed();
+        apply_panic_strike_clear_for_failure(&strikes, exec_id, &Ok::<(), HarvestError>(()));
+        assert_eq!(
+            strikes.lock().unwrap().get(&exec_id).copied(),
+            Some(2),
+            "a successful result is not a failure and must not mutate the map"
+        );
+
+        // A pre-/mid-handler capability miss preserves the streak.
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+        ] {
+            let strikes = seed();
+            let result: HarvestResult<()> = Err(HarvestError::HandlerNotRegistered {
+                kind: "workflow",
+                name: "onboarding".into(),
+                phase,
+            });
+            apply_panic_strike_clear_for_failure(&strikes, exec_id, &result);
+            assert_eq!(
+                strikes.lock().unwrap().get(&exec_id).copied(),
+                Some(2),
+                "a {phase:?} miss releases the task; the streak must survive"
+            );
+        }
+
+        // A post-handler miss, and any ordinary error, clear it.
+        let strikes = seed();
+        let after: HarvestResult<()> = Err(HarvestError::HandlerNotRegistered {
+            kind: "workflow",
+            name: "onboarding".into(),
+            phase: CapabilityMissPhase::AfterHandler,
+        });
+        apply_panic_strike_clear_for_failure(&strikes, exec_id, &after);
+        assert!(strikes.lock().unwrap().is_empty());
+
+        let strikes = seed();
+        let ordinary: HarvestResult<()> = Err(HarvestError::NotFound("gone".into()));
+        apply_panic_strike_clear_for_failure(&strikes, exec_id, &ordinary);
+        assert!(strikes.lock().unwrap().is_empty());
     }
 
     #[test]

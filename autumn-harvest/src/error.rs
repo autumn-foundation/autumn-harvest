@@ -618,7 +618,7 @@ pub enum HarvestError {
 /// detected, relative to the workflow handler's own execution.
 ///
 /// The distinction exists to answer one underlying question — *did this
-/// dispatch actually watch the handler reach a conclusion?* — on which two
+/// dispatch actually watch the handler reach a conclusion?* — on which three
 /// independent strike counters depend:
 ///
 /// - the issue #494 consecutive-workflow-task-timeout strike map, which answers
@@ -626,10 +626,13 @@ pub enum HarvestError {
 ///   ([`Self::clears_workflow_timeout_strike`]);
 /// - the issue #367 `crash_strikes` column, which answers *"does this task keep
 ///   killing the worker process that runs it?"*
-///   ([`Self::clears_crash_strikes`]).
+///   ([`Self::clears_crash_strikes`]);
+/// - the issue #782 consecutive-workflow-handler-panic strike map, which answers
+///   *"does this workflow body keep panicking?"*
+///   ([`Self::clears_panic_strike`]).
 ///
-/// Both are evidence about *execution*, so only a dispatch that ran the handler
-/// to a conclusion is entitled to reset either.
+/// All three are evidence about *execution*, so only a dispatch that ran the
+/// handler to a conclusion is entitled to reset any of them.
 ///
 /// Getting this wrong is a two-sided hazard, which is why it is a phase rather
 /// than a blanket rule:
@@ -662,10 +665,10 @@ pub enum CapabilityMissPhase {
 impl CapabilityMissPhase {
     /// Did this dispatch watch the handler run to a conclusion?
     ///
-    /// The single fact both strike predicates below are derived from, stated
-    /// once so they cannot drift apart. Only [`Self::AfterHandler`] qualifies:
-    /// [`Self::DuringHandler`] is deliberately conservative because a mid-body
-    /// miss is not a completed body.
+    /// The single fact all three strike predicates below are derived from,
+    /// stated once so they cannot drift apart. Only [`Self::AfterHandler`]
+    /// qualifies: [`Self::DuringHandler`] is deliberately conservative because a
+    /// mid-body miss is not a completed body.
     #[must_use]
     const fn handler_ran_to_conclusion(self) -> bool {
         matches!(self, Self::AfterHandler)
@@ -705,6 +708,32 @@ impl CapabilityMissPhase {
     /// NOT NULL`, and a released row is `PENDING` with a NULL worker.
     #[must_use]
     pub const fn clears_crash_strikes(self) -> bool {
+        self.handler_ran_to_conclusion()
+    }
+
+    /// May a release at this phase clear the execution's issue #782
+    /// consecutive-workflow-handler-panic strike?
+    ///
+    /// The panic strike map counts how many times in a row this execution's
+    /// *body* panicked, so — exactly like the two counters above — only a
+    /// dispatch that ran the body to a conclusion is evidence the streak is
+    /// broken.
+    ///
+    /// A capability miss that surfaces before or during the handler is a
+    /// **non-terminal** condition: the dispatch path releases the task for a
+    /// capable peer instead of failing the execution. Clearing the strike there
+    /// would let a worker that alternates between panicking on the body and
+    /// missing an unregistered local activity reset `workflow_panic_max_attempts`
+    /// forever, so the panic budget is never reached and #782's containment is
+    /// silently defeated — the same blameless-third-party defeat this type
+    /// already prevents for #494 and #367.
+    ///
+    /// A *terminal* failure still clears the entry regardless of phase, because
+    /// the execution ends there and a retained entry would leak one `u32` per
+    /// such execution; that decision belongs to the caller, which only consults
+    /// this predicate for a capability miss.
+    #[must_use]
+    pub const fn clears_panic_strike(self) -> bool {
         self.handler_ran_to_conclusion()
     }
 }
@@ -1705,7 +1734,7 @@ mod tests {
             "a mid-body miss is not a completed body: the very crash the \
              counter tracks could still be ahead of it"
         );
-        // The two predicates answer different questions but share one fact, so
+        // The predicates answer different questions but share one fact, so
         // they must never disagree about a phase.
         for phase in [
             CapabilityMissPhase::BeforeHandler,
@@ -1716,6 +1745,46 @@ mod tests {
                 phase.clears_crash_strikes(),
                 phase.clears_workflow_timeout_strike(),
                 "both strike predicates derive from `handler_ran_to_conclusion`; \
+                 a divergence for {phase:?} means one of them was special-cased \
+                 without stating why"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_miss_phase_clears_panic_strike_only_after_the_handler_ran() {
+        // Issue #782's strike map counts consecutive panics of this execution's
+        // BODY. A capability miss detected before/during the handler is
+        // non-terminal (the task is released for a capable peer), so it must not
+        // reset a streak it observed nothing about -- otherwise a worker
+        // alternating "panic" and "unregistered local activity" resets
+        // `workflow_panic_max_attempts` forever (Codex round-13 P2).
+        assert!(
+            CapabilityMissPhase::AfterHandler.clears_panic_strike(),
+            "the body returned its commands without panicking, so the \
+             consecutive-panic streak is genuinely broken"
+        );
+        assert!(
+            !CapabilityMissPhase::BeforeHandler.clears_panic_strike(),
+            "the handler never ran, so this dispatch proves nothing about \
+             whether the body still panics"
+        );
+        assert!(
+            !CapabilityMissPhase::DuringHandler.clears_panic_strike(),
+            "an inline local-activity miss happens MID-body: the very panic the \
+             counter tracks could still be ahead of it"
+        );
+        // All three predicates share `handler_ran_to_conclusion`, so a
+        // divergence means one was special-cased without stating why.
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+            CapabilityMissPhase::AfterHandler,
+        ] {
+            assert_eq!(
+                phase.clears_panic_strike(),
+                phase.clears_workflow_timeout_strike(),
+                "all strike predicates derive from `handler_ran_to_conclusion`; \
                  a divergence for {phase:?} means one of them was special-cased \
                  without stating why"
             );
