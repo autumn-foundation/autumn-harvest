@@ -4407,8 +4407,8 @@ pub fn no_capable_worker_reason(
             let basis = if capable_peer_may_exist {
                 "a live worker on this queue never missed this task, so it may well have the \
                  handler and simply lost every claim race — check whether it is saturated, \
-                 draining, or advertising a stale queue list before concluding the handler is \
-                 missing"
+                 draining, advertising a stale queue list, or ineligible for this activity's \
+                 registered capability requirements before concluding the handler is missing"
             } else {
                 "fewer distinct workers missed this task than the budget allows, so either those \
                  workers lack the handler or a capable peer lost every claim race — check the \
@@ -15388,8 +15388,17 @@ async fn handle_capability_miss(
             // The backoff is applied against the DB clock inside the release
             // statement, so host/Postgres skew cannot swallow it.
             let delay = capability_miss_backoff(task.capability_misses);
-            let released =
-                queue::release_task_for_capability_miss(conn, task.id, worker_id, delay).await?;
+            // Issue #367's `crash_strikes` may only be cleared by a dispatch
+            // that actually ran the handler (Codex round-12 P1) -- see
+            // `CapabilityMissPhase::clears_crash_strikes`.
+            let released = queue::release_task_for_capability_miss(
+                conn,
+                task.id,
+                worker_id,
+                delay,
+                missing.phase.clears_crash_strikes(),
+            )
+            .await?;
             if !released {
                 // A concurrent poison-pill reclaim (or an operator action) took
                 // the row out from under this claim. Nothing to do and nothing

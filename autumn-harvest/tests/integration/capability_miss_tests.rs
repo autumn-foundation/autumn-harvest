@@ -1510,6 +1510,9 @@ async fn release_never_writes_the_error_column() {
         task_id,
         "incapable",
         Duration::from_secs(1),
+        // A workflow-type lookup miss is `BeforeHandler`, so the crash-strike
+        // counter is preserved (Codex round-12 P1).
+        false,
     )
     .await
     .expect("release query runs");
@@ -1545,6 +1548,9 @@ async fn release_never_writes_the_error_column() {
         task2,
         "incapable",
         Duration::from_secs(1),
+        // A workflow-type lookup miss is `BeforeHandler`, so the crash-strike
+        // counter is preserved (Codex round-12 P1).
+        false,
     )
     .await
     .expect("release query runs");
@@ -1587,6 +1593,7 @@ async fn release_is_a_noop_when_the_claim_was_already_taken() {
         task_id,
         "worker-we-are",
         Duration::from_secs(1),
+        false,
     )
     .await
     .expect("release query runs");
@@ -1802,5 +1809,112 @@ async fn releasing_a_rate_limited_activity_refunds_its_token() {
         tokens >= 0.99,
         "releasing an activity that never ran must refund its claim-time token, \
          leaving the bucket full; got {tokens}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A release must not launder a poison task's crash history (issue #804 x #367).
+// ---------------------------------------------------------------------------
+
+/// A pre-handler capability miss must **preserve** `crash_strikes` (Codex
+/// round-12 P1).
+///
+/// `crash_strikes` is issue #367's evidence that a task keeps killing the worker
+/// process that runs it: `reclaim_orphaned_tasks` increments it each time the
+/// row is found orphaned under a worker that stopped heartbeating, and
+/// quarantines the task once it reaches `poison_pill_threshold`.
+///
+/// A capability miss ran nothing, so it is evidence about *neither* direction.
+/// Zeroing the column on it is not merely generous — in a heterogeneous fleet it
+/// is a silent defeat of the quarantine: an incapable claim landing between two
+/// capable crashes resets the streak to zero every time, so the threshold is
+/// never reached and the poison task goes on crashing replacement workers
+/// indefinitely.
+///
+/// AC4 requires only that a clean miss never *increments* a crash counter, and
+/// preserving satisfies that strictly more conservatively than zeroing did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    let exec_id = seed_workflow(&mut conn, "noop_wf", serde_json::json!({}), Q_NOOP).await;
+    let task_id = load_tasks(&url, exec_id).await[0].id;
+
+    // The exact interleaving the finding describes: two capable workers have
+    // already died on this row (so `reclaim_orphaned_tasks` banked two strikes),
+    // and an incapable worker now wins the claim race.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+            SET state = 'RUNNING', worker_id = 'incapable', started_at = NOW(), \
+                crash_strikes = 2 \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("seed a claimed row that already crashed two workers");
+    assert_eq!(load_task(&url, task_id).await.crash_strikes, 2);
+
+    let released = queue::release_task_for_capability_miss(
+        &mut conn,
+        task_id,
+        "incapable",
+        Duration::from_secs(1),
+        // `CapabilityMissPhase::BeforeHandler.clears_crash_strikes()`.
+        false,
+    )
+    .await
+    .expect("release query runs");
+    assert!(released);
+
+    let task = load_task(&url, task_id).await;
+    assert_eq!(
+        task.crash_strikes, 2,
+        "the incapable worker ran nothing, so it must not erase the two worker \
+         deaths this task has already caused; zeroing here means the next \
+         capable worker's crash restarts the streak at 1 and \
+         `poison_pill_threshold` is never reached"
+    );
+    assert_eq!(
+        task.state, "PENDING",
+        "the release itself must still work exactly as before"
+    );
+    assert_eq!(
+        task.capability_misses, 1,
+        "the redelivery counter is the ONLY counter a capability miss advances"
+    );
+
+    // The complement: a post-handler miss DID watch the body run to a
+    // conclusion without killing this worker, so the streak is genuinely broken.
+    let exec2 = seed_workflow(&mut conn, "noop_wf", serde_json::json!({ "n": 2 }), Q_NOOP).await;
+    let task2 = load_tasks(&url, exec2).await[0].id;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+            SET state = 'RUNNING', worker_id = 'incapable', started_at = NOW(), \
+                crash_strikes = 2 \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task2)
+    .execute(&mut conn)
+    .await
+    .expect("seed a second claimed row");
+
+    let released2 = queue::release_task_for_capability_miss(
+        &mut conn,
+        task2,
+        "incapable",
+        Duration::from_secs(1),
+        // `CapabilityMissPhase::AfterHandler.clears_crash_strikes()`.
+        true,
+    )
+    .await
+    .expect("release query runs");
+    assert!(released2);
+    assert_eq!(
+        load_task(&url, task2).await.crash_strikes,
+        0,
+        "the body returned its commands on this very dispatch, so this worker \
+         demonstrably survived running it"
     );
 }

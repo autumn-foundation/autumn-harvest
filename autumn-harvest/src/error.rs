@@ -617,22 +617,31 @@ pub enum HarvestError {
 /// Where in a task's dispatch cycle a capability miss (issue #804) was
 /// detected, relative to the workflow handler's own execution.
 ///
-/// The distinction exists for exactly one decision: whether releasing the claim
-/// may also clear the execution's issue #494 consecutive-workflow-task-timeout
-/// strike. That strike map answers *"is this workflow body still hanging?"*, so
-/// only a dispatch that actually watched the body reach a conclusion is
-/// entitled to reset it.
+/// The distinction exists to answer one underlying question — *did this
+/// dispatch actually watch the handler reach a conclusion?* — on which two
+/// independent strike counters depend:
+///
+/// - the issue #494 consecutive-workflow-task-timeout strike map, which answers
+///   *"is this workflow body still hanging?"*
+///   ([`Self::clears_workflow_timeout_strike`]);
+/// - the issue #367 `crash_strikes` column, which answers *"does this task keep
+///   killing the worker process that runs it?"*
+///   ([`Self::clears_crash_strikes`]).
+///
+/// Both are evidence about *execution*, so only a dispatch that ran the handler
+/// to a conclusion is entitled to reset either.
 ///
 /// Getting this wrong is a two-sided hazard, which is why it is a phase rather
 /// than a blanket rule:
-/// - Always preserving the strike lets a *healthy* workflow accumulate strikes
-///   from post-handler misses it had nothing to do with (its body finished
-///   fine; only persistence found an unregistered child/activity type), so a
-///   single later transient timeout can tip it into poison-pill quarantine.
-/// - Always clearing it lets an incapable worker erase a *genuinely hung*
-///   execution's streak every time it happens to claim the row, so
-///   `poison_pill_threshold` is never reached in a mixed fleet and #494's
-///   protection is silently defeated by a blameless third party.
+/// - Always preserving lets a *healthy* workflow accumulate strikes from
+///   post-handler misses it had nothing to do with (its body finished fine;
+///   only persistence found an unregistered child/activity type), so a single
+///   later transient timeout can tip it into poison-pill quarantine.
+/// - Always clearing lets an incapable worker erase a *genuinely hung* — or
+///   genuinely worker-killing — execution's streak every time it happens to
+///   claim the row, so `poison_pill_threshold` is never reached in a mixed
+///   fleet and #494/#367's protection is silently defeated by a blameless third
+///   party.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityMissPhase {
     /// Detected before the handler was invoked — the workflow-type lookup in
@@ -651,6 +660,17 @@ pub enum CapabilityMissPhase {
 }
 
 impl CapabilityMissPhase {
+    /// Did this dispatch watch the handler run to a conclusion?
+    ///
+    /// The single fact both strike predicates below are derived from, stated
+    /// once so they cannot drift apart. Only [`Self::AfterHandler`] qualifies:
+    /// [`Self::DuringHandler`] is deliberately conservative because a mid-body
+    /// miss is not a completed body.
+    #[must_use]
+    const fn handler_ran_to_conclusion(self) -> bool {
+        matches!(self, Self::AfterHandler)
+    }
+
     /// May a release at this phase clear the issue #494 consecutive-timeout
     /// strike for the owning execution?
     ///
@@ -660,7 +680,32 @@ impl CapabilityMissPhase {
     /// its own streak on every redelivery.
     #[must_use]
     pub const fn clears_workflow_timeout_strike(self) -> bool {
-        matches!(self, Self::AfterHandler)
+        self.handler_ran_to_conclusion()
+    }
+
+    /// May a release at this phase clear the task row's issue #367
+    /// `crash_strikes` counter?
+    ///
+    /// `crash_strikes` counts how many times a task was found orphaned under a
+    /// worker that stopped heartbeating — i.e. how many worker processes it has
+    /// killed. Only an execution that *ran* is evidence about that, so a
+    /// pre-/mid-handler miss must leave the counter alone.
+    ///
+    /// Clearing it unconditionally would let an incapable worker launder a
+    /// poison task's history: in a heterogeneous fleet, an incapable claim
+    /// landing between two capable crashes resets the streak to zero every
+    /// time, so `poison_pill_threshold` is never reached and the task goes on
+    /// crashing replacement workers indefinitely. That is the same
+    /// blameless-third-party defeat this type exists to prevent for #494.
+    ///
+    /// Preserving is still strictly weaker than *incrementing*: AC4 requires
+    /// only that a clean miss never advances a crash counter, and the release
+    /// never does. It is also invisible to the sole writer of the column —
+    /// `poison_pill::reclaim_orphaned_tasks` scans `RUNNING AND worker_id IS
+    /// NOT NULL`, and a released row is `PENDING` with a NULL worker.
+    #[must_use]
+    pub const fn clears_crash_strikes(self) -> bool {
+        self.handler_ran_to_conclusion()
     }
 }
 
@@ -1635,6 +1680,46 @@ mod tests {
             !CapabilityMissPhase::DuringHandler.clears_workflow_timeout_strike(),
             "a mid-body miss is not a completed body"
         );
+    }
+
+    #[test]
+    fn capability_miss_phase_clears_crash_strikes_only_after_the_handler_ran() {
+        // Issue #367's `crash_strikes` counts worker processes this task has
+        // killed. Only a dispatch that RAN the handler is evidence about that,
+        // and the truth table must therefore match the #494 one exactly --
+        // both are derived from `handler_ran_to_conclusion`.
+        assert!(
+            CapabilityMissPhase::AfterHandler.clears_crash_strikes(),
+            "the body ran to a conclusion without killing this worker, so the \
+             consecutive-crash streak is genuinely broken"
+        );
+        assert!(
+            !CapabilityMissPhase::BeforeHandler.clears_crash_strikes(),
+            "the handler never ran, so this dispatch proves nothing about \
+             whether the task still crashes workers -- clearing here lets an \
+             incapable claim landing between two capable crashes launder the \
+             poison task's history forever (Codex round-12 P1)"
+        );
+        assert!(
+            !CapabilityMissPhase::DuringHandler.clears_crash_strikes(),
+            "a mid-body miss is not a completed body: the very crash the \
+             counter tracks could still be ahead of it"
+        );
+        // The two predicates answer different questions but share one fact, so
+        // they must never disagree about a phase.
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+            CapabilityMissPhase::AfterHandler,
+        ] {
+            assert_eq!(
+                phase.clears_crash_strikes(),
+                phase.clears_workflow_timeout_strike(),
+                "both strike predicates derive from `handler_ran_to_conclusion`; \
+                 a divergence for {phase:?} means one of them was special-cased \
+                 without stating why"
+            );
+        }
     }
 
     #[test]

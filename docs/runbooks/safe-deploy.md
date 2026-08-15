@@ -366,7 +366,7 @@ when a live worker on the queue has never missed the task. That case gets its
 own wording, pointing at the peer rather than at the deploy:
 
 ```
-no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 50 capability-miss redeliveries spread across only 6 distinct worker(s), hitting the absolute release ceiling of 10x capability_miss_max_redeliveries = 5; a live worker on this queue never missed this task, so it may well have the handler and simply lost every claim race — check whether it is saturated, draining, or advertising a stale queue list before concluding the handler is missing)
+no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 50 capability-miss redeliveries spread across only 6 distinct worker(s), hitting the absolute release ceiling of 10x capability_miss_max_redeliveries = 5; a live worker on this queue never missed this task, so it may well have the handler and simply lost every claim race — check whether it is saturated, draining, advertising a stale queue list, or ineligible for this activity's registered capability requirements before concluding the handler is missing)
 ```
 
 The counts in every reason string are the **persisted** ones: redeliveries that
@@ -438,9 +438,17 @@ incident: the resulting terminal error names the knob, not a missing deploy.
   budget (`attempt` is restored on release), and never produces a `PoisonPill`
   dead-letter row — escalation writes no dead-letter row at all. The `harvest.task.quarantined` metric and the
   `harvest_no_capable_worker` alert
-  are therefore mutually exclusive diagnoses.
-- **Not a hung body (#494).** The workflow-task timeout strike counter is
-  untouched — a released task never ran a handler at all.
+  are therefore mutually exclusive diagnoses. It also does not *erase* a
+  poison task's history: a release only clears `crash_strikes` when the miss
+  was found **after** the workflow body ran to a conclusion (persisting its
+  commands hit an unregistered activity or child type). A miss found before or
+  during the body ran nothing, so it leaves the counter alone — otherwise, in a
+  mixed fleet, an incapable claim landing between two capable crashes would
+  reset the streak every time and `poison_pill_threshold` would never be
+  reached.
+- **Not a hung body (#494).** The workflow-task timeout strike counter follows
+  the same rule for the same reason: a released task that never ran a handler
+  is not evidence the body stopped hanging.
 - **Session-pinned tasks (#606) escalate immediately.** A session task is
   hard-pinned to its acquiring host, so "release for a capable peer" is false
   by construction: no other worker can ever claim it. Such a task escalates on

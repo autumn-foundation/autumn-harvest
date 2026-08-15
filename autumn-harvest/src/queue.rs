@@ -2050,7 +2050,18 @@ pub async fn defer_rate_limited_task(
 /// (issue #804).
 ///
 /// `$1` = task id, `$2` = the releasing worker's id, `$3` = the backoff in
-/// seconds, `$4` = the diagnostic recorded in `error` when the row has none.
+/// seconds.
+///
+/// `clear_crash_strikes` selects between two literal statements rather than
+/// binding a flag, mirroring [`park_workflow_task_query`]. It is `true` only
+/// when the miss was detected *after* the workflow body ran to a conclusion
+/// (see [`crate::error::CapabilityMissPhase::clears_crash_strikes`]): issue
+/// #367's `crash_strikes` counts the worker processes a task has killed, so a
+/// pre-/mid-handler miss ran nothing and is not evidence about it. Zeroing
+/// unconditionally would let an incapable claim landing between two capable
+/// crashes reset the streak every time, so `poison_pill_threshold` is never
+/// reached in a heterogeneous fleet (Codex round-12 P1). Neither variant ever
+/// *increments* it, which is what AC4 actually requires.
 ///
 /// One statement, guarded on `state = 'RUNNING' AND worker_id = $2` so it can
 /// only ever undo *this* worker's own claim — a concurrent poison-pill reclaim
@@ -2081,28 +2092,51 @@ pub async fn defer_rate_limited_task(
 ///   reaches the operator through the release's `tracing::info!` and the
 ///   `harvest.task.capability_miss` counter.
 #[must_use]
-pub const fn release_task_for_capability_miss_query() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET state = 'PENDING', \
-         worker_id = NULL, \
-         started_at = NULL, \
-         last_heartbeat_at = NULL, \
-         attempt = GREATEST(attempt - 1, 0), \
-         crash_strikes = 0, \
-         capability_misses = capability_misses + 1, \
-         capability_miss_workers = CASE \
-             WHEN $2 = ANY(capability_miss_workers) THEN capability_miss_workers \
-             ELSE array_append(capability_miss_workers, $2) \
-         END, \
-         scheduled_at = NOW() + make_interval(secs => $3), \
-         sticky_worker_id = NULL, \
-         sticky_until = NULL, \
-         sticky_timeout = NULL, \
-         wake_requested = FALSE, \
-         activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END \
-     WHERE id = $1 \
-       AND state = 'RUNNING' \
-       AND worker_id = $2"
+pub const fn release_task_for_capability_miss_query(clear_crash_strikes: bool) -> &'static str {
+    if clear_crash_strikes {
+        "UPDATE harvest_task_queue \
+         SET state = 'PENDING', \
+             worker_id = NULL, \
+             started_at = NULL, \
+             last_heartbeat_at = NULL, \
+             attempt = GREATEST(attempt - 1, 0), \
+             crash_strikes = 0, \
+             capability_misses = capability_misses + 1, \
+             capability_miss_workers = CASE \
+                 WHEN $2 = ANY(capability_miss_workers) THEN capability_miss_workers \
+                 ELSE array_append(capability_miss_workers, $2) \
+             END, \
+             scheduled_at = NOW() + make_interval(secs => $3), \
+             sticky_worker_id = NULL, \
+             sticky_until = NULL, \
+             sticky_timeout = NULL, \
+             wake_requested = FALSE, \
+             activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END \
+         WHERE id = $1 \
+           AND state = 'RUNNING' \
+           AND worker_id = $2"
+    } else {
+        "UPDATE harvest_task_queue \
+         SET state = 'PENDING', \
+             worker_id = NULL, \
+             started_at = NULL, \
+             last_heartbeat_at = NULL, \
+             attempt = GREATEST(attempt - 1, 0), \
+             capability_misses = capability_misses + 1, \
+             capability_miss_workers = CASE \
+                 WHEN $2 = ANY(capability_miss_workers) THEN capability_miss_workers \
+                 ELSE array_append(capability_miss_workers, $2) \
+             END, \
+             scheduled_at = NOW() + make_interval(secs => $3), \
+             sticky_worker_id = NULL, \
+             sticky_until = NULL, \
+             sticky_timeout = NULL, \
+             wake_requested = FALSE, \
+             activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END \
+         WHERE id = $1 \
+           AND state = 'RUNNING' \
+           AND worker_id = $2"
+    }
 }
 
 /// Release a claimed task back to `PENDING` because this worker has **no
@@ -2121,10 +2155,15 @@ pub const fn release_task_for_capability_miss_query() -> &'static str {
 ///   increments it on claim, and the handler never ran, so a capability miss
 ///   must not drain the retry budget (the exact bug issue #369 fixed for
 ///   rate-limit deferrals).
-/// - **`crash_strikes` resets to 0** — a successful claim+release proves the
-///   task crashed no worker, and the poison-pill threshold (#367) measures
-///   *consecutive* crashes. The release also takes the row out of `RUNNING`
-///   with `worker_id NULL`, so the orphan reclaimer cannot see it at all.
+/// - **`crash_strikes` is never incremented, and is reset only when the handler
+///   ran** (`clear_crash_strikes`) — the poison-pill threshold (#367) measures
+///   *consecutive* crashes, so only a dispatch that watched the body reach a
+///   conclusion without dying is evidence the streak is broken. A pre-/mid-handler
+///   miss ran nothing and leaves the column alone: zeroing it would let an
+///   incapable claim landing between two capable crashes launder the task's
+///   history forever (Codex round-12 P1). Either way the release takes the row
+///   out of `RUNNING` with `worker_id NULL`, so the orphan reclaimer — the only
+///   writer that *increments* the column — cannot see it at all.
 /// - **`capability_misses` is incremented** — the only counter a capability
 ///   miss advances. It bounds the bounce; the caller escalates at
 ///   `WorkerConfig::capability_miss_max_redeliveries`.
@@ -2141,6 +2180,11 @@ pub const fn release_task_for_capability_miss_query() -> &'static str {
 /// so waking pollers early would be pure noise (mirrors
 /// [`requeue_workflow_task_nd_blocked`]).
 ///
+/// `clear_crash_strikes` must come from
+/// [`crate::error::CapabilityMissPhase::clears_crash_strikes`] — see
+/// [`release_task_for_capability_miss_query`] for why a pre-/mid-handler miss
+/// must leave issue #367's counter alone.
+///
 /// Returns `true` when this worker's claim was actually released; `false`
 /// means the row was already taken by something else (e.g. an orphan reclaim
 /// won the race) and the caller must treat the task as no longer its own.
@@ -2153,10 +2197,11 @@ pub async fn release_task_for_capability_miss(
     task_id: Uuid,
     worker_id: &str,
     backoff: StdDuration,
+    clear_crash_strikes: bool,
 ) -> HarvestResult<bool> {
     // Bounded by `capability_miss_backoff`'s 30s cap; the clamp is defensive.
     let backoff_secs = f64::min(backoff.as_secs_f64(), 3600.0);
-    let released = diesel::sql_query(release_task_for_capability_miss_query())
+    let released = diesel::sql_query(release_task_for_capability_miss_query(clear_crash_strikes))
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .bind::<diesel::sql_types::Double, _>(backoff_secs)
@@ -3747,53 +3792,99 @@ mod tests {
 
     #[test]
     fn capability_miss_release_query_is_ownership_guarded() {
-        let sql = release_task_for_capability_miss_query();
-        assert!(
-            sql.contains("state = 'RUNNING'"),
-            "compare-and-swap: only a still-claimed row may be released",
-        );
-        assert!(
-            sql.contains("worker_id = $2"),
-            "a worker may only ever undo its OWN claim -- a concurrent \
-             poison-pill reclaim must not be clobbered",
-        );
-        assert!(sql.contains("id = $1"));
+        // Asserted for BOTH literal variants: the crash-strike flag selects
+        // between two statements, so every shared clause must be pinned in
+        // both or they can silently drift apart.
+        for sql in [
+            release_task_for_capability_miss_query(true),
+            release_task_for_capability_miss_query(false),
+        ] {
+            assert!(
+                sql.contains("state = 'RUNNING'"),
+                "compare-and-swap: only a still-claimed row may be released",
+            );
+            assert!(
+                sql.contains("worker_id = $2"),
+                "a worker may only ever undo its OWN claim -- a concurrent \
+                 poison-pill reclaim must not be clobbered",
+            );
+            assert!(sql.contains("id = $1"));
+        }
     }
 
     #[test]
     fn capability_miss_release_query_restores_the_attempt() {
-        let sql = release_task_for_capability_miss_query();
-        assert!(
-            sql.contains("attempt = GREATEST(attempt - 1, 0)"),
-            "claim_task does `attempt + 1`; a capability miss never ran the \
-             handler, so it must not consume the retry budget (AC4)",
-        );
+        // Asserted for BOTH literal variants: the crash-strike flag selects
+        // between two statements, so every shared clause must be pinned in
+        // both or they can silently drift apart.
+        for sql in [
+            release_task_for_capability_miss_query(true),
+            release_task_for_capability_miss_query(false),
+        ] {
+            assert!(
+                sql.contains("attempt = GREATEST(attempt - 1, 0)"),
+                "claim_task does `attempt + 1`; a capability miss never ran the \
+                 handler, so it must not consume the retry budget (AC4)",
+            );
+        }
     }
 
     #[test]
     fn capability_miss_release_query_never_increments_crash_strikes() {
-        let sql = release_task_for_capability_miss_query();
+        for clear in [true, false] {
+            let sql = release_task_for_capability_miss_query(clear);
+            assert!(
+                !sql.contains("crash_strikes + 1") && !sql.contains("crash_strikes+1"),
+                "AC4: crash_strikes must never be incremented by a capability \
+                 miss, whichever phase detected it: {sql}",
+            );
+        }
+    }
+
+    /// The release may only clear `crash_strikes` when the handler actually ran
+    /// (issue #804 x #367, Codex round-12 P1).
+    ///
+    /// `crash_strikes` is issue #367's evidence that a task keeps killing the
+    /// worker process that runs it. A pre-/mid-handler capability miss ran
+    /// nothing, so it is not evidence of anything -- and zeroing on it lets an
+    /// incapable claim landing between two capable crashes reset the streak
+    /// every time, so `poison_pill_threshold` is never reached in a
+    /// heterogeneous fleet and the poison task crashes replacement workers
+    /// indefinitely.
+    #[test]
+    fn capability_miss_release_query_preserves_crash_strikes_for_a_pre_handler_miss() {
+        let preserving = release_task_for_capability_miss_query(false);
         assert!(
-            sql.contains("crash_strikes = 0"),
-            "AC4: a clean capability miss must not quarantine a healthy task; \
-             a successful claim+release proves the task crashed no worker, so \
-             the consecutive-crash streak resets (mirrors every sibling \
-             release path)",
+            !preserving.contains("crash_strikes"),
+            "a pre-/mid-handler miss must not write the column AT ALL -- the \
+             handler never ran, so this dispatch is not evidence about whether \
+             the task still crashes workers: {preserving}",
         );
+
+        let clearing = release_task_for_capability_miss_query(true);
         assert!(
-            !sql.contains("crash_strikes = crash_strikes"),
-            "crash_strikes must never be incremented by a capability miss",
+            clearing.contains("crash_strikes = 0"),
+            "a post-handler miss DID watch the body run to a conclusion without \
+             killing this worker, so the consecutive-crash streak is genuinely \
+             broken (mirrors every sibling release path): {clearing}",
         );
     }
 
     #[test]
     fn capability_miss_release_query_increments_the_capability_counter() {
-        let sql = release_task_for_capability_miss_query();
-        assert!(
-            sql.contains("capability_misses = capability_misses + 1"),
-            "the bounded-redelivery counter is the only counter a capability \
-             miss advances (AC3/AC4)",
-        );
+        // Asserted for BOTH literal variants: the crash-strike flag selects
+        // between two statements, so every shared clause must be pinned in
+        // both or they can silently drift apart.
+        for sql in [
+            release_task_for_capability_miss_query(true),
+            release_task_for_capability_miss_query(false),
+        ] {
+            assert!(
+                sql.contains("capability_misses = capability_misses + 1"),
+                "the bounded-redelivery counter is the only counter a capability \
+                 miss advances (AC3/AC4)",
+            );
+        }
     }
 
     /// The distinct-worker set must grow **idempotently** (issue #804 round 6).
@@ -3805,22 +3896,29 @@ mod tests {
     /// the budget just as fast as the plain counter did.
     #[test]
     fn capability_miss_release_query_appends_the_worker_only_once() {
-        let sql = release_task_for_capability_miss_query();
-        assert!(
-            sql.contains("$2 = ANY(capability_miss_workers)"),
-            "a repeat miss by the same worker must be recognised, not appended \
-             again: {sql}"
-        );
-        assert!(
-            sql.contains("array_append(capability_miss_workers, $2)"),
-            "a NEW worker must be recorded so it consumes one budget unit: {sql}"
-        );
-        // $2 is the claiming worker id, already bound for the ownership guard.
-        assert!(
-            sql.contains("AND worker_id = $2"),
-            "the appended id must be the SAME id the ownership guard checks, \
-             or the set would record a worker that never held the claim: {sql}"
-        );
+        // Asserted for BOTH literal variants: the crash-strike flag selects
+        // between two statements, so every shared clause must be pinned in
+        // both or they can silently drift apart.
+        for sql in [
+            release_task_for_capability_miss_query(true),
+            release_task_for_capability_miss_query(false),
+        ] {
+            assert!(
+                sql.contains("$2 = ANY(capability_miss_workers)"),
+                "a repeat miss by the same worker must be recognised, not appended \
+                 again: {sql}"
+            );
+            assert!(
+                sql.contains("array_append(capability_miss_workers, $2)"),
+                "a NEW worker must be recorded so it consumes one budget unit: {sql}"
+            );
+            // $2 is the claiming worker id, already bound for the ownership guard.
+            assert!(
+                sql.contains("AND worker_id = $2"),
+                "the appended id must be the SAME id the ownership guard checks, \
+                 or the set would record a worker that never held the claim: {sql}"
+            );
+        }
     }
 
     /// The release must leave the task row's `error` column **untouched**.
@@ -3879,52 +3977,80 @@ mod tests {
 
     #[test]
     fn capability_miss_release_query_never_writes_the_error_column() {
-        let sql = release_task_for_capability_miss_query();
-        assert!(
-            !sql.contains("error ="),
-            "a capability miss is not a task failure; writing `error` makes \
-             /stack fabricate a last_failure at attempt 0 (issue #773 AC3): {sql}"
-        );
+        // Asserted for BOTH literal variants: the crash-strike flag selects
+        // between two statements, so every shared clause must be pinned in
+        // both or they can silently drift apart.
+        for sql in [
+            release_task_for_capability_miss_query(true),
+            release_task_for_capability_miss_query(false),
+        ] {
+            assert!(
+                !sql.contains("error ="),
+                "a capability miss is not a task failure; writing `error` makes \
+                 /stack fabricate a last_failure at attempt 0 (issue #773 AC3): {sql}"
+            );
+        }
     }
 
     #[test]
     fn capability_miss_release_query_unpins_sticky_so_a_peer_can_claim() {
-        let sql = release_task_for_capability_miss_query();
-        // Without this the row stays pinned to the very worker that just
-        // proved it cannot run it, so no peer can claim it and the task
-        // bounces on one worker straight to escalation.
-        assert!(sql.contains("sticky_worker_id = NULL"));
-        assert!(sql.contains("sticky_until = NULL"));
-        assert!(sql.contains("sticky_timeout = NULL"));
+        // Asserted for BOTH literal variants: the crash-strike flag selects
+        // between two statements, so every shared clause must be pinned in
+        // both or they can silently drift apart.
+        for sql in [
+            release_task_for_capability_miss_query(true),
+            release_task_for_capability_miss_query(false),
+        ] {
+            // Without this the row stays pinned to the very worker that just
+            // proved it cannot run it, so no peer can claim it and the task
+            // bounces on one worker straight to escalation.
+            assert!(sql.contains("sticky_worker_id = NULL"));
+            assert!(sql.contains("sticky_until = NULL"));
+            assert!(sql.contains("sticky_timeout = NULL"));
+        }
     }
 
     #[test]
     fn capability_miss_release_query_clears_the_claim_columns() {
-        let sql = release_task_for_capability_miss_query();
-        assert!(sql.contains("state = 'PENDING'"));
-        assert!(sql.contains("worker_id = NULL"));
-        assert!(sql.contains("started_at = NULL"));
-        assert!(sql.contains("last_heartbeat_at = NULL"));
-        assert!(
-            sql.contains("wake_requested = FALSE"),
-            "a wake captured mid-cycle must not short-circuit the backoff",
-        );
+        // Asserted for BOTH literal variants: the crash-strike flag selects
+        // between two statements, so every shared clause must be pinned in
+        // both or they can silently drift apart.
+        for sql in [
+            release_task_for_capability_miss_query(true),
+            release_task_for_capability_miss_query(false),
+        ] {
+            assert!(sql.contains("state = 'PENDING'"));
+            assert!(sql.contains("worker_id = NULL"));
+            assert!(sql.contains("started_at = NULL"));
+            assert!(sql.contains("last_heartbeat_at = NULL"));
+            assert!(
+                sql.contains("wake_requested = FALSE"),
+                "a wake captured mid-cycle must not short-circuit the backoff",
+            );
+        }
     }
 
     #[test]
     fn capability_miss_release_query_clears_the_sentinel_on_workflow_rows_only() {
-        let sql = release_task_for_capability_miss_query();
-        // A stale `mixed_signal_suspension` sentinel left in `activity_name` on
-        // a WORKFLOW row lets an unrelated wake reset `scheduled_at` to now and
-        // bypass the backoff (the issue #603 fix). On an ACTIVITY row
-        // `activity_name` is load-bearing and must survive the release.
-        assert!(
-            sql.contains(
-                "activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END"
-            ),
-            "activity_name must be cleared for workflow rows and preserved for \
-             activity rows: {sql}",
-        );
+        // Asserted for BOTH literal variants: the crash-strike flag selects
+        // between two statements, so every shared clause must be pinned in
+        // both or they can silently drift apart.
+        for sql in [
+            release_task_for_capability_miss_query(true),
+            release_task_for_capability_miss_query(false),
+        ] {
+            // A stale `mixed_signal_suspension` sentinel left in `activity_name` on
+            // a WORKFLOW row lets an unrelated wake reset `scheduled_at` to now and
+            // bypass the backoff (the issue #603 fix). On an ACTIVITY row
+            // `activity_name` is load-bearing and must survive the release.
+            assert!(
+                sql.contains(
+                    "activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END"
+                ),
+                "activity_name must be cleared for workflow rows and preserved for \
+                 activity rows: {sql}",
+            );
+        }
     }
 
     /// PR-review regression test (Gemini finding): `PendingRequeueChangeset`
