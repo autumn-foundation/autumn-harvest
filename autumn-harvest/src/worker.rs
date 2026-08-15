@@ -16566,19 +16566,22 @@ async fn release_capability_miss(
                 crate::telemetry::CAPABILITY_MISS_OUTCOME_RELEASED,
             );
             tracing::info!(
-                task_id = %task.id,
-                queue = %task.queue_name,
-                task_type = %task.task_type,
-                handler_kind = missing.kind,
-                handler = missing.name,
-                capability_misses = resolution.total_after,
-                distinct_incapable_workers = resolution.distinct_after,
-                fleet_evidence = ?resolution.evidence,
-                worker_is_new_misser = resolution.worker_is_new,
-                max_redeliveries,
-                backoff_secs = delay.as_secs(),
-                "released task for a capable peer: no handler registered on this worker"
-            );
+                    task_id = %task.id,
+                    queue = %task.queue_name,
+                    task_type = %task.task_type,
+                    handler_kind = missing.kind,
+                    handler = missing.name,
+                    capability_misses = resolution.total_after,
+                    // The persisted count, matching `completed_releases` above and the reason
+            // string: this branch never runs the release UPDATE, so the claimant was
+            // never appended to `capability_miss_workers` (Codex round-34 P2).
+            distinct_incapable_workers = resolution.distinct_before,
+                    fleet_evidence = ?resolution.evidence,
+                    worker_is_new_misser = resolution.worker_is_new,
+                    max_redeliveries,
+                    backoff_secs = delay.as_secs(),
+                    "released task for a capable peer: no handler registered on this worker"
+                );
             Ok(TaskDispatchOutcome::Released {
                 clears_timeout_strike: missing.phase.clears_workflow_timeout_strike(),
             })
@@ -16703,6 +16706,23 @@ pub struct EscalationEvidenceRecheck<'a> {
     pub frontier_reset_committed: bool,
 }
 
+/// The escalation half of a terminal write: what to re-decide from, and how to
+/// report the decision it lands on.
+///
+/// The two travel together on purpose. A re-decision that cannot change the
+/// reported reason is the round-34 P2 bug (the boundary escalates for a fresh
+/// cause while paging with the stale one), so the boundary never accepts one
+/// without the other.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct EscalationCommit<'a> {
+    /// What to re-read and re-decide from, under the task lock.
+    pub recheck: EscalationEvidenceRecheck<'a>,
+    /// Renders the terminal reason for whatever resolution the re-decision
+    /// lands on.
+    pub derive_reason: &'a (dyn Fn(&CapabilityMissResolution) -> String + Send + Sync),
+}
+
 /// Re-decide an escalation from freshly-read evidence.
 ///
 /// Shared by the pre-transaction check (which avoids opening a transaction at
@@ -16759,6 +16779,63 @@ async fn revalidate_escalation_evidence(
     revalidate_escalation(observed, fresh)
 }
 
+/// Log an escalation withdrawn at the terminal write, naming why.
+fn log_terminal_withdrawal(task: &TaskQueueItem, write: &TerminalWriteOutcome) {
+    let reason = match write {
+        TerminalWriteOutcome::ClaimLost => "claim_lost",
+        TerminalWriteOutcome::EvidenceChanged(reason) => reason,
+        TerminalWriteOutcome::Committed(_) => return,
+    };
+    tracing::info!(
+        task_id = %task.id,
+        queue = %task.queue_name,
+        reason,
+        "withdrew a capability-miss escalation at the terminal write; releasing instead"
+    );
+}
+
+/// Renders an escalation's cause, reason string and metric label from one
+/// resolution, so the three can never tell an operator different stories about
+/// the same escalation (issue #804, Codex round-34 P2).
+///
+/// The *reported* counts are the persisted ones. The decision was made on the
+/// post-increment distinct count (this claim is evidence), but the escalation
+/// branch never runs the release `UPDATE`, so no redelivery and no
+/// distinct-worker append actually happened for this claim (Codex round-8 P2,
+/// extended to the log field in round 34).
+struct EscalationReporter {
+    detail: String,
+    max_redeliveries: u32,
+    session_id: Option<uuid::Uuid>,
+}
+
+impl EscalationReporter {
+    fn escalation(resolution: &CapabilityMissResolution) -> CapabilityMissEscalation {
+        escalation_from_persisted(
+            resolution.misses_before,
+            resolution.distinct_before,
+            resolution,
+        )
+    }
+
+    fn cause(&self, resolution: &CapabilityMissResolution) -> EscalationCause {
+        EscalationCause::resolve(
+            self.max_redeliveries,
+            self.session_id,
+            Self::escalation(resolution),
+        )
+    }
+
+    fn reason(&self, resolution: &CapabilityMissResolution) -> String {
+        no_capable_worker_reason(
+            &self.detail,
+            self.max_redeliveries,
+            self.session_id,
+            Self::escalation(resolution),
+        )
+    }
+}
+
 /// The log line for an escalation, keyed on the cause.
 ///
 /// The message must match the branch, not just carry a field naming it: a
@@ -16805,7 +16882,11 @@ const fn escalation_log_message(cause: EscalationCause) -> &'static str {
 #[doc(hidden)]
 pub enum TerminalWriteOutcome {
     /// The claim was still ours under the row lock; the failure is durable.
-    Committed,
+    ///
+    /// Carries the resolution the boundary actually decided from when an
+    /// evidence re-check was attached, so the caller's log reports the same
+    /// story the persisted reason string tells (issue #804, Codex round-34 P2).
+    Committed(Option<CapabilityMissResolution>),
     /// The row changed hands. Nothing was written.
     ClaimLost,
     /// The claim was still ours, but the capability-miss evidence moved under
@@ -16894,11 +16975,11 @@ pub async fn commit_terminal_failure_if_still_claimed<F>(
     worker_id: &str,
     error: &str,
     preloaded: PreloadedFailureHistory,
-    recheck: Option<EscalationEvidenceRecheck<'_>>,
+    escalation: Option<EscalationCommit<'_>>,
     before_write: F,
 ) -> HarvestResult<TerminalWriteOutcome>
 where
-    F: Fn() + Send + Sync,
+    F: Fn(Option<&CapabilityMissResolution>) + Send + Sync,
 {
     let error = error.to_string();
     Box::pin(
@@ -16944,15 +17025,29 @@ where
             // peer re-registers, so the guard above cannot see a peer that
             // cleared itself from `capability_miss_workers` between the
             // pre-transaction observation and this point.
-            if let Some(recheck) = recheck
-                && let EscalationRevalidation::Withdrawn(reason) =
-                    revalidate_escalation_evidence(conn, recheck).await
-            {
-                return Ok(TerminalWriteOutcome::EvidenceChanged(reason));
-            }
-            before_write();
+            let fresh = match escalation {
+                None => None,
+                Some(escalation) => {
+                    match revalidate_escalation_evidence(conn, escalation.recheck).await {
+                        EscalationRevalidation::Withdrawn(reason) => {
+                            return Ok(TerminalWriteOutcome::EvidenceChanged(reason));
+                        }
+                        EscalationRevalidation::Stands(fresh) => Some(fresh),
+                    }
+                }
+            };
+            // The escalation still stands -- but possibly for a DIFFERENT cause
+            // than the pre-transaction decision found, and the cause is what the
+            // operator is paged with. Derive the reason from the evidence this
+            // boundary actually decided on, never from the older one
+            // (issue #804, Codex round-34 P2).
+            let error = match (fresh.as_ref(), escalation.as_ref()) {
+                (Some(fresh), Some(escalation)) => (escalation.derive_reason)(fresh),
+                _ => error.clone(),
+            };
+            before_write(fresh.as_ref());
             fail_task_and_execution_with_history(conn, task, worker_id, &error, preloaded).await?;
-            Ok(TerminalWriteOutcome::Committed)
+            Ok(TerminalWriteOutcome::Committed(fresh))
         }),
     )
     .await
@@ -17038,7 +17133,16 @@ async fn escalate_capability_miss(
     // The label is cause-specific: only budget exhaustion actually offered the
     // task around the queue, so only it may page the fleet-exhaustion rule.
     // See `EscalationCause::outcome_label`.
-    let outcome_label = cause.outcome_label();
+    // Derive the reported cause from whichever resolution the boundary actually
+    // decided on. Both the pre-transaction and the in-transaction paths go
+    // through this one closure, so the reason string, the metric label, and the
+    // log line can never disagree about the same escalation.
+    let reporter = EscalationReporter {
+        detail: missing.detail(),
+        max_redeliveries,
+        session_id: task.session_id,
+    };
+    let reason_of = |resolution: &CapabilityMissResolution| reporter.reason(resolution);
     let write = commit_terminal_failure_if_still_claimed(
         conn,
         task,
@@ -17048,31 +17152,34 @@ async fn escalate_capability_miss(
         // The authoritative evidence re-decision: read under the task lock,
         // so a peer that re-registered after the pre-transaction check
         // cannot be missed (issue #804, Codex round-33 P1).
-        Some(EscalationEvidenceRecheck {
-            task,
-            worker_id,
-            policy,
-            frontier_reset_committed,
+        Some(EscalationCommit {
+            recheck: EscalationEvidenceRecheck {
+                task,
+                worker_id,
+                policy,
+                frontier_reset_committed,
+            },
+            derive_reason: &reason_of,
         }),
-        || {
-            metrics.record_task_capability_miss(&task.queue_name, &task.task_type, outcome_label);
+        |fresh| {
+            let label = fresh.map_or_else(
+                || cause.outcome_label(),
+                |r| reporter.cause(r).outcome_label(),
+            );
+            metrics.record_task_capability_miss(&task.queue_name, &task.task_type, label);
         },
     )
     .await?;
-    let withdrawn = match write {
-        TerminalWriteOutcome::Committed => None,
-        TerminalWriteOutcome::ClaimLost => Some("claim_lost"),
-        TerminalWriteOutcome::EvidenceChanged(reason) => Some(reason),
+    let (resolution, cause) = match write {
+        TerminalWriteOutcome::Committed(fresh) => {
+            let resolution = fresh.unwrap_or(resolution);
+            (resolution, reporter.cause(&resolution))
+        }
+        TerminalWriteOutcome::ClaimLost | TerminalWriteOutcome::EvidenceChanged(_) => {
+            log_terminal_withdrawal(task, &write);
+            return Ok(None);
+        }
     };
-    if let Some(reason) = withdrawn {
-        tracing::info!(
-            task_id = %task.id,
-            queue = %task.queue_name,
-            reason,
-            "withdrew a capability-miss escalation at the terminal write; releasing instead"
-        );
-        return Ok(None);
-    }
     let message = escalation_log_message(cause);
     tracing::error!(
         task_id = %task.id,

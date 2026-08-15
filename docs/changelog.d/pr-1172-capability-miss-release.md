@@ -1116,3 +1116,56 @@ Honest scope. Two things this deliberately does **not** claim:
   the test above and silently break AC3's boundedness.
 - The four round-31/32 claim-guard tests pass `None` for the re-check, so they
   keep pinning exactly the ownership contract they were written for.
+
+## Review round 34
+
+Two P2s on round 33's boundary, both about telling an operator the truth.
+
+### The persisted reason came from the wrong decision (P2)
+
+Round 33 made the boundary re-decide under the lock, but only inspected the
+`Withdrawn` arm — `Stands(fresh)` was discarded, so the terminal reason string,
+the metric label and the log line were all still built from the *pre-transaction*
+resolution. Round 33's own changelog flagged this as an accepted "diagnostic
+nuance"; Codex is right that it isn't one.
+
+The concrete case: a task above the absolute release ceiling resolves
+`BudgetExhausted` before the transaction, then a never-tried capable peer
+registers before the locked re-check and the fresh resolution becomes
+`ReleaseCeilingExhausted`. Both escalate, so a `Stands`-only check sees nothing
+change — but the two produce *opposite* reason strings. The older one states
+"no live worker on this queue has the handler"; the fresh one states "a live
+worker on this queue never missed this task, so it may well have the handler and
+simply lost every claim race". Paging someone toward a missing deploy that does
+not exist is exactly the failure mode round 23 fixed for the other causes.
+
+The boundary now derives the reason from whichever resolution it decided on,
+through a caller-supplied deriver, and `TerminalWriteOutcome::Committed` carries
+that resolution so the caller's log and metric label follow it too. Both the
+pre-transaction and in-transaction paths go through the same `cause_of` /
+`reason_of` closures, so the three can never tell different stories about one
+escalation. The `None`-recheck path (the claim-guard tests) keeps using the
+supplied string, unchanged.
+
+### The log overstated the durable distinct-worker count by one (P2)
+
+`distinct_incapable_workers` logged `resolution.distinct_after`, the
+post-increment count that includes the escalating claimant. But this branch never
+runs the release `UPDATE`, so that claimant is never appended to
+`capability_miss_workers` — the durable record is `distinct_before`. The field
+therefore overstated the persisted evidence by one and disagreed with both its
+own sibling `completed_releases` (already the persisted count, from round 8) and
+the reason string (which correctly uses `distinct_before`). Now
+`distinct_before`, so the log, the reason and the row agree.
+
+### Tests
+
+- `the_persisted_reason_comes_from_the_in_transaction_resolution` (DB) — a
+  deliberately distinguishable stale reason is passed in and a different one is
+  derived; the row must carry the derived one. **Confirmed RED** with
+  `left: Some("no_capable_worker: decided-before-the-lock")` /
+  `right: Some("no_capable_worker: derived-under-the-lock")`. Also asserts the
+  counter callback receives the fresh resolution and that `Committed` carries it.
+- The `distinct_before` fix is a consistency change to a tracing field; it is
+  covered by the reason-string assertions that already pin the persisted counts,
+  and by the field now matching the sibling it always should have.

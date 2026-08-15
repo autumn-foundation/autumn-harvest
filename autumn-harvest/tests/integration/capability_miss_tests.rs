@@ -62,7 +62,7 @@ use autumn_harvest::telemetry::{
 };
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{
-    CapabilityMissPolicy, DbPool, EscalationEvidenceRecheck, HandlerRegistry,
+    CapabilityMissPolicy, DbPool, EscalationCommit, EscalationEvidenceRecheck, HandlerRegistry,
     NO_CAPABLE_WORKER_PREFIX, SESSION_PINNED_ESCALATION_MARKER, TerminalWriteOutcome, Worker,
     WorkerRuntimeConfig, commit_terminal_failure_if_still_claimed, preload_failure_history,
 };
@@ -3675,7 +3675,7 @@ async fn a_claim_transferred_before_the_terminal_write_is_not_failed_by_the_stal
         // These pin the CLAIM guard specifically; the evidence re-decision has
         // its own test below.
         None,
-        || {
+        |_| {
             *recorded_writer
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
@@ -3764,7 +3764,7 @@ async fn a_task_row_locked_by_a_concurrent_transaction_withdraws_without_waiting
             "no_capable_worker: activity 'charge' is not registered",
             preloaded,
             None,
-            || {
+            |_| {
                 *recorded_writer
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
@@ -3857,7 +3857,7 @@ async fn a_same_worker_reclaim_after_a_requeue_is_not_failed_by_the_stale_escala
         // These pin the CLAIM guard specifically; the evidence re-decision has
         // its own test below.
         None,
-        || {
+        |_| {
             *recorded_writer
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
@@ -3915,7 +3915,7 @@ async fn a_claim_still_held_through_the_terminal_write_still_fails_the_task() {
         // These pin the CLAIM guard specifically; the evidence re-decision has
         // its own test below.
         None,
-        || {
+        |_| {
             *recorded_writer
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
@@ -3924,7 +3924,10 @@ async fn a_claim_still_held_through_the_terminal_write_still_fails_the_task() {
     .await
     .expect("the guarded write must not error");
 
-    assert_eq!(outcome, TerminalWriteOutcome::Committed);
+    assert!(
+        matches!(outcome, TerminalWriteOutcome::Committed(_)),
+        "got {outcome:?}"
+    );
 
     let history = load_history(&url, exec_id).await;
     assert!(
@@ -4004,11 +4007,14 @@ async fn a_terminal_write_appends_at_the_event_id_current_under_the_lock() {
         // These pin the CLAIM guard specifically; the evidence re-decision has
         // its own test below.
         None,
-        || {},
+        |_| {},
     )
     .await
     .expect("the terminal write must not collide with the consumed event id");
-    assert_eq!(outcome, TerminalWriteOutcome::Committed);
+    assert!(
+        matches!(outcome, TerminalWriteOutcome::Committed(_)),
+        "got {outcome:?}"
+    );
 
     // The escalation actually happened: the run is terminal, not stranded.
     let history = load_history(&url, exec_id).await;
@@ -4082,16 +4088,21 @@ async fn a_peer_that_re_registers_before_the_lock_withdraws_the_escalation() {
         "worker-a",
         "no_capable_worker: activity 'charge' is not registered",
         preloaded,
-        Some(EscalationEvidenceRecheck {
-            task: &task,
-            worker_id: "worker-a",
-            policy: CapabilityMissPolicy {
-                max_redeliveries: 2,
-                worker_stale_secs: 600,
+        Some(EscalationCommit {
+            recheck: EscalationEvidenceRecheck {
+                task: &task,
+                worker_id: "worker-a",
+                policy: CapabilityMissPolicy {
+                    max_redeliveries: 2,
+                    worker_stale_secs: 600,
+                },
+                frontier_reset_committed: false,
             },
-            frontier_reset_committed: false,
+            derive_reason: &|_| {
+                "no_capable_worker: activity 'charge' is not registered".to_string()
+            },
         }),
-        || {
+        |_| {
             *recorded_writer
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
@@ -4148,16 +4159,21 @@ async fn evidence_that_still_supports_escalation_under_the_lock_still_commits() 
         "worker-a",
         "no_capable_worker: activity 'charge' is not registered",
         preloaded,
-        Some(EscalationEvidenceRecheck {
-            task: &task,
-            worker_id: "worker-a",
-            policy: CapabilityMissPolicy {
-                max_redeliveries: 2,
-                worker_stale_secs: 600,
+        Some(EscalationCommit {
+            recheck: EscalationEvidenceRecheck {
+                task: &task,
+                worker_id: "worker-a",
+                policy: CapabilityMissPolicy {
+                    max_redeliveries: 2,
+                    worker_stale_secs: 600,
+                },
+                frontier_reset_committed: false,
             },
-            frontier_reset_committed: false,
+            derive_reason: &|_| {
+                "no_capable_worker: activity 'charge' is not registered".to_string()
+            },
         }),
-        || {
+        |_| {
             *recorded_writer
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
@@ -4166,10 +4182,9 @@ async fn evidence_that_still_supports_escalation_under_the_lock_still_commits() 
     .await
     .expect("the guarded write must not error");
 
-    assert_eq!(
-        outcome,
-        TerminalWriteOutcome::Committed,
-        "evidence that still names every live worker as incapable must escalate (AC3)"
+    assert!(
+        matches!(outcome, TerminalWriteOutcome::Committed(_)),
+        "evidence that still names every live worker as incapable must escalate (AC3); got {outcome:?}"
     );
     let history = load_history(&url, exec_id).await;
     assert!(
@@ -4185,5 +4200,89 @@ async fn evidence_that_still_supports_escalation_under_the_lock_still_commits() 
             .unwrap_or_else(std::sync::PoisonError::into_inner),
         1,
         "the page-severity counter must fire exactly once for a committed escalation"
+    );
+}
+
+/// Codex round-34 P2: the terminal reason must come from the resolution the
+/// boundary decided on, not the one from a moment earlier.
+///
+/// An escalation can still *stand* under the lock but stand for a different
+/// cause — Codex's example is a task above the absolute release ceiling whose
+/// pre-transaction decision is `BudgetExhausted`, until a never-tried capable
+/// peer registers and the fresh decision becomes `ReleaseCeilingExhausted`.
+/// Both escalate, so a `Stands`-only check sees no change; but the two produce
+/// opposite reason strings, and the older one tells an operator that no live
+/// worker has the handler when one demonstrably might.
+///
+/// Asserted at the mechanism rather than by reproducing that arithmetic: the
+/// caller supplies a stale `error` and a deriver, and what lands in the row must
+/// be the derived one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_persisted_reason_comes_from_the_in_transaction_resolution() {
+    let (url, _container) = setup_db().await;
+    let queue = "q804-round34";
+
+    let (exec_id, task) = seed_claimed_task(&url, queue, "worker-a").await;
+    seed_live_worker(&url, "worker-a", queue).await;
+    seed_live_worker(&url, "worker-b", queue).await;
+    seed_prior_missing_workers(&url, exec_id, &["worker-a", "worker-b"]).await;
+
+    let fresh_reason = format!("{NO_CAPABLE_WORKER_PREFIX} derived-under-the-lock");
+    let expected = fresh_reason.clone();
+    let mut conn = connect(&url).await;
+    let preloaded = preload_failure_history(&mut conn, &task).await;
+    let seen = Arc::new(Mutex::new(0usize));
+    let seen_writer = Arc::clone(&seen);
+    let outcome = commit_terminal_failure_if_still_claimed(
+        &mut conn,
+        &task,
+        "worker-a",
+        // The pre-transaction reason -- deliberately distinguishable, and
+        // deliberately wrong by the time the boundary runs.
+        &format!("{NO_CAPABLE_WORKER_PREFIX} decided-before-the-lock"),
+        preloaded,
+        Some(EscalationCommit {
+            recheck: EscalationEvidenceRecheck {
+                task: &task,
+                worker_id: "worker-a",
+                policy: CapabilityMissPolicy {
+                    max_redeliveries: 2,
+                    worker_stale_secs: 600,
+                },
+                frontier_reset_committed: false,
+            },
+            derive_reason: &|_resolution| fresh_reason.clone(),
+        }),
+        |fresh| {
+            // The metric label is chosen from the same resolution the reason is.
+            assert!(
+                fresh.is_some(),
+                "an attached recheck must hand the counter its fresh resolution"
+            );
+            *seen_writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        },
+    )
+    .await
+    .expect("the guarded write must not error");
+
+    assert!(
+        matches!(outcome, TerminalWriteOutcome::Committed(Some(_))),
+        "a committed escalation must carry the resolution it decided on, so the \
+         caller's log reports the same story the row does; got {outcome:?}"
+    );
+    let after = load_task(&url, task.id).await;
+    assert_eq!(
+        after.error.as_deref(),
+        Some(expected.as_str()),
+        "the persisted reason must be the one derived under the lock, not the \
+         pre-transaction one"
+    );
+    assert_eq!(
+        *seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        1
     );
 }
