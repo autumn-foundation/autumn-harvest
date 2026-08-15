@@ -674,6 +674,60 @@ impl CapabilityMissPhase {
         matches!(self, Self::AfterHandler)
     }
 
+    /// Did this dispatch get far enough to *begin* the workflow handler?
+    ///
+    /// Deliberately a **different** fact from
+    /// [`Self::handler_ran_to_conclusion`], and the two disagree on exactly one
+    /// phase — [`Self::DuringHandler`], which began the body but did not finish
+    /// it. The strike counters ask "did it finish?"; the dispatch-attempt
+    /// question below asks "did it begin?", because everything that fires at
+    /// the *start* of a dispatch has already fired by then.
+    #[must_use]
+    const fn handler_was_reached(self) -> bool {
+        matches!(self, Self::DuringHandler | Self::AfterHandler)
+    }
+
+    /// May a release at this phase roll `task.attempt` back to undo
+    /// [`crate::queue::claim_task`]'s claim-time increment?
+    ///
+    /// Only [`Self::BeforeHandler`]. `attempt` does double duty on a task row:
+    ///
+    /// - it is the **retry budget** for an activity task, which a miss must not
+    ///   drain because the handler never ran (the exact bug issue #369 fixed
+    ///   for rate-limit deferrals); and
+    /// - it is the **"is this the first dispatch?"** signal `record_workflow_started`
+    ///   reads on a workflow task (`task.attempt == 1` plus "no scheduling
+    ///   events in history").
+    ///
+    /// Those two roles want opposite things once the handler has run. A
+    /// post-handler miss — the persist-time pre-pass finding an unregistered
+    /// activity or child type — happens *after* the start metric fired, and its
+    /// persistence transaction rolls back, so no scheduling event lands either.
+    /// Restoring `attempt` there would leave the next capable claim looking
+    /// exactly like a first dispatch, and `harvest.workflow.started` would be
+    /// emitted a **second** time for one execution, inflating start counts and
+    /// every SLO derived from them (Codex round-17 P2).
+    ///
+    /// Splitting on the phase satisfies both roles at once, because the two
+    /// populations do not overlap:
+    ///
+    /// - Every **activity**-task miss is [`Self::BeforeHandler`] (the
+    ///   activity-handler lookup in `process_activity_task`), so the retry
+    ///   budget is still always restored where it is a budget.
+    /// - Every [`Self::DuringHandler`]/[`Self::AfterHandler`] miss is on a
+    ///   **workflow** task, where `attempt` is read only by the metric gate
+    ///   above and the informational `attempts` field of a dead-letter row. It
+    ///   is not a claim filter (`claim_task` never selects on it) and not the
+    ///   issue #523 workflow-level retry budget, which counts the
+    ///   `harvest_workflow_executions.workflow_attempt` column instead.
+    ///
+    /// So letting a workflow row's `attempt` grow across post-handler releases
+    /// costs nothing and is exactly what suppresses the duplicate metric.
+    #[must_use]
+    pub const fn restores_dispatch_attempt(self) -> bool {
+        !self.handler_was_reached()
+    }
+
     /// May a release at this phase clear the issue #494 consecutive-timeout
     /// strike for the owning execution?
     ///
@@ -1789,6 +1843,45 @@ mod tests {
                  without stating why"
             );
         }
+    }
+
+    #[test]
+    fn capability_miss_phase_restores_the_attempt_only_before_the_handler_ran() {
+        // Issue #804 Codex round-17 P2. `task.attempt` is what
+        // `record_workflow_started` reads to decide whether a workflow dispatch
+        // is the FIRST one. Restoring it after the handler already ran makes the
+        // next capable claim look like a first dispatch and double-counts the
+        // metric.
+        assert!(
+            CapabilityMissPhase::BeforeHandler.restores_dispatch_attempt(),
+            "nothing ran and `harvest.workflow.started` was never emitted, so \
+             the budget must be restored AND the next dispatch must still be \
+             able to emit the metric"
+        );
+        assert!(
+            !CapabilityMissPhase::DuringHandler.restores_dispatch_attempt(),
+            "an inline local-activity miss is MID-body: the start metric already \
+             fired for this execution, so a restored attempt would re-emit it"
+        );
+        assert!(
+            !CapabilityMissPhase::AfterHandler.restores_dispatch_attempt(),
+            "the body ran to a conclusion, so the start metric already fired"
+        );
+        // This predicate is deliberately NOT the inverse of
+        // `handler_ran_to_conclusion`: the three strike predicates ask "did the
+        // body FINISH?" while this one asks "did the body BEGIN?".
+        // `DuringHandler` is the single phase that separates the two facts --
+        // it began but did not finish, so BOTH answers are `false` there. Pin
+        // that, or a later refactor could "simplify" this to
+        // `!clears_panic_strike()` and silently re-introduce the round-17
+        // double-count for every mid-body local-activity miss.
+        assert!(
+            !CapabilityMissPhase::DuringHandler.restores_dispatch_attempt()
+                && !CapabilityMissPhase::DuringHandler.clears_panic_strike(),
+            "DuringHandler must answer `false` to BOTH questions -- it is where \
+             'began' and 'finished' come apart, so this predicate cannot be \
+             expressed as the negation of a strike predicate"
+        );
     }
 
     #[test]

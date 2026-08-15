@@ -15532,15 +15532,19 @@ async fn handle_capability_miss(
             // The backoff is applied against the DB clock inside the release
             // statement, so host/Postgres skew cannot swallow it.
             let delay = capability_miss_backoff(task.capability_misses);
-            // Issue #367's `crash_strikes` may only be cleared by a dispatch
-            // that actually ran the handler (Codex round-12 P1) -- see
-            // `CapabilityMissPhase::clears_crash_strikes`.
+            // The phase governs both conditional clauses of the release:
+            // issue #367's `crash_strikes` may only be cleared by a dispatch
+            // that ran the handler to a conclusion (Codex round-12 P1), and
+            // `attempt` may only be restored by one that never reached the
+            // handler at all (Codex round-17 P2). See
+            // `CapabilityMissPhase::clears_crash_strikes` /
+            // `::restores_dispatch_attempt`.
             let released = queue::release_task_for_capability_miss(
                 conn,
                 task.id,
                 worker_id,
                 delay,
-                missing.phase.clears_crash_strikes(),
+                missing.phase,
             )
             .await?;
             if !released {

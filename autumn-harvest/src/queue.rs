@@ -2052,16 +2052,27 @@ pub async fn defer_rate_limited_task(
 /// `$1` = task id, `$2` = the releasing worker's id, `$3` = the backoff in
 /// seconds.
 ///
-/// `clear_crash_strikes` selects between two literal statements rather than
-/// binding a flag, mirroring [`park_workflow_task_query`]. It is `true` only
-/// when the miss was detected *after* the workflow body ran to a conclusion
-/// (see [`crate::error::CapabilityMissPhase::clears_crash_strikes`]): issue
-/// #367's `crash_strikes` counts the worker processes a task has killed, so a
-/// pre-/mid-handler miss ran nothing and is not evidence about it. Zeroing
-/// unconditionally would let an incapable claim landing between two capable
-/// crashes reset the streak every time, so `poison_pill_threshold` is never
-/// reached in a heterogeneous fleet (Codex round-12 P1). Neither variant ever
-/// *increments* it, which is what AC4 actually requires.
+/// The `phase` selects between three literal statements rather than binding
+/// flags, mirroring [`park_workflow_task_query`]. Taking the phase itself —
+/// rather than the two booleans it implies — keeps
+/// [`crate::error::CapabilityMissPhase`] the single source of truth and makes
+/// the one incoherent combination (clear the crash strikes *and* restore the
+/// attempt) unrepresentable. The two clauses it governs:
+///
+/// - **`crash_strikes = 0`** only when the miss was detected *after* the
+///   workflow body ran to a conclusion
+///   ([`crate::error::CapabilityMissPhase::clears_crash_strikes`]): issue
+///   #367's counter counts the worker processes a task has killed, so a
+///   pre-/mid-handler miss ran nothing and is not evidence about it. Zeroing
+///   unconditionally would let an incapable claim landing between two capable
+///   crashes reset the streak every time, so `poison_pill_threshold` is never
+///   reached in a heterogeneous fleet (Codex round-12 P1). No variant ever
+///   *increments* it, which is what AC4 actually requires.
+/// - **`attempt = GREATEST(attempt - 1, 0)`** only when the handler was never
+///   reached ([`crate::error::CapabilityMissPhase::restores_dispatch_attempt`]):
+///   `attempt` is both the retry budget and the "first dispatch?" signal
+///   `record_workflow_started` reads, and once the handler has begun, the start
+///   metric has already fired. See that predicate for the full argument.
 ///
 /// One statement, guarded on `state = 'RUNNING' AND worker_id = $2` so it can
 /// only ever undo *this* worker's own claim — a concurrent poison-pill reclaim
@@ -2083,7 +2094,9 @@ pub async fn defer_rate_limited_task(
 ///   it and would both be misled: `ActivityContext::previous_failure()` (which
 ///   an author branches on) and, more sharply, the issue #773 `/stack`
 ///   endpoint, which renders any non-null `error` on a pending activity as a
-///   `last_failure`. Because the release also restores `attempt` to `0`, that
+///   `last_failure`. Because the release also restores `attempt` to `0` (an
+///   activity-task miss is always [`crate::error::CapabilityMissPhase::BeforeHandler`],
+///   so the round-17 phase gate never withholds the restoration here), that
 ///   would report a failure at an otherwise-unreachable `attempt: 0` for an
 ///   activity that never executed — violating #773 AC3 ("a never-failed
 ///   pending activity omits `last_failure`") and making a blameless deploy
@@ -2092,14 +2105,22 @@ pub async fn defer_rate_limited_task(
 ///   reaches the operator through the release's `tracing::info!` and the
 ///   `harvest.task.capability_miss` counter.
 #[must_use]
-pub const fn release_task_for_capability_miss_query(clear_crash_strikes: bool) -> &'static str {
-    if clear_crash_strikes {
+pub const fn release_task_for_capability_miss_query(
+    phase: crate::error::CapabilityMissPhase,
+) -> &'static str {
+    // Both clauses derive from `phase`, so the arms below cover exactly the
+    // three reachable combinations. `AfterHandler` is the only phase that
+    // clears the crash strikes, and `BeforeHandler` the only one that restores
+    // the attempt, so "clear AND restore" cannot be constructed.
+    if phase.clears_crash_strikes() {
+        // AfterHandler: the body reached a conclusion on this worker, so the
+        // #367 crash streak is genuinely broken -- and the start metric has
+        // already fired, so `attempt` stays put.
         "UPDATE harvest_task_queue \
          SET state = 'PENDING', \
              worker_id = NULL, \
              started_at = NULL, \
              last_heartbeat_at = NULL, \
-             attempt = GREATEST(attempt - 1, 0), \
              crash_strikes = 0, \
              capability_misses = capability_misses + 1, \
              capability_miss_workers = CASE \
@@ -2115,13 +2136,39 @@ pub const fn release_task_for_capability_miss_query(clear_crash_strikes: bool) -
          WHERE id = $1 \
            AND state = 'RUNNING' \
            AND worker_id = $2"
-    } else {
+    } else if phase.restores_dispatch_attempt() {
+        // BeforeHandler: nothing ran at all. Restore the claim-time increment
+        // so the miss neither drains an activity's retry budget nor blocks a
+        // workflow's first-dispatch start metric.
         "UPDATE harvest_task_queue \
          SET state = 'PENDING', \
              worker_id = NULL, \
              started_at = NULL, \
              last_heartbeat_at = NULL, \
              attempt = GREATEST(attempt - 1, 0), \
+             capability_misses = capability_misses + 1, \
+             capability_miss_workers = CASE \
+                 WHEN $2 = ANY(capability_miss_workers) THEN capability_miss_workers \
+                 ELSE array_append(capability_miss_workers, $2) \
+             END, \
+             scheduled_at = NOW() + make_interval(secs => $3), \
+             sticky_worker_id = NULL, \
+             sticky_until = NULL, \
+             sticky_timeout = NULL, \
+             wake_requested = FALSE, \
+             activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END \
+         WHERE id = $1 \
+           AND state = 'RUNNING' \
+           AND worker_id = $2"
+    } else {
+        // DuringHandler: the body BEGAN (so the start metric fired and
+        // `attempt` must stay put) but did not finish (so the #367 streak is
+        // not evidence-broken). The one phase where the two clauses disagree.
+        "UPDATE harvest_task_queue \
+         SET state = 'PENDING', \
+             worker_id = NULL, \
+             started_at = NULL, \
+             last_heartbeat_at = NULL, \
              capability_misses = capability_misses + 1, \
              capability_miss_workers = CASE \
                  WHEN $2 = ANY(capability_miss_workers) THEN capability_miss_workers \
@@ -2151,10 +2198,16 @@ pub const fn release_task_for_capability_miss_query(clear_crash_strikes: bool) -
 ///
 /// Semantics, and why each differs from a plain reschedule:
 ///
-/// - **`attempt` is restored** (`GREATEST(attempt - 1, 0)`) — [`claim_task`]
-///   increments it on claim, and the handler never ran, so a capability miss
-///   must not drain the retry budget (the exact bug issue #369 fixed for
-///   rate-limit deferrals).
+/// - **`attempt` is restored only when the handler was never reached**
+///   (`GREATEST(attempt - 1, 0)`, gated by
+///   [`crate::error::CapabilityMissPhase::restores_dispatch_attempt`]) —
+///   [`claim_task`] increments it on claim, and a pre-handler miss ran nothing,
+///   so it must not drain the retry budget (the exact bug issue #369 fixed for
+///   rate-limit deferrals). Once the handler has *begun*, `record_workflow_started`
+///   has already fired for this execution, and restoring `attempt` would make
+///   the next capable claim look like a first dispatch and emit that counter a
+///   second time (Codex round-17 P2). Every activity-task miss is
+///   pre-handler, so the budget is still always restored where it is a budget.
 /// - **`crash_strikes` is never incremented, and is reset only when the handler
 ///   ran** (`clear_crash_strikes`) — the poison-pill threshold (#367) measures
 ///   *consecutive* crashes, so only a dispatch that watched the body reach a
@@ -2180,10 +2233,10 @@ pub const fn release_task_for_capability_miss_query(clear_crash_strikes: bool) -
 /// so waking pollers early would be pure noise (mirrors
 /// [`requeue_workflow_task_nd_blocked`]).
 ///
-/// `clear_crash_strikes` must come from
-/// [`crate::error::CapabilityMissPhase::clears_crash_strikes`] — see
-/// [`release_task_for_capability_miss_query`] for why a pre-/mid-handler miss
-/// must leave issue #367's counter alone.
+/// `phase` is the miss's [`crate::error::CapabilityMissPhase`], which governs
+/// both conditional clauses — see [`release_task_for_capability_miss_query`]
+/// for why a pre-/mid-handler miss must leave issue #367's counter alone and
+/// why a post-handler miss must leave `attempt` alone.
 ///
 /// Returns `true` when this worker's claim was actually released; `false`
 /// means the row was already taken by something else (e.g. an orphan reclaim
@@ -2197,11 +2250,11 @@ pub async fn release_task_for_capability_miss(
     task_id: Uuid,
     worker_id: &str,
     backoff: StdDuration,
-    clear_crash_strikes: bool,
+    phase: crate::error::CapabilityMissPhase,
 ) -> HarvestResult<bool> {
     // Bounded by `capability_miss_backoff`'s 30s cap; the clamp is defensive.
     let backoff_secs = f64::min(backoff.as_secs_f64(), 3600.0);
-    let released = diesel::sql_query(release_task_for_capability_miss_query(clear_crash_strikes))
+    let released = diesel::sql_query(release_task_for_capability_miss_query(phase))
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .bind::<diesel::sql_types::Double, _>(backoff_secs)
@@ -3326,6 +3379,7 @@ pub async fn pending_queue_demand_by_queue_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::CapabilityMissPhase;
 
     // ── Issue #774: queue coverage — pending-demand query ───────────────────
 
@@ -3796,8 +3850,8 @@ mod tests {
         // between two statements, so every shared clause must be pinned in
         // both or they can silently drift apart.
         for sql in [
-            release_task_for_capability_miss_query(true),
-            release_task_for_capability_miss_query(false),
+            release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler),
+            release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
         ] {
             assert!(
                 sql.contains("state = 'RUNNING'"),
@@ -3813,26 +3867,77 @@ mod tests {
     }
 
     #[test]
-    fn capability_miss_release_query_restores_the_attempt() {
-        // Asserted for BOTH literal variants: the crash-strike flag selects
-        // between two statements, so every shared clause must be pinned in
-        // both or they can silently drift apart.
-        for sql in [
-            release_task_for_capability_miss_query(true),
-            release_task_for_capability_miss_query(false),
+    fn capability_miss_release_query_restores_the_attempt_only_before_the_handler() {
+        // Issue #804 Codex round-17 P2. `attempt` does double duty on a workflow
+        // row: it is the retry budget AND the "is this the first dispatch?"
+        // signal `record_workflow_started` reads. Restoring it is required when
+        // nothing ran, and wrong once the start metric has already fired.
+        assert!(
+            release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler)
+                .contains("attempt = GREATEST(attempt - 1, 0)"),
+            "claim_task does `attempt + 1`; a pre-handler miss never ran the \
+             handler, so it must not consume the retry budget (AC4)",
+        );
+        for phase in [
+            CapabilityMissPhase::DuringHandler,
+            CapabilityMissPhase::AfterHandler,
         ] {
+            let sql = release_task_for_capability_miss_query(phase);
             assert!(
-                sql.contains("attempt = GREATEST(attempt - 1, 0)"),
-                "claim_task does `attempt + 1`; a capability miss never ran the \
-                 handler, so it must not consume the retry budget (AC4)",
+                !sql.contains("GREATEST(attempt - 1, 0)"),
+                "{phase:?}: the start metric already fired for this execution, \
+                 so rolling `attempt` back to 0 would make the next capable \
+                 claim re-emit `harvest.workflow.started`: {sql}",
             );
+            assert!(
+                !sql.contains("attempt ="),
+                "{phase:?}: a post-handler release must leave `attempt` alone \
+                 entirely, not rewrite it to some other value: {sql}",
+            );
+        }
+    }
+
+    /// Every phase-selected literal must keep the clauses that are not about
+    /// `attempt` or `crash_strikes` — three statements can drift where two
+    /// could.
+    #[test]
+    fn capability_miss_release_query_variants_share_every_common_clause() {
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+            CapabilityMissPhase::AfterHandler,
+        ] {
+            let sql = release_task_for_capability_miss_query(phase);
+            for clause in [
+                "state = 'PENDING'",
+                "worker_id = NULL",
+                "started_at = NULL",
+                "last_heartbeat_at = NULL",
+                "capability_misses = capability_misses + 1",
+                "capability_miss_workers = CASE",
+                "scheduled_at = NOW() + make_interval(secs => $3)",
+                "sticky_worker_id = NULL",
+                "sticky_until = NULL",
+                "sticky_timeout = NULL",
+                "wake_requested = FALSE",
+                "activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END",
+            ] {
+                assert!(
+                    sql.contains(clause),
+                    "{phase:?} lost the shared clause `{clause}`: {sql}",
+                );
+            }
         }
     }
 
     #[test]
     fn capability_miss_release_query_never_increments_crash_strikes() {
-        for clear in [true, false] {
-            let sql = release_task_for_capability_miss_query(clear);
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+            CapabilityMissPhase::AfterHandler,
+        ] {
+            let sql = release_task_for_capability_miss_query(phase);
             assert!(
                 !sql.contains("crash_strikes + 1") && !sql.contains("crash_strikes+1"),
                 "AC4: crash_strikes must never be incremented by a capability \
@@ -3853,7 +3958,7 @@ mod tests {
     /// indefinitely.
     #[test]
     fn capability_miss_release_query_preserves_crash_strikes_for_a_pre_handler_miss() {
-        let preserving = release_task_for_capability_miss_query(false);
+        let preserving = release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler);
         assert!(
             !preserving.contains("crash_strikes"),
             "a pre-/mid-handler miss must not write the column AT ALL -- the \
@@ -3861,7 +3966,7 @@ mod tests {
              the task still crashes workers: {preserving}",
         );
 
-        let clearing = release_task_for_capability_miss_query(true);
+        let clearing = release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler);
         assert!(
             clearing.contains("crash_strikes = 0"),
             "a post-handler miss DID watch the body run to a conclusion without \
@@ -3876,8 +3981,8 @@ mod tests {
         // between two statements, so every shared clause must be pinned in
         // both or they can silently drift apart.
         for sql in [
-            release_task_for_capability_miss_query(true),
-            release_task_for_capability_miss_query(false),
+            release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler),
+            release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
         ] {
             assert!(
                 sql.contains("capability_misses = capability_misses + 1"),
@@ -3900,8 +4005,8 @@ mod tests {
         // between two statements, so every shared clause must be pinned in
         // both or they can silently drift apart.
         for sql in [
-            release_task_for_capability_miss_query(true),
-            release_task_for_capability_miss_query(false),
+            release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler),
+            release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
         ] {
             assert!(
                 sql.contains("$2 = ANY(capability_miss_workers)"),
@@ -3981,8 +4086,8 @@ mod tests {
         // between two statements, so every shared clause must be pinned in
         // both or they can silently drift apart.
         for sql in [
-            release_task_for_capability_miss_query(true),
-            release_task_for_capability_miss_query(false),
+            release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler),
+            release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
         ] {
             assert!(
                 !sql.contains("error ="),
@@ -3998,8 +4103,8 @@ mod tests {
         // between two statements, so every shared clause must be pinned in
         // both or they can silently drift apart.
         for sql in [
-            release_task_for_capability_miss_query(true),
-            release_task_for_capability_miss_query(false),
+            release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler),
+            release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
         ] {
             // Without this the row stays pinned to the very worker that just
             // proved it cannot run it, so no peer can claim it and the task
@@ -4016,8 +4121,8 @@ mod tests {
         // between two statements, so every shared clause must be pinned in
         // both or they can silently drift apart.
         for sql in [
-            release_task_for_capability_miss_query(true),
-            release_task_for_capability_miss_query(false),
+            release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler),
+            release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
         ] {
             assert!(sql.contains("state = 'PENDING'"));
             assert!(sql.contains("worker_id = NULL"));
@@ -4036,8 +4141,8 @@ mod tests {
         // between two statements, so every shared clause must be pinned in
         // both or they can silently drift apart.
         for sql in [
-            release_task_for_capability_miss_query(true),
-            release_task_for_capability_miss_query(false),
+            release_task_for_capability_miss_query(CapabilityMissPhase::AfterHandler),
+            release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
         ] {
             // A stale `mixed_signal_suspension` sentinel left in `activity_name` on
             // a WORKFLOW row lets an unrelated wake reset `scheduled_at` to now and

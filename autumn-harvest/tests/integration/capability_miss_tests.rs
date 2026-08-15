@@ -47,6 +47,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use autumn_harvest::error::CapabilityMissPhase;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
@@ -124,6 +125,9 @@ struct CapabilityMetrics {
     misses: Mutex<Vec<(String, String, String)>>,
     /// Poison-pill quarantine emissions — must stay empty (AC4).
     quarantined: Mutex<Vec<(String, String)>>,
+    /// `harvest.workflow.started` emissions as `(workflow, queue)`. A release
+    /// must never let this fire twice for one execution (Codex round-17 P2).
+    started: Mutex<Vec<(String, String)>>,
 }
 
 impl CapabilityMetrics {
@@ -143,6 +147,10 @@ impl CapabilityMetrics {
     fn quarantine_count(&self) -> usize {
         self.quarantined.lock().unwrap().len()
     }
+
+    fn started_samples(&self) -> Vec<(String, String)> {
+        self.started.lock().unwrap().clone()
+    }
 }
 
 impl MetricsRecorder for CapabilityMetrics {
@@ -159,6 +167,13 @@ impl MetricsRecorder for CapabilityMetrics {
             .lock()
             .unwrap()
             .push((queue.to_owned(), reason.to_owned()));
+    }
+
+    fn record_workflow_started(&self, workflow: &str, queue: &str) {
+        self.started
+            .lock()
+            .unwrap()
+            .push((workflow.to_owned(), queue.to_owned()));
     }
 }
 
@@ -500,8 +515,15 @@ async fn wait_for_terminal(
 // ---------------------------------------------------------------------------
 
 /// Assert the invariants every capability-miss release must satisfy, whatever
-/// the task type: the claim is dropped for a peer, none of the *crash*
-/// accounting is touched (AC4), and the row is not marked as having failed.
+/// the task type *or phase*: the claim is dropped for a peer, none of the
+/// *crash* accounting is touched (AC4), and the row is not marked as having
+/// failed.
+///
+/// `attempt` is deliberately **not** asserted here, because it is the one
+/// clause that legitimately differs by phase (Codex round-17 P2): a
+/// pre-handler release restores it, a post-handler release must not. Use
+/// [`assert_released_before_the_handler`] for the pre-handler case, which is
+/// where restoring it is the AC4 retry-budget guarantee.
 fn assert_released_for_a_peer(task: &TaskQueueItem) {
     assert_eq!(
         task.state, "PENDING",
@@ -525,24 +547,34 @@ fn assert_released_for_a_peer(task: &TaskQueueItem) {
         task.crash_strikes, 0,
         "a clean capability miss must never increment crash strikes (AC4)"
     );
-    assert_eq!(
-        task.attempt, 0,
-        "the release must restore the attempt `claim_task` consumed, or the retry \
-         budget silently drains (AC4)"
-    );
-
     // The `error` column is reserved for genuine task failures and must stay
     // untouched. `/stack` (issue #773) renders any non-null `error` on a pending
-    // activity as a `last_failure` — and because the release also restores
-    // `attempt` to 0 (asserted above), a breadcrumb here would surface as a
-    // failure at an otherwise-unreachable attempt 0 for work that never ran,
-    // violating #773 AC3. The operator breadcrumb reaches them through the
-    // release's `tracing::info!` and the `harvest.task.capability_miss` counter
-    // instead; `release_never_writes_the_error_column` covers both directions.
+    // activity as a `last_failure` — and because a pre-handler release also
+    // restores `attempt` to 0, a breadcrumb here would surface as a failure at
+    // an otherwise-unreachable attempt 0 for work that never ran, violating
+    // #773 AC3. The operator breadcrumb reaches them through the release's
+    // `tracing::info!` and the `harvest.task.capability_miss` counter instead;
+    // `release_never_writes_the_error_column` covers both directions.
     assert!(
         task.error.is_none(),
         "a capability miss is not a task failure and must not write `error`; got {:?}",
         task.error
+    );
+}
+
+/// [`assert_released_for_a_peer`] plus the clause that is specific to a
+/// **pre-handler** miss: the claim-time `attempt` increment is undone.
+///
+/// This is the AC4 retry-budget guarantee, and it belongs to exactly the phase
+/// where nothing ran — which is every activity-task miss, and a workflow task
+/// whose *type* was unregistered. A post-handler release deliberately leaves
+/// `attempt` alone; see `CapabilityMissPhase::restores_dispatch_attempt`.
+fn assert_released_before_the_handler(task: &TaskQueueItem) {
+    assert_released_for_a_peer(task);
+    assert_eq!(
+        task.attempt, 0,
+        "a pre-handler release must restore the attempt `claim_task` consumed, \
+         or the retry budget silently drains (AC4)"
     );
 }
 
@@ -594,6 +626,8 @@ const MIXED_FLEET_BUDGET: u32 = 50;
 const Q_NOOP: &str = "q804-noop";
 const Q_PARK: &str = "q804-park";
 const Q_LIVE_PEER: &str = "q804-live-peer";
+const Q_STARTED_ONCE: &str = "q804-started-once";
+const Q_STARTED_ONCE_ACTS: &str = "q804-started-once-acts";
 
 type BoxFut<'a> =
     Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>>;
@@ -615,6 +649,20 @@ fn decoy_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'
 fn workflow_calls_peer_activity(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move {
         ctx.execute_activity_raw("peer_only_activity", input, Q_ACT_ACTS)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Sibling of [`workflow_calls_peer_activity`] on its own dedicated activity
+/// queue, so the round-17 start-metric test cannot claim (or be blocked by) an
+/// adjacent test's activity row in the shared database.
+fn workflow_calls_started_once_activity(
+    ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("started_once_activity", input, Q_STARTED_ONCE_ACTS)
             .await
             .map_err(|e| e.to_string())
     })
@@ -742,7 +790,7 @@ async fn workflow_capability_miss_is_released_for_a_capable_peer() {
     .await;
 
     // AC1 — released back to PENDING for a peer, not failed.
-    assert_released_for_a_peer(&released);
+    assert_released_before_the_handler(&released);
     assert_eq!(released.task_type, "workflow");
     assert_eq!(
         released.capability_misses, 1,
@@ -877,7 +925,7 @@ async fn activity_capability_miss_is_released_for_a_capable_peer() {
     // AC2 — the ACTIVITY task is the one released.
     assert_eq!(released.task_type, "activity");
     assert_eq!(released.queue_name, Q_ACT_ACTS);
-    assert_released_for_a_peer(&released);
+    assert_released_before_the_handler(&released);
     assert_eq!(
         released.activity_name.as_deref(),
         Some("peer_only_activity"),
@@ -913,6 +961,141 @@ async fn activity_capability_miss_is_released_for_a_capable_peer() {
         completed.output,
         Some(serde_json::json!("activity done")),
         "the workflow returned the capable peer's activity output"
+    );
+    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// A post-handler release must not let `harvest.workflow.started` fire twice.
+// ---------------------------------------------------------------------------
+
+/// `record_workflow_started` fires exactly once per execution, gated on
+/// `task.attempt == 1 && no scheduling events in history`. A **post-handler**
+/// capability miss (the persist-time pre-pass finding an unregistered activity)
+/// happens *after* that gate has already fired, and its persistence transaction
+/// rolls back — so nothing lands in history either. If the release also rolled
+/// `attempt` back to `0`, the next capable claim would see `attempt == 1` with
+/// no scheduling events and emit the counter a **second** time, inflating
+/// workflow-start counts and every SLO derived from them (Codex round-17 P2).
+///
+/// The fix is phase-gated: only a `BeforeHandler` release restores `attempt`
+/// (nothing ran, and the metric was never emitted, so the next dispatch *must*
+/// still look like the first). `During`/`AfterHandler` releases leave it alone.
+/// That is safe because `task.attempt` is a retry budget only for **activity**
+/// tasks — and every activity-task miss is `BeforeHandler` — while on a
+/// workflow row it is read solely by this metric gate and the informational DLQ
+/// `attempts` field. The #523 workflow-level retry loop counts
+/// `executions.workflow_attempt`, a different column entirely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_post_handler_release_does_not_re_emit_workflow_started() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "started_once_wf",
+        serde_json::json!({"n": 17}),
+        Q_STARTED_ONCE,
+    )
+    .await;
+
+    // ONE recorder across both phases: the assertion is about the total number
+    // of `harvest.workflow.started` emissions for this execution, however many
+    // workers observed it.
+    let metrics = Arc::new(CapabilityMetrics::default());
+
+    // --- Phase 1: a worker that CAN run the body but NOT the activity. ------
+    //
+    // The body runs to a conclusion (so the start metric fires), then the
+    // persist-time capability pre-pass finds `started_once_activity`
+    // unregistered and releases the workflow task — an `AfterHandler` miss.
+    // It polls the activity queue too, so a later inability to *complete* the
+    // run can only be the capability miss, never a routing gap.
+    let half_capable = build_worker(
+        "worker-body-only",
+        &[Q_STARTED_ONCE, Q_STARTED_ONCE_ACTS],
+        build_registry(
+            vec![workflow_info(
+                "started_once_wf",
+                workflow_calls_started_once_activity,
+            )],
+            vec![activity_info(
+                "some_other_activity",
+                decoy_activity,
+                Q_STARTED_ONCE_ACTS,
+            )],
+            Arc::clone(&metrics),
+        ),
+        50,
+    );
+
+    let released = with_worker_running(&half_capable, &pool, async {
+        wait_for_capability_misses(&url, exec_id, 1, Duration::from_secs(30)).await
+    })
+    .await;
+
+    assert_eq!(
+        released.task_type, "workflow",
+        "the persist-time pre-pass releases the WORKFLOW task, not an activity \
+         row -- the activity was never enqueued"
+    );
+    assert_released_for_a_peer(&released);
+    assert_eq!(
+        metrics.started_samples().len(),
+        1,
+        "the body ran, so the start metric fired exactly once in phase 1: {:?}",
+        metrics.started_samples()
+    );
+    assert_eq!(
+        released.attempt, 1,
+        "a post-handler release must LEAVE `attempt` at its claimed value: \
+         rolling it back to 0 is precisely what makes the next capable claim \
+         look like a first dispatch and re-emit the start metric"
+    );
+    // The rolled-back persist means history is still just the seeded start
+    // event -- which is the other half of the metric gate's condition, and why
+    // `attempt` alone has to carry the "already dispatched" signal here.
+    assert_eq!(
+        load_history(&url, exec_id).await.len(),
+        1,
+        "the persist transaction rolled back, so no scheduling event landed"
+    );
+
+    // --- Phase 2: the fully capable worker finishes the job. ----------------
+    let capable = build_worker(
+        "worker-full",
+        &[Q_STARTED_ONCE, Q_STARTED_ONCE_ACTS],
+        build_registry(
+            vec![workflow_info(
+                "started_once_wf",
+                workflow_calls_started_once_activity,
+            )],
+            vec![activity_info(
+                "started_once_activity",
+                peer_only_activity,
+                Q_STARTED_ONCE_ACTS,
+            )],
+            Arc::clone(&metrics),
+        ),
+        50,
+    );
+
+    let completed = with_worker_running(&capable, &pool, async {
+        wait_for_state(&url, exec_id, "COMPLETED", Duration::from_secs(30)).await
+    })
+    .await;
+
+    assert_eq!(
+        completed.output,
+        Some(serde_json::json!("activity done")),
+        "the capable worker ran the real activity"
+    );
+    assert_eq!(
+        metrics.started_samples(),
+        vec![("started_once_wf".to_string(), Q_STARTED_ONCE.to_string())],
+        "`harvest.workflow.started` must be emitted EXACTLY ONCE for this \
+         execution across the whole incapable-then-capable dispatch sequence"
     );
     assert!(dead_letter_errors(&url, exec_id).await.is_empty());
 }
@@ -1655,9 +1838,10 @@ async fn release_never_writes_the_error_column() {
         task_id,
         "incapable",
         Duration::from_secs(1),
-        // A workflow-type lookup miss is `BeforeHandler`, so the crash-strike
-        // counter is preserved (Codex round-12 P1).
-        false,
+        // A workflow-type lookup miss is `BeforeHandler`: the crash-strike
+        // counter is preserved (Codex round-12 P1) and `attempt` is restored
+        // (Codex round-17 P2).
+        CapabilityMissPhase::BeforeHandler,
     )
     .await
     .expect("release query runs");
@@ -1693,9 +1877,10 @@ async fn release_never_writes_the_error_column() {
         task2,
         "incapable",
         Duration::from_secs(1),
-        // A workflow-type lookup miss is `BeforeHandler`, so the crash-strike
-        // counter is preserved (Codex round-12 P1).
-        false,
+        // A workflow-type lookup miss is `BeforeHandler`: the crash-strike
+        // counter is preserved (Codex round-12 P1) and `attempt` is restored
+        // (Codex round-17 P2).
+        CapabilityMissPhase::BeforeHandler,
     )
     .await
     .expect("release query runs");
@@ -1738,7 +1923,7 @@ async fn release_is_a_noop_when_the_claim_was_already_taken() {
         task_id,
         "worker-we-are",
         Duration::from_secs(1),
-        false,
+        CapabilityMissPhase::BeforeHandler,
     )
     .await
     .expect("release query runs");
@@ -2006,8 +2191,7 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
         task_id,
         "incapable",
         Duration::from_secs(1),
-        // `CapabilityMissPhase::BeforeHandler.clears_crash_strikes()`.
-        false,
+        CapabilityMissPhase::BeforeHandler,
     )
     .await
     .expect("release query runs");
@@ -2037,7 +2221,7 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
     diesel::sql_query(
         "UPDATE harvest_task_queue \
             SET state = 'RUNNING', worker_id = 'incapable', started_at = NOW(), \
-                crash_strikes = 2 \
+                crash_strikes = 2, attempt = 1 \
           WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(task2)
@@ -2050,16 +2234,21 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
         task2,
         "incapable",
         Duration::from_secs(1),
-        // `CapabilityMissPhase::AfterHandler.clears_crash_strikes()`.
-        true,
+        CapabilityMissPhase::AfterHandler,
     )
     .await
     .expect("release query runs");
     assert!(released2);
+    let after = load_task(&url, task2).await;
     assert_eq!(
-        load_task(&url, task2).await.crash_strikes,
-        0,
+        after.crash_strikes, 0,
         "the body returned its commands on this very dispatch, so this worker \
          demonstrably survived running it"
+    );
+    assert_eq!(
+        after.attempt, 1,
+        "the SAME phase that clears the crash strikes must PRESERVE `attempt`: \
+         the body ran, so `record_workflow_started` already fired and rolling \
+         back to 0 would let the next capable claim re-emit it (round-17 P2)"
     );
 }

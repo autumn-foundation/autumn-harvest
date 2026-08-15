@@ -459,8 +459,9 @@ incident: the resulting terminal error names the knob, not a missing deploy.
 ### Interactions and carve-outs
 
 - **Not a poison pill (#367).** A capability miss is a clean "wrong pod", not a
-  crash. It never increments `crash_strikes`, never consumes the task's retry
-  budget (`attempt` is restored on release), and never produces a `PoisonPill`
+  crash. It never increments `crash_strikes`, never consumes an activity's retry
+  budget (`attempt` is restored whenever the handler was never reached, which is
+  every activity-task miss), and never produces a `PoisonPill`
   dead-letter row — escalation writes no dead-letter row at all. The `harvest.task.quarantined` metric and the
   `harvest_no_capable_worker` alert
   are therefore mutually exclusive diagnoses. It also does not *erase* a
