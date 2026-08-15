@@ -359,6 +359,71 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
     Ok(())
 }
 
+/// Register a worker **and** clear the stale capability-miss evidence its id
+/// may still carry, atomically (issue #804, Codex rounds 26 and 28).
+///
+/// The two writes must land together or not at all, for two independent
+/// reasons.
+///
+/// **A published-but-uncleaned worker is affirmative fleet evidence against
+/// itself.** `register_worker` upserts on `worker_id`, so a pod restarting
+/// under the same configured id onto a build that *does* register the missing
+/// handler republishes itself as live. Capability-miss evidence stores bare
+/// ids, so until the invalidation lands, every task that id missed on its
+/// previous build still names it — and another claimant reading the registry
+/// sees the whole live fleet as already covered, derives
+/// [`crate::worker::FleetCapabilityEvidence::AllLiveWorkersMissed`], and
+/// terminally fails a run at exactly the moment the fix arrived. Committing the
+/// registration while the invalidation fails is therefore strictly worse than
+/// not registering at all, and "log and continue" leaves precisely that state.
+/// Rolling back keeps the worker unpublished until the pair succeeds, and the
+/// heartbeat's `Ok(0)` self-heal retries it within one interval.
+///
+/// **Atomicity is also what makes a claimant's reads coherent.** A decision
+/// brackets its fleet read between two miss-state reads and requires them to
+/// agree (see `worker::miss_evidence_confidence`). That check is only sound if
+/// registration and invalidation are a single commit: split them, and a
+/// claimant can observe a world where the peer is already in the fleet but its
+/// evidence is not yet cleared — which reads as covered, agrees across both
+/// miss reads, and escalates.
+///
+/// Returns the number of task rows whose evidence was cleared.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on serialization or database failure. Either write
+/// failing rolls back both.
+pub async fn register_worker_and_clear_stale_miss_evidence(
+    conn: &mut AsyncPgConnection,
+    registration: &WorkerRegistration,
+) -> HarvestResult<usize> {
+    use diesel_async::AsyncConnection;
+
+    Box::pin(conn.transaction(async |tx| {
+        register_worker(
+            tx,
+            &registration.worker_id,
+            &registration.queues,
+            &registration.shard_assignments,
+            registration.max_concurrency,
+            &registration.host,
+            registration.version.as_deref(),
+            &registration.build_id,
+            registration.deployment_name.as_deref(),
+            &registration.labels,
+            registration.max_concurrent_sessions,
+        )
+        .await?;
+        crate::queue::invalidate_capability_miss_evidence_for_worker(
+            tx,
+            &registration.worker_id,
+            &registration.queues,
+        )
+        .await
+    }))
+    .await
+}
+
 /// Upsert `last_heartbeat_at` and `in_flight_count` for a worker.
 ///
 /// Returns the number of rows updated (1 if the worker row exists, 0 if it is
@@ -1239,20 +1304,14 @@ async fn do_heartbeat_tick(
                 );
             } else {
                 tracing::info!(worker_id = %registration.worker_id, "worker row missing; re-registering");
-                if let Err(error) = register_worker(
-                    conn,
-                    &registration.worker_id,
-                    &registration.queues,
-                    &registration.shard_assignments,
-                    registration.max_concurrency,
-                    &registration.host,
-                    registration.version.as_deref(),
-                    &registration.build_id,
-                    registration.deployment_name.as_deref(),
-                    &registration.labels,
-                    registration.max_concurrent_sessions,
-                )
-                .await
+                // Atomically, exactly as startup does: republishing this id
+                // without clearing the capability-miss evidence it may still
+                // carry would make it affirmative fleet evidence against
+                // itself (issue #804, Codex round-28 P1). This branch is also
+                // the retry that heals a startup registration whose
+                // invalidation failed and rolled the pair back.
+                if let Err(error) =
+                    register_worker_and_clear_stale_miss_evidence(conn, registration).await
                 {
                     tracing::warn!(worker_id = %registration.worker_id, error = %error, "worker re-registration failed");
                 }

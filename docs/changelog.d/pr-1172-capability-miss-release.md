@@ -626,3 +626,124 @@ window, hit exactly, with no sleep and no second worker to race. Falsified by
 reverting `current_frontier_miss_state` to the bare snapshot: the execution lands
 in `FAILED` with a `no_capable_worker:` reason instead of the task returning to
 `PENDING`.
+
+## Review round 28 — a decision needs ownership, coherence, and evidence it can trust (Codex, 4× P1)
+
+Round 27 re-read the miss counters before deciding. Round 28 is four findings on
+what that re-read did **not** establish, and they compose into one rule: an
+escalation may only run on evidence that is *owned*, *readable*, and *coherent
+with the fleet read beside it*.
+
+### 1. A lost claim is not a decision to make
+
+`read_capability_miss_state` returning `None` means the row is no longer
+`RUNNING` under this worker — a poison-pill reclaim or an operator took it.
+Round 27 treated that as merely "no fresh data" and fell back to the snapshot.
+But the two write paths are not symmetric: the **release** is ownership-guarded
+(`worker_id = $2`, whose `0 rows affected` the caller already handles) while the
+**escalation** is not — `queue::fail_task` accepts any `PENDING`/`RUNNING` row
+regardless of `worker_id`, and `fail_task_and_execution` transitions the
+execution. So a stale dispatcher deciding `Escalate` terminally failed a task
+another worker owned, which a zero-budget, session-pinned, or already-exhausted
+task reaches on its very first miss.
+
+`None` is now `CurrentMissState::ClaimLost` — positive evidence, not absence of
+it — and the caller returns `Released` without deciding anything.
+
+### 2. An unreadable row may not license an evidence-derived escalation
+
+Round 27's error fallback restored the claim-time array, which after round 26 is
+no longer known to match storage: re-registration is an unguarded concurrent
+writer, so the array can still name a peer that has since invalidated its own
+entry. With the fleet read seeing that peer as live, the resolver derived
+`AllLiveWorkersMissed` and failed the run at the budget.
+
+The counters still fall back to the snapshot — the round-21 P2 hazard is
+unchanged, and a fabricated clean frontier would bypass the storage ceiling and
+strand a `RUNNING` row on `integer out of range` — but they now arrive as
+`CurrentMissState::Unreadable`, which suppresses the evidence-derived bounds.
+
+### 3. Neither read order is safe, so the fleet read is bracketed
+
+The fleet read and the miss read are separate statements, so under `READ
+COMMITTED` a registration can commit between them — and **both** orderings lose:
+
+- fleet first: the peer is *absent from the fleet* but its evidence is *already
+  cleared*, so the claimant is the only live worker and the only misser →
+  `AllLiveWorkersMissed`.
+- miss first: the peer is *present in the fleet* with its evidence *still
+  stale*, so it reads as covered → `AllLiveWorkersMissed` again.
+
+Reordering trades one race for the other. So the miss state is read on **both**
+sides of the fleet read and the two must agree. Registration and invalidation
+commit atomically (below) and snapshots are monotonic in time, so any commit the
+fleet read could have seen is also visible to the second miss read — which makes
+it differ from the first. Agreement therefore certifies that no registration
+landed anywhere inside the bracket, and the three reads describe one coherent
+world.
+
+### 4. A published worker whose cleanup failed is evidence against itself
+
+Round 26 logged an invalidation failure and continued into the poll loop. That
+leaves the worst of both states: the worker is published as live on its new,
+possibly capable build while every task it missed on the old one still names it,
+so another claimant reads the whole live fleet as covered and fails a run.
+
+`register_worker` and the invalidation are now one transaction
+(`workers::register_worker_and_clear_stale_miss_evidence`). A failed cleanup
+rolls the registration back, so the worker stays unpublished rather than
+published-and-stale, and the heartbeat's existing `Ok(0)` self-heal retries the
+pair within one interval — which is also why that self-heal had to move onto the
+same atomic composite, or it would have republished without the cleanup and
+reopened the hole one heartbeat later. Atomicity is additionally what makes
+finding 3's bracket sound: split the pair and a claimant can observe the peer in
+the fleet with its evidence not yet cleared, which agrees across both miss reads
+and escalates.
+
+### Suppression is exactly two bounds, and stays bounded
+
+`MissEvidenceConfidence::PossiblyStale` forces the fleet answer to
+`CapablePeerMayExist` — not a fudge but the literal truth, since the distinct set
+may name a peer that has re-registered onto a capable build. That single
+substitution withholds precisely the two **evidence-derived** bounds (the
+distinct bound, gated on `!CapablePeerMayExist`, and the configured total bound,
+gated on `AllLiveWorkersMissed`) and leaves every **ungated** one in force: the
+absolute `10x` ceiling, the `i32::MAX` storage ceiling, the zero-budget
+fail-fast, and the session-pinned carve-out. AC3's bounded release therefore
+survives suppression — a permanently-unreadable row terminates at the ceiling
+rather than releasing forever.
+
+Suppressing the *distinct* bound as well as the total one is deliberate: its
+input is `capability_miss_workers`, the very array a re-registration
+invalidates, so its length is precisely what goes stale.
+
+The 6-argument `resolve_capability_miss` is now a wrapper that means
+`Current`, so all 21 existing call sites keep their meaning verbatim.
+
+**No new `WorkflowEvent` variant, no migration** (AC7): one read-only `SELECT`
+added on the miss path, and two existing writes moved into one transaction.
+
+### Tests
+
+Five pure `worker.rs` unit tests: a lost claim yields no decidable counters
+while an unreadable row still yields the snapshot (so the storage ceiling keeps
+its real count); confidence requires two *agreeing owned* reads; stale evidence
+withholds both evidence-derived bounds; it keeps all four ungated ones; and the
+un-confidenced form still means `Current`.
+
+Two DB tests, each falsified by reverting its own fix:
+
+- `a_claim_lost_mid_dispatch_makes_no_terminal_decision` — budget `0`, the
+  sharpest case, so the ownership probe is the *only* thing between the stolen
+  row and a terminal failure. The workflow body hands its own row to another
+  worker mid-dispatch, which is deterministic rather than raced: a body runs
+  strictly between `claim_task` and the `AfterHandler` miss. It then waits on
+  that hand-off as a positive observable rather than sleeping blind — the test
+  asserts that *nothing* happens, and a lost claim deliberately records no
+  metric, so the body's own effect is the last event before the decision.
+  Reverting the guard fails it with `left: "FAILED", right: "RUNNING"`.
+- `a_failed_evidence_cleanup_rolls_back_the_registration` — the invalidation's
+  target table is renamed away on a separate connection, so the failure is
+  injected deterministically and reversibly (the suite runs `--test-threads=1`).
+  Reverting to log-and-continue fails it with `left: 1, right: 0` — the worker
+  published while its stale evidence survived.

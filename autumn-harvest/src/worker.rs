@@ -5011,50 +5011,135 @@ fn frontier_miss_state(task: &TaskQueueItem, reset_committed: bool) -> (i32, Vec
 /// `AllLiveWorkersMissed`, the terminal failure round 26 exists to prevent,
 /// reintroduced through the back door.
 ///
-/// So the row is re-read, and only its own writer can change what comes back.
-/// Three cases, all safe:
+/// So the row is re-read, and the three outcomes are kept **distinct** rather
+/// than collapsed onto one pair of counters (issue #804, Codex round-28 P1) —
+/// see [`CurrentMissState`] for why each one decides differently.
 ///
-/// * `reset_committed` — an exact in-memory fact about *this* dispatch that no
-///   read can improve on, so it short-circuits with no round-trip at all.
-/// * a successful read — authoritative. Invalidation only ever *removes*
-///   entries, so a fresher view can only weaken the fleet evidence, and weaker
-///   evidence can only bias toward releasing (AC1).
-/// * `None` (the claim is gone) or an error — fall back to the snapshot, which
-///   is exactly the pre-round-27 behaviour. Deliberately **not** a fabricated
-///   clean frontier: that is the round-21 P2 hazard described above, and a
-///   read failure must degrade to the status quo rather than to something new.
-///
-/// The read sits as late as it can without a transaction — immediately before
-/// the decision, with only in-memory work between it and the terminal write —
-/// so the window in which a registration can still slip past is a few
-/// microseconds rather than the whole decision cycle (which, for an
-/// `AfterHandler` miss, is the entire workflow body).
+/// The read is unconditional, including when this dispatch committed a frontier
+/// reset. Round 22 short-circuited that case on the grounds that the counters
+/// are an exact in-memory fact no read can improve on, and that is still true:
+/// the reset is a durable `capability_misses = 0, capability_miss_workers = '{}'`
+/// write, so a successful read returns exactly those values. But the read now
+/// answers a *second* question the in-memory fact cannot — whether this worker
+/// still owns the claim — and that question has no cheap local answer. The
+/// reset's counters survive as the read-failure fallback, so nothing about
+/// round 22 is lost; only an ownership probe is gained, on a path that is rare
+/// by construction.
 async fn current_frontier_miss_state(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     worker_id: &str,
     reset_committed: bool,
-) -> (i32, Vec<String>) {
-    if reset_committed {
-        return frontier_miss_state(task, true);
-    }
+) -> CurrentMissState {
     match queue::read_capability_miss_state(conn, task.id, worker_id).await {
-        Ok(Some(fresh)) => fresh,
-        Ok(None) => {
-            tracing::debug!(
-                task_id = %task.id,
-                "capability-miss state re-read matched no owned row; deciding on the claim-time snapshot"
-            );
-            frontier_miss_state(task, false)
-        }
+        Ok(Some((misses, workers))) => CurrentMissState::Owned { misses, workers },
+        Ok(None) => CurrentMissState::ClaimLost,
         Err(error) => {
             tracing::warn!(
                 task_id = %task.id,
                 error = %error,
-                "failed to re-read capability-miss state; deciding on the claim-time snapshot"
+                "failed to re-read capability-miss state; suppressing evidence-derived \
+                 escalation and deciding on the claim-time snapshot"
             );
-            frontier_miss_state(task, false)
+            let (misses, workers) = frontier_miss_state(task, reset_committed);
+            CurrentMissState::Unreadable { misses, workers }
         }
+    }
+}
+
+/// What re-reading the capability-miss counters found (issue #804, Codex
+/// round-28 P1). The three cases decide differently, and collapsing any two of
+/// them reintroduces a terminal failure this issue exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CurrentMissState {
+    /// Fresh counters read from a row this worker still holds. Authoritative:
+    /// invalidation only ever *removes* entries, so a fresher view can only
+    /// weaken the fleet evidence, and weaker evidence can only bias toward
+    /// releasing (AC1).
+    Owned { misses: i32, workers: Vec<String> },
+    /// The row is no longer `RUNNING` under this worker's claim — a poison-pill
+    /// reclaim or an operator action took it.
+    ///
+    /// This is **positive evidence of a lost claim**, not merely an absence of
+    /// fresh data, and the difference is the whole point: the release path is
+    /// ownership-guarded (`worker_id = $2`, whose `0 rows affected` the caller
+    /// already handles) but the **escalation** path is not —
+    /// `queue::fail_task` accepts any `PENDING` or `RUNNING` row regardless of
+    /// `worker_id`, and `fail_task_and_execution` transitions the execution.
+    /// So a stale dispatcher that decides `Escalate` here terminally fails a
+    /// task another worker now owns, which a zero-budget, session-pinned, or
+    /// already-exhausted task reaches on its very first miss. The caller must
+    /// therefore return without making a terminal decision at all.
+    ClaimLost,
+    /// The row could not be read. The counters fall back to the claim-time
+    /// snapshot — deliberately **not** a fabricated clean frontier, which is
+    /// the round-21 P2 hazard (a row already at `i32::MAX` would be released
+    /// and the release statement's `capability_misses + 1` would raise
+    /// `integer out of range`, stranding a `RUNNING` row under a live worker
+    /// that orphan reclamation skips).
+    ///
+    /// But those counters may no longer match storage, because round 26's
+    /// invalidation is an unguarded concurrent writer, so the evidence they
+    /// carry is only good enough for the **ungated** bounds. See
+    /// [`MissEvidenceConfidence`].
+    Unreadable { misses: i32, workers: Vec<String> },
+}
+
+impl CurrentMissState {
+    /// The counters to decide on, or `None` when the claim is gone and no
+    /// terminal decision may be made at all.
+    const fn decidable_counters(&self) -> Option<(i32, &[String])> {
+        match self {
+            Self::Owned { misses, workers } | Self::Unreadable { misses, workers } => {
+                Some((*misses, workers.as_slice()))
+            }
+            Self::ClaimLost => None,
+        }
+    }
+}
+
+/// Whether the miss evidence the decision is about to weigh is known to be
+/// current (issue #804, Codex round-28 P1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissEvidenceConfidence {
+    /// Read fresh from the owned row, and unchanged across the fleet read.
+    Current,
+    /// The row could not be re-read, or it changed while the fleet was being
+    /// read. Either way the distinct set may name a worker that has since
+    /// invalidated its own entry, so no fleet-wide conclusion may be drawn
+    /// from it.
+    PossiblyStale,
+}
+
+/// Compare the two miss-state reads that bracket the fleet read (issue #804,
+/// Codex round-28 P1).
+///
+/// The fleet read and the miss read are separate statements, so under `READ
+/// COMMITTED` each gets its own snapshot and a registration can commit between
+/// them. Neither ordering is safe on its own: read the fleet first and a
+/// registration landing in the gap leaves the peer *absent from the fleet* but
+/// its evidence *already cleared*, so the claimant is the only live worker and
+/// the only misser — `AllLiveWorkersMissed`; read the miss state first and the
+/// same registration leaves the peer *present in the fleet* with its evidence
+/// *still stale*, so it reads as covered — `AllLiveWorkersMissed` again. Both
+/// terminally fail a run while the capable peer is up.
+///
+/// So the miss state is read on **both** sides of the fleet read and the two
+/// are required to agree. Registration and invalidation commit atomically (see
+/// `Worker::register_in_fleet`), and snapshots are monotonic in time, so any
+/// commit that the fleet read could have seen is also visible to the second
+/// miss read — which makes it differ from the first. Agreement therefore
+/// certifies that no registration landed anywhere inside the bracket, and the
+/// three reads describe one coherent world.
+fn miss_evidence_confidence(
+    first: &CurrentMissState,
+    second: &CurrentMissState,
+) -> MissEvidenceConfidence {
+    match (first, second) {
+        (CurrentMissState::Owned { .. }, CurrentMissState::Owned { .. }) if first == second => {
+            MissEvidenceConfidence::Current
+        }
+        _ => MissEvidenceConfidence::PossiblyStale,
     }
 }
 
@@ -5083,6 +5168,46 @@ pub fn resolve_capability_miss(
     session_id: Option<uuid::Uuid>,
     live_workers_on_queue: &[String],
 ) -> CapabilityMissResolution {
+    resolve_capability_miss_with_confidence(
+        distinct_workers_before,
+        misses_before,
+        worker_id,
+        max_redeliveries,
+        session_id,
+        live_workers_on_queue,
+        MissEvidenceConfidence::Current,
+    )
+}
+
+/// [`resolve_capability_miss`], told whether the miss evidence it is weighing
+/// is known to be current (issue #804, Codex round-28 P1).
+///
+/// `PossiblyStale` forces the fleet answer to
+/// [`FleetCapabilityEvidence::CapablePeerMayExist`], which is not a fudge but
+/// the literal truth of the situation: the distinct set may name a peer that
+/// has since re-registered onto a capable build and invalidated its own entry,
+/// so a capable peer may indeed exist. That one substitution withholds exactly
+/// the two **evidence-derived** bounds — the primary distinct bound (gated on
+/// `!CapablePeerMayExist`) and the configured total bound (gated on
+/// `AllLiveWorkersMissed`) — while leaving every **ungated** bound in force:
+/// the absolute `10x` ceiling, the `i32::MAX` storage ceiling, the zero-budget
+/// fail-fast, and the session-pinned carve-out. AC3's "bounded release"
+/// therefore still holds under suppression; a permanently-unreadable row
+/// terminates at the ceiling rather than releasing forever.
+///
+/// Suppressing the *distinct* bound as well as the total one is deliberate. Its
+/// input is `capability_miss_workers`, which is the very array a re-registration
+/// invalidates, so its length is precisely what goes stale.
+#[must_use]
+pub fn resolve_capability_miss_with_confidence(
+    distinct_workers_before: &[String],
+    misses_before: i32,
+    worker_id: &str,
+    max_redeliveries: u32,
+    session_id: Option<uuid::Uuid>,
+    live_workers_on_queue: &[String],
+    confidence: MissEvidenceConfidence,
+) -> CapabilityMissResolution {
     let total_after = misses_before.saturating_add(1);
     let worker_is_new = !distinct_workers_before.iter().any(|w| w == worker_id);
     let distinct_before = i32::try_from(distinct_workers_before.len()).unwrap_or(i32::MAX);
@@ -5097,7 +5222,15 @@ pub fn resolve_capability_miss(
     if worker_is_new {
         miss_after.push(worker_id.to_string());
     }
-    let evidence = fleet_capability_evidence(live_workers_on_queue, &miss_after, worker_id);
+    let evidence = match confidence {
+        MissEvidenceConfidence::Current => {
+            fleet_capability_evidence(live_workers_on_queue, &miss_after, worker_id)
+        }
+        // The miss set may name an already-invalidated peer, so no fleet-wide
+        // conclusion may be drawn from it. See the doc comment above for why
+        // this single substitution is the exact suppression required.
+        MissEvidenceConfidence::PossiblyStale => FleetCapabilityEvidence::CapablePeerMayExist,
+    };
     if !capability_miss_releasable(session_id) {
         return CapabilityMissResolution {
             action: CapabilityMissAction::Escalate,
@@ -16114,24 +16247,53 @@ async fn handle_capability_miss(
     // charged to a dispatch that did nothing.
     refund_capability_miss_rate_limit_token(conn, task).await;
 
+    // Issue #804 (Codex rounds 20, 22, 27 and 28): decide on the counters as
+    // they stand NOW, which is not the claim-time snapshot in `task` — this
+    // dispatch may have retired a frontier, and a peer's re-registration may
+    // have invalidated its own stale evidence on this very row.
+    //
+    // The miss state is read on BOTH sides of the fleet read, and the two must
+    // agree before any evidence-derived bound may fire. See
+    // `miss_evidence_confidence` for why neither ordering is safe on its own.
+    let before_fleet =
+        current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed).await;
     // Fleet evidence for the distinct-worker bound (issue #804, Codex round-8
     // P1). See `read_live_fleet_or_degrade` for why a failure here degrades to
     // an empty set instead of propagating.
     let live_workers = read_live_fleet_or_degrade(conn, task, policy.worker_stale_secs).await;
-    // Issue #804 (Codex rounds 20, 22 and 27): decide on the counters as they
-    // stand NOW, which is not the claim-time snapshot in `task` — this dispatch
-    // may have retired a frontier, and a peer's re-registration may have
-    // invalidated its own stale evidence on this very row. See
-    // `current_frontier_miss_state`.
-    let (misses_before, distinct_before) =
+    let after_fleet =
         current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed).await;
-    let resolution = resolve_capability_miss(
+
+    // A lost claim is not a decision to make. The escalation write is not
+    // ownership-guarded, so deciding here would let a stale dispatcher
+    // terminally fail a task another worker now owns (Codex round-28 P1).
+    // Either read observing the loss is enough — the claim does not come back.
+    let (Some((misses_before, distinct_before)), Some(_)) = (
+        before_fleet.decidable_counters(),
+        after_fleet.decidable_counters(),
+    ) else {
+        tracing::debug!(
+            task_id = %task.id,
+            "capability-miss state re-read matched no owned row; the claim was already \
+             taken, so this dispatch makes no decision about it"
+        );
+        // `Released`, not `Completed`: this worker observed nothing about the
+        // execution, so it must not be treated as a clean dispatch (see
+        // `TaskDispatchOutcome`).
+        return Ok(TaskDispatchOutcome::Released {
+            clears_timeout_strike: missing.phase.clears_workflow_timeout_strike(),
+        });
+    };
+    let confidence = miss_evidence_confidence(&before_fleet, &after_fleet);
+    let distinct_before = distinct_before.to_vec();
+    let resolution = resolve_capability_miss_with_confidence(
         &distinct_before,
         misses_before,
         worker_id,
         policy.max_redeliveries,
         task.session_id,
         &live_workers,
+        confidence,
     );
 
     match resolution.action {
@@ -19236,71 +19398,56 @@ impl Worker {
         let host = crate::workers::local_hostname();
         let version = env!("CARGO_PKG_VERSION");
 
+        // This registration may be a RESTART of the same configured worker_id
+        // onto a NEW build (register_worker upserts on worker_id and refreshes
+        // build_id/started_at). Capability-miss evidence stores bare IDs, so
+        // the restarted -- possibly now capable -- instance would otherwise be
+        // indistinguishable from the old incapable one, and another claimant
+        // would derive `AllLiveWorkersMissed` and terminally fail a run at
+        // exactly the moment the fix arrived (issue #804, Codex round-26 P1).
+        //
+        // Publishing the worker while that cleanup fails is strictly worse than
+        // not publishing it, so the two are ATOMIC (Codex round-28 P1): a failed
+        // invalidation rolls the registration back, and the heartbeat's
+        // `Ok(0)` self-heal retries the pair within one interval. See
+        // `register_worker_and_clear_stale_miss_evidence`.
+        let registration = crate::workers::WorkerRegistration {
+            worker_id: self.config.worker_id.clone(),
+            queues: self.config.queues.clone(),
+            shard_assignments: shard_ids,
+            max_concurrency,
+            host: host.clone(),
+            version: Some(version.to_string()),
+            build_id: self.config.build_id.clone(),
+            deployment_name: self.config.deployment_name.clone(),
+            labels: self.config.labels.clone(),
+            max_concurrent_sessions: self.config.max_concurrent_sessions,
+        };
         match pool.get().await {
             Ok(mut conn) => {
-                if let Err(error) = crate::workers::register_worker(
+                match crate::workers::register_worker_and_clear_stale_miss_evidence(
                     &mut conn,
-                    &self.config.worker_id,
-                    &self.config.queues,
-                    &shard_ids,
-                    max_concurrency,
-                    &host,
-                    Some(version),
-                    &self.config.build_id,
-                    self.config.deployment_name.as_deref(),
-                    &self.config.labels,
-                    self.config.max_concurrent_sessions,
+                    &registration,
                 )
                 .await
                 {
-                    tracing::warn!(
-                        worker_id = %self.config.worker_id,
-                        error = %error,
-                        "failed to register worker in fleet table; continuing without fleet registration"
-                    );
-                } else {
-                    tracing::info!(
-                        worker_id = %self.config.worker_id,
-                        host = %host,
-                        max_concurrency,
-                        "worker registered in fleet"
-                    );
-                    // This registration may be a RESTART of the same configured
-                    // worker_id onto a NEW build (register_worker upserts on
-                    // worker_id and refreshes build_id/started_at). Capability-miss
-                    // evidence stores bare IDs, so without this the restarted --
-                    // possibly now capable -- instance is indistinguishable from
-                    // the old incapable one, and another claimant would derive
-                    // `AllLiveWorkersMissed` and terminally fail a run at exactly
-                    // the moment the fix arrived (issue #804, Codex round-26 P1).
-                    //
-                    // Only ever REMOVES evidence, so it can only bias toward
-                    // releasing rather than escalating; the ungated absolute
-                    // ceiling on `capability_misses` (untouched here) still bounds
-                    // a worker crash-looping on the same incapable build.
-                    match crate::queue::invalidate_capability_miss_evidence_for_worker(
-                        &mut conn,
-                        &self.config.worker_id,
-                        &self.config.queues,
-                    )
-                    .await
-                    {
-                        Ok(cleared) if cleared > 0 => {
-                            tracing::info!(
-                                worker_id = %self.config.worker_id,
-                                cleared,
-                                "cleared stale capability-miss evidence for re-registered worker id"
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            tracing::warn!(
-                                worker_id = %self.config.worker_id,
-                                error = %error,
-                                "failed to clear stale capability-miss evidence; a task this id \
-                                 missed on a previous build may escalate early"
-                            );
-                        }
+                    Ok(cleared) => {
+                        tracing::info!(
+                            worker_id = %self.config.worker_id,
+                            host = %host,
+                            max_concurrency,
+                            cleared_capability_miss_evidence = cleared,
+                            "worker registered in fleet"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            worker_id = %self.config.worker_id,
+                            error = %error,
+                            "failed to register worker in fleet table (registration and \
+                             capability-miss cleanup are atomic, so neither landed); the \
+                             heartbeat will retry"
+                        );
                     }
                 }
             }
@@ -25170,6 +25317,218 @@ mod tests {
             over.action,
             CapabilityMissAction::Escalate,
             "without a reset the configured budget is enforced on the true count"
+        );
+    }
+
+    // -- Codex round-28 P1s: ownership, staleness, and read coherence --------
+
+    /// A re-read that matches no owned row is POSITIVE evidence that the claim
+    /// is gone, not merely an absence of fresh data. It must not fall back to
+    /// the snapshot and let the decision proceed: the escalation write is not
+    /// ownership-guarded (`queue::fail_task` accepts any PENDING/RUNNING row
+    /// regardless of `worker_id`), so a stale dispatcher deciding `Escalate`
+    /// terminally fails a task another worker now owns (Codex round-28 P1).
+    #[test]
+    fn a_lost_claim_is_distinguished_from_an_unreadable_row() {
+        let task = frontier_task(3, &["worker-a"]);
+        let (misses, workers) = frontier_miss_state(&task, false);
+
+        let lost = CurrentMissState::ClaimLost;
+        assert!(
+            lost.decidable_counters().is_none(),
+            "a lost claim yields no counters to decide on -- the caller must \
+             return without making a terminal decision"
+        );
+
+        let unreadable = CurrentMissState::Unreadable {
+            misses,
+            workers: workers.clone(),
+        };
+        assert_eq!(
+            unreadable.decidable_counters(),
+            Some((misses, workers.as_slice())),
+            "an unreadable row still decides on the snapshot, so the storage \
+             ceiling keeps its real count (the round-21 P2 hazard)"
+        );
+    }
+
+    /// Two agreeing reads of an owned row are the only state that licenses an
+    /// evidence-derived escalation. Anything else -- an unreadable row, or a
+    /// row that changed while the fleet was being read -- means the distinct
+    /// set may name a worker that has since invalidated its own entry.
+    #[test]
+    fn evidence_confidence_requires_two_agreeing_owned_reads() {
+        let owned = |m: i32, w: &[&str]| CurrentMissState::Owned {
+            misses: m,
+            workers: w.iter().map(|s| (*s).to_string()).collect(),
+        };
+
+        assert_eq!(
+            miss_evidence_confidence(&owned(2, &["a", "b"]), &owned(2, &["a", "b"])),
+            MissEvidenceConfidence::Current,
+            "an unchanged owned row across both reads is a coherent snapshot"
+        );
+        assert_eq!(
+            miss_evidence_confidence(&owned(2, &["a", "b"]), &owned(2, &["b"])),
+            MissEvidenceConfidence::PossiblyStale,
+            "a peer invalidating its entry between the two reads is exactly the \
+             registration this decision must not talk over"
+        );
+        assert_eq!(
+            miss_evidence_confidence(&owned(2, &["a"]), &owned(3, &["a"])),
+            MissEvidenceConfidence::PossiblyStale,
+            "any disagreement at all, including the count"
+        );
+        assert_eq!(
+            miss_evidence_confidence(
+                &CurrentMissState::Unreadable {
+                    misses: 2,
+                    workers: vec!["a".to_string()],
+                },
+                &owned(2, &["a"]),
+            ),
+            MissEvidenceConfidence::PossiblyStale,
+            "an unreadable read is not evidence of agreement"
+        );
+    }
+
+    /// Possibly-stale evidence withholds BOTH evidence-derived bounds. The
+    /// distinct bound is included deliberately: its input is the very array a
+    /// re-registration invalidates, so its length is what goes stale.
+    #[test]
+    fn stale_evidence_withholds_both_evidence_derived_bounds() {
+        const BUDGET: u32 = 5;
+        let fleet: Vec<String> = (0..6).map(|i| format!("w{i}")).collect();
+
+        // Budget spent by 5 distinct workers, and the registry says every live
+        // worker has missed -- normally an escalation on both bounds at once.
+        let current = resolve_capability_miss_with_confidence(
+            &fleet[..5],
+            5,
+            &fleet[5],
+            BUDGET,
+            None,
+            &fleet,
+            MissEvidenceConfidence::Current,
+        );
+        assert_eq!(
+            current.action,
+            CapabilityMissAction::Escalate,
+            "control: a coherent snapshot still escalates at the budget"
+        );
+
+        let stale = resolve_capability_miss_with_confidence(
+            &fleet[..5],
+            5,
+            &fleet[5],
+            BUDGET,
+            None,
+            &fleet,
+            MissEvidenceConfidence::PossiblyStale,
+        );
+        assert_eq!(
+            stale.action,
+            CapabilityMissAction::Release,
+            "evidence that may name an already-invalidated peer must not \
+             terminally fail the run"
+        );
+        assert_eq!(
+            stale.evidence,
+            FleetCapabilityEvidence::CapablePeerMayExist,
+            "and the reported evidence must say so, rather than claiming a \
+             fleet-wide conclusion the read could not support"
+        );
+    }
+
+    /// Suppression is bounded (AC3): the ungated backstops are untouched, so a
+    /// permanently-unreadable row still terminates rather than releasing
+    /// forever.
+    #[test]
+    fn stale_evidence_keeps_every_ungated_bound() {
+        let ceiling = CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER * 5;
+        let lone = "w1".to_string();
+        let seen = vec![lone.clone()];
+
+        let over_ceiling = resolve_capability_miss_with_confidence(
+            &seen,
+            ceiling,
+            &lone,
+            5,
+            None,
+            &[],
+            MissEvidenceConfidence::PossiblyStale,
+        );
+        assert_eq!(
+            over_ceiling.action,
+            CapabilityMissAction::Escalate,
+            "the absolute ceiling is ungated and must survive suppression"
+        );
+
+        let storage = resolve_capability_miss_with_confidence(
+            &seen,
+            i32::MAX,
+            &lone,
+            5,
+            None,
+            &[],
+            MissEvidenceConfidence::PossiblyStale,
+        );
+        assert_eq!(
+            storage.action,
+            CapabilityMissAction::Escalate,
+            "so must the storage ceiling -- releasing would issue an UPDATE \
+             that can only raise `integer out of range`"
+        );
+
+        let zero_budget = resolve_capability_miss_with_confidence(
+            &[],
+            0,
+            "w1",
+            0,
+            None,
+            &[],
+            MissEvidenceConfidence::PossiblyStale,
+        );
+        assert_eq!(
+            zero_budget.action,
+            CapabilityMissAction::Escalate,
+            "a disabled budget is a configured knob, not fleet evidence"
+        );
+
+        let pinned = resolve_capability_miss_with_confidence(
+            &[],
+            0,
+            "w1",
+            5,
+            Some(uuid::Uuid::new_v4()),
+            &[],
+            MissEvidenceConfidence::PossiblyStale,
+        );
+        assert_eq!(
+            pinned.action,
+            CapabilityMissAction::Escalate,
+            "a session-pinned task can only ever return to one host, which is \
+             a structural fact rather than an evidence-derived one"
+        );
+    }
+
+    /// The 6-argument form is the confident one, so every existing call site
+    /// keeps its meaning.
+    #[test]
+    fn the_unconfidenced_form_still_means_current() {
+        let fleet: Vec<String> = (0..6).map(|i| format!("w{i}")).collect();
+        assert_eq!(
+            resolve_capability_miss(&fleet[..5], 5, &fleet[5], 5, None, &fleet).action,
+            resolve_capability_miss_with_confidence(
+                &fleet[..5],
+                5,
+                &fleet[5],
+                5,
+                None,
+                &fleet,
+                MissEvidenceConfidence::Current,
+            )
+            .action,
         );
     }
 

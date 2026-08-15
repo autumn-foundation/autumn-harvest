@@ -543,6 +543,33 @@ async fn wait_for_miss_by(
     })
 }
 
+/// Poll until some task row for `exec_id` is claimed by `worker_id`.
+///
+/// The claim-theft test needs a positive observable for "the workflow body has
+/// run", and the body's own effect — handing the row to another owner — is
+/// exactly that.
+async fn wait_for_task_owner(
+    url: &str,
+    exec_id: ExecutionId,
+    worker_id: &str,
+    timeout: Duration,
+) -> TaskQueueItem {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(task) = load_tasks(url, exec_id)
+                .await
+                .into_iter()
+                .find(|t| t.worker_id.as_deref() == Some(worker_id))
+            {
+                break task;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no task row was claimed by {worker_id} within {timeout:?}"))
+}
+
 async fn wait_for_state(
     url: &str,
     exec_id: ExecutionId,
@@ -764,6 +791,43 @@ fn workflow_invalidates_peer_then_misses(
         // Now miss: this activity is registered nowhere on this worker, so the
         // enqueue preflight raises an `AfterHandler` capability miss.
         ctx.execute_activity_raw("never_registered_activity", input, Q_CLAIM_RACE)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Where `workflow_steals_own_claim_then_misses` reaches the database (issue
+/// #804 round 28). Same `OnceLock` rationale as [`RACE_INJECTION`].
+static CLAIM_THEFT_INJECTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The deterministic injection point for the round-28 lost-claim P1: a workflow
+/// body that hands its own task row to another worker **while its dispatch is
+/// still running**, then misses.
+///
+/// This is what a concurrent poison-pill reclaim or an operator action looks
+/// like from the dispatcher's side, hit exactly rather than raced for: the body
+/// runs strictly between `claim_task` and the `AfterHandler` miss raised by
+/// `persist_scheduled_activities`, so by the time the decision runs the row is
+/// genuinely owned by someone else.
+fn workflow_steals_own_claim_then_misses(
+    ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> BoxFut<'_> {
+    Box::pin(async move {
+        if let Some(url) = CLAIM_THEFT_INJECTION.get() {
+            let mut conn = AsyncPgConnection::establish(url)
+                .await
+                .expect("claim-theft injection connects");
+            diesel::sql_query(
+                "UPDATE harvest_task_queue SET worker_id = 'thief' \
+                 WHERE queue_name = $1 AND state = 'RUNNING'",
+            )
+            .bind::<diesel::sql_types::Text, _>(Q_LOST_CLAIM)
+            .execute(&mut conn)
+            .await
+            .expect("claim-theft injection reassigns the row");
+        }
+        ctx.execute_activity_raw("never_registered_activity", input, Q_LOST_CLAIM)
             .await
             .map_err(|e| e.to_string())
     })
@@ -2069,6 +2133,10 @@ async fn single_worker_fleet_escalates_at_the_configured_budget() {
 const Q_RESTART: &str = "q804-restart";
 const Q_CLAIM_RACE: &str = "q804-claim-race";
 
+/// Dedicated queue for the round-28 lost-claim test, so stealing every RUNNING
+/// row on it cannot disturb an adjacent test sharing the database.
+const Q_LOST_CLAIM: &str = "q804-lost-claim";
+
 /// Move the execution's task rows out of (or back into) claim range.
 ///
 /// The restarted worker in these tests must REGISTER without CLAIMING: it is
@@ -2411,6 +2479,188 @@ async fn peer_reregistering_mid_dispatch_is_seen_by_the_decision() {
         metrics.samples()
     );
     assert_eq!(metrics.quarantine_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Codex round-28 P1s: a lost claim makes no decision; registration is atomic.
+// ---------------------------------------------------------------------------
+
+/// A dispatcher that lost its claim mid-dispatch must make **no terminal
+/// decision** about the task (issue #804, Codex round-28 P1).
+///
+/// The release path is ownership-guarded (`worker_id = $2`), but the escalation
+/// path is not: `queue::fail_task` accepts any `PENDING`/`RUNNING` row
+/// regardless of `worker_id`, and `fail_task_and_execution` transitions the
+/// execution. So a stale dispatcher deciding `Escalate` terminally fails a task
+/// another worker now owns.
+///
+/// Budget `0` is the sharpest possible case and the one Codex named: it
+/// escalates on the very first miss, so *every* protection except the ownership
+/// probe is out of the way, and the decision the fix suppresses is the only
+/// thing standing between the stolen row and a terminal failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_lost_mid_dispatch_makes_no_terminal_decision() {
+    const BUDGET: u32 = 0;
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "lost_claim_wf",
+        serde_json::json!({}),
+        Q_LOST_CLAIM,
+    )
+    .await;
+
+    CLAIM_THEFT_INJECTION
+        .set(url.clone())
+        .expect("claim-theft injection is armed exactly once per process");
+
+    let metrics = Arc::new(CapabilityMetrics::default());
+    let worker = build_worker(
+        "pod-loses-claim",
+        &[Q_LOST_CLAIM],
+        build_registry(
+            vec![workflow_info(
+                "lost_claim_wf",
+                workflow_steals_own_claim_then_misses,
+            )],
+            vec![],
+            Arc::clone(&metrics),
+        ),
+        BUDGET,
+    );
+
+    with_worker_running(&worker, &pool, async {
+        // This test asserts that NOTHING happens, so there is no completion
+        // event to wait on — a lost claim deliberately records no metric. Wait
+        // instead on the precondition the body establishes (the row changing
+        // hands), which is the last observable moment before the decision, then
+        // allow a small fixed grace for the decision itself: the miss is raised
+        // synchronously in the same dispatch, microseconds after the body
+        // returns. A single long blind sleep would be both slower and less
+        // reliable, since it hopes the claim, body and miss all fit inside it.
+        wait_for_task_owner(&url, exec_id, "thief", Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+    })
+    .await;
+
+    let execution = load_execution(&url, exec_id).await;
+    assert_eq!(
+        execution.state, "RUNNING",
+        "a dispatcher that no longer owns the row must not fail the run it \
+         stopped being responsible for"
+    );
+    assert_eq!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED),
+        0,
+        "no escalation may be decided on a lost claim, got {:?}",
+        metrics.samples()
+    );
+
+    // And the row itself is untouched by this dispatch: still owned by the
+    // thief, never failed.
+    let task = load_tasks(&url, exec_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("the workflow task row survives an undecided dispatch");
+    assert_eq!(
+        task.state, "RUNNING",
+        "the stolen row belongs to its new owner, not to this dispatch"
+    );
+    assert_eq!(
+        task.worker_id.as_deref(),
+        Some("thief"),
+        "sanity: the injection really did hand the claim away"
+    );
+    assert_eq!(
+        task.capability_miss_workers,
+        Vec::<String>::new(),
+        "a dispatch that owns nothing records nothing"
+    );
+}
+
+/// Registration and capability-miss cleanup are one commit (issue #804, Codex
+/// round-28 P1).
+///
+/// Publishing a worker as live while its stale evidence survives makes it
+/// affirmative fleet evidence *against itself*: another claimant reads the whole
+/// live fleet as already covered and terminally fails a run at exactly the
+/// moment the capable build arrived. So a failed cleanup must take the
+/// registration with it.
+///
+/// The failure is injected by renaming `harvest_task_queue` out from under the
+/// invalidation on a separate connection — deterministic, and reversible within
+/// the test. The DB suite runs `--test-threads=1`, so no sibling can observe it.
+#[tokio::test]
+async fn a_failed_evidence_cleanup_rolls_back_the_registration() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    let registration = autumn_harvest::workers::WorkerRegistration {
+        worker_id: "pod-atomic".to_string(),
+        queues: vec![Q_LOST_CLAIM.to_string()],
+        shard_assignments: vec![0],
+        max_concurrency: 1,
+        host: "test-host".to_string(),
+        version: None,
+        build_id: String::new(),
+        deployment_name: None,
+        labels: std::collections::HashMap::new(),
+        max_concurrent_sessions: 0,
+    };
+
+    // Control: with the table present, both writes land.
+    let cleared = autumn_harvest::workers::register_worker_and_clear_stale_miss_evidence(
+        &mut conn,
+        &registration,
+    )
+    .await
+    .expect("the happy path commits both writes");
+    assert_eq!(cleared, 0, "no task carries this id's evidence yet");
+    assert_eq!(
+        live_worker_count(&url, "pod-atomic").await,
+        1,
+        "control: a successful pair publishes the worker"
+    );
+
+    // Now remove the row so the rollback has something to prove, and break the
+    // invalidation's target table.
+    let mut side = connect(&url).await;
+    diesel::sql_query("DELETE FROM harvest_workers WHERE worker_id = 'pod-atomic'")
+        .execute(&mut side)
+        .await
+        .expect("clears the control row");
+    diesel::sql_query("ALTER TABLE harvest_task_queue RENAME TO harvest_task_queue_hidden")
+        .execute(&mut side)
+        .await
+        .expect("hides the invalidation's target");
+
+    let failed = autumn_harvest::workers::register_worker_and_clear_stale_miss_evidence(
+        &mut conn,
+        &registration,
+    )
+    .await;
+
+    diesel::sql_query("ALTER TABLE harvest_task_queue_hidden RENAME TO harvest_task_queue")
+        .execute(&mut side)
+        .await
+        .expect("restores the table for any later test");
+
+    assert!(
+        failed.is_err(),
+        "the pair must surface the cleanup failure rather than swallowing it"
+    );
+    assert_eq!(
+        live_worker_count(&url, "pod-atomic").await,
+        0,
+        "a worker published while its stale evidence survives is affirmative \
+         fleet evidence against itself, so the registration must roll back with \
+         the cleanup rather than being left committed"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2935,6 +3185,17 @@ async fn seed_live_worker(url: &str, worker_id: &str, queue: &str) {
 /// observable edge for "this worker has come up" — and therefore for "its stale
 /// capability-miss evidence has been invalidated", which happens in the same
 /// registration step.
+/// How many rows `harvest_workers` holds for `worker_id` (issue #804 round 28).
+async fn live_worker_count(url: &str, worker_id: &str) -> i64 {
+    let mut conn = connect(url).await;
+    harvest_workers::table
+        .filter(harvest_workers::worker_id.eq(worker_id))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count worker rows")
+}
+
 async fn wait_for_live_worker(url: &str, worker_id: &str, timeout: Duration) {
     tokio::time::timeout(timeout, async {
         loop {
