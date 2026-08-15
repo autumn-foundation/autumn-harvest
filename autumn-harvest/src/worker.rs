@@ -4791,6 +4791,44 @@ fn apply_panic_strike_clear_for_failure<T>(
     }
 }
 
+/// Clear the issue #782 panic strike when a capability miss **escalated**
+/// (issue #804, Codex round-16 P2).
+///
+/// [`failure_clears_panic_strike`] deliberately preserves the strike for a
+/// pre-/mid-handler miss, because that miss normally *releases* the task and the
+/// execution keeps running (round 13). Escalation is the other outcome: it
+/// routes through `fail_task_and_execution`, so the execution is terminally
+/// failed and no later cycle for it exists. Preserving the entry there leaks one
+/// map slot per such execution for the worker's lifetime — the same leak the
+/// ordinary-error arm of `apply_panic_strike_clear_for_failure` exists to
+/// prevent.
+///
+/// **The discriminator is the re-raised typed error, and that is load-bearing.**
+/// `escalate_capability_miss` re-raises `HandlerNotRegistered` only *after*
+/// `fail_task_and_execution` returned `Ok`, and the release arm never returns
+/// that variant at all — so this shape means "escalated **and** the terminal
+/// write landed", and nothing else. A failed terminal write propagates as its
+/// own error variant, leaves the row stranded `RUNNING`, and keeps the strike:
+/// that row is re-claimed and re-driven later, which is exactly the case round
+/// 13's protection is for.
+///
+/// `workflow_exec_id` is `None` only for a task with no owning execution, which
+/// has no key in this map.
+fn clear_panic_strike_on_capability_miss_escalation<T>(
+    strikes: &std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>,
+    workflow_exec_id: Option<uuid::Uuid>,
+    outcome: &HarvestResult<T>,
+) {
+    if let Some(exec_id) = workflow_exec_id
+        && outcome
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.handler_not_registered().is_some())
+    {
+        clear_panic_strike(strikes, exec_id);
+    }
+}
+
 /// Encode a contained **activity** handler-panic message as the typed
 /// `harvest_activity_failure_v1` envelope carrying the engine-reserved
 /// [`ERROR_TYPE_HANDLER_PANIC`](crate::failure::ERROR_TYPE_HANDLER_PANIC)
@@ -15287,7 +15325,7 @@ async fn process_task(
     let phase = error
         .capability_miss_phase()
         .unwrap_or(CapabilityMissPhase::BeforeHandler);
-    handle_capability_miss(
+    let resolved = handle_capability_miss(
         &mut conn,
         &task,
         worker_id,
@@ -15295,7 +15333,18 @@ async fn process_task(
         MissingHandler { kind, name, phase },
         capability_miss_policy,
     )
-    .await
+    .await;
+    // An escalation terminally failed the execution, so its #782 strike entry
+    // has nothing left to measure and must not outlive it (Codex round-16 P2).
+    // A release leaves the execution running and keeps the entry — see
+    // `clear_panic_strike_on_capability_miss_escalation` for why the re-raised
+    // typed error is the exact discriminator.
+    clear_panic_strike_on_capability_miss_escalation(
+        &workflow_panic_strikes,
+        task.workflow_exec_id,
+        &resolved,
+    );
+    resolved
 }
 
 /// The handler a claiming worker turned out not to register (issue #804).
@@ -24276,6 +24325,90 @@ mod tests {
         let ordinary: HarvestResult<()> = Err(HarvestError::NotFound("gone".into()));
         apply_panic_strike_clear_for_failure(&strikes, exec_id, &ordinary);
         assert!(strikes.lock().unwrap().is_empty());
+    }
+
+    /// **Issue #804 round-16 P2.** An *escalated* capability miss must clear the
+    /// #782 panic strike, because escalation terminally fails the execution.
+    ///
+    /// Round 13 stopped a pre-/mid-handler miss from clearing the strike, which
+    /// is right for the **release** path — the execution stays `RUNNING` and the
+    /// streak must survive. Escalation is the opposite: it routes through
+    /// `fail_task_and_execution`, so there is no later cycle for that execution
+    /// and the entry would sit in the map for the worker's lifetime — exactly
+    /// the leak `apply_panic_strike_clear_for_failure`'s ordinary-error arm
+    /// exists to prevent.
+    ///
+    /// The discriminator is deliberately the **re-raised typed error**:
+    /// `escalate_capability_miss` re-raises `HandlerNotRegistered` only *after*
+    /// `fail_task_and_execution` succeeded, so this shape means "terminally
+    /// failed" and nothing else. A DB error from the terminal write propagates
+    /// as its own variant and preserves the strike, which is what the
+    /// stranded-row re-drive needs.
+    #[test]
+    fn capability_miss_escalation_clears_the_panic_strike() {
+        let exec_id = uuid::Uuid::new_v4();
+        let seed = || std::sync::Mutex::new(std::collections::HashMap::from([(exec_id, 2_u32)]));
+
+        // Escalation re-raises the typed miss after the terminal write landed.
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+            CapabilityMissPhase::AfterHandler,
+        ] {
+            let strikes = seed();
+            let escalated: HarvestResult<TaskDispatchOutcome> =
+                Err(HarvestError::HandlerNotRegistered {
+                    kind: "workflow",
+                    name: "onboarding".into(),
+                    phase,
+                });
+            clear_panic_strike_on_capability_miss_escalation(&strikes, Some(exec_id), &escalated);
+            assert!(
+                strikes.lock().unwrap().is_empty(),
+                "a {phase:?} escalation terminally fails the execution, so the \
+                 strike entry must not outlive it"
+            );
+        }
+
+        // A release is non-terminal: round 13's protection stands.
+        let strikes = seed();
+        let released: HarvestResult<TaskDispatchOutcome> = Ok(TaskDispatchOutcome::Released {
+            clears_timeout_strike: false,
+        });
+        clear_panic_strike_on_capability_miss_escalation(&strikes, Some(exec_id), &released);
+        assert_eq!(
+            strikes.lock().unwrap().get(&exec_id).copied(),
+            Some(2),
+            "a released task keeps running; clearing here would let a worker \
+             alternating panic/miss hold workflow_panic_max_attempts out of reach"
+        );
+
+        // The terminal write failed, so the row is stranded `RUNNING` and will
+        // be re-driven. Preserving the streak is the whole point of round 13.
+        let strikes = seed();
+        let write_failed: HarvestResult<TaskDispatchOutcome> =
+            Err(HarvestError::NotFound("terminal write lost the row".into()));
+        clear_panic_strike_on_capability_miss_escalation(&strikes, Some(exec_id), &write_failed);
+        assert_eq!(
+            strikes.lock().unwrap().get(&exec_id).copied(),
+            Some(2),
+            "no terminal write means no terminal execution; the strike survives"
+        );
+
+        // A task with no owning execution has no key to clear.
+        let strikes = seed();
+        let escalated: HarvestResult<TaskDispatchOutcome> =
+            Err(HarvestError::HandlerNotRegistered {
+                kind: "activity",
+                name: "send_email".into(),
+                phase: CapabilityMissPhase::BeforeHandler,
+            });
+        clear_panic_strike_on_capability_miss_escalation(&strikes, None, &escalated);
+        assert_eq!(
+            strikes.lock().unwrap().get(&exec_id).copied(),
+            Some(2),
+            "an orphan task cannot name an execution, so nothing is cleared"
+        );
     }
 
     #[test]
