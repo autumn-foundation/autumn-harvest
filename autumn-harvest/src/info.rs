@@ -856,11 +856,82 @@ pub fn validate_against_schema(
     input: &serde_json::Value,
 ) -> Result<(), Vec<SchemaViolation>> {
     let mut violations: Vec<SchemaViolation> = Vec::new();
-    validate_node(schema, schema, input, "", &mut violations, 0);
+    validate_node(
+        schema,
+        schema,
+        input,
+        &JsonPointerPath::Root,
+        &mut violations,
+        0,
+    );
     if violations.is_empty() {
         Ok(())
     } else {
         Err(violations)
+    }
+}
+
+/// A borrowed, zero-allocation link in the JSON-Pointer path currently being
+/// validated, threaded through [`validate_node`]'s recursion in place of a
+/// pre-materialized `&str` prefix.
+///
+/// Each recursive call borrows a `JsonPointerPath` value that lives on the
+/// *caller's* stack frame -- safe because that frame outlives the whole
+/// recursive call it makes, the same "cons list on the stack" shape as the
+/// existing `$ref` cycle guard's `visited` set. The RFC 6901 escape
+/// (`~` -> `~0`, `/` -> `~1`) and the actual `String` join happen only in
+/// [`JsonPointerPath::materialize`], called exactly at the handful of sites
+/// that construct a [`SchemaViolation`] -- so a validation call that finds
+/// zero violations (the common, deliberately-measured case for the schema
+/// walker's own `schema_validate_profile` benchmark) allocates zero path
+/// strings, no matter how deep or wide the schema is. Every intermediate
+/// property/array-item *visited* on the way to a violation-free subtree was
+/// previously paying for a `String` allocation whose value nothing ever
+/// read.
+enum JsonPointerPath<'a> {
+    Root,
+    Prop { parent: &'a Self, name: &'a str },
+    Index { parent: &'a Self, index: usize },
+}
+
+impl JsonPointerPath<'_> {
+    /// Build the escaped RFC 6901 JSON Pointer string for this path, or
+    /// `None` at the root -- matching the `field_path` convention every
+    /// [`SchemaViolation`] call site already relies on (an empty pointer is
+    /// represented as the absence of a path, not `Some(String::new())`).
+    fn materialize(&self) -> Option<String> {
+        // Write the decimal digits of an array index directly into the
+        // target buffer -- no intermediate `String` the way
+        // `format!("{index}")` would allocate.
+        use std::fmt::Write as _;
+
+        fn push_segment(path: &JsonPointerPath<'_>, out: &mut String) {
+            match path {
+                JsonPointerPath::Root => {}
+                JsonPointerPath::Prop { parent, name } => {
+                    push_segment(parent, out);
+                    out.push('/');
+                    for ch in name.chars() {
+                        match ch {
+                            '~' => out.push_str("~0"),
+                            '/' => out.push_str("~1"),
+                            c => out.push(c),
+                        }
+                    }
+                }
+                JsonPointerPath::Index { parent, index } => {
+                    push_segment(parent, out);
+                    out.push('/');
+                    let _ = write!(out, "{index}");
+                }
+            }
+        }
+        if matches!(self, JsonPointerPath::Root) {
+            return None;
+        }
+        let mut out = String::new();
+        push_segment(self, &mut out);
+        Some(out)
     }
 }
 
@@ -876,7 +947,7 @@ pub fn validate_against_schema(
 /// accept, never a panic).
 const MAX_VALIDATION_DEPTH: usize = 128;
 
-/// Recursive schema walker — validates `value` against `schema` at path `ptr`.
+/// Recursive schema walker — validates `value` against `schema` at `path`.
 ///
 /// `root` is the top-level schema document, used to resolve `$ref` pointers.
 /// `depth` is the current recursion depth, bounded by [`MAX_VALIDATION_DEPTH`].
@@ -885,7 +956,7 @@ fn validate_node(
     root: &serde_json::Value,
     schema: &serde_json::Value,
     value: &serde_json::Value,
-    ptr: &str,
+    path: &JsonPointerPath<'_>,
     out: &mut Vec<SchemaViolation>,
     depth: usize,
 ) {
@@ -896,11 +967,7 @@ fn validate_node(
             message:
                 "validation aborted: schema or input nesting exceeds the maximum supported depth"
                     .to_string(),
-            field_path: if ptr.is_empty() {
-                None
-            } else {
-                Some(ptr.to_string())
-            },
+            field_path: path.materialize(),
         });
         return;
     }
@@ -927,15 +994,6 @@ fn validate_node(
         return;
     };
 
-    // field_path helper: returns None for the root, Some(ptr) otherwise.
-    let path = || {
-        if ptr.is_empty() {
-            None
-        } else {
-            Some(ptr.to_string())
-        }
-    };
-
     // type check — handles both scalar "type": "string" and multi-type "type": ["string","null"]
     if let Some(type_node) = schema_obj.get("type") {
         let type_ok = type_node.as_str().map_or_else(
@@ -952,7 +1010,7 @@ fn validate_node(
             let expected = type_node.to_string();
             out.push(SchemaViolation {
                 message: format!("expected type {expected}, got '{}'", json_type_name(value)),
-                field_path: path(),
+                field_path: path.materialize(),
             });
             return;
         }
@@ -967,11 +1025,13 @@ fn validate_node(
             if let Some(field) = req.as_str()
                 && !obj.contains_key(field)
             {
-                // Escape field name per RFC 6901: ~ → ~0, / → ~1.
-                let escaped = field.replace('~', "~0").replace('/', "~1");
+                let child_path = JsonPointerPath::Prop {
+                    parent: path,
+                    name: field,
+                };
                 out.push(SchemaViolation {
                     message: format!("missing required field '{field}'"),
-                    field_path: Some(format!("{ptr}/{escaped}")),
+                    field_path: child_path.materialize(),
                 });
             }
         }
@@ -984,10 +1044,11 @@ fn validate_node(
     ) {
         for (prop_name, prop_schema) in properties {
             if let Some(prop_value) = obj.get(prop_name) {
-                // Escape property name per RFC 6901: ~ → ~0, / → ~1.
-                let escaped_name = prop_name.replace('~', "~0").replace('/', "~1");
-                let child_ptr = format!("{ptr}/{escaped_name}");
-                validate_node(root, prop_schema, prop_value, &child_ptr, out, depth + 1);
+                let child_path = JsonPointerPath::Prop {
+                    parent: path,
+                    name: prop_name,
+                };
+                validate_node(root, prop_schema, prop_value, &child_path, out, depth + 1);
             }
         }
     }
@@ -998,15 +1059,18 @@ fn validate_node(
     {
         out.push(SchemaViolation {
             message: "value is not one of the allowed enum values".to_string(),
-            field_path: path(),
+            field_path: path.materialize(),
         });
     }
 
     // array items — recurse into each element
     if let (Some(items_schema), Some(arr)) = (schema_obj.get("items"), value.as_array()) {
         for (i, elem) in arr.iter().enumerate() {
-            let child_ptr = format!("{ptr}/{i}");
-            validate_node(root, items_schema, elem, &child_ptr, out, depth + 1);
+            let child_path = JsonPointerPath::Index {
+                parent: path,
+                index: i,
+            };
+            validate_node(root, items_schema, elem, &child_path, out, depth + 1);
         }
     }
 
@@ -1020,7 +1084,7 @@ fn validate_node(
         {
             out.push(SchemaViolation {
                 message: format!("string is shorter than minLength {min}"),
-                field_path: path(),
+                field_path: path.materialize(),
             });
         }
         if let Some(max) = schema_obj
@@ -1030,7 +1094,7 @@ fn validate_node(
         {
             out.push(SchemaViolation {
                 message: format!("string is longer than maxLength {max}"),
-                field_path: path(),
+                field_path: path.materialize(),
             });
         }
     }
@@ -1044,7 +1108,7 @@ fn validate_node(
         {
             out.push(SchemaViolation {
                 message: format!("value {n} is less than minimum {min}"),
-                field_path: path(),
+                field_path: path.materialize(),
             });
         }
         if let Some(max) = schema_obj
@@ -1054,7 +1118,7 @@ fn validate_node(
         {
             out.push(SchemaViolation {
                 message: format!("value {n} is greater than maximum {max}"),
-                field_path: path(),
+                field_path: path.materialize(),
             });
         }
     }
@@ -1076,10 +1140,13 @@ fn validate_node(
             // boolean false: any unknown key is forbidden
             for key in obj.keys() {
                 if !is_known_prop(key) {
-                    let escaped = key.replace('~', "~0").replace('/', "~1");
+                    let child_path = JsonPointerPath::Prop {
+                        parent: path,
+                        name: key,
+                    };
                     out.push(SchemaViolation {
                         message: format!("additional property '{key}' is not allowed"),
-                        field_path: Some(format!("{ptr}/{escaped}")),
+                        field_path: child_path.materialize(),
                     });
                 }
             }
@@ -1087,9 +1154,11 @@ fn validate_node(
             // schema object: validate each additional (non-properties) key against it
             for (key, val) in obj {
                 if !is_known_prop(key) {
-                    let escaped = key.replace('~', "~0").replace('/', "~1");
-                    let child_ptr = format!("{ptr}/{escaped}");
-                    validate_node(root, add_props, val, &child_ptr, out, depth + 1);
+                    let child_path = JsonPointerPath::Prop {
+                        parent: path,
+                        name: key,
+                    };
+                    validate_node(root, add_props, val, &child_path, out, depth + 1);
                 }
             }
         }
@@ -1099,7 +1168,14 @@ fn validate_node(
     if let Some(all_of) = schema_obj.get("allOf").and_then(|v| v.as_array()) {
         for sub_schema in all_of {
             let mut sub_violations = Vec::new();
-            validate_node(root, sub_schema, value, ptr, &mut sub_violations, depth + 1);
+            validate_node(
+                root,
+                sub_schema,
+                value,
+                path,
+                &mut sub_violations,
+                depth + 1,
+            );
             out.extend(sub_violations);
         }
     }
@@ -1108,13 +1184,20 @@ fn validate_node(
     if let Some(any_of) = schema_obj.get("anyOf").and_then(|v| v.as_array()) {
         let satisfied = any_of.iter().any(|sub_schema| {
             let mut sub_violations = Vec::new();
-            validate_node(root, sub_schema, value, ptr, &mut sub_violations, depth + 1);
+            validate_node(
+                root,
+                sub_schema,
+                value,
+                path,
+                &mut sub_violations,
+                depth + 1,
+            );
             sub_violations.is_empty()
         });
         if !satisfied {
             out.push(SchemaViolation {
                 message: "value does not match any of the allowed schemas (anyOf)".to_string(),
-                field_path: path(),
+                field_path: path.materialize(),
             });
         }
     }
@@ -1125,7 +1208,14 @@ fn validate_node(
             .iter()
             .filter(|sub_schema| {
                 let mut sub_violations = Vec::new();
-                validate_node(root, sub_schema, value, ptr, &mut sub_violations, depth + 1);
+                validate_node(
+                    root,
+                    sub_schema,
+                    value,
+                    path,
+                    &mut sub_violations,
+                    depth + 1,
+                );
                 sub_violations.is_empty()
             })
             .count();
@@ -1134,7 +1224,7 @@ fn validate_node(
                 message: format!(
                     "value matches {matched} of the allowed schemas (oneOf requires exactly 1)"
                 ),
-                field_path: path(),
+                field_path: path.materialize(),
             });
         }
     }
