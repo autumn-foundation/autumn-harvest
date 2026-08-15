@@ -16155,6 +16155,49 @@ pub struct CapabilityMissPolicy {
     pub worker_stale_secs: i64,
 }
 
+/// One coherent observation of the miss evidence and the live fleet
+/// (issue #804, Codex rounds 28 and 30).
+///
+/// The fleet read and the miss read are separate statements, so under `READ
+/// COMMITTED` a registration can commit between them — and **both** orderings
+/// lose (see [`miss_evidence_confidence`]). The miss state is therefore read on
+/// both sides of the fleet read and the two must agree before any
+/// evidence-derived bound may fire.
+///
+/// This exists as a shared constructor because round 29 re-derived the same
+/// sequence by hand at the commit boundary and silently dropped the bracket,
+/// reintroducing exactly the race round 28 had closed. Both the decision and
+/// its revalidation now take their `(fleet, confidence)` pair from here, so the
+/// two cannot drift apart again.
+struct BracketedMissObservation {
+    before: CurrentMissState,
+    after: CurrentMissState,
+    live_workers: Vec<String>,
+    confidence: MissEvidenceConfidence,
+}
+
+async fn observe_miss_and_fleet(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    policy: CapabilityMissPolicy,
+    frontier_reset_committed: bool,
+) -> BracketedMissObservation {
+    let before = current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed).await;
+    // Fleet evidence for the distinct-worker bound (issue #804, Codex round-8
+    // P1). See `read_live_fleet_or_degrade` for why a failure here degrades to
+    // an empty set instead of propagating.
+    let live_workers = read_live_fleet_or_degrade(conn, task, policy.worker_stale_secs).await;
+    let after = current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed).await;
+    let confidence = miss_evidence_confidence(&before, &after);
+    BracketedMissObservation {
+        before,
+        after,
+        live_workers,
+        confidence,
+    }
+}
+
 /// Read the live worker fleet for `task`'s queue, degrading to an EMPTY set.
 ///
 /// A registry failure must not propagate: doing so would turn a transient blip
@@ -16309,14 +16352,12 @@ async fn handle_capability_miss(
     // The miss state is read on BOTH sides of the fleet read, and the two must
     // agree before any evidence-derived bound may fire. See
     // `miss_evidence_confidence` for why neither ordering is safe on its own.
-    let before_fleet =
-        current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed).await;
-    // Fleet evidence for the distinct-worker bound (issue #804, Codex round-8
-    // P1). See `read_live_fleet_or_degrade` for why a failure here degrades to
-    // an empty set instead of propagating.
-    let live_workers = read_live_fleet_or_degrade(conn, task, policy.worker_stale_secs).await;
-    let after_fleet =
-        current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed).await;
+    let BracketedMissObservation {
+        before: before_fleet,
+        after: after_fleet,
+        live_workers,
+        confidence,
+    } = observe_miss_and_fleet(conn, task, worker_id, policy, frontier_reset_committed).await;
 
     // A lost claim is not a decision to make. The escalation write is not
     // ownership-guarded, so deciding here would let a stale dispatcher
@@ -16338,7 +16379,6 @@ async fn handle_capability_miss(
             clears_timeout_strike: missing.phase.clears_workflow_timeout_strike(),
         });
     };
-    let confidence = miss_evidence_confidence(&before_fleet, &after_fleet);
     let distinct_before = distinct_before.to_vec();
     let resolution = resolve_capability_miss_with_confidence(
         &distinct_before,
@@ -16555,14 +16595,22 @@ async fn prepare_escalation_commit(
         task, worker_id, ..
     } = ctx;
     let preloaded = preload_failure_history(conn, task).await;
-    let current =
-        current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed).await;
-    let live_workers = read_live_fleet_or_degrade(conn, task, policy.worker_stale_secs).await;
-    let fresh_action = current.decidable_counters().map_or(
-        // No owned row: `revalidate_escalation` withdraws on `ClaimLost`
-        // regardless, so the action here is immaterial.
-        CapabilityMissAction::Release,
-        |(misses, distinct)| {
+    // The revalidation uses the SAME bracketed observation the decision does
+    // (issue #804, Codex round-30 P1). Round 29 re-derived a single miss read
+    // here and so reintroduced the round-28 race: a peer re-registering between
+    // that read and the fleet read is still named in the miss array while
+    // already appearing live, which derives `AllLiveWorkersMissed` and fails a
+    // run a capable worker could serve.
+    let BracketedMissObservation {
+        before,
+        after,
+        live_workers,
+        confidence,
+    } = observe_miss_and_fleet(conn, task, worker_id, policy, frontier_reset_committed).await;
+    // Either read observing a lost claim is enough — the claim does not come
+    // back — so `before` decides and `after` only has to agree it is still ours.
+    let fresh_action = match (before.decidable_counters(), after.decidable_counters()) {
+        (Some((misses, distinct)), Some(_)) => {
             resolve_capability_miss_with_confidence(
                 distinct,
                 misses,
@@ -16570,19 +16618,20 @@ async fn prepare_escalation_commit(
                 policy.max_redeliveries,
                 task.session_id,
                 &live_workers,
-                // A single read cannot certify coherence with the fleet read
-                // beside it the way the decision-time bracket does, but an
-                // `Unreadable` row is affirmatively stale (round-28 P1), so it
-                // must not license an evidence-derived escalation here either.
-                match current {
-                    CurrentMissState::Owned { .. } => MissEvidenceConfidence::Current,
-                    _ => MissEvidenceConfidence::PossiblyStale,
-                },
+                confidence,
             )
             .action
-        },
-    );
-    (preloaded, revalidate_escalation(&current, fresh_action))
+        }
+        // No owned row: `revalidate_escalation` withdraws on `ClaimLost`
+        // regardless, so the action here is immaterial.
+        _ => CapabilityMissAction::Release,
+    };
+    let observed = if matches!(after, CurrentMissState::ClaimLost) {
+        &after
+    } else {
+        &before
+    };
+    (preloaded, revalidate_escalation(observed, fresh_action))
 }
 
 /// Route an exhausted capability miss through the ordinary terminal-failure
@@ -25827,6 +25876,57 @@ mod tests {
         assert_eq!(
             revalidate_escalation(&unreadable, CapabilityMissAction::Release),
             EscalationRevalidation::Withdrawn("evidence_changed"),
+        );
+    }
+
+    #[test]
+    fn a_peer_reregistering_inside_the_commit_bracket_withdraws_the_escalation() {
+        // Codex round-30 P1. Round 29 re-derived a SINGLE miss read at the
+        // commit boundary, so a peer whose entry is invalidated between that
+        // read and the fleet read still counted as a misser while already
+        // appearing live -- `AllLiveWorkersMissed`, and a terminal write.
+        //
+        // This composes exactly what `prepare_escalation_commit` now does with
+        // the shared bracket: the two reads disagree, so the confidence is
+        // `PossiblyStale`, which withholds both evidence-derived bounds, so the
+        // fresh action is `Release`, so the escalation is withdrawn.
+        let before = CurrentMissState::Owned {
+            misses: 5,
+            workers: vec!["pod-a".to_string(), "pod-b".to_string()],
+        };
+        // `pod-a` re-registered onto a capable build and cleared its own entry.
+        let after = CurrentMissState::Owned {
+            misses: 5,
+            workers: vec!["pod-b".to_string()],
+        };
+        let confidence = miss_evidence_confidence(&before, &after);
+        assert_eq!(confidence, MissEvidenceConfidence::PossiblyStale);
+
+        let (misses, distinct) = before
+            .decidable_counters()
+            .expect("the row is still owned in both reads");
+        let fleet = vec!["pod-a".to_string(), "pod-b".to_string()];
+        let action = resolve_capability_miss_with_confidence(
+            distinct, misses, "pod-b", 5, None, &fleet, confidence,
+        )
+        .action;
+        assert_eq!(
+            revalidate_escalation(&before, action),
+            EscalationRevalidation::Withdrawn("evidence_changed"),
+        );
+
+        // And the control: had the bracket agreed, the same numbers escalate --
+        // so the withdrawal above is the bracket doing work, not the budget
+        // failing to be reached.
+        let agreed = miss_evidence_confidence(&before, &before);
+        assert_eq!(agreed, MissEvidenceConfidence::Current);
+        let action_agreed = resolve_capability_miss_with_confidence(
+            distinct, misses, "pod-b", 5, None, &fleet, agreed,
+        )
+        .action;
+        assert_eq!(
+            revalidate_escalation(&before, action_agreed),
+            EscalationRevalidation::Stands,
         );
     }
 

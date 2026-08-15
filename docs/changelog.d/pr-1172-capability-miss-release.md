@@ -820,3 +820,50 @@ The ordering property is pinned by the compiler rather than by a test — the
 committing function cannot be called without the preloaded history — and the
 24-test DB suite covers the refactor for behavioural regression, since every
 escalation test in it now runs through the split path.
+
+## Review round 30 — the revalidation uses the same bracket the decision does (Codex, P1)
+
+Round 29's commit-boundary revalidation re-derived its own read sequence: one
+miss read, then the fleet read. That silently dropped the two-miss-read bracket
+round 28 had put in place, and reintroduced exactly the race round 28 closed —
+a peer re-registering between those two awaited reads is still named in
+`capability_miss_workers` while already appearing in the live fleet, which
+derives `AllLiveWorkersMissed` and terminally fails a run the newly-capable
+worker could serve.
+
+The finding is right, and its root cause is duplication: the bracket existed in
+one place and was re-implemented by hand in another.
+
+### One constructor, both callers
+
+`observe_miss_and_fleet` now performs the miss → fleet → miss sequence and
+returns a `BracketedMissObservation` carrying both reads, the fleet, and the
+`MissEvidenceConfidence` derived from whether the two reads agree. The
+decision path and its commit-boundary revalidation both take their
+`(fleet, confidence)` pair from it, so neither can drift from the other again.
+The only two `current_frontier_miss_state` calls left in the crate are the two
+inside that helper.
+
+The revalidation's own rule is unchanged: a lost claim withdraws
+(`claim_lost`), a fresh answer that is no longer `Escalate` withdraws
+(`evidence_changed`), and a withdrawal falls through to the ordinary release
+path. What changed is that its `Escalate` can no longer be reached from
+mismatched snapshots — a disagreeing bracket forces `PossiblyStale`, which
+withholds both evidence-derived bounds, so the fresh answer becomes `Release`
+and the escalation is withdrawn.
+
+**No new `WorkflowEvent` variant, no migration** (AC7).
+
+### Test
+
+`a_peer_reregistering_inside_the_commit_bracket_withdraws_the_escalation`
+composes exactly what the commit boundary now does: a first read naming
+`pod-a` and `pod-b`, a second read in which `pod-a` has cleared its own entry,
+and a fleet in which both are live. The disagreement forces `PossiblyStale`,
+the resolver withholds the evidence-derived bounds, and the escalation is
+withdrawn.
+
+It carries its own control in the same test: feeding the *same* counts through
+an **agreeing** bracket escalates. Without that, the assertion would pass for
+the trivial reason that the budget was never reached, and would keep passing if
+the bracket stopped doing anything.
