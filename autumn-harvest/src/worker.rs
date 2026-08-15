@@ -2821,6 +2821,60 @@ fn local_attempt_deadline(
     }
 }
 
+/// The claimed workflow-task row whose capability-miss accounting describes the
+/// frontier a local activity is about to resolve (issue #804, Codex round-21
+/// P1).
+///
+/// Carried into [`run_local_activity_inline`] so the reset can commit in the
+/// SAME transaction as the events that make the progress durable — see
+/// [`append_frontier_resolution`].
+#[derive(Clone, Copy)]
+struct FrontierAccounting<'a> {
+    /// `harvest_task_queue.id` of the workflow task being dispatched.
+    task_id: uuid::Uuid,
+    /// The worker holding the claim; guards the reset so it can only ever clear
+    /// accounting on a row this dispatch still owns.
+    worker_id: &'a str,
+}
+
+/// Append a local activity's **frontier-resolving** events and clear the
+/// capability-miss accounting atomically (issue #804, Codex round-21 P1).
+///
+/// The reset is bookkeeping *about* the appended events: it says "the misses
+/// recorded so far were recorded against a handler this run has now moved past".
+/// Writing it separately would make it an independent failure point AFTER the
+/// progress became durable — and a failure there strands the claimed row
+/// (`RUNNING`, owned by a live worker, so neither the workflow-task timeout nor
+/// the poison-pill orphan reclaim recovers it). Committing both together means
+/// the only failure mode left is the pre-existing "the append itself failed",
+/// in which case no progress became durable and the counters still describe
+/// reality.
+///
+/// Called only for the two outcomes that actually retire a frontier — success
+/// (`LocalActivityCompleted`) and retry exhaustion (the
+/// `LocalActivityFailed` + `LocalActivityExhausted` pair). A non-terminal
+/// failure leaves the SAME local activity as the frontier, so it must not reset.
+async fn append_frontier_resolution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    events: &[WorkflowEvent],
+    event_start: i32,
+    frontier: FrontierAccounting<'_>,
+) -> HarvestResult<()> {
+    let owned: Vec<WorkflowEvent> = events.to_vec();
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        store::append_events(conn, exec_id, &owned, event_start).await?;
+        queue::reset_capability_misses_after_inline_progress(
+            conn,
+            frontier.task_id,
+            frontier.worker_id,
+        )
+        .await?;
+        Ok(())
+    }))
+    .await
+}
+
 /// Run a local activity inline, appending durability events to `harvest_events`.
 ///
 /// Retries the handler up to `max_attempts` times (per the retry policy),
@@ -2848,6 +2902,10 @@ async fn run_local_activity_inline(
     // off at (issue #494), or `None` when that timeout is disabled. Clamps the
     // reported per-attempt deadline so it can never out-live the cycle.
     workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    // Issue #804 (Codex round-21 P1): the claimed row whose capability-miss
+    // accounting is retired atomically with this activity's frontier-resolving
+    // append. See `append_frontier_resolution`.
+    frontier: FrontierAccounting<'_>,
 ) -> HarvestResult<LocalActivityInlineOutcome> {
     let LocalActivityCommandBatch {
         pre_schedule_events,
@@ -3093,11 +3151,15 @@ async fn run_local_activity_inline(
                     activity_id: run.activity_id,
                     output,
                 };
-                store::append_events(
+                // The success append retires this frontier, so it carries the
+                // capability-miss reset in its own transaction (issue #804,
+                // Codex round-21 P1).
+                append_frontier_resolution(
                     conn,
                     exec_id,
                     std::slice::from_ref(&completed_event),
                     *next_event_id,
+                    frontier,
                 )
                 .await?;
                 *next_event_id += 1;
@@ -3176,7 +3238,17 @@ async fn run_local_activity_inline(
                         attempt,
                     };
                     let terminal_pair = [failed_event, exhausted_event];
-                    store::append_events(conn, exec_id, &terminal_pair, *next_event_id).await?;
+                    // Retry exhaustion retires this frontier just as decisively
+                    // as success, so it too carries the capability-miss reset in
+                    // its own transaction (issue #804, Codex round-21 P1).
+                    append_frontier_resolution(
+                        conn,
+                        exec_id,
+                        &terminal_pair,
+                        *next_event_id,
+                        frontier,
+                    )
+                    .await?;
                     *next_event_id += i32::try_from(terminal_pair.len())
                         .map_err(|_| HarvestError::Config("event count overflow".into()))?;
                     all_new_events.extend(terminal_pair);
@@ -4767,6 +4839,25 @@ pub struct CapabilityMissResolution {
     /// (issue #804). Carried out of the resolution so the escalation reason can
     /// report the same evidence the decision was made on.
     pub evidence: FleetCapabilityEvidence,
+}
+
+/// The capability-miss counters an **unreadable or vanished** row must be
+/// treated as holding (issue #804, Codex round-21 P2).
+///
+/// Deliberately a clean frontier rather than the claim-time snapshot. That
+/// snapshot may describe a PRIOR frontier this dispatch has already resolved
+/// inline, so trusting it would let a budget spent elsewhere terminally fail
+/// the run at the first miss of a frontier no peer has ever been offered.
+///
+/// This is the same rule [`FleetCapabilityEvidence::Unavailable`] already
+/// encodes one level up: evidence we cannot prove may never justify a terminal
+/// failure. It is self-healing rather than lossy — the release statement's own
+/// increment is relative (`+ 1`), so whatever the row really holds survives —
+/// and it cannot suppress a legitimate escalation, because the session-pin and
+/// zero-budget cases are both decided before any budget bound.
+#[must_use]
+pub const fn clean_frontier_state() -> (i32, Vec<String>) {
+    (0, Vec::new())
 }
 
 /// Resolve what to do about a capability miss on a claimed task (issue #804).
@@ -14112,6 +14203,10 @@ async fn process_workflow_task(
                         workflow_type: prepared.execution.workflow_name.as_str(),
                     },
                     workflow_task_deadline,
+                    FrontierAccounting {
+                        task_id: task.id,
+                        worker_id,
+                    },
                 )
                 .await
                 {
@@ -14170,10 +14265,12 @@ async fn process_workflow_task(
                 // Bounded: a completed local activity replays from history
                 // (`HistoryMatch::Matched`) and emits no command, so a frontier
                 // can make inline progress at most once.
-                if !new_events.is_empty() {
-                    queue::reset_capability_misses_after_inline_progress(conn, task.id, worker_id)
-                        .await?;
-                }
+                //
+                // The reset itself lives inside `run_local_activity_inline`,
+                // committed in the SAME transaction as the frontier-resolving
+                // append (Codex round-21 P1) — writing it here would be an
+                // independent failure point after the progress became durable,
+                // and a failure would strand this still-claimed row.
                 history_events.extend(new_events);
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
@@ -15744,21 +15841,31 @@ async fn handle_capability_miss(
     // we are actually stuck at now.
     //
     // The row is claimed by this worker, so nothing else is mutating these two
-    // columns; a vanished row (`None`) falls back to the snapshot, and the
-    // release's own `0 rows affected` path handles it a few lines below.
+    // columns.
+    //
+    // Neither failure mode falls back to the claim-time snapshot (issue #804,
+    // Codex round-21 P2): that snapshot may describe a PRIOR frontier this
+    // dispatch has already moved past, so a snapshot that had spent the budget
+    // would terminally fail the run at the first miss of a frontier no peer has
+    // ever been offered. An unreadable (`Err`) or vanished (`None`) current
+    // state is instead treated as a clean frontier — the same rule
+    // `FleetCapabilityEvidence::Unavailable` already encodes: evidence we
+    // cannot prove may never justify a terminal failure. Self-healing, because
+    // the release statement's own increment is relative (`+ 1`), so whatever
+    // the row really holds is preserved. The session-pin and zero-budget
+    // escalations are unaffected — both are decided before the budget bounds.
     let (misses_before, distinct_before) =
         match queue::current_capability_miss_state(conn, task.id).await {
             Ok(Some(state)) => state,
-            Ok(None) => (task.capability_misses, task.capability_miss_workers.clone()),
+            Ok(None) => clean_frontier_state(),
             Err(error) => {
                 tracing::warn!(
                     task_id = %task.id,
                     %error,
-                    "failed to re-read the capability-miss counters; falling back to the \
-                     claim-time snapshot, which may over-count if this dispatch made \
-                     durable inline progress"
+                    "failed to re-read the capability-miss counters; treating this frontier \
+                     as unspent rather than escalating on evidence we cannot read"
                 );
-                (task.capability_misses, task.capability_miss_workers.clone())
+                clean_frontier_state()
             }
         };
     let resolution = resolve_capability_miss(
@@ -24458,6 +24565,62 @@ mod tests {
                 CapabilityMissKind::Workflow.as_str(),
                 "first_missing".to_string()
             )),
+        );
+    }
+
+    #[test]
+    fn an_unreadable_frontier_state_never_escalates_where_a_stale_snapshot_would_have() {
+        // Issue #804, Codex round-21 P2. A dispatch that resolved a local
+        // activity inline reset the row, but the re-read of that reset failed.
+        // The claim-time snapshot still describes the PRIOR frontier, and it had
+        // spent the whole budget.
+        let spent_snapshot = vec!["worker-a".to_string(), "worker-b".to_string()];
+        let live = vec!["worker-a".to_string(), "worker-b".to_string()];
+
+        // Deciding from that stale snapshot terminally fails a run whose new
+        // frontier no peer has ever been offered.
+        let stale = resolve_capability_miss(&spent_snapshot, 2, "worker-c", 2, None, &live);
+        assert_eq!(
+            stale.action,
+            CapabilityMissAction::Escalate,
+            "the stale snapshot is what makes this a bug worth fixing"
+        );
+
+        // The rule decides from a clean frontier instead, so the miss releases.
+        let (misses, workers) = clean_frontier_state();
+        let clean = resolve_capability_miss(&workers, misses, "worker-c", 2, None, &live);
+        assert_eq!(
+            (clean.action, clean.total_after),
+            (CapabilityMissAction::Release, 1),
+            "an unreadable current state is insufficient evidence to escalate"
+        );
+    }
+
+    #[test]
+    fn a_clean_frontier_state_still_escalates_a_session_pin_and_a_zero_budget() {
+        // The round-21 fallback must not become a way to dodge the two
+        // escalations that are decided BEFORE any budget bound.
+        let (misses, workers) = clean_frontier_state();
+
+        let pinned = resolve_capability_miss(
+            &workers,
+            misses,
+            "worker-a",
+            5,
+            Some(uuid::Uuid::new_v4()),
+            &[],
+        );
+        assert_eq!(
+            pinned.action,
+            CapabilityMissAction::Escalate,
+            "a session-pinned task cannot be released to a peer, clean frontier or not"
+        );
+
+        let zero_budget = resolve_capability_miss(&workers, misses, "worker-a", 0, None, &[]);
+        assert_eq!(
+            zero_budget.action,
+            CapabilityMissAction::Escalate,
+            "an operator who configured a zero budget still gets an immediate escalation"
         );
     }
 

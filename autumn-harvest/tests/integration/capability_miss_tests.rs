@@ -1339,6 +1339,57 @@ fn two_frontier_worker(
     )
 }
 
+const Q_EXHAUST_FRONTIER: &str = "q804-exhaust-frontier";
+
+fn always_failing_local_activity(
+    _ctx: &autumn_harvest::ActivityContext,
+    _input: serde_json::Value,
+) -> BoxFut<'_> {
+    Box::pin(async move { Err("frontier 1 always fails".to_string()) })
+}
+
+/// Frontier 1 exhausts its retries and the workflow CATCHES that, so the run
+/// carries on to frontier 2 rather than sealing. That is what makes exhaustion
+/// observable as a frontier transition instead of a terminal outcome.
+fn workflow_exhausting_then_second(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let _ = ctx
+            .execute_local_activity_raw("failing_local", input.clone(), None, None)
+            .await;
+        ctx.execute_local_activity_raw("second_local", input, None, None)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// As [`two_frontier_worker`], but for the exhaustion fleet: one retry attempt
+/// so frontier 1 reaches `LocalActivityExhausted` promptly, and a budget of 1 so
+/// conflating the two frontiers fails the run at the earliest possible point.
+fn exhausting_frontier_worker(
+    worker_id: &str,
+    local: &'static str,
+    handler: autumn_harvest::info::ActivityHandlerFn,
+    metrics: &Arc<CapabilityMetrics>,
+) -> Arc<Worker> {
+    let info = ActivityInfo {
+        default_retry_policy: Some(RetryPolicy::fixed(1, Duration::from_millis(10))),
+        ..local_activity_info_on(local, handler, Q_EXHAUST_FRONTIER)
+    };
+    build_worker(
+        worker_id,
+        &[Q_EXHAUST_FRONTIER],
+        build_registry(
+            vec![workflow_info(
+                "exhausting_frontier_wf",
+                workflow_exhausting_then_second,
+            )],
+            vec![info],
+            Arc::clone(metrics),
+        ),
+        1,
+    )
+}
+
 /// `capability_misses` / `capability_miss_workers` describe ONE frontier — the
 /// position the workflow is currently stuck at. Durable inline progress moves
 /// that position, so every miss recorded before it was recorded against a
@@ -1446,6 +1497,104 @@ async fn durable_inline_progress_starts_the_next_frontier_with_a_clean_budget() 
         completed.output,
         Some(serde_json::json!("second frontier done")),
         "A replays past the durably-completed frontier 1 and runs frontier 2"
+    );
+    assert!(
+        dead_letter_errors(&url, exec_id).await.is_empty(),
+        "a run the fleet could finish must never reach the DLQ"
+    );
+}
+
+/// Retry **exhaustion** retires a frontier as decisively as success does — the
+/// local activity will never be attempted again, so the run's stuck position has
+/// moved. Both outcomes therefore reset the accounting, and both do it in the
+/// same transaction as the append that makes the progress durable (issue #804,
+/// Codex round-21 P1).
+///
+/// Same non-nested fleet as the success case above, but frontier 1 is a local
+/// activity that always fails and a workflow that catches the exhaustion and
+/// carries on. Threading the reset into only the success append leaves this path
+/// charging B's miss on frontier 2 to A's miss on frontier 1, and a budget of 1
+/// then fails a run the fleet can still finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exhausting_a_local_activity_also_starts_the_next_frontier_clean() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "exhausting_frontier_wf",
+        serde_json::json!({"n": 21}),
+        Q_EXHAUST_FRONTIER,
+    )
+    .await;
+
+    let metrics = Arc::new(CapabilityMetrics::default());
+    let has_second = || {
+        exhausting_frontier_worker(
+            "worker-has-second",
+            "second_local",
+            second_frontier_activity,
+            &metrics,
+        )
+    };
+
+    // --- Phase 1: A misses frontier 1 (`failing_local`). --------------------
+    let released_a = with_worker_running(&has_second(), &pool, async {
+        wait_for_capability_misses(&url, exec_id, 1, Duration::from_secs(30)).await
+    })
+    .await;
+    assert_released_for_a_peer(&released_a);
+
+    // --- Phase 2: B exhausts frontier 1 durably, then misses frontier 2. ----
+    let has_first = exhausting_frontier_worker(
+        "worker-has-first",
+        "failing_local",
+        always_failing_local_activity,
+        &metrics,
+    );
+
+    let released_b = with_worker_running(&has_first, &pool, async {
+        wait_for_miss_by(&url, exec_id, "worker-has-first", Duration::from_secs(30)).await
+    })
+    .await;
+
+    // The premise: B really did exhaust frontier 1 before missing frontier 2.
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::LocalActivityExhausted { .. })),
+        "this test's premise is the EXHAUSTION append, not the success one; \
+         without that event it re-tests the success path: {history:?}"
+    );
+
+    let released_b = released_b.expect(
+        "B must record a miss and release; a sealed run here means the exhaustion \
+         append did not carry the frontier reset",
+    );
+    assert_released_for_a_peer(&released_b);
+    assert_eq!(
+        released_b.capability_miss_workers,
+        vec!["worker-has-first".to_string()],
+        "an exhausted frontier is behind us, so its misser set must not follow \
+         the run to the next one"
+    );
+    assert_eq!(
+        released_b.capability_misses, 1,
+        "the count is scoped to the current frontier on the exhaustion path too"
+    );
+
+    // --- Phase 3: A replays past the exhausted frontier and clears frontier 2.
+    let completed = with_worker_running(&has_second(), &pool, async {
+        wait_for_state(&url, exec_id, "COMPLETED", Duration::from_secs(30)).await
+    })
+    .await;
+
+    assert_eq!(
+        completed.output,
+        Some(serde_json::json!("second frontier done")),
+        "A replays past the durably-exhausted frontier 1 and runs frontier 2"
     );
     assert!(
         dead_letter_errors(&url, exec_id).await.is_empty(),
