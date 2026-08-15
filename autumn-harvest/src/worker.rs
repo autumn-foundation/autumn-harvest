@@ -4406,6 +4406,20 @@ enum EscalationCause {
     /// a real maximum for a fleet smaller than the budget, where the distinct
     /// count is pinned below it forever.
     BudgetExhausted {
+        /// Redeliveries that actually **completed** (the persisted counter),
+        /// on the same basis as [`ReleaseCeilingExhausted::completed_releases`].
+        ///
+        /// Carried rather than derived from `max_redeliveries` because the two
+        /// coincide only in the canonical shape where each worker misses once
+        /// (Codex round-23 P1). Under
+        /// [`FleetCapabilityEvidence::Unavailable`] a repeat miss grows this
+        /// counter without moving `distinct_after`, and the configured TOTAL
+        /// bound is gated off, so releases can run far past the budget before a
+        /// fresh distinct worker trips the distinct bound.
+        completed_releases: i32,
+        /// How many distinct workers those completed releases were spread
+        /// across (the persisted array's length, on the same basis).
+        released_workers: i32,
         /// `true` when the live fleet on this queue was enumerated and every
         /// member of it had missed the task
         /// ([`FleetCapabilityEvidence::AllLiveWorkersMissed`]) — the conclusion
@@ -4475,6 +4489,8 @@ impl EscalationCause {
                 && escalation.distinct_after > capability_miss_budget(max_redeliveries) =>
             {
                 Self::BudgetExhausted {
+                    completed_releases: escalation.completed_releases,
+                    released_workers: escalation.released_workers,
                     fleet_confirmed: matches!(
                         escalation.evidence,
                         FleetCapabilityEvidence::AllLiveWorkersMissed
@@ -4495,6 +4511,8 @@ impl EscalationCause {
                 > capability_miss_budget(max_redeliveries) =>
             {
                 Self::BudgetExhausted {
+                    completed_releases: escalation.completed_releases,
+                    released_workers: escalation.released_workers,
                     fleet_confirmed: true,
                 }
             }
@@ -4652,7 +4670,11 @@ pub fn no_capable_worker_reason(
     escalation: CapabilityMissEscalation,
 ) -> String {
     match EscalationCause::resolve(max_redeliveries, session_id, escalation) {
-        EscalationCause::BudgetExhausted { fleet_confirmed } => {
+        EscalationCause::BudgetExhausted {
+            completed_releases,
+            released_workers,
+            fleet_confirmed,
+        } => {
             let basis = if fleet_confirmed {
                 "every worker with a live heartbeat here has now missed it, so no live worker on \
                  this queue has the handler"
@@ -4662,9 +4684,22 @@ pub fn no_capable_worker_reason(
                  names workers advertise), so the configured budget alone bounded the release and \
                  a capable worker may still exist"
             };
+            // The REAL release count, not `max_redeliveries` (Codex round-23
+            // P1). The two coincide only in the canonical shape where each
+            // worker misses exactly once; under `Unavailable` evidence a repeat
+            // miss grows the release count without moving `distinct_after`, and
+            // the configured TOTAL bound is gated off, so five workers can spend
+            // twenty releases before a sixth distinct worker trips this bound.
+            // Naming the budget there understates the durable record fourfold in
+            // the exact string an operator reconstructs the incident from.
+            //
+            // The knob still has to appear, because raising it is the fix -- but
+            // as its own labelled value, not in the position that reads as a
+            // release count.
             format!(
-                "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated after {max_redeliveries} \
-                 capability-miss redeliveries; {basis})"
+                "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated after {completed_releases} \
+                 capability-miss redeliveries across {released_workers} distinct worker(s); \
+                 capability_miss_max_redeliveries = {max_redeliveries}; {basis})"
             )
         }
         EscalationCause::ReleaseCeilingExhausted {
@@ -4682,12 +4717,22 @@ pub fn no_capable_worker_reason(
                  workers lack the handler or a capable peer lost every claim race — check the \
                  workers that missed it before concluding the whole queue lacks the handler"
             };
+            // The ceiling that actually tripped, computed with the SAME clamped,
+            // saturating expression `capability_miss_decision` compares against,
+            // so the printed bound cannot drift from the enforced one (Codex
+            // round-23 P2). Previously this rendered
+            // `10x capability_miss_max_redeliveries = 5` -- an equation that is
+            // false as one, and off by the whole multiplier: an operator sizing
+            // the knob off it concludes the fleet gave up after 5 releases when
+            // 51 had been spent.
+            let ceiling = capability_miss_budget(max_redeliveries)
+                .saturating_mul(CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER);
             format!(
                 "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated after {completed_releases} \
                  capability-miss redeliveries spread across only {released_workers} distinct \
-                 worker(s), hitting the absolute release ceiling of \
-                 {CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER}x capability_miss_max_redeliveries = \
-                 {max_redeliveries}; {basis})"
+                 worker(s), hitting the absolute release ceiling of {ceiling} releases \
+                 ({CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER}x capability_miss_max_redeliveries \
+                 ({max_redeliveries})); {basis})"
             )
         }
         EscalationCause::ZeroBudgetFailFast => format!(
@@ -16058,9 +16103,11 @@ async fn escalate_capability_miss(
         }
         EscalationCause::BudgetExhausted {
             fleet_confirmed: true,
+            ..
         } => "escalated task: no capable worker on this queue registers the handler",
         EscalationCause::BudgetExhausted {
             fleet_confirmed: false,
+            ..
         } => {
             "escalated task: the redelivery budget was exhausted, but the worker registry could not confirm the live fleet (this worker is not listed against this queue); a capable worker may still exist"
         }
@@ -23430,7 +23477,9 @@ mod tests {
         assert_eq!(
             EscalationCause::resolve(budget, None, escalation),
             EscalationCause::BudgetExhausted {
-                fleet_confirmed: true
+                completed_releases: 5,
+                released_workers: 1,
+                fleet_confirmed: true,
             }
         );
         let reason = no_capable_worker_reason("workflow 'onboarding'", budget, None, escalation);
@@ -23682,7 +23731,9 @@ mod tests {
         // Only budget exhaustion actually offered the task around the queue.
         assert_eq!(
             EscalationCause::BudgetExhausted {
-                fleet_confirmed: true
+                completed_releases: 5,
+                released_workers: 5,
+                fleet_confirmed: true,
             }
             .outcome_label(),
             CAPABILITY_MISS_OUTCOME_ESCALATED,
@@ -23846,8 +23897,138 @@ mod tests {
         assert_eq!(
             EscalationCause::resolve(BUDGET, None, budget_exhausted_counts(BUDGET)),
             EscalationCause::BudgetExhausted {
-                fleet_confirmed: true
+                completed_releases: BUDGET.cast_signed(),
+                released_workers: BUDGET.cast_signed(),
+                fleet_confirmed: true,
             },
+        );
+    }
+
+    /// The ceiling wording must print the ceiling that actually tripped, not the
+    /// multiplier applied to a number it then fails to multiply (Codex round-23
+    /// P2).
+    ///
+    /// `{MULTIPLIER}x capability_miss_max_redeliveries = {max_redeliveries}`
+    /// reads as an equation and is false as one: with the default budget it
+    /// renders `10x capability_miss_max_redeliveries = 5` while the bound that
+    /// terminated the task was 50. An operator sizing the knob off that string
+    /// concludes the fleet gave up after 5 releases and that raising the budget
+    /// to 6 is enough, when 51 releases had already been spent.
+    #[test]
+    fn release_ceiling_reason_prints_the_computed_ceiling_not_the_bare_budget() {
+        const BUDGET: u32 = 5;
+        // The product `capability_miss_decision` actually compares against.
+        let ceiling =
+            capability_miss_budget(BUDGET).saturating_mul(CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER);
+        assert_eq!(
+            ceiling, 50,
+            "guard the arithmetic this test is asserting on"
+        );
+
+        let reason = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            BUDGET,
+            None,
+            CapabilityMissEscalation {
+                distinct_after: 1,
+                completed_releases: ceiling + 1,
+                released_workers: 1,
+                evidence: FleetCapabilityEvidence::Unavailable,
+            },
+        );
+        assert!(
+            reason.contains(&format!("absolute release ceiling of {ceiling} releases")),
+            "the printed ceiling must be the product that tripped, not a factor \
+             of it: {reason}"
+        );
+        // The knob is still named -- with its own, correct value -- because
+        // raising it is the fix. It just must not masquerade as the ceiling.
+        assert!(
+            reason.contains(&format!(
+                "{CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER}x capability_miss_max_redeliveries \
+                 ({BUDGET})"
+            )),
+            "the knob and its multiplier must still be stated so the fix is \
+             obvious: {reason}"
+        );
+        assert!(
+            !reason.contains(&format!(
+                "{CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER}x capability_miss_max_redeliveries = \
+                 {BUDGET}"
+            )),
+            "the defect: an equation whose right-hand side is the unmultiplied \
+             budget: {reason}"
+        );
+    }
+
+    /// Distinct-bound exhaustion must report the releases that actually
+    /// happened, not the budget (Codex round-23 P1).
+    ///
+    /// The two are equal only in the canonical shape where every worker misses
+    /// exactly once. Under `Unavailable` evidence a repeat miss grows
+    /// `completed_releases` without moving `distinct_after`, and the configured
+    /// TOTAL bound is gated off (it requires `AllLiveWorkersMissed`), so the
+    /// releases can run far past the budget before a fresh distinct worker
+    /// finally trips the distinct bound. Printing `max_redeliveries` there
+    /// understates the durable record by an unbounded factor -- and it is the
+    /// string an operator reconstructs the incident from.
+    #[test]
+    fn distinct_bound_exhaustion_reports_real_releases_not_the_budget() {
+        const BUDGET: u32 = 5;
+        // Five workers bounced the task 20 times between them (no registry
+        // evidence, so repeats were free), then a sixth distinct worker missed
+        // it and pushed the distinct count over budget.
+        let counts = CapabilityMissEscalation {
+            distinct_after: 6,
+            completed_releases: 20,
+            released_workers: 5,
+            evidence: FleetCapabilityEvidence::Unavailable,
+        };
+        // Premise: this shape really does reach the DISTINCT bound, not the
+        // ceiling -- 21 total releases is well under the ceiling of 50.
+        assert_eq!(
+            capability_miss_decision(
+                counts.distinct_after,
+                counts.completed_releases + 1,
+                BUDGET,
+                counts.evidence
+            ),
+            CapabilityMissAction::Escalate,
+        );
+        assert_eq!(
+            EscalationCause::resolve(BUDGET, None, counts),
+            EscalationCause::BudgetExhausted {
+                completed_releases: 20,
+                released_workers: 5,
+                fleet_confirmed: false,
+            },
+            "the cause must carry the counts it will report"
+        );
+
+        let reason = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            BUDGET,
+            None,
+            counts,
+        );
+        assert!(
+            reason.contains("escalated after 20 capability-miss redeliveries"),
+            "20 releases were persisted; the string must say so: {reason}"
+        );
+        assert!(
+            !reason.contains("escalated after 5 capability-miss redeliveries"),
+            "the defect: reporting the budget as the release count understates \
+             the record fourfold here: {reason}"
+        );
+        assert!(
+            reason.contains("across 5 distinct worker(s)"),
+            "the distinct count is the bound that tripped and must be stated: {reason}"
+        );
+        // The knob still has to be named, because raising it is the fix -- just
+        // not in the position that claims to be a release count.
+        assert!(
+            reason.contains("capability_miss_max_redeliveries = 5"),
+            "name the knob so the operator can act without reading source: {reason}"
         );
     }
 
@@ -24133,7 +24314,9 @@ mod tests {
                 }
             ),
             EscalationCause::BudgetExhausted {
-                fleet_confirmed: true
+                completed_releases: 5,
+                released_workers: 5,
+                fleet_confirmed: true,
             }
         );
     }

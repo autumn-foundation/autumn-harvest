@@ -1664,8 +1664,17 @@ async fn capability_miss_escalates_after_the_budget_with_no_capable_worker() {
     );
     assert!(
         error.contains("after 3 capability-miss redeliveries"),
-        "the reason must state the exact budget that was exhausted \
+        "the reason must state the exact number of releases that completed \
          (a single-char check cannot catch an off-by-one), got {error:?}"
+    );
+    // The knob is reported separately from the release count (Codex round-23
+    // P1). They coincide here -- a distinct sweep where each worker missed once
+    // -- but the string must name the knob in its own labelled position, so an
+    // operator can tell a real 3-release sweep from a budget that happens to be
+    // 3.
+    assert!(
+        error.contains("capability_miss_max_redeliveries = 3"),
+        "the configured knob must be named so the fix is actionable, got {error:?}"
     );
 
     // AC3 — it routes through the EXISTING terminal path, not a new one.
@@ -1908,7 +1917,21 @@ async fn single_worker_fleet_escalates_at_the_configured_budget() {
     // The headline: the reason names the CONFIGURED budget, not the ceiling.
     assert!(
         error.contains("escalated after 2 capability-miss redeliveries"),
-        "the reason must name the budget the operator configured, got {error:?}"
+        "the reason must name the releases that actually completed, got {error:?}"
+    );
+    // A single-pod fleet exhausts on TOTAL releases, so the distinct count stays
+    // at 1 while the release count reaches the budget. Reporting them separately
+    // is what lets an operator tell this sub-case apart from a real N-worker
+    // sweep at a glance (Codex round-23 P1) -- with only one number printed the
+    // two are indistinguishable.
+    assert!(
+        error.contains("across 1 distinct worker(s)"),
+        "a one-pod fleet must report its real distinct count, not the budget, \
+         got {error:?}"
+    );
+    assert!(
+        error.contains("capability_miss_max_redeliveries = 2"),
+        "the configured knob must still be named, got {error:?}"
     );
     assert!(
         !error.contains("absolute release ceiling"),

@@ -310,8 +310,15 @@ event and a `FAILED` execution row, **not** a dead-letter entry — with a
 greppable reason:
 
 ```
-no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 5 capability-miss redeliveries; no live worker on this queue has the handler)
+no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 5 capability-miss redeliveries across 5 distinct worker(s); capability_miss_max_redeliveries = 5; every worker with a live heartbeat here has now missed it, so no live worker on this queue has the handler)
 ```
+
+The release count and the distinct-worker count are the **real** persisted ones,
+reported separately from the configured knob. They coincide only when each
+worker missed exactly once; if the registry could not confirm the fleet, repeat
+misses are free (they back off but consume no budget), so the release count can
+run well past `capability_miss_max_redeliveries` before a fresh distinct worker
+finally exhausts it.
 
 Counting *distinct* workers rather than total releases is what stops a single
 incapable pod from exhausting the shared budget by repeatedly winning the claim
@@ -367,8 +374,12 @@ budget-exhausted reason as a distinct-worker sweep, because the registry
 confirmed the same fact — every live worker here has now missed it:
 
 ```
-no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 5 capability-miss redeliveries; every worker with a live heartbeat here has now missed it, so no live worker on this queue has the handler)
+no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 5 capability-miss redeliveries across 1 distinct worker(s); capability_miss_max_redeliveries = 5; every worker with a live heartbeat here has now missed it, so no live worker on this queue has the handler)
 ```
+
+Note the `1` — a single-pod fleet exhausts the budget on *total* releases, so the
+distinct count stays at one throughout. That is the tell for this sub-case, and
+it is why the two counts are reported separately.
 
 The **absolute ceiling** escalates with a different reason string, because it
 supports a weaker conclusion — it is reached only when the fleet could not be
@@ -383,8 +394,13 @@ the task, which gets its own wording pointing at the peer rather than at the
 deploy:
 
 ```
-no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 50 capability-miss redeliveries spread across only 6 distinct worker(s), hitting the absolute release ceiling of 10x capability_miss_max_redeliveries = 5; a live worker on this queue never missed this task, so it may well have the handler and simply lost every claim race — check whether it is saturated, draining, advertising a stale queue list, or ineligible for this activity's registered capability requirements before concluding the handler is missing)
+no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 50 capability-miss redeliveries spread across only 6 distinct worker(s), hitting the absolute release ceiling of 50 releases (10x capability_miss_max_redeliveries (5)); a live worker on this queue never missed this task, so it may well have the handler and simply lost every claim race — check whether it is saturated, draining, advertising a stale queue list, or ineligible for this activity's registered capability requirements before concluding the handler is missing)
 ```
+
+The ceiling is printed as the **computed product** (`50`), with the multiplier
+and the knob shown alongside it so the arithmetic is checkable. Do not size the
+knob off the multiplier alone: raising `capability_miss_max_redeliveries` moves
+this ceiling by `10 ×` the change.
 
 The counts in every reason string are the **persisted** ones: redeliveries that
 actually completed, and workers that actually released. The claim that escalated
