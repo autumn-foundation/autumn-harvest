@@ -541,3 +541,88 @@ Falsifiable — verified by disabling the invalidation call: the headline test f
 first on the evidence guard (`got [["pod-a"]]`) and, with that guard relaxed,
 fails on the harm itself (`the execution went terminal instead of releasing`),
 while the control passes throughout.
+
+## Review round 27 — the decision must not run on a snapshot round 26 can invalidate (Codex P1)
+
+Round 26's `invalidate_capability_miss_evidence_for_worker` is deliberately **not**
+ownership-guarded: it has to reach a row another worker is mid-dispatch on,
+because that is precisely the row whose decision the stale evidence poisons. That
+made it the **one writer** that can change `capability_miss_workers` between a
+claim and its miss — and `frontier_miss_state` had documented, and relied on, the
+opposite:
+
+> Nothing else writes them between the claim and the miss: a concurrent
+> poison-pill reclaim changes `worker_id`, which the release's own
+> `worker_id = $2` guard turns into a `0 rows affected` no-op.
+
+So round 26 fixed nothing in its own headline scenario whenever the restart lands
+mid-dispatch. `pod-b` claims while the row still names `pod-a`; `pod-a` restarts
+onto a capable build and clears its entry; `pod-b`, still deciding on its
+claim-time snapshot, reads `pod-a` as incapable *and* the registry reports it
+live, derives `AllLiveWorkersMissed`, and terminally fails the run. Same terminal
+failure, one layer down.
+
+**Fix.** The decision re-reads the counters instead of trusting the snapshot. New
+`queue::read_capability_miss_state` (ownership-guarded `SELECT`, so a row a
+concurrent reclaim took is never decided about) behind the new async
+`worker::current_frontier_miss_state`, which resolves three cases:
+
+- `reset_committed` — an exact in-memory fact about *this* dispatch that no read
+  can improve on, so it short-circuits with **no round-trip at all**. Round 20's
+  frontier scoping and round 22's mechanism are untouched.
+- a successful read — authoritative. Invalidation only ever *removes* entries, so
+  a fresher view can only weaken the fleet evidence, and weaker evidence can only
+  bias toward releasing (AC1).
+- `None` (the claim is gone) or an error — fall back to the claim-time snapshot,
+  which is exactly the pre-round-27 behaviour.
+
+That fallback is the load-bearing detail. Round 21 P2 had *removed* a re-read
+precisely because its failure fallback fabricated a clean `(0, [])` frontier,
+bypassing the storage-ceiling guard: a row already at `i32::MAX` would be released
+and the `capability_misses + 1` in the release statement would raise `integer out
+of range`, stranding a `RUNNING` row under a live worker that orphan reclamation
+skips. Falling back to the snapshot has no such mode — the count is real, so the
+ceiling still fires, and a read failure degrades to the status quo rather than to
+something new. `frontier_miss_state` survives unchanged as that fallback, with its
+now-false invariant paragraph corrected to say what actually holds.
+
+**Window.** The read sits as late as it can without a transaction — immediately
+before the decision, with only in-memory work between it and the terminal write —
+so a registration can still slip past in a few microseconds rather than across the
+whole decision cycle, which for an `AfterHandler` miss is the entire workflow
+body. Closing it completely would mean re-reading `FOR UPDATE` inside the
+escalation's own transaction, and `fail_task_and_execution` is a sequence of
+statements rather than one; that restructure is not worth the risk against a
+window of pure in-memory work, and the residual fails in the same direction as
+before rather than a new one.
+
+**Truthful diagnostics preserved.** `escalate_capability_miss` reported
+`task.capability_misses` and `task.capability_miss_workers.len()` — the snapshot,
+which after round 26 may name a worker the decision no longer counted.
+`CapabilityMissResolution` now carries `misses_before`/`distinct_before`, set by
+`resolve_capability_miss` from the very values it decided on, and the escalation
+reports those. Round 23's contract ("every number in an escalation reason is the
+one that actually acted") therefore survives the change that made the snapshot
+untrustworthy, and is now true *by construction* rather than by two call sites
+agreeing to read the same row — the reported numbers and the decision cannot
+diverge because they are the same values.
+
+**No new `WorkflowEvent` variant, no migration** (AC7): one read-only `SELECT` on
+the miss path, and no change to the release or escalation statements.
+
+**Tests.** Two pure `queue.rs` unit tests pin the two halves of the invariant that
+now replaces the old one: `miss_state_read_is_ownership_guarded` (the re-read is
+scoped to this worker's own claim and refreshes both counters together) and
+`registration_invalidation_must_reach_rows_under_an_active_claim`, which asserts
+the invalidation has **no** ownership guard — the reflex fix, since every sibling
+writer has one, and the one that would skip exactly the row the round-26 harm
+lands on.
+
+The DB test `peer_reregistering_mid_dispatch_is_seen_by_the_decision` hits the
+race **deterministically rather than by timing**: the workflow body itself
+performs the invalidation, and a body runs strictly between `claim_task` and the
+`AfterHandler` miss raised by `persist_scheduled_activities`. That is the real
+window, hit exactly, with no sleep and no second worker to race. Falsified by
+reverting `current_frontier_miss_state` to the bare snapshot: the execution lands
+in `FAILED` with a `no_capable_worker:` reason instead of the task returning to
+`PENDING`.

@@ -4931,6 +4931,19 @@ pub struct CapabilityMissResolution {
     /// `true` when this worker is not yet in the task's distinct-miss set, so
     /// the release must append it.
     pub worker_is_new: bool,
+    /// Completed releases recorded against the current frontier **before** this
+    /// claim — the number an escalation must report.
+    ///
+    /// Carried here rather than re-read off the task row (issue #804, Codex
+    /// round 27): after round 26 a peer's re-registration can invalidate its own
+    /// stale entry on this row mid-dispatch, so the claim-time snapshot may name
+    /// a worker the decision no longer counted. Reporting from the same values
+    /// the decision consumed is what keeps round 23's contract — every number in
+    /// an escalation reason is the one that actually acted — true.
+    pub misses_before: i32,
+    /// Distinct workers recorded against the current frontier **before** this
+    /// claim. Same provenance as [`Self::misses_before`].
+    pub distinct_before: usize,
     /// What the worker registry said about a capable peer still being live
     /// (issue #804). Carried out of the resolution so the escalation reason can
     /// report the same evidence the decision was made on.
@@ -4958,23 +4971,90 @@ pub struct CapabilityMissResolution {
 /// * otherwise — nothing in this dispatch touched those columns, so the
 ///   snapshot is still exactly what the row holds.
 ///
-/// Nothing else writes them between the claim and the miss: a concurrent
-/// poison-pill reclaim changes `worker_id`, which the release's own
-/// `worker_id = $2` guard turns into a `0 rows affected` no-op.
+/// The `reset_committed` branch is exact and infallible, and deliberately so:
+/// it deliberately replaces a *fabricated* clean frontier that round 21 P2 had
+/// substituted when a DB re-read failed. That fabrication bypassed the
+/// storage-ceiling guard, so a row already at `i32::MAX` would be released and
+/// the `capability_misses + 1` in the release statement would raise
+/// `integer out of range` — stranding a `RUNNING` row under a live worker that
+/// orphan reclamation skips. An in-memory fact about this dispatch has no such
+/// mode, and it stays the first branch for that reason.
 ///
-/// This deliberately replaces a DB re-read (round 21 P2's fix), which had a
-/// failure mode of its own: substituting a fabricated clean frontier when the
-/// read failed bypassed the storage-ceiling guard, so a row already at
-/// `i32::MAX` would be released and the `capability_misses + 1` in the release
-/// statement would raise `integer out of range` — stranding a `RUNNING` row
-/// under a live worker that orphan reclamation skips. An infallible in-memory
-/// fact has no such mode.
+/// # The snapshot is not authoritative on its own
+///
+/// This function is the *fallback* half of the decision input, not the whole of
+/// it: see [`current_frontier_miss_state`], which re-reads the row first. Until
+/// round 26 nothing could write these columns between the claim and the miss —
+/// every writer was ownership-guarded, so a concurrent poison-pill reclaim
+/// changed `worker_id` and turned the release into a `0 rows affected` no-op.
+/// `queue::invalidate_capability_miss_evidence_for_worker` broke that invariant
+/// on purpose: it must reach a row under an active claim, because that is the
+/// row whose decision stale evidence poisons.
 #[must_use]
 fn frontier_miss_state(task: &TaskQueueItem, reset_committed: bool) -> (i32, Vec<String>) {
     if reset_committed {
         (0, Vec::new())
     } else {
         (task.capability_misses, task.capability_miss_workers.clone())
+    }
+}
+
+/// The capability-miss counters to decide on, refreshed from the row
+/// (issue #804, Codex round-27 P1).
+///
+/// A worker's claim-time snapshot can be stale by the time it decides.
+/// `queue::invalidate_capability_miss_evidence_for_worker` (round 26) runs when
+/// a worker registers and is deliberately **not** ownership-guarded, so a pod
+/// restarting onto a capable build clears its stale entry from rows other
+/// workers are mid-dispatch on. Deciding on the snapshot then reads that pod as
+/// still incapable *and* the registry reports it live — which is
+/// `AllLiveWorkersMissed`, the terminal failure round 26 exists to prevent,
+/// reintroduced through the back door.
+///
+/// So the row is re-read, and only its own writer can change what comes back.
+/// Three cases, all safe:
+///
+/// * `reset_committed` — an exact in-memory fact about *this* dispatch that no
+///   read can improve on, so it short-circuits with no round-trip at all.
+/// * a successful read — authoritative. Invalidation only ever *removes*
+///   entries, so a fresher view can only weaken the fleet evidence, and weaker
+///   evidence can only bias toward releasing (AC1).
+/// * `None` (the claim is gone) or an error — fall back to the snapshot, which
+///   is exactly the pre-round-27 behaviour. Deliberately **not** a fabricated
+///   clean frontier: that is the round-21 P2 hazard described above, and a
+///   read failure must degrade to the status quo rather than to something new.
+///
+/// The read sits as late as it can without a transaction — immediately before
+/// the decision, with only in-memory work between it and the terminal write —
+/// so the window in which a registration can still slip past is a few
+/// microseconds rather than the whole decision cycle (which, for an
+/// `AfterHandler` miss, is the entire workflow body).
+async fn current_frontier_miss_state(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    reset_committed: bool,
+) -> (i32, Vec<String>) {
+    if reset_committed {
+        return frontier_miss_state(task, true);
+    }
+    match queue::read_capability_miss_state(conn, task.id, worker_id).await {
+        Ok(Some(fresh)) => fresh,
+        Ok(None) => {
+            tracing::debug!(
+                task_id = %task.id,
+                "capability-miss state re-read matched no owned row; deciding on the claim-time snapshot"
+            );
+            frontier_miss_state(task, false)
+        }
+        Err(error) => {
+            tracing::warn!(
+                task_id = %task.id,
+                error = %error,
+                "failed to re-read capability-miss state; deciding on the claim-time snapshot"
+            );
+            frontier_miss_state(task, false)
+        }
     }
 }
 
@@ -5025,6 +5105,8 @@ pub fn resolve_capability_miss(
             distinct_after,
             worker_is_new,
             evidence,
+            misses_before,
+            distinct_before: distinct_workers_before.len(),
         };
     }
     CapabilityMissResolution {
@@ -5033,6 +5115,8 @@ pub fn resolve_capability_miss(
         distinct_after,
         worker_is_new,
         evidence,
+        misses_before,
+        distinct_before: distinct_workers_before.len(),
     }
 }
 
@@ -16034,10 +16118,13 @@ async fn handle_capability_miss(
     // P1). See `read_live_fleet_or_degrade` for why a failure here degrades to
     // an empty set instead of propagating.
     let live_workers = read_live_fleet_or_degrade(conn, task, policy.worker_stale_secs).await;
-    // Issue #804 (Codex rounds 20 and 22): decide on the counters as they stand
-    // NOW, which is not always the claim-time snapshot in `task` — see
-    // `frontier_miss_state`.
-    let (misses_before, distinct_before) = frontier_miss_state(task, frontier_reset_committed);
+    // Issue #804 (Codex rounds 20, 22 and 27): decide on the counters as they
+    // stand NOW, which is not the claim-time snapshot in `task` — this dispatch
+    // may have retired a frontier, and a peer's re-registration may have
+    // invalidated its own stale evidence on this very row. See
+    // `current_frontier_miss_state`.
+    let (misses_before, distinct_before) =
+        current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed).await;
     let resolution = resolve_capability_miss(
         &distinct_before,
         misses_before,
@@ -16153,8 +16240,8 @@ async fn escalate_capability_miss(
     // post-increment total here would tell an operator that N+1 redeliveries
     // occurred when only N did.
     let escalation = escalation_from_persisted(
-        task.capability_misses,
-        task.capability_miss_workers.len(),
+        resolution.misses_before,
+        resolution.distinct_before,
         resolution,
     );
     let cause = EscalationCause::resolve(max_redeliveries, task.session_id, escalation);
@@ -16223,7 +16310,7 @@ async fn escalate_capability_miss(
         task_type = %task.task_type,
         handler_kind = missing.kind,
         handler = missing.name,
-        completed_releases = task.capability_misses,
+        completed_releases = resolution.misses_before,
         distinct_incapable_workers = resolution.distinct_after,
         fleet_evidence = ?resolution.evidence,
         max_redeliveries,

@@ -727,6 +727,48 @@ fn decoy_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'
     Box::pin(async move { Ok(serde_json::json!("decoy")) })
 }
 
+/// Where `workflow_invalidates_peer_then_misses` reaches the database, and the
+/// peer whose evidence it clears (issue #804 round 27).
+///
+/// A `OnceLock` rather than a parameter because a `WorkflowHandlerFn` is a bare
+/// `fn` pointer with a fixed signature and cannot capture.
+static RACE_INJECTION: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// The deterministic injection point for the round-27 race: a workflow body
+/// that clears a peer's capability-miss evidence **while its own dispatch holds
+/// the claim**, then misses on an activity this worker does not register.
+///
+/// This is the real interleaving, not a simulation of it. The body runs strictly
+/// between `claim_task` (which took the snapshot naming the peer) and
+/// `persist_scheduled_activities` (which raises the `AfterHandler` miss and
+/// decides), so a registration landing here is exactly a pod restarting
+/// mid-dispatch. Injecting it from inside the body is what makes the race
+/// deterministic instead of a sleep-and-hope.
+fn workflow_invalidates_peer_then_misses(
+    ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> BoxFut<'_> {
+    Box::pin(async move {
+        if let Some((url, peer)) = RACE_INJECTION.get() {
+            let mut conn = AsyncPgConnection::establish(url)
+                .await
+                .expect("race injection connects");
+            queue::invalidate_capability_miss_evidence_for_worker(
+                &mut conn,
+                peer,
+                &[Q_CLAIM_RACE.to_string()],
+            )
+            .await
+            .expect("race injection invalidates the peer's evidence");
+        }
+        // Now miss: this activity is registered nowhere on this worker, so the
+        // enqueue preflight raises an `AfterHandler` capability miss.
+        ctx.execute_activity_raw("never_registered_activity", input, Q_CLAIM_RACE)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// Workflow that dispatches one activity onto the dedicated activity queue and
 /// returns its output (AC2's realistic split-queue fleet).
 fn workflow_calls_peer_activity(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
@@ -2025,6 +2067,7 @@ async fn single_worker_fleet_escalates_at_the_configured_budget() {
 // ---------------------------------------------------------------------------
 
 const Q_RESTART: &str = "q804-restart";
+const Q_CLAIM_RACE: &str = "q804-claim-race";
 
 /// Move the execution's task rows out of (or back into) claim range.
 ///
@@ -2260,6 +2303,113 @@ async fn restart_onto_a_capable_build_clears_its_stale_miss_evidence() {
         metrics.samples()
     );
     // AC4: a capability miss is never a crash, on this path either.
+    assert_eq!(metrics.quarantine_count(), 0);
+}
+
+/// **Issue #804, Codex round-27 P1.** The release-vs-escalate decision must not
+/// be made on a claim-time snapshot that a peer's re-registration has since
+/// invalidated.
+///
+/// Round 26's invalidation is deliberately **not** ownership-guarded — it has to
+/// reach a row another worker is mid-dispatch on, because that is precisely the
+/// row whose decision stale evidence poisons. That made it the one writer that
+/// can change these columns between a claim and its miss, breaking the invariant
+/// `frontier_miss_state` had documented and relied on.
+///
+/// The consequence is that round 26 fixes nothing in its own headline scenario
+/// whenever the restart lands mid-dispatch: `pod-b` claimed while the row still
+/// named `pod-a`, `pod-a` restarts onto a capable build and clears its entry,
+/// and `pod-b` — still deciding on its snapshot — reads `pod-a` as incapable
+/// *and* the registry reports it live, derives `AllLiveWorkersMissed`, and
+/// terminally fails the run. Same terminal failure, one layer down.
+///
+/// The interleaving here is **deterministic, not timed**: the workflow body
+/// itself performs the invalidation, and a body runs strictly between
+/// `claim_task` and the `AfterHandler` miss raised by
+/// `persist_scheduled_activities`. That is the real window, hit exactly, with no
+/// sleep and no second worker to race.
+///
+/// Falsifiable — verified by reverting `current_frontier_miss_state` to the bare
+/// `frontier_miss_state` snapshot: the execution lands in `FAILED` with a
+/// `no_capable_worker:` reason instead of the task returning to `PENDING`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_reregistering_mid_dispatch_is_seen_by_the_decision() {
+    // Budget 1, already spent by the seeded miss: without the re-read the very
+    // next miss escalates, so the two outcomes are one claim apart.
+    const BUDGET: u32 = 1;
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "claim_race_wf",
+        serde_json::json!({}),
+        Q_CLAIM_RACE,
+    )
+    .await;
+
+    // `pod-a` missed this frontier on its old build, exhausting the budget, and
+    // is live (it is about to restart onto a capable build, mid-dispatch).
+    seed_prior_missing_workers(&url, exec_id, &["pod-a"]).await;
+    seed_live_worker(&url, "pod-a", Q_CLAIM_RACE).await;
+
+    // Arm the injection the workflow body performs while holding the claim.
+    RACE_INJECTION
+        .set((url.clone(), "pod-a".to_string()))
+        .expect("race injection is armed exactly once per process");
+
+    let metrics = Arc::new(CapabilityMetrics::default());
+    let pod_b = build_worker(
+        "pod-b",
+        &[Q_CLAIM_RACE],
+        build_registry(
+            // `pod-b` CAN run the workflow (so the body executes and the miss is
+            // `AfterHandler`), but registers no activity at all.
+            vec![workflow_info(
+                "claim_race_wf",
+                workflow_invalidates_peer_then_misses,
+            )],
+            vec![],
+            Arc::clone(&metrics),
+        ),
+        BUDGET,
+    );
+
+    let observed = with_worker_running(&pod_b, &pool, async {
+        wait_for_miss_by(&url, exec_id, "pod-b", Duration::from_secs(60)).await
+    })
+    .await;
+
+    let task = observed.expect(
+        "the execution went terminal instead of releasing -- the decision used \
+         the claim-time snapshot, which still named `pod-a` even though its \
+         evidence had been invalidated during this very dispatch",
+    );
+
+    assert_eq!(
+        task.state, "PENDING",
+        "the task must return to the queue for the restarted, capable pod"
+    );
+    let execution = load_execution(&url, exec_id).await;
+    assert_eq!(
+        execution.state, "RUNNING",
+        "a live worker whose evidence was invalidated mid-dispatch means the \
+         fleet is NOT swept, so the run must survive"
+    );
+    assert_eq!(
+        task.capability_miss_workers,
+        vec!["pod-b".to_string()],
+        "the release appends to the CURRENT array, so the invalidated peer must \
+         not reappear"
+    );
+    assert_eq!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED),
+        0,
+        "no escalation may occur while a live peer is unaccounted for, got {:?}",
+        metrics.samples()
+    );
     assert_eq!(metrics.quarantine_count(), 0);
 }
 

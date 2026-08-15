@@ -2375,6 +2375,22 @@ pub const fn invalidate_capability_miss_evidence_for_worker_query() -> &'static 
 /// Scoped by `queue_name` so a worker only invalidates evidence on queues it
 /// actually polls.
 ///
+/// # Deliberately not ownership-guarded
+///
+/// Unlike every other writer of these columns, this statement has no
+/// `state = 'RUNNING' AND worker_id = $n` clause: it must reach a row **another
+/// worker is currently processing**, because that is exactly the row whose
+/// decision the stale evidence would poison. A worker holding a claim taken
+/// before this restart would otherwise still weigh the old instance as
+/// incapable and terminally fail the run (issue #804, Codex round-27 P1).
+///
+/// That makes this the one writer that can change the columns between a claim
+/// and its miss, which is why the decision path re-reads them through
+/// [`read_capability_miss_state`] rather than trusting the claim-time snapshot.
+/// The re-read is safe in one direction by construction: this statement only
+/// ever *removes* entries, so a fresher read can only weaken the fleet evidence
+/// and therefore only bias toward releasing.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
@@ -2393,6 +2409,59 @@ pub async fn invalidate_capability_miss_evidence_for_worker(
         .await
         .map_err(crate::error::database_error)?;
     Ok(cleared)
+}
+
+/// SQL for [`read_capability_miss_state`]. Extracted as a `const fn` so its
+/// shape is unit-testable without a database.
+///
+/// Ownership-guarded (`state = 'RUNNING' AND worker_id = $2`) for the same
+/// reason the release statement is: a row a concurrent poison-pill reclaim or
+/// operator action already took out from under this dispatch is not ours to
+/// decide about, and returning its counters would let this worker escalate a
+/// claim it no longer holds.
+#[must_use]
+pub const fn read_capability_miss_state_query() -> &'static str {
+    "SELECT capability_misses, capability_miss_workers \
+     FROM harvest_task_queue \
+     WHERE id = $1 \
+       AND state = 'RUNNING' \
+       AND worker_id = $2"
+}
+
+/// The task's capability-miss counters **as they stand now**, for the
+/// release-vs-escalate decision (issue #804, Codex round-27 P1).
+///
+/// Returns `None` when the row is no longer claimed by `worker_id` — a
+/// concurrent reclaim or operator action took it — which the caller treats as
+/// "decide on what we last saw", since the release that follows is itself
+/// ownership-guarded and will no-op.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the query fails.
+pub async fn read_capability_miss_state(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    worker_id: &str,
+) -> HarvestResult<Option<(i32, Vec<String>)>> {
+    #[derive(diesel::QueryableByName)]
+    struct MissStateRow {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        capability_misses: i32,
+        #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Text>)]
+        capability_miss_workers: Vec<String>,
+    }
+
+    let rows: Vec<MissStateRow> = diesel::sql_query(read_capability_miss_state_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .map(|r| (r.capability_misses, r.capability_miss_workers)))
 }
 
 /// Hint for sticky cross-worker routing when parking or enqueueing a task.
@@ -4078,6 +4147,44 @@ mod tests {
         assert!(
             sql.contains("queue_name = ANY($2)"),
             "evidence invalidation must be scoped to this worker's queues: {sql}"
+        );
+    }
+
+    /// The one writer of these columns that is deliberately NOT ownership-
+    /// guarded, and must stay that way (issue #804, Codex round-27 P1).
+    ///
+    /// The row whose decision stale evidence poisons is precisely the one
+    /// another worker is *already processing*: it claimed before this restart,
+    /// so its snapshot still lists the old incapable instance. Adding a
+    /// `state = 'RUNNING' AND worker_id = ...` guard here — the reflex, since
+    /// every sibling writer has one — would skip exactly that row and leave the
+    /// round-26 terminal failure intact. The claim-vs-write race it creates is
+    /// answered on the read side instead, by `read_capability_miss_state`.
+    #[test]
+    fn registration_invalidation_must_reach_rows_under_an_active_claim() {
+        let sql = invalidate_capability_miss_evidence_for_worker_query();
+        assert!(
+            !sql.contains("state = 'RUNNING'") && !sql.contains("worker_id"),
+            "an ownership guard here would skip the claimed row whose decision \
+             the stale evidence actually poisons; the race is answered by the \
+             decision-time re-read instead: {sql}"
+        );
+    }
+
+    /// The decision-time re-read must only ever return counters for a row this
+    /// worker still holds. Returning a foreign owner's counters would let this
+    /// dispatch escalate a claim it no longer has.
+    #[test]
+    fn miss_state_read_is_ownership_guarded() {
+        let sql = read_capability_miss_state_query();
+        assert!(
+            sql.contains("state = 'RUNNING'") && sql.contains("worker_id = $2"),
+            "the re-read must be scoped to this worker's own claim: {sql}"
+        );
+        assert!(
+            sql.contains("capability_misses") && sql.contains("capability_miss_workers"),
+            "both counters must be refreshed together, or the pair could \
+             disagree about the same frontier: {sql}"
         );
     }
 
