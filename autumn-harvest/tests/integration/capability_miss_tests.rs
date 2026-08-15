@@ -52,7 +52,8 @@ use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::{
-    harvest_dead_letters, harvest_task_queue, harvest_workflow_executions,
+    harvest_dead_letters, harvest_rate_limit_buckets, harvest_task_queue,
+    harvest_workflow_executions,
 };
 use autumn_harvest::telemetry::{
     CAPABILITY_MISS_OUTCOME_ESCALATED, CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED,
@@ -1696,5 +1697,110 @@ async fn budget_never_escalates_while_a_capable_worker_is_live() {
     assert_eq!(
         metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED),
         0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rate-limit token refund on release (#804 x #332, Codex round-11 P2)
+// ---------------------------------------------------------------------------
+
+const Q_RATE: &str = "q804-rate";
+
+/// Read a rate-limit bucket's stored token count.
+///
+/// The stored value is only accurate as of `last_refilled_at` in general, but
+/// the bucket this helper is used against is seeded with `refill_rate = 0.0`,
+/// so no time-based refill can occur and the stored value *is* the effective
+/// one. That is deliberate: a bucket that refills would replace the token on
+/// its own and mask a missing refund entirely.
+async fn stored_tokens(url: &str, key: &str) -> f64 {
+    let mut conn = connect(url).await;
+    harvest_rate_limit_buckets::table
+        .find(key)
+        .select(harvest_rate_limit_buckets::tokens)
+        .first(&mut conn)
+        .await
+        .expect("read rate-limit bucket")
+}
+
+/// Releasing a rate-limited activity for a capable peer must give its token
+/// back (issue #804, Codex round-11 P2).
+///
+/// `claim_task` debits a token for any rate-limited activity that is not
+/// circuit-breaker-tracked, and an incapable worker's claim is no exception —
+/// it is not tracked *because* the worker does not register the activity at
+/// all. The activity never runs, so keeping the token charges real capacity to
+/// a dispatch that did nothing. With a slow refill that is not cosmetic: the
+/// capable peer waits a full refill interval it should not have to, and the
+/// incapable worker (whose release backoff starts at 1 s) is positioned to take
+/// each newly minted token again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn releasing_a_rate_limited_activity_refunds_its_token() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+
+    let exec_id = seed_execution(&mut conn, "rate_limited_wf", serde_json::json!({})).await;
+
+    // burst 1 / refill 0: exactly one token, ever. Any refill would mask a
+    // missing refund by replacing the token on its own.
+    //
+    // The key is unique per run. A shared key would let a PENDING task left
+    // behind by an earlier run race for the single token, so a later run could
+    // fail for having lost that race rather than for the property under test.
+    let key = format!("q804-rate-bucket-{exec_id}");
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at) \
+         VALUES ($1, 0.0, 1.0, 1.0, NOW())",
+    )
+    .bind::<diesel::sql_types::Text, _>(key.as_str())
+    .execute(&mut conn)
+    .await
+    .expect("seed rate-limit bucket");
+
+    let mut params = EnqueueParams::new(Q_RATE, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.activity_name = Some("rate_limited_activity".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.rate_limit_key = Some(key.clone());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue rate-limited activity task");
+
+    let metrics = Arc::new(CapabilityMetrics::default());
+    let worker = build_worker(
+        "worker-rate-incapable",
+        &[Q_RATE],
+        build_registry(
+            vec![],
+            // Registers a DIFFERENT activity, so `rate_limited_activity` is a
+            // capability miss -- and, being unregistered, is necessarily absent
+            // from this worker's circuit-breaker tracked set, so its claim took
+            // the debiting branch.
+            vec![activity_info("some_other_activity", decoy_activity, Q_RATE)],
+            Arc::clone(&metrics),
+        ),
+        50,
+    );
+
+    with_worker_running(&worker, &pool, async {
+        wait_for_capability_misses(&url, exec_id, 1, Duration::from_secs(30)).await;
+    })
+    .await;
+
+    assert!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_RELEASED) >= 1,
+        "the task must have been released, got {:?}",
+        metrics.samples()
+    );
+
+    // The refund is the whole point: with refill 0, a bucket that is not
+    // refunded stays at 0.0 forever and the capable peer can never claim.
+    let tokens = stored_tokens(&url, &key).await;
+    assert!(
+        tokens >= 0.99,
+        "releasing an activity that never ran must refund its claim-time token, \
+         leaving the bucket full; got {tokens}"
     );
 }

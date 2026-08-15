@@ -15302,6 +15302,47 @@ async fn read_live_fleet_or_degrade(
     )
 }
 
+/// Give back the per-activity rate-limit token this claim spent, when it spent
+/// one (issue #804 x #332, Codex round-11 P2).
+///
+/// `claim_task` debits a token in its `rate_limit_debit` CTE for any task
+/// carrying a `rate_limit_key` whose activity is **not** circuit-breaker
+/// tracked; for a tracked activity the debit is deferred to dispatch (#369) and
+/// the claim skips it. A capability miss can only ever be the untracked case:
+/// the tracked set is derived from this worker's own registered activities, so
+/// an activity it does not register cannot be in it. A present `rate_limit_key`
+/// therefore means this claim debited, and the presence check alone is the
+/// correct — and drift-proof — predicate, mirroring `claim_task`'s own gate.
+///
+/// Keeping the token would charge real capacity to a dispatch that ran nothing.
+/// That is not cosmetic on a slow bucket: the capable peer waits out a refill
+/// interval it should not have to, and the incapable worker — whose release
+/// backoff starts at one second — is well placed to take the next minted token
+/// too, so a low-refill activity can be starved by a worker that cannot run it.
+///
+/// A refund failure is logged, never propagated: the release itself is the
+/// load-bearing action, and failing the dispatch over unreturned capacity would
+/// strand the row `RUNNING` under a live worker, which is strictly worse than
+/// the leak (the poison-pill reclaimer only recovers rows whose worker has
+/// stopped heartbeating).
+async fn refund_capability_miss_rate_limit_token(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+) {
+    let Some(key) = task.rate_limit_key.as_deref() else {
+        return;
+    };
+    if let Err(error) = queue::refund_rate_limit_token(conn, key).await {
+        tracing::warn!(
+            task_id = %task.id,
+            rate_limit_key = %key,
+            %error,
+            "failed to refund the rate-limit token for a capability miss; the activity did not \
+             run, so this leaks one token of capacity until the bucket refills"
+        );
+    }
+}
+
 /// Release a claim taken by a worker with no handler for the task's type, or
 /// escalate it once the redelivery budget is exhausted (issue #804).
 ///
@@ -15320,6 +15361,12 @@ async fn handle_capability_miss(
     missing: MissingHandler<'_>,
     policy: CapabilityMissPolicy,
 ) -> HarvestResult<TaskDispatchOutcome> {
+    // Give back the rate-limit token this claim spent (issue #804, Codex
+    // round-11 P2). Unconditional here, before the release-vs-escalate branch,
+    // because the activity did not run in EITHER case — the capacity was
+    // charged to a dispatch that did nothing.
+    refund_capability_miss_rate_limit_token(conn, task).await;
+
     // Fleet evidence for the distinct-worker bound (issue #804, Codex round-8
     // P1). See `read_live_fleet_or_degrade` for why a failure here degrades to
     // an empty set instead of propagating.
