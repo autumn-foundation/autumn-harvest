@@ -3094,12 +3094,31 @@ pub struct WorkerConfig {
     /// (`capability_miss_workers`), and a repeat miss by a worker already in
     /// that set is free: it still backs off, but consumes no budget.
     ///
-    /// A secondary absolute ceiling of `10 ×` this value on *total* releases
-    /// terminates the degenerate case a distinct-worker budget cannot reach —
-    /// a fleet smaller than the budget, where the distinct set can never grow
-    /// far enough. Reaching it while a capable peer is live means that peer
-    /// lost the claim race that many times consecutively, which is vanishingly
-    /// unlikely; the sustained-release alert fires long before it.
+    /// # The budget is gated on the live fleet
+    ///
+    /// A distinct count still has no relationship to how many workers are
+    /// actually up: a rollout with `N + 1` old pods plus one new capable pod
+    /// can hand `N + 1` distinct incapable ids to the budget while the capable
+    /// pod is live and polling. So this budget may only terminate a task once
+    /// the recorded miss set **covers the live fleet for the task's queue**
+    /// (`harvest_workers` rows with a fresh heartbeat advertising it, using the
+    /// same `2 × worker_heartbeat_interval` liveness window as
+    /// [`crate::poison_pill`] and the broken-session scanner). While any live
+    /// worker there has never missed the task, this bound is withheld.
+    ///
+    /// Two consequences: the effective bound is `max(N, live fleet size)`
+    /// redeliveries — you cannot prove "no worker here has the handler" in
+    /// fewer redeliveries than there are workers to ask — and a fleet whose
+    /// workers are not registered at all (heartbeats disabled, or a different
+    /// queue name advertised) falls back to bounding on `N` alone, with the
+    /// escalation reason saying so rather than claiming a fleet conclusion.
+    ///
+    /// A secondary absolute ceiling of `10 ×` this value on *total* releases is
+    /// **ungated**, and terminates what the gated bound cannot: a fleet smaller
+    /// than the budget (where the distinct set can never grow far enough), and
+    /// a live worker that never claims. It reports the counts it actually
+    /// observed rather than a fleet-wide conclusion, and the sustained-release
+    /// alert fires long before it.
     ///
     /// Both the set and the total are reset by every path that proves the
     /// claiming worker *was* capable, so they measure **consecutive** misses —
@@ -5081,7 +5100,12 @@ mod tests {
         let config = WorkerConfig::default().with_capability_miss_max_redeliveries(0);
         assert_eq!(config.capability_miss_max_redeliveries, 0);
         assert_eq!(
-            crate::worker::capability_miss_decision(1, 1, config.capability_miss_max_redeliveries),
+            crate::worker::capability_miss_decision(
+                1,
+                1,
+                config.capability_miss_max_redeliveries,
+                crate::worker::FleetCapabilityEvidence::AllLiveWorkersMissed,
+            ),
             crate::worker::CapabilityMissAction::Escalate
         );
     }

@@ -321,6 +321,32 @@ set backs off but consumes no budget. A secondary absolute ceiling of `10 ×` th
 budget on total releases covers the one case a distinct-worker budget cannot: a
 fleet smaller than the budget, where the set can never grow far enough.
 
+**The budget is gated on the live fleet, not just on its own count.** A fixed
+number of distinct workers still has no relationship to how many workers are
+actually up: a rollout with `budget + 1` old pods plus one new capable pod could
+hand `budget + 1` distinct incapable ids to the budget while the capable pod was
+live and polling. So before the budget may terminate a task, the workers
+recorded as having missed it must **cover the live fleet for its queue** —
+`harvest_workers` rows with a fresh heartbeat advertising that queue, using the
+same `2 × worker_heartbeat_interval` liveness window as the poison-pill
+reclaimer (#367) and the broken-session scanner (#606). While any live worker
+there has never missed the task, the budget is withheld and the task keeps
+being offered around.
+
+This is the mechanism behind the guarantee: **as long as at least one capable
+worker is live on the queue, the budget cannot fail the run.** Two consequences
+worth knowing before you tune anything:
+
+- The bound is `max(budget, live fleet size)` redeliveries, not exactly
+  `budget` — you cannot prove "no worker here has the handler" in fewer
+  redeliveries than there are workers to ask.
+- A worker that is *not* registered in `harvest_workers` (heartbeats disabled,
+  or advertising a different queue name) makes the registry unusable, and the
+  budget falls back to bounding on its own. The escalation reason says so
+  explicitly rather than claiming a fleet conclusion it never established —
+  see row 1b in
+  [`harvest-alerts.md`](harvest-alerts.md#harvest_no_capable_worker).
+
 The ceiling escalates with a **different reason string**, because it supports a
 weaker conclusion — the releases were concentrated in fewer workers than the
 budget allows, so the whole queue was never swept:
@@ -334,6 +360,19 @@ bound reachable, so ticketing it would mean a one-pod deployment never pages for
 a genuinely missing handler. Check the named `distinct_incapable_workers` count
 against `GET /api/harvest/workers` before concluding the whole queue lacks the
 handler.
+
+Because the budget is fleet-gated, the ceiling is also the only bound reachable
+when a live worker on the queue has never missed the task. That case gets its
+own wording, pointing at the peer rather than at the deploy:
+
+```
+no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 50 capability-miss redeliveries spread across only 6 distinct worker(s), hitting the absolute release ceiling of 10x capability_miss_max_redeliveries = 5; a live worker on this queue never missed this task, so it may well have the handler and simply lost every claim race — check whether it is saturated, draining, or advertising a stale queue list before concluding the handler is missing)
+```
+
+The counts in every reason string are the **persisted** ones: redeliveries that
+actually completed, and workers that actually released. The claim that escalated
+never ran a release, so it is not counted — the string describes the durable
+record you can go and read.
 
 That bound is what keeps a genuinely-missing handler — a workflow type deleted
 or renamed in the new build with runs still in flight — from bouncing around

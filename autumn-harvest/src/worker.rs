@@ -3909,6 +3909,28 @@ pub const CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER: i32 = 10;
 /// the counter got there. Organically it never does (2^31 releases at the 30 s
 /// backoff cap is roughly two thousand years), but the column is writable by an
 /// operator, a backfill, or a test seed.
+/// How long a worker may go without a heartbeat before the fleet treats it as
+/// dead.
+///
+/// `2 × heartbeat_interval`, with a 1 s floor for sub-second intervals and a
+/// one-year cap so an absurd configured interval cannot overflow the
+/// `chrono::Duration` arithmetic downstream. The doubling happens *before*
+/// rounding to whole seconds so a fractional interval (e.g. 1500 ms → 3 s, not
+/// 2 s) keeps the documented window.
+///
+/// Extracted so the three subsystems that ask "is this worker alive?" — the
+/// poison-pill orphan reclaimer (#367), the broken-worker-session scanner
+/// (#606), and the capability-miss fleet lookup (#804) — cannot drift apart on
+/// the answer.
+#[must_use]
+pub fn worker_stale_secs(heartbeat_interval: Duration) -> i64 {
+    let doubled = heartbeat_interval.saturating_mul(2);
+    i64::try_from(doubled.as_secs())
+        .unwrap_or(crate::poison_pill::MAX_WORKER_STALE_SECS)
+        .saturating_add(i64::from(doubled.subsec_nanos() > 0))
+        .clamp(1, crate::poison_pill::MAX_WORKER_STALE_SECS)
+}
+
 /// The redelivery budget as an `i32`, clamped for the persisted counter's type.
 ///
 /// `max_redeliveries` is a `u32` but `capability_misses` is a Postgres `INT`, so
@@ -3929,6 +3951,7 @@ pub const fn capability_miss_decision(
     distinct_workers_after: i32,
     misses_after_increment: i32,
     max_redeliveries: u32,
+    evidence: FleetCapabilityEvidence,
 ) -> CapabilityMissAction {
     if max_redeliveries == 0 {
         return CapabilityMissAction::Escalate;
@@ -3940,11 +3963,25 @@ pub const fn capability_miss_decision(
         return CapabilityMissAction::Escalate;
     }
     let budget = capability_miss_budget(max_redeliveries);
-    // PRIMARY bound: distinct incapable workers. A repeat miss by a worker
-    // already known to be incapable for this task does not move this number,
-    // so no single worker can consume the budget by winning the claim race
-    // repeatedly (issue #804, Codex round-6 P1).
-    if distinct_workers_after > budget {
+    // PRIMARY bound: distinct incapable workers, GATED ON FLEET EVIDENCE.
+    //
+    // A repeat miss by a worker already known to be incapable does not move
+    // this number, so no single worker can consume the budget by winning the
+    // claim race repeatedly (issue #804, Codex round-6 P1). But the count alone
+    // still has no relationship to the live fleet: a rollout with `budget + 1`
+    // old pods and one new capable pod can hand `budget + 1` distinct old
+    // worker ids to this check while the capable pod is live and polling, and
+    // the terminal failure would then assert the exact opposite of the truth
+    // (Codex round-8 P1).
+    //
+    // So the budget may only terminate the task once the registry agrees that
+    // no live worker on the queue is still unaccounted for. While a live worker
+    // has never missed it, that worker may be capable and this bound is
+    // withheld — the absolute ceiling below remains the backstop, which is what
+    // keeps AC3's "bounded release" true even when coverage is unreachable.
+    if distinct_workers_after > budget
+        && !matches!(evidence, FleetCapabilityEvidence::CapablePeerMayExist)
+    {
         return CapabilityMissAction::Escalate;
     }
     // ABSOLUTE bound: total releases. The distinct bound alone cannot terminate
@@ -3993,6 +4030,65 @@ pub const SESSION_PINNED_ESCALATION_MARKER: &str = "pinned to worker session";
 /// Greppable alongside [`NO_CAPABLE_WORKER_PREFIX`], which every variant keeps.
 pub const ZERO_BUDGET_ESCALATION_MARKER: &str = "capability-miss redelivery is disabled";
 
+/// What the worker registry says about whether a **capable peer could still
+/// claim this task** (issue #804).
+///
+/// The task's `capability_miss_workers` array records workers that have
+/// demonstrably no handler for it. On its own that is only ever evidence about
+/// the workers that happened to win a claim race — never about the fleet. A
+/// fixed redelivery budget therefore cannot distinguish "six incapable pods and
+/// nothing else" from "six incapable pods plus the new capable one", and would
+/// terminally fail the task in both cases as soon as `budget + 1` distinct
+/// workers had claimed it. This enum is the missing half: it compares the miss
+/// set against the workers that are actually **live on the task's queue**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FleetCapabilityEvidence {
+    /// Every live worker advertising this queue has now missed this task, so
+    /// "no live worker on this queue has the handler" is a *conclusion*.
+    AllLiveWorkersMissed,
+    /// At least one live worker advertising this queue has never missed this
+    /// task, so it may well be capable and merely lost the claim races so far.
+    /// The distinct-worker budget must **not** escalate while this holds.
+    CapablePeerMayExist,
+    /// The registry returned no usable answer, so no conclusion is available in
+    /// either direction and the configured budget is the only bound left.
+    ///
+    /// Detected self-referentially: the worker that just claimed the task is by
+    /// definition live and polling this queue, so if the registry does not list
+    /// it, the registry is not describing this fleet (heartbeats disabled, a
+    /// queue advertised under a different name, a stale window shorter than the
+    /// heartbeat interval, …). Trusting a set that cannot even see the claimant
+    /// would let a misconfigured registry suppress escalation forever.
+    Unavailable,
+}
+
+/// Classify the live fleet against the workers already known to lack this
+/// task's handler (issue #804).
+///
+/// `miss_workers` is the **post-increment** set — it includes `claiming_worker`,
+/// which has just proven it has no handler — because the question being asked
+/// is about the fleet as it stands *after* this miss.
+#[must_use]
+pub fn fleet_capability_evidence(
+    live_workers: &[String],
+    miss_workers: &[String],
+    claiming_worker: &str,
+) -> FleetCapabilityEvidence {
+    if !live_workers.iter().any(|w| w == claiming_worker) {
+        // Includes the empty-set case: a registry that cannot see the worker
+        // currently holding the claim cannot be used to reason about peers.
+        return FleetCapabilityEvidence::Unavailable;
+    }
+    if live_workers
+        .iter()
+        .all(|live| miss_workers.iter().any(|missed| missed == live))
+    {
+        FleetCapabilityEvidence::AllLiveWorkersMissed
+    } else {
+        FleetCapabilityEvidence::CapablePeerMayExist
+    }
+}
+
 /// Why a capability miss escalated instead of being released (issue #804).
 ///
 /// Resolved from the inputs already available to [`no_capable_worker_reason`],
@@ -4004,9 +4100,19 @@ pub const ZERO_BUDGET_ESCALATION_MARKER: &str = "capability-miss redelivery is d
 /// conclusion after it was added in review round 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscalationCause {
-    /// `max_redeliveries + 1` **distinct** workers each missed the task. Only
-    /// this case supports the fleet-wide conclusion.
-    BudgetExhausted,
+    /// `max_redeliveries + 1` **distinct** workers each missed the task, and
+    /// the registry raised no objection. Only this case supports the fleet-wide
+    /// conclusion.
+    BudgetExhausted {
+        /// `true` when the live fleet on this queue was enumerated and every
+        /// member of it had missed the task
+        /// ([`FleetCapabilityEvidence::AllLiveWorkersMissed`]) — the conclusion
+        /// is then substantiated rather than assumed. `false` means the
+        /// registry gave no usable answer
+        /// ([`FleetCapabilityEvidence::Unavailable`]) and the budget alone
+        /// bounded the release, which the reason string must say out loud.
+        fleet_confirmed: bool,
+    },
     /// The absolute release ceiling
     /// ([`CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER`] × budget) tripped while the
     /// distinct-misser set stayed within budget — so the releases were
@@ -4019,10 +4125,20 @@ enum EscalationCause {
     /// that tripped, but `releases` reports the real value, which is what triage
     /// acts on.
     ReleaseCeilingExhausted {
-        /// Total releases persisted on the row (the ceiling that tripped).
-        releases: i32,
-        /// How many distinct workers those releases were spread across.
-        distinct_workers: i32,
+        /// Redeliveries that actually **completed** (the persisted counter).
+        /// The escalating claim is not one of them: the escalation branch never
+        /// runs the release UPDATE, so counting it would overstate the record
+        /// by one in the very string an operator uses to reconstruct events.
+        completed_releases: i32,
+        /// How many distinct workers those completed releases were spread
+        /// across (the persisted array's length, on the same basis).
+        released_workers: i32,
+        /// `true` when a live worker on this queue had still never missed the
+        /// task ([`FleetCapabilityEvidence::CapablePeerMayExist`]) — i.e. the
+        /// ceiling, not the fleet, is what ended the retries. Materially
+        /// changes the operator's next step, so the reason string branches on
+        /// it.
+        capable_peer_may_exist: bool,
     },
     /// Redelivery is disabled, so the task was failed on its first claim by a
     /// single incapable worker, having been offered to no peer at all.
@@ -4044,17 +4160,29 @@ impl EscalationCause {
     const fn resolve(
         max_redeliveries: u32,
         session_id: Option<uuid::Uuid>,
-        counts: CapabilityMissCounts,
+        escalation: CapabilityMissEscalation,
     ) -> Self {
+        let fleet_blocks_budget = matches!(
+            escalation.evidence,
+            FleetCapabilityEvidence::CapablePeerMayExist
+        );
         match session_id {
             Some(session) => Self::SessionPinned(session),
             None if max_redeliveries == 0 => Self::ZeroBudgetFailFast,
-            None if counts.distinct_workers > capability_miss_budget(max_redeliveries) => {
-                Self::BudgetExhausted
+            None if !fleet_blocks_budget
+                && escalation.distinct_after > capability_miss_budget(max_redeliveries) =>
+            {
+                Self::BudgetExhausted {
+                    fleet_confirmed: matches!(
+                        escalation.evidence,
+                        FleetCapabilityEvidence::AllLiveWorkersMissed
+                    ),
+                }
             }
             None => Self::ReleaseCeilingExhausted {
-                releases: counts.releases,
-                distinct_workers: counts.distinct_workers,
+                completed_releases: escalation.completed_releases,
+                released_workers: escalation.released_workers,
+                capable_peer_may_exist: fleet_blocks_budget,
             },
         }
     }
@@ -4085,7 +4213,7 @@ impl EscalationCause {
     /// what tells the two apart during triage.
     const fn outcome_label(self) -> &'static str {
         match self {
-            Self::BudgetExhausted | Self::ReleaseCeilingExhausted { .. } => {
+            Self::BudgetExhausted { .. } | Self::ReleaseCeilingExhausted { .. } => {
                 crate::telemetry::CAPABILITY_MISS_OUTCOME_ESCALATED
             }
             Self::ZeroBudgetFailFast | Self::SessionPinned(_) => {
@@ -4095,17 +4223,60 @@ impl EscalationCause {
     }
 }
 
-/// The two capability-miss counts an escalation reports, as they will be
-/// persisted by this release (issue #804).
+/// Everything an escalation needs in order to name the bound that actually
+/// tripped and report it truthfully (issue #804).
 ///
 /// Bundled so [`no_capable_worker_reason`] and [`EscalationCause::resolve`]
-/// cannot be handed the two `i32`s in the wrong order.
+/// cannot be handed the `i32`s in the wrong order, and so the *decision* input
+/// and the *reported* counts stay visibly distinct — they are deliberately on
+/// different bases:
+///
+/// - `distinct_after` is **post-increment**: this claim is itself evidence that
+///   the claiming worker lacks the handler, so the decision must count it.
+/// - `completed_releases` / `released_workers` are **as persisted**: the
+///   escalation branch never runs the release UPDATE, so the durable record has
+///   one fewer release (and possibly one fewer distinct worker) than the
+///   decision saw. Reporting the decision's numbers as if they were history
+///   would tell an operator reconstructing the incident that a redelivery
+///   happened which never did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CapabilityMissCounts {
-    /// Distinct workers that will have missed this task, including this one.
-    pub distinct_workers: i32,
-    /// Total releases that will have been recorded on the row.
-    pub releases: i32,
+pub struct CapabilityMissEscalation {
+    /// Distinct workers known to lack the handler **including this claim** —
+    /// the value the escalation decision was made on.
+    pub distinct_after: i32,
+    /// Redeliveries that actually completed (the row's persisted
+    /// `capability_misses`, before this claim).
+    pub completed_releases: i32,
+    /// Distinct workers that actually released (the persisted
+    /// `capability_miss_workers` length, before this claim).
+    pub released_workers: i32,
+    /// What the worker registry says about a capable peer still being live.
+    pub evidence: FleetCapabilityEvidence,
+}
+
+/// Build the escalation report from the **persisted** row plus the resolution
+/// that decided to escalate (issue #804).
+///
+/// Exists as its own function so the one rule that is easy to get wrong at the
+/// call site is testable in isolation: the escalation branch never runs the
+/// release UPDATE, so `resolution.total_after` (and a freshly-appended distinct
+/// worker) describe a release that **did not happen**. Reporting them would
+/// overstate the durable record by one in the exact string an operator uses to
+/// reconstruct the incident (Codex round-8 P2). The decision input
+/// (`distinct_after`) is carried through unchanged, because the decision
+/// genuinely was made on it.
+#[must_use]
+pub fn escalation_from_persisted(
+    persisted_misses: i32,
+    persisted_miss_workers: usize,
+    resolution: &CapabilityMissResolution,
+) -> CapabilityMissEscalation {
+    CapabilityMissEscalation {
+        distinct_after: resolution.distinct_after,
+        completed_releases: persisted_misses,
+        released_workers: i32::try_from(persisted_miss_workers).unwrap_or(i32::MAX),
+        evidence: resolution.evidence,
+    }
 }
 
 /// Build the terminal error recorded when a capability miss escalates
@@ -4156,25 +4327,47 @@ pub fn no_capable_worker_reason(
     detail: &str,
     max_redeliveries: u32,
     session_id: Option<uuid::Uuid>,
-    counts: CapabilityMissCounts,
+    escalation: CapabilityMissEscalation,
 ) -> String {
-    match EscalationCause::resolve(max_redeliveries, session_id, counts) {
-        EscalationCause::BudgetExhausted => format!(
-            "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated after {max_redeliveries} \
-             capability-miss redeliveries; no live worker on this queue has the handler)"
-        ),
+    match EscalationCause::resolve(max_redeliveries, session_id, escalation) {
+        EscalationCause::BudgetExhausted { fleet_confirmed } => {
+            let basis = if fleet_confirmed {
+                "every worker with a live heartbeat here has now missed it, so no live worker on \
+                 this queue has the handler"
+            } else {
+                "the worker registry could not be used to confirm the live fleet (the claiming \
+                 worker is not listed against this queue — check worker heartbeats and the queue \
+                 names workers advertise), so the configured budget alone bounded the release and \
+                 a capable worker may still exist"
+            };
+            format!(
+                "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated after {max_redeliveries} \
+                 capability-miss redeliveries; {basis})"
+            )
+        }
         EscalationCause::ReleaseCeilingExhausted {
-            releases,
-            distinct_workers,
-        } => format!(
-            "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated after {releases} capability-miss \
-             redeliveries spread across only {distinct_workers} distinct worker(s), hitting the \
-             absolute release ceiling of {CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER}x \
-             capability_miss_max_redeliveries = {max_redeliveries}; fewer distinct workers missed \
-             this task than the budget allows, so either those workers lack the handler or a \
-             capable peer lost every claim race — check the workers that missed it before \
-             concluding the whole queue lacks the handler)"
-        ),
+            completed_releases,
+            released_workers,
+            capable_peer_may_exist,
+        } => {
+            let basis = if capable_peer_may_exist {
+                "a live worker on this queue never missed this task, so it may well have the \
+                 handler and simply lost every claim race — check whether it is saturated, \
+                 draining, or advertising a stale queue list before concluding the handler is \
+                 missing"
+            } else {
+                "fewer distinct workers missed this task than the budget allows, so either those \
+                 workers lack the handler or a capable peer lost every claim race — check the \
+                 workers that missed it before concluding the whole queue lacks the handler"
+            };
+            format!(
+                "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated after {completed_releases} \
+                 capability-miss redeliveries spread across only {released_workers} distinct \
+                 worker(s), hitting the absolute release ceiling of \
+                 {CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER}x capability_miss_max_redeliveries = \
+                 {max_redeliveries}; {basis})"
+            )
+        }
         EscalationCause::ZeroBudgetFailFast => format!(
             "{NO_CAPABLE_WORKER_PREFIX} {detail} (escalated immediately after 0 redeliveries: \
              {ZERO_BUDGET_ESCALATION_MARKER} (capability_miss_max_redeliveries = 0), so this task \
@@ -4298,6 +4491,10 @@ pub struct CapabilityMissResolution {
     /// `true` when this worker is not yet in the task's distinct-miss set, so
     /// the release must append it.
     pub worker_is_new: bool,
+    /// What the worker registry said about a capable peer still being live
+    /// (issue #804). Carried out of the resolution so the escalation reason can
+    /// report the same evidence the decision was made on.
+    pub evidence: FleetCapabilityEvidence,
 }
 
 /// Resolve what to do about a capability miss on a claimed task (issue #804).
@@ -4323,6 +4520,7 @@ pub fn resolve_capability_miss(
     worker_id: &str,
     max_redeliveries: u32,
     session_id: Option<uuid::Uuid>,
+    live_workers_on_queue: &[String],
 ) -> CapabilityMissResolution {
     let total_after = misses_before.saturating_add(1);
     let worker_is_new = !distinct_workers_before.iter().any(|w| w == worker_id);
@@ -4332,19 +4530,28 @@ pub fn resolve_capability_miss(
     } else {
         distinct_before
     };
+    // The miss set as it stands *after* this claim: the claiming worker has
+    // just proven it lacks the handler, so fleet coverage must count it.
+    let mut miss_after: Vec<String> = distinct_workers_before.to_vec();
+    if worker_is_new {
+        miss_after.push(worker_id.to_string());
+    }
+    let evidence = fleet_capability_evidence(live_workers_on_queue, &miss_after, worker_id);
     if !capability_miss_releasable(session_id) {
         return CapabilityMissResolution {
             action: CapabilityMissAction::Escalate,
             total_after,
             distinct_after,
             worker_is_new,
+            evidence,
         };
     }
     CapabilityMissResolution {
-        action: capability_miss_decision(distinct_after, total_after, max_redeliveries),
+        action: capability_miss_decision(distinct_after, total_after, max_redeliveries, evidence),
         total_after,
         distinct_after,
         worker_is_new,
+        evidence,
     }
 }
 
@@ -14825,7 +15032,9 @@ async fn process_task(
     // (issue #494); `None` when that timeout is disabled. Workflow path only —
     // an activity task is not wrapped in it.
     workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
-    capability_miss_max_redeliveries: u32,
+    // Issue #804: the redelivery budget and the fleet-liveness window that
+    // gates it.
+    capability_miss_policy: CapabilityMissPolicy,
 ) -> HarvestResult<TaskDispatchOutcome> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
@@ -14895,11 +15104,81 @@ async fn process_task(
         &task,
         worker_id,
         registry.telemetry().metrics.as_ref(),
-        kind,
-        name,
-        capability_miss_max_redeliveries,
+        MissingHandler { kind, name },
+        capability_miss_policy,
     )
     .await
+}
+
+/// The handler a claiming worker turned out not to register (issue #804).
+///
+/// Bundles the pair that `HarvestError::handler_not_registered` returns so the
+/// two always travel together: every diagnostic on the miss path — the reason
+/// string, the log fields, and the re-raised error — needs both halves, and
+/// splitting them across argument lists is how they drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingHandler<'a> {
+    /// `"workflow"` or `"activity"` — the registry that was consulted.
+    pub kind: &'static str,
+    /// The registered name the claiming worker looked up and did not find.
+    pub name: &'a str,
+}
+
+impl MissingHandler<'_> {
+    /// The human half of the escalation reason string.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        format!("no {} handler registered for '{}'", self.kind, self.name)
+    }
+}
+
+/// The two knobs that govern the capability-miss path (issue #804).
+///
+/// Bundled because they are only ever meaningful together: the budget decides
+/// *how many* redeliveries are allowed, and the liveness window decides
+/// *whether the fleet may withhold that bound at all*. Threading them
+/// separately invites a call site that passes one and defaults the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityMissPolicy {
+    /// `WorkerConfig::capability_miss_max_redeliveries`.
+    pub max_redeliveries: u32,
+    /// Liveness window for the worker-fleet lookup that gates the redelivery
+    /// budget, mirroring the poison-pill reclaimer's
+    /// `2 × worker_heartbeat_interval` convention (see [`worker_stale_secs`]).
+    pub worker_stale_secs: i64,
+}
+
+/// Read the live worker fleet for `task`'s queue, degrading to an EMPTY set.
+///
+/// A registry failure must not propagate: doing so would turn a transient blip
+/// into a dispatch error that leaves the row `RUNNING` under a live worker,
+/// where the poison-pill reclaimer (which requires a dead heartbeat) cannot see
+/// it. An empty set is the conservative direction on both axes — it cannot
+/// contain the claiming worker, so [`fleet_capability_evidence`] reports
+/// [`FleetCapabilityEvidence::Unavailable`], which withholds no bound (the
+/// budget still applies) and makes the escalation reason say out loud that the
+/// fleet was not confirmed.
+///
+/// Only ever called on the miss path, which is rare by construction, so the
+/// happy path never pays for this query.
+async fn read_live_fleet_or_degrade(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_stale_secs: i64,
+) -> Vec<String> {
+    match crate::workers::live_workers_on_queue(conn, &task.queue_name, worker_stale_secs).await {
+        Ok(workers) => workers,
+        Err(error) => {
+            tracing::warn!(
+                task_id = %task.id,
+                queue = %task.queue_name,
+                %error,
+                "could not read the live worker fleet for a capability miss; falling back to the \
+                 configured redelivery budget alone"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Release a claim taken by a worker with no handler for the task's type, or
@@ -14917,21 +15196,23 @@ async fn handle_capability_miss(
     task: &TaskQueueItem,
     worker_id: &str,
     metrics: &dyn crate::telemetry::MetricsRecorder,
-    kind: &'static str,
-    name: &str,
-    max_redeliveries: u32,
+    missing: MissingHandler<'_>,
+    policy: CapabilityMissPolicy,
 ) -> HarvestResult<TaskDispatchOutcome> {
+    // Fleet evidence for the distinct-worker bound (issue #804, Codex round-8
+    // P1). See `read_live_fleet_or_degrade` for why a failure here degrades to
+    // an empty set instead of propagating.
+    let live_workers = read_live_fleet_or_degrade(conn, task, policy.worker_stale_secs).await;
     let resolution = resolve_capability_miss(
         &task.capability_miss_workers,
         task.capability_misses,
         worker_id,
-        max_redeliveries,
+        policy.max_redeliveries,
         task.session_id,
+        &live_workers,
     );
-    let (action, misses_after) = (resolution.action, resolution.total_after);
-    let detail = format!("no {kind} handler registered for '{name}'");
 
-    match action {
+    match resolution.action {
         CapabilityMissAction::Release => {
             // Back off before the next redelivery so the dwell window outlasts a
             // pod flip: without it the budget would be spent in milliseconds by
@@ -14963,90 +15244,140 @@ async fn handle_capability_miss(
                 task_id = %task.id,
                 queue = %task.queue_name,
                 task_type = %task.task_type,
-                handler_kind = kind,
-                handler = name,
-                capability_misses = misses_after,
+                handler_kind = missing.kind,
+                handler = missing.name,
+                capability_misses = resolution.total_after,
                 distinct_incapable_workers = resolution.distinct_after,
+                fleet_evidence = ?resolution.evidence,
                 worker_is_new_misser = resolution.worker_is_new,
-                max_redeliveries,
+                max_redeliveries = policy.max_redeliveries,
                 backoff_secs = delay.as_secs(),
                 "released task for a capable peer: no handler registered on this worker"
             );
             Ok(TaskDispatchOutcome::Released)
         }
         CapabilityMissAction::Escalate => {
-            // Resolve the cause ONCE and derive the reason string, the metric
-            // label, and the log line from it, so the three can never tell an
-            // operator different stories about the same escalation.
-            let counts = CapabilityMissCounts {
-                distinct_workers: resolution.distinct_after,
-                releases: misses_after,
-            };
-            let cause = EscalationCause::resolve(max_redeliveries, task.session_id, counts);
-            let reason =
-                no_capable_worker_reason(&detail, max_redeliveries, task.session_id, counts);
-            // Recorded BEFORE the terminal write, deliberately. This counter is
-            // what the page-severity `harvest_no_capable_worker` rule selects
-            // on, and the terminal write can fail transiently — which is
-            // precisely the case that most needs the page: a failed
-            // `fail_task_and_execution` leaves the row `RUNNING` under a *live*
-            // worker, where the poison-pill orphan reclaimer (which requires a
-            // dead heartbeat) cannot see it. Ordering the metric after the `?`
-            // would silence the alert in exactly that stranding case.
-            //
-            // The counter therefore reports the escalation *decision*, which is
-            // final by the time it is emitted. A stranded row is re-claimed
-            // later and escalates again, so the counter is at-least-once rather
-            // than exactly-once — the right trade for a paging signal.
-            //
-            // The label is cause-specific: only budget exhaustion actually
-            // offered the task around the queue, so only it may page the
-            // fleet-exhaustion rule. See `EscalationCause::outcome_label`.
-            metrics.record_task_capability_miss(
-                &task.queue_name,
-                &task.task_type,
-                cause.outcome_label(),
-            );
-            fail_task_and_execution(conn, task, worker_id, &reason).await?;
-            // The message must match the branch, not just carry a field naming
-            // it: a session-pinned escalation is NOT evidence that the queue has
-            // no capable worker (see `no_capable_worker_reason`), and logging it
-            // as such sends whoever is reading logs after a page to look for a
-            // missing deploy that may not exist.
-            let message = match cause {
-                EscalationCause::SessionPinned(_) => {
-                    "escalated task: pinned to a worker session whose host does not register the handler"
-                }
-                EscalationCause::ZeroBudgetFailFast => {
-                    "escalated task: capability-miss redelivery is disabled (capability_miss_max_redeliveries = 0), so the task was never offered to a peer"
-                }
-                EscalationCause::BudgetExhausted => {
-                    "escalated task: no capable worker on this queue registers the handler"
-                }
-                EscalationCause::ReleaseCeilingExhausted { .. } => {
-                    "escalated task: hit the absolute capability-miss release ceiling with fewer distinct workers than the budget allows; check the workers that missed it before concluding the queue lacks the handler"
-                }
-            };
-            tracing::error!(
-                task_id = %task.id,
-                queue = %task.queue_name,
-                task_type = %task.task_type,
-                handler_kind = kind,
-                handler = name,
-                capability_misses = misses_after,
-                distinct_incapable_workers = resolution.distinct_after,
-                max_redeliveries,
-                session_pinned = task.session_id.is_some(),
-                session_id = ?task.session_id,
-                outcome = cause.outcome_label(),
-                "{message}"
-            );
-            Err(HarvestError::HandlerNotRegistered {
-                kind,
-                name: name.to_owned(),
-            })
+            escalate_capability_miss(
+                conn,
+                task,
+                worker_id,
+                metrics,
+                missing,
+                policy.max_redeliveries,
+                &resolution,
+            )
+            .await
         }
     }
+}
+
+/// Route an exhausted capability miss through the ordinary terminal-failure
+/// path (issue #804).
+///
+/// Split out of [`handle_capability_miss`] so the release arm — the one that
+/// runs on every ordinary redelivery — stays readable next to the escalation
+/// arm, which runs at most once per task.
+async fn escalate_capability_miss(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    missing: MissingHandler<'_>,
+    max_redeliveries: u32,
+    resolution: &CapabilityMissResolution,
+) -> HarvestResult<TaskDispatchOutcome> {
+    // Resolve the cause ONCE and derive the reason string, the metric label,
+    // and the log line from it, so the three can never tell an operator
+    // different stories about the same escalation.
+    //
+    // The decision was made on the POST-increment distinct count (this claim is
+    // evidence), but the *reported* counts are the persisted ones: this branch
+    // never runs the release UPDATE, so no redelivery and no distinct-worker
+    // append actually happened for this claim (Codex round-8 P2). Reporting the
+    // post-increment total here would tell an operator that N+1 redeliveries
+    // occurred when only N did.
+    let escalation = escalation_from_persisted(
+        task.capability_misses,
+        task.capability_miss_workers.len(),
+        resolution,
+    );
+    let cause = EscalationCause::resolve(max_redeliveries, task.session_id, escalation);
+    let reason = no_capable_worker_reason(
+        &missing.detail(),
+        max_redeliveries,
+        task.session_id,
+        escalation,
+    );
+    // Recorded BEFORE the terminal write, deliberately. This counter is what
+    // the page-severity `harvest_no_capable_worker` rule selects on, and the
+    // terminal write can fail transiently — which is precisely the case that
+    // most needs the page: a failed `fail_task_and_execution` leaves the row
+    // `RUNNING` under a *live* worker, where the poison-pill orphan reclaimer
+    // (which requires a dead heartbeat) cannot see it. Ordering the metric
+    // after the `?` would silence the alert in exactly that stranding case.
+    //
+    // The counter therefore reports the escalation *decision*, which is final
+    // by the time it is emitted. A stranded row is re-claimed later and
+    // escalates again, so the counter is at-least-once rather than
+    // exactly-once — the right trade for a paging signal.
+    //
+    // The label is cause-specific: only budget exhaustion actually offered the
+    // task around the queue, so only it may page the fleet-exhaustion rule.
+    // See `EscalationCause::outcome_label`.
+    metrics.record_task_capability_miss(&task.queue_name, &task.task_type, cause.outcome_label());
+    fail_task_and_execution(conn, task, worker_id, &reason).await?;
+    // The message must match the branch, not just carry a field naming it: a
+    // session-pinned escalation is NOT evidence that the queue has no capable
+    // worker (see `no_capable_worker_reason`), and logging it as such sends
+    // whoever is reading logs after a page to look for a missing deploy that
+    // may not exist.
+    let message = match cause {
+        EscalationCause::SessionPinned(_) => {
+            "escalated task: pinned to a worker session whose host does not register the handler"
+        }
+        EscalationCause::ZeroBudgetFailFast => {
+            "escalated task: capability-miss redelivery is disabled (capability_miss_max_redeliveries = 0), so the task was never offered to a peer"
+        }
+        EscalationCause::BudgetExhausted {
+            fleet_confirmed: true,
+        } => "escalated task: no capable worker on this queue registers the handler",
+        EscalationCause::BudgetExhausted {
+            fleet_confirmed: false,
+        } => {
+            "escalated task: the redelivery budget was exhausted, but the worker registry could not confirm the live fleet (this worker is not listed against this queue); a capable worker may still exist"
+        }
+        EscalationCause::ReleaseCeilingExhausted {
+            capable_peer_may_exist: false,
+            ..
+        } => {
+            "escalated task: hit the absolute capability-miss release ceiling with fewer distinct workers than the budget allows; check the workers that missed it before concluding the queue lacks the handler"
+        }
+        EscalationCause::ReleaseCeilingExhausted {
+            capable_peer_may_exist: true,
+            ..
+        } => {
+            "escalated task: hit the absolute capability-miss release ceiling while a live worker on this queue had still never missed it; check whether that worker is saturated, draining, or advertising a stale queue list"
+        }
+    };
+    tracing::error!(
+        task_id = %task.id,
+        queue = %task.queue_name,
+        task_type = %task.task_type,
+        handler_kind = missing.kind,
+        handler = missing.name,
+        completed_releases = task.capability_misses,
+        distinct_incapable_workers = resolution.distinct_after,
+        fleet_evidence = ?resolution.evidence,
+        max_redeliveries,
+        session_pinned = task.session_id.is_some(),
+        session_id = ?task.session_id,
+        outcome = cause.outcome_label(),
+        "{message}"
+    );
+    Err(HarvestError::HandlerNotRegistered {
+        kind: missing.kind,
+        name: missing.name.to_owned(),
+    })
 }
 
 /// Periodically sample per-queue pending-task counts and forward them to the
@@ -17401,20 +17732,13 @@ impl Worker {
         let shard_pools_for_monitors: Vec<(DbPool, Option<crate::types::ShardId>)> =
             vec![(pool.clone(), None)];
 
-        // Worker-stale threshold mirrors the fleet-health classifier:
-        // 2 × heartbeat interval, with a 1 s floor for sub-second intervals.
-        // Double *before* rounding to whole seconds so a fractional interval
-        // (e.g. 1500ms → 3s, not 2s) keeps the documented liveness window, and
-        // cap at one year so an absurd interval can never overflow the
-        // chrono::Duration arithmetic in the reclaim path. Shared by the
-        // poison-pill reclaimer and the worker-session broken-session scanner
-        // (issue #606, folded into `enforce_timeouts_once`) -- both use the
-        // exact same "is this worker's heartbeat too old" liveness signal.
-        let doubled = self.config.worker_heartbeat_interval.saturating_mul(2);
-        let worker_stale_secs = i64::try_from(doubled.as_secs())
-            .unwrap_or(crate::poison_pill::MAX_WORKER_STALE_SECS)
-            .saturating_add(i64::from(doubled.subsec_nanos() > 0))
-            .clamp(1, crate::poison_pill::MAX_WORKER_STALE_SECS);
+        // Worker-stale threshold mirrors the fleet-health classifier. Shared by
+        // the poison-pill reclaimer, the worker-session broken-session scanner
+        // (issue #606, folded into `enforce_timeouts_once`), and the
+        // capability-miss fleet lookup (issue #804) -- all three use the exact
+        // same "is this worker's heartbeat too old" liveness signal, so the
+        // computation lives in one place.
+        let worker_stale_secs = worker_stale_secs(self.config.worker_heartbeat_interval);
 
         // One timeout checker per assigned shard. `enforce_timeouts_once` scans
         // the connection's *own* database (find_timed_out_tasks, external-task
@@ -18339,7 +18663,15 @@ impl Worker {
         // Issue #782: contained-handler-panic retry budget + strike map.
         let panic_strikes = Arc::clone(&self.workflow_panic_strikes);
         let workflow_panic_max_attempts = self.config.workflow_panic_max_attempts;
-        let capability_miss_max_redeliveries = self.config.capability_miss_max_redeliveries;
+        // Issue #804: the redelivery budget plus the same liveness window the
+        // poison-pill reclaimer and the broken-session scanner use, so all three
+        // agree on "is this worker alive". Derived here rather than threaded
+        // from `spawn_monitoring_tasks` because the poll loop and the monitors
+        // are independent spawn paths.
+        let capability_miss_policy = CapabilityMissPolicy {
+            max_redeliveries: self.config.capability_miss_max_redeliveries,
+            worker_stale_secs: worker_stale_secs(self.config.worker_heartbeat_interval),
+        };
         let exec_id_for_timeout = task.workflow_exec_id;
         let telemetry = Arc::clone(&self.registry);
 
@@ -18411,7 +18743,7 @@ impl Worker {
                         Arc::clone(&panic_strikes),
                         workflow_panic_max_attempts,
                         workflow_task_deadline,
-                        capability_miss_max_redeliveries,
+                        capability_miss_policy,
                     ),
                 )
                 .await
@@ -18566,7 +18898,7 @@ impl Worker {
                     // No enclosing workflow-task budget on this arm, so the
                     // local per-attempt budget is the only clock (issue #783).
                     None,
-                    capability_miss_max_redeliveries,
+                    capability_miss_policy,
                 )
                 .await
                 {
@@ -22137,7 +22469,7 @@ mod tests {
         // REDELIVERIES are granted, so a budget of 5 releases misses 1..=5.
         for misses in 1..=5 {
             assert_eq!(
-                capability_miss_decision(misses, misses, 5),
+                capability_miss_decision(misses, misses, 5, ALL_MISSED),
                 CapabilityMissAction::Release,
                 "miss {misses} of 5 must release for a capable peer",
             );
@@ -22154,13 +22486,13 @@ mod tests {
             let bound = i32::try_from(budget).expect("test budgets fit in i32");
             for misses in 1..=bound {
                 assert_eq!(
-                    capability_miss_decision(misses, misses, budget),
+                    capability_miss_decision(misses, misses, budget, ALL_MISSED),
                     CapabilityMissAction::Release,
                     "budget {budget} must grant redelivery {misses}",
                 );
             }
             assert_eq!(
-                capability_miss_decision(bound + 1, bound + 1, budget),
+                capability_miss_decision(bound + 1, bound + 1, budget, ALL_MISSED),
                 CapabilityMissAction::Escalate,
                 "budget {budget} must escalate on claim {}",
                 bound + 1
@@ -22171,11 +22503,11 @@ mod tests {
     #[test]
     fn capability_miss_decision_escalates_over_the_bound() {
         assert_eq!(
-            capability_miss_decision(6, 6, 5),
+            capability_miss_decision(6, 6, 5, ALL_MISSED),
             CapabilityMissAction::Escalate
         );
         assert_eq!(
-            capability_miss_decision(i32::MAX, i32::MAX, 5),
+            capability_miss_decision(i32::MAX, i32::MAX, 5, ALL_MISSED),
             CapabilityMissAction::Escalate
         );
     }
@@ -22185,7 +22517,7 @@ mod tests {
         // `0` is the documented rollback switch: no redeliveries allowed, so the
         // very first capability miss takes the pre-#804 terminal-failure path.
         assert_eq!(
-            capability_miss_decision(1, 1, 0),
+            capability_miss_decision(1, 1, 0, ALL_MISSED),
             CapabilityMissAction::Escalate
         );
     }
@@ -22195,15 +22527,15 @@ mod tests {
         // Defensive: the column is NOT NULL DEFAULT 0 and only ever incremented,
         // but a hand-edited/corrupt row must not silently disable escalation.
         assert_eq!(
-            capability_miss_decision(0, 0, 5),
+            capability_miss_decision(0, 0, 5, ALL_MISSED),
             CapabilityMissAction::Release
         );
         assert_eq!(
-            capability_miss_decision(-1, -1, 5),
+            capability_miss_decision(-1, -1, 5, ALL_MISSED),
             CapabilityMissAction::Release
         );
         assert_eq!(
-            capability_miss_decision(0, 0, 0),
+            capability_miss_decision(0, 0, 0, ALL_MISSED),
             CapabilityMissAction::Escalate
         );
     }
@@ -22247,7 +22579,8 @@ mod tests {
 
         let releases = (1..=i32::try_from(budget).expect("small budget") + 1)
             .take_while(|misses| {
-                capability_miss_decision(*misses, *misses, budget) == CapabilityMissAction::Release
+                capability_miss_decision(*misses, *misses, budget, ALL_MISSED)
+                    == CapabilityMissAction::Release
             })
             .count();
         assert_eq!(
@@ -22262,25 +22595,38 @@ mod tests {
         assert_eq!(dwell, Duration::from_secs(31));
     }
 
+    /// Shorthand for the fleet evidence these arithmetic tests are not about:
+    /// the registry confirmed every live worker on the queue has missed the
+    /// task, so the budget/ceiling bounds are free to act. The fleet *gate*
+    /// itself is covered separately by the `..._gated_on_fleet_evidence` tests.
+    const ALL_MISSED: FleetCapabilityEvidence = FleetCapabilityEvidence::AllLiveWorkersMissed;
+
     /// Counts for a genuine **distinct-worker** budget exhaustion: `budget + 1`
     /// different workers each missed the task once, which is the only shape that
     /// supports the unqualified fleet-wide conclusion.
-    fn budget_exhausted_counts(budget: u32) -> CapabilityMissCounts {
+    fn budget_exhausted_counts(budget: u32) -> CapabilityMissEscalation {
         let n = i32::try_from(budget)
             .expect("test budget fits i32")
             .saturating_add(1);
-        CapabilityMissCounts {
-            distinct_workers: n,
-            releases: n,
+        CapabilityMissEscalation {
+            distinct_after: n,
+            // The escalating claim never runs the release UPDATE, so the
+            // durable record is one release (and one distinct worker) behind
+            // the decision input.
+            completed_releases: n - 1,
+            released_workers: n - 1,
+            evidence: FleetCapabilityEvidence::AllLiveWorkersMissed,
         }
     }
 
     /// Counts as they stand on the FIRST miss — the state the never-offered
     /// causes (zero budget, session pin) escalate from.
-    const fn first_miss_counts() -> CapabilityMissCounts {
-        CapabilityMissCounts {
-            distinct_workers: 1,
-            releases: 1,
+    const fn first_miss_counts() -> CapabilityMissEscalation {
+        CapabilityMissEscalation {
+            distinct_after: 1,
+            completed_releases: 0,
+            released_workers: 0,
+            evidence: FleetCapabilityEvidence::AllLiveWorkersMissed,
         }
     }
 
@@ -22482,7 +22828,10 @@ mod tests {
 
         // Only budget exhaustion actually offered the task around the queue.
         assert_eq!(
-            EscalationCause::BudgetExhausted.outcome_label(),
+            EscalationCause::BudgetExhausted {
+                fleet_confirmed: true
+            }
+            .outcome_label(),
             CAPABILITY_MISS_OUTCOME_ESCALATED,
             "budget exhaustion is the fleet-exhaustion signal and keeps the \
              value the paging rule selects"
@@ -22561,20 +22910,28 @@ mod tests {
         const BUDGET: u32 = 5;
         // The shape only this bound can produce: releases past the ceiling,
         // distinct workers still comfortably within budget.
-        let counts = CapabilityMissCounts {
-            distinct_workers: 1,
-            releases: 51,
+        let counts = CapabilityMissEscalation {
+            distinct_after: 1,
+            completed_releases: 51,
+            released_workers: 1,
+            evidence: FleetCapabilityEvidence::AllLiveWorkersMissed,
         };
         assert_eq!(
-            capability_miss_decision(counts.distinct_workers, counts.releases, BUDGET),
+            capability_miss_decision(
+                counts.distinct_after,
+                counts.completed_releases + 1,
+                BUDGET,
+                counts.evidence
+            ),
             CapabilityMissAction::Escalate,
             "the ceiling must be what terminates a one-worker bounce"
         );
         assert_eq!(
             EscalationCause::resolve(BUDGET, None, counts),
             EscalationCause::ReleaseCeilingExhausted {
-                releases: 51,
-                distinct_workers: 1,
+                completed_releases: 51,
+                released_workers: 1,
+                capable_peer_may_exist: false,
             },
             "a ceiling trip must not be reported as distinct-worker exhaustion"
         );
@@ -22618,8 +22975,9 @@ mod tests {
         // deployment never pages for a genuinely missing handler.
         assert_eq!(
             EscalationCause::ReleaseCeilingExhausted {
-                releases: 51,
-                distinct_workers: 1,
+                completed_releases: 51,
+                released_workers: 1,
+                capable_peer_may_exist: false,
             }
             .outcome_label(),
             CAPABILITY_MISS_OUTCOME_ESCALATED,
@@ -22628,7 +22986,257 @@ mod tests {
         // A genuine distinct-worker exhaustion is still reported as such.
         assert_eq!(
             EscalationCause::resolve(BUDGET, None, budget_exhausted_counts(BUDGET)),
-            EscalationCause::BudgetExhausted,
+            EscalationCause::BudgetExhausted {
+                fleet_confirmed: true
+            },
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fleet-gated redelivery budget (issue #804, Codex round-8 P1)
+    // -----------------------------------------------------------------------
+
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn fleet_evidence_classifies_the_three_cases() {
+        // Every live worker has missed it -> a genuine fleet conclusion.
+        assert_eq!(
+            fleet_capability_evidence(&ids(&["a", "b"]), &ids(&["a", "b"]), "b"),
+            FleetCapabilityEvidence::AllLiveWorkersMissed
+        );
+        // A live worker that has never missed it may be capable.
+        assert_eq!(
+            fleet_capability_evidence(&ids(&["a", "b", "c"]), &ids(&["a", "b"]), "b"),
+            FleetCapabilityEvidence::CapablePeerMayExist
+        );
+        // The registry cannot see the worker holding the claim, so it is not
+        // describing this fleet: no conclusion in either direction.
+        assert_eq!(
+            fleet_capability_evidence(&ids(&["a"]), &ids(&["a", "zz"]), "zz"),
+            FleetCapabilityEvidence::Unavailable
+        );
+        // Empty registry is the same case, reached the same way.
+        assert_eq!(
+            fleet_capability_evidence(&[], &ids(&["a"]), "a"),
+            FleetCapabilityEvidence::Unavailable
+        );
+    }
+
+    /// The success metric's load-bearing half: *"zero spurious FAILED
+    /// executions ... as long as >= 1 capable worker is live"*.
+    ///
+    /// A rolling deploy with `budget + 1` old pods and one new capable pod can
+    /// hand `budget + 1` DISTINCT incapable worker ids to the decision while the
+    /// capable pod is live and polling. Before the fleet gate that escalated,
+    /// terminally failing a run whose handler was live the whole time and
+    /// asserting the exact opposite of the truth in its error column.
+    #[test]
+    fn budget_never_escalates_while_a_live_worker_has_never_missed() {
+        const BUDGET: u32 = 5;
+        let old_pods = ids(&["old-0", "old-1", "old-2", "old-3", "old-4", "old-5"]);
+        let mut live = old_pods.clone();
+        live.push("new-capable".to_string());
+
+        // Walk the whole rollout: every one of the six old pods claims in turn.
+        for (i, claimant) in old_pods.iter().enumerate() {
+            let seen = &old_pods[..i];
+            let r = resolve_capability_miss(
+                seen,
+                i32::try_from(i).expect("small"),
+                claimant,
+                BUDGET,
+                None,
+                &live,
+            );
+            assert_eq!(
+                r.evidence,
+                FleetCapabilityEvidence::CapablePeerMayExist,
+                "the capable pod is live and has never missed this task"
+            );
+            assert_eq!(
+                r.action,
+                CapabilityMissAction::Release,
+                "miss {} by {claimant} must be released for the live capable peer, not escalated \
+                 (distinct_after = {})",
+                i + 1,
+                r.distinct_after
+            );
+        }
+        // Sanity: the sixth miss really did cross the raw distinct bound, so the
+        // gate is what suppressed it rather than the arithmetic never firing.
+        assert!(
+            6 > capability_miss_budget(BUDGET),
+            "the scenario must actually exceed the budget for this test to mean anything"
+        );
+    }
+
+    #[test]
+    fn budget_escalates_once_every_live_worker_has_missed() {
+        const BUDGET: u32 = 5;
+        let fleet = ids(&["w0", "w1", "w2", "w3", "w4", "w5"]);
+        let r = resolve_capability_miss(&fleet[..5], 5, &fleet[5], BUDGET, None, &fleet);
+        assert_eq!(r.evidence, FleetCapabilityEvidence::AllLiveWorkersMissed);
+        assert_eq!(r.action, CapabilityMissAction::Escalate);
+        assert_eq!(
+            EscalationCause::resolve(
+                BUDGET,
+                None,
+                CapabilityMissEscalation {
+                    distinct_after: r.distinct_after,
+                    completed_releases: 5,
+                    released_workers: 5,
+                    evidence: r.evidence,
+                }
+            ),
+            EscalationCause::BudgetExhausted {
+                fleet_confirmed: true
+            }
+        );
+    }
+
+    #[test]
+    fn unavailable_registry_falls_back_to_the_budget_and_says_so() {
+        const BUDGET: u32 = 5;
+        let fleet = ids(&["w0", "w1", "w2", "w3", "w4", "w5"]);
+        // No live-worker rows at all: the budget must still bound the release
+        // (a broken registry must not suppress escalation forever), but the
+        // reason must not claim a fleet conclusion it never established.
+        let r = resolve_capability_miss(&fleet[..5], 5, &fleet[5], BUDGET, None, &[]);
+        assert_eq!(r.evidence, FleetCapabilityEvidence::Unavailable);
+        assert_eq!(r.action, CapabilityMissAction::Escalate);
+
+        let reason = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            BUDGET,
+            None,
+            CapabilityMissEscalation {
+                distinct_after: r.distinct_after,
+                completed_releases: 5,
+                released_workers: 5,
+                evidence: r.evidence,
+            },
+        );
+        assert!(
+            reason.contains("could not be used to confirm the live fleet"),
+            "an unconfirmed fleet must be stated, not glossed: {reason}"
+        );
+        assert!(
+            !reason.contains("no live worker on this queue has the handler"),
+            "the fleet-wide conclusion is NOT supported without registry evidence: {reason}"
+        );
+    }
+
+    /// Codex round-8 P2: the escalation branch never runs the release UPDATE,
+    /// so the durable record has one fewer redelivery than the decision saw.
+    /// The reason string is what an operator reconstructs the incident from, so
+    /// it must report completed redeliveries only.
+    #[test]
+    fn escalation_reports_only_completed_redeliveries() {
+        const BUDGET: u32 = 5;
+        let reason = no_capable_worker_reason(
+            "no activity handler registered for 'transcode'",
+            BUDGET,
+            None,
+            CapabilityMissEscalation {
+                distinct_after: 1,
+                completed_releases: 50,
+                released_workers: 1,
+                evidence: FleetCapabilityEvidence::AllLiveWorkersMissed,
+            },
+        );
+        assert!(
+            reason.contains("after 50 capability-miss redeliveries"),
+            "50 releases were persisted; the 51st claim escalated without releasing: {reason}"
+        );
+        assert!(
+            !reason.contains("after 51 capability-miss redeliveries"),
+            "the escalating claim is not itself a redelivery: {reason}"
+        );
+    }
+
+    /// The call-site half of Codex round-8 P2: the reported counts must come
+    /// from the PERSISTED row, never from the resolution's post-increment
+    /// decision inputs. Constructed so the two differ by exactly one, which is
+    /// the whole bug.
+    #[test]
+    fn escalation_report_uses_persisted_counts_not_the_decision_inputs() {
+        let fleet = ids(&["w0"]);
+        // 50 releases already persisted by one worker; this 51st claim is the
+        // one that escalates, and it releases nothing.
+        let resolution = resolve_capability_miss(&fleet, 50, "w0", 5, None, &fleet);
+        assert_eq!(resolution.action, CapabilityMissAction::Escalate);
+        assert_eq!(
+            resolution.total_after, 51,
+            "the DECISION is made on the post-increment count"
+        );
+
+        let escalation = escalation_from_persisted(50, fleet.len(), &resolution);
+        assert_eq!(
+            escalation.completed_releases, 50,
+            "the escalating claim never ran the release UPDATE, so only 50 \
+             redeliveries actually completed"
+        );
+        assert_eq!(escalation.released_workers, 1);
+        assert_eq!(
+            escalation.distinct_after, resolution.distinct_after,
+            "the decision input is carried through unchanged"
+        );
+    }
+
+    #[test]
+    fn ceiling_escalation_names_the_live_peer_when_one_still_exists() {
+        const BUDGET: u32 = 5;
+        let cause = EscalationCause::resolve(
+            BUDGET,
+            None,
+            CapabilityMissEscalation {
+                distinct_after: 6,
+                completed_releases: 50,
+                released_workers: 6,
+                evidence: FleetCapabilityEvidence::CapablePeerMayExist,
+            },
+        );
+        assert_eq!(
+            cause,
+            EscalationCause::ReleaseCeilingExhausted {
+                completed_releases: 50,
+                released_workers: 6,
+                capable_peer_may_exist: true,
+            },
+            "with a live never-missing peer the distinct bound is gated, so only \
+             the ceiling can have tripped -- and it must say so"
+        );
+        let reason = no_capable_worker_reason(
+            "no activity handler registered for 'x'",
+            BUDGET,
+            None,
+            CapabilityMissEscalation {
+                distinct_after: 6,
+                completed_releases: 50,
+                released_workers: 6,
+                evidence: FleetCapabilityEvidence::CapablePeerMayExist,
+            },
+        );
+        assert!(
+            reason.contains("never missed this task"),
+            "the operator's next step is the live peer, not the deploy: {reason}"
+        );
+    }
+
+    #[test]
+    fn worker_stale_secs_doubles_the_heartbeat_interval_with_a_floor() {
+        assert_eq!(worker_stale_secs(Duration::from_secs(30)), 60);
+        // Sub-second interval keeps a 1s floor rather than collapsing to 0.
+        assert_eq!(worker_stale_secs(Duration::from_millis(100)), 1);
+        // Doubling happens before rounding: 1500ms -> 3s, not 2s.
+        assert_eq!(worker_stale_secs(Duration::from_millis(1500)), 3);
+        // Absurd values clamp instead of overflowing downstream chrono math.
+        assert_eq!(
+            worker_stale_secs(Duration::from_secs(u64::MAX)),
+            crate::poison_pill::MAX_WORKER_STALE_SECS
         );
     }
 
@@ -22826,8 +23434,14 @@ mod tests {
         let fleet: Vec<String> = (0..6).map(|i| format!("worker-{i}")).collect();
         for before in 0..5_i32 {
             let seen_count = usize::try_from(before).expect("non-negative");
-            let r =
-                resolve_capability_miss(&fleet[..seen_count], before, &fleet[seen_count], 5, None);
+            let r = resolve_capability_miss(
+                &fleet[..seen_count],
+                before,
+                &fleet[seen_count],
+                5,
+                None,
+                &[],
+            );
             assert_eq!(
                 (r.action, r.total_after),
                 (CapabilityMissAction::Release, before + 1),
@@ -22835,7 +23449,7 @@ mod tests {
                 before + 1
             );
         }
-        let r = resolve_capability_miss(&fleet[..5], 5, &fleet[5], 5, None);
+        let r = resolve_capability_miss(&fleet[..5], 5, &fleet[5], 5, None, &[]);
         assert_eq!(
             (r.action, r.total_after),
             (CapabilityMissAction::Escalate, 6),
@@ -22857,7 +23471,7 @@ mod tests {
         let noisy = "incapable-pod-1".to_string();
         let seen = vec![noisy.clone()];
         for total_before in 1..40 {
-            let r = resolve_capability_miss(&seen, total_before, &noisy, 5, None);
+            let r = resolve_capability_miss(&seen, total_before, &noisy, 5, None, &[]);
             assert_eq!(
                 r.action,
                 CapabilityMissAction::Release,
@@ -22883,14 +23497,14 @@ mod tests {
         let seen = vec![lone.clone()];
         let ceiling = 5 * CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER;
 
-        let r = resolve_capability_miss(&seen, ceiling - 1, &lone, 5, None);
+        let r = resolve_capability_miss(&seen, ceiling - 1, &lone, 5, None, &[]);
         assert_eq!(
             r.action,
             CapabilityMissAction::Release,
             "one below the ceiling still releases"
         );
 
-        let r = resolve_capability_miss(&seen, ceiling, &lone, 5, None);
+        let r = resolve_capability_miss(&seen, ceiling, &lone, 5, None, &[]);
         assert_eq!(
             r.action,
             CapabilityMissAction::Escalate,
@@ -22903,7 +23517,7 @@ mod tests {
         // `0` is the pre-#804 fail-fast behaviour, NOT an unlimited-release
         // switch — releasing forever would let a genuinely-unregistered type
         // bounce around the fleet indefinitely.
-        let r = resolve_capability_miss(&[], 0, "w1", 0, None);
+        let r = resolve_capability_miss(&[], 0, "w1", 0, None, &[]);
         assert_eq!(
             (r.action, r.total_after),
             (CapabilityMissAction::Escalate, 1)
@@ -22919,14 +23533,14 @@ mod tests {
         // window before surfacing the real condition.
         let session = Some(uuid::Uuid::new_v4());
         assert!(!capability_miss_releasable(session));
-        let r = resolve_capability_miss(&[], 0, "w1", 5, session);
+        let r = resolve_capability_miss(&[], 0, "w1", 5, session, &[]);
         assert_eq!(
             (r.action, r.total_after),
             (CapabilityMissAction::Escalate, 1),
             "a session-pinned task must escalate on the FIRST miss"
         );
         // ...and the un-pinned control still releases with the same budget.
-        let r = resolve_capability_miss(&[], 0, "w1", 5, None);
+        let r = resolve_capability_miss(&[], 0, "w1", 5, None, &[]);
         assert_eq!(
             (r.action, r.total_after),
             (CapabilityMissAction::Release, 1)
@@ -22936,7 +23550,7 @@ mod tests {
     #[test]
     fn resolve_capability_miss_tolerates_a_saturating_persisted_count() {
         // A pathological persisted value must not panic on overflow.
-        let r = resolve_capability_miss(&["w1".to_string()], i32::MAX, "w1", 5, None);
+        let r = resolve_capability_miss(&["w1".to_string()], i32::MAX, "w1", 5, None, &[]);
         assert_eq!(
             (r.action, r.total_after),
             (CapabilityMissAction::Escalate, i32::MAX)
@@ -22965,12 +23579,12 @@ mod tests {
         // The exact shape flagged in review: a budget at or above the column's
         // maximum cannot bound a saturated counter by comparison alone.
         assert_eq!(
-            capability_miss_decision(i32::MAX, i32::MAX, i32::MAX.cast_unsigned()),
+            capability_miss_decision(i32::MAX, i32::MAX, i32::MAX.cast_unsigned(), ALL_MISSED),
             CapabilityMissAction::Escalate,
             "a saturated counter must escalate even when the budget is i32::MAX"
         );
         assert_eq!(
-            capability_miss_decision(i32::MAX, i32::MAX, u32::MAX),
+            capability_miss_decision(i32::MAX, i32::MAX, u32::MAX, ALL_MISSED),
             CapabilityMissAction::Escalate,
             "a budget above the column's range is clamped, not wrapped, and still \
              must not authorise an overflowing increment"
@@ -22979,12 +23593,12 @@ mod tests {
         // is where the guard starts: persisting it would make the NEXT `+ 1`
         // unrepresentable.
         assert_eq!(
-            capability_miss_decision(i32::MAX - 1, i32::MAX - 1, u32::MAX),
+            capability_miss_decision(i32::MAX - 1, i32::MAX - 1, u32::MAX, ALL_MISSED),
             CapabilityMissAction::Release,
             "the guard must fire only at the ceiling, not one short of it"
         );
         // End to end through the real entry point.
-        let r = resolve_capability_miss(&["w1".to_string()], i32::MAX, "w1", u32::MAX, None);
+        let r = resolve_capability_miss(&["w1".to_string()], i32::MAX, "w1", u32::MAX, None, &[]);
         assert_eq!(
             (r.action, r.total_after),
             (CapabilityMissAction::Escalate, i32::MAX),
@@ -22992,7 +23606,7 @@ mod tests {
         );
         // A normal budget is completely unaffected.
         assert_eq!(
-            capability_miss_decision(3, 3, 5),
+            capability_miss_decision(3, 3, 5, ALL_MISSED),
             CapabilityMissAction::Release,
             "the ceiling guard must not perturb ordinary budgets"
         );

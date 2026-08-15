@@ -2111,37 +2111,59 @@ Distinct from two adjacent signals, deliberately:
    `error`), which is not the DLQ. Do not look in `GET /dead-letters` for these
    — it will be empty, and that emptiness is not evidence the alert is spurious.
 
+   **What this alert already rules out.** The redelivery budget cannot escalate
+   while the worker registry still lists a live worker on the queue that has
+   never missed this task. Before the budget may terminate a task, the workers
+   recorded as having missed it must *cover* the live fleet for its queue
+   (`harvest_workers`, same freshness window the poison-pill reclaimer uses:
+   `2 × worker_heartbeat_interval`). So "a capable pod was up the whole time and
+   simply kept losing the claim race" is not a way to reach rows 1a/1b below —
+   the only bound that can fire in that situation is the absolute ceiling, which
+   says so explicitly (row 2b).
+
    The `error` distinguishes the **four** escalation causes, which have
-   different fixes. **Only the first two reach this alert.** The other two report
-   `outcome="escalated_never_offered"` and fire the ticket-severity
+   different fixes; two of them additionally state what the registry could or
+   could not confirm. **Only the first two causes reach this alert.** The other
+   two report `outcome="escalated_never_offered"` and fire the ticket-severity
    [`harvest_capability_miss_never_offered`](#harvest_capability_miss_never_offered)
    instead — they are listed here so that, if you arrive at a `no_capable_worker:`
    error from a log or a support ticket rather than from this page, you can tell
    which alert should have fired and which triage to follow:
 
-   | `error` says | Cause | Alert | Fix |
-   | --- | --- | --- | --- |
-   | `escalated after N capability-miss redeliveries; no live worker on this queue has the handler` | `N + 1` **distinct** workers each missed the task. The queue really was swept. | **This page** | Deploy the handler / finish the rollout. Steps 1–3 apply as written. |
-   | `escalated after R capability-miss redeliveries spread across only D distinct worker(s), hitting the absolute release ceiling …` | The task bounced `R` times but across **fewer** distinct workers than the budget allows — typically a small (often single-worker) fleet, which can only ever escalate this way. | **This page** | Check those `D` workers first (step 3), *then* the fleet. See the note below. |
-   | `escalated immediately after 0 redeliveries: capability-miss redelivery is disabled (capability_miss_max_redeliveries = 0) …` | Redelivery is switched off, so the task was failed on its first claim by a single incapable worker and never offered to a peer. | Ticket: `harvest_capability_miss_never_offered` | Raise `capability_miss_max_redeliveries` off `0`. Steps 1–3 may find nothing wrong — this is a config, not a missing deploy. |
-   | `escalated immediately after 0 redeliveries: task is pinned to worker session {id} …` | The task is hard-pinned to one host (#606) and could never be offered to a peer at all. | Ticket: `harvest_capability_miss_never_offered` | Go to the pinned host, not the fleet. Raising the budget is a **guaranteed no-op** here. |
+   | # | `error` says | Cause | Alert | Fix |
+   | --- | --- | --- | --- | --- |
+   | 1a | `escalated after N capability-miss redeliveries; every worker with a live heartbeat here has now missed it, so no live worker on this queue has the handler` | `N + 1` **distinct** workers each missed the task **and** the registry confirmed they cover the live fleet. The queue really was swept. | **This page** | Deploy the handler / finish the rollout. Steps 1–3 apply as written. |
+   | 1b | `escalated after N capability-miss redeliveries; the worker registry could not be used to confirm the live fleet …` | The budget was exhausted, but the claiming worker was **not listed** against this queue in `harvest_workers`, so no fleet conclusion was available. | **This page** | Fix the registry first: check worker heartbeats (`GET /api/harvest/workers`) and that workers advertise this queue name. The handler may be fine. |
+   | 2a | `escalated after R capability-miss redeliveries spread across only D distinct worker(s), hitting the absolute release ceiling …; fewer distinct workers missed this task than the budget allows …` | The task bounced `R` times across **fewer** distinct workers than the budget allows — typically a small (often single-worker) fleet, which can only ever escalate this way. | **This page** | Check those `D` workers first (step 3), *then* the fleet. See the note below. |
+   | 2b | `… hitting the absolute release ceiling …; a live worker on this queue never missed this task …` | A live worker on the queue **never missed it**, so the fleet gate withheld the budget and only the ceiling could fire. That worker may well be capable. | **This page** | Go to that worker, not the deploy: is it saturated, draining, or advertising a stale queue list? |
+   | 3 | `escalated immediately after 0 redeliveries: capability-miss redelivery is disabled (capability_miss_max_redeliveries = 0) …` | Redelivery is switched off, so the task was failed on its first claim by a single incapable worker and never offered to a peer. | Ticket: `harvest_capability_miss_never_offered` | Raise `capability_miss_max_redeliveries` off `0`. Steps 1–3 may find nothing wrong — this is a config, not a missing deploy. |
+   | 4 | `escalated immediately after 0 redeliveries: task is pinned to worker session {id} …` | The task is hard-pinned to one host (#606) and could never be offered to a peer at all. | Ticket: `harvest_capability_miss_never_offered` | Go to the pinned host, not the fleet. Raising the budget is a **guaranteed no-op** here. |
 
    The matching worker log carries a `session_pinned` boolean, a
-   `distinct_incapable_workers` count, an `outcome` field holding the same value
-   as the metric label, and (when pinned) a `session_id`, so the same four-way
-   split is greppable in logs as well as in the execution's `error`.
+   `distinct_incapable_workers` count, a `completed_releases` count, a
+   `fleet_evidence` field (`AllLiveWorkersMissed` / `CapablePeerMayExist` /
+   `Unavailable` — the same three states rows 1a/1b/2b are drawn from), an
+   `outcome` field holding the same value as the metric label, and (when pinned)
+   a `session_id`, so the same split is greppable in logs as well as in the
+   execution's `error`.
 
-   **Row 2 (release ceiling) has a second reading.** It fires when the *absolute*
-   bound (`10 ×` the budget in total releases) trips while the distinct-misser
-   set stayed within budget. The likely cause is still a missing handler on the
-   workers that actually claimed it — but it can also mean a capable peer kept
-   losing the claim race to an incapable one. It pages anyway because a
-   single-worker deployment can trip *no other bound*, so ticketing it would mean
-   such a deployment never pages for a genuinely missing handler. Losing `10 ×
-   budget` consecutive races across ~25 minutes of backoff is not a realistic
-   steady state, so treat row 2 as a real handler outage first and check
-   `distinct_incapable_workers` against `GET /api/harvest/workers` to rule out
-   the race reading.
+   **Counts in the `error` are what actually happened.** `R` and `D` report the
+   *persisted* record — redeliveries that completed and workers that released.
+   The claim that escalated is not counted: it never released, so including it
+   would have you looking for a redelivery that does not exist.
+
+   **Row 2a has a second reading.** It fires when the *absolute* bound (`10 ×`
+   the budget in total releases) trips while the distinct-misser set stayed
+   within budget and the registry raised no objection. The likely cause is a
+   missing handler on the workers that actually claimed it — but it can also
+   mean a capable peer kept losing the claim race while being absent from the
+   registry. It pages anyway because a single-worker deployment can trip *no
+   other bound*, so ticketing it would mean such a deployment never pages for a
+   genuinely missing handler. Losing `10 × budget` consecutive races across ~25
+   minutes of backoff is not a realistic steady state, so treat row 2a as a real
+   handler outage first and check `distinct_incapable_workers` against
+   `GET /api/harvest/workers` to rule out the race reading. (Row 2b is the case
+   where the registry *did* see the peer — there, start with the peer.)
 
    If this page is firing, you are in row 1 or 2 by construction: the alert
    selects `outcome="escalated"` with an exact matcher. Rows 3–4 are here for

@@ -612,6 +612,63 @@ pub async fn fleet_health(
     })
 }
 
+/// SQL for [`live_workers_on_queue`], exposed for no-DB shape tests (issue #804).
+///
+/// `$1` = the staleness window in seconds, `$2` = the queue name.
+///
+/// The liveness predicate is deliberately **identical** to the one the
+/// poison-pill orphan reclaimer uses
+/// ([`crate::poison_pill::orphaned_running_tasks_query`]): a fresh
+/// `last_heartbeat_at` inside `2 × worker_heartbeat_interval`. Two subsystems
+/// answering "is this worker alive?" differently would be a latent
+/// inconsistency, so this reuses that convention verbatim rather than
+/// inventing a second one.
+///
+/// `status` is deliberately **not** filtered. A `Draining` worker still
+/// belongs in the live set: it is a worker the fleet may still be told to keep,
+/// and excluding it would let a capability-miss escalation conclude "no capable
+/// worker" while a capable drainer is a rollback away. A genuinely gone worker
+/// stops heartbeating and ages out of this query on its own, which is the
+/// self-healing behaviour the freshness window already provides.
+#[must_use]
+pub const fn live_workers_on_queue_query() -> &'static str {
+    "SELECT worker_id FROM harvest_workers \
+     WHERE last_heartbeat_at > NOW() - ($1::bigint * INTERVAL '1 second') \
+       AND queues @> to_jsonb($2::text)"
+}
+
+/// Worker ids with a fresh heartbeat that advertise `queue_name` (issue #804).
+///
+/// This is the *fleet* half of the capability-miss decision: the task's
+/// `capability_miss_workers` array says which workers have demonstrably no
+/// handler for it, and this says which workers could claim it at all. Only when
+/// the first covers the second is "no capable worker is live" an actual
+/// conclusion rather than an assumption drawn from a fixed redelivery budget.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the query fails.
+pub async fn live_workers_on_queue(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+    worker_stale_secs: i64,
+) -> HarvestResult<Vec<String>> {
+    #[derive(diesel::QueryableByName)]
+    struct LiveWorkerRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        worker_id: String,
+    }
+
+    let stale = worker_stale_secs.clamp(0, crate::poison_pill::MAX_WORKER_STALE_SECS);
+    let rows: Vec<LiveWorkerRow> = diesel::sql_query(live_workers_on_queue_query())
+        .bind::<diesel::sql_types::BigInt, _>(stale)
+        .bind::<diesel::sql_types::Text, _>(queue_name)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(rows.into_iter().map(|r| r.worker_id).collect())
+}
+
 // ---------------------------------------------------------------------------
 // Response types
 // ---------------------------------------------------------------------------
@@ -1372,6 +1429,30 @@ pub fn local_hostname() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The fleet lookup that gates the capability-miss redelivery budget
+    /// (issue #804) must keep using the SAME liveness predicate as the
+    /// poison-pill orphan reclaimer, and must scope to the task's own queue.
+    /// Two subsystems disagreeing about "is this worker alive" would let one
+    /// escalate on a fleet the other still considers healthy.
+    #[test]
+    fn live_workers_on_queue_query_matches_the_shared_liveness_predicate() {
+        let sql = super::live_workers_on_queue_query();
+        assert!(
+            sql.contains("last_heartbeat_at > NOW() - ($1::bigint * INTERVAL '1 second')"),
+            "must reuse the poison-pill freshness window verbatim: {sql}"
+        );
+        assert!(
+            sql.contains("queues @> to_jsonb($2::text)"),
+            "a worker polling a DIFFERENT queue is not a candidate claimant: {sql}"
+        );
+        assert!(
+            !sql.contains("status"),
+            "a Draining worker is still live enough to be a capable peer, and \
+             excluding it would let escalation conclude 'no capable worker' one \
+             rollback too early: {sql}"
+        );
+    }
+
     use super::*;
 
     // -- WorkerStatus --

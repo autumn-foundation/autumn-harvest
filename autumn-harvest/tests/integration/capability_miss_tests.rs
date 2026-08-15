@@ -592,6 +592,7 @@ const Q_MIXED: &str = "q804-mixed";
 const MIXED_FLEET_BUDGET: u32 = 50;
 const Q_NOOP: &str = "q804-noop";
 const Q_PARK: &str = "q804-park";
+const Q_LIVE_PEER: &str = "q804-live-peer";
 
 type BoxFut<'a> =
     Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>>;
@@ -1606,5 +1607,94 @@ async fn release_is_a_noop_when_the_claim_was_already_taken() {
     assert_eq!(
         task.capability_misses, 0,
         "a no-op release must not inflate the miss counter"
+    );
+}
+
+/// Register a worker row in `harvest_workers` advertising `queue` (issue #804).
+///
+/// The capability-miss fleet gate asks the registry which workers *could* claim
+/// this task; a row inserted here is indistinguishable from a real worker that
+/// has never happened to win a claim race for it.
+async fn seed_live_worker(url: &str, worker_id: &str, queue: &str) {
+    let mut conn = connect(url).await;
+    diesel::sql_query(
+        "INSERT INTO harvest_workers \
+         (worker_id, started_at, last_heartbeat_at, queues, shard_assignments, \
+          max_concurrency, in_flight_count, host, status, build_id, labels) \
+         VALUES ($1, NOW(), NOW(), $2::jsonb, '[]'::jsonb, 4, 0, 'test-host', 'Active', '', '{}'::jsonb) \
+         ON CONFLICT (worker_id) DO UPDATE SET last_heartbeat_at = NOW(), queues = EXCLUDED.queues",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .bind::<diesel::sql_types::Text, _>(format!("[\"{queue}\"]"))
+    .execute(&mut conn)
+    .await
+    .expect("seed live worker row");
+}
+
+/// Codex round-8 P1 / the success metric's load-bearing half: **zero spurious
+/// FAILED executions as long as >= 1 capable worker is live.**
+///
+/// A fixed redelivery budget has no relationship to the live fleet, so a
+/// rollout with `budget + 1` incapable pods could hand `budget + 1` DISTINCT
+/// worker ids to the decision and terminally fail the run — while the capable
+/// pod was live and polling the whole time, and while the error column asserted
+/// the exact opposite.
+///
+/// The contrast case is
+/// `capability_miss_escalates_after_the_budget_with_no_capable_worker`: same
+/// shape, no live capable peer registered, and it escalates as AC3 requires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budget_never_escalates_while_a_capable_worker_is_live() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "never_registered_wf",
+        serde_json::json!({}),
+        Q_LIVE_PEER,
+    )
+    .await;
+    // Budget of 1, already spent by one distinct incapable worker: the next
+    // distinct worker crosses the raw bound.
+    seed_prior_missing_workers(&url, exec_id, &["pod-a-incapable"]).await;
+    // ... but a capable worker is live on this queue and has never missed it.
+    seed_live_worker(&url, "pod-capable-live", Q_LIVE_PEER).await;
+
+    let metrics = Arc::new(CapabilityMetrics::default());
+    let worker = build_worker(
+        "worker-incapable-second",
+        &[Q_LIVE_PEER],
+        build_registry(
+            vec![workflow_info("some_other_wf", decoy_workflow)],
+            vec![],
+            Arc::clone(&metrics),
+        ),
+        1,
+    );
+
+    with_worker_running(&worker, &pool, async {
+        // Two releases PAST the point the ungated budget would have escalated.
+        wait_for_capability_misses(&url, exec_id, 3, Duration::from_secs(60)).await;
+    })
+    .await;
+
+    let execution = load_execution(&url, exec_id).await;
+    assert_eq!(
+        execution.state, "RUNNING",
+        "a live capable peer must keep the task in play, got {:?} / {:?}",
+        execution.state, execution.error
+    );
+    assert_eq!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED),
+        0,
+        "the distinct-worker budget must be withheld while a live worker has \
+         never missed this task, got {:?}",
+        metrics.samples()
+    );
+    assert_eq!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED),
+        0
     );
 }
