@@ -1043,6 +1043,16 @@ async fn capability_miss_escalates_after_the_budget_with_no_capable_worker() {
 /// far past that budget: the distinct set stays at one entry, so it releases
 /// every time and never escalates.
 ///
+/// A live peer that never claims is seeded so the fleet evidence stays
+/// `CapablePeerMayExist` — which is exactly the state this property is about.
+/// The concern round 6 fixed is "a capable peer may be live and merely losing
+/// the claim race", so the test has to be run in a fleet where that is true.
+/// With the registry instead CONFIRMING that the lone worker is the whole live
+/// fleet there is provably no peer to protect, and the configured budget bounds
+/// total releases too (round 15) — see
+/// `single_worker_fleet_escalates_at_the_configured_budget` below and the pure
+/// `configured_total_bound_requires_confirmed_fleet_coverage`.
+///
 /// Falsifiable — verified by reverting `capability_miss_decision` to the
 /// total-miss bound and re-running: with a budget of 2 the task escalates on
 /// the third claim, so it never accrues a fourth miss and the row is gone.
@@ -1068,6 +1078,12 @@ async fn one_incapable_worker_cannot_exhaust_the_shared_redelivery_budget() {
         Q_ESCALATE,
     )
     .await;
+
+    // A live worker on this queue that never claims, so the registry can never
+    // conclude the fleet has been swept. Without it the lone incapable pod IS
+    // the confirmed fleet, and the round-15 total bound would (correctly)
+    // escalate at BUDGET + 1 -- a different property, covered separately.
+    seed_live_worker(&url, "pod-peer-live-never-claims", Q_ESCALATE).await;
 
     let metrics = Arc::new(CapabilityMetrics::default());
     let worker = build_worker(
@@ -1123,6 +1139,135 @@ async fn one_incapable_worker_cannot_exhaust_the_shared_redelivery_budget() {
     );
     // AC4 stays true throughout: a capability miss is never a crash.
     assert_eq!(metrics.quarantine_count(), 0);
+}
+
+/// A dedicated queue so the *only* live worker on it is this test's. The
+/// database is shared across the suite when `HARVEST_TEST_DATABASE_URL` is set,
+/// and `live_workers_on_queue` filters by queue name — reusing `Q_ESCALATE`
+/// would let another test's registered pod (or its deliberately-seeded
+/// never-claiming peer) sit in this test's live set and flip the evidence to
+/// `CapablePeerMayExist`, which is the state this test is the contrast for.
+const Q_SOLO_FLEET: &str = "q804-solo-fleet";
+
+/// **Issue #804 round-15 P1.** `capability_miss_max_redeliveries` must remain a
+/// *maximum* in a fleet smaller than the budget.
+///
+/// The budget's unit of account is DISTINCT workers (round 6), so a fleet of
+/// one can never satisfy `distinct_after > budget` however many times it
+/// bounces the task. Before round 15 the only remaining bound was the absolute
+/// `10x` release ceiling: with the default budget of 5 that is 51 claims and,
+/// under the capped backoff, roughly 23 minutes before anyone is paged — for a
+/// knob documented as five releases and ~31 seconds.
+///
+/// Round 15 applies the configured budget to *total* releases as well, but only
+/// once the worker registry CONFIRMS every live worker on the queue has missed
+/// the task (`AllLiveWorkersMissed`). That gate is what keeps round 6 intact:
+/// on unconfirmed evidence the same total could have been run up by one pod
+/// while a capable peer merely kept losing the claim race.
+///
+/// This is the exact contrast to
+/// `one_incapable_worker_cannot_exhaust_the_shared_redelivery_budget`: same
+/// single incapable pod, same repeated self-claim — the only difference is that
+/// there a live peer is seeded so the fleet is never confirmed swept, and here
+/// the lone pod IS the confirmed fleet, so the budget is free to bound it.
+///
+/// Falsifiable — verified by reverting the round-15 branch in
+/// `capability_miss_decision`: the run stays `RUNNING` past the budget and
+/// `wait_for_state(.., "FAILED", ..)` times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_worker_fleet_escalates_at_the_configured_budget() {
+    // Budget 2: releases at 1s and 2s of backoff, escalating on the third
+    // claim ~3s in. The `10x` ceiling would need 21 claims and ~2 minutes, so
+    // the assertion below distinguishes the two bounds by wall clock as well as
+    // by wording.
+    const BUDGET: u32 = 2;
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "never_registered_wf",
+        serde_json::json!({}),
+        Q_SOLO_FLEET,
+    )
+    .await;
+
+    // Deliberately NO seeded peer. The worker registers itself in
+    // `harvest_workers` before its poll loop starts, so from its very first
+    // miss the live set is exactly `[the-only-pod]` and the evidence is
+    // `AllLiveWorkersMissed`.
+    let metrics = Arc::new(CapabilityMetrics::default());
+    let worker = build_worker(
+        "the-only-pod",
+        &[Q_SOLO_FLEET],
+        build_registry(
+            vec![workflow_info("some_other_wf", decoy_workflow)],
+            vec![],
+            Arc::clone(&metrics),
+        ),
+        BUDGET,
+    );
+
+    let failed = with_worker_running(&worker, &pool, async {
+        wait_for_state(&url, exec_id, "FAILED", Duration::from_secs(60)).await
+    })
+    .await;
+
+    let error = failed.error.unwrap_or_default();
+    assert!(
+        error.starts_with(NO_CAPABLE_WORKER_PREFIX),
+        "escalation must carry the stable prefix, got {error:?}"
+    );
+    // The headline: the reason names the CONFIGURED budget, not the ceiling.
+    assert!(
+        error.contains("escalated after 2 capability-miss redeliveries"),
+        "the reason must name the budget the operator configured, got {error:?}"
+    );
+    assert!(
+        !error.contains("absolute release ceiling"),
+        "a confirmed-fleet budget exhaustion must not inherit the ceiling's \
+         wording -- that would send the operator to a knob 10x away from the \
+         one that actually bounded this, got {error:?}"
+    );
+    assert!(
+        error.contains("every worker with a live heartbeat here has now missed it"),
+        "confirmed fleet coverage is what licenses applying the budget to \
+         total releases, so the reason must say so, got {error:?}"
+    );
+
+    // Exactly BUDGET releases, then one escalation. `capability_misses` counts
+    // the escalating claim too, so it lands at BUDGET + 1 while the released
+    // count is BUDGET.
+    assert_eq!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_RELEASED),
+        usize::try_from(BUDGET).expect("small"),
+        "a budget of {BUDGET} must grant exactly {BUDGET} releases, got {:?}",
+        metrics.samples()
+    );
+    assert_eq!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED),
+        1,
+        "exactly one escalation, and the fleet-confirmed one (never \
+         `escalated_never_offered`, which is a ticket rather than a page), got {:?}",
+        metrics.samples()
+    );
+    assert_eq!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED),
+        0,
+        "the task WAS offered to a peer {BUDGET} times, so the never-offered \
+         outcome would misroute the alert, got {:?}",
+        metrics.samples()
+    );
+
+    // AC4 holds at escalation too: a capability miss is never a crash.
+    assert_eq!(metrics.quarantine_count(), 0);
+    assert!(
+        dead_letter_errors(&url, exec_id).await.is_empty(),
+        "escalation routes through the ordinary terminal-failure path, which \
+         writes no dead-letter row"
+    );
 }
 
 // ---------------------------------------------------------------------------

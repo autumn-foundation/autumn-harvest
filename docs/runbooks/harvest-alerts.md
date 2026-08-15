@@ -2046,14 +2046,22 @@ peer is live: a repeat miss by a worker already in the set backs off but
 consumes no budget. Reaching this page via that bound therefore means `N + 1`
 **different** workers each failed to resolve the handler.
 
-A secondary **absolute ceiling** of `10 ×` the budget on *total* releases also
-escalates with the same `escalated` outcome. It exists for a fleet smaller than
-the budget, where the distinct set can never grow far enough to trip the primary
-bound — with one worker it is the *only* bound reachable, so routing it elsewhere
-would mean a single-worker deployment never pages for a genuinely missing
-handler. Its reason string names the real release count and the distinct count
-(`spread across only D distinct worker(s)`) rather than the budget, so it is
-distinguishable in triage; see the four-way table in step 4.
+A distinct-worker count alone cannot bound a fleet **smaller** than the budget —
+one incapable pod pins the set at 1 forever. So once the registry confirms every
+live eligible worker on the queue has already missed the task, the same budget
+value bounds *total* releases too, and a single-worker fleet escalates after `N`
+releases (~31 s) rather than `10 × N`. It reports the same budget-exhausted
+reason, because the registry confirmed the same fact.
+
+That total bound requires **confirmed** coverage. If the registry cannot be read,
+`N` total releases may all have been won by the same pod — the case the distinct
+count exists to reject — so a third, deliberately generous **absolute ceiling**
+of `10 ×` the budget remains as the backstop for the two states where coverage is
+unprovable: a live worker that never missed the task, or an unreadable registry.
+It escalates with the same `escalated` outcome, and its reason string names the
+real release count and the distinct count (`spread across only D distinct
+worker(s)`) rather than the budget, so it is distinguishable in triage; see the
+four-way table in step 4.
 
 Those conclusions are sound because the task was *offered around the queue*
 first. Two escalation causes fail an execution on its **first** claim after
@@ -2154,16 +2162,19 @@ Distinct from two adjacent signals, deliberately:
 
    **Row 2a has a second reading.** It fires when the *absolute* bound (`10 ×`
    the budget in total releases) trips while the distinct-misser set stayed
-   within budget and the registry raised no objection. The likely cause is a
-   missing handler on the workers that actually claimed it — but it can also
-   mean a capable peer kept losing the claim race while being absent from the
-   registry. It pages anyway because a single-worker deployment can trip *no
-   other bound*, so ticketing it would mean such a deployment never pages for a
-   genuinely missing handler. Losing `10 × budget` consecutive races across ~25
-   minutes of backoff is not a realistic steady state, so treat row 2a as a real
-   handler outage first and check `distinct_incapable_workers` against
-   `GET /api/harvest/workers` to rule out the race reading. (Row 2b is the case
-   where the registry *did* see the peer — there, start with the peer.)
+   within budget and the registry gave no usable answer — a worker not listed
+   against this queue, so coverage could not be confirmed. The likely cause is a
+   missing handler on the workers that actually claimed it, but it can also mean
+   a capable peer kept losing the claim race while being absent from the
+   registry. It pages anyway because the executions are failing either way and
+   under-paging a genuinely missing handler is the worse error. Losing
+   `10 × budget` consecutive races across ~25 minutes of backoff is not a
+   realistic steady state, so treat row 2a as a real handler outage first, and
+   check `distinct_incapable_workers` against `GET /api/harvest/workers` to rule
+   out the race reading. Fix the registry gap too — with a readable registry this
+   shape would have escalated at the configured budget with a much clearer
+   reason. (Row 2b is the case where the registry *did* see the peer — there,
+   start with the peer.)
 
    If this page is firing, you are in row 1 or 2 by construction: the alert
    selects `outcome="escalated"` with an exact matcher. Rows 3–4 are here for

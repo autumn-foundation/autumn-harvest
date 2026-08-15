@@ -3987,9 +3987,36 @@ pub const fn capability_miss_decision(
     {
         return CapabilityMissAction::Escalate;
     }
-    // ABSOLUTE bound: total releases. The distinct bound alone cannot terminate
-    // a fleet SMALLER than the budget, so this is what keeps AC3's "bounded
-    // release" true for e.g. a single incapable worker.
+    // CONFIGURED TOTAL bound: once the registry confirms every live eligible
+    // worker on this queue has already missed the task, the distinct set cannot
+    // grow from the fleet as it stands, so the distinct bound is unreachable for
+    // any fleet SMALLER than the budget -- with one incapable worker and the
+    // default budget of 5, `distinct_after` is pinned at 1 forever. Left to the
+    // absolute ceiling alone that permits 50 releases and escalates on the 51st
+    // claim, roughly 23 minutes at the backoff cap, so
+    // `capability_miss_max_redeliveries` stopped being a *maximum* for the
+    // common small deployment and the issue's own bound ("with zero capable
+    // workers, escalate within <= N") was violated (Codex round-15 P1).
+    //
+    // Gated on `AllLiveWorkersMissed` SPECIFICALLY, not merely
+    // `!CapablePeerMayExist`. On `Unavailable` this bound would fire after
+    // `budget` releases that may all have been won by the SAME worker, which is
+    // exactly the round-6 P1 the distinct bound exists to prevent -- one
+    // incapable worker exhausting the budget by winning the claim race over and
+    // over. The distinct bound may fire on `Unavailable` because `budget + 1`
+    // distinct workers is strong evidence on its own; this one may not, because
+    // its evidence comes entirely from the registry. A fleet the registry cannot
+    // describe therefore keeps the absolute ceiling as its only bound, which is
+    // the "release for longer, never fail sooner" direction every prior round
+    // has chosen for unprovable coverage.
+    if matches!(evidence, FleetCapabilityEvidence::AllLiveWorkersMissed)
+        && misses_after_increment > budget
+    {
+        return CapabilityMissAction::Escalate;
+    }
+    // ABSOLUTE bound: total releases. Backstop for the two evidence states the
+    // bound above deliberately withholds itself from, so AC3's "bounded release"
+    // stays true even when fleet coverage is unprovable.
     if misses_after_increment > budget.saturating_mul(CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER) {
         return CapabilityMissAction::Escalate;
     }
@@ -4154,9 +4181,16 @@ pub fn fleet_capability_evidence(
 /// conclusion after it was added in review round 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscalationCause {
-    /// `max_redeliveries + 1` **distinct** workers each missed the task, and
-    /// the registry raised no objection. Only this case supports the fleet-wide
-    /// conclusion.
+    /// The configured `max_redeliveries` budget was exhausted, and the registry
+    /// raised no objection. Only this case supports the fleet-wide conclusion.
+    ///
+    /// Two ways to get here, matching [`capability_miss_decision`]'s two
+    /// budget-bearing bounds: `max_redeliveries + 1` **distinct** workers each
+    /// missed the task, or — once the registry confirms every live eligible
+    /// worker has already missed it, so the distinct set can no longer grow —
+    /// `max_redeliveries + 1` total releases. The second is what makes the knob
+    /// a real maximum for a fleet smaller than the budget, where the distinct
+    /// count is pinned below it forever.
     BudgetExhausted {
         /// `true` when the live fleet on this queue was enumerated and every
         /// member of it had missed the task
@@ -4233,6 +4267,23 @@ impl EscalationCause {
                     ),
                 }
             }
+            // The configured TOTAL bound (Codex round-15 P1). Mirrors
+            // `capability_miss_decision`'s third branch exactly, on the same
+            // clamped budget and the same `AllLiveWorkersMissed` gate, so a
+            // small fleet that exhausts the budget by total releases reports the
+            // budget it exhausted rather than inheriting the ceiling's wording.
+            // `completed_releases` is the persisted counter before this claim,
+            // so `+ 1` is the value the decision compared.
+            None if matches!(
+                escalation.evidence,
+                FleetCapabilityEvidence::AllLiveWorkersMissed
+            ) && escalation.completed_releases.saturating_add(1)
+                > capability_miss_budget(max_redeliveries) =>
+            {
+                Self::BudgetExhausted {
+                    fleet_confirmed: true,
+                }
+            }
             None => Self::ReleaseCeilingExhausted {
                 completed_releases: escalation.completed_releases,
                 released_workers: escalation.released_workers,
@@ -4250,15 +4301,18 @@ impl EscalationCause {
     /// registers the handler" strongly enough to page — the conclusion the
     /// page-severity `harvest_no_capable_worker` rule exists to assert.
     ///
-    /// `ReleaseCeilingExhausted` pages despite its weaker evidence because it is
-    /// the *only* way a fleet smaller than the budget can escalate at all: with
-    /// one worker the distinct set can never exceed a budget of 5, so routing
-    /// the ceiling to a ticket would mean a single-worker deployment never pages
-    /// for a genuinely missing handler — under-paging the exact outage #804
-    /// exists to surface. Its alternative reading (a capable peer kept losing
-    /// the claim race) requires losing `10 × budget` consecutive races across
-    /// ~25 minutes of backoff, which is not a realistic steady state. The reason
-    /// string states both readings so triage is not misled either way.
+    /// `ReleaseCeilingExhausted` pages despite its weaker evidence because the
+    /// executions are being failed either way, and under-paging is the worse
+    /// error for the outage #804 exists to surface. Since round 15 it is
+    /// reachable only on the two evidence states the configured total bound
+    /// withholds itself from — a live worker that never missed the task
+    /// (`CapablePeerMayExist`), or a registry that could not be read
+    /// (`Unavailable`) for a fleet smaller than the budget — so it now means
+    /// *"bounded by the ceiling because the fleet could not be concluded about"*
+    /// rather than *"small fleet"*. Its alternative reading (a capable peer kept
+    /// losing the claim race) requires losing `10 × budget` consecutive races
+    /// across ~25 minutes of backoff, which is not a realistic steady state. The
+    /// reason string states both readings so triage is not misled either way.
     ///
     /// The other two escalate on the FIRST claim after zero releases, where a
     /// capable worker may be live and idle on the queue the whole time. They
@@ -22834,6 +22888,116 @@ mod tests {
         assert_eq!(dwell, Duration::from_secs(31));
     }
 
+    #[test]
+    fn single_worker_fleet_honors_the_configured_redelivery_maximum() {
+        // Codex round-15 P1. In a fleet SMALLER than the budget the distinct
+        // bound is unreachable by construction: one incapable worker pins
+        // `distinct_after` at 1 forever, and `1 > 5` never holds. Before the
+        // fix the only remaining bound was the 10x ceiling, so a budget of 5
+        // permitted 50 releases and escalated on the 51st claim -- roughly 23
+        // minutes at the backoff cap -- and `capability_miss_max_redeliveries`
+        // stopped being a maximum for the common small deployment.
+        let budget = WorkerConfig::default().capability_miss_max_redeliveries;
+        assert_eq!(budget, 5, "the shipped default this bound is derived from");
+
+        // One distinct worker, missing over and over, with the registry
+        // confirming it is the whole live fleet. Bounded comfortably above the
+        // old `10x` ceiling so a regression reports the real number (50) rather
+        // than hanging.
+        let probe_limit = i32::try_from(budget).expect("small budget")
+            * CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER
+            + 5;
+        let releases = (1..=probe_limit)
+            .take_while(|misses| {
+                capability_miss_decision(1, *misses, budget, ALL_MISSED)
+                    == CapabilityMissAction::Release
+            })
+            .count();
+        assert_eq!(
+            releases,
+            usize::try_from(budget).expect("small budget"),
+            "a single-worker fleet must still be bounded by the CONFIGURED budget, \
+             not by the {CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER}x ceiling"
+        );
+
+        // And the dwell must match the documented one, not ~23 minutes.
+        let dwell: Duration = (0..i32::try_from(releases).expect("small"))
+            .map(capability_miss_backoff)
+            .sum();
+        assert_eq!(dwell, Duration::from_secs(31));
+    }
+
+    #[test]
+    fn configured_total_bound_requires_confirmed_fleet_coverage() {
+        let budget = 5_u32;
+        // `Unavailable`: the registry gave no usable answer, so `budget` total
+        // releases may all have been won by the SAME worker -- exactly the
+        // round-6 P1 the distinct bound exists to prevent. The tight bound must
+        // NOT fire; the ceiling remains the only backstop.
+        assert_eq!(
+            capability_miss_decision(1, 6, budget, FleetCapabilityEvidence::Unavailable),
+            CapabilityMissAction::Release,
+            "an unreadable registry must not let one worker's repeat misses exhaust \
+             the budget -- that is the round-6 defect, reintroduced"
+        );
+        // ... and it is still bounded, by the ceiling.
+        assert_eq!(
+            capability_miss_decision(1, 51, budget, FleetCapabilityEvidence::Unavailable),
+            CapabilityMissAction::Escalate
+        );
+        // `CapablePeerMayExist`: a live worker has never missed it, so it may be
+        // capable. Same conclusion, for the round-8 reason.
+        assert_eq!(
+            capability_miss_decision(1, 6, budget, FleetCapabilityEvidence::CapablePeerMayExist),
+            CapabilityMissAction::Release
+        );
+        // Confirmed coverage is what makes "one worker missed it N times"
+        // equivalent to "the whole live fleet lacks the handler".
+        assert_eq!(
+            capability_miss_decision(1, 6, budget, ALL_MISSED),
+            CapabilityMissAction::Escalate
+        );
+        assert_eq!(
+            capability_miss_decision(1, 5, budget, ALL_MISSED),
+            CapabilityMissAction::Release,
+            "the budget is a count of PERMITTED redeliveries: the Nth still releases"
+        );
+    }
+
+    #[test]
+    fn small_fleet_budget_exhaustion_reports_the_budget_not_the_ceiling() {
+        // The reason string an operator reads must name the bound that actually
+        // tripped. Before the fix this shape could only ever reach the ceiling;
+        // now it must resolve to BudgetExhausted with the fleet-wide conclusion
+        // substantiated, because the registry confirmed the coverage.
+        let budget = 5_u32;
+        let escalation = CapabilityMissEscalation {
+            distinct_after: 1,
+            completed_releases: 5,
+            released_workers: 1,
+            evidence: ALL_MISSED,
+        };
+        assert_eq!(
+            EscalationCause::resolve(budget, None, escalation),
+            EscalationCause::BudgetExhausted {
+                fleet_confirmed: true
+            }
+        );
+        let reason = no_capable_worker_reason("workflow 'onboarding'", budget, None, escalation);
+        assert!(
+            reason.contains("escalated after 5 capability-miss redeliveries"),
+            "must name the configured budget it exhausted: {reason}"
+        );
+        assert!(
+            !reason.contains("absolute release ceiling"),
+            "must not inherit the ceiling's wording: {reason}"
+        );
+        assert!(
+            reason.contains("every worker with a live heartbeat here has now missed it"),
+            "confirmed coverage is what licenses the fleet-wide conclusion: {reason}"
+        );
+    }
+
     /// Shorthand for the fleet evidence these arithmetic tests are not about:
     /// the registry confirmed every live worker on the queue has missed the
     /// task, so the budget/ceiling bounds are free to act. The fleet *gate*
@@ -23149,11 +23313,18 @@ mod tests {
         const BUDGET: u32 = 5;
         // The shape only this bound can produce: releases past the ceiling,
         // distinct workers still comfortably within budget.
+        //
+        // `Unavailable` is load-bearing since round 15. With confirmed coverage
+        // the configured budget now bounds TOTAL releases as well, so a
+        // one-worker fleet escalates at 6 and can never accumulate 51 -- the
+        // ceiling is reachable only when coverage could not be established. The
+        // assertions below are unchanged; only the evidence that makes this
+        // shape reachable is.
         let counts = CapabilityMissEscalation {
             distinct_after: 1,
             completed_releases: 51,
             released_workers: 1,
-            evidence: FleetCapabilityEvidence::AllLiveWorkersMissed,
+            evidence: FleetCapabilityEvidence::Unavailable,
         };
         assert_eq!(
             capability_miss_decision(
@@ -23209,9 +23380,8 @@ mod tests {
             "the alternative reading must be offered so triage is not misled: {reason}"
         );
 
-        // It still pages: this is the ONLY bound a fleet smaller than the budget
-        // can trip, so routing it to a ticket would mean a single-worker
-        // deployment never pages for a genuinely missing handler.
+        // It still pages: the executions are failing either way, and
+        // under-paging a genuinely missing handler is the worse error.
         assert_eq!(
             EscalationCause::ReleaseCeilingExhausted {
                 completed_releases: 51,
@@ -23455,7 +23625,12 @@ mod tests {
                 distinct_after: 1,
                 completed_releases: 50,
                 released_workers: 1,
-                evidence: FleetCapabilityEvidence::AllLiveWorkersMissed,
+                // `Unavailable`, not confirmed coverage: since round 15 the
+                // configured budget also bounds TOTAL releases once coverage is
+                // confirmed, so a one-worker fleet could never reach 50
+                // releases under `AllLiveWorkersMissed`. The ceiling wording
+                // this test is about is reachable only here.
+                evidence: FleetCapabilityEvidence::Unavailable,
             },
         );
         assert!(
@@ -23799,11 +23974,17 @@ mod tests {
     fn capability_miss_total_ceiling_bounds_a_single_worker_bounce() {
         // The distinct budget alone cannot terminate a fleet SMALLER than the
         // budget (a lone incapable worker never grows the distinct set past 1),
-        // so AC3's "bounded release" needs an absolute ceiling as well. It is a
-        // generous multiple of the budget: reaching it while a capable peer is
-        // live requires that peer to lose the claim race that many times in a
-        // row, which is vanishingly unlikely, while a genuinely capability-less
-        // fleet still terminates rather than bouncing forever.
+        // so AC3's "bounded release" needs an absolute ceiling as well.
+        //
+        // The empty `live_workers` here is load-bearing: it makes the evidence
+        // `Unavailable`, which is exactly the state the round-15 configured
+        // total bound withholds itself from (it would otherwise let one worker's
+        // repeat misses exhaust the budget -- the round-6 defect). So this is
+        // the case the ceiling still exists for, and it is a generous multiple
+        // of the budget: reaching it while a capable peer is live requires that
+        // peer to lose the claim race that many times in a row, which is
+        // vanishingly unlikely, while a genuinely capability-less fleet still
+        // terminates rather than bouncing forever.
         let lone = "only-pod".to_string();
         let seen = vec![lone.clone()];
         let ceiling = 5 * CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER;

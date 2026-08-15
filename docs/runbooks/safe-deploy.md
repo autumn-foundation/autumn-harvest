@@ -317,9 +317,24 @@ Counting *distinct* workers rather than total releases is what stops a single
 incapable pod from exhausting the shared budget by repeatedly winning the claim
 race on its own released row — otherwise a capable peer could sit live and idle
 while the run was failed underneath it. A repeat miss by a worker already in the
-set backs off but consumes no budget. A secondary absolute ceiling of `10 ×` the
-budget on total releases covers the one case a distinct-worker budget cannot: a
-fleet smaller than the budget, where the set can never grow far enough.
+set backs off but consumes no budget.
+
+A distinct-worker count alone cannot bound a fleet **smaller** than the budget:
+one incapable pod pins the set at 1 forever, and `1 > 5` never holds. So once
+the registry confirms every live eligible worker on the queue has already missed
+the task — the set can no longer grow from the fleet as it stands — the same
+`capability_miss_max_redeliveries` value bounds *total* releases too. That is
+what keeps the knob a real maximum for the common small deployment: a
+single-worker fleet escalates after 5 releases (~31 s), not 50.
+
+That total bound requires **confirmed** coverage, not merely the absence of an
+objection. If the worker registry cannot be read, `budget` total releases may all
+have been won by the same pod, which is precisely the case the distinct count
+exists to reject. A third, deliberately generous **absolute ceiling** of `10 ×`
+the budget therefore remains as the backstop for the two states where coverage
+is unprovable — a live worker that has never missed the task, or an unreadable
+registry — so the release is always bounded even when nothing can be concluded
+about the fleet.
 
 **The budget is gated on the live fleet, not just on its own count.** A fixed
 number of distinct workers still has no relationship to how many workers are
@@ -347,23 +362,25 @@ worth knowing before you tune anything:
   see row 1b in
   [`harvest-alerts.md`](harvest-alerts.md#harvest_no_capable_worker).
 
-The ceiling escalates with a **different reason string**, because it supports a
-weaker conclusion — the releases were concentrated in fewer workers than the
-budget allows, so the whole queue was never swept:
+A small fleet that exhausts the budget on *total* releases reports the same
+budget-exhausted reason as a distinct-worker sweep, because the registry
+confirmed the same fact — every live worker here has now missed it:
 
 ```
-no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 51 capability-miss redeliveries spread across only 1 distinct worker(s), hitting the absolute release ceiling of 10x capability_miss_max_redeliveries = 5; ...)
+no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 5 capability-miss redeliveries; every worker with a live heartbeat here has now missed it, so no live worker on this queue has the handler)
 ```
 
-It still fires the page-severity alert: with a single worker it is the *only*
-bound reachable, so ticketing it would mean a one-pod deployment never pages for
-a genuinely missing handler. Check the named `distinct_incapable_workers` count
-against `GET /api/harvest/workers` before concluding the whole queue lacks the
-handler.
+The **absolute ceiling** escalates with a different reason string, because it
+supports a weaker conclusion — it is reached only when the fleet could not be
+concluded about at all, so the queue was never provably swept. It still fires
+the page-severity alert: the executions are failing either way, and under-paging
+a genuinely missing handler is the worse error. Check the named
+`distinct_incapable_workers` count against `GET /api/harvest/workers` before
+concluding the whole queue lacks the handler.
 
-Because the budget is fleet-gated, the ceiling is also the only bound reachable
-when a live worker on the queue has never missed the task. That case gets its
-own wording, pointing at the peer rather than at the deploy:
+The commonest way to reach it is a live worker on the queue that never missed
+the task, which gets its own wording pointing at the peer rather than at the
+deploy:
 
 ```
 no_capable_worker: no workflow handler registered for 'ship_order' (escalated after 50 capability-miss redeliveries spread across only 6 distinct worker(s), hitting the absolute release ceiling of 10x capability_miss_max_redeliveries = 5; a live worker on this queue never missed this task, so it may well have the handler and simply lost every claim race — check whether it is saturated, draining, advertising a stale queue list, or ineligible for this activity's registered capability requirements before concluding the handler is missing)
@@ -389,7 +406,7 @@ old pods failing perfectly good new-build work.
 |---|---|---|
 | `harvest.task.capability_miss{outcome="released"}` rising, then falling to zero | Normal deploy skew, self-healing | None. Confirm it returns to zero once the rollout completes. |
 | `harvest.task.capability_miss{outcome="released"}` sustained past the rollout | Some pods are stuck on the old build, or the new handler never shipped to part of the fleet | Finish/roll back the deploy; check the fleet's build IDs. |
-| `harvest.task.capability_miss{outcome="escalated"}` non-zero | The task was offered around the queue and nobody took it. Executions are now failing. Two sub-cases, told apart by the reason string: `N + 1` **distinct** workers each missed it (**no live worker on that queue registers the handler**), or the absolute release ceiling tripped with **fewer** distinct workers than the budget — likely the same conclusion on a small fleet, but check those workers first. | Page. Ship the handler, or accept the failures deliberately. |
+| `harvest.task.capability_miss{outcome="escalated"}` non-zero | The task was offered around the queue and nobody took it. Executions are now failing. Two sub-cases, told apart by the reason string: the configured budget was exhausted with the registry confirming every live worker here has missed it (**no live worker on that queue registers the handler**), or the absolute release ceiling tripped because coverage could not be confirmed at all — a peer that never missed it, or an unreadable registry. Check those workers first in the second case. | Page. Ship the handler, or accept the failures deliberately. |
 | `harvest.task.capability_miss{outcome="escalated_never_offered"}` non-zero | Executions are failing, but the task was failed on its **first** claim after **zero** releases — either `capability_miss_max_redeliveries = 0`, or a worker-session pin (#606) whose host lacks the handler. **This is not evidence the fleet lacks the handler**; a capable worker may be live and idle the whole time. | Ticket. Read the `no_capable_worker:` reason on a failed execution — its parenthetical names which of the two causes applies. |
 
 The two escalation outcomes are deliberately separate label values because they
@@ -408,9 +425,17 @@ time budget, but the backoff makes it dwell. A budget of `N` grants exactly `N`
 releases and escalates on the `N + 1`th claim, so the default allows five
 releases whose backoffs sum to **31 s** (1 + 2 + 4 + 8 + 16) of queue dwell
 before escalation — that is the *minimum* window a capable peer has to appear,
-measured **on a single worker**. In a fleet, releases are consumed by whichever
+measured **on a single worker**, and it is what a single-worker fleet actually
+gets: the budget bounds total releases once the registry confirms the whole live
+fleet has missed the task. In a wider fleet, releases are consumed by whichever
 worker claims next, so a wide fleet of incapable workers burns the budget in
 fewer seconds of wall clock.
+
+**Size it against your rollout, not against a single pod restart.** Escalation is
+the loud signal that nobody can run the work, and it now arrives at the
+configured budget on *every* fleet size rather than being stretched to `10 ×` on
+small ones. If your replacement pods routinely take longer than the dwell above
+to come up, raise the knob — 31 s is not much of a rollout window.
 
 Escalation is also **probabilistic, not exhaustive**: a release carries no
 affinity, so in an `M`-incapable / `1`-capable fleet a task can in principle
