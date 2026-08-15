@@ -490,7 +490,11 @@ incident: the resulting terminal error names the knob, not a missing deploy.
   this worker's build allowed to resume this history?"*; a capability miss
   asks *"does this worker have the handler at all?"* A fleet using build
   policies still benefits: routing narrows who *may* claim, but a worker that
-  passes the build gate can still lack a brand-new handler.
+  passes the build gate can still lack a brand-new handler. The budget's
+  fleet check reads `harvest_build_compat` so a cross-build peer counts as a
+  possible claimant; if that read fails it **keeps** cross-build peers rather
+  than concluding they are ineligible, so a blip in the declaration table can
+  only delay escalation, never cause one.
 - **Orthogonal to the handler-coverage gate (#520/#700), below.** That gate is
   a *pre-cutover* check for handlers you are about to **remove**; this is a
   *runtime* absorber for handlers not yet **added**.

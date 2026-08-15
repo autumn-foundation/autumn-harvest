@@ -4143,6 +4143,62 @@ pub fn claim_eligible_workers(
         .collect()
 }
 
+/// Narrow the live fleet to the workers that could actually win this task's
+/// claim, tolerating an unreadable compatibility table (issue #804).
+///
+/// `compat` is `None` when [`crate::build_routing::load_compat_set`] failed.
+/// That is **not** the same as an empty set, and the difference is the whole
+/// point of this wrapper:
+/// [`crate::build_routing::BuildCompatibilitySet::is_eligible`] answers `false`
+/// for any worker whose build differs from the requirement unless a declaration
+/// says otherwise, so degrading a failed read to `default()` does not lose
+/// information — it *asserts the opposite of what we know*, silently dropping
+/// every cross-build peer `claim_task` would still admit through
+/// `harvest_build_compat` (#171).
+///
+/// The consequence is not cosmetic. The narrowed fleet then contains only the
+/// incapable claimer, [`fleet_capability_evidence`] fabricates
+/// [`FleetCapabilityEvidence::AllLiveWorkersMissed`], and
+/// [`capability_miss_decision`]'s configured-total bound escalates at
+/// `budget + 1` — turning one transient `SELECT` failure into a terminally
+/// failed execution while a live, eligible, capable peer was polling the queue
+/// (Codex round-18 P1).
+///
+/// So an unreadable table suppresses the **build** axis only, by asking
+/// [`claim_eligible_workers`] to evaluate no build requirement at all
+/// (`is_eligible(_, None)` is unconditionally `true`). The #522 label axis is
+/// still readable from the worker rows themselves and stays enforced, so this
+/// gives back exactly the narrowing that became unknowable and no more.
+///
+/// This is the same doctrine the unparseable-`required_capabilities` case
+/// already follows inside [`claim_eligible_workers`] ("an unreadable
+/// requirement falls back to keeping the worker"), and the same direction every
+/// prior round chose for unprovable coverage: release for longer, never fail
+/// sooner. Retaining a worker that turns out to be genuinely ineligible costs
+/// at most a delay to the absolute ceiling; dropping a capable one costs the
+/// execution.
+#[must_use]
+pub fn narrow_live_fleet(
+    live: &[crate::workers::LiveWorker],
+    compat: Option<&crate::build_routing::BuildCompatibilitySet>,
+    required_build_id: Option<&str>,
+    required_capabilities: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let unreadable = crate::build_routing::BuildCompatibilitySet::new();
+    // The rule, stated once: apply the build requirement only if we were able
+    // to read the declarations that decide it. `and` yields the requirement
+    // when `compat` is `Some` and `None` otherwise, and `is_eligible(_, None)`
+    // is unconditionally `true` — so an unreadable table narrows on labels
+    // alone rather than asserting that cross-build peers are ineligible.
+    let build_requirement = compat.and(required_build_id);
+    claim_eligible_workers(
+        live,
+        compat.unwrap_or(&unreadable),
+        build_requirement,
+        required_capabilities,
+    )
+}
+
 /// Classify the live fleet against the workers already known to lack this
 /// task's handler (issue #804).
 ///
@@ -15393,11 +15449,18 @@ pub struct CapabilityMissPolicy {
 /// A registry failure must not propagate: doing so would turn a transient blip
 /// into a dispatch error that leaves the row `RUNNING` under a live worker,
 /// where the poison-pill reclaimer (which requires a dead heartbeat) cannot see
-/// it. An empty set is the conservative direction on both axes — it cannot
-/// contain the claiming worker, so [`fleet_capability_evidence`] reports
-/// [`FleetCapabilityEvidence::Unavailable`], which withholds no bound (the
-/// budget still applies) and makes the escalation reason say out loud that the
-/// fleet was not confirmed.
+/// it. An empty set is the conservative direction — it cannot contain the
+/// claiming worker, so [`fleet_capability_evidence`] reports
+/// [`FleetCapabilityEvidence::Unavailable`], which withholds the
+/// registry-derived configured-total bound (that one fires only on a confirmed
+/// [`FleetCapabilityEvidence::AllLiveWorkersMissed`]) while leaving the distinct
+/// bound and the absolute ceiling in force, so AC3 still holds. It also makes
+/// the escalation reason say out loud that the fleet was not confirmed.
+///
+/// Note the asymmetry with the compatibility read below, and why it is
+/// deliberate: an empty *fleet* is inert — it concludes nothing about peers —
+/// whereas an empty *compatibility set* actively asserts that cross-build peers
+/// are ineligible. Only the first is safe to reach by degrading.
 ///
 /// Only ever called on the miss path, which is rare by construction, so the
 /// happy path never pays for this query.
@@ -15431,16 +15494,29 @@ async fn read_live_fleet_or_degrade(
     // the claim, so it never joins `capability_miss_workers` and would
     // otherwise hold the evidence at `CapablePeerMayExist` forever.
     //
-    // A compat-set read failure degrades to the empty set, matching the #522
-    // sampler: exact-match and legacy-worker rules still apply, so the filter
-    // stays correct for every deployment that has declared no cross-build
-    // compatibility at all.
-    let compat = crate::build_routing::load_compat_set(conn)
-        .await
-        .unwrap_or_default();
-    claim_eligible_workers(
+    // A compat-set read FAILURE is not evidence of incompatibility: degrading
+    // it to an empty set would assert that every cross-build peer is
+    // ineligible, fabricate `AllLiveWorkersMissed`, and terminally fail the
+    // execution at `budget + 1` while a declared, capable peer was live
+    // (Codex round-18 P1). `narrow_live_fleet` therefore suppresses the build
+    // axis on failure and keeps the still-readable label axis.
+    let compat = match crate::build_routing::load_compat_set(conn).await {
+        Ok(compat) => Some(compat),
+        Err(error) => {
+            tracing::warn!(
+                task_id = %task.id,
+                queue = %task.queue_name,
+                %error,
+                "could not read the build-compatibility declarations for a capability miss; \
+                 keeping cross-build peers in the live fleet rather than concluding they are \
+                 ineligible"
+            );
+            None
+        }
+    };
+    narrow_live_fleet(
         &live,
-        &compat,
+        compat.as_ref(),
         task.required_build_id.as_deref(),
         task.required_capabilities.as_ref(),
     )
@@ -23531,6 +23607,116 @@ mod tests {
             claim_eligible_workers(&live, &compat, None, Some(&junk)),
             ids(&["wrong-build", "wrong-labels", "eligible"]),
             "an unreadable requirement falls back to keeping the worker"
+        );
+    }
+
+    /// An **unreadable** compatibility table is not evidence of
+    /// incompatibility (issue #804, Codex round-18 P1).
+    ///
+    /// `BuildCompatibilitySet::is_eligible` answers `false` for a worker whose
+    /// build differs from the requirement unless a declaration says otherwise,
+    /// so degrading a failed `load_compat_set` to `default()` does not merely
+    /// lose information — it *asserts the opposite*, silently dropping every
+    /// cross-build peer `claim_task` would still let claim through
+    /// `harvest_build_compat`. The narrowed fleet then contains only the
+    /// incapable claimer, `fleet_capability_evidence` fabricates
+    /// `AllLiveWorkersMissed`, and the round-15 configured-total bound fires at
+    /// `budget + 1` — terminally failing an execution a live capable peer was
+    /// eligible to run, on the strength of one transient `SELECT` failure.
+    ///
+    /// This is the same doctrine the unparseable-`required_capabilities` case
+    /// above already follows ("an unreadable requirement falls back to keeping
+    /// the worker"); the compat read was simply never held to it.
+    #[test]
+    fn unknown_compat_keeps_a_declared_peer_instead_of_fabricating_a_fleet_conclusion() {
+        // The task was started on build "v1".
+        let required = Some("v1");
+        // "v2" is declared compatible with "v1", so a v2 worker CAN claim it.
+        let mut compat = crate::build_routing::BuildCompatibilitySet::new();
+        compat.add_declaration("v2", "v1");
+
+        let live = vec![
+            // Exact-build worker that has already missed: it lacks the handler.
+            crate::workers::LiveWorker::for_test("incapable-v1", "v1", serde_json::json!({})),
+            // Cross-build peer that HAS the handler and has never missed.
+            crate::workers::LiveWorker::for_test("capable-v2", "v2", serde_json::json!({})),
+        ];
+
+        // Baseline: with the table readable, the peer is retained.
+        assert_eq!(
+            narrow_live_fleet(&live, Some(&compat), required, None),
+            ids(&["incapable-v1", "capable-v2"]),
+            "a declared cross-build peer is claim-eligible"
+        );
+
+        // The fix: an unreadable table must NOT narrow by build at all.
+        assert_eq!(
+            narrow_live_fleet(&live, None, required, None),
+            ids(&["incapable-v1", "capable-v2"]),
+            "an unreadable compat table must keep cross-build peers -- absence \
+             of declaration data is not evidence of incompatibility"
+        );
+
+        // ...and that difference is exactly the difference between releasing
+        // for a live capable peer and terminally failing the execution.
+        let budget = capability_miss_budget(5);
+        let missed = ids(&["incapable-v1"]);
+
+        let with_fix = narrow_live_fleet(&live, None, required, None);
+        assert_eq!(
+            fleet_capability_evidence(&with_fix, &missed, "incapable-v1"),
+            FleetCapabilityEvidence::CapablePeerMayExist
+        );
+        assert_eq!(
+            capability_miss_decision(
+                1,
+                budget + 1,
+                5,
+                fleet_capability_evidence(&with_fix, &missed, "incapable-v1")
+            ),
+            CapabilityMissAction::Release,
+            "the run keeps being offered to the live peer that can finish it"
+        );
+
+        // The falsifying control: treating the unreadable table as an empty
+        // one is what produced the terminal failure.
+        let pre_fix = claim_eligible_workers(
+            &live,
+            &crate::build_routing::BuildCompatibilitySet::default(),
+            required,
+            None,
+        );
+        assert_eq!(
+            pre_fix,
+            ids(&["incapable-v1"]),
+            "control: the empty-set degrade drops the capable peer"
+        );
+        assert_eq!(
+            capability_miss_decision(
+                1,
+                budget + 1,
+                5,
+                fleet_capability_evidence(&pre_fix, &missed, "incapable-v1")
+            ),
+            CapabilityMissAction::Escalate,
+            "control: which escalates -- the P1 this test pins shut"
+        );
+
+        // A worker the label filter rejects is still excluded: suppressing the
+        // BUILD narrowing must not suppress the #522 capability narrowing too.
+        let caps = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+        let mixed = vec![
+            crate::workers::LiveWorker::for_test(
+                "no-gpu",
+                "v2",
+                serde_json::json!({"gpu": "false"}),
+            ),
+            crate::workers::LiveWorker::for_test("gpu", "v2", serde_json::json!({"gpu": "true"})),
+        ];
+        assert_eq!(
+            narrow_live_fleet(&mixed, None, required, Some(&caps)),
+            ids(&["gpu"]),
+            "only the build axis is suppressed; labels are still readable"
         );
     }
 
