@@ -128,6 +128,10 @@ struct CapabilityMetrics {
     /// `harvest.workflow.started` emissions as `(workflow, queue)`. A release
     /// must never let this fire twice for one execution (Codex round-17 P2).
     started: Mutex<Vec<(String, String)>>,
+    /// `harvest.workflow.task_timeout` emissions as `(workflow, queue)` — the
+    /// issue #494 signal, kept separate from `misses` so the two paths can be
+    /// told apart (Codex round-25 P1).
+    task_timeouts: Mutex<Vec<(String, String)>>,
 }
 
 impl CapabilityMetrics {
@@ -151,6 +155,10 @@ impl CapabilityMetrics {
     fn started_samples(&self) -> Vec<(String, String)> {
         self.started.lock().unwrap().clone()
     }
+
+    fn task_timeout_count(&self) -> usize {
+        self.task_timeouts.lock().unwrap().len()
+    }
 }
 
 impl MetricsRecorder for CapabilityMetrics {
@@ -171,6 +179,13 @@ impl MetricsRecorder for CapabilityMetrics {
 
     fn record_workflow_started(&self, workflow: &str, queue: &str) {
         self.started
+            .lock()
+            .unwrap()
+            .push((workflow.to_owned(), queue.to_owned()));
+    }
+
+    fn record_workflow_task_timeout(&self, workflow: &str, queue: &str) {
+        self.task_timeouts
             .lock()
             .unwrap()
             .push((workflow.to_owned(), queue.to_owned()));
@@ -224,6 +239,32 @@ fn build_worker(
     registry: Arc<HandlerRegistry>,
     capability_miss_max_redeliveries: u32,
 ) -> Arc<Worker> {
+    build_worker_tuned(
+        worker_id,
+        queues,
+        registry,
+        capability_miss_max_redeliveries,
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+        3,
+    )
+}
+
+/// `build_worker` with the two issue #494 knobs exposed.
+///
+/// Only the round-25 P1 regression guard needs them: it has to make the
+/// workflow decision cycle overrun a *short* budget and quarantine on the
+/// *first* strike, so the timeout path is reached deterministically rather
+/// than after 90 seconds and three redeliveries.
+fn build_worker_tuned(
+    worker_id: &str,
+    queues: &[&str],
+    registry: Arc<HandlerRegistry>,
+    capability_miss_max_redeliveries: u32,
+    workflow_task_timeout: Duration,
+    max_local_activity_start_to_close: Duration,
+    poison_pill_threshold: i32,
+) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
@@ -236,7 +277,7 @@ fn build_worker(
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
-                max_local_activity_start_to_close: Duration::from_secs(60),
+                max_local_activity_start_to_close,
                 shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
@@ -244,9 +285,9 @@ fn build_worker(
                 workflow_cache_size: 1000,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
-                poison_pill_threshold: 3,
+                poison_pill_threshold,
                 capability_miss_max_redeliveries,
-                workflow_task_timeout: Duration::from_secs(30),
+                workflow_task_timeout,
                 workflow_panic_max_attempts: 3,
                 labels: HashMap::new(),
                 queue_weights: HashMap::new(),
@@ -665,6 +706,7 @@ const Q_NOOP: &str = "q804-noop";
 const Q_PARK: &str = "q804-park";
 const Q_LIVE_PEER: &str = "q804-live-peer";
 const Q_STARTED_ONCE: &str = "q804-started-once";
+const Q_BODY_BUDGET: &str = "q804-body-budget";
 const Q_STARTED_ONCE_ACTS: &str = "q804-started-once-acts";
 const Q_LOCAL_MISS: &str = "q804-local-miss";
 /// The breadcrumb whose presence proves the inline arm's commit block ran.
@@ -2775,5 +2817,104 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
         "the SAME phase that clears the crash strikes must PRESERVE `attempt`: \
          the body ran, so `record_workflow_started` already fired and rolling \
          back to 0 would let the next capable claim re-emit it (round-17 P2)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Codex round-25 P1 — the issue #494 budget bounds the decision cycle, and
+// nothing after it.
+// ---------------------------------------------------------------------------
+
+/// A workflow with nothing to do: the decision cycle is the DB work around it
+/// (load the execution, load history, run, persist the terminal event), which
+/// is several round-trips and therefore comfortably longer than the 1ms budget
+/// the guard below hands it.
+fn trivial_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move { Ok(serde_json::json!("done")) })
+}
+
+/// Moving the issue #494 budget out of the dispatch site and into
+/// `process_task` must not weaken issue #494 itself.
+///
+/// The budget used to be a `tokio::time::timeout` wrapped around the whole of
+/// `process_task`, which meant it also bounded the issue #804 capability-miss
+/// release/escalation that runs *after* the decision cycle — so a workflow that
+/// returned near its deadline and only then tripped the post-handler preflight
+/// could have that blameless cleanup cancelled, bank a timeout strike it never
+/// earned, and at `poison_pill_threshold` be terminally failed (Codex round-25
+/// P1). It now wraps the decision cycle alone, inside `process_task`.
+///
+/// The scoping rule itself is pinned without a database by
+/// `worker::tests::cleanup_sequenced_after_the_budget_is_not_cancelled_by_it`,
+/// whose control shows the old spanning shape cancelling the cleanup. What is
+/// only observable end to end — and is the regression risk of *moving* a
+/// timeout — is that an overrunning cycle is still cut, still counted as an
+/// issue #494 timeout, and still quarantined. Every handler here is registered,
+/// so this is the pure hang path with no capability miss anywhere in it: AC4
+/// says the two must stay tellable apart, and the assertions below check both
+/// halves of that.
+///
+/// The budget is 1ms rather than something scaled off a slow handler because
+/// `effective_workflow_task_timeout` floors it at
+/// `max_local_activity_start_to_close` — a local activity runs inline inside
+/// the cycle, so the budget may never sit below the local cap. Both are set to
+/// 1ms here; no local activity is involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_overrunning_decision_cycle_is_still_cut_by_the_workflow_task_budget() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "body_budget_wf",
+        serde_json::json!({"n": 25}),
+        Q_BODY_BUDGET,
+    )
+    .await;
+
+    let metrics = Arc::new(CapabilityMetrics::default());
+    let registry = build_registry(
+        vec![workflow_info("body_budget_wf", trivial_workflow)],
+        vec![],
+        Arc::clone(&metrics),
+    );
+    // Quarantine on the first strike so the terminal outcome is reached in one
+    // pass rather than three.
+    let worker = build_worker_tuned(
+        "w-body-budget",
+        &[Q_BODY_BUDGET],
+        registry,
+        5,
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+        1,
+    );
+
+    let execution = with_worker_running(&worker, &pool, async {
+        wait_for_terminal(&url, exec_id, Duration::from_secs(60)).await
+    })
+    .await;
+
+    assert!(
+        metrics.task_timeout_count() >= 1,
+        "the overrunning cycle must still emit harvest.workflow.task_timeout; got {}",
+        metrics.task_timeout_count()
+    );
+    assert_eq!(
+        execution.state, "FAILED",
+        "issue #494 must still quarantine a cycle that overruns its budget"
+    );
+    assert!(
+        metrics.samples().is_empty(),
+        "a pure hang is not a capability miss and must emit no \
+         harvest.task.capability_miss sample; got {:?}",
+        metrics.samples()
+    );
+    let dlq = dead_letter_errors(&url, exec_id).await;
+    assert!(
+        dlq.iter().any(|e| e.contains("WorkflowTaskTimeout")),
+        "the dead letter must name the issue #494 reason so the hang path stays \
+         distinguishable from a capability miss (AC4); got {dlq:?}"
     );
 }

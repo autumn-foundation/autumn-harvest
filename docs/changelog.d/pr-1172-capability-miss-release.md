@@ -354,3 +354,100 @@ Two P2s, both in the terminal `no_capable_worker:` reason string — the artifac
 **Preserving is compliant and not lax.** AC4 requires only that a capability miss never *advances* a strike counter, and the release never does — `capability_miss_release_query_never_increments_crash_strikes` has pinned that since round 4. Genuine progress does still clear all three, by the intended route: the clean continuation (`CleanContinuationChangeset`), which fires when the body carries forward to a suspension instead of stalling at a later frontier. The declined behaviour is confined to the case where a dispatch made partial progress and then could not continue — where the counters' own question ("does this task still kill workers / hang / panic?") is genuinely unanswered.
 
 **What did change is the missing signpost.** `append_frontier_resolution` documented why it resets the capability columns but said nothing about why it deliberately leaves the three strike states alone, which is what made this reachable as a finding at all. It now states the rule and the two failure modes above. Two pure tests pin it so the decision is enforced rather than only argued: `inline_progress_reset_never_launders_a_crash_strike` asserts the reset's `SET` clause is exactly the two capability columns (verified load-bearing — adding `crash_strikes = 0` fails it), and `inline_progress_at_an_earlier_frontier_does_not_clear_any_strike` pins the phase-level rule against all three counters under the scenario's own name.
+
+## Review round 25 — the issue #494 budget must not cancel the capability-miss cleanup (Codex P1)
+
+`process_task` was wrapped, at the dispatch site, in
+`tokio::time::timeout(workflow_task_timeout, ...)` — the issue #494
+consecutive-workflow-task-timeout budget. That wrapper spanned the whole
+function, so it bounded not just the workflow decision cycle but also the
+issue #804 capability-miss interception that runs *after* it.
+
+That cleanup is DB I/O: a rate-limit refund, a fleet/compatibility read, and
+the release-or-escalate statement. The post-handler preflight raises its miss
+inside `persist_scheduled_activities` — i.e. once the workflow body has already
+returned its commands and only persisting them found an unregistered activity
+or child (`CapabilityMissPhase::AfterHandler`). A workflow that returns near
+its deadline therefore reaches the cleanup with very little budget left, and
+when the cleanup outlives it the whole future is cancelled mid-flight:
+
+- the release never commits, so `capability_misses` does not advance and the
+  bounded-escalation guarantee (AC3) makes no progress;
+- an issue #494 timeout strike is banked against an execution whose body
+  demonstrably completed;
+- `harvest.workflow.task_timeout` is emitted instead of
+  `harvest.task.capability_miss` (AC5), and the two paths stop being
+  distinguishable (AC4);
+- and once `poison_pill_threshold` strikes accumulate, the execution is
+  quarantined and **terminally failed** — the exact outcome AC1 exists to
+  prevent, with a workflow-task-timeout reason rather than
+  `no_capable_worker:`.
+
+The mechanism was traced end to end before changing anything: the dispatch-site
+wrapper, the `AfterHandler` raise site inside the enqueue preflight, the three
+awaits in `handle_capability_miss`, and the `Err(_elapsed)` recovery arm that
+increments the strike map and calls `quarantine_decision`.
+
+### The fix — scope the budget to the decision cycle
+
+The budget moves *into* `process_task` as a new `workflow_body_timeout:
+Option<Duration>` parameter and wraps the workflow decision cycle alone, via
+the new generic helper `run_under_workflow_body_budget`. Everything sequenced
+after that call — the capability-miss release/escalation — is outside the
+budget and can no longer be cancelled by it. The dispatch site now hands the
+budget down instead of wrapping the call, and routes the new
+`TaskDispatchOutcome::BodyTimedOut` into the recovery arm that used to be
+`Err(_elapsed)`; all four of its branches map one-for-one, so the strike
+accounting, the timeout metric, the permit drop and the
+requeue-or-quarantine decision are unchanged.
+
+Two deliberate details:
+
+- **The connection acquire stays inside the budget.** `pool.get()` moved into
+  the budgeted block rather than above it, so a pool stall still counts against
+  the decision cycle exactly as it did when the dispatch site owned the
+  timeout. This change is about *where the budget ends*, not about widening
+  what it covers.
+- **A cut cycle never reuses its connection.** Dropping the budgeted future
+  returns the connection to the pool, precisely as cancelling the whole of
+  `process_task` used to; the `BodyTimedOut` arm returns without touching it,
+  because a cancelled cycle may have left a transaction open on it.
+
+The activity arm no longer acquires a connection up front only to drop it
+before the handler runs — it acquires one only on the capability-miss path it
+actually needs one for, so the activity happy path now pays for no checkout at
+all rather than one wasted round-trip.
+
+### Tests
+
+`worker::tests::cleanup_sequenced_after_the_budget_is_not_cancelled_by_it` is
+the falsifying pin: it runs the helper with a short budget and a cycle that
+finishes inside it, then does work that outlives the remaining budget and
+asserts that work completed — alongside a **control** that wraps both halves in
+one timeout and demonstrates the cleanup being cancelled, which is the defect
+this scoping removes. Three sibling tests pin the rest of the helper's contract
+(`None` runs unbounded, an overrunning cycle is cut, a finishing cycle is
+admitted).
+
+`capability_miss_tests::an_overrunning_decision_cycle_is_still_cut_by_the_workflow_task_budget`
+is the end-to-end regression guard for *moving* a timeout: an overrunning cycle
+must still be cut, still emit `harvest.workflow.task_timeout`, still quarantine
+to `FAILED`, and still land a `WorkflowTaskTimeout` dead letter — with **no**
+`harvest.task.capability_miss` sample anywhere, since every handler in that
+fixture is registered and a pure hang is not a capability miss (AC4).
+
+Sizing that guard surfaced a real constraint worth recording:
+`effective_workflow_task_timeout` floors the budget at
+`max_local_activity_start_to_close`, because a local activity runs inline
+inside the cycle and the budget may never sit below the local cap. A first
+attempt drove the overrun with a slow local activity and could not fail — the
+60s floor swallowed the 500ms budget. The guard now sets both to 1ms and uses
+no local activity at all.
+
+A deterministic *database-level* falsification of the P1 itself is not cleanly
+reachable and was deliberately not faked: hitting it requires the budget to
+expire during the cleanup rather than during the cycle, and since
+`prepare_workflow_task` does DB work before the handler lookup, any budget
+small enough to be reliable cuts the cycle instead. The pure control test
+carries the falsification; the DB test carries the regression guard for the
+move. Both doc comments say exactly that.

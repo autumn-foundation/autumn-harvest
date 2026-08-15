@@ -15644,6 +15644,47 @@ enum TaskDispatchOutcome {
         /// from [`CapabilityMissPhase::clears_workflow_timeout_strike`].
         clears_timeout_strike: bool,
     },
+    /// The issue #494 wall-clock budget elapsed while the workflow decision
+    /// cycle was still running, so the cycle was cancelled.
+    ///
+    /// Reported as an outcome rather than raised as an error because the
+    /// dispatch site owns the recovery: the consecutive-timeout strike, the
+    /// `harvest.workflow.task_timeout` metric, and the requeue-or-quarantine
+    /// decision. It exists at all because the budget now lives *inside*
+    /// `process_task`, wrapped around the decision cycle alone — see
+    /// [`run_under_workflow_body_budget`] (issue #804, Codex round-25 P1).
+    BodyTimedOut,
+}
+
+/// Run the workflow decision cycle under its issue #494 wall-clock budget.
+///
+/// Deliberately generic and free of every engine type, because the thing worth
+/// pinning is the *scoping* rule rather than any particular body: whatever is
+/// sequenced **after** this call is outside the budget and can never be
+/// cancelled by it. That is load-bearing for issue #804. The capability-miss
+/// release/escalation runs after the decision cycle returns, and it is DB I/O
+/// (a rate-limit refund, a fleet/compatibility read, and the release or
+/// escalation statement). While it sat inside the budget, a workflow that
+/// returned near its deadline and only then tripped the post-handler preflight
+/// could have that cleanup cancelled mid-flight — banking an issue #494
+/// timeout strike, emitting the wrong metric, and, once
+/// `poison_pill_threshold` strikes accumulated, terminally failing an
+/// execution whose body had in fact completed and whose correct outcome was a
+/// blameless release (Codex round-25 P1).
+///
+/// `None` means no budget: the activity path was never wrapped in one, and the
+/// workflow path opts out when `workflow_task_timeout` is zero.
+///
+/// Returns `None` when the budget elapsed first, which the caller reports as
+/// [`TaskDispatchOutcome::BodyTimedOut`].
+async fn run_under_workflow_body_budget<F: std::future::Future>(
+    budget: Option<Duration>,
+    body: F,
+) -> Option<F::Output> {
+    match budget {
+        Some(budget) => tokio::time::timeout(budget, body).await.ok(),
+        None => Some(body.await),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15671,9 +15712,13 @@ async fn process_task(
     // Issue #804: the redelivery budget and the fleet-liveness window that
     // gates it.
     capability_miss_policy: CapabilityMissPolicy,
+    // Issue #804 (Codex round-25 P1): the issue #494 wall-clock budget, applied
+    // HERE around the workflow decision cycle alone rather than by the dispatch
+    // site around this whole function — so it can never cancel the
+    // capability-miss cleanup below. `None` on the activity path (never bounded
+    // by it) and when `workflow_task_timeout` is zero.
+    workflow_body_timeout: Option<Duration>,
 ) -> HarvestResult<TaskDispatchOutcome> {
-    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-
     // Issue #804 (Codex round-22 P2): the workflow path sets this when a
     // frontier reset commits, so the capability-miss interception below knows
     // the persisted counters without re-reading them. Activity tasks never
@@ -15681,31 +15726,48 @@ async fn process_task(
     // claim-time snapshot is trivially current.
     let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
 
-    let outcome = match ClaimedTaskKind::from_db(&task.task_type)? {
+    let (mut conn, outcome) = match ClaimedTaskKind::from_db(&task.task_type)? {
         ClaimedTaskKind::Workflow => {
-            process_workflow_task(
-                &mut conn,
-                registry.as_ref(),
-                &task,
-                worker_id,
-                build_id,
-                sticky_timeout,
-                max_local_activity_start_to_close,
-                workflow_cache,
-                dispatched_at,
-                &workflow_panic_strikes,
-                workflow_panic_max_attempts,
-                workflow_task_deadline,
-                &frontier_reset_committed,
-            )
-            .await
+            // The connection is acquired *inside* the budget so a pool stall
+            // still counts against the decision cycle exactly as it did when
+            // the dispatch site owned the timeout.
+            // Boxed so `process_task`'s own future does not grow by the whole
+            // decision cycle's state (clippy::large_futures).
+            let cycle = Box::pin(async {
+                let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+                let outcome = process_workflow_task(
+                    &mut conn,
+                    registry.as_ref(),
+                    &task,
+                    worker_id,
+                    build_id,
+                    sticky_timeout,
+                    max_local_activity_start_to_close,
+                    workflow_cache,
+                    dispatched_at,
+                    &workflow_panic_strikes,
+                    workflow_panic_max_attempts,
+                    workflow_task_deadline,
+                    &frontier_reset_committed,
+                )
+                .await;
+                Ok::<_, HarvestError>((conn, outcome))
+            });
+            let Some(finished) = run_under_workflow_body_budget(workflow_body_timeout, cycle).await
+            else {
+                // Dropping `cycle` already returned the connection to the pool,
+                // exactly as cancelling the whole of `process_task` used to.
+                // Never reuse it: the cancelled cycle may have left a
+                // transaction open on it.
+                return Ok(TaskDispatchOutcome::BodyTimedOut);
+            };
+            finished?
         }
         ClaimedTaskKind::Activity => {
-            // Drop the connection before the handler runs: run_transactional
-            // acquires a second pool slot inside the handler, and holding this
-            // one during execution would cause a deadlock when max_size
-            // connections are all claimed by concurrent activity tasks.
-            drop(conn);
+            // No connection is held while the handler runs: run_transactional
+            // acquires a pool slot inside the handler, and holding one here
+            // would deadlock when max_size connections are all claimed by
+            // concurrent activity tasks.
             let result = process_activity_task(
                 pool,
                 registry.as_ref(),
@@ -15717,18 +15779,18 @@ async fn process_task(
                 session_slots_in_use,
             )
             .await;
-            // Re-acquire only if we actually need to act on a capability miss:
-            // the happy path must not pay for a second checkout.
+            // Acquire only if we actually need to act on a capability miss:
+            // the happy path must not pay for a checkout at all.
             if result
                 .as_ref()
                 .err()
                 .is_some_and(|e| e.handler_not_registered().is_some())
             {
-                conn = pool.get().await.map_err(crate::error::database_error)?;
+                let conn = pool.get().await.map_err(crate::error::database_error)?;
+                (conn, result)
             } else {
                 return result.map(|()| TaskDispatchOutcome::Completed);
             }
-            result
         }
     };
 
@@ -19530,30 +19592,37 @@ impl Worker {
                 let workflow_task_deadline = chrono::Duration::from_std(workflow_task_timeout)
                     .ok()
                     .and_then(|budget| chrono::Utc::now().checked_add_signed(budget));
-                match tokio::time::timeout(
-                    workflow_task_timeout,
-                    process_task(
-                        &pool,
-                        Arc::clone(&registry),
-                        task,
-                        &worker_id,
-                        &build_id,
-                        cancellation_grace_period,
-                        sticky_timeout,
-                        max_local_activity_start_to_close,
-                        workflow_cache,
-                        dispatched_at,
-                        max_concurrent_sessions,
-                        &session_slots_in_use,
-                        Arc::clone(&panic_strikes),
-                        workflow_panic_max_attempts,
-                        workflow_task_deadline,
-                        capability_miss_policy,
-                    ),
+                // Issue #804 (Codex round-25 P1): the budget is handed to
+                // `process_task`, which scopes it to the decision cycle, rather
+                // than wrapped around the call. Wrapping it here also bounded
+                // the capability-miss release/escalation that follows the
+                // cycle, so a workflow that returned near its deadline and only
+                // then tripped the post-handler preflight could have that
+                // blameless cleanup cancelled — banking a timeout strike it did
+                // not earn and, at `poison_pill_threshold`, terminally failing
+                // an execution whose body had completed.
+                match process_task(
+                    &pool,
+                    Arc::clone(&registry),
+                    task,
+                    &worker_id,
+                    &build_id,
+                    cancellation_grace_period,
+                    sticky_timeout,
+                    max_local_activity_start_to_close,
+                    workflow_cache,
+                    dispatched_at,
+                    max_concurrent_sessions,
+                    &session_slots_in_use,
+                    Arc::clone(&panic_strikes),
+                    workflow_panic_max_attempts,
+                    workflow_task_deadline,
+                    capability_miss_policy,
+                    Some(workflow_task_timeout),
                 )
                 .await
                 {
-                    Ok(Ok(TaskDispatchOutcome::Completed)) => {
+                    Ok(TaskDispatchOutcome::Completed) => {
                         // Success: clear the consecutive-timeout counter for
                         // this execution so a later transient timeout doesn't
                         // inherit previous strikes.
@@ -19564,9 +19633,9 @@ impl Worker {
                                 .remove(&exec_id);
                         }
                     }
-                    Ok(Ok(TaskDispatchOutcome::Released {
+                    Ok(TaskDispatchOutcome::Released {
                         clears_timeout_strike,
-                    })) => {
+                    }) => {
                         // Issue #804: whether a capability-miss release may
                         // clear the strike map depends on where the miss was
                         // detected (see `CapabilityMissPhase`).
@@ -19592,7 +19661,7 @@ impl Worker {
                                 .remove(&exec_id);
                         }
                     }
-                    Ok(Err(error)) => {
+                    Err(error) => {
                         // Task returned a clean error (not a timeout): clear
                         // the strike counter and log the error normally.
                         if let Some(exec_id) = exec_id_for_timeout {
@@ -19609,14 +19678,13 @@ impl Worker {
                             "task execution failed"
                         );
                     }
-                    Err(_elapsed) => {
+                    Ok(TaskDispatchOutcome::BodyTimedOut) => {
                         // Release the concurrency slot immediately so other
                         // tasks can be dispatched while we do recovery I/O
-                        // (metric DB lookup + reset/quarantine).  The
-                        // `process_task` future was already cancelled by
-                        // tokio::time::timeout, but `permit` lives in this
-                        // outer scope and would otherwise be held until the
-                        // recovery awaits complete.
+                        // (metric DB lookup + reset/quarantine).  The decision
+                        // cycle was already cancelled inside `process_task`,
+                        // but `permit` lives in this outer scope and would
+                        // otherwise be held until the recovery awaits complete.
                         drop(permit);
                         let timeout_secs = workflow_task_timeout.as_secs();
                         let new_strikes = exec_id_for_timeout.map_or(1, |exec_id| {
@@ -19720,6 +19788,9 @@ impl Worker {
                     // local per-attempt budget is the only clock (issue #783).
                     None,
                     capability_miss_policy,
+                    // Same reason: this arm is the "no timeout configured, or
+                    // not a workflow task" path, which was never wrapped.
+                    None,
                 )
                 .await
                 {
@@ -21356,6 +21427,94 @@ mod tests {
         assert_eq!(
             crate::poison_pill::quarantine_decision(100, 0),
             crate::poison_pill::ReclaimAction::Requeue
+        );
+    }
+
+    /// `None` means "no issue #494 budget", so the body runs unbounded — the
+    /// activity path and a zero `workflow_task_timeout`.
+    #[tokio::test]
+    async fn body_budget_of_none_runs_the_cycle_unbounded() {
+        let out = run_under_workflow_body_budget(None, async {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            7
+        })
+        .await;
+        assert_eq!(out, Some(7), "an unbudgeted cycle must run to completion");
+    }
+
+    /// A cycle that outruns its budget is cancelled and reported as `None`,
+    /// which the caller turns into `TaskDispatchOutcome::BodyTimedOut`.
+    #[tokio::test]
+    async fn body_budget_cancels_a_cycle_that_overruns_it() {
+        let out = run_under_workflow_body_budget(Some(Duration::from_millis(20)), async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            7
+        })
+        .await;
+        assert_eq!(out, None, "an overrunning cycle must be cut by the budget");
+    }
+
+    /// A cycle that finishes inside its budget is admitted untouched.
+    #[tokio::test]
+    async fn body_budget_admits_a_cycle_that_finishes_inside_it() {
+        let out = run_under_workflow_body_budget(Some(Duration::from_secs(30)), async { 7 }).await;
+        assert_eq!(out, Some(7));
+    }
+
+    /// The round-25 P1 itself: work sequenced **after** the budgeted cycle must
+    /// survive, even when it outlives every millisecond the budget had left.
+    ///
+    /// That "after" work is the issue #804 capability-miss release/escalation —
+    /// several DB round-trips that a workflow returning near its deadline only
+    /// reaches once the post-handler preflight has already found an
+    /// unregistered activity or child. Cancelling it there banks an issue #494
+    /// timeout strike the execution did not earn, emits
+    /// `harvest.workflow.task_timeout` instead of
+    /// `harvest.task.capability_miss`, and at `poison_pill_threshold` strikes
+    /// quarantines and terminally fails a run whose body had completed —
+    /// breaking AC1, AC4 and AC5 at once.
+    ///
+    /// The control below is the shape this replaced: one timeout spanning both
+    /// halves, which does cancel the cleanup. Both halves are driven by the
+    /// same clock here, so the contrast is the assertion, not the timing.
+    #[tokio::test]
+    async fn cleanup_sequenced_after_the_budget_is_not_cancelled_by_it() {
+        let budget = Duration::from_millis(30);
+        let cleanup = Duration::from_millis(150);
+
+        // The shipped shape: budget wraps the cycle only.
+        let cleanup_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&cleanup_ran);
+        let cycle = run_under_workflow_body_budget(Some(budget), async { 7 }).await;
+        assert_eq!(
+            cycle,
+            Some(7),
+            "the cycle itself finished inside its budget"
+        );
+        // Stands in for handle_capability_miss: refund, fleet read, release.
+        tokio::time::sleep(cleanup).await;
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            std::sync::atomic::AtomicBool::load(&cleanup_ran, std::sync::atomic::Ordering::Relaxed),
+            "cleanup sequenced after the budget must always complete"
+        );
+
+        // The control: one timeout spanning cycle + cleanup cancels the
+        // cleanup, which is exactly the defect this scoping removes.
+        let control_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let control_flag = std::sync::Arc::clone(&control_ran);
+        let spanned = tokio::time::timeout(budget, async move {
+            tokio::time::sleep(cleanup).await;
+            control_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        })
+        .await;
+        assert!(spanned.is_err(), "the control's spanning budget must fire");
+        assert!(
+            !std::sync::atomic::AtomicBool::load(
+                &control_ran,
+                std::sync::atomic::Ordering::Relaxed
+            ),
+            "a budget spanning the cleanup cancels it — the round-25 P1"
         );
     }
 
