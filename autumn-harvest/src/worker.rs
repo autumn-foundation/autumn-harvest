@@ -2835,6 +2835,19 @@ struct FrontierAccounting<'a> {
     /// The worker holding the claim; guards the reset so it can only ever clear
     /// accounting on a row this dispatch still owns.
     worker_id: &'a str,
+    /// Set once a frontier reset has **committed** in this dispatch (issue
+    /// #804, Codex round-22 P2).
+    ///
+    /// This is how `handle_capability_miss` knows the persisted counters
+    /// without re-reading them. Because the reset commits in the same
+    /// transaction as the frontier-resolving append, the flag is exact rather
+    /// than advisory: set means the row was written to `(0, [])`, clear means
+    /// nothing in this dispatch touched those columns, so the claim-time
+    /// snapshot is still current. Nothing else writes them between claim and
+    /// the miss (a concurrent reclaim changes `worker_id`, which the release's
+    /// own guard turns into a `0 rows affected` no-op), so the two cases are
+    /// exhaustive.
+    reset_committed: &'a std::sync::atomic::AtomicBool,
 }
 
 /// Append a local activity's **frontier-resolving** events and clear the
@@ -2872,7 +2885,14 @@ async fn append_frontier_resolution(
         .await?;
         Ok(())
     }))
-    .await
+    .await?;
+    // Only after the commit: a rolled-back transaction reset nothing, so the
+    // claim-time snapshot is still the truth and must stay the basis for the
+    // release-vs-escalate decision (issue #804, Codex round-22 P2).
+    frontier
+        .reset_committed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 /// Run a local activity inline, appending durability events to `harvest_events`.
@@ -4841,23 +4861,45 @@ pub struct CapabilityMissResolution {
     pub evidence: FleetCapabilityEvidence,
 }
 
-/// The capability-miss counters an **unreadable or vanished** row must be
-/// treated as holding (issue #804, Codex round-21 P2).
+/// The capability-miss counters the release-vs-escalate decision must be made
+/// on (issue #804, Codex rounds 20 and 22).
 ///
-/// Deliberately a clean frontier rather than the claim-time snapshot. That
-/// snapshot may describe a PRIOR frontier this dispatch has already resolved
-/// inline, so trusting it would let a budget spent elsewhere terminally fail
-/// the run at the first miss of a frontier no peer has ever been offered.
+/// The claim-time snapshot is **not** unconditionally current: one dispatch can
+/// resolve several local-activity frontiers inline, and each resolution resets
+/// the counters (they describe the frontier the run is stuck at, so misses
+/// recorded against a handler the run has moved past are stale by
+/// construction). Deciding on a snapshot taken before such a reset charges a
+/// prior frontier's spend to a frontier no peer has ever been offered, and
+/// terminally fails a run the fleet can still finish.
 ///
-/// This is the same rule [`FleetCapabilityEvidence::Unavailable`] already
-/// encodes one level up: evidence we cannot prove may never justify a terminal
-/// failure. It is self-healing rather than lossy — the release statement's own
-/// increment is relative (`+ 1`), so whatever the row really holds survives —
-/// and it cannot suppress a legitimate escalation, because the session-pin and
-/// zero-budget cases are both decided before any budget bound.
+/// Rather than re-read the row, the caller reports whether **this dispatch**
+/// committed a reset. That is exact, not advisory, and the two cases are
+/// exhaustive:
+///
+/// * `reset_committed` — the reset ran in the *same transaction* as the
+///   frontier-resolving append (see [`append_frontier_resolution`]), so the row
+///   was written to `(0, [])`. A rolled-back transaction leaves the flag clear.
+/// * otherwise — nothing in this dispatch touched those columns, so the
+///   snapshot is still exactly what the row holds.
+///
+/// Nothing else writes them between the claim and the miss: a concurrent
+/// poison-pill reclaim changes `worker_id`, which the release's own
+/// `worker_id = $2` guard turns into a `0 rows affected` no-op.
+///
+/// This deliberately replaces a DB re-read (round 21 P2's fix), which had a
+/// failure mode of its own: substituting a fabricated clean frontier when the
+/// read failed bypassed the storage-ceiling guard, so a row already at
+/// `i32::MAX` would be released and the `capability_misses + 1` in the release
+/// statement would raise `integer out of range` — stranding a `RUNNING` row
+/// under a live worker that orphan reclamation skips. An infallible in-memory
+/// fact has no such mode.
 #[must_use]
-pub const fn clean_frontier_state() -> (i32, Vec<String>) {
-    (0, Vec::new())
+fn frontier_miss_state(task: &TaskQueueItem, reset_committed: bool) -> (i32, Vec<String>) {
+    if reset_committed {
+        (0, Vec::new())
+    } else {
+        (task.capability_misses, task.capability_miss_workers.clone())
+    }
 }
 
 /// Resolve what to do about a capability miss on a claimed task (issue #804).
@@ -13755,6 +13797,10 @@ async fn process_workflow_task(
     // (issue #494), forwarded to inline local activities so their reported
     // deadline cannot out-live the cycle. `None` when that timeout is disabled.
     workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    // Issue #804 (Codex round-22 P2): set by this dispatch when a frontier
+    // reset commits, so a later capability miss can decide on the counters the
+    // row actually holds without re-reading them. See `frontier_miss_state`.
+    frontier_reset_committed: &std::sync::atomic::AtomicBool,
 ) -> HarvestResult<()> {
     let Some(mut prepared) = prepare_workflow_task_with_cache(
         conn,
@@ -14206,6 +14252,7 @@ async fn process_workflow_task(
                     FrontierAccounting {
                         task_id: task.id,
                         worker_id,
+                        reset_committed: frontier_reset_committed,
                     },
                 )
                 .await
@@ -15551,6 +15598,13 @@ async fn process_task(
 ) -> HarvestResult<TaskDispatchOutcome> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
+    // Issue #804 (Codex round-22 P2): the workflow path sets this when a
+    // frontier reset commits, so the capability-miss interception below knows
+    // the persisted counters without re-reading them. Activity tasks never
+    // resolve a frontier inline, so it stays clear on that path and their
+    // claim-time snapshot is trivially current.
+    let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
+
     let outcome = match ClaimedTaskKind::from_db(&task.task_type)? {
         ClaimedTaskKind::Workflow => {
             process_workflow_task(
@@ -15566,6 +15620,7 @@ async fn process_task(
                 &workflow_panic_strikes,
                 workflow_panic_max_attempts,
                 workflow_task_deadline,
+                &frontier_reset_committed,
             )
             .await
         }
@@ -15625,6 +15680,12 @@ async fn process_task(
         registry.telemetry().metrics.as_ref(),
         MissingHandler { kind, name, phase },
         capability_miss_policy,
+        // Fully qualified: diesel's blanket `RunQueryDsl` puts a `load` in scope
+        // for every type, which otherwise wins method resolution here.
+        std::sync::atomic::AtomicBool::load(
+            &frontier_reset_committed,
+            std::sync::atomic::Ordering::Relaxed,
+        ),
     )
     .await;
     // An escalation terminally failed the execution, so its #782 strike entry
@@ -15821,6 +15882,9 @@ async fn handle_capability_miss(
     metrics: &dyn crate::telemetry::MetricsRecorder,
     missing: MissingHandler<'_>,
     policy: CapabilityMissPolicy,
+    // Issue #804 (Codex round-22 P2): did this dispatch commit a frontier
+    // reset? See `frontier_miss_state` for why this replaces a DB re-read.
+    frontier_reset_committed: bool,
 ) -> HarvestResult<TaskDispatchOutcome> {
     // Give back the rate-limit token this claim spent (issue #804, Codex
     // round-11 P2). Unconditional here, before the release-vs-escalate branch,
@@ -15832,42 +15896,10 @@ async fn handle_capability_miss(
     // P1). See `read_live_fleet_or_degrade` for why a failure here degrades to
     // an empty set instead of propagating.
     let live_workers = read_live_fleet_or_degrade(conn, task, policy.worker_stale_secs).await;
-    // Issue #804 (Codex round-20 P1): read the counters as they stand NOW, not
-    // off the claim-time snapshot in `task`. One dispatch can resolve several
-    // local-activity frontiers inline, and each resolution resets the budget
-    // (`reset_capability_misses_after_inline_progress`) precisely because the
-    // misses recorded before it were recorded against a handler the run no
-    // longer needs. Deciding on the snapshot would charge those to the frontier
-    // we are actually stuck at now.
-    //
-    // The row is claimed by this worker, so nothing else is mutating these two
-    // columns.
-    //
-    // Neither failure mode falls back to the claim-time snapshot (issue #804,
-    // Codex round-21 P2): that snapshot may describe a PRIOR frontier this
-    // dispatch has already moved past, so a snapshot that had spent the budget
-    // would terminally fail the run at the first miss of a frontier no peer has
-    // ever been offered. An unreadable (`Err`) or vanished (`None`) current
-    // state is instead treated as a clean frontier — the same rule
-    // `FleetCapabilityEvidence::Unavailable` already encodes: evidence we
-    // cannot prove may never justify a terminal failure. Self-healing, because
-    // the release statement's own increment is relative (`+ 1`), so whatever
-    // the row really holds is preserved. The session-pin and zero-budget
-    // escalations are unaffected — both are decided before the budget bounds.
-    let (misses_before, distinct_before) =
-        match queue::current_capability_miss_state(conn, task.id).await {
-            Ok(Some(state)) => state,
-            Ok(None) => clean_frontier_state(),
-            Err(error) => {
-                tracing::warn!(
-                    task_id = %task.id,
-                    %error,
-                    "failed to re-read the capability-miss counters; treating this frontier \
-                     as unspent rather than escalating on evidence we cannot read"
-                );
-                clean_frontier_state()
-            }
-        };
+    // Issue #804 (Codex rounds 20 and 22): decide on the counters as they stand
+    // NOW, which is not always the claim-time snapshot in `task` — see
+    // `frontier_miss_state`.
+    let (misses_before, distinct_before) = frontier_miss_state(task, frontier_reset_committed);
     let resolution = resolve_capability_miss(
         &distinct_before,
         misses_before,
@@ -24568,39 +24600,82 @@ mod tests {
         );
     }
 
+    /// A `TaskQueueItem` carrying only the two capability-miss columns this
+    /// rule reads; every other field is irrelevant to it.
+    fn frontier_task(misses: i32, workers: &[&str]) -> TaskQueueItem {
+        TaskQueueItem {
+            capability_misses: misses,
+            capability_miss_workers: workers.iter().map(|w| (*w).to_owned()).collect(),
+            ..retry_after_test_task(1, 5)
+        }
+    }
+
     #[test]
-    fn an_unreadable_frontier_state_never_escalates_where_a_stale_snapshot_would_have() {
-        // Issue #804, Codex round-21 P2. A dispatch that resolved a local
-        // activity inline reset the row, but the re-read of that reset failed.
-        // The claim-time snapshot still describes the PRIOR frontier, and it had
-        // spent the whole budget.
-        let spent_snapshot = vec!["worker-a".to_string(), "worker-b".to_string()];
+    fn a_committed_frontier_reset_decides_on_the_clean_frontier_not_the_snapshot() {
+        // Issue #804, Codex rounds 20 and 22. This dispatch resolved a local
+        // activity inline, which reset the row to (0, []) in the SAME
+        // transaction as the append. The claim-time snapshot still describes
+        // the PRIOR frontier, and it had spent the whole budget.
+        let task = frontier_task(2, &["worker-a", "worker-b"]);
         let live = vec!["worker-a".to_string(), "worker-b".to_string()];
 
-        // Deciding from that stale snapshot terminally fails a run whose new
-        // frontier no peer has ever been offered.
-        let stale = resolve_capability_miss(&spent_snapshot, 2, "worker-c", 2, None, &live);
-        assert_eq!(
-            stale.action,
-            CapabilityMissAction::Escalate,
-            "the stale snapshot is what makes this a bug worth fixing"
-        );
+        // Deciding on that snapshot terminally fails a run whose new frontier
+        // no peer has ever been offered -- this control is what makes the rule
+        // worth having.
+        let (stale_misses, stale_workers) = frontier_miss_state(&task, false);
+        let stale =
+            resolve_capability_miss(&stale_workers, stale_misses, "worker-c", 2, None, &live);
+        assert_eq!(stale.action, CapabilityMissAction::Escalate);
 
-        // The rule decides from a clean frontier instead, so the miss releases.
-        let (misses, workers) = clean_frontier_state();
+        // With the reset committed, the row really holds (0, []), so the miss
+        // releases and the persisted count lands at 1.
+        let (misses, workers) = frontier_miss_state(&task, true);
+        assert_eq!((misses, workers.as_slice()), (0, [].as_slice()));
         let clean = resolve_capability_miss(&workers, misses, "worker-c", 2, None, &live);
         assert_eq!(
             (clean.action, clean.total_after),
-            (CapabilityMissAction::Release, 1),
-            "an unreadable current state is insufficient evidence to escalate"
+            (CapabilityMissAction::Release, 1)
         );
     }
 
     #[test]
-    fn a_clean_frontier_state_still_escalates_a_session_pin_and_a_zero_budget() {
-        // The round-21 fallback must not become a way to dodge the two
-        // escalations that are decided BEFORE any budget bound.
-        let (misses, workers) = clean_frontier_state();
+    fn no_frontier_reset_preserves_the_storage_ceiling_guard() {
+        // Issue #804, Codex round-22 P2. The predecessor of this rule
+        // fabricated a clean frontier whenever a re-read failed, which bypassed
+        // the `i32::MAX` guard: the resolver said Release, and the release
+        // statement's `capability_misses + 1` against the REAL row then raised
+        // `integer out of range`, stranding a RUNNING row under a live worker.
+        //
+        // Reporting the snapshot when no reset committed keeps the guard on the
+        // value the column actually holds.
+        let task = frontier_task(i32::MAX, &["worker-a"]);
+        let (misses, workers) = frontier_miss_state(&task, false);
+        assert_eq!(misses, i32::MAX, "the ceiling must survive the rule");
+        let at_ceiling = resolve_capability_miss(&workers, misses, "worker-b", 5, None, &[]);
+        assert_eq!(
+            at_ceiling.action,
+            CapabilityMissAction::Escalate,
+            "a column already at the storage ceiling escalates rather than \
+             issuing an UPDATE that can only fail"
+        );
+
+        // And a spent-but-representable budget still escalates on its own terms.
+        let spent = frontier_task(5, &["w0", "w1", "w2", "w3", "w4"]);
+        let (m, w) = frontier_miss_state(&spent, false);
+        let over = resolve_capability_miss(&w, m, "w5", 5, None, &[]);
+        assert_eq!(
+            over.action,
+            CapabilityMissAction::Escalate,
+            "without a reset the configured budget is enforced on the true count"
+        );
+    }
+
+    #[test]
+    fn a_clean_frontier_still_escalates_a_session_pin_and_a_zero_budget() {
+        // The reset path must not become a way to dodge the two escalations
+        // that are decided BEFORE any budget bound.
+        let task = frontier_task(2, &["worker-a", "worker-b"]);
+        let (misses, workers) = frontier_miss_state(&task, true);
 
         let pinned = resolve_capability_miss(
             &workers,
@@ -24613,7 +24688,7 @@ mod tests {
         assert_eq!(
             pinned.action,
             CapabilityMissAction::Escalate,
-            "a session-pinned task cannot be released to a peer, clean frontier or not"
+            "a session-pinned task cannot be released to a peer, reset or not"
         );
 
         let zero_budget = resolve_capability_miss(&workers, misses, "worker-a", 0, None, &[]);

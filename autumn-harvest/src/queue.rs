@@ -2122,7 +2122,7 @@ pub const fn release_task_for_capability_miss_query(
              started_at = NULL, \
              last_heartbeat_at = NULL, \
              crash_strikes = 0, \
-             capability_misses = capability_misses + 1, \
+             capability_misses = LEAST(capability_misses, 2147483646) + 1, \
              capability_miss_workers = CASE \
                  WHEN $2 = ANY(capability_miss_workers) THEN capability_miss_workers \
                  ELSE array_append(capability_miss_workers, $2) \
@@ -2146,7 +2146,7 @@ pub const fn release_task_for_capability_miss_query(
              started_at = NULL, \
              last_heartbeat_at = NULL, \
              attempt = GREATEST(attempt - 1, 0), \
-             capability_misses = capability_misses + 1, \
+             capability_misses = LEAST(capability_misses, 2147483646) + 1, \
              capability_miss_workers = CASE \
                  WHEN $2 = ANY(capability_miss_workers) THEN capability_miss_workers \
                  ELSE array_append(capability_miss_workers, $2) \
@@ -2169,7 +2169,7 @@ pub const fn release_task_for_capability_miss_query(
              worker_id = NULL, \
              started_at = NULL, \
              last_heartbeat_at = NULL, \
-             capability_misses = capability_misses + 1, \
+             capability_misses = LEAST(capability_misses, 2147483646) + 1, \
              capability_miss_workers = CASE \
                  WHEN $2 = ANY(capability_miss_workers) THEN capability_miss_workers \
                  ELSE array_append(capability_miss_workers, $2) \
@@ -2323,37 +2323,6 @@ pub async fn reset_capability_misses_after_inline_progress(
         .await
         .map_err(crate::error::database_error)?;
     Ok(updated > 0)
-}
-
-/// The two capability-miss columns as they stand **now** (issue #804, Codex
-/// round-20 P1).
-///
-/// `handle_capability_miss` cannot read them off the claimed `TaskQueueItem`:
-/// that snapshot is taken at claim time, and
-/// [`reset_capability_misses_after_inline_progress`] may have rewritten the row
-/// since, from inside this very dispatch. Deciding release-vs-escalate on the
-/// stale snapshot would charge a prior frontier's misses to the current one.
-///
-/// Returns `None` when the row is gone, which callers treat as "fall back to the
-/// snapshot" rather than an error: losing the row is already handled downstream
-/// by the release's own `0 rows affected` path.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] on query failure.
-pub async fn current_capability_miss_state(
-    conn: &mut AsyncPgConnection,
-    task_id: Uuid,
-) -> HarvestResult<Option<(i32, Vec<String>)>> {
-    use crate::schema::harvest_task_queue::dsl;
-    let row: Option<(i32, Vec<String>)> = dsl::harvest_task_queue
-        .filter(dsl::id.eq(task_id))
-        .select((dsl::capability_misses, dsl::capability_miss_workers))
-        .first(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?;
-    Ok(row)
 }
 
 /// Hint for sticky cross-worker routing when parking or enqueueing a task.
@@ -4041,7 +4010,7 @@ mod tests {
                 "worker_id = NULL",
                 "started_at = NULL",
                 "last_heartbeat_at = NULL",
-                "capability_misses = capability_misses + 1",
+                "capability_misses = LEAST(capability_misses, 2147483646) + 1",
                 "capability_miss_workers = CASE",
                 "scheduled_at = NOW() + make_interval(secs => $3)",
                 "sticky_worker_id = NULL",
@@ -4113,9 +4082,12 @@ mod tests {
             release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
         ] {
             assert!(
-                sql.contains("capability_misses = capability_misses + 1"),
+                sql.contains("capability_misses = LEAST(capability_misses, 2147483646) + 1"),
                 "the bounded-redelivery counter is the only counter a capability \
-                 miss advances (AC3/AC4)",
+                 miss advances (AC3/AC4), and it must SATURATE rather than raise: \
+                 a bare `+ 1` at i32::MAX aborts the statement, leaving the row \
+                 RUNNING under a live worker that orphan reclamation skips \
+                 (issue #804, Codex round-22 P2)",
             );
         }
     }
