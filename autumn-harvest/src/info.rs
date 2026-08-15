@@ -1063,15 +1063,19 @@ fn validate_node(
     if let (Some(add_props), Some(obj)) =
         (schema_obj.get("additionalProperties"), value.as_object())
     {
-        let known_keys: std::collections::HashSet<&str> = schema_obj
-            .get("properties")
-            .and_then(|v| v.as_object())
-            .map(|props| props.keys().map(String::as_str).collect())
-            .unwrap_or_default();
+        // Known-property membership is checked directly against the schema's
+        // own `properties` map (already a `BTreeMap`) rather than collecting
+        // it into a fresh `HashSet<&str>` on every call: `Map::contains_key`
+        // is an allocation-free lookup against a map we've already fetched,
+        // whereas rebuilding and hashing a `HashSet` from scratch every
+        // validation is pure per-call waste for a value that never changes
+        // for a given schema.
+        let known_props = schema_obj.get("properties").and_then(|v| v.as_object());
+        let is_known_prop = |key: &str| known_props.is_some_and(|props| props.contains_key(key));
         if add_props.as_bool() == Some(false) {
             // boolean false: any unknown key is forbidden
             for key in obj.keys() {
-                if !known_keys.contains(key.as_str()) {
+                if !is_known_prop(key) {
                     let escaped = key.replace('~', "~0").replace('/', "~1");
                     out.push(SchemaViolation {
                         message: format!("additional property '{key}' is not allowed"),
@@ -1082,7 +1086,7 @@ fn validate_node(
         } else if add_props.is_object() {
             // schema object: validate each additional (non-properties) key against it
             for (key, val) in obj {
-                if !known_keys.contains(key.as_str()) {
+                if !is_known_prop(key) {
                     let escaped = key.replace('~', "~0").replace('/', "~1");
                     let child_ptr = format!("{ptr}/{escaped}");
                     validate_node(root, add_props, val, &child_ptr, out, depth + 1);
