@@ -128,3 +128,72 @@ emit. Four new tests in `tests/integration/replay_drift_tests.rs`
 `per_workflow_input_cap_override_is_applied_during_replay`, and the falsifying
 control `without_an_override_the_global_input_cap_still_binds`). **No new
 `WorkflowEvent` variant, no migration.**
+
+**Post-review hardening, round 23 (Codex, P1 + P2 — bundle-vs-manifest
+reconciliation was aggregate-only; sample discovery materialized an unbounded
+per-type superset).** Two findings, verified against the code before either was
+touched. **(P1)** `ReplayDriftReport::fixture_count_disagrees_with_manifest`
+compared one number — `manifest.sampled_total` — against the count of files
+walked, so it accepted any corruption that *preserved the total*: lose a fixture
+for workflow `A` while the artifact retains or duplicates one for `B`, and both
+`B` fixtures replay cleanly, the totals still agree, and the gate exits `0`
+having replayed no `A` history at all. The named defect is "accepting any
+count-preserving substitution", and per-type counts alone do not close it — a
+substitution *within* one type preserves every count there is — so the fix
+reconciles at both finer grains. `SampleWorkflowCoverage` gains
+`sampled_execution_ids: Vec<ExecutionId>` (`#[serde(default)]`), the exporter
+fills it from the documents it actually wrote (deriving `sampled` from the same
+list, so the count and the identities cannot disagree with each other, and
+sorting both there and in `merge_coverage` so two exports of one sample produce a
+byte-identical manifest), and the report carries the bundle-side half as
+`found_execution_ids` — recorded for **every** fixture regardless of replay
+outcome, since the question is delivery, not verdict, and counting only successes
+would report each divergence as *also* a missing file. New
+`bundle_inventory_mismatches()` returns per-type `declared`/`found` plus the exact
+missing and unexpected ids, over the *union* of the two sides' type names (a type
+only one of them knows about is precisely what a shared-keys comparison would
+miss); `bundle_inventory_disagrees_with_manifest()` joins rung `2`. A manifest
+carrying no identities makes **no claim** rather than a claim of *none*, so a
+pre-identity bundle degrades to the per-type count check instead of reporting
+every fixture as unexpected. Keyed on the inner UUID throughout because
+`ExecutionId` is deliberately not `Ord`. **(P2)** `rn <= $3` in the two
+sample-discovery statements bounds each *type* but nothing bounds the number of
+types, so discovery returned `types × per_workflow` rows — a million per shard at
+2,000 types and `per_workflow = 500`, decoded into owned strings and
+`context_headers` JSON — for `stratify_sample_rows` to keep at most
+`MAX_SAMPLE_TOTAL` of. Both statements now apply the *effective* share the global
+budget allows (`LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))`,
+mirroring `stratify_sample_rows`'s own `effective_per_workflow`, with `types`
+counted over the unfiltered `ranked` set). Three properties keep this a bound
+rather than a behavior change: a shard sees at most the types the union sees, so
+its share is never *smaller* than the global one and each shard still returns a
+superset of its contribution to the global top-N; `GREATEST(…, 1)` floors the
+limit at one row per type, so the per-type population census `shard_population`
+reads off each name partition's first row — and therefore the manifest's
+`in_flight_total` and `zero_coverage_types` — survives; and below
+`types × per_workflow > MAX_SAMPLE_TOTAL` the `LEAST` selects `per_workflow` and
+the statement is byte-identical to before. Database-side work is unchanged
+(`COUNT(*) OVER (PARTITION BY …)` already scans every in-flight row); this narrows
+only what crosses the wire and lands in process memory. Both fixes falsified by
+neutering: removing the rung-`2` wiring returned exit `0` on all three
+substitution tests ("2 fixture(s) — 2 clean, 0 diverged"), removing *only* the
+identity comparison left the within-one-type substitution entirely undetected
+(`left: 0, right: 1` mismatches — proving identities are load-bearing and per-type
+counts alone would not catch it), and removing the per-type floor made a
+many-type deployment return **zero** rows with a `status: "complete"` manifest
+over an empty `per_workflow` — the catastrophic false green the floor exists to
+prevent. Tests: five in `tests/integration/replay_drift_tests.rs`
+(`a_count_preserving_substitution_across_types_is_caught`,
+`a_count_preserving_substitution_within_one_type_is_caught`, the falsifying
+control `a_faithful_bundle_reconciles_against_the_manifest_identities`,
+`a_manifest_without_identities_falls_back_to_per_type_counts`, and its complement
+`per_type_counts_bind_even_without_declared_identities`), two SQL-shape and
+share-arithmetic unit tests in the plugin
+(`history_sample_sql_bounds_discovery_by_the_effective_per_type_share`,
+`the_per_shard_share_is_never_smaller_than_the_global_share`), and two Postgres-
+backed tests in `replay_sample_export_integration.rs`
+(`many_types_keep_their_population_census_under_the_discovery_bound`,
+`the_manifest_records_the_exported_execution_identities`) — the latter asserting
+the declared identities are exactly the documents the export wrote, so a list of
+merely the right length cannot satisfy the check it strengthens. **No new
+`WorkflowEvent` variant, no migration.**

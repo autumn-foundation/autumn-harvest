@@ -163,6 +163,9 @@ fn complete_manifest(workflow_name: &str, sampled: u64, in_flight_total: u64) ->
             workflow_name: workflow_name.into(),
             sampled,
             in_flight_total,
+            // No identities claimed: these helpers predate the inventory
+            // reconciliation and exercise the count path.
+            sampled_execution_ids: Vec::new(),
         }],
         sampled_total: sampled,
         in_flight_total,
@@ -452,6 +455,7 @@ async fn bundle_manifest_coverage_is_surfaced_on_the_report() {
             workflow_name: "wf".into(),
             sampled: 1,
             in_flight_total: 4000,
+            sampled_execution_ids: Vec::new(),
         }],
         sampled_total: 1,
         in_flight_total: 4000,
@@ -508,6 +512,7 @@ async fn a_size_truncated_bundle_blocks_the_gate() {
             workflow_name: "wf".into(),
             sampled: 1,
             in_flight_total: 1,
+            sampled_execution_ids: Vec::new(),
         }],
         sampled_total: 1,
         in_flight_total: 1,
@@ -569,6 +574,7 @@ async fn an_export_that_dropped_candidates_blocks_the_gate() {
             // the fixture-count check cannot catch this.
             sampled: 1,
             in_flight_total: 1,
+            sampled_execution_ids: Vec::new(),
         }],
         sampled_total: 1,
         in_flight_total: 1,
@@ -621,6 +627,7 @@ async fn partial_shard_coverage_can_block_the_gate() {
             workflow_name: "wf".into(),
             sampled: 1,
             in_flight_total: 1,
+            sampled_execution_ids: Vec::new(),
         }],
         sampled_total: 1,
         in_flight_total: 1,
@@ -911,6 +918,7 @@ async fn a_divergence_outranks_the_coverage_rungs() {
             workflow_name: "wf".into(),
             sampled: 1,
             in_flight_total: 900,
+            sampled_execution_ids: Vec::new(),
         }],
         sampled_total: 1,
         in_flight_total: 900,
@@ -1314,6 +1322,7 @@ async fn a_bundle_missing_manifest_declared_fixtures_blocks_the_gate() {
             workflow_name: "wf".into(),
             sampled: 3,
             in_flight_total: 3,
+            sampled_execution_ids: Vec::new(),
         }],
         sampled_total: 3,
         in_flight_total: 3,
@@ -1413,12 +1422,14 @@ async fn a_workflow_type_sampled_zero_times_fails_a_complete_coverage_claim() {
                 workflow_name: "wf".into(),
                 sampled: 1,
                 in_flight_total: 1,
+                sampled_execution_ids: Vec::new(),
             },
             // Starved by the global cap: in flight, never sampled.
             SampleWorkflowCoverage {
                 workflow_name: "never_sampled_wf".into(),
                 sampled: 0,
                 in_flight_total: 900,
+                sampled_execution_ids: Vec::new(),
             },
         ],
         sampled_total: 1,
@@ -2917,5 +2928,301 @@ async fn without_an_override_the_global_input_cap_still_binds() {
     assert!(
         !report.is_clean(),
         "with no per-workflow override the global cap must still bind: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bundle ↔ manifest inventory reconciliation (round-23 P1)
+// ---------------------------------------------------------------------------
+
+/// An in-flight history for `workflow_name` under a caller-chosen execution id.
+///
+/// The identity tests below need to control which executions the bundle holds so
+/// they can disagree with the manifest in a *count-preserving* way — the exact
+/// corruption an aggregate comparison accepts.
+fn in_flight_snapshot_with_id(workflow_name: &str, exec_id: ExecutionId) -> String {
+    let events = vec![
+        started_event(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "step_one".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+    ];
+    snapshot_json(workflow_name, exec_id, events)
+}
+
+/// A two-type manifest whose per-type entries carry the exported identities.
+fn manifest_with_identities(entries: Vec<(&str, Vec<ExecutionId>)>) -> SampleManifest {
+    let per_workflow: Vec<SampleWorkflowCoverage> = entries
+        .into_iter()
+        .map(|(name, ids)| SampleWorkflowCoverage {
+            workflow_name: name.into(),
+            sampled: ids.len() as u64,
+            in_flight_total: ids.len() as u64,
+            sampled_execution_ids: ids,
+        })
+        .collect();
+    let sampled_total = per_workflow.iter().map(|entry| entry.sampled).sum();
+    SampleManifest {
+        generated_at: Utc::now(),
+        status: SampleStatus::Complete,
+        states: vec!["RUNNING".into()],
+        per_workflow,
+        sampled_total,
+        in_flight_total: sampled_total,
+        unavailable_shards: vec![],
+        inspected_shards: vec![0],
+        truncated_by_size: false,
+        export_failures: 0,
+    }
+}
+
+/// The money test for the count-preserving substitution across workflow types.
+///
+/// The manifest declares one fixture each for `wf_a` and `wf_b`. The delivered
+/// bundle holds two files — but both are `wf_b`, and `wf_a` never made it. The
+/// **total** still reads 2 of 2, so the aggregate guard is satisfied; both
+/// `wf_b` fixtures replay cleanly, so no divergence is reported. Before the
+/// per-type reconciliation this exits `0`: a green release gate that never
+/// replayed a single `wf_a` history.
+#[tokio::test]
+async fn a_count_preserving_substitution_across_types_is_caught() {
+    let dir = tempfile::tempdir().unwrap();
+    let id_a = ExecutionId::new();
+    let id_b = ExecutionId::new();
+
+    // `wf_a`'s fixture was lost in transit; a duplicate `wf_b` took its place.
+    write(
+        dir.path(),
+        "a.json",
+        &in_flight_snapshot_with_id("wf_b", id_b),
+    );
+    write(
+        dir.path(),
+        "b.json",
+        &in_flight_snapshot_with_id("wf_b", id_b),
+    );
+    let manifest = manifest_with_identities(vec![("wf_a", vec![id_a]), ("wf_b", vec![id_b])]);
+    write(
+        dir.path(),
+        SampleManifest::FILE_NAME,
+        &serde_json::to_string(&manifest).unwrap(),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf_a", canonical_workflow as WorkflowHandlerFn)
+        .register_fn("wf_b", canonical_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    // The aggregate guard is genuinely satisfied — that is the whole point.
+    assert!(
+        !report.fixture_count_disagrees_with_manifest(),
+        "the totals must agree, or this test is not exercising the gap: {report}"
+    );
+    assert!(
+        report.diverged.is_empty(),
+        "both delivered fixtures replay cleanly: {report}"
+    );
+
+    assert_eq!(
+        report.exit_code(),
+        2,
+        "a type the bundle never delivered must block the gate: {report}"
+    );
+    let mismatches = report.bundle_inventory_mismatches();
+    let names: Vec<&str> = mismatches
+        .iter()
+        .map(|mismatch| mismatch.workflow_name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["wf_a", "wf_b"],
+        "both the starved and the doubled type are disagreements: {report}"
+    );
+    let wf_a = &mismatches[0];
+    assert_eq!((wf_a.declared, wf_a.found), (1, 0));
+    assert_eq!(wf_a.missing_execution_ids, vec![id_a]);
+}
+
+/// The same corruption one level down: *within* a single type.
+///
+/// Per-type counts match, the total matches, and every delivered fixture
+/// replays cleanly — only the identities differ. A gate that compared counts
+/// alone (at any grain) would certify this.
+#[tokio::test]
+async fn a_count_preserving_substitution_within_one_type_is_caught() {
+    let dir = tempfile::tempdir().unwrap();
+    let kept = ExecutionId::new();
+    let lost = ExecutionId::new();
+    let substituted = ExecutionId::new();
+
+    write(
+        dir.path(),
+        "a.json",
+        &in_flight_snapshot_with_id("wf", kept),
+    );
+    write(
+        dir.path(),
+        "b.json",
+        &in_flight_snapshot_with_id("wf", substituted),
+    );
+    let manifest = manifest_with_identities(vec![("wf", vec![kept, lost])]);
+    write(
+        dir.path(),
+        SampleManifest::FILE_NAME,
+        &serde_json::to_string(&manifest).unwrap(),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", canonical_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        !report.fixture_count_disagrees_with_manifest(),
+        "totals agree: {report}"
+    );
+    let mismatches = report.bundle_inventory_mismatches();
+    assert_eq!(mismatches.len(), 1, "one type disagrees: {report}");
+    assert_eq!(
+        (mismatches[0].declared, mismatches[0].found),
+        (2, 2),
+        "per-type counts agree too — identity is the only signal: {report}"
+    );
+    assert_eq!(mismatches[0].missing_execution_ids, vec![lost]);
+    assert_eq!(mismatches[0].unexpected_execution_ids, vec![substituted]);
+    assert_eq!(
+        report.exit_code(),
+        2,
+        "an execution the bundle never delivered must block the gate: {report}"
+    );
+}
+
+/// The falsifying control: a faithful bundle must still pass.
+///
+/// Without this, "report a mismatch unconditionally" would satisfy both tests
+/// above while making the gate permanently red.
+#[tokio::test]
+async fn a_faithful_bundle_reconciles_against_the_manifest_identities() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = ExecutionId::new();
+    let second = ExecutionId::new();
+
+    write(
+        dir.path(),
+        "a.json",
+        &in_flight_snapshot_with_id("wf", first),
+    );
+    write(
+        dir.path(),
+        "b.json",
+        &in_flight_snapshot_with_id("wf", second),
+    );
+    // Deliberately declared in the opposite order: the reconciliation compares
+    // sets, not file-walk order.
+    let manifest = manifest_with_identities(vec![("wf", vec![second, first])]);
+    write(
+        dir.path(),
+        SampleManifest::FILE_NAME,
+        &serde_json::to_string(&manifest).unwrap(),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", canonical_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.bundle_inventory_mismatches().is_empty(),
+        "a faithful bundle has no inventory disagreement: {report}"
+    );
+    assert!(report.is_clean(), "and the gate passes: {report}");
+}
+
+/// A pre-identity manifest makes *no* claim about which executions it holds.
+///
+/// Reading its empty `sampled_execution_ids` as a claim of *none* would report
+/// every delivered fixture as unexpected and turn every older bundle red. Such
+/// a manifest degrades to the per-type count check — still strictly stronger
+/// than the total it replaced.
+#[tokio::test]
+async fn a_manifest_without_identities_falls_back_to_per_type_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.json",
+        &in_flight_snapshot_with_id("wf", ExecutionId::new()),
+    );
+    let mut manifest = manifest_with_identities(vec![("wf", vec![ExecutionId::new()])]);
+    // Exactly what a manifest written before the field existed deserializes to.
+    manifest.per_workflow[0].sampled_execution_ids.clear();
+    write(
+        dir.path(),
+        SampleManifest::FILE_NAME,
+        &serde_json::to_string(&manifest).unwrap(),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf", canonical_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        report.bundle_inventory_mismatches().is_empty(),
+        "counts agree and no identities were claimed: {report}"
+    );
+    assert!(report.is_clean(), "so the gate passes: {report}");
+}
+
+/// Per-type counts still bind when the manifest claims no identities.
+///
+/// The complement of the test above: the fallback must be a *fallback*, not an
+/// exemption. A pre-identity manifest whose per-type counts disagree is still a
+/// blocked gate, even though the total matches.
+#[tokio::test]
+async fn per_type_counts_bind_even_without_declared_identities() {
+    let dir = tempfile::tempdir().unwrap();
+    let id_b = ExecutionId::new();
+    write(
+        dir.path(),
+        "a.json",
+        &in_flight_snapshot_with_id("wf_b", id_b),
+    );
+    write(
+        dir.path(),
+        "b.json",
+        &in_flight_snapshot_with_id("wf_b", id_b),
+    );
+
+    let mut manifest = manifest_with_identities(vec![
+        ("wf_a", vec![ExecutionId::new()]),
+        ("wf_b", vec![id_b]),
+    ]);
+    for entry in &mut manifest.per_workflow {
+        entry.sampled_execution_ids.clear();
+    }
+    write(
+        dir.path(),
+        SampleManifest::FILE_NAME,
+        &serde_json::to_string(&manifest).unwrap(),
+    );
+
+    let report = ReplayVerifier::new()
+        .register_fn("wf_a", canonical_workflow as WorkflowHandlerFn)
+        .register_fn("wf_b", canonical_workflow as WorkflowHandlerFn)
+        .replay_bundle(dir.path())
+        .await;
+
+    assert!(
+        !report.fixture_count_disagrees_with_manifest(),
+        "totals agree: {report}"
+    );
+    assert_eq!(
+        report.exit_code(),
+        2,
+        "per-type counts must still bind without identities: {report}"
     );
 }

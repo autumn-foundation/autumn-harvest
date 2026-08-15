@@ -170,6 +170,9 @@ needs to act:
 | `exit_code()` | See the table below. |
 | `zero_coverage_types()` | Workflow types the manifest reports as having in-flight work but sampled **zero** times. |
 | `fixture_count_disagrees_with_manifest()` | The bundle holds a different number of fixtures than the manifest declares. |
+| `bundle_inventory_mismatches()` | Per-workflow-type disagreements between the bundle and the manifest's inventory — including, when the manifest names them, the exact executions that are missing or unexpected. |
+| `bundle_inventory_disagrees_with_manifest()` | `!bundle_inventory_mismatches().is_empty()`. |
+| `found_execution_ids` | `BTreeMap<String, Vec<ExecutionId>>` — what the bundle actually held, per workflow type, whatever each fixture's replay outcome. |
 
 ### Exit codes
 
@@ -177,7 +180,7 @@ needs to act:
 |---|---|
 | `0` | Clean — promote. |
 | `1` | At least one execution diverged. **Do not promote.** |
-| `2` | The gate could not fully run. Dominates `1`. A fixture blocked it (unparseable, an unregistered workflow type, a redacted bundle, or a fixture carrying offloaded payload references or undecoded codec envelopes); the bundle's manifest was present but unreadable; the bundle holds a different number of fixtures than its manifest declares; **or** the export itself delivered fewer fixtures than the sample selected (it hit the response byte budget, or individual selected candidates failed to fetch). |
+| `2` | The gate could not fully run. Dominates `1`. A fixture blocked it (unparseable, an unregistered workflow type, a redacted bundle, or a fixture carrying offloaded payload references or undecoded codec envelopes); the bundle's manifest was present but unreadable; the bundle holds a different number of fixtures than its manifest declares; the bundle's per-type or per-execution inventory disagrees with the manifest; **or** the export itself delivered fewer fixtures than the sample selected (it hit the response byte budget, or individual selected candidates failed to fetch). |
 | `3` | Nothing was verified and `allow_empty_bundle(false)` (the default) — the bundle was empty, **or** every fixture in it was skipped. Also returned *despite* `allow_empty_bundle(true)` when the bundle's manifest reports incomplete shard coverage: an export that could not read the fleet is empty too, so the opt-out does not apply to it. |
 | `4` | `require_complete_coverage(true)` and complete coverage was not proven — the manifest reports partial shard coverage, the bundle carries no readable manifest, **or** a workflow type with in-flight work was sampled zero times. |
 
@@ -212,6 +215,20 @@ gate green on a damaged bundle.
 A fixture count that disagrees with the manifest means files went missing after the
 export (a truncated artifact upload, a partial copy): every surviving fixture may
 replay cleanly while the gate certifies a strict subset of what was sampled.
+
+The **total** alone is not enough, because it accepts any corruption that
+preserves it. Lose a fixture for `billing_checkout` while the artifact gains a
+duplicate `onboarding` and the count still reads 63 of 63: both `onboarding`
+fixtures replay cleanly, the gate exits `0`, and no `billing_checkout` history
+was replayed at all. So the bundle is also reconciled against the manifest's
+inventory at two finer grains — per workflow type, and (when the manifest names
+them) per execution id. A same-type substitution matches on every count there
+is; only identity separates it from the real sample. Both disagreements block at
+`2` and name the missing and unexpected executions in the report.
+
+A manifest produced before identities were recorded carries none, and makes *no*
+claim about which executions it holds — such a bundle degrades to the per-type
+count check rather than reporting every fixture as unexpected.
 
 Exit code `3` is deliberate. A gate that passes because it pointed at an empty
 or mistyped directory is worse than no gate at all — it reports green having
@@ -489,8 +506,18 @@ does. The manifest is what tells you the difference:
   "sampled_total": 63,
   "in_flight_total": 4127,
   "per_workflow": [
-    { "workflow_name": "billing_checkout", "sampled": 50, "in_flight_total": 4021 },
-    { "workflow_name": "onboarding",       "sampled": 13, "in_flight_total": 106  }
+    {
+      "workflow_name": "billing_checkout",
+      "sampled": 50,
+      "in_flight_total": 4021,
+      "sampled_execution_ids": ["00000000-0000-0000-0000-0000000000a1", "…"]
+    },
+    {
+      "workflow_name": "onboarding",
+      "sampled": 13,
+      "in_flight_total": 106,
+      "sampled_execution_ids": ["00000000-0000-0000-0000-0000000000b7", "…"]
+    }
   ],
   "inspected_shards": [0, 1],
   "unavailable_shards": []
@@ -510,7 +537,7 @@ onboarding                                    13        106  no
 NOTE: the sample is truncated; a clean gate verifies the SAMPLE, not the fleet.
 ```
 
-Four failure modes the manifest exists to prevent:
+Five failure modes the manifest exists to prevent:
 
 * **Silent truncation.** `sampled: 50, in_flight_total: 4021` is stated, never
   implied. A workflow type whose entire sample failed the per-execution size
@@ -546,6 +573,17 @@ Four failure modes the manifest exists to prevent:
   likely to span the change you are gating, so the executions most worth
   replaying are exactly the ones dropped. Raise `--max-bytes`, or narrow the
   sample until every selected candidate fits.
+* **A silently *substituted* bundle.** The failures above are all about the
+  export; this one is about what happened to the bundle afterwards. A fixture
+  lost in transit while another is duplicated leaves the total — and, if the two
+  belong to the same type, even the per-type count — intact, so the bundle looks
+  whole and every surviving fixture replays cleanly.
+
+  `sampled_execution_ids` is the inventory that makes it visible: the gate
+  reconciles the fixtures it actually found against the executions the export
+  says it wrote, and blocks at `2` naming each missing and unexpected id. This
+  is the only field that can tell the bundle you were handed apart from a bundle
+  of the right *shape*.
 
 Both shortfall causes — the byte-budget cut and dropped candidates — are read
 through one predicate, `SampleManifest::is_incomplete_export()`, and both fail

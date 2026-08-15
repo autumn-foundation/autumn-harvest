@@ -172,6 +172,29 @@ pub struct SampleWorkflowCoverage {
     /// How many executions of this type were in flight when the sample was
     /// drawn, across every inspected shard.
     pub in_flight_total: u64,
+    /// The execution ids the export actually wrote a fixture for, sorted.
+    ///
+    /// The inventory the gate reconciles the delivered bundle against. Counts
+    /// alone — even per-type counts — accept any *substitution* that preserves
+    /// them: swap one execution of this type for a duplicate of another, and
+    /// `sampled` still matches while a real in-flight history was never
+    /// replayed. Only identities can tell "the bundle I was given" apart from
+    /// "a bundle with the right shape".
+    ///
+    /// Exactly the survivors, so this agrees with
+    /// [`sampled`](Self::sampled) by construction: a candidate the export
+    /// selected but could not fetch contributes neither an id nor a count (it
+    /// is reported through
+    /// [`SampleManifest::export_failures`](SampleManifest::export_failures)
+    /// instead).
+    ///
+    /// `#[serde(default)]` so a manifest written before this field existed
+    /// reads back as empty rather than failing the whole bundle. An empty list
+    /// is therefore *no claim*, not a claim of zero — the gate falls back to
+    /// the per-type count check for such a manifest rather than reporting every
+    /// fixture as unexpected.
+    #[serde(default)]
+    pub sampled_execution_ids: Vec<crate::types::ExecutionId>,
 }
 
 impl SampleWorkflowCoverage {
@@ -359,9 +382,10 @@ pub const fn clamp_per_workflow(requested: usize) -> usize {
 
 /// Merge per-shard coverage rows into one fleet-wide, name-sorted view.
 ///
-/// A workflow type observed on several shards has its `sampled` and
-/// `in_flight_total` summed, so `in_flight_total` is the true cross-shard
-/// population rather than whichever shard answered last.
+/// A workflow type observed on several shards has its `sampled`,
+/// `in_flight_total` and `sampled_execution_ids` merged, so `in_flight_total`
+/// is the true cross-shard population rather than whichever shard answered
+/// last.
 #[must_use]
 pub fn merge_coverage(per_shard: &[Vec<SampleWorkflowCoverage>]) -> Vec<SampleWorkflowCoverage> {
     let mut merged: std::collections::BTreeMap<String, SampleWorkflowCoverage> =
@@ -375,10 +399,22 @@ pub fn merge_coverage(per_shard: &[Vec<SampleWorkflowCoverage>]) -> Vec<SampleWo
                         workflow_name: row.workflow_name.clone(),
                         sampled: 0,
                         in_flight_total: 0,
+                        sampled_execution_ids: Vec::new(),
                     });
             entry.sampled = entry.sampled.saturating_add(row.sampled);
             entry.in_flight_total = entry.in_flight_total.saturating_add(row.in_flight_total);
+            entry
+                .sampled_execution_ids
+                .extend(row.sampled_execution_ids.iter().copied());
         }
+    }
+    // Sorted so the manifest is byte-stable across shard iteration order: two
+    // exports of the same sample must produce the same manifest, or a diff of
+    // two CI artifacts reports noise.
+    for entry in merged.values_mut() {
+        entry
+            .sampled_execution_ids
+            .sort_unstable_by_key(crate::types::ExecutionId::as_uuid);
     }
     merged.into_values().collect()
 }
@@ -487,34 +523,46 @@ mod tests {
             workflow_name: "wf".into(),
             sampled: 10,
             in_flight_total: 10,
+            sampled_execution_ids: Vec::new(),
         };
         assert!(!full.truncated());
         let partial = SampleWorkflowCoverage {
             workflow_name: "wf".into(),
             sampled: 10,
             in_flight_total: 4000,
+            sampled_execution_ids: Vec::new(),
         };
         assert!(partial.truncated());
     }
 
     #[test]
     fn merge_sums_across_shards_and_sorts_by_name() {
+        // Identities from two different shards must both survive the merge --
+        // a manifest that dropped one shard's ids would declare a bundle the
+        // gate could never reconcile.
+        let alpha_shard0 = crate::types::ExecutionId::new();
+        let alpha_shard1 = crate::types::ExecutionId::new();
+        let zeta_id = crate::types::ExecutionId::new();
+
         let shard0 = vec![
             SampleWorkflowCoverage {
                 workflow_name: "zeta".into(),
                 sampled: 2,
                 in_flight_total: 9,
+                sampled_execution_ids: vec![zeta_id],
             },
             SampleWorkflowCoverage {
                 workflow_name: "alpha".into(),
                 sampled: 3,
                 in_flight_total: 5,
+                sampled_execution_ids: vec![alpha_shard0],
             },
         ];
         let shard1 = vec![SampleWorkflowCoverage {
             workflow_name: "alpha".into(),
             sampled: 1,
             in_flight_total: 7,
+            sampled_execution_ids: vec![alpha_shard1],
         }];
 
         let merged = merge_coverage(&[shard0, shard1]);
@@ -525,7 +573,15 @@ mod tests {
             merged[0].in_flight_total, 12,
             "in-flight population sums across shards"
         );
+
+        let mut expected = vec![alpha_shard0, alpha_shard1];
+        expected.sort_unstable_by_key(crate::types::ExecutionId::as_uuid);
+        assert_eq!(
+            merged[0].sampled_execution_ids, expected,
+            "identities merge across shards and land in a stable order"
+        );
         assert_eq!(merged[1].workflow_name, "zeta");
+        assert_eq!(merged[1].sampled_execution_ids, vec![zeta_id]);
     }
 
     #[test]
@@ -591,6 +647,7 @@ mod tests {
                 workflow_name: "wf".into(),
                 sampled: 1,
                 in_flight_total: 2,
+                sampled_execution_ids: vec![crate::types::ExecutionId::new()],
             }],
             sampled_total: 1,
             in_flight_total: 2,

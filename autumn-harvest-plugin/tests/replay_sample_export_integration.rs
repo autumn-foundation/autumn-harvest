@@ -1447,3 +1447,139 @@ async fn workflow_name_filter_narrows_the_sample() {
     let manifest = manifest_of(&body);
     assert_eq!(manifest.per_workflow.len(), 1);
 }
+
+/// Round-23 P2: discovery must not materialize the whole per-type superset, and
+/// bounding it must not cost the population census.
+///
+/// The per-type limit is `per_workflow`, but nothing bounds the number of
+/// *types*, so discovery returned `types × per_workflow` rows for the
+/// stratifier to throw all but `MAX_SAMPLE_TOTAL` of away. The fix bounds each
+/// shard by the effective share the global budget allows — which is only safe
+/// if the floor of one row per type holds, because the manifest's
+/// `in_flight_total` (and therefore `zero_coverage_types`, the "this type was
+/// never replayed" alarm) is read off the first row of each name partition.
+///
+/// So this seeds many types, each with more executions than the share allows,
+/// and asserts the property that a naive `LIMIT` would break: **every type is
+/// still present in the manifest with its true population**, even the ones the
+/// budget starves down to a single fixture.
+#[tokio::test]
+async fn many_types_keep_their_population_census_under_the_discovery_bound() {
+    // Three executions each, so every type is genuinely truncatable.
+    const TYPES: usize = 12;
+
+    let (urls, _guard) = setup_shards(1).await;
+    let app = build_app(&urls);
+    let t0 = base_time();
+
+    for type_index in 0..TYPES {
+        for exec_index in 0..3i64 {
+            seed_execution(
+                &urls[0],
+                ShardId::new(0),
+                &format!("wf_{type_index:03}"),
+                &format!("wf-{type_index:03}-{exec_index}"),
+                "RUNNING",
+                t0 + chrono::Duration::seconds(exec_index),
+            )
+            .await;
+        }
+    }
+
+    let (status, body) = get_json(&app, &format!("{SAMPLE_ROUTE}?per_workflow=2")).await;
+    assert_eq!(status, StatusCode::OK, "sample export must succeed: {body}");
+
+    let manifest = manifest_of(&body);
+    assert_eq!(
+        manifest.per_workflow.len(),
+        TYPES,
+        "every in-flight type must appear in the manifest — a type dropped by a \
+         discovery bound is a type the gate can say nothing about, with nothing \
+         in the report to reveal it: {body}"
+    );
+    for type_index in 0..TYPES {
+        let name = format!("wf_{type_index:03}");
+        let coverage = coverage_for(&manifest, &name);
+        assert_eq!(
+            coverage.in_flight_total, 3,
+            "{name}: the true population must survive the bound, or the coverage \
+             denominator understates the fleet: {body}"
+        );
+        assert!(
+            coverage.sampled >= 1,
+            "{name}: every type must keep at least one fixture: {body}"
+        );
+    }
+
+    // And the sample itself is unchanged by the bound: `per_workflow = 2` is far
+    // below the global share here, so it is the binding constraint exactly as
+    // before.
+    let names = exported_workflow_names(&body);
+    for type_index in 0..TYPES {
+        let name = format!("wf_{type_index:03}");
+        assert_eq!(
+            names.iter().filter(|found| **found == name).count(),
+            2,
+            "{name}: below the global share, per_workflow still binds: {body}"
+        );
+    }
+    assert_eq!(manifest.sampled_total, (TYPES * 2) as u64);
+    assert_eq!(manifest.in_flight_total, (TYPES * 3) as u64);
+}
+
+/// The exporter must record *which* executions it wrote, not just how many.
+///
+/// `sampled` alone accepts any substitution that preserves the count, so the
+/// gate cannot tell the bundle it was handed apart from a bundle of the right
+/// shape (round-23 P1). The identities are what
+/// `ReplayDriftReport::bundle_inventory_mismatches` reconciles against, so an
+/// exporter that stopped recording them would silently disarm that check.
+#[tokio::test]
+async fn the_manifest_records_the_exported_execution_identities() {
+    let (urls, _guard) = setup_shards(1).await;
+    let app = build_app(&urls);
+    let t0 = base_time();
+
+    for index in 0..3 {
+        seed_execution(
+            &urls[0],
+            ShardId::new(0),
+            "wf",
+            &format!("wf-{index}"),
+            "RUNNING",
+            t0 + chrono::Duration::seconds(index),
+        )
+        .await;
+    }
+
+    let (status, body) = get_json(&app, &format!("{SAMPLE_ROUTE}?per_workflow=2")).await;
+    assert_eq!(status, StatusCode::OK, "sample export must succeed: {body}");
+
+    let manifest = manifest_of(&body);
+    let coverage = coverage_for(&manifest, "wf");
+    assert_eq!(coverage.sampled, 2);
+    assert_eq!(
+        coverage.sampled_execution_ids.len(),
+        2,
+        "the manifest must name every exported execution: {body}"
+    );
+
+    // The identities must be exactly the documents the export actually wrote —
+    // a list that merely has the right length would satisfy the count check it
+    // is meant to strengthen.
+    let exported: std::collections::BTreeSet<String> = body["exports"]
+        .as_array()
+        .expect("exports array")
+        .iter()
+        .map(|document| document["execution_id"].as_str().unwrap().to_string())
+        .collect();
+    let declared: std::collections::BTreeSet<String> = coverage
+        .sampled_execution_ids
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    assert_eq!(
+        declared, exported,
+        "declared identities must be the exported ones: {body}"
+    );
+}

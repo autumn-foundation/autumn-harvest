@@ -33806,6 +33806,43 @@ async fn load_history_export_candidates(
 ///   `LIKE` wildcard, so a `LIKE` form would over-match real workflow names.
 ///   The literal mirrors `canary::CANARY_WORKFLOW_NAME_PREFIX`, kept in sync by
 ///   `the_canary_exclusion_literal_matches_the_canary_prefix_constant`.
+///
+/// # Why the row limit is not simply `rn <= per_workflow`
+///
+/// `per_workflow` bounds each *type*, but nothing bounds the number of types,
+/// so the returned set is `types × per_workflow`. `stratify_sample_rows` then
+/// discards all but `MAX_SAMPLE_TOTAL` of it — after the whole superset has
+/// been decoded into `HistorySampleCandidate`s, strings and `context_headers`
+/// JSON included. At 2,000 in-flight types and `per_workflow = 500` that is a
+/// million rows materialized per shard to keep 2,000, and the management API is
+/// a shared service: a routine authenticated CI export must not be able to
+/// exhaust it.
+///
+/// So the per-type limit applied here is the *effective* share the global
+/// budget will allow — `LEAST(per_workflow, GREATEST(MAX_SAMPLE_TOTAL / types,
+/// 1))` — mirroring `stratify_sample_rows`'s own `effective_per_workflow`.
+/// `types` is counted over `ranked`, which is unfiltered, so it is this shard's
+/// true distinct-type count.
+///
+/// Three properties make this safe rather than merely smaller:
+///
+/// * **The sample is unchanged.** A shard sees at most the types the union
+///   sees, so its share (`MAX/types_shard`) is never *smaller* than the global
+///   share (`MAX/types_union`) the stratifier will apply. Each shard therefore
+///   still returns a superset of its contribution to the global top-N, which is
+///   exactly the property the cross-shard union already relied on.
+/// * **The population census survives.** `GREATEST(…, 1)` floors the limit at
+///   one row per type, and `shard_population` reads `in_flight_total` from the
+///   first row of each name partition — so no type can drop out of the
+///   manifest, which is what `zero_coverage_types` and the coverage denominator
+///   depend on.
+/// * **The common case is byte-identical.** The global budget only binds at
+///   `types × per_workflow > MAX_SAMPLE_TOTAL`; below that `LEAST` selects
+///   `per_workflow` and the statement behaves exactly as before.
+///
+/// The database-side work is unchanged either way — `COUNT(*) OVER (PARTITION
+/// BY …)` already scans every in-flight row — so this narrows what crosses the
+/// wire and lands in process memory, which is where the cost was.
 const HISTORY_SAMPLE_CANDIDATES_OLDEST_SQL: &str = r"
 WITH ranked AS (
     SELECT
@@ -33830,12 +33867,15 @@ WITH ranked AS (
       AND w.state = ANY($1::TEXT[])
       AND ($2::TEXT IS NULL OR w.workflow_name = $2::TEXT)
       AND NOT starts_with(w.workflow_name, '__harvest_canary_probe')
+),
+type_count AS (
+    SELECT COUNT(*)::BIGINT AS types FROM (SELECT DISTINCT workflow_name FROM ranked) d
 )
 SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
        execution_timeout, deadline_at, parent_id, context_headers, queue_name,
        in_flight_total
-FROM ranked
-WHERE rn <= $3
+FROM ranked, type_count
+WHERE rn <= LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))
 ORDER BY workflow_name ASC, rn ASC
 ";
 
@@ -33868,12 +33908,15 @@ WITH ranked AS (
       AND w.state = ANY($1::TEXT[])
       AND ($2::TEXT IS NULL OR w.workflow_name = $2::TEXT)
       AND NOT starts_with(w.workflow_name, '__harvest_canary_probe')
+),
+type_count AS (
+    SELECT COUNT(*)::BIGINT AS types FROM (SELECT DISTINCT workflow_name FROM ranked) d
 )
 SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
        execution_timeout, deadline_at, parent_id, context_headers, queue_name,
        in_flight_total
-FROM ranked
-WHERE rn <= $3
+FROM ranked, type_count
+WHERE rn <= LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))
 ORDER BY workflow_name ASC, rn ASC
 ";
 
@@ -33898,6 +33941,11 @@ async fn load_history_sample_candidates(
     shard_id: i32,
 ) -> HarvestResult<Vec<HistorySampleCandidate>> {
     let per_workflow = i64::try_from(filters.per_workflow).unwrap_or(i64::MAX);
+    // Bound so this shard cannot return a superset the global stratifier will
+    // only throw away — see the statement's own "why the row limit is not
+    // simply `rn <= per_workflow`".
+    let max_sample_total =
+        i64::try_from(autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL).unwrap_or(i64::MAX);
     diesel::sql_query(history_sample_candidates_sql(filters.order))
         .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(filters.states.clone())
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
@@ -33905,6 +33953,7 @@ async fn load_history_sample_candidates(
         )
         .bind::<diesel::sql_types::BigInt, _>(per_workflow)
         .bind::<diesel::sql_types::Integer, _>(shard_id)
+        .bind::<diesel::sql_types::BigInt, _>(max_sample_total)
         .load(conn)
         .await
         .map_err(database_error)
@@ -33944,11 +33993,12 @@ fn shard_population(
         .map(|(workflow_name, in_flight_total)| {
             autumn_harvest::replay_sample::SampleWorkflowCoverage {
                 workflow_name: workflow_name.to_string(),
-                // Filled in after export from the documents actually
+                // Both filled in after export from the documents actually
                 // written, so a size-limit failure is never counted as a
                 // sample.
                 sampled: 0,
                 in_flight_total,
+                sampled_execution_ids: Vec::new(),
             }
         })
         .collect()
@@ -34221,15 +34271,32 @@ fn build_sample_manifest(
     let mut per_workflow =
         autumn_harvest::replay_sample::merge_coverage(&work.per_shard_population);
 
-    let mut exported: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    // Identities, not just a tally. `sampled` alone accepts any substitution
+    // that preserves the count — swap one execution of a type for a duplicate
+    // of another and the number still matches — so the gate cannot tell the
+    // bundle it was handed apart from a bundle of the right shape. Recording
+    // what was actually written lets it (see
+    // `ReplayDriftReport::bundle_inventory_mismatches`).
+    let mut exported: std::collections::BTreeMap<&str, Vec<autumn_harvest::ExecutionId>> =
+        std::collections::BTreeMap::new();
     for document in &work.batch.exports {
-        *exported.entry(document.workflow_name.as_str()).or_insert(0) += 1;
+        exported
+            .entry(document.workflow_name.as_str())
+            .or_default()
+            .push(document.execution_id);
     }
     for entry in &mut per_workflow {
-        entry.sampled = exported
+        let mut ids = exported
             .get(entry.workflow_name.as_str())
-            .copied()
-            .unwrap_or(0);
+            .cloned()
+            .unwrap_or_default();
+        // Sorted so two exports of the same sample produce a byte-identical
+        // manifest rather than one that differs by export iteration order.
+        ids.sort_unstable_by_key(autumn_harvest::ExecutionId::as_uuid);
+        // Derived from the same list rather than counted separately, so the
+        // count and the identities can never disagree with each other.
+        entry.sampled = u64::try_from(ids.len()).unwrap_or(u64::MAX);
+        entry.sampled_execution_ids = ids;
     }
 
     let sampled_total = per_workflow.iter().map(|entry| entry.sampled).sum();
@@ -43423,6 +43490,72 @@ mod tests {
                 "LIKE would over-match: `_` is a wildcard: {sql}"
             );
         }
+    }
+
+    /// Discovery must not materialize a superset the stratifier will discard.
+    ///
+    /// `rn <= $3` bounds each *type* but nothing bounds the number of types, so
+    /// the returned set is `types × per_workflow` — a million rows per shard at
+    /// 2,000 types and `per_workflow = 500`, decoded into owned strings and
+    /// `context_headers` JSON, only for `stratify_sample_rows` to keep 2,000 of
+    /// them. On a shared management API that is a memory-exhaustion vector for
+    /// a routine authenticated CI export.
+    ///
+    /// The statement must therefore apply the same *effective* per-type share
+    /// the global budget allows. `GREATEST(…, 1)` is the load-bearing half of
+    /// it: without the floor, a deployment with more types than
+    /// `MAX_SAMPLE_TOTAL` gets an integer-divided limit of zero and the export
+    /// returns nothing at all — no candidates *and* no per-type population
+    /// census, which is what `zero_coverage_types` and the coverage denominator
+    /// read.
+    #[test]
+    fn history_sample_sql_bounds_discovery_by_the_effective_per_type_share() {
+        for order in [
+            autumn_harvest::replay_sample::SampleOrder::Oldest,
+            autumn_harvest::replay_sample::SampleOrder::Newest,
+        ] {
+            let sql = history_sample_candidates_sql(order);
+            assert!(
+                sql.contains("LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))"),
+                "discovery must bound rows by the effective per-type share, or a \
+                 many-type deployment materializes `types * per_workflow` rows to \
+                 keep MAX_SAMPLE_TOTAL: {sql}"
+            );
+            assert!(
+                !sql.contains("WHERE rn <= $3\n"),
+                "the unbounded per-type limit must be gone, not merely joined: {sql}"
+            );
+            assert!(
+                sql.contains("SELECT DISTINCT workflow_name FROM ranked"),
+                "the type count must be taken over the *unfiltered* ranked set, or \
+                 the share is computed from an already-truncated population: {sql}"
+            );
+        }
+    }
+
+    /// The bound is only correct if it is at least as generous as what the
+    /// global stratifier will keep, or a shard would withhold rows the union
+    /// needed and silently shrink real coverage.
+    ///
+    /// A shard sees at most the types the union sees, so `MAX / types_shard >=
+    /// MAX / types_union`: the per-shard share is never smaller than the global
+    /// one. This pins that arithmetic rather than trusting the prose.
+    #[test]
+    fn the_per_shard_share_is_never_smaller_than_the_global_share() {
+        let max = autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL;
+        let share = |types: usize| max.checked_div(types).map_or(max, |s| s.max(1));
+        for types_union in [1usize, 2, 41, 500, 2_000, 5_000] {
+            for types_shard in 1..=types_union {
+                assert!(
+                    share(types_shard) >= share(types_union),
+                    "shard share must be >= global share: {types_shard} vs {types_union}"
+                );
+            }
+        }
+        // And every type keeps at least one row, so the population census — the
+        // manifest's `in_flight_total` and `zero_coverage_types` — survives even
+        // when types outnumber the whole budget.
+        assert_eq!(share(max * 3), 1);
     }
 
     /// The literal above must track the constant it mirrors, or the exclusion

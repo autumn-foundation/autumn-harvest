@@ -2739,6 +2739,30 @@ pub struct ReplayDrift {
     pub fixture_path: std::path::PathBuf,
 }
 
+/// One workflow type whose fixtures in the bundle disagree with what the
+/// manifest says the export wrote.
+///
+/// Produced by
+/// [`ReplayDriftReport::bundle_inventory_mismatches`](ReplayDriftReport::bundle_inventory_mismatches).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BundleInventoryMismatch {
+    /// The workflow type the disagreement is about.
+    pub workflow_name: String,
+    /// How many fixtures of this type the manifest says were exported.
+    pub declared: u64,
+    /// How many fixtures of this type the bundle actually holds.
+    pub found: usize,
+    /// Executions the manifest says were exported but which the bundle does not
+    /// contain — histories the gate silently never replayed.
+    ///
+    /// Empty when the manifest carries no identities (a pre-identity export),
+    /// in which case only the counts were comparable.
+    pub missing_execution_ids: Vec<ExecutionId>,
+    /// Executions present in the bundle that the manifest does not list — the
+    /// directory is not the sample the manifest describes.
+    pub unexpected_execution_ids: Vec<ExecutionId>,
+}
+
 /// One fixture that could not be replayed at all (a harness-side problem, not a
 /// determinism verdict).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2778,6 +2802,18 @@ pub struct ReplayDriftReport {
     pub blocked: Vec<ReplayBlocked>,
     /// Fixtures skipped because `allow_unregistered` was set.
     pub skipped: usize,
+    /// What the bundle actually held, per workflow type: the execution ids of
+    /// every fixture discovered, whatever its replay outcome.
+    ///
+    /// The bundle-side half of the manifest reconciliation. Recorded for every
+    /// fixture — passed, diverged, skipped, blocked — because presence in the
+    /// directory is the question, not verdict: a fixture that failed to replay
+    /// was still delivered, and counting only the successes would report every
+    /// divergence as *also* a missing file.
+    ///
+    /// A fixture too malformed to yield an execution id contributes nothing
+    /// here; it is already a rung-`2` block in its own right.
+    pub found_execution_ids: std::collections::BTreeMap<String, Vec<ExecutionId>>,
     /// Coverage claimed by the bundle's manifest, when it has one.
     pub coverage: Option<crate::replay_sample::SampleManifest>,
     /// Why the bundle's manifest could not be read, when it was present but
@@ -2810,8 +2846,19 @@ impl ReplayDriftReport {
         };
         let mut diverged = Vec::new();
         let mut blocked = Vec::new();
+        let mut found_execution_ids: std::collections::BTreeMap<String, Vec<ExecutionId>> =
+            std::collections::BTreeMap::new();
 
         for result in batch.results {
+            // Inventory first, and for every status: the question this answers
+            // is "was this history delivered?", which a divergence does not
+            // change. Recorded before the match so no future arm can forget it.
+            if let Some(execution_id) = result.execution_id {
+                found_execution_ids
+                    .entry(result.workflow_name.clone())
+                    .or_default()
+                    .push(execution_id);
+            }
             match result.status {
                 FixtureStatus::Passed | FixtureStatus::Skipped { .. } => {}
                 FixtureStatus::Failed(ReplayStatus::NonDeterminismDetected {
@@ -2858,12 +2905,17 @@ impl ReplayDriftReport {
             }
         }
 
+        for ids in found_execution_ids.values_mut() {
+            ids.sort_unstable_by_key(ExecutionId::as_uuid);
+        }
+
         Self {
             total: batch.fixtures_total,
             succeeded: batch.succeeded,
             diverged,
             blocked,
             skipped: batch.skipped,
+            found_execution_ids,
             coverage,
             manifest_unreadable,
             allow_empty_bundle,
@@ -2911,6 +2963,116 @@ impl ReplayDriftReport {
             // itself a disagreement rather than a reason to stay silent.
             !usize::try_from(manifest.sampled_total).is_ok_and(|declared| declared == self.total)
         })
+    }
+
+    /// Per-workflow-type disagreements between the bundle and the manifest's
+    /// inventory.
+    ///
+    /// [`fixture_count_disagrees_with_manifest`](Self::fixture_count_disagrees_with_manifest)
+    /// compares one number against one number, so it accepts any corruption
+    /// that preserves the *total*. Lose a fixture for workflow `A` while the
+    /// artifact gains a duplicate for workflow `B` and the totals still match:
+    /// both `B` fixtures replay cleanly, the gate exits `0`, and `A` was never
+    /// verified at all. That is the same silent false pass the aggregate check
+    /// exists to prevent, one level down.
+    ///
+    /// So this reconciles at the two finer grains the manifest supports:
+    ///
+    /// * **Per type** — `found` against `declared`, catching a substitution
+    ///   across types that the total hides.
+    /// * **Per execution** — the exact ids, catching a substitution *within* a
+    ///   type, which per-type counts hide in turn. A bundle that swaps one
+    ///   execution of `A` for a duplicate of another `A` matches on every
+    ///   count there is; only identity separates it from the real sample.
+    ///
+    /// The identity comparison is skipped for a manifest that carries no
+    /// [`sampled_execution_ids`](crate::replay_sample::SampleWorkflowCoverage::sampled_execution_ids)
+    /// — a bundle from a pre-identity export makes *no claim* about which
+    /// executions it holds, and reading that as a claim of *none* would report
+    /// every fixture as unexpected on every such bundle. Those degrade to the
+    /// per-type count check, which is still strictly stronger than the total.
+    ///
+    /// A type present in the bundle but absent from the manifest is reported
+    /// with `declared: 0`, and one in the manifest but absent from the bundle
+    /// with `found: 0`; neither can be expressed by comparing only the types
+    /// the two happen to share.
+    #[must_use]
+    pub fn bundle_inventory_mismatches(&self) -> Vec<BundleInventoryMismatch> {
+        let Some(manifest) = self.coverage.as_ref() else {
+            return Vec::new();
+        };
+        let declared: std::collections::BTreeMap<
+            &str,
+            &crate::replay_sample::SampleWorkflowCoverage,
+        > = manifest
+            .per_workflow
+            .iter()
+            .map(|entry| (entry.workflow_name.as_str(), entry))
+            .collect();
+
+        // Union of both sides: a type only one of them knows about is exactly
+        // the case a shared-keys comparison would miss.
+        let names: std::collections::BTreeSet<&str> = declared
+            .keys()
+            .copied()
+            .chain(self.found_execution_ids.keys().map(String::as_str))
+            .collect();
+
+        let mut mismatches = Vec::new();
+        for name in names {
+            let entry = declared.get(name).copied();
+            let empty: Vec<ExecutionId> = Vec::new();
+            let found_ids = self.found_execution_ids.get(name).unwrap_or(&empty);
+            let declared_count = entry.map_or(0, |coverage| coverage.sampled);
+            let count_disagrees =
+                !u64::try_from(found_ids.len()).is_ok_and(|found| found == declared_count);
+
+            // Only compare identities when the manifest actually asserts them.
+            let declared_ids = entry.map_or(&empty, |coverage| &coverage.sampled_execution_ids);
+            // Keyed on the inner UUID because `ExecutionId` is deliberately not
+            // `Ord`; the set difference needs a total order, and a UUID has one.
+            let (missing, unexpected): (Vec<ExecutionId>, Vec<ExecutionId>) =
+                if declared_ids.is_empty() {
+                    (Vec::new(), Vec::new())
+                } else {
+                    let declared_set: std::collections::BTreeSet<uuid::Uuid> =
+                        declared_ids.iter().map(ExecutionId::as_uuid).collect();
+                    let found_set: std::collections::BTreeSet<uuid::Uuid> =
+                        found_ids.iter().map(ExecutionId::as_uuid).collect();
+                    (
+                        declared_set
+                            .difference(&found_set)
+                            .copied()
+                            .map(ExecutionId::from_uuid)
+                            .collect(),
+                        found_set
+                            .difference(&declared_set)
+                            .copied()
+                            .map(ExecutionId::from_uuid)
+                            .collect(),
+                    )
+                };
+
+            if count_disagrees || !missing.is_empty() || !unexpected.is_empty() {
+                mismatches.push(BundleInventoryMismatch {
+                    workflow_name: name.to_string(),
+                    declared: declared_count,
+                    found: found_ids.len(),
+                    missing_execution_ids: missing,
+                    unexpected_execution_ids: unexpected,
+                });
+            }
+        }
+        mismatches
+    }
+
+    /// Whether the bundle's contents disagree with the manifest's inventory.
+    ///
+    /// See [`bundle_inventory_mismatches`](Self::bundle_inventory_mismatches)
+    /// for what is compared and why the total alone is not enough.
+    #[must_use]
+    pub fn bundle_inventory_disagrees_with_manifest(&self) -> bool {
+        !self.bundle_inventory_mismatches().is_empty()
     }
 
     /// Whether the bundle's manifest reports incomplete cross-shard coverage.
@@ -3082,7 +3244,7 @@ impl ReplayDriftReport {
     /// |------|---------|
     /// | `0` | Every fixture replayed cleanly |
     /// | `1` | One or more fixtures diverged — a determinism regression |
-    /// | `2` | The gate could not fully run: a fixture failed to replay, the bundle's manifest was present but unreadable, the bundle holds a different number of fixtures than its manifest declares, **or** the export itself delivered fewer fixtures than the sample selected (dominates over `1`, because a gate that did not fully run cannot be trusted — mirrors [`CiReport::exit_code`]) |
+    /// | `2` | The gate could not fully run: a fixture failed to replay, the bundle's manifest was present but unreadable, the bundle holds a different number of fixtures than its manifest declares, the bundle's per-type or per-execution inventory disagrees with the manifest, **or** the export itself delivered fewer fixtures than the sample selected (dominates over `1`, because a gate that did not fully run cannot be trusted — mirrors [`CiReport::exit_code`]) |
     /// | `3` | Nothing was verified — the bundle was empty, or every fixture was skipped. [`allow_empty_bundle`](ReplayVerifier::allow_empty_bundle) opts out, but **not** when the bundle's manifest reports incomplete shard coverage: an export that could not read the fleet is empty too, and certifying a release against it is a false green |
     /// | `4` | `require_complete_coverage` is set and complete coverage was not proven — the sample is knowingly incomplete, a workflow type with in-flight work was sampled zero times, **or** the bundle carries no readable manifest at all |
     ///
@@ -3099,6 +3261,7 @@ impl ReplayDriftReport {
         if !self.blocked.is_empty()
             || self.manifest_is_unreadable()
             || self.fixture_count_disagrees_with_manifest()
+            || self.bundle_inventory_disagrees_with_manifest()
             || self.export_is_incomplete()
         {
             return 2;
@@ -3204,6 +3367,41 @@ impl ReplayDriftReport {
                  transit?), so this verdict covers only a subset of what was exported",
                 coverage.sampled_total, self.total,
             )?;
+        }
+        self.fmt_inventory_mismatches(f)?;
+        Ok(())
+    }
+
+    /// Render the per-type / per-execution bundle-vs-manifest disagreements.
+    ///
+    /// Split out from the aggregate line because the operator action differs:
+    /// the total being wrong says "files went missing", while a matching total
+    /// with a mismatched inventory says "the files you have are not the files
+    /// that were exported" — which a re-count would never reveal.
+    fn fmt_inventory_mismatches(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mismatches = self.bundle_inventory_mismatches();
+        if mismatches.is_empty() {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "  BUNDLE INVENTORY MISMATCH: the fixtures present are not the ones the \
+             manifest says were exported, so some in-flight histories were never \
+             replayed even though the totals may agree. Re-export, or re-fetch the \
+             artifact.",
+        )?;
+        for mismatch in mismatches {
+            writeln!(
+                f,
+                "    {}: manifest declares {}, bundle holds {}",
+                mismatch.workflow_name, mismatch.declared, mismatch.found,
+            )?;
+            for execution_id in &mismatch.missing_execution_ids {
+                writeln!(f, "      MISSING    {execution_id}")?;
+            }
+            for execution_id in &mismatch.unexpected_execution_ids {
+                writeln!(f, "      UNEXPECTED {execution_id}")?;
+            }
         }
         Ok(())
     }
