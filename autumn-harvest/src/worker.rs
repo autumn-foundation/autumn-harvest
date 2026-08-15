@@ -19178,6 +19178,43 @@ impl Worker {
                         max_concurrency,
                         "worker registered in fleet"
                     );
+                    // This registration may be a RESTART of the same configured
+                    // worker_id onto a NEW build (register_worker upserts on
+                    // worker_id and refreshes build_id/started_at). Capability-miss
+                    // evidence stores bare IDs, so without this the restarted --
+                    // possibly now capable -- instance is indistinguishable from
+                    // the old incapable one, and another claimant would derive
+                    // `AllLiveWorkersMissed` and terminally fail a run at exactly
+                    // the moment the fix arrived (issue #804, Codex round-26 P1).
+                    //
+                    // Only ever REMOVES evidence, so it can only bias toward
+                    // releasing rather than escalating; the ungated absolute
+                    // ceiling on `capability_misses` (untouched here) still bounds
+                    // a worker crash-looping on the same incapable build.
+                    match crate::queue::invalidate_capability_miss_evidence_for_worker(
+                        &mut conn,
+                        &self.config.worker_id,
+                        &self.config.queues,
+                    )
+                    .await
+                    {
+                        Ok(cleared) if cleared > 0 => {
+                            tracing::info!(
+                                worker_id = %self.config.worker_id,
+                                cleared,
+                                "cleared stale capability-miss evidence for re-registered worker id"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                worker_id = %self.config.worker_id,
+                                error = %error,
+                                "failed to clear stale capability-miss evidence; a task this id \
+                                 missed on a previous build may escalate early"
+                            );
+                        }
+                    }
                 }
             }
             Err(error) => {

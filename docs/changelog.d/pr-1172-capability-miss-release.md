@@ -451,3 +451,93 @@ expire during the cleanup rather than during the cycle, and since
 small enough to be reliable cuts the cycle instead. The pure control test
 carries the falsification; the DB test carries the regression guard for the
 move. Both doc comments say exactly that.
+
+## Review round 26 — a same-id restart onto a capable build must not still read as incapable (Codex P1)
+
+`capability_miss_workers` stores **bare worker IDs**, and `workers::register_worker`
+upserts on `worker_id` — refreshing that row's `started_at` and `build_id`. A pod
+restarting under the same configured `worker_id` onto a **new build that registers
+the previously-missing handler** is therefore an explicitly supported operation
+that the miss evidence could not see: by ID alone, the new capable instance was
+indistinguishable from the old incapable one.
+
+The harm lands at precisely the wrong moment. Once the persisted release budget
+is spent, the next incapable claimant reads the live fleet, finds every ID in it
+already covered by the stale evidence, derives `AllLiveWorkersMissed`, and
+terminally fails the execution — **while the pod that can actually run it is up
+and polling**. That is the exact failure issue #804 exists to prevent, arriving
+one claim before the fix would have landed.
+
+**Fix.** `Worker::register_in_fleet` now clears the re-registering ID's stale
+evidence immediately after a successful `register_worker`, via the new
+`queue::invalidate_capability_miss_evidence_for_worker`:
+
+```sql
+UPDATE harvest_task_queue
+SET capability_miss_workers = array_remove(capability_miss_workers, $1)
+WHERE queue_name = ANY($2)
+  AND $1 = ANY(capability_miss_workers)
+```
+
+Registration is the first thing `Worker::run` does, so the invalidation lands
+before this worker's first poll — and, more importantly, before any *other*
+worker's next claim can weigh the fleet.
+
+**Why invalidation rather than keying evidence by build/generation.** The finding
+offered both. Keying by `build_id` degenerates exactly where it is needed most:
+`build_id` is optional and empty by default (`#171`), so the common deployment
+gets no discrimination at all. Keying by a registration generation would change
+the persisted array's format and thread a new composite identity through
+`resolve_capability_miss`, `release_task_for_capability_miss`, and every DB
+fixture — a wide change whose failure mode is a *silently mismatched* key.
+Invalidation is one new statement plus one call site, changes no formats, and
+fails in the safe direction: it only ever **removes** evidence, and removing
+evidence can only bias the decision toward releasing rather than terminally
+failing (AC1).
+
+**What is deliberately NOT touched.** `capability_misses` is a true historical
+count of releases and backs the **ungated** absolute ceiling
+(`CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER`), the one bound that still applies when
+no fleet evidence is available. Decrementing it here would remove that bound.
+Pinned by `registration_invalidation_never_refunds_the_release_budget`, which
+asserts the statement's `SET` clause assigns exactly one column.
+
+**Accepted trade-off, stated plainly.** A worker crash-looping on the same
+*incapable* build also clears its own evidence on every restart, so the
+`AllLiveWorkersMissed` **total** bound stops applying to it. That case remains
+bounded — by the absolute ceiling, which this change never touches — so escalation
+still happens, just later. The degradation is deliberately in the safe direction:
+prefer holding a task over terminally failing an execution that a deploy could
+still rescue.
+
+Scoped by `queue_name` so a worker only invalidates evidence on queues it actually
+polls; an unscoped statement would hand a fresh reprieve to a task on a queue this
+worker will never claim from. Failure to invalidate is logged and does not fail
+startup, matching the existing registration error handling — a warning names the
+consequence (a task this ID missed on a previous build may escalate early).
+
+**No new `WorkflowEvent` variant, no migration, no change to the adjacently-tagged
+event JSON** (AC7): a single `UPDATE` against one existing `TEXT[]` column.
+
+**Tests.** Three pure `queue.rs` unit tests pin the statement's shape — that it
+uses `array_remove` on exactly the re-registering ID (never clearing the whole
+set, since other workers' evidence is still true), that it never touches
+`capability_misses`, and that it is scoped by `queue_name`. Two DB integration
+tests in `capability_miss_tests.rs` run as a **pair**:
+
+- `restart_onto_a_capable_build_clears_its_stale_miss_evidence` — the headline.
+  `pod-a` missed the frontier on its old build (budget spent), then restarts onto
+  a build that registers the handler; the task is deferred out of claim range so
+  it registers **without** claiming; `pod-b` (still incapable) then claims. The
+  task must return to `PENDING` with the execution still `RUNNING`.
+- `stale_miss_evidence_from_a_worker_that_never_restarted_still_escalates` — the
+  control. Identical fixture, except `pod-a` is seeded directly into
+  `harvest_workers` and never restarts, so no registration runs and its evidence
+  is still true. The run **does** escalate. Without this the headline test could
+  pass on a fixture that never escalates at all; with it, the release is
+  attributable to the re-registration and nothing else.
+
+Falsifiable — verified by disabling the invalidation call: the headline test fails
+first on the evidence guard (`got [["pod-a"]]`) and, with that guard relaxed,
+fails on the harm itself (`the execution went terminal instead of releasing`),
+while the control passes throughout.

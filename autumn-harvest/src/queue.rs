@@ -2325,6 +2325,76 @@ pub async fn reset_capability_misses_after_inline_progress(
     Ok(updated > 0)
 }
 
+/// SQL for [`invalidate_capability_miss_evidence_for_worker`]. Extracted as a
+/// `const fn` so its shape is unit-testable without a database.
+///
+/// Deliberately touches **only** `capability_miss_workers`. `capability_misses`
+/// is a true historical count of how many times this frontier was released, and
+/// it backs the ungated absolute ceiling
+/// (`CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER`) that bounds the release loop even
+/// when no fleet evidence is available. Decrementing it here would remove that
+/// bound; removing one stale ID only ever weakens the *fleet* evidence, which
+/// biases toward releasing rather than terminally failing.
+#[must_use]
+pub const fn invalidate_capability_miss_evidence_for_worker_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET capability_miss_workers = array_remove(capability_miss_workers, $1) \
+     WHERE queue_name = ANY($2) \
+       AND $1 = ANY(capability_miss_workers)"
+}
+
+/// Drop a worker ID's stale capability-miss evidence because that ID has just
+/// (re-)registered (issue #804, Codex round-26 P1).
+///
+/// `capability_miss_workers` stores **bare worker IDs**, and
+/// [`crate::workers::register_worker`] upserts on `worker_id` — refreshing
+/// `started_at` and `build_id` — so a worker that restarts with the *same*
+/// configured `worker_id` but a *new* build carrying the previously-missing
+/// handler is indistinguishable, by ID alone, from the old incapable instance.
+///
+/// The harm is a false terminal failure at exactly the wrong moment. Once the
+/// persisted release budget is spent, another incapable claimant reads the live
+/// fleet, sees the restarted worker's ID already covered by the stale evidence,
+/// derives [`crate::worker::FleetCapabilityEvidence::AllLiveWorkersMissed`], and
+/// escalates — terminally failing the execution just as the capable build
+/// arrives, which is the precise outcome issue #804 exists to prevent.
+///
+/// Clearing the ID's evidence on re-registration restores the truth: the
+/// restarted instance has *not* been observed to miss this frontier, so the
+/// fleet is no longer "all missed" and the task is released for it to claim.
+///
+/// # Trade-off
+///
+/// A worker crash-looping on the same *incapable* build also clears its own
+/// evidence on each restart, so the `AllLiveWorkersMissed` total bound stops
+/// applying to it. That case is still bounded — by the ungated absolute ceiling
+/// on `capability_misses`, which this function never decrements — and the
+/// degradation is deliberately in the safe direction: prefer holding a task over
+/// terminally failing an execution a deploy could still rescue (AC1).
+///
+/// Scoped by `queue_name` so a worker only invalidates evidence on queues it
+/// actually polls.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn invalidate_capability_miss_evidence_for_worker(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    queues: &[String],
+) -> HarvestResult<usize> {
+    if queues.is_empty() {
+        return Ok(0);
+    }
+    let cleared = diesel::sql_query(invalidate_capability_miss_evidence_for_worker_query())
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(cleared)
+}
+
 /// Hint for sticky cross-worker routing when parking or enqueueing a task.
 ///
 /// When both fields are set, the task is pinned to `worker_id` for `timeout`
@@ -3949,6 +4019,65 @@ mod tests {
             set.matches('=').count(),
             2,
             "the reset must assign exactly the two capability columns: {set}"
+        );
+    }
+
+    /// A same-ID restart is explicitly supported: `workers::register_worker`
+    /// upserts on `worker_id` and refreshes `started_at`/`build_id`. But
+    /// `capability_miss_workers` stores bare IDs, so the new — possibly capable
+    /// — instance is indistinguishable from the old incapable one. Removing
+    /// exactly that ID on re-registration restores the truth (issue #804, Codex
+    /// round-26 P1).
+    #[test]
+    fn registration_invalidates_only_that_workers_miss_evidence() {
+        let sql = invalidate_capability_miss_evidence_for_worker_query();
+        assert!(
+            sql.contains("array_remove(capability_miss_workers, $1)"),
+            "must drop exactly the re-registering ID, not clear the set -- other \
+             workers' evidence is still true: {sql}"
+        );
+        assert!(
+            sql.contains("$1 = ANY(capability_miss_workers)"),
+            "must only touch rows that actually carry this ID's evidence: {sql}"
+        );
+    }
+
+    /// `capability_misses` is a true historical count of releases and backs the
+    /// **ungated** absolute ceiling that bounds the release loop when no fleet
+    /// evidence is available. Decrementing it here would remove the only bound
+    /// that still applies to a worker crash-looping on the same incapable build
+    /// (which now clears its own evidence on every restart), turning a bounded
+    /// degradation into an unbounded release loop.
+    #[test]
+    fn registration_invalidation_never_refunds_the_release_budget() {
+        let sql = invalidate_capability_miss_evidence_for_worker_query();
+        assert!(
+            !sql.contains("capability_misses"),
+            "the count is historical and backs the ungated absolute ceiling; \
+             only the DISTINCT-worker evidence may be invalidated: {sql}"
+        );
+        let set = sql
+            .split("SET ")
+            .nth(1)
+            .and_then(|s| s.split(" WHERE").next())
+            .expect("statement has a SET ... WHERE shape");
+        assert_eq!(
+            set.matches('=').count(),
+            1,
+            "invalidation must assign exactly the one evidence column: {set}"
+        );
+    }
+
+    /// A worker only observes — and therefore may only invalidate evidence on —
+    /// the queues it actually polls. An unscoped statement would let a worker on
+    /// one queue hand a fresh `AllLiveWorkersMissed` reprieve to a task on a
+    /// queue it will never claim from.
+    #[test]
+    fn registration_invalidation_is_scoped_to_the_workers_queues() {
+        let sql = invalidate_capability_miss_evidence_for_worker_query();
+        assert!(
+            sql.contains("queue_name = ANY($2)"),
+            "evidence invalidation must be scoped to this worker's queues: {sql}"
         );
     }
 

@@ -53,7 +53,7 @@ use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::{
-    harvest_dead_letters, harvest_rate_limit_buckets, harvest_task_queue,
+    harvest_dead_letters, harvest_rate_limit_buckets, harvest_task_queue, harvest_workers,
     harvest_workflow_executions,
 };
 use autumn_harvest::telemetry::{
@@ -2021,6 +2021,249 @@ async fn single_worker_fleet_escalates_at_the_configured_budget() {
 }
 
 // ---------------------------------------------------------------------------
+// Same-id restart onto a capable build (issue #804, Codex round-26 P1)
+// ---------------------------------------------------------------------------
+
+const Q_RESTART: &str = "q804-restart";
+
+/// Move the execution's task rows out of (or back into) claim range.
+///
+/// The restarted worker in these tests must REGISTER without CLAIMING: it is
+/// deliberately the capable one, so a claim would complete the run and the
+/// escalation path under test would never be reached. `claim_task` gates on
+/// `scheduled_at <= NOW()`, so deferring the row is the precise, race-free way
+/// to phase "this worker came up" ahead of "this worker polled".
+async fn set_task_scheduled_at(url: &str, exec_id: ExecutionId, at: chrono::DateTime<Utc>) {
+    let mut conn = connect(url).await;
+    diesel::update(
+        harvest_task_queue::table
+            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid()))),
+    )
+    .set(harvest_task_queue::scheduled_at.eq(at))
+    .execute(&mut conn)
+    .await
+    .expect("reschedule task");
+}
+
+/// **Control for `restart_onto_a_capable_build_clears_its_stale_miss_evidence`.**
+///
+/// Identical fixture, with the one difference that `pod-a` never restarts: it is
+/// seeded straight into `harvest_workers`, so no registration runs and no
+/// evidence is invalidated. The stale entry therefore still covers a live
+/// worker, `pod-b`'s miss completes the sweep, and the run is failed terminally.
+///
+/// This is what makes the pair meaningful. Without it the sibling test could
+/// pass because the fixture never escalates at all — here the same seeded
+/// evidence, the same budget, and the same incapable claimant DO escalate, so
+/// the sibling's release is attributable to the re-registration and nothing
+/// else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_miss_evidence_from_a_worker_that_never_restarted_still_escalates() {
+    const BUDGET: u32 = 1;
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "restart_target_wf",
+        serde_json::json!({}),
+        Q_RESTART,
+    )
+    .await;
+
+    // `pod-a` missed this frontier on a previous deploy...
+    seed_prior_missing_workers(&url, exec_id, &["pod-a"]).await;
+    // ...and is live, but was never restarted, so its evidence is still true.
+    seed_live_worker(&url, "pod-a", Q_RESTART).await;
+
+    let metrics = Arc::new(CapabilityMetrics::default());
+    let pod_b = build_worker(
+        "pod-b",
+        &[Q_RESTART],
+        build_registry(
+            vec![workflow_info("some_other_wf", decoy_workflow)],
+            vec![],
+            Arc::clone(&metrics),
+        ),
+        BUDGET,
+    );
+
+    let failed = with_worker_running(&pod_b, &pool, async {
+        wait_for_state(&url, exec_id, "FAILED", Duration::from_secs(60)).await
+    })
+    .await;
+
+    let error = failed.error.unwrap_or_default();
+    assert!(
+        error.starts_with(NO_CAPABLE_WORKER_PREFIX),
+        "the control must escalate through the capability-miss path, got {error:?}"
+    );
+    assert_eq!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED),
+        1,
+        "exactly one escalation, got {:?}",
+        metrics.samples()
+    );
+}
+
+/// **Issue #804, Codex round-26 P1.** A worker that restarts onto a build which
+/// registers the missing handler must not still be counted as incapable.
+///
+/// `workers::register_worker` upserts on `worker_id` and refreshes that row's
+/// `build_id`/`started_at`, so restarting a pod under the same configured
+/// `worker_id` onto a new build is explicitly supported. `capability_miss_workers`
+/// stores only the bare id, though, so before this fix the new capable instance
+/// was indistinguishable from the old incapable one.
+///
+/// The harm lands at exactly the wrong moment. With the release budget already
+/// spent, the next incapable claimant reads the live fleet, finds every id in it
+/// already covered by the stale evidence, derives `AllLiveWorkersMissed`, and
+/// terminally fails the execution — while the pod that can actually run it is up
+/// and polling. That is the precise failure issue #804 exists to prevent, so the
+/// fix has to land before the claim, not after.
+///
+/// Phasing is deliberate and race-free rather than timing-based: the task is
+/// deferred out of claim range while `pod-a` comes up, so it registers (clearing
+/// its own stale entry) without claiming, and only then is the row made eligible
+/// for the incapable `pod-b`. `pod-a`'s heartbeat stays fresh across its
+/// shutdown — `live_workers_on_queue_query` filters on heartbeat age alone, not
+/// status — so it is still a live peer when `pod-b` weighs the evidence, which is
+/// the whole point.
+///
+/// Falsifiable — verified by reverting the invalidation call in
+/// `Worker::register_in_fleet`: `pod-a`'s entry survives, `pod-b`'s miss reads as
+/// a completed fleet sweep, and the execution lands in `FAILED` with a
+/// `no_capable_worker:` reason instead of the task returning to `PENDING`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_onto_a_capable_build_clears_its_stale_miss_evidence() {
+    // Budget 1, already spent by the seeded miss: the very next miss escalates
+    // unless the evidence is invalidated, so the two outcomes are one claim
+    // apart and nothing else can explain the difference.
+    const BUDGET: u32 = 1;
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "restart_target_wf",
+        serde_json::json!({}),
+        Q_RESTART,
+    )
+    .await;
+
+    // `pod-a` missed this frontier on its OLD build, exhausting the budget.
+    seed_prior_missing_workers(&url, exec_id, &["pod-a"]).await;
+
+    // Phase 1: `pod-a` restarts onto a build that DOES register the handler.
+    // Deferred out of claim range so it registers without claiming — a claim
+    // would simply run the workflow and never reach the decision under test.
+    set_task_scheduled_at(&url, exec_id, Utc::now() + chrono::Duration::hours(1)).await;
+    let restart_metrics = Arc::new(CapabilityMetrics::default());
+    let pod_a = build_worker(
+        "pod-a",
+        &[Q_RESTART],
+        build_registry(
+            vec![workflow_info("restart_target_wf", decoy_workflow)],
+            vec![],
+            Arc::clone(&restart_metrics),
+        ),
+        BUDGET,
+    );
+    with_worker_running(&pod_a, &pool, async {
+        // Registration is the first thing `run` does, so waiting for the row to
+        // carry a fresh heartbeat is waiting for the invalidation to have run.
+        wait_for_live_worker(&url, "pod-a", Duration::from_secs(30)).await;
+    })
+    .await;
+
+    // The evidence must be gone the moment the worker registered -- not on some
+    // later claim, because the whole point is that the escalation below happens
+    // BEFORE this pod gets one.
+    let after_restart = load_tasks(&url, exec_id).await;
+    assert!(
+        after_restart
+            .iter()
+            .all(|t| !t.capability_miss_workers.iter().any(|w| w == "pod-a")),
+        "re-registration must drop this id's stale evidence, got {:?}",
+        after_restart
+            .iter()
+            .map(|t| t.capability_miss_workers.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        after_restart.iter().all(|t| t.capability_misses >= 1),
+        "the historical release count must be preserved -- it backs the ungated \
+         absolute ceiling that still bounds a pod crash-looping on the SAME \
+         incapable build, got {:?}",
+        after_restart
+            .iter()
+            .map(|t| t.capability_misses)
+            .collect::<Vec<_>>()
+    );
+
+    // Phase 2: the task becomes eligible and the still-incapable `pod-b` wins
+    // the claim. `pod-a` remains a live peer (fresh heartbeat, shut down or not).
+    set_task_scheduled_at(&url, exec_id, Utc::now() - chrono::Duration::seconds(5)).await;
+    let metrics = Arc::new(CapabilityMetrics::default());
+    let pod_b = build_worker(
+        "pod-b",
+        &[Q_RESTART],
+        build_registry(
+            vec![workflow_info("some_other_wf", decoy_workflow)],
+            vec![],
+            Arc::clone(&metrics),
+        ),
+        BUDGET,
+    );
+
+    let observed = with_worker_running(&pod_b, &pool, async {
+        wait_for_miss_by(&url, exec_id, "pod-b", Duration::from_secs(60)).await
+    })
+    .await;
+
+    let task = observed.expect(
+        "the execution went terminal instead of releasing -- `pod-a`'s stale \
+         evidence made `pod-b`'s miss look like a completed fleet sweep",
+    );
+
+    // The headline: released for the restarted pod, not failed out from under it.
+    assert_eq!(
+        task.state, "PENDING",
+        "the task must return to the queue for the capable pod to claim"
+    );
+    let execution = load_execution(&url, exec_id).await;
+    assert_eq!(
+        execution.state, "RUNNING",
+        "a live worker on a build that registers the handler means the fleet is \
+         NOT swept, so the run must survive"
+    );
+    assert_eq!(
+        task.capability_miss_workers,
+        vec!["pod-b".to_string()],
+        "only the worker that actually missed on its CURRENT build may carry \
+         evidence"
+    );
+    assert_eq!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED),
+        0,
+        "no escalation may occur while a live peer is unaccounted for, got {:?}",
+        metrics.samples()
+    );
+    assert_eq!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_RELEASED),
+        1,
+        "the miss must be released, got {:?}",
+        metrics.samples()
+    );
+    // AC4: a capability miss is never a crash, on this path either.
+    assert_eq!(metrics.quarantine_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // Session hard-pin carve-out (#606) — release is impossible, so escalate now.
 // ---------------------------------------------------------------------------
 
@@ -2534,6 +2777,32 @@ async fn seed_live_worker(url: &str, worker_id: &str, queue: &str) {
     .execute(&mut conn)
     .await
     .expect("seed live worker row");
+}
+
+/// Poll until `worker_id` has a row in `harvest_workers` (issue #804 round 26).
+///
+/// `Worker::run` registers before entering its poll loop, so this is the
+/// observable edge for "this worker has come up" — and therefore for "its stale
+/// capability-miss evidence has been invalidated", which happens in the same
+/// registration step.
+async fn wait_for_live_worker(url: &str, worker_id: &str, timeout: Duration) {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let mut conn = connect(url).await;
+            let found: i64 = harvest_workers::table
+                .filter(harvest_workers::worker_id.eq(worker_id))
+                .count()
+                .get_result(&mut conn)
+                .await
+                .expect("count worker rows");
+            if found > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("worker {worker_id} never registered within {timeout:?}"));
 }
 
 /// Codex round-8 P1 / the success metric's load-bearing half: **zero spurious
