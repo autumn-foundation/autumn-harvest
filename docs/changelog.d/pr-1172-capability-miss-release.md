@@ -747,3 +747,76 @@ Two DB tests, each falsified by reverting its own fix:
   injected deterministically and reversibly (the suite runs `--test-threads=1`).
   Reverting to log-and-continue fails it with `left: 1, right: 0` — the worker
   published while its stale evidence survived.
+
+## Review round 29 — an escalation is revalidated at the commit boundary (Codex, P1)
+
+Round 27 characterised the gap between the final evidence read and the terminal
+write as "a few microseconds of pure in-memory work". That was wrong, and this
+finding says exactly why: `fail_task_and_execution` **awaits
+`store::load_history`** before it opens the failure transaction, so the window
+contained a database read whose cost grows with the run's history. A capable
+peer registering during that read was neither seen nor blocked, and neither
+`fail_task_and_execution` nor `queue::fail_task` rechecks anything.
+
+### The expensive read is paid first, and the type system enforces it
+
+`fail_task_and_execution` is split into `preload_failure_history` (the awaited
+read, resolved into a `PreloadedFailureHistory`) and
+`fail_task_and_execution_with_history` (the writes, which **consume** it). The
+public wrapper preloads and delegates, so all six existing call sites are
+behaviourally identical.
+
+Because the committing call takes the preloaded value by value, an escalation
+*cannot* reach the write without having already paid the read. The ordering is
+therefore a compile-time property rather than a comment that drifts — which is
+the whole reason round 27's comment was able to become false.
+
+### Then the decision is re-run one last time
+
+With the expensive await behind it, the escalation re-reads the miss evidence
+(ownership-guarded) and the live fleet, and re-runs the *same pure resolver*.
+`revalidate_escalation` turns that into one rule:
+
+- the claim is gone → **withdraw** (`claim_lost`); the escalation write is not
+  ownership-guarded, so a dispatcher that lost the row must not fail it;
+- the fresh answer is no longer `Escalate` → **withdraw** (`evidence_changed`);
+  a peer that re-registered appears here either as a cleared miss entry or as a
+  newly-live capable worker, and both flip the answer;
+- otherwise → **commit**.
+
+A withdrawn escalation falls through to the ordinary release path rather than
+returning early. That is load-bearing: leaving the row `RUNNING` under a **live**
+worker would strand it, because the orphan reclaimer requires a dead heartbeat.
+The release arm was extracted into `release_capability_miss` so the two callers
+cannot drift on the backoff, the phase-gated counter handling, or the metric.
+
+An `Unreadable` row is judged by its fresh action rather than being withdrawn on
+sight: round 28 already handles its staleness upstream by forcing
+`PossiblyStale`, which withholds the two evidence-derived bounds. An escalation
+that survives *that* — the absolute ceiling, the storage ceiling, a zero budget,
+a session pin — is a real one, so AC3 keeps terminating.
+
+### What is left, stated plainly
+
+A worker that registers strictly **after** the revalidation is indistinguishable
+from one that registers after the commit: any implementation evaluates the fleet
+at *some* instant, and "no capable worker is live" is a statement about a moving
+set. What this round removes is the part that was not inherent — an unbounded
+awaited read sitting inside the window. The residual is now genuinely the commit
+itself, it fails in the same direction as before, and it is reachable only with
+the budget already exhausted, where the outcome is a paged, redrivable
+`no_capable_worker:` failure.
+
+**No new `WorkflowEvent` variant, no migration** (AC7).
+
+### Tests
+
+Four pure `worker.rs` unit tests over `revalidate_escalation`: a lost claim
+withdraws even when the decision said escalate; a fresh `Release` withdraws; an
+unchanged decision commits; and an `Unreadable` row is judged by its fresh action
+in both directions.
+
+The ordering property is pinned by the compiler rather than by a test — the
+committing function cannot be called without the preloaded history — and the
+24-test DB suite covers the refactor for behavioural regression, since every
+escalation test in it now runs through the split path.

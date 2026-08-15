@@ -8841,13 +8841,46 @@ async fn fail_task_and_execution(
     worker_id: &str,
     error: &str,
 ) -> HarvestResult<()> {
-    let Some(exec_uuid) = task.workflow_exec_id else {
-        return fail_task_only(conn, task.id, error).await;
-    };
+    let preloaded = preload_failure_history(conn, task).await;
+    fail_task_and_execution_with_history(conn, task, worker_id, error, preloaded).await
+}
 
+/// The history read [`fail_task_and_execution`] needs, resolved ahead of the
+/// terminal write (issue #804, Codex round-29 P1).
+///
+/// Loading a workflow's history is an *awaited database read* whose cost grows
+/// with the history, and it used to sit between a capability-miss escalation's
+/// last evidence check and its terminal write — so the window in which a
+/// capable peer could go live without being noticed was neither small nor
+/// bounded. Hoisting the read into a value the committing call *consumes* makes
+/// that ordering a compile-time property rather than a comment: an escalation
+/// cannot reach the write without having already paid the read, so its final
+/// revalidation is the last thing before the commit.
+enum PreloadedFailureHistory {
+    /// The task has no owning execution; only the queue row is failed.
+    NoExecution,
+    /// The next event id to append the terminal `WorkflowFailed` at.
+    Loaded {
+        exec_id: ExecutionId,
+        next_event_id: i32,
+    },
+    /// The history could not be read; rows are updated without an event append.
+    Unavailable { exec_id: ExecutionId },
+}
+
+async fn preload_failure_history(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+) -> PreloadedFailureHistory {
+    let Some(exec_uuid) = task.workflow_exec_id else {
+        return PreloadedFailureHistory::NoExecution;
+    };
     let exec_id = execution_id_from_uuid(exec_uuid);
-    let history = match store::load_history(conn, exec_id).await {
-        Ok(h) => h,
+    match store::load_history(conn, exec_id).await {
+        Ok(h) => PreloadedFailureHistory::Loaded {
+            exec_id,
+            next_event_id: h.next_event_id,
+        },
         Err(history_error) => {
             tracing::warn!(
                 task_id = %task.id,
@@ -8855,16 +8888,37 @@ async fn fail_task_and_execution(
                 error = %history_error,
                 "failed to load workflow history while persisting task failure; updating rows without event append"
             );
+            PreloadedFailureHistory::Unavailable { exec_id }
+        }
+    }
+}
+
+async fn fail_task_and_execution_with_history(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    error: &str,
+    preloaded: PreloadedFailureHistory,
+) -> HarvestResult<()> {
+    let (exec_id, next_event_id) = match preloaded {
+        PreloadedFailureHistory::NoExecution => {
+            return fail_task_only(conn, task.id, error).await;
+        }
+        PreloadedFailureHistory::Unavailable { exec_id } => {
             update_workflow_execution_failed(conn, exec_id, worker_id, error, None).await?;
             return queue::fail_task(conn, task.id, error).await;
         }
+        PreloadedFailureHistory::Loaded {
+            exec_id,
+            next_event_id,
+        } => (exec_id, next_event_id),
     };
 
     persist_workflow_failure(
         conn,
         task.id,
         exec_id,
-        history.next_event_id,
+        next_event_id,
         worker_id,
         error,
         None,
@@ -16296,8 +16350,79 @@ async fn handle_capability_miss(
         confidence,
     );
 
+    let ctx = CapabilityMissCtx {
+        task,
+        worker_id,
+        metrics,
+        missing,
+    };
     match resolution.action {
         CapabilityMissAction::Release => {
+            release_capability_miss(
+                conn,
+                ctx,
+                misses_before,
+                policy.max_redeliveries,
+                &resolution,
+            )
+            .await
+        }
+        CapabilityMissAction::Escalate => {
+            match escalate_capability_miss(conn, ctx, policy, frontier_reset_committed, &resolution)
+                .await?
+            {
+                Some(outcome) => Ok(outcome),
+                // Withdrawn at the commit boundary: the row must still leave
+                // this worker's hands, or it would sit `RUNNING` under a LIVE
+                // worker where the orphan reclaimer (which needs a dead
+                // heartbeat) cannot see it.
+                None => {
+                    release_capability_miss(
+                        conn,
+                        ctx,
+                        misses_before,
+                        policy.max_redeliveries,
+                        &resolution,
+                    )
+                    .await
+                }
+            }
+        }
+    }
+}
+
+/// The per-dispatch identity a capability-miss arm needs (issue #804).
+///
+/// Bundled so the release and escalation arms take the same four values in the
+/// same order and neither drifts a positional argument past the other.
+#[derive(Clone, Copy)]
+struct CapabilityMissCtx<'a> {
+    task: &'a TaskQueueItem,
+    worker_id: &'a str,
+    metrics: &'a dyn crate::telemetry::MetricsRecorder,
+    missing: MissingHandler<'a>,
+}
+
+/// Return an incapable claim to the queue for a peer (issue #804, AC1/AC2).
+///
+/// Shared by the ordinary release arm and by an escalation withdrawn at the
+/// commit boundary (Codex round-29 P1), so the two can never drift on the
+/// backoff, the phase-gated counter handling, or the metric.
+async fn release_capability_miss(
+    conn: &mut AsyncPgConnection,
+    ctx: CapabilityMissCtx<'_>,
+    misses_before: i32,
+    max_redeliveries: u32,
+    resolution: &CapabilityMissResolution,
+) -> HarvestResult<TaskDispatchOutcome> {
+    let CapabilityMissCtx {
+        task,
+        worker_id,
+        metrics,
+        missing,
+    } = ctx;
+    {
+        {
             // Back off before the next redelivery so the dwell window outlasts a
             // pod flip: without it the budget would be spent in milliseconds by
             // the same incapable worker re-claiming its own released row.
@@ -16353,7 +16478,7 @@ async fn handle_capability_miss(
                 distinct_incapable_workers = resolution.distinct_after,
                 fleet_evidence = ?resolution.evidence,
                 worker_is_new_misser = resolution.worker_is_new,
-                max_redeliveries = policy.max_redeliveries,
+                max_redeliveries,
                 backoff_secs = delay.as_secs(),
                 "released task for a capable peer: no handler registered on this worker"
             );
@@ -16361,19 +16486,103 @@ async fn handle_capability_miss(
                 clears_timeout_strike: missing.phase.clears_workflow_timeout_strike(),
             })
         }
-        CapabilityMissAction::Escalate => {
-            escalate_capability_miss(
-                conn,
-                task,
-                worker_id,
-                metrics,
-                missing,
-                policy.max_redeliveries,
-                &resolution,
-            )
-            .await
-        }
     }
+}
+
+/// Whether an escalation decided a moment ago still stands at the commit
+/// boundary (issue #804, Codex round-29 P1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscalationRevalidation {
+    /// Commit the terminal failure.
+    Stands,
+    /// Abandon it — the reason is `&'static str` so the log line and the test
+    /// assert on the same value.
+    Withdrawn(&'static str),
+}
+
+/// The rule that decides it.
+///
+/// A decision is only allowed to become a terminal write if the claim is still
+/// ours *and* re-running it against freshly-read evidence reaches the same
+/// answer. Both inputs are re-read immediately before this call, so `Stands`
+/// means "no awaited read separates this conclusion from its commit".
+///
+/// Withdrawal is always safe: the row returns to the release path, which is
+/// itself ownership-guarded and a no-op on a lost claim, and AC3's bounds are
+/// unaffected — the absolute ceiling and the storage ceiling are re-evaluated
+/// on every redelivery, so a task that genuinely has no capable worker still
+/// terminates.
+const fn revalidate_escalation(
+    current: &CurrentMissState,
+    fresh_action: CapabilityMissAction,
+) -> EscalationRevalidation {
+    match current {
+        // The escalation write is not ownership-guarded (round-28 P1), so a row
+        // that changed hands must not be failed by the dispatcher that lost it.
+        CurrentMissState::ClaimLost => EscalationRevalidation::Withdrawn("claim_lost"),
+        _ => match fresh_action {
+            CapabilityMissAction::Escalate => EscalationRevalidation::Stands,
+            // A capable peer went live, or its evidence was invalidated, between
+            // the decision and here. Release rather than fail the run it can
+            // serve.
+            CapabilityMissAction::Release => EscalationRevalidation::Withdrawn("evidence_changed"),
+        },
+    }
+}
+
+/// Pay the escalation's expensive read, then re-validate it (issue #804, Codex
+/// round-29 P1).
+///
+/// `fail_task_and_execution` used to load the workflow's history *after* the
+/// last evidence check, so the window in which a capable peer could go live
+/// unnoticed contained an awaited read whose cost grows with the history — not
+/// the "few microseconds of in-memory work" the round-27 note claimed. The read
+/// is paid here first, and the returned [`PreloadedFailureHistory`] is
+/// *consumed* by the committing call, so the ordering is a compile-time
+/// property rather than a comment that can drift.
+///
+/// Only then are the evidence and the fleet re-read and the same pure decision
+/// re-run. A peer that re-registered during the history load appears here either
+/// as a cleared miss entry or as a newly-live capable worker, and both flip the
+/// answer to `Release`.
+async fn prepare_escalation_commit(
+    conn: &mut AsyncPgConnection,
+    ctx: CapabilityMissCtx<'_>,
+    policy: CapabilityMissPolicy,
+    frontier_reset_committed: bool,
+) -> (PreloadedFailureHistory, EscalationRevalidation) {
+    let CapabilityMissCtx {
+        task, worker_id, ..
+    } = ctx;
+    let preloaded = preload_failure_history(conn, task).await;
+    let current =
+        current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed).await;
+    let live_workers = read_live_fleet_or_degrade(conn, task, policy.worker_stale_secs).await;
+    let fresh_action = current.decidable_counters().map_or(
+        // No owned row: `revalidate_escalation` withdraws on `ClaimLost`
+        // regardless, so the action here is immaterial.
+        CapabilityMissAction::Release,
+        |(misses, distinct)| {
+            resolve_capability_miss_with_confidence(
+                distinct,
+                misses,
+                worker_id,
+                policy.max_redeliveries,
+                task.session_id,
+                &live_workers,
+                // A single read cannot certify coherence with the fleet read
+                // beside it the way the decision-time bracket does, but an
+                // `Unreadable` row is affirmatively stale (round-28 P1), so it
+                // must not license an evidence-derived escalation here either.
+                match current {
+                    CurrentMissState::Owned { .. } => MissEvidenceConfidence::Current,
+                    _ => MissEvidenceConfidence::PossiblyStale,
+                },
+            )
+            .action
+        },
+    );
+    (preloaded, revalidate_escalation(&current, fresh_action))
 }
 
 /// Route an exhausted capability miss through the ordinary terminal-failure
@@ -16382,15 +16591,36 @@ async fn handle_capability_miss(
 /// Split out of [`handle_capability_miss`] so the release arm — the one that
 /// runs on every ordinary redelivery — stays readable next to the escalation
 /// arm, which runs at most once per task.
+///
+/// Returns `Ok(None)` when the escalation is withdrawn at the commit boundary;
+/// the caller then falls through to the release path.
 async fn escalate_capability_miss(
     conn: &mut AsyncPgConnection,
-    task: &TaskQueueItem,
-    worker_id: &str,
-    metrics: &dyn crate::telemetry::MetricsRecorder,
-    missing: MissingHandler<'_>,
-    max_redeliveries: u32,
+    ctx: CapabilityMissCtx<'_>,
+    policy: CapabilityMissPolicy,
+    frontier_reset_committed: bool,
     resolution: &CapabilityMissResolution,
-) -> HarvestResult<TaskDispatchOutcome> {
+) -> HarvestResult<Option<TaskDispatchOutcome>> {
+    let CapabilityMissCtx {
+        task,
+        worker_id,
+        metrics,
+        missing,
+    } = ctx;
+    let max_redeliveries = policy.max_redeliveries;
+
+    let (preloaded, revalidation) =
+        prepare_escalation_commit(conn, ctx, policy, frontier_reset_committed).await;
+    if let EscalationRevalidation::Withdrawn(why) = revalidation {
+        tracing::info!(
+            task_id = %task.id,
+            queue = %task.queue_name,
+            reason = why,
+            "withdrew a capability-miss escalation at the commit boundary; releasing instead"
+        );
+        return Ok(None);
+    }
+
     // Resolve the cause ONCE and derive the reason string, the metric label,
     // and the log line from it, so the three can never tell an operator
     // different stories about the same escalation.
@@ -16430,7 +16660,7 @@ async fn escalate_capability_miss(
     // task around the queue, so only it may page the fleet-exhaustion rule.
     // See `EscalationCause::outcome_label`.
     metrics.record_task_capability_miss(&task.queue_name, &task.task_type, cause.outcome_label());
-    fail_task_and_execution(conn, task, worker_id, &reason).await?;
+    fail_task_and_execution_with_history(conn, task, worker_id, &reason, preloaded).await?;
     // The message must match the branch, not just carry a field naming it: a
     // session-pinned escalation is NOT evidence that the queue has no capable
     // worker (see `no_capable_worker_reason`), and logging it as such sends
@@ -25529,6 +25759,74 @@ mod tests {
                 MissEvidenceConfidence::Current,
             )
             .action,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Codex round-29 P1: an escalation is revalidated at the commit boundary.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_lost_claim_withdraws_the_escalation_at_the_commit_boundary() {
+        // The escalation write is not ownership-guarded, so a row that changed
+        // hands during the (now hoisted) history load must not be failed by the
+        // dispatcher that lost it -- even though its own decision said escalate.
+        assert_eq!(
+            revalidate_escalation(&CurrentMissState::ClaimLost, CapabilityMissAction::Escalate),
+            EscalationRevalidation::Withdrawn("claim_lost"),
+        );
+    }
+
+    #[test]
+    fn a_capable_peer_going_live_withdraws_the_escalation() {
+        // The whole point of the revalidation: the fresh re-run says release, so
+        // the terminal write must not happen.
+        assert_eq!(
+            revalidate_escalation(
+                &CurrentMissState::Owned {
+                    misses: 5,
+                    workers: vec!["w0".to_string()],
+                },
+                CapabilityMissAction::Release,
+            ),
+            EscalationRevalidation::Withdrawn("evidence_changed"),
+        );
+    }
+
+    #[test]
+    fn an_unchanged_decision_still_commits() {
+        // And the common case is untouched: nothing moved, so the escalation
+        // decided a moment ago is the one that commits.
+        assert_eq!(
+            revalidate_escalation(
+                &CurrentMissState::Owned {
+                    misses: 5,
+                    workers: vec!["w0".to_string()],
+                },
+                CapabilityMissAction::Escalate,
+            ),
+            EscalationRevalidation::Stands,
+        );
+    }
+
+    #[test]
+    fn an_unreadable_row_is_judged_by_its_fresh_action_not_by_being_unreadable() {
+        // `Unreadable` is not itself a withdrawal: the staleness it implies is
+        // handled upstream by `PossiblyStale`, which withholds the two
+        // evidence-derived bounds. An escalation that survives THAT (the
+        // absolute ceiling, the storage ceiling, a zero budget, a session pin)
+        // is still a real one, so AC3 keeps terminating.
+        let unreadable = CurrentMissState::Unreadable {
+            misses: 5,
+            workers: vec!["w0".to_string()],
+        };
+        assert_eq!(
+            revalidate_escalation(&unreadable, CapabilityMissAction::Escalate),
+            EscalationRevalidation::Stands,
+        );
+        assert_eq!(
+            revalidate_escalation(&unreadable, CapabilityMissAction::Release),
+            EscalationRevalidation::Withdrawn("evidence_changed"),
         );
     }
 
