@@ -2860,6 +2860,13 @@ async fn run_local_activity_inline(
     // The typed error releases the workflow task for a capable peer rather than
     // failing the run (the pre-#804 `Config` error propagated to
     // `fail_execution_on_error` and sealed it terminally).
+    //
+    // In practice `missing_local_activity_handler` has already raised this a few
+    // frames up (Codex round-19 P2), before the caller commits the batch's
+    // sibling side effects — this lookup is still the one that yields the
+    // `&ActivityInfo`, so it stays as the backstop that keeps the two honest.
+    // Both consult `registry.activities`, so they cannot disagree about
+    // *whether* a handler exists; only about how much work happened first.
     let activity =
         registry
             .activities
@@ -3934,6 +3941,65 @@ pub fn worker_stale_secs(heartbeat_interval: Duration) -> i64 {
         .clamp(1, crate::poison_pill::MAX_WORKER_STALE_SECS)
 }
 
+/// The slowest `worker_heartbeat_interval` a peer may be configured with and
+/// still be seen as alive by another worker's capability-miss fleet lookup
+/// (issue #804, Codex round-19 P1).
+///
+/// This is a *fleet-wide* contract, not a per-worker one, and it exists because
+/// nothing in `harvest_workers` records a worker's own cadence — a reader has
+/// only `last_heartbeat_at`, so it cannot ask "is this row fresh *for the
+/// worker that wrote it*". Naming the ceiling is what lets a single window be
+/// safe for every peer; [`crate::builder::HarvestBuilder::try_build`] warns a
+/// worker configured past it, so the assumption is surfaced rather than silent.
+pub const MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS: Duration = Duration::from_secs(60);
+
+/// Floor on the liveness window used by the capability-miss fleet lookup
+/// (issue #804, Codex round-19 P1).
+///
+/// [`worker_stale_secs`] answers "is a worker alive?" from *this* worker's
+/// configured cadence, which is correct for the two subsystems that ask it
+/// about **themselves and their own tasks** — the poison-pill reclaimer (#367)
+/// and the broken-session scanner (#606) both compare a window they chose
+/// against rows they are entitled to judge. The capability-miss lookup asks a
+/// different question: "could some **other** worker still run this?" Applying
+/// the claimant's window there judges every peer by the claimant's cadence, so
+/// a worker heartbeating every second queries a two-second window and drops a
+/// live peer running the **default** five-second cadence — a default-config
+/// hazard, not an exotic one. With that peer gone the narrowed fleet holds only
+/// the incapable claimant, [`fleet_capability_evidence`] reports
+/// [`FleetCapabilityEvidence::AllLiveWorkersMissed`], and round 15's
+/// configured-total bound terminally fails the execution while a capable peer
+/// is polling the queue.
+///
+/// The floor is `2 ×` [`MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS`],
+/// so it covers any peer at or under the supported cadence whatever the
+/// claimant's own interval, and it is applied with `max` rather than replacing
+/// the computed window — the result is never *narrower* than before, so this
+/// can only ever retain more peers and no fleet that escalated correctly can
+/// begin escalating spuriously.
+///
+/// Retaining a worker that is genuinely gone is the safe direction and is
+/// bounded: a stale row that is not in `capability_miss_workers` holds the
+/// evidence at [`FleetCapabilityEvidence::CapablePeerMayExist`], which withholds
+/// only the configured-total bound — the distinct-worker bound and the absolute
+/// ceiling still fire, so AC3 holds. The cost is a delayed escalation; the cost
+/// of the opposite error is the execution. That is the same trade every prior
+/// round took for unprovable coverage: release for longer, never fail sooner.
+pub const CAPABILITY_MISS_MIN_FLEET_STALE_SECS: i64 = 120;
+
+/// The liveness window the capability-miss fleet lookup must use.
+///
+/// [`worker_stale_secs`] widened by [`CAPABILITY_MISS_MIN_FLEET_STALE_SECS`], so
+/// a fast-heartbeating claimant cannot conclude a slower — but healthy — peer is
+/// dead. Deliberately a distinct function rather than a change to
+/// `worker_stale_secs`: the poison-pill reclaimer and the broken-session scanner
+/// judge rows they own with a window they chose, and widening theirs would delay
+/// orphan recovery for no benefit. Only the peer question needs the floor.
+#[must_use]
+pub fn capability_miss_fleet_stale_secs(heartbeat_interval: Duration) -> i64 {
+    worker_stale_secs(heartbeat_interval).max(CAPABILITY_MISS_MIN_FLEET_STALE_SECS)
+}
+
 /// The redelivery budget as an `i32`, clamped for the persisted counter's type.
 ///
 /// `max_redeliveries` is a `u32` but `capability_misses` is a Postgres `INT`, so
@@ -4625,6 +4691,48 @@ fn first_persist_capability_miss(
         }
     }
     None
+}
+
+/// The first local activity in this cycle's commands whose handler this worker
+/// does not register (issue #804, Codex round-19 P2).
+///
+/// The inline local-activity arm of `process_workflow_task` commits five things
+/// before it ever reaches `run_local_activity_inline`'s registry lookup:
+/// search-attribute patches, the `current_details` breadcrumb, durable workflow
+/// logs (#790), ephemeral progress notifications (#791), and any early mutex
+/// release (#691). Once a miss became *releasable*, an incapable worker would
+/// pay for all five and then hand the task on, and the next worker would redo
+/// them — up to once per redelivery.
+///
+/// None of those five is *corrupted* by the repeat: logs carry a deterministic
+/// `seq` and insert `ON CONFLICT DO NOTHING` precisely so a re-drive is a no-op,
+/// attribute and breadcrumb writes are last-write-wins, and a repeated mutex
+/// release is fenced to zero rows. Progress frames do re-fire, but they are
+/// declared ephemeral and at-least-once with a `seq` clients dedup on, and every
+/// other re-drive trigger (#494 timeout, #782 panic containment, #603 ND-block)
+/// already re-runs the same frontier through the same commits. So this is not a
+/// correctness fix — it is the reviewer's first suggested remedy, and it is
+/// strictly better: an incapable worker should discover it cannot run the batch
+/// *before* doing work a capable peer will redo.
+///
+/// Checks **every** `RunLocalActivity` in the batch, not just the first:
+/// [`extract_run_local_activity`] keeps the *last* one, so a first-only check
+/// would wave through exactly the command about to run. A batch this worker
+/// cannot finish is one it should not start, whichever command the extractor
+/// picks — and the extras it flags are ones a later re-drive of the same batch
+/// would reach anyway.
+fn missing_local_activity_handler<'a>(
+    registry: &HandlerRegistry,
+    commands: &'a [WorkflowCommand],
+) -> Option<&'a str> {
+    commands.iter().find_map(|cmd| match cmd {
+        WorkflowCommand::RunLocalActivity { name, .. }
+            if !registry.activities.contains_key(name.as_str()) =>
+        {
+            Some(name.as_str())
+        }
+        _ => None,
+    })
 }
 
 /// Should this task be released for a capable peer at all, or escalated
@@ -13858,6 +13966,22 @@ async fn process_workflow_task(
                         .iter()
                         .any(|c| matches!(c, WorkflowCommand::AcquireMutex { .. })) =>
             {
+                // Issue #804 (Codex round-19 P2): bail out for a capable peer
+                // BEFORE the five commits below. `run_local_activity_inline`
+                // resolves the handler at its top, so raising here is
+                // behaviourally identical — same typed error, same
+                // `DuringHandler` phase (the body began and did not conclude:
+                // it suspended on this local activity) — except that an
+                // incapable worker no longer patches attributes, writes the
+                // breadcrumb, appends logs, fires progress frames, or resolves
+                // a mutex release on the way to discovering it cannot run this.
+                if let Some(name) = missing_local_activity_handler(registry, &commands) {
+                    return Err(HarvestError::HandlerNotRegistered {
+                        kind: CapabilityMissKind::Activity.as_str(),
+                        name: name.to_string(),
+                        phase: CapabilityMissPhase::DuringHandler,
+                    });
+                }
                 // Apply any search-attribute patches before running the local
                 // activity so that attributes are visible even if the worker
                 // crashes during inline execution.
@@ -15439,8 +15563,12 @@ pub struct CapabilityMissPolicy {
     /// `WorkerConfig::capability_miss_max_redeliveries`.
     pub max_redeliveries: u32,
     /// Liveness window for the worker-fleet lookup that gates the redelivery
-    /// budget, mirroring the poison-pill reclaimer's
-    /// `2 × worker_heartbeat_interval` convention (see [`worker_stale_secs`]).
+    /// budget.
+    ///
+    /// Build it with [`capability_miss_fleet_stale_secs`], not
+    /// [`worker_stale_secs`]: this window is applied to *peers*, so it must
+    /// carry the fleet-wide floor that keeps a slower-but-healthy peer visible
+    /// to a fast-heartbeating claimant (Codex round-19 P1).
     pub worker_stale_secs: i64,
 }
 
@@ -19069,14 +19197,22 @@ impl Worker {
         // Issue #782: contained-handler-panic retry budget + strike map.
         let panic_strikes = Arc::clone(&self.workflow_panic_strikes);
         let workflow_panic_max_attempts = self.config.workflow_panic_max_attempts;
-        // Issue #804: the redelivery budget plus the same liveness window the
-        // poison-pill reclaimer and the broken-session scanner use, so all three
-        // agree on "is this worker alive". Derived here rather than threaded
-        // from `spawn_monitoring_tasks` because the poll loop and the monitors
-        // are independent spawn paths.
+        // Issue #804: the redelivery budget plus the liveness window for the
+        // fleet lookup. Derived here rather than threaded from
+        // `spawn_monitoring_tasks` because the poll loop and the monitors are
+        // independent spawn paths.
+        //
+        // Deliberately `capability_miss_fleet_stale_secs`, NOT the bare
+        // `worker_stale_secs` the poison-pill reclaimer and broken-session
+        // scanner use (Codex round-19 P1): those judge rows with a window they
+        // chose, whereas this judges *peers* by a cadence they did not. Without
+        // the floor a fast-heartbeating claimant drops a live peer on the
+        // default cadence and terminally fails an execution it could have run.
         let capability_miss_policy = CapabilityMissPolicy {
             max_redeliveries: self.config.capability_miss_max_redeliveries,
-            worker_stale_secs: worker_stale_secs(self.config.worker_heartbeat_interval),
+            worker_stale_secs: capability_miss_fleet_stale_secs(
+                self.config.worker_heartbeat_interval,
+            ),
         };
         let exec_id_for_timeout = task.workflow_exec_id;
         let telemetry = Arc::clone(&self.registry);
@@ -23966,6 +24102,66 @@ mod tests {
     }
 
     #[test]
+    fn capability_miss_fleet_window_never_shrinks_the_liveness_window() {
+        // The whole safety argument for the floor is that it can only ever
+        // RETAIN more peers than the pre-round-19 window did, so no fleet that
+        // escalated correctly before can start escalating spuriously now.
+        for secs in [0, 1, 2, 5, 10, 30, 59, 60, 61, 120, 600, 86_400] {
+            let interval = Duration::from_secs(secs);
+            assert!(
+                capability_miss_fleet_stale_secs(interval) >= worker_stale_secs(interval),
+                "the capability-miss window must never be narrower than the shared \
+                 liveness window it replaces (interval {secs}s)"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_miss_fleet_window_covers_a_peer_on_the_default_cadence() {
+        // The round-19 P1 itself: a claimant configured to heartbeat every
+        // second must not conclude a peer running the DEFAULT 5s cadence is
+        // dead. This is a default-configuration hazard, not an exotic one.
+        let fast_claimant = Duration::from_secs(1);
+        let default_peer = Duration::from_secs(5);
+        assert!(
+            capability_miss_fleet_stale_secs(fast_claimant) >= worker_stale_secs(default_peer),
+            "a 1s-cadence claimant must still see a peer on the default 5s cadence"
+        );
+        // Falsifying control: the window this replaces did NOT cover that peer,
+        // which is exactly how a live capable peer got dropped from the fleet.
+        assert!(
+            worker_stale_secs(fast_claimant) < worker_stale_secs(default_peer),
+            "pre-fix, the claimant's own window was narrower than the default \
+             peer's -- without that gap this test proves nothing"
+        );
+    }
+
+    #[test]
+    fn capability_miss_fleet_window_still_tracks_a_slower_claimant() {
+        // The floor is a floor, not a cap: a claimant slower than the supported
+        // ceiling keeps its own (larger) window rather than being narrowed to it.
+        let slow = Duration::from_secs(600);
+        assert_eq!(
+            capability_miss_fleet_stale_secs(slow),
+            worker_stale_secs(slow),
+            "a claimant slower than the floor must keep its own window"
+        );
+        assert!(capability_miss_fleet_stale_secs(slow) > CAPABILITY_MISS_MIN_FLEET_STALE_SECS);
+    }
+
+    #[test]
+    fn capability_miss_fleet_floor_matches_the_documented_supported_cadence() {
+        // The floor and the cadence ceiling the builder warns about are one
+        // contract stated twice; pin them together so they cannot drift.
+        assert_eq!(
+            CAPABILITY_MISS_MIN_FLEET_STALE_SECS,
+            worker_stale_secs(MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS),
+            "the floor must be exactly the window a peer at the supported \
+             cadence ceiling needs"
+        );
+    }
+
+    #[test]
     fn capability_miss_kind_labels_are_bounded() {
         // Metric label cardinality (ADR-0001 §7): exactly two values, ever.
         assert_eq!(CapabilityMissKind::Workflow.as_str(), "workflow");
@@ -24051,6 +24247,75 @@ mod tests {
             input: serde_json::Value::Null,
             result_tx,
         }
+    }
+
+    /// A `RunLocalActivity` command naming `name`. Only `name` is load-bearing
+    /// for the preflight.
+    fn run_local_cmd(name: &str) -> WorkflowCommand {
+        let (result_tx, _rx) = tokio::sync::oneshot::channel();
+        WorkflowCommand::RunLocalActivity {
+            activity_id: crate::types::ActivityExecId::new(),
+            name: name.to_string(),
+            input: serde_json::Value::Null,
+            start_to_close: None,
+            retry_policy: None,
+            result_tx,
+            already_scheduled: false,
+            failed_attempts: 0,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn missing_local_activity_handler_names_the_activity_that_cannot_run() {
+        // Issue #804 (Codex round-19 P2): the inline local-activity arm commits
+        // durable logs (#790), progress notifications (#791), search-attribute
+        // and current-details patches, and mutex releases (#691) BEFORE
+        // `run_local_activity_inline` consults the registry. Once a miss became
+        // releasable, every incapable redelivery re-ran those commits. This
+        // preflight is what lets the arm bail out ahead of them.
+        let registry = registry_knowing("known_wf", "known_act");
+
+        // A registered local activity must NOT be flagged -- otherwise every
+        // healthy local-activity cycle would release instead of running.
+        assert_eq!(
+            missing_local_activity_handler(&registry, &[run_local_cmd("known_act")]),
+            None
+        );
+        assert_eq!(
+            missing_local_activity_handler(&registry, &[run_local_cmd("missing_act")]),
+            Some("missing_act")
+        );
+
+        // `extract_run_local_activity` keeps the LAST `RunLocalActivity` in the
+        // batch, so a preflight that stopped at the first would wave through
+        // exactly the command about to run.
+        assert_eq!(
+            missing_local_activity_handler(
+                &registry,
+                &[run_local_cmd("known_act"), run_local_cmd("missing_act")]
+            ),
+            Some("missing_act")
+        );
+
+        // The sibling commands whose premature commit this exists to prevent
+        // must never flag on their own -- and neither must a `ScheduleActivity`
+        // for an unregistered handler, which the persist-time pre-pass already
+        // catches ahead of the same commits.
+        assert_eq!(
+            missing_local_activity_handler(
+                &registry,
+                &[
+                    WorkflowCommand::RecordLog {
+                        seq: 1,
+                        level: crate::context::WorkflowLogLevel::Info,
+                        message: "hello".to_string(),
+                    },
+                    schedule_activity_cmd("missing_act"),
+                ]
+            ),
+            None
+        );
     }
 
     #[test]

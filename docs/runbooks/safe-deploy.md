@@ -495,6 +495,20 @@ incident: the resulting terminal error names the knob, not a missing deploy.
   possible claimant; if that read fails it **keeps** cross-build peers rather
   than concluding they are ineligible, so a blip in the declaration table can
   only delay escalation, never cause one.
+- **Keep `worker_heartbeat_interval` at or under 60 s.** The fleet check that
+  decides whether "no live worker here has the handler" is *true* reads
+  `harvest_workers.last_heartbeat_at`, and nothing in that table records the
+  cadence each worker chose — so one fleet-wide freshness window is applied to
+  every row. Harvest floors that window at **120 s** (`2 ×` the supported 60 s
+  cadence) rather than deriving it from the *reading* worker's own interval,
+  precisely so a pod configured to heartbeat every second cannot decide a peer
+  on the default 5 s cadence is dead and escalate a task that peer could have
+  run. A worker configured past 60 s logs a warning at startup naming this; it
+  still boots, and only the configured-total bound is affected (the
+  distinct-worker bound and the absolute ceiling are unaffected), but it can be
+  escalated against early by a faster peer. The floor errs the other way — a
+  worker that is genuinely gone lingers in the fleet view for up to two minutes,
+  which *delays* an escalation rather than fabricating one.
 - **Orthogonal to the handler-coverage gate (#520/#700), below.** That gate is
   a *pre-cutover* check for handlers you are about to **remove**; this is a
   *runtime* absorber for handlers not yet **added**.

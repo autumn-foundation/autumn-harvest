@@ -2078,6 +2078,11 @@ impl HarvestBuilder {
                 "worker_heartbeat_interval must be greater than zero".to_string(),
             ));
         }
+        // Issue #804 (Codex round-19 P1): surface a cadence the fleet-wide
+        // capability-miss liveness window cannot vouch for. Never rejects — an
+        // already-deployed slow fleet must keep booting.
+        #[cfg(feature = "db")]
+        warn_if_heartbeat_outruns_fleet_liveness(self.worker_config.worker_heartbeat_interval);
 
         validate_concurrency_keys(&self.activities)?;
         validate_workflow_concurrency_limits(&self.workflows)?;
@@ -2381,6 +2386,43 @@ fn validate_completion_triggers(
         }
     }
     Ok(())
+}
+
+/// Warn when this worker heartbeats more slowly than the fleet-wide liveness
+/// window its peers judge it by (issue #804, Codex round-19 P1).
+///
+/// Nothing in `harvest_workers` records a worker's cadence, so a peer running
+/// the capability-miss fleet lookup cannot ask "is this row fresh *for the
+/// worker that wrote it*" — it applies one fleet-wide window
+/// ([`crate::worker::CAPABILITY_MISS_MIN_FLEET_STALE_SECS`]) to every row. A
+/// worker configured past
+/// [`crate::worker::MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS`] can
+/// therefore look dead to a peer while it is perfectly healthy, and be omitted
+/// from the fleet that decides whether "no capable worker is live" is true.
+///
+/// A warning rather than a rejection: an existing deployment already running a
+/// slow cadence must keep booting (the same warn-never-error posture the
+/// degenerate slot-tuner band and `queue_weights` take), and the consequence is
+/// confined to one escalation bound — the distinct-worker bound and the absolute
+/// ceiling are unaffected.
+///
+/// Returns whether the warning fired so the decision is testable without a
+/// tracing subscriber.
+#[cfg(feature = "db")]
+fn warn_if_heartbeat_outruns_fleet_liveness(interval: Duration) -> bool {
+    let ceiling = crate::worker::MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS;
+    if interval <= ceiling {
+        return false;
+    }
+    tracing::warn!(
+        worker_heartbeat_interval_secs = interval.as_secs(),
+        supported_ceiling_secs = ceiling.as_secs(),
+        "harvest: worker_heartbeat_interval exceeds the cadence the capability-miss fleet \
+         lookup can vouch for (issue #804); a peer may treat this worker as dead while it is \
+         healthy and escalate a task this worker could have run. Lower the interval, or accept \
+         that the configured-total redelivery bound may fire early for this fleet."
+    );
+    true
 }
 
 /// Validates that every per-workflow-type retention override (issue #737)
@@ -3935,6 +3977,36 @@ mod tests {
         assert!(
             matches!(result, Err(HarvestBuilderError::InvalidWorkerConfig(_))),
             "expected InvalidWorkerConfig but got {result:?}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn slow_heartbeat_warns_but_never_blocks_the_build() {
+        // The default cadence -- and anything up to the supported ceiling --
+        // must stay silent, or the warning is noise operators learn to ignore.
+        assert!(!warn_if_heartbeat_outruns_fleet_liveness(
+            WorkerConfig::default().worker_heartbeat_interval
+        ));
+        assert!(!warn_if_heartbeat_outruns_fleet_liveness(
+            crate::worker::MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS
+        ));
+        // One second past the ceiling is where a peer can start mistaking this
+        // worker for a dead one.
+        assert!(warn_if_heartbeat_outruns_fleet_liveness(
+            crate::worker::MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS
+                + Duration::from_secs(1)
+        ));
+        // Warn, never reject: an already-deployed slow fleet must keep booting.
+        assert!(
+            HarvestBuilder::new()
+                .worker(
+                    WorkerConfig::default()
+                        .with_worker_heartbeat_interval(Duration::from_secs(600))
+                )
+                .try_build()
+                .is_ok(),
+            "a slow heartbeat is a warning, not a build failure"
         );
     }
 

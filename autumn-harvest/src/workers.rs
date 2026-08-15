@@ -616,13 +616,24 @@ pub async fn fleet_health(
 ///
 /// `$1` = the staleness window in seconds, `$2` = the queue name.
 ///
-/// The liveness predicate is deliberately **identical** to the one the
-/// poison-pill orphan reclaimer uses
-/// ([`crate::poison_pill::orphaned_running_tasks_query`]): a fresh
-/// `last_heartbeat_at` inside `2 × worker_heartbeat_interval`. Two subsystems
-/// answering "is this worker alive?" differently would be a latent
-/// inconsistency, so this reuses that convention verbatim rather than
-/// inventing a second one.
+/// The predicate — a fresh `last_heartbeat_at` inside a caller-supplied window
+/// — is the same *shape* the poison-pill orphan reclaimer uses
+/// ([`crate::poison_pill::orphaned_running_tasks_query`]), but the **window is
+/// not the same value**, and that divergence is deliberate (Codex round-19 P1).
+///
+/// The reclaimer judges a row it is entitled to judge, with a window derived
+/// from its own configured cadence. This query judges *peers*, whose cadence the
+/// caller does not know and cannot read — nothing in `harvest_workers` records
+/// it. Applying the caller's own `2 × worker_heartbeat_interval` here would let
+/// a worker heartbeating every second declare a live peer on the **default**
+/// five-second cadence dead, which the capability-miss path then reads as "no
+/// capable worker is live" and turns into a terminal failure. Callers therefore
+/// pass [`crate::worker::capability_miss_fleet_stale_secs`], which floors the
+/// window at a fleet-wide bound that covers any peer at the supported cadence.
+///
+/// The error directions are what make one window unsafe for both: too *narrow*
+/// here fabricates an escalation, while too *wide* only delays one (the
+/// distinct-worker bound and the absolute ceiling still fire).
 ///
 /// `status` is deliberately **not** filtered. A `Draining` worker still
 /// belongs in the live set: it is a worker the fleet may still be told to keep,
@@ -687,6 +698,11 @@ impl LiveWorker {
 /// handler for it, and this says which workers could claim it at all. Only when
 /// the first covers the second is "no capable worker is live" an actual
 /// conclusion rather than an assumption drawn from a fixed redelivery budget.
+///
+/// Pass [`crate::worker::capability_miss_fleet_stale_secs`] for
+/// `worker_stale_secs`, never the bare [`crate::worker::worker_stale_secs`] —
+/// see [`live_workers_on_queue_query`] for why judging peers by the caller's own
+/// cadence turns a healthy fleet into a terminal failure.
 ///
 /// # Errors
 ///

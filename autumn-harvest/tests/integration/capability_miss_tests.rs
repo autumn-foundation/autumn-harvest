@@ -628,6 +628,9 @@ const Q_PARK: &str = "q804-park";
 const Q_LIVE_PEER: &str = "q804-live-peer";
 const Q_STARTED_ONCE: &str = "q804-started-once";
 const Q_STARTED_ONCE_ACTS: &str = "q804-started-once-acts";
+const Q_LOCAL_MISS: &str = "q804-local-miss";
+/// The breadcrumb whose presence proves the inline arm's commit block ran.
+const LOCAL_MISS_BREADCRUMB: &str = "about to run the local activity";
 
 type BoxFut<'a> =
     Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>>;
@@ -1096,6 +1099,138 @@ async fn a_post_handler_release_does_not_re_emit_workflow_started() {
         vec![("started_once_wf".to_string(), Q_STARTED_ONCE.to_string())],
         "`harvest.workflow.started` must be emitted EXACTLY ONCE for this \
          execution across the whole incapable-then-capable dispatch sequence"
+    );
+    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Codex round-19 P2 — a local-activity miss releases BEFORE its batch's
+// sibling commands are committed.
+// ---------------------------------------------------------------------------
+
+/// A workflow that publishes an operator breadcrumb and then runs a **local**
+/// activity, so both commands arrive in one suspension batch — the shape whose
+/// commits used to run ahead of the handler lookup.
+fn workflow_details_then_local_activity(
+    ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.set_current_details(LOCAL_MISS_BREADCRUMB);
+        ctx.execute_local_activity_raw("local_only_activity", input, None, None)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// A local activity — `is_local: true` is what routes it through the inline arm
+/// rather than the task queue.
+fn local_activity_info(name: &'static str) -> ActivityInfo {
+    ActivityInfo {
+        is_local: true,
+        default_queue: None,
+        ..activity_info(name, peer_only_activity, Q_LOCAL_MISS)
+    }
+}
+
+/// The inline local-activity arm commits search-attribute patches, the
+/// `current_details` breadcrumb, durable logs (#790), progress frames (#791),
+/// and any early mutex release (#691) *before* `run_local_activity_inline`
+/// resolves the handler. Once a miss became releasable, an incapable worker
+/// paid for all five and handed the task on, and the next worker redid them.
+///
+/// `current_details` is the cheapest durable, directly-queryable witness for the
+/// whole block: it is `NULL` until that commit runs. Phase 1 asserts the
+/// incapable worker left it `NULL`; phase 2 asserts the capable worker *does*
+/// write it, so the phase-1 assertion cannot be passing merely because the
+/// workflow never sets it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_activity_miss_releases_before_committing_its_batch() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "local_miss_wf",
+        serde_json::json!({"n": 19}),
+        Q_LOCAL_MISS,
+    )
+    .await;
+
+    let metrics = Arc::new(CapabilityMetrics::default());
+
+    // --- Phase 1: registers the workflow, NOT the local activity. -----------
+    let incapable = build_worker(
+        "worker-no-local",
+        &[Q_LOCAL_MISS],
+        build_registry(
+            vec![workflow_info(
+                "local_miss_wf",
+                workflow_details_then_local_activity,
+            )],
+            vec![local_activity_info("some_other_local_activity")],
+            Arc::clone(&metrics),
+        ),
+        50,
+    );
+
+    let released = with_worker_running(&incapable, &pool, async {
+        wait_for_capability_misses(&url, exec_id, 1, Duration::from_secs(30)).await
+    })
+    .await;
+
+    assert_eq!(
+        released.task_type, "workflow",
+        "a local activity runs inline on the WORKFLOW task, so that is the row \
+         released -- no activity row is ever enqueued"
+    );
+    assert_released_for_a_peer(&released);
+    assert_eq!(
+        load_execution(&url, exec_id).await.current_details,
+        None,
+        "the incapable worker must release BEFORE the batch's sibling commands \
+         are committed -- a written breadcrumb means it patched attributes, \
+         appended logs, and fired progress frames on its way to discovering it \
+         could not run the local activity at all"
+    );
+    // The body began and did not conclude, so `attempt` stays at its claimed
+    // value: this is a `DuringHandler` miss, not a `BeforeHandler` one.
+    assert_eq!(
+        released.attempt, 1,
+        "a mid-handler release must not roll `attempt` back -- the body ran"
+    );
+
+    // --- Phase 2: a worker that registers the local activity finishes. ------
+    let capable = build_worker(
+        "worker-with-local",
+        &[Q_LOCAL_MISS],
+        build_registry(
+            vec![workflow_info(
+                "local_miss_wf",
+                workflow_details_then_local_activity,
+            )],
+            vec![local_activity_info("local_only_activity")],
+            Arc::clone(&metrics),
+        ),
+        50,
+    );
+
+    let completed = with_worker_running(&capable, &pool, async {
+        wait_for_state(&url, exec_id, "COMPLETED", Duration::from_secs(30)).await
+    })
+    .await;
+
+    assert_eq!(
+        completed.output,
+        Some(serde_json::json!("activity done")),
+        "the capable worker ran the local activity inline"
+    );
+    assert_eq!(
+        completed.current_details.as_deref(),
+        Some(LOCAL_MISS_BREADCRUMB),
+        "the capable worker DOES commit the breadcrumb -- without this the \
+         phase-1 assertion would hold for the wrong reason"
     );
     assert!(dead_letter_errors(&url, exec_id).await.is_empty());
 }
