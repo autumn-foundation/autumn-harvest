@@ -629,6 +629,83 @@ fn capability_miss_paging_rule_prose_is_cause_neutral() {
     }
 }
 
+/// The `escalated` metric-label docs must carry the same cause-neutral reading
+/// the paging rule does (issue #804, Codex round-44).
+///
+/// Sibling of [`capability_miss_paging_rule_prose_is_cause_neutral`]: round 43
+/// fixed the alert pack and the runbook, but the label constant in
+/// `src/telemetry.rs` is the surface a consumer writing a CUSTOM alert reads,
+/// and it carried the same false conclusion. Both must state it, so a future
+/// edit that repairs one and leaves the other still fails.
+///
+/// The claim under test: `EscalationCause::outcome_label` maps BOTH
+/// `BudgetExhausted` and `ReleaseCeilingExhausted` to `escalated`, and since
+/// round 15 the ceiling is reachable ONLY on the two evidence states that mean
+/// coverage was never established (`CapablePeerMayExist`, `Unavailable`). So a
+/// sample carrying this label does not on its own prove the fleet was swept.
+#[test]
+fn capability_miss_escalated_label_docs_are_cause_neutral() {
+    let doc = rustdoc_above_const("CAPABILITY_MISS_OUTCOME_ESCALATED");
+
+    // The two sentences that assert fleet exhaustion for the WHOLE label.
+    assert!(
+        !doc.contains("the only escalation cause"),
+        "the label is recorded by two causes with different evidential strength, so it cannot \
+         be the only one supporting the fleet conclusion: {doc}"
+    );
+    assert!(
+        !doc.contains("no capable worker ever claimed it"),
+        "a ceiling escalation fires precisely when a live worker may be capable \
+         (`CapablePeerMayExist`) or the registry was unreadable (`Unavailable`), so this is \
+         false for that half of the label: {doc}"
+    );
+
+    // The weaker cause must be named, and the discriminator handed over.
+    assert!(
+        doc.contains("ceiling"),
+        "the docs must name the ceiling cause explicitly -- a consumer alerting on this label \
+         cannot reason about the sample they get otherwise: {doc}"
+    );
+    assert!(
+        doc.contains("reason"),
+        "the docs must point consumers at the execution's reason string, which is the only \
+         place the actual cause is recorded: {doc}"
+    );
+
+    // Round 15 gave the small-fleet case to the configured-total bound.
+    assert!(
+        !doc.contains("fleet smaller than the budget"),
+        "the ceiling has not owned the small-fleet case since review round 15: {doc}"
+    );
+}
+
+/// Reads the contiguous `///` block immediately above a `pub const` in
+/// `src/telemetry.rs`.
+///
+/// Walking BACKWARD from the declaration is what makes this reformat-tolerant:
+/// it needs no fixed line numbers and no assumption about how the doc wraps.
+fn rustdoc_above_const(name: &str) -> String {
+    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/telemetry.rs"))
+        .expect("failed to read src/telemetry.rs");
+    let lines: Vec<&str> = source.lines().collect();
+    let decl = lines
+        .iter()
+        .position(|line| line.starts_with(&format!("pub const {name}:")))
+        .unwrap_or_else(|| panic!("`pub const {name}` must exist in src/telemetry.rs"));
+
+    let mut doc: Vec<&str> = Vec::new();
+    for line in lines[..decl].iter().rev() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("///") {
+            break;
+        }
+        doc.push(trimmed.trim_start_matches("///").trim());
+    }
+    assert!(!doc.is_empty(), "`{name}` must carry a rustdoc block");
+    doc.reverse();
+    doc.join(" ")
+}
+
 /// Half 2 of the capability-miss alert-shape pin (issue #804).
 ///
 /// Split from [`capability_miss_released_outcome_never_pages`] along the seam

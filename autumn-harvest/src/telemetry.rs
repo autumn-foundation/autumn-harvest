@@ -521,15 +521,32 @@ pub const METRIC_TASK_CAPABILITY_MISS: &str = "harvest.task.capability_miss";
 /// released back to `PENDING` for a capable peer to pick up (issue #804).
 pub const CAPABILITY_MISS_OUTCOME_RELEASED: &str = "released";
 
-/// `outcome` label value on [`METRIC_TASK_CAPABILITY_MISS`]: escalated after
-/// the redelivery budget was **exhausted** (issue #804).
+/// `outcome` label value on [`METRIC_TASK_CAPABILITY_MISS`]: the task was
+/// released to a peer at least once, and was then escalated (issue #804).
 ///
-/// This is the *fleet-exhaustion* signal, and the only escalation cause that
-/// supports the conclusion "no live worker on this queue registers the
-/// handler": the task was offered to peers
-/// `WorkerConfig::capability_miss_max_redeliveries` times, with capped
-/// exponential backoff between each, and no capable worker ever claimed it.
-/// It is what the page-severity `harvest_no_capable_worker` rule selects.
+/// **This label is recorded by two different bounds, which do not license the
+/// same conclusion.** Read the `no_capable_worker:` reason string on the failed
+/// execution — it names the bound that actually tripped — before concluding
+/// anything about the fleet from a sample:
+///
+/// - **Coverage confirmed.** The task was offered around the queue with capped
+///   exponential backoff between releases, and the worker registry then agreed
+///   that every live eligible worker on the queue had already missed it. This
+///   is the *fleet-exhaustion* reading — "no live worker on this queue
+///   registers the handler" — and the one
+///   `GET /admin/workflow-types/reachability` corroborates.
+/// - **Release ceiling.** Coverage was never established: a live worker had
+///   still never been offered the task, or the registry could not be read. The
+///   absolute release ceiling stops the redeliveries anyway so AC3's bound
+///   holds, but such a sample does **not** show the queue was swept, and a
+///   capable worker may have been live on it the whole time.
+///
+/// Both are recorded here because under either reading the executions are
+/// being failed, and paging on only the provable half would under-page the
+/// outage #804 exists to surface. So treat the label as "executions on this
+/// queue are being failed for want of a handler", which is true of every
+/// sample, rather than as proof about the fleet, which is not. It is what the
+/// page-severity `harvest_no_capable_worker` rule selects.
 ///
 /// Escalations where the task was **never offered to a peer at all** report
 /// [`CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED`] instead — see there for

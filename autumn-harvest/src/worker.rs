@@ -4616,7 +4616,10 @@ impl EscalationCause {
     /// reachable only on the two evidence states the configured total bound
     /// withholds itself from — a live worker that never missed the task
     /// (`CapablePeerMayExist`), or a registry that could not be read
-    /// (`Unavailable`) for a fleet smaller than the budget — so it now means
+    /// (`Unavailable`) with no more distinct incapable workers than the budget
+    /// (under `Unavailable` the fleet's actual size is exactly what is not
+    /// knowable, so the distinct set is all this can be said about) — so it now
+    /// means
     /// *"bounded by the ceiling because the fleet could not be concluded about"*
     /// rather than *"small fleet"*. Its alternative reading (a capable peer kept
     /// losing the claim race) requires losing `10 × budget` consecutive races

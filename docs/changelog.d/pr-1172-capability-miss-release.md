@@ -1665,3 +1665,46 @@ conclusion is stated; confirmed falsifiable against the pre-fix pack.
 The changelog's earlier sections are left as written: they record what was true
 at the round they describe, and rewriting them would falsify the history that
 rounds 41 and 43 exist to correct.
+
+## Review round 44
+
+**Cause-neutral `escalated` metric-label docs.** Round 43 fixed the alert pack
+and the runbook, but stopped at the surfaces harvest ships pre-written. The
+`CAPABILITY_MISS_OUTCOME_ESCALATED` constant in `telemetry.rs` — the surface a
+consumer reads when writing their *own* alert on `harvest.task.capability_miss`
+— still called itself "the *fleet-exhaustion* signal, and the only escalation
+cause that supports the conclusion 'no live worker on this queue registers the
+handler'", and asserted "no capable worker ever claimed it".
+
+Both claims are false for half of what the label records.
+`EscalationCause::outcome_label` maps `BudgetExhausted` **and**
+`ReleaseCeilingExhausted` to `escalated`, and since round 15 the ceiling is
+reachable only on the two evidence states the configured-total bound withholds
+itself from — `CapablePeerMayExist` (a live worker that has never been offered
+the task, and may well be capable) and `Unavailable` (the registry could not be
+read). A ceiling sample is precisely the case where coverage was *not*
+established, so a consumer following these docs would page on it and then be
+contradicted by `GET /admin/workflow-types/reachability`.
+
+The docs now name both bounds, state that the ceiling case does not show the
+queue was swept, explain why both are still recorded under one value
+(under-paging is the worse error when executions are being failed either way),
+and hand the reader the discriminator: the `no_capable_worker:` reason string
+on the failed execution, which names the bound that actually tripped.
+
+**Pinned, and paired.** `capability_miss_escalated_label_docs_are_cause_neutral`
+reads the rustdoc block directly above the constant — walking backward from the
+declaration, so it needs no line numbers and survives reformatting — and fails
+if the label re-acquires the fleet-exhaustion assertion, drops the ceiling, stops
+pointing at the reason string, or re-acquires the round-15 "fleet smaller than
+the budget" claim. It sits beside round 43's
+`capability_miss_paging_rule_prose_is_cause_neutral` deliberately: the two guard
+the same false conclusion on two surfaces, so a future edit that repairs one and
+leaves the other still fails. All four assertions were confirmed red against the
+pre-fix text.
+
+**Last copy of the imprecise clause.** `EscalationCause::outcome_label`'s own
+rustdoc attributed the ceiling's `Unavailable` case to "a fleet smaller than the
+budget". Under `Unavailable` the fleet's size is exactly what cannot be known —
+the bound is on the distinct *observed* incapable workers — so the clause now
+says that, with the reason it can say nothing stronger.
