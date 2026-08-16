@@ -570,8 +570,9 @@ sides of the fix — expected, not a discrepancy.
 rows and never touch the actively paused queue's rows (proven end-to-end by
 `tests/integration/queue_pause_tests.rs::claim_query_excludes_paused_queues_end_to_end`,
 which also covers resuming the queue). Reproduce with
-`autumn-harvest/scripts/queue_pause_claim_perf_repro.sh` (requires
-`HARVEST_TEST_DATABASE_URL`).
+`autumn-harvest/scripts/queue_pause_claim_perf_repro.sh`, which needs either
+`HARVEST_TEST_DATABASE_URL` (an admin connection string) or a reachable Docker
+daemon for its testcontainer fallback — not both.
 
 ## Enqueue throughput
 
