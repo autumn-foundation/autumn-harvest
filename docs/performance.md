@@ -52,6 +52,16 @@ this page says nothing about what they cost; see
   anti-join predicate itself — the two scenarios take different query plans —
   so this page does not publish a cost for the predicate in isolation. See
   [the control that changed the conclusion](#the-control-that-changed-the-conclusion).
+* **The queue-pause anti-join (#619) — flagged above as accreted-but-unmeasured
+  — has since been measured with an actively paused queue, and fixed.** It is
+  a different predicate from the PAUSED-*execution* skip above (that one
+  checks `harvest_workflow_executions.state`; this one checks
+  `harvest_queue_pauses`, an operator-facing "pause this whole queue" switch).
+  Pre-filtering it into a small array instead of re-probing it once per
+  candidate row cuts buffers touched by a single claim **-98.05%** at the
+  headline 10k-backlog scenario (12 743 → 248) with one of four polled queues
+  paused. See
+  [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
 * **Enqueue is not the problem.** ~4 800 rows/s sustained at p50 ~1.5 ms, flat
   from 1k to 100k backlog (inside run-to-run noise). At 100k the write side
   sustains ~4 600 rows/s while the read side manages ~3 claims/s — **a queue
@@ -442,6 +452,17 @@ Three things to read here:
    20 223 buffer hits. It is an index lookup, so it is cheap *per row*, but it is
    paid per row.
 
+   > **Follow-up (issue #619 fix):** this node describes the *pre-fix* shape of
+   > `claim_task_query()`. The scenario above — like every scenario on this
+   > page — evaluates the predicate against an always-*empty*
+   > `harvest_queue_pauses` (see [known limitations](#known-limitations)), so
+   > even this `loops=10000` never ran against a queue that was genuinely
+   > paused. [The queue-pause anti-join fix](#the-queue-pause-anti-join-fix)
+   > below measures the identical `loops=N` pattern against an *actively
+   > paused* queue directly, confirms the mechanism, and replaces the
+   > correlated anti-join with a one-time prefilter. Points 1 and 2 above are
+   > unaffected by that fix and remain accurate for the current query.
+
 One number in the full output is deliberately **not** comparable to the tables
 above: this plan's `Execution Time` was 1 287 ms, against a measured p50 of
 89 ms for the same scenario. The `EXPLAIN` is a single *cold* claim on a fresh
@@ -464,6 +485,94 @@ actually use the feature.
 is left byte-for-byte unchanged; measuring it and tuning it are separate pieces
 of work, and tuning without a published baseline is how you get an unfalsifiable
 "optimisation". This page is the baseline.
+
+## The queue-pause anti-join fix
+
+Point 3 above — `loops=10000` on the queue-pause anti-join — describes a real
+cost, but every scenario elsewhere on this page evaluates it against an empty
+`harvest_queue_pauses` (see [known limitations](#known-limitations)), so it was
+flagged, never measured. This section closes that gap with a dedicated harness
+variant that seeds an *active* pause on one of the worker's polled queues, then
+fixes the predicate the measurement indicts.
+
+**Mechanism.** `claim_task_query()`'s pre-fix anti-join
+(`NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp WHERE qp.queue_name =
+harvest_task_queue.queue_name)`) is *correlated*: Postgres re-evaluates it once
+per candidate row the outer scan visits, not once per claim. The fix replaces
+it with a `MATERIALIZED` CTE that reads the (small, low-cardinality) pause
+table once per claim into an array, then tests membership with a plain
+`<> ALL(...)`:
+
+```sql
+paused_queues AS MATERIALIZED (
+    SELECT COALESCE(array_agg(queue_name), ARRAY[]::text[]) AS names
+    FROM harvest_queue_pauses
+    WHERE queue_name = ANY($2)
+)
+...
+CROSS JOIN paused_queues
+...
+NOT (harvest_task_queue.queue_name = ANY(paused_queues.names))
+```
+
+The array is bounded by `$2` — the worker's own polled-queue list, typically
+single digits — never a scan of the whole pause table.
+
+**Measurement.** One cold claim (`EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS,
+TIMING OFF)`), four polled queues, one of the four actively paused, against the
+reference environment above. Full artifacts (before/after `EXPLAIN` at each
+backlog depth, plus a `pg_stat_statements` snapshot) are committed under
+[`docs/perf-artifacts/queue-pause-claim-anti-join/`](perf-artifacts/queue-pause-claim-anti-join/).
+
+| Backlog | Buffers (before) | Buffers (after) | Δ |
+|--:|--:|--:|--:|
+| 1 000 | 1 292 | 47 | **-96.36%** |
+| 10 000 (headline) | 12 743 | 248 | **-98.05%** |
+| 100 000 | 9 008 | 2 251 | **-75.01%** |
+
+At 1k and 10k the mechanism is exactly the one the plan above describes: the
+anti-join subnode itself goes from `loops=10000, Buffers: shared hit=12500`
+(98.1% of the statement's own buffer cost at 10k) to a CTE evaluated
+`loops=1, Buffers: shared hit=5`. At 100k the picture is more interesting:
+Postgres's *own* planner already escapes the `loops=N` shape in the **pre-fix**
+plan — it switches to a `Merge Anti Join`, since one side (the one-row pause
+set) sorts for free — so the anti-join itself is cheap there either way (~2
+buffer hits before, ~5 after). The 100k delta instead comes from a secondary,
+plan-shape effect the rewrite enables: once the correlated form is gone, the
+planner no longer needs *sorted* input from the base table to support a merge,
+and switches the base scan from an index scan (`idx_harvest_tq_poll`, 8 983
+buffers) to a plain sequential scan (2 223 buffers) — cheaper here because the
+table fits comfortably in a handful of large sequential reads. This is reported
+honestly rather than folded into "the same mechanism at every scale": the fix
+is unambiguously good everywhere measured, but *why* varies with the
+scale-dependent plan Postgres already chooses.
+
+**Corroboration.** Wall-clock execution time moved in the same direction as
+buffers by more than 2x only at the headline scale (1 372 ms → 123 ms, 11.2x)
+— the bar this page's own methodology sets for treating wall-clock as
+corroborating evidence. At 1k it improved modestly (2.16 ms → 1.56 ms, well
+under 2x) and at 100k it was flat (1 401 ms → 1 421 ms) — the "after" plan
+spills *more* to a temp-file external sort at that scale (810 → 1 417 pages
+written), because the wider intermediate row (each candidate row now carries
+`paused_queues.names` through the join before the anti-join filter narrows it)
+costs more to sort even though fewer buffers are touched to produce it.
+Buffers, not wall-clock, is what this fix is measured against; the 100k
+wall-clock flatness is reported for completeness, not hidden.
+
+**Cumulative, real-claim-loop evidence.** A `pg_stat_statements` snapshot of
+7 501 real `claim_task()` calls draining the full 10k-row headline backlog (one
+queue paused throughout): total buffers **18 671 000 → 3 773 247**
+(**-79.79%**). Lower than the single-cold-claim -98.05% because later claims in
+the drain face a shrinking, already-less-pathological candidate set on both
+sides of the fix — expected, not a discrepancy.
+
+**Equivalence.** Both before and after runs claim the identical 7 500 of 10 000
+rows and never touch the actively paused queue's rows (proven end-to-end by
+`tests/integration/queue_pause_tests.rs::claim_query_excludes_paused_queues_end_to_end`,
+which also covers resuming the queue). Reproduce with
+`autumn-harvest/scripts/queue_pause_claim_perf_repro.sh`, which needs either
+`HARVEST_TEST_DATABASE_URL` (an admin connection string) or a reachable Docker
+daemon for its testcontainer fallback — not both.
 
 ## Enqueue throughput
 
@@ -757,10 +866,12 @@ from the benchmark are directly comparable.
     subplan, so the one whose real cost is least predictable from the query
     text, and the most defensible next scenario to add. The seed leaves
     `required_capabilities` null.
-  * **Queue pauses (#619)** — a `NOT EXISTS` against `harvest_queue_pauses`,
-    which the harness only ever `TRUNCATE`s. The predicate is evaluated on every
-    claim, but always against an *empty* relation, which is the cheapest path it
-    has. Being in the plan is not the same as being measured.
+  * **Queue pauses (#619)** — the attribution-table sweep above still only ever
+    `TRUNCATE`s `harvest_queue_pauses`, so it still says nothing about this
+    predicate's cost on its own. A dedicated harness variant that actively
+    pauses a queue closed that specific gap and, as a direct result, replaced
+    the correlated anti-join with a one-time prefilter — see
+    [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
   * **`schedule_to_close` (#378), worker sessions (#606), sticky routing
     (#235)** — cheap inline column tests, against columns the seed leaves null.
 
@@ -784,3 +895,8 @@ from the benchmark are directly comparable.
 * `tests/integration/claim_budget_tests.rs` — the gate.
 * `docs/sharding.md` — what to do when the backlog table says you have outgrown
   one shard.
+* `docs/perf-artifacts/queue-pause-claim-anti-join/` — committed before/after
+  `EXPLAIN`/`pg_stat_statements` evidence for
+  [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
+* `autumn-harvest/scripts/queue_pause_claim_perf_repro.sh` — regenerates that
+  evidence from a clean checkout.

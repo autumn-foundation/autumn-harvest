@@ -3161,6 +3161,24 @@ pub mod db {
             Postgres::default()
                 .with_init_sql(autumn_harvest::full_migrations_sql().as_bytes().to_vec())
                 .with_tag("16")
+                // Preload `pg_stat_statements` so the evidence-capture test's
+                // real-claim_task() snapshot (`zz_capture_queue_pause_claim_evidence`)
+                // works on the pure-Docker fallback path, not just against an
+                // external `HARVEST_TEST_DATABASE_URL` that happens to already
+                // have it configured -- the extension's C hooks only exist once
+                // preloaded at postmaster start; `CREATE EXTENSION` alone (which
+                // that test already runs) cannot retroactively enable them.
+                // `.with_cmd(...)` fully replaces `Image::cmd()` rather than
+                // merging with it, so the image's own `fsync=off` default
+                // (`Postgres::default()` never calls `.with_fsync_enabled()`) is
+                // repeated here explicitly to avoid silently re-enabling fsync
+                // and slowing down every Docker-fallback benchmark run.
+                .with_cmd([
+                    "-c",
+                    "shared_preload_libraries=pg_stat_statements",
+                    "-c",
+                    "fsync=off",
+                ])
                 .start(),
         )
         .await?

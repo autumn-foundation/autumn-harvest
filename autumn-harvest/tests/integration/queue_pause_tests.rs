@@ -227,19 +227,36 @@ async fn claim_one(conn: &mut AsyncPgConnection, queue: &str) -> Option<Uuid> {
 
 // ── Pure (no-DB) unit tests ───────────────────────────────────────────────────
 
-/// AC2 — the claim predicate carries the queue-pause anti-join, so a paused
-/// queue is skipped by *every* worker with no cache and no boot-ordering race.
+/// AC2 — the claim predicate excludes every paused queue, so a paused queue is
+/// skipped by *every* worker with no cache and no boot-ordering race.
+///
+/// The claim path pre-filters `harvest_queue_pauses` once into a small array
+/// (`paused_queues`) rather than embedding `QUEUE_PAUSE_CLAIM_PREDICATE`
+/// verbatim — that per-row correlated form was re-probing the pause table once
+/// per *candidate row* scanned, not once per claim (docs/performance.md); see
+/// the DB-backed `claim_query_excludes_paused_queues_end_to_end` below for the
+/// behavioral proof that the two forms are equivalent.
 #[test]
 fn claim_query_contains_the_queue_pause_anti_join() {
     let sql = queue::claim_task_query();
     assert!(
         sql.contains("harvest_queue_pauses"),
-        "claim_task must anti-join the pause table; got:\n{sql}"
+        "claim_task must reference the pause table; got:\n{sql}"
     );
     assert!(
-        sql.contains(queue_pause::QUEUE_PAUSE_CLAIM_PREDICATE),
-        "claim_task must embed the shared predicate verbatim so the two cannot drift"
+        sql.contains("paused_queues AS MATERIALIZED"),
+        "claim_task must pre-filter the pause table once, not per row; got:\n{sql}"
     );
+    assert!(
+        sql.contains("NOT (harvest_task_queue.queue_name = ANY(paused_queues.names))"),
+        "claim_task must exclude a queue present in the pre-filtered pause \
+         array; got:\n{sql}"
+    );
+    // `QUEUE_PAUSE_CLAIM_PREDICATE` still exists and is still used verbatim by
+    // `oldest_pending_ages` and `claimable_pending_demand_by_queue` (asserted
+    // in `claim_mirror_queries_contain_the_queue_pause_anti_join` below);
+    // `claim_task` is the one deliberate, evidence-backed exception to
+    // embedding it.
 }
 
 /// The two queries that document "mirrors every claim-time gate" must mirror
@@ -400,6 +417,80 @@ async fn pause_holds_dispatch_and_resume_releases_it() {
         Some(task),
         "AC5: held tasks are immediately claimable after resume"
     );
+}
+
+/// Ledger perf pass (issue #619 follow-up): `claim_task`'s `$2` queue-name
+/// array can name several queues in one call (a worker typically polls more
+/// than one), and the pre-filtered `paused_queues` CTE this test protects
+/// derives its exclusion set from that same array. No existing test in this
+/// file drives `claim_task` with more than one queue name at once, so a bug
+/// that let a paused queue's array-membership check leak through (or wrongly
+/// excluded an *unpaused* queue sharing the `$2` call) would go unnoticed.
+///
+/// This is the DB-backed equivalence proof the claim-query rewrite's own doc
+/// comment points to: with one of three polled queues paused, every task on
+/// the paused queue is skipped and every task on the other two is still
+/// claimed — the exact set a correlated `NOT EXISTS` would have produced.
+#[tokio::test]
+async fn claim_query_excludes_paused_queues_end_to_end() {
+    let (mut conn, _c) = setup_db().await;
+    let paused_q = unique_queue("multi-paused");
+    let live_q_a = unique_queue("multi-live-a");
+    let live_q_b = unique_queue("multi-live-b");
+    let queues = vec![paused_q.clone(), live_q_a.clone(), live_q_b.clone()];
+
+    // Two tasks on the queue that will be paused, one each on the two live
+    // queues -- so a bug in either direction (paused leaks through, or a live
+    // queue is wrongly excluded) shows up as a wrong total or a wrong split.
+    let held_1 = enqueue_activity(&mut conn, &paused_q, None).await;
+    let held_2 = enqueue_activity(&mut conn, &paused_q, None).await;
+    let live_a = enqueue_activity(&mut conn, &live_q_a, None).await;
+    let live_b = enqueue_activity(&mut conn, &live_q_b, None).await;
+
+    queue_pause::pause_queue(
+        &mut conn,
+        &paused_q,
+        "ledger-multi-queue-test",
+        "alice",
+        None,
+    )
+    .await
+    .expect("pause");
+
+    let mut claimed: Vec<Uuid> = Vec::new();
+    while let Some(t) = claim_task(&mut conn, &queues, "w1", "", None, &[], &[])
+        .await
+        .expect("claim")
+    {
+        claimed.push(t.id);
+    }
+    claimed.sort();
+    let mut expected = vec![live_a, live_b];
+    expected.sort();
+    assert_eq!(
+        claimed, expected,
+        "a multi-queue claim with one paused queue must claim exactly the \
+         live queues' tasks -- the paused queue's tasks must never appear, \
+         and the live queues' tasks must never be excluded by accident"
+    );
+    assert_eq!(task_state(&mut conn, held_1).await, "PENDING");
+    assert_eq!(task_state(&mut conn, held_2).await, "PENDING");
+
+    // Resuming makes the held pair claimable, and nothing else changes.
+    queue_pause::resume_queue(&mut conn, &paused_q, "alice")
+        .await
+        .expect("resume");
+    let mut resumed_claims: Vec<Uuid> = Vec::new();
+    while let Some(t) = claim_task(&mut conn, &queues, "w1", "", None, &[], &[])
+        .await
+        .expect("claim")
+    {
+        resumed_claims.push(t.id);
+    }
+    resumed_claims.sort();
+    let mut expected_resumed = vec![held_1, held_2];
+    expected_resumed.sort();
+    assert_eq!(resumed_claims, expected_resumed);
 }
 
 /// AC2 — a pause holds *dispatch*; a task already RUNNING when the pause lands
