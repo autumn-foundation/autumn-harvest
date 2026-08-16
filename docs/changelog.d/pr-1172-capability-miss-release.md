@@ -1615,3 +1615,53 @@ and the new test perturbed exactly that. Wrapped both statements in an explicit
 `BEGIN`/`ROLLBACK` so the setting survives to the `EXPLAIN`; both probes now pass
 against a pristine empty database, which the positive one could not have done
 before.
+
+## Review round 43
+
+One P2, accepted in part — the *repair* chosen is the second of the two the
+finding offered, and for a reason worth recording.
+
+`EscalationCause::outcome_label` maps both the budget bounds and the ungated
+absolute release ceiling to `outcome="escalated"`. That mapping is deliberate
+(round 23): executions are being failed either way, and under-paging is the
+worse error for the outage #804 exists to surface. But the two do not license
+the same *conclusion*. The gated bounds fire only once the registry confirms the
+recorded missers cover the live fleet; the ceiling fires precisely where that
+coverage could **not** be established, so a live, never-tried peer may still be
+capable. The paging rule's prose asserted the fleet reading for the whole
+outcome — "the task was bounced around the queue … and still found no capable
+worker", and a `first_action` that sent on-call straight to
+`workflow-types/reachability` — so a ceiling escalation pointed triage at a
+conclusion that does not follow.
+
+The finding offered two repairs: split the ceiling into its own outcome, or make
+the alert cause-neutral. **Cause-neutral was chosen.** Splitting would add a
+fourth value to a bounded metric label and, unless the paging rule were widened
+to select both, would stop the ceiling paging at all — reversing round 23's
+deliberate "under-paging is worse" call for a case documented as requiring
+`10 × budget` consecutive lost claim races across ~25 minutes of backoff. The
+defect is in the prose asserting a conclusion the label never carried, not in
+the label.
+
+So the rule now names the discriminator instead of guessing: the description
+directs the reader to the `no_capable_worker:` reason string **before** drawing
+any fleet conclusion and states plainly that a ceiling escalation "does NOT mean
+the queue was swept"; `default_threshold` justifies paging by *executions are
+being failed* rather than by a fleet conclusion; and `first_action` branches —
+reachability/workers for a coverage-confirmed escalation, the named workers
+first for a ceiling trip. The runbook's escalation-cause table already gave the
+two rows different fixes, so only its row 2a needed correcting.
+
+**Same stale claim, third copy.** Row 2a and the alert description both still
+credited the ceiling with "a fleet smaller than the budget" — the round-15
+regression round 41 corrected in `builder.rs`. A *registered* small fleet
+escalates at `N` via the configured-total bound (row 1a, `D ≤ N`); the ceiling
+covers unprovable coverage. Both are corrected, and the new pin
+`capability_miss_paging_rule_prose_is_cause_neutral` fails if the phrase returns
+to any of the three prose fields — so the fourth copy cannot be written silently.
+The pin also asserts the discriminator is named first and the ceiling's weaker
+conclusion is stated; confirmed falsifiable against the pre-fix pack.
+
+The changelog's earlier sections are left as written: they record what was true
+at the round they describe, and rewriting them would falsify the history that
+rounds 41 and 43 exist to correct.

@@ -546,6 +546,89 @@ fn capability_miss_released_outcome_never_pages() {
     );
 }
 
+/// The paging rule must not assert a fleet conclusion the outcome label does
+/// not support (issue #804, Codex round-43).
+///
+/// `EscalationCause::outcome_label` maps BOTH the budget bounds and the ungated
+/// absolute release ceiling to `outcome="escalated"`, deliberately: executions
+/// are being failed either way and under-paging is the worse error. But the two
+/// do not license the same conclusion. The gated bounds fire only once the
+/// registry confirms the recorded missers cover the live fleet; the ceiling
+/// fires precisely where that coverage could NOT be established, so a live,
+/// never-tried peer may still be capable.
+///
+/// The rule's prose is what on-call reads first, so it must not send them to a
+/// fleet-exhaustion investigation for an escalation that does not support one.
+/// This pins the cause-neutral phrasing rather than the wording: the reason
+/// string must be named as the discriminator, the ceiling's weaker conclusion
+/// must be stated, and the round-15-stale "a fleet smaller than the budget"
+/// claim must not reappear — a *registered* small fleet escalates at `N` via
+/// the configured-total bound, not via the ceiling.
+#[test]
+fn capability_miss_paging_rule_prose_is_cause_neutral() {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+    let rule = rules
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some("harvest_no_capable_worker"))
+        .expect("the paging capability-miss rule must exist");
+
+    let field = |name: &str| -> String {
+        rule[name]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} must be a string"))
+            .to_string()
+    };
+    let description = field("description");
+    let first_action = field("first_action");
+    let threshold = field("default_threshold");
+
+    // The discriminator must be named, and named FIRST in the triage step --
+    // every other check in `first_action` is only correct for one of the two
+    // conclusions.
+    assert!(
+        first_action.contains("reason") && first_action.contains("FIRST"),
+        "first_action must send on-call to the execution's reason string before \
+         any fleet API, since that string is what says which conclusion applies: {first_action}"
+    );
+    assert!(
+        first_action.contains("ceiling"),
+        "first_action must branch on the ceiling case explicitly -- the reachability/workers \
+         path is only correct for a coverage-confirmed escalation: {first_action}"
+    );
+
+    // The ceiling's weaker conclusion must be stated, not left implied.
+    assert!(
+        description.contains("does NOT mean the queue was swept"),
+        "the description must state plainly that a ceiling escalation does not support the \
+         fleet-exhaustion reading: {description}"
+    );
+    assert!(
+        !description.contains("still found no capable worker"),
+        "the description must not assert fleet exhaustion for the whole outcome -- that reading \
+         is false for every ceiling trip: {description}"
+    );
+    assert!(
+        !threshold.contains("no live worker on that queue registers the handler"),
+        "the threshold must justify paging by executions being failed, not by a fleet \
+         conclusion that only some escalations support: {threshold}"
+    );
+
+    // Round 15 gave the small-fleet case to the configured-total bound; the
+    // ceiling now covers unprovable coverage. The stale claim must not return.
+    for (name, text) in [
+        ("description", &description),
+        ("first_action", &first_action),
+        ("default_threshold", &threshold),
+    ] {
+        assert!(
+            !text.contains("fleet smaller than the budget"),
+            "{name} still credits the ceiling with the small-fleet case that the \
+             configured-total bound has owned since review round 15: {text}"
+        );
+    }
+}
+
 /// Half 2 of the capability-miss alert-shape pin (issue #804).
 ///
 /// Split from [`capability_miss_released_outcome_never_pages`] along the seam
