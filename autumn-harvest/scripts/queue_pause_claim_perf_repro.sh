@@ -11,25 +11,41 @@
 #
 #   1. "after"  -- against the tree exactly as checked out (assumed to have
 #                  the fix, since that is what this script ships alongside).
-#   2. "before" -- against `queue.rs` with the fix temporarily removed via
-#                  `git stash`, restored automatically on exit (success,
-#                  failure, or interrupt).
+#   2. "before" -- against `queue.rs` with the fix temporarily removed. Two
+#                  ways to get there, auto-detected:
+#                    - dev loop (uncommitted diff present, fix not yet
+#                      committed): `git stash` the file, as before.
+#                    - clean checkout (no uncommitted diff -- the normal state
+#                      once this branch has merged): walk `git log` for
+#                      `queue.rs` to the most recent commit whose content does
+#                      NOT yet contain the fix marker
+#                      (`paused_queues AS MATERIALIZED`), and materialize that
+#                      commit's content into the working file for the
+#                      duration of the "before" capture. Either way the
+#                      original working-tree file is restored on exit
+#                      (success, failure, or interrupt).
 #
 # The capture test self-detects which shape it measured by inspecting
 # `queue::claim_task_query()`'s own text at runtime, so there is no
 # hand-maintained "old" copy of the query for either invocation to drift out
 # of sync with -- both runs execute the real, compiled function.
 #
-# Usage:
+# Usage (works with or without HARVEST_TEST_DATABASE_URL -- see below):
 #   HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 #     ./autumn-harvest/scripts/queue_pause_claim_perf_repro.sh
 #
-# `HARVEST_TEST_DATABASE_URL` is treated as an ADMIN URL, exactly as
-# `claim_bench_support.rs` treats it elsewhere in this crate: the harness
+#   # or, with only a reachable Docker daemon and no external Postgres:
+#   ./autumn-harvest/scripts/queue_pause_claim_perf_repro.sh
+#
+# `HARVEST_TEST_DATABASE_URL`, when set, is treated as an ADMIN URL, exactly
+# as `claim_bench_support.rs` treats it elsewhere in this crate: the harness
 # creates, migrates, seeds, measures, and drops a fresh uniquely-named
-# database per test run. Unset it (or run without Docker reachable either) and
-# the capture test SKIPs loudly instead of producing artifacts -- see
-# `bench_db_or_skip()` in `claim_budget_tests.rs`.
+# database per test run. When it is UNSET, `setup_bench_db()` falls back to a
+# testcontainer automatically -- this script does not gate on the variable
+# being present, so that fallback is reachable. If neither an external
+# database nor a Docker daemon is reachable, the capture test SKIPs loudly
+# instead of producing artifacts -- see `bench_db_or_skip()` in
+# `claim_budget_tests.rs`.
 #
 # Writes into `docs/perf-artifacts/queue-pause-claim-anti-join/`:
 #   {before,after}-claim-backlog-{1000,10000,100000}.explain.txt
@@ -59,8 +75,14 @@ cd "$REPO_ROOT"
 QUEUE_RS="autumn-harvest/src/queue.rs"
 OUT_DIR="${1:-$REPO_ROOT/docs/perf-artifacts/queue-pause-claim-anti-join}"
 TEST_FILTER="claim_budget_tests::zz_capture_queue_pause_claim_evidence"
+FIX_MARKER="paused_queues AS MATERIALIZED"
 
-: "${HARVEST_TEST_DATABASE_URL:?set HARVEST_TEST_DATABASE_URL to an admin connection string, e.g. postgres://postgres:postgres@localhost:5432/postgres (or ensure Docker is reachable for the testcontainer fallback)}"
+if [ -z "${HARVEST_TEST_DATABASE_URL:-}" ]; then
+  echo "== HARVEST_TEST_DATABASE_URL is unset -- relying on the testcontainer \
+fallback (Docker must be reachable). Set the variable to an admin connection \
+string, e.g. postgres://postgres:postgres@localhost:5432/postgres, to skip \
+Docker entirely. =="
+fi
 
 capture() {
   local label="$1"
@@ -73,19 +95,30 @@ capture() {
   if [ "$produced" -lt 1 ]; then
     echo "FATAL: the test run did not report 'label=${label}' -- either \
 queue::claim_task_query() was not in the expected shape for this half of the \
-repro (see the git-stash step above/below), or the capture test itself \
+repro (see the before-half setup above/below), or the capture test itself \
 failed/skipped. Check the log at /tmp/queue_pause_claim_capture_${label}.log." >&2
     exit 1
   fi
 }
 
-STASHED=0
+# One of: "none" (nothing to restore yet), "stash" (dev-loop half, restore via
+# `git stash pop`), "checkout" (clean-checkout half, restore via
+# `git checkout -- $QUEUE_RS`). Set right before the corresponding mutation so
+# the trap is always correct regardless of which exit path fires.
+RESTORE_MODE="none"
 restore() {
-  if [ "$STASHED" -eq 1 ]; then
-    echo "== restoring ${QUEUE_RS} (git stash pop) =="
-    git stash pop
-    STASHED=0
-  fi
+  case "$RESTORE_MODE" in
+    stash)
+      echo "== restoring ${QUEUE_RS} (git stash pop) =="
+      git stash pop
+      ;;
+    checkout)
+      echo "== restoring ${QUEUE_RS} (git checkout) =="
+      git checkout -- "$QUEUE_RS"
+      ;;
+    none) ;;
+  esac
+  RESTORE_MODE="none"
 }
 trap restore EXIT
 
@@ -93,19 +126,30 @@ echo "== half one: 'after' -- the tree as checked out =="
 capture "after"
 
 echo "== half two: 'before' -- ${QUEUE_RS} with the fix temporarily removed =="
-if git diff --quiet -- "$QUEUE_RS"; then
-  echo "FATAL: ${QUEUE_RS} has no uncommitted changes relative to HEAD, so \
-there is nothing for 'git stash' to remove. This script is meant to be run \
-from the PR branch BEFORE the fix commit lands (uncommitted diff present). \
-To reproduce after the fix has been committed, check out the commit \
-immediately before it, re-run this script's 'after' half by hand against that \
-older commit's queue.rs, then check out the fix commit and re-run the 'after' \
-half again -- there is no single-command path once both shapes are only \
-reachable via git history rather than one working tree." >&2
-  exit 1
+if ! git diff --quiet -- "$QUEUE_RS"; then
+  echo "== dev-loop checkout: stashing the uncommitted ${QUEUE_RS} diff =="
+  git stash push --quiet -- "$QUEUE_RS"
+  RESTORE_MODE="stash"
+else
+  echo "== clean checkout: ${QUEUE_RS} has no uncommitted diff -- looking up \
+the last commit predating the fix marker '${FIX_MARKER}' =="
+  PRE_FIX_COMMIT=""
+  while IFS= read -r sha; do
+    if ! git show "${sha}:${QUEUE_RS}" 2>/dev/null | grep -qF "$FIX_MARKER"; then
+      PRE_FIX_COMMIT="$sha"
+      break
+    fi
+  done < <(git log --format='%H' -- "$QUEUE_RS")
+  if [ -z "$PRE_FIX_COMMIT" ]; then
+    echo "FATAL: every commit touching ${QUEUE_RS} in this history already \
+contains the fix marker '${FIX_MARKER}' -- could not locate a pre-fix \
+revision to reproduce the baseline from." >&2
+    exit 1
+  fi
+  echo "== using ${QUEUE_RS} from ${PRE_FIX_COMMIT} (pre-fix) =="
+  git show "${PRE_FIX_COMMIT}:${QUEUE_RS}" > "$QUEUE_RS"
+  RESTORE_MODE="checkout"
 fi
-git stash push --quiet -- "$QUEUE_RS"
-STASHED=1
 capture "before"
 restore
 trap - EXIT
