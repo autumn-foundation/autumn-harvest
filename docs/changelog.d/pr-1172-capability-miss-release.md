@@ -1224,3 +1224,64 @@ affect.
 - `queue::tests::registration_invalidates_only_that_workers_miss_evidence` gains
   a `state IN ('PENDING', 'RUNNING')` assertion. **Confirmed RED** with the
   filter removed.
+
+## Review round 36
+
+**Codex P2 — the release logged a cardinality its own write never produced.**
+Round 35 justified reporting `resolution.distinct_after` on the release branch
+with: "the release `UPDATE` ran and appended this claimant, so the post-claim
+count *is* the durable set." That justification only holds if nothing touched
+`capability_miss_workers` between the read and the write — and something can.
+
+`observe_miss_and_fleet` snapshots the array, then a peer restarting onto a
+capable build runs `invalidate_capability_miss_evidence_for_worker`, which
+`array_remove`s its own id from exactly these `RUNNING` rows (that is the
+round-26 fix, correctly scoped by round 35 to live rows). The release `UPDATE`
+then appends the claimant to the *post-invalidation* array, so the snapshot
+over-reports: `{A,B}` + claimant `C` logs as 3 while the row actually holds
+`{B,C}`.
+
+The fix makes the number true by construction rather than by a timing
+assumption: all three phase-selected release statements now carry
+`RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) AS
+distinct_miss_workers`, and `release_task_for_capability_miss` returns
+`Option<i32>` — `None` for a claim already taken (the previous `false`),
+`Some(n)` for the cardinality *this statement committed*. The release log
+reports that value.
+
+`reported_distinct_workers` keeps its round-35 role as the single place the
+choice is made, with the release arm now taking the durable value rather than a
+snapshot field:
+
+- `Some(durable)` — the release branch, straight from the `UPDATE`.
+- `None` — the escalation branch, which never runs that `UPDATE`, so the
+  claimant was never appended and the pre-claim `distinct_before` is correct
+  (Codex round-8 P2, unchanged).
+
+RED, on the no-DB SQL-shape pin:
+
+```
+the release must return its own post-update cardinality -- a value derived from
+the caller's earlier snapshot silently over-reports when a peer's
+re-registration invalidated an entry in between
+```
+
+RED, on the DB test, with a mutant reproducing the bug's exact symptom
+(reporting one more than durable):
+
+```
+assertion `left == right` failed: the release must report the cardinality it
+committed (["stale-b", "incapable"]), not the snapshot-derived 3 -- a peer
+invalidated an entry in between
+  left: Some(3)
+ right: Some(2)
+```
+
+`the_release_reports_the_cardinality_it_actually_committed` reproduces the
+interleaving in order — snapshot `{stale-a, stale-b}`, invalidate `stale-a`,
+then release as `incapable` — and asserts the durable set is `{stale-b,
+incapable}` and the reported count is 2, not the snapshot-derived 3. The
+`the_two_branches_report_opposite_distinct_worker_bases` fixture was widened to
+two invalidations so the durable count coincides with neither snapshot field;
+with a single invalidation it equals `distinct_before` numerically and the
+assertions could not discriminate.

@@ -2135,7 +2135,9 @@ pub const fn release_task_for_capability_miss_query(
              activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END \
          WHERE id = $1 \
            AND state = 'RUNNING' \
-           AND worker_id = $2"
+           AND worker_id = $2 \
+         RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
+             AS distinct_miss_workers"
     } else if phase.restores_dispatch_attempt() {
         // BeforeHandler: nothing ran at all. Restore the claim-time increment
         // so the miss neither drains an activity's retry budget nor blocks a
@@ -2159,7 +2161,9 @@ pub const fn release_task_for_capability_miss_query(
              activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END \
          WHERE id = $1 \
            AND state = 'RUNNING' \
-           AND worker_id = $2"
+           AND worker_id = $2 \
+         RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
+             AS distinct_miss_workers"
     } else {
         // DuringHandler: the body BEGAN (so the start metric fired and
         // `attempt` must stay put) but did not finish (so the #367 streak is
@@ -2182,7 +2186,9 @@ pub const fn release_task_for_capability_miss_query(
              activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END \
          WHERE id = $1 \
            AND state = 'RUNNING' \
-           AND worker_id = $2"
+           AND worker_id = $2 \
+         RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
+             AS distinct_miss_workers"
     }
 }
 
@@ -2238,9 +2244,22 @@ pub const fn release_task_for_capability_miss_query(
 /// for why a pre-/mid-handler miss must leave issue #367's counter alone and
 /// why a post-handler miss must leave `attempt` alone.
 ///
-/// Returns `true` when this worker's claim was actually released; `false`
-/// means the row was already taken by something else (e.g. an orphan reclaim
-/// won the race) and the caller must treat the task as no longer its own.
+/// Returns `Some(distinct_miss_workers)` when this worker's claim was actually
+/// released, carrying the **post-update** cardinality of
+/// `capability_miss_workers` as this statement committed it. `None` means the
+/// row was already taken by something else (e.g. an orphan reclaim won the
+/// race) and the caller must treat the task as no longer its own.
+///
+/// The count is returned by the `UPDATE` rather than derived from the caller's
+/// earlier read because the two can genuinely disagree (Codex round-36 P2).
+/// `observe_miss_and_fleet` snapshots the array before the release; a peer
+/// restarting onto a capable build then runs
+/// [`invalidate_capability_miss_evidence_for_worker`], which `array_remove`s
+/// its own id from exactly these `RUNNING` rows. This statement appends the
+/// claimant to the *post-invalidation* array, so a snapshot-derived number
+/// over-reports: `{A,B}` + claimant `C` reads as 3 while the row actually holds
+/// `{B,C}`. Reporting what the write produced makes the rollout diagnostic true
+/// by construction instead of by a timing assumption.
 ///
 /// # Errors
 ///
@@ -2251,17 +2270,28 @@ pub async fn release_task_for_capability_miss(
     worker_id: &str,
     backoff: StdDuration,
     phase: crate::error::CapabilityMissPhase,
-) -> HarvestResult<bool> {
+) -> HarvestResult<Option<i32>> {
     // Bounded by `capability_miss_backoff`'s 30s cap; the clamp is defensive.
     let backoff_secs = f64::min(backoff.as_secs_f64(), 3600.0);
     let released = diesel::sql_query(release_task_for_capability_miss_query(phase))
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .bind::<diesel::sql_types::Double, _>(backoff_secs)
-        .execute(conn)
+        .get_results::<DistinctMissWorkersRow>(conn)
         .await
         .map_err(crate::error::database_error)?;
-    Ok(released > 0)
+    Ok(released
+        .into_iter()
+        .next()
+        .map(|row| row.distinct_miss_workers))
+}
+
+/// The post-update `capability_miss_workers` cardinality returned by
+/// [`release_task_for_capability_miss_query`].
+#[derive(diesel::QueryableByName)]
+struct DistinctMissWorkersRow {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    distinct_miss_workers: i32,
 }
 
 /// SQL for [`reset_capability_misses_after_inline_progress`]. Extracted as a
@@ -4386,6 +4416,42 @@ mod tests {
                 !sql.contains("attempt ="),
                 "{phase:?}: a post-handler release must leave `attempt` alone \
                  entirely, not rewrite it to some other value: {sql}",
+            );
+        }
+    }
+
+    /// The release must report the cardinality **its own `UPDATE` produced**,
+    /// not the one the caller read beforehand (issue #804, Codex round-36 P2).
+    ///
+    /// `observe_miss_and_fleet` reads `capability_miss_workers` and derives
+    /// `distinct_after` from that snapshot. Between that read and this `UPDATE`,
+    /// a peer restarting onto a capable build runs
+    /// `invalidate_capability_miss_evidence_for_worker`, which `array_remove`s
+    /// its own id from exactly these `RUNNING` rows. The `UPDATE` then appends
+    /// the claimant to the *post-invalidation* array, so the durable set can be
+    /// smaller than the snapshot predicted — `{A,B}` + claimant `C` is logged as
+    /// 3 even though `A` was invalidated first and the row actually holds
+    /// `{B,C}`.
+    ///
+    /// Returning the count from the statement that wrote it is the only way the
+    /// number is true by construction rather than by a timing assumption.
+    #[test]
+    fn capability_miss_release_returns_the_cardinality_it_committed() {
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+            CapabilityMissPhase::AfterHandler,
+        ] {
+            let sql = release_task_for_capability_miss_query(phase);
+            assert!(
+                sql.contains(
+                    "RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
+                     AS distinct_miss_workers"
+                ),
+                "{phase:?}: the release must return its own post-update \
+                 cardinality -- a value derived from the caller's earlier \
+                 snapshot silently over-reports when a peer's re-registration \
+                 invalidated an entry in between: {sql}",
             );
         }
     }

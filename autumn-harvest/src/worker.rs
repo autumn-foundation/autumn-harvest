@@ -16537,6 +16537,10 @@ async fn release_capability_miss(
             // handler at all (Codex round-17 P2). See
             // `CapabilityMissPhase::clears_crash_strikes` /
             // `::restores_dispatch_attempt`.
+            // The returned cardinality is the one this `UPDATE` committed, not
+            // the one `observe_miss_and_fleet` snapshotted -- a peer's
+            // re-registration can invalidate an entry in between (Codex
+            // round-36 P2). See `release_task_for_capability_miss`.
             let released = queue::release_task_for_capability_miss(
                 conn,
                 task.id,
@@ -16545,7 +16549,7 @@ async fn release_capability_miss(
                 missing.phase,
             )
             .await?;
-            if !released {
+            let Some(durable_distinct_workers) = released else {
                 // A concurrent poison-pill reclaim (or an operator action) took
                 // the row out from under this claim. Nothing to do and nothing
                 // to count: the row is no longer ours to release.
@@ -16559,7 +16563,7 @@ async fn release_capability_miss(
                 return Ok(TaskDispatchOutcome::Released {
                     clears_timeout_strike: missing.phase.clears_workflow_timeout_strike(),
                 });
-            }
+            };
             metrics.record_task_capability_miss(
                 &task.queue_name,
                 &task.task_type,
@@ -16572,7 +16576,8 @@ async fn release_capability_miss(
                 handler_kind = missing.kind,
                 handler = missing.name,
                 capability_misses = resolution.total_after,
-                distinct_incapable_workers = reported_distinct_workers(resolution, true),
+                distinct_incapable_workers =
+                    reported_distinct_workers(resolution, Some(durable_distinct_workers)),
                 fleet_evidence = ?resolution.evidence,
                 worker_is_new_misser = resolution.worker_is_new,
                 max_redeliveries,
@@ -16784,24 +16789,27 @@ async fn revalidate_escalation_evidence(
 /// count it must not use, while the escalation log kept the post-claim count it
 /// must not use. Both now go through here so they cannot drift again.
 ///
-/// - `released == true` — the release `UPDATE` ran and appended this claimant to
-///   `capability_miss_workers`, so the post-claim count *is* the durable set,
-///   matching `capability_misses` (also reported post-update) on the same line.
-/// - `released == false` — the escalation branch never runs that `UPDATE`, so
-///   the claimant was never appended. The persisted set is the pre-claim count,
-///   matching `completed_releases` and the reason string on the same line
-///   (Codex round-8 P2).
+/// - `Some(durable)` — the release branch. The value is what the release
+///   `UPDATE` itself returned, so it *is* the durable set, matching
+///   `capability_misses` (also reported post-update) on the same line. It is
+///   deliberately **not** `resolution.distinct_after`: that is derived from the
+///   snapshot `observe_miss_and_fleet` read, and a peer restarting onto a
+///   capable build can `array_remove` an entry between that read and the write,
+///   leaving the snapshot one higher than the row (Codex round-36 P2).
+/// - `None` — the escalation branch never runs that `UPDATE`, so the claimant
+///   was never appended and there is no post-update count to report. The
+///   persisted set is the pre-claim count, matching `completed_releases` and the
+///   reason string on the same line (Codex round-8 P2).
 ///
-/// The two fields also have different Rust types (`i32` vs `usize`), which is
+/// The two sources also have different Rust types (`i32` vs `usize`), which is
 /// part of why swapping them compiled silently — `tracing` accepts either. The
 /// helper normalises to one type so the choice is a deliberate argument rather
 /// than an incidental field name.
-fn reported_distinct_workers(resolution: &CapabilityMissResolution, released: bool) -> i64 {
-    if released {
-        i64::from(resolution.distinct_after)
-    } else {
-        i64::try_from(resolution.distinct_before).unwrap_or(i64::MAX)
-    }
+fn reported_distinct_workers(resolution: &CapabilityMissResolution, released: Option<i32>) -> i64 {
+    released.map_or_else(
+        || i64::try_from(resolution.distinct_before).unwrap_or(i64::MAX),
+        i64::from,
+    )
 }
 
 /// Log an escalation withdrawn at the terminal write, naming why.
@@ -17213,7 +17221,7 @@ async fn escalate_capability_miss(
         handler_kind = missing.kind,
         handler = missing.name,
         completed_releases = resolution.misses_before,
-        distinct_incapable_workers = reported_distinct_workers(&resolution, false),
+        distinct_incapable_workers = reported_distinct_workers(&resolution, None),
         fleet_evidence = ?resolution.evidence,
         max_redeliveries,
         session_pinned = task.session_id.is_some(),
@@ -21397,29 +21405,42 @@ mod tests {
         let resolution = CapabilityMissResolution {
             action: CapabilityMissAction::Escalate,
             total_after: 6,
-            distinct_after: 3,
+            distinct_after: 4,
             worker_is_new: true,
             misses_before: 5,
-            distinct_before: 2,
+            distinct_before: 3,
             evidence: FleetCapabilityEvidence::AllLiveWorkersMissed,
         };
+        // The release branch reports what its own UPDATE returned. The durable
+        // value (2) is deliberately lower than BOTH the snapshot's
+        // `distinct_after` (4) and its `distinct_before` (3) -- the round-36
+        // case, with two peers re-registering and having their evidence
+        // invalidated between the read and the write. Two rather than one so
+        // the durable count cannot coincide with either snapshot field, which
+        // is what makes the assertions below discriminating.
         assert_eq!(
-            reported_distinct_workers(&resolution, true),
+            reported_distinct_workers(&resolution, Some(2)),
+            2,
+            "the release branch must report the cardinality its UPDATE committed, \
+             not the snapshot's distinct_after"
+        );
+        assert_ne!(
+            reported_distinct_workers(&resolution, Some(2)),
             i64::from(resolution.distinct_after),
-            "the release branch RUNS the UPDATE that appends this claimant, so the \
-             durable set is the post-claim count"
+            "the fixture must keep the durable and snapshot counts distinct, or \
+             this proves nothing about which source is used"
         );
         assert_eq!(
-            reported_distinct_workers(&resolution, false),
+            reported_distinct_workers(&resolution, None),
             i64::try_from(resolution.distinct_before).unwrap(),
             "the escalation branch never runs that UPDATE, so the claimant was \
              never appended and the durable set is the pre-claim count"
         );
         assert_ne!(
-            reported_distinct_workers(&resolution, true),
-            reported_distinct_workers(&resolution, false),
+            reported_distinct_workers(&resolution, Some(2)),
+            reported_distinct_workers(&resolution, None),
             "if these ever coincide the test proves nothing -- the fixture must \
-             keep the two counts distinct"
+             keep the two branches' answers distinct"
         );
     }
     use crate::types::ParentClosePolicy;

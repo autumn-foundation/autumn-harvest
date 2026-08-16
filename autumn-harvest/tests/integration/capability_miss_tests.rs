@@ -3013,6 +3013,85 @@ async fn a_timed_out_workflow_task_reset_preserves_the_capability_miss_budget() 
     );
 }
 
+/// The number the release logs must be the one its own `UPDATE` wrote
+/// (issue #804, Codex round-36 P2).
+///
+/// `observe_miss_and_fleet` snapshots `capability_miss_workers` and derives
+/// `distinct_after` from it. A peer restarting onto a capable build then runs
+/// `invalidate_capability_miss_evidence_for_worker`, which `array_remove`s its
+/// own id from exactly these `RUNNING` rows -- so by the time the release
+/// `UPDATE` appends this claimant, the array it appends to is smaller than the
+/// snapshot predicted.
+///
+/// This reproduces that interleaving in order: snapshot `{stale-a, stale-b}`
+/// (so a snapshot-derived count would say 3), invalidate `stale-a`, then
+/// release as `incapable`. The durable set is `{stale-b, incapable}`, and the
+/// release must report **2**.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_release_reports_the_cardinality_it_actually_committed() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    let exec_id = seed_workflow(&mut conn, "noop_wf", serde_json::json!({}), Q_NOOP).await;
+    let task_id = load_tasks(&url, exec_id).await[0].id;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET state = 'RUNNING', worker_id = 'incapable', started_at = NOW(), attempt = 1, \
+             capability_miss_workers = ARRAY['stale-a', 'stale-b'] \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("simulate a claim over prior miss evidence");
+
+    // The caller's snapshot at this instant: two prior missers, so appending
+    // this claimant would make three.
+    let snapshot: Vec<String> = load_task(&url, task_id).await.capability_miss_workers;
+    assert_eq!(
+        snapshot.len(),
+        2,
+        "precondition: the snapshot a caller would read here"
+    );
+
+    // A peer restarts onto a capable build BEFORE the release commits.
+    let cleared = queue::invalidate_capability_miss_evidence_for_worker(
+        &mut conn,
+        "stale-a",
+        &[Q_NOOP.to_string()],
+    )
+    .await
+    .expect("peer re-registration clears its own stale evidence");
+    assert_eq!(
+        cleared, 1,
+        "precondition: the peer's evidence was invalidated"
+    );
+
+    let released = queue::release_task_for_capability_miss(
+        &mut conn,
+        task_id,
+        "incapable",
+        Duration::from_secs(1),
+        CapabilityMissPhase::BeforeHandler,
+    )
+    .await
+    .expect("release query runs");
+
+    let durable = load_task(&url, task_id).await.capability_miss_workers;
+    assert_eq!(
+        durable.len(),
+        2,
+        "the durable set is the post-invalidation array plus this claimant; \
+         got {durable:?}"
+    );
+    assert_eq!(
+        released,
+        Some(2),
+        "the release must report the cardinality it committed ({durable:?}), not \
+         the snapshot-derived 3 -- a peer invalidated an entry in between"
+    );
+}
+
 /// A release must leave the task row's `error` column **untouched** so the
 /// issue #773 `/stack` surface does not fabricate a failure that never happened.
 ///
@@ -3056,7 +3135,10 @@ async fn release_never_writes_the_error_column() {
     )
     .await
     .expect("release query runs");
-    assert!(released);
+    assert!(
+        released.is_some(),
+        "the release must report the claim was actually released"
+    );
 
     let task = load_task(&url, task_id).await;
     assert!(
@@ -3095,7 +3177,10 @@ async fn release_never_writes_the_error_column() {
     )
     .await
     .expect("release query runs");
-    assert!(released2);
+    assert!(
+        released2.is_some(),
+        "the release must report the claim was actually released"
+    );
     assert_eq!(
         load_task(&url, task2).await.error.as_deref(),
         Some("downstream 503"),
@@ -3140,7 +3225,7 @@ async fn release_is_a_noop_when_the_claim_was_already_taken() {
     .expect("release query runs");
 
     assert!(
-        !released,
+        released.is_none(),
         "release must report no-op when the row is owned by another worker"
     );
     let task = load_task(&url, task_id).await;
@@ -3443,7 +3528,10 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
     )
     .await
     .expect("release query runs");
-    assert!(released);
+    assert!(
+        released.is_some(),
+        "the release must report the claim was actually released"
+    );
 
     let task = load_task(&url, task_id).await;
     assert_eq!(
@@ -3486,7 +3574,10 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
     )
     .await
     .expect("release query runs");
-    assert!(released2);
+    assert!(
+        released2.is_some(),
+        "the release must report the claim was actually released"
+    );
     let after = load_task(&url, task2).await;
     assert_eq!(
         after.crash_strikes, 0,
