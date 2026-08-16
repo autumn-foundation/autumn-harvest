@@ -821,17 +821,37 @@ fn capability_miss_fleet_window_is_never_documented_as_the_poison_pill_window() 
             fs::read_to_string(workspace_path("docs/runbooks/harvest-alerts.md"))
                 .expect("failed to read the alerts runbook"),
         ),
+        // The alert pack itself. Round 48 corrected the two runbooks and the
+        // builder knob but not the machine-readable pack an operator reads
+        // *first* — straight off the firing alert — which is how the stale
+        // claim survived to Codex round 53.
+        (
+            "alert pack",
+            fs::read_to_string(workspace_path("docs/alerts/starter-pack-v0.1.0.json"))
+                .expect("failed to read the alert pack"),
+        ),
     ];
 
     for (surface, text) in &surfaces {
-        let flat = squeeze_whitespace(text);
+        // Normalize the two ways this claim can be spelled before matching.
+        // The prose surfaces write a backticked `2 × worker_heartbeat_interval`
+        // (Unicode multiplication sign); the JSON pack writes a bare ASCII
+        // `2x worker_heartbeat_interval`. A banned-substring list written for
+        // one spelling silently passes the other, which is the second half of
+        // why the pack was missed.
+        let flat = squeeze_whitespace(text)
+            .replace('×', "x")
+            .replace('`', "")
+            .replace("2 x ", "2x ");
         // Ban the SAMENESS construction, not the window itself: a correct doc
-        // may well name `2 × worker_heartbeat_interval` in order to say the
+        // may well name 2x worker_heartbeat_interval in order to say the
         // capability lookup is *not* that value.
         for banned in [
-            "same `2 × worker_heartbeat_interval` liveness window as",
+            "same 2x worker_heartbeat_interval liveness window as",
+            "same 2x worker_heartbeat_interval window as",
+            "same 2x worker_heartbeat_interval freshness window",
             "same freshness window the poison-pill reclaimer uses",
-            "same `2 × worker_heartbeat_interval` window as",
+            "same liveness window the poison-pill reclaimer uses",
         ] {
             assert!(
                 !flat.contains(banned),

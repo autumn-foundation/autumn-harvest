@@ -2134,3 +2134,43 @@ surrounding convention.
 three surfaces, with the positive rule-out required only of the two an operator
 reads, so whichever copy the next edit misses is caught. Verified RED at
 `builder.rs` with the widened guard against the unfixed docs.
+
+## Review round 53
+
+**P2 accepted — the same scope failure as round 52, one round later, in the
+surface an operator reads first.** Round 48 corrected three docs that claimed
+the capability-miss fleet lookup shares the poison-pill reclaimer's
+`2 × worker_heartbeat_interval` liveness window, and added
+`capability_miss_fleet_window_is_never_documented_as_the_poison_pill_window` to
+keep them corrected. That guard covers `builder.rs`, the safe-deploy runbook and
+the alerts runbook — but **not `docs/alerts/starter-pack-v0.1.0.json`**, the
+machine-readable pack whose `description` is what an on-call engineer reads
+*straight off the firing alert*, before either runbook. The stale claim survived
+there for five rounds.
+
+It is materially wrong, not merely imprecise. `capability_miss_fleet_stale_secs`
+is `worker_stale_secs(interval).max(CAPABILITY_MISS_MIN_FLEET_STALE_SECS)` with
+the floor at **120 s**, so at the default 5 s cadence the capability window is
+120 s where the reclaimer's is 10 s — a **12×** divergence. An operator told
+"10 s" mispredicts escalation timing by two orders of magnitude: after a pod
+dies its row keeps the evidence at `CapablePeerMayExist` for up to 120 s, and in
+that interval **both** evidence-derived bounds are withheld, so the task waits
+on the ungated `10 ×` ceiling instead of on `max_redeliveries`. The description
+now states the floor, names the 120 s / 10 s contrast, and adds the
+counter-intuitive consequence the runbooks already carry: lowering
+`worker_heartbeat_interval` does **not** shorten the window.
+
+**Two independent reasons the guard missed it, both fixed.** The first is scope
+(the pack was not in the surface list). The second would have defeated the guard
+even if it had been: the banned-substring list was written against the prose
+spelling — backticked, with the Unicode `×` — while the JSON pack writes bare
+ASCII `2x worker_heartbeat_interval`, so every pattern would have passed on a
+string saying exactly the banned thing. The guard now **normalizes** each
+surface (`×`→`x`, strip backticks, collapse `2 x `→`2x `) before matching, and
+the banned list covers both the "same … window as" and "same … freshness window"
+constructions. Verified RED at the alert pack, on the phrasing-normalized
+`"same 2x worker_heartbeat_interval freshness window"` pattern.
+
+A repo-wide sweep for the claim across `src`, the plugin and `docs` (excluding
+this changelog) confirms the alert pack was the **only** remaining offender, so
+this closes the class rather than one more instance of it.
