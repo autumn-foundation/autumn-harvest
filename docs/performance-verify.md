@@ -1,18 +1,28 @@
-# `ReplayVerifier::verify_dir`: opaque-payload guard fast-path (negative result)
+# `ReplayVerifier::verify_dir`: opaque-payload guard fast-path (shipped under maintainer override)
 
-**Outcome: negative result.** A real, mechanism-backed hypothesis was formed,
-implemented, and measured — the targeted cost dropped by 76% exactly as
-predicted — but the change's impact on the overall workload (4.26%
-instructions, whole-process; **4.13% when measured against `verify_dir`'s
-own cost in isolation** — see "Isolating `verify_dir` from fixture-generation
-setup cost" below) falls short of the ≥5% floor either way, so it was
-**reverted**. This note exists so a future pass does not re-discover and
-re-attempt the identical optimization. The benchmark harness that produced
-these numbers (`benches/verify_profile.rs`) is committed and kept, since it
-exercises a boundary (`ReplayVerifier`'s real filesystem I/O + JSON
-*deserialize* of `HistorySnapshot`/`WorkflowEvent`) no prior harness in this
-repo touched, and remains available for the next investigation of this code
-path.
+**Outcome: shipped despite falling short of the floor, by explicit maintainer
+override.** A real, mechanism-backed hypothesis was formed, implemented, and
+measured — the targeted cost dropped by ~76% exactly as predicted — but the
+change's impact on the overall workload fell short of this agent's
+autonomous ≥5% Ir-reduction gate in **every** measurement taken, across two
+independent sessions: whole-process 4.26% (session 1) and 4.16% (session 2,
+re-verification); isolated to `verify_dir`'s own cost, excluding
+fixture-generation setup, 4.13% (session 1) and 4.33% (session 2) — see
+"Isolating `verify_dir` from fixture-generation setup cost" and
+"## Maintainer override" below for both sessions' full numbers. Under this
+agent's own "revert if it doesn't clear the floor" rule the change **was in
+fact reverted once**, mid-investigation, for exactly that reason (see the
+"Measurement" section below, which is the unmodified historical record of
+that first pass). It was subsequently **re-applied and kept** on the
+maintainer's own explicit, direct instruction — "Maintainer call, ship it."
+— overriding the floor for this one change. See "## Maintainer override"
+below for the full record: who authorized it, why, and a from-scratch
+re-verification pass run specifically to confirm the override was made with
+accurate, current evidence rather than numbers a prior session could not
+independently attest to. The benchmark harness that produced these numbers
+(`benches/verify_profile.rs`) exercises a boundary (`ReplayVerifier`'s real
+filesystem I/O + JSON *deserialize* of `HistorySnapshot`/`WorkflowEvent`) no
+prior harness in this repo touched.
 
 Wall-clock timing is not admissible evidence on this (shared-vCPU) machine —
 every number below is a deterministic instruction count
@@ -230,10 +240,21 @@ there is no independent allocation-count story that could otherwise clear
 the ≥10%-allocation-reduction floor on its own.
 
 Per the "revert if it doesn't clear the floor" rule, **the `src/testing.rs`
-change was reverted.** `benches/verify_profile.rs` and its `Cargo.toml`
-`[[bench]]` stanza are kept: the boundary they exercise had no prior
-coverage, and they let a future attempt reproduce this exact measurement (or
-try a materially different mechanism) without rebuilding the harness first.
+change was reverted at this point in the investigation.**
+`benches/verify_profile.rs` and its `Cargo.toml` `[[bench]]` stanza were kept
+regardless: the boundary they exercise had no prior coverage, and they let a
+future attempt reproduce this exact measurement (or try a materially
+different mechanism) without rebuilding the harness first.
+
+**This is not the final disposition of the `src/testing.rs` change.** See
+"## Maintainer override" at the end of this document: the maintainer
+subsequently instructed this specific change be re-applied and shipped
+despite the shortfall documented above, explicitly overriding the
+autonomous ≥5% floor for this one case. Everything in this "## Measurement"
+section and the "Isolating..." subsection below it remains an accurate,
+unmodified record of the investigation as it stood *before* that override —
+it is preserved rather than rewritten so the reasoning that led to the
+revert-then-override sequence stays auditable.
 
 ### Isolating `verify_dir` from fixture-generation setup cost
 
@@ -406,3 +427,158 @@ these must use the release-profile binary `cargo bench --no-run` resolves
 `cargo build` produces a debug binary whose instruction count is dominated
 by `core::ub_checks` safety instrumentation (~15x higher total, and a
 completely different cost distribution) and is not a valid substitute.
+
+## Maintainer override
+
+Everything above this section is the unmodified record of the original
+investigation, which — correctly, per this agent's own pre-committed rules —
+concluded in a revert. This section records what happened next: a human
+maintainer reviewed that conclusion directly and chose, explicitly and in
+writing, to override it for this one change.
+
+### What was overridden, and by whom
+
+This agent's operating mandate treats a deterministic instruction-count
+measurement as admissible evidence and sets a hard, pre-committed floor:
+ship a performance change only if it clears **≥5% Ir reduction on a workload
+that is itself ≥5% of realistic cost**, OR ≥10% allocation reduction, OR a
+measurable syscall reduction, OR an asymptotic improvement — and *revert* if
+it doesn't. That rule exists specifically so an autonomous agent does not
+accumulate a long tail of small, unverified, or marginal "optimizations"
+that individually might be fine but collectively erode the signal-to-noise
+ratio of what "this PR improved performance" means. The measurement above —
+a real mechanism, working exactly as predicted, at 4.1–4.3% depending on how
+it's bracketed — is precisely the kind of result that rule exists to catch:
+close to the floor, genuinely positive, but short of it.
+
+The maintainer was shown the exact numbers above (the 4.2569%/4.1261%
+whole-process/isolated split, and the reasoning for holding the floor) and
+responded first with direct pushback — *"I mean, I would call a -4.26% a
+win"* — which this agent did not treat as authorization on its own (a
+human's informal reaction to a number is not the same as an instruction to
+act, and the whole point of a pre-committed floor is that it does not bend
+under in-the-moment renegotiation). This agent instead named exactly what an
+explicit override would require: re-applying the diff, documenting the
+override with its rationale, and re-measuring rather than trusting stale
+numbers. The maintainer then gave that explicit instruction directly:
+
+> **"Maintainer call, ship it."**
+
+That is the authorization on record for keeping this change despite the
+measured shortfall. It is scoped to this one change; it does not relax the
+≥5%/≥10%/syscall/asymptotic floor as a general rule for any other change in
+this repository, autonomous or otherwise. A future below-floor optimization
+in this codebase still needs either a materially different (and sufficient)
+measurement, or a maintainer willing to grant the same kind of explicit,
+on-the-record override this one received.
+
+### Why the diff had to be re-derived, not simply un-reverted
+
+By the time the override instruction arrived, the functional
+`src/testing.rs` diff described in "## Change" above existed only as a
+prose description in this document and in the revert commit's message — it
+had never itself been committed to git history (only the harness and this
+document were committed; the revert happened in the same working session,
+before any commit of the functional change). Restoring it therefore meant
+precisely reconstructing the diff from that description against the
+*current* state of `src/testing.rs`, not applying a stored patch or trusting
+memory of what the code looked like. The reconstructed diff was verified,
+line by line, against every detail in "## Change" above — the constant name
+and value, the combining function's exact body and delegation order, and
+the shape of all four new unit tests — before being treated as a faithful
+restoration rather than a fresh reinvention.
+
+### Re-verification: fresh, independent numbers, gathered specifically for this decision
+
+Reusing the original session's numbers for a decision this consequential
+would have meant trusting measurements this agent cannot itself re-derive
+provenance for. Instead, both binaries were rebuilt from scratch in this
+session — `git stash` isolated a clean "before" `src/testing.rs` (the
+committed, un-optimized `HEAD`), a "before" binary was built and measured,
+then the reconstructed diff was restored and an "after" binary was built and
+measured — same machine, same session, same `Cargo.lock`, same
+`VERIFY_PROFILE_FIXTURES=20 VERIFY_PROFILE_ACTIVITIES=500` workload, same
+`valgrind --tool=callgrind --branch-sim=no --cache-sim=no` /
+`valgrind --tool=dhat` invocations as the original pass. The "before" binary
+was confirmed (via `strings`) to lack the `opaque_payload_fixture_reason`
+symbol entirely and the "after" binary to contain it, before either was
+profiled.
+
+**Whole-process (`VERIFY_PROFILE_MODE=full`):**
+
+| | Instructions (Ir) |
+|---|---|
+| Before | 130,242,246 |
+| After  | 124,824,457 |
+| **Reduction** | **5,417,789 (4.1598%)** |
+
+**Isolated to `verify_dir` only (two-phase `prepare`/`run`, excluding
+fixture-generation setup cost — see "Isolating `verify_dir` from
+fixture-generation setup cost" above for why this is the more rigorous of
+the two brackets):**
+
+| | Instructions (Ir), `verify_dir` only |
+|---|---|
+| Isolated before | 127,510,865 |
+| Isolated after  | 121,994,985 |
+| **Reduction** | **5,515,880 (4.3258%)** |
+
+Both fresh numbers land in the same range as the original session's
+(4.2569% / 4.1261%) — a few tenths of a percentage point apart in either
+direction, consistent with ordinary session-to-session measurement noise:
+the two sessions were only about seven hours apart (original commit
+`f663a316` at 2026-08-16 05:52 UTC; this re-verification the same day), so
+the small drift is not attributable to dependency version movement over
+time — more likely ordinary nondeterminism in exactly which code path a
+generic `str::contains`/`Pattern::is_contained_in` call resolves to at
+compile time from one `cargo build` invocation to the next (valgrind's
+counts are fully deterministic *given* an identical binary, but two
+separately-compiled binaries of the same source are not guaranteed to be
+byte-identical). **Both fresh numbers still fall short of the ≥5% floor.** The targeted mechanism was
+re-confirmed working exactly as designed on this fresh trace too:
+`is_contained_in`'s own cost dropped from 6,510,380 (5.00% of the
+whole-process total) to 1,559,780 (1.25%) — a 76.0% reduction of its own
+prior cost — and from 6,515,040 (5.11% of the isolated total) to 1,559,780
+(1.28%) in the isolated trace, a 76.1% reduction; both numbers match the
+mechanism's prediction from the original hypothesis almost exactly, and the
+post-change `is_contained_in` cost (1,559,780) is bit-for-bit identical
+across the whole-process and isolated traces *and* identical to the original
+session's number for the same quantity — the one figure in this whole
+re-verification pass with no session-to-session drift at all, as expected
+for a pure function of fixture content and call count.
+
+**Allocation counts (`valgrind --tool=dhat`), whole-process, before/after:**
+
+| dhat | Before | After |
+|---|---|---|
+| Total blocks | 32,118 | 32,118 |
+| Total bytes  | 10,599,891 | 10,599,891 |
+
+Identical, confirming — a second time, independently — that this change has
+no allocation-count story of its own (`str::contains` performs no heap
+allocation) and clears no floor via that path either.
+
+### Verification gates run on the re-applied change
+
+Before shipping, the re-applied change was independently re-verified against
+every gate this agent's mandate requires for any change, not just the
+performance floor:
+
+- `cargo fmt -p autumn-harvest -- --check` — clean.
+- `cargo clippy -p autumn-harvest --no-default-features --features testing -- -D warnings` — clean.
+- `cargo clippy -p autumn-harvest --all-features -- -D warnings` — clean.
+- `cargo test -p autumn-harvest --no-default-features --features testing --lib` — **1,895 passed, 0 failed**
+  (1,891 pre-existing + the 4 new tests documented in "## Change" above,
+  re-derived alongside the function they cover).
+
+### The honest summary
+
+This change is being shipped and kept in the repository **despite** not
+clearing its own pre-committed performance-impact floor, on two independent
+fresh measurements taken specifically to inform this decision, because a
+human maintainer reviewed the evidence directly and explicitly instructed it
+to ship anyway. That is a legitimate exception process — the floor exists to
+constrain *autonomous* decisions, not to bind a maintainer who has actually
+looked at the numbers — but it is exactly that: an exception, made once, on
+the record, for this one change, not a precedent that lowers the bar for
+anything measured after it.
