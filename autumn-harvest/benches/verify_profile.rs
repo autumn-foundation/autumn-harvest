@@ -87,7 +87,10 @@
 //! (build + write fixtures to a fresh tempdir + verify, all in one process --
 //! a convenience mode for a quick smoke run; NOT the mode to point a profiler
 //! at when isolating `verify_dir`'s own cost, since it also measures fixture
-//! generation).
+//! generation). Any other value panics rather than silently falling back to
+//! `full` -- a typo in `VERIFY_PROFILE_MODE` (e.g. `ru` instead of `run`)
+//! must not produce a plausible-looking but methodologically invalid
+//! measurement.
 //!
 //! # Running (`full` convenience mode)
 //!
@@ -187,7 +190,43 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Write `fixtures` copies of the same fixture JSON into `dir`. Pure
+/// Filename for the tiny sidecar `prepare_fixtures` writes alongside the
+/// fixture files, recording the exact `fixtures`/`activities` values used to
+/// generate them (`key=value` lines -- deliberately not JSON: `verify_dir`'s
+/// directory walk globs every `*.json` file in the directory as a fixture to
+/// replay, and a stray non-fixture `.json` file there would fail as a
+/// spurious harness error). `run` mode reads it via `read_prepared_meta` to
+/// derive the ground-truth workload shape *cheaply*, in preference to
+/// `activities_per_fixture_from_disk`'s full-fixture parse below -- see that
+/// function's doc comment for why a *some* ground-truth check is needed at
+/// all, and its measured cost (~3.9M instructions / ~3% of the isolated
+/// `verify_dir` total measured elsewhere in this file's history -- see
+/// `docs/performance-verify.md` -- non-negligible, and exactly the kind of
+/// unrelated cost the two-phase split exists to keep out of the profiled
+/// `run`-mode region). The sidecar read costs a few thousand instructions
+/// for a few dozen bytes, not millions for an entire ~1001-event fixture.
+const PROFILE_META_FILENAME: &str = "verify_profile_meta.txt";
+
+/// Read the `fixtures`/`activities` values `prepare_fixtures` persisted to
+/// `PROFILE_META_FILENAME`. `None` when the sidecar is missing (a directory
+/// populated without going through `VERIFY_PROFILE_MODE=prepare` at all),
+/// in which case the caller falls back to `activities_per_fixture_from_disk`.
+fn read_prepared_meta(dir: &std::path::Path) -> Option<(usize, usize)> {
+    let text = std::fs::read_to_string(dir.join(PROFILE_META_FILENAME)).ok()?;
+    let mut fixtures = None;
+    let mut activities = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("fixtures=") {
+            fixtures = value.trim().parse().ok();
+        } else if let Some(value) = line.strip_prefix("activities=") {
+            activities = value.trim().parse().ok();
+        }
+    }
+    Some((fixtures?, activities?))
+}
+
+/// Write `fixtures` copies of the same fixture JSON into `dir`, plus the
+/// `PROFILE_META_FILENAME` sidecar recording the exact values used. Pure
 /// filesystem I/O plus one one-time `serde_json::to_string` -- intentionally
 /// isolable so it can run **unprofiled** (`VERIFY_PROFILE_MODE=prepare`)
 /// ahead of a profiled `VERIFY_PROFILE_MODE=run` pass that measures only
@@ -201,12 +240,44 @@ fn prepare_fixtures(dir: &std::path::Path, fixtures: usize, activities: usize) {
         std::fs::write(dir.join(format!("fixture_{i:05}.json")), &fixture_json)
             .expect("write fixture");
     }
+    std::fs::write(
+        dir.join(PROFILE_META_FILENAME),
+        format!("fixtures={fixtures}\nactivities={activities}\n"),
+    )
+    .expect("write profile meta sidecar");
 }
 
 fn required_profile_dir(mode: &str) -> std::path::PathBuf {
     std::env::var("VERIFY_PROFILE_DIR")
         .unwrap_or_else(|_| panic!("VERIFY_PROFILE_DIR must be set in `{mode}` mode"))
         .into()
+}
+
+/// Fallback for `read_prepared_meta` returning `None`: read one fixture file
+/// already on disk in `dir` and derive its per-fixture activity count from
+/// the actual recorded event count (`WorkflowStarted` + two events per
+/// activity). Every fixture written by `prepare_fixtures` is an identical
+/// copy, so sampling exactly one is fully representative, not merely
+/// convenient. Costs a full JSON parse of a realistic-size fixture (see
+/// `PROFILE_META_FILENAME`'s doc comment for the measured cost) -- correct
+/// as a fallback for a directory not populated via `prepare_fixtures`, but
+/// not the path a normal two-phase `prepare`/`run` invocation should take.
+fn activities_per_fixture_from_disk(dir: &std::path::Path) -> usize {
+    let mut fixture_paths: Vec<_> = std::fs::read_dir(dir)
+        .expect("read fixture dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect();
+    fixture_paths.sort();
+    let sample_path = fixture_paths
+        .first()
+        .expect("at least one *.json fixture file in the profile dir");
+    let json = std::fs::read_to_string(sample_path).expect("read sample fixture");
+    let snapshot: HistorySnapshot = serde_json::from_str(&json).expect("parse sample fixture");
+    // WorkflowStarted (1 event) + ActivityScheduled/ActivityCompleted per
+    // activity (2 events each) -- the exact shape `build_fixture_json` emits.
+    (snapshot.events.len() - 1) / 2
 }
 
 /// Build the tokio runtime + call `verify_dir` on `dir`. This is the ONLY
@@ -234,10 +305,28 @@ fn run_verify(dir: &std::path::Path, fixtures: usize, activities: usize) {
         "unexpected fixture failure(s): {report:?}"
     );
 
+    // Derive the reported workload shape from what `prepare` actually wrote
+    // -- see `PROFILE_META_FILENAME`'s doc comment for why this must not
+    // simply trust the `activities` env-var argument, and why the cheap
+    // sidecar read is preferred over the full-fixture-parse fallback inside
+    // this profiled region.
+    let actual_activities = read_prepared_meta(dir).map_or_else(
+        || activities_per_fixture_from_disk(dir),
+        |(_prepared_fixtures, prepared_activities)| prepared_activities,
+    );
+    if actual_activities != activities {
+        eprintln!(
+            "verify_profile: WARNING -- VERIFY_PROFILE_ACTIVITIES={activities} does not \
+             match the {actual_activities} activities/fixture actually found on disk in \
+             {} (prepare/run env drift?); the line below reports the on-disk value.",
+            dir.display()
+        );
+    }
+
     println!(
-        "verify_profile: fixtures={fixtures} activities_per_fixture={activities} \
+        "verify_profile: fixtures={fixtures} activities_per_fixture={actual_activities} \
          total_events_verified={} succeeded={}",
-        fixtures * (activities * 2 + 1),
+        fixtures * (actual_activities * 2 + 1),
         report.succeeded,
     );
 }
@@ -260,7 +349,7 @@ fn main() {
             let dir = required_profile_dir("run");
             run_verify(&dir, fixtures, activities);
         }
-        _ => {
+        "full" => {
             // Convenience mode: prepare + verify in one process against a
             // fresh tempdir. NOT the mode to profile in isolation -- it also
             // measures fixture generation. Use `prepare` + `run` for that.
@@ -268,5 +357,11 @@ fn main() {
             prepare_fixtures(dir.path(), fixtures, activities);
             run_verify(dir.path(), fixtures, activities);
         }
+        other => panic!(
+            "unrecognized VERIFY_PROFILE_MODE={other:?}; expected one of \
+             \"prepare\", \"run\", \"full\" (the default when the env var is unset). \
+             A typo here would otherwise silently fall back to `full` and reintroduce \
+             the setup cost the two-phase mode exists to exclude."
+        ),
     }
 }

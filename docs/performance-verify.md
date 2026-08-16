@@ -3,7 +3,7 @@
 **Outcome: negative result.** A real, mechanism-backed hypothesis was formed,
 implemented, and measured — the targeted cost dropped by 76% exactly as
 predicted — but the change's impact on the overall workload (4.26%
-instructions, whole-process; **4.20% when measured against `verify_dir`'s
+instructions, whole-process; **4.13% when measured against `verify_dir`'s
 own cost in isolation** — see "Isolating `verify_dir` from fixture-generation
 setup cost" below) falls short of the ≥5% floor either way, so it was
 **reverted**. This note exists so a future pass does not re-discover and
@@ -264,26 +264,25 @@ through this isolated `run`-only path, before and after the same
 
 | | Instructions (Ir), `verify_dir` only |
 |---|---|
-| Isolated before | 127,450,069 |
-| Isolated after  | 122,102,182 |
-| **Reduction** | **5,347,887 (4.1957%)** |
+| Isolated before | 127,543,706 |
+| Isolated after  | 122,281,078 |
+| **Reduction** | **5,262,628 (4.1261%)** |
 
 This is the properly-bracketed answer to the reviewer's question, and it
 **confirms rather than overturns** the negative result: isolating away the
-~2.74M instructions (2.1% of the naive total) of fixed setup cost moves the
-ratio from 4.2569% to **4.1957%** — slightly *smaller*, not larger, because
+~2.84M instructions (2.2% of the naive total) of fixed setup cost moves the
+ratio from 4.2569% to **4.1261%** — slightly *smaller*, not larger, because
 the fixture-generation setup that got excluded from the denominator
 contributed essentially nothing to the delta (the `src/testing.rs` diff
 touches only code `verify_dir` calls, never the setup path), so removing it
 from both numerator and denominator alike leaves the ratio to standard
-before/after measurement noise (~3.7% relative, consistent with the small
-size of this change) rather than any systematic dilution effect. Both the
-naive (whole-process) and the properly-isolated (`verify_dir`-only) ratios
-land comfortably below the 5% floor — 5% of the isolated `verify_dir`-only
-denominator is 6,372,503 Ir, and the measured reduction (5,347,887) falls
-short of that by over 1,024,000 Ir, i.e. the change would need to be roughly
-19% *more* effective than what it actually achieves to clear the floor even
-under this most-favorable denominator.
+before/after measurement noise rather than any systematic dilution effect.
+Both the naive (whole-process) and the properly-isolated (`verify_dir`-only)
+ratios land comfortably below the 5% floor — 5% of the isolated
+`verify_dir`-only denominator is 6,377,185 Ir, and the measured reduction
+(5,262,628) falls short of that by over 1,114,000 Ir, i.e. the change would
+need to be roughly 21% *more* effective than what it actually achieves to
+clear the floor even under this most-favorable denominator.
 
 `callgrind_annotate` on the isolated trace shows the same flat-cost shape as
 the original whole-process listing above (same functions, same relative
@@ -301,10 +300,56 @@ shape issue #251 documents: at larger `N`, `verify_dir`'s own cost grows
 roughly linearly while the truly-fixed portion of setup (tokio runtime
 construction) shrinks as a fraction of any total that still includes it, so
 the isolated ratio above is, if anything, a slight underestimate of how
-close a larger run would land to 4.2%, not an overestimate. There is no free
+close a larger run would land to 4.1%, not an overestimate. There is no free
 knob (more fixtures, larger fixtures, more activities per fixture) that
-would shift this ratio in either direction by anything close to the ~0.8
+would shift this ratio in either direction by anything close to the ~0.9
 percentage points needed to reach the floor.
+
+#### A second review pass: reporting correctness inside the isolated region
+
+A follow-up review of the two-phase harness itself (not of `src/testing.rs`)
+found two more issues, both in `benches/verify_profile.rs`: (1) `run` mode's
+printed workload-shape label was read from the *current process's own*
+`VERIFY_PROFILE_ACTIVITIES` env var rather than from what `prepare` actually
+wrote to disk, so a `prepare`/`run` env-var mismatch (a real risk — the two
+are separate process invocations, plausibly separate shell commands) would
+silently mislabel the measured workload; and (2) an unrecognized
+`VERIFY_PROFILE_MODE` value (a typo like `ru` instead of `run`) silently fell
+back to `full` mode, which writes fixtures **inside** the profiled process —
+exactly the setup-cost pollution the two-phase mode exists to exclude, with
+no indication anything had gone wrong.
+
+Fix (2) is a straightforward `match` tightened to an explicit `"full"` arm
+plus a `panic!` on anything else — no measurement impact.
+
+Fix (1) needed more care, because the naive fix (parse a fixture already on
+disk to recover the true per-fixture activity count) would itself run
+**inside** the `run`-mode profiled region — reintroducing a smaller version
+of the exact problem this whole section exists to solve. Measured directly:
+parsing one full ~124 KB / 1,001-event fixture to recover its activity count
+costs **3,916,883 Ir (~3.07%** of the isolated total) — non-negligible, and
+large enough on its own to materially shift the reported ratio. The fix that
+shipped instead has `prepare` mode persist a tiny `key=value` sidecar file
+(`verify_profile_meta.txt`, deliberately not `.json` — `verify_dir`'s
+directory walk globs every `*.json` file as a fixture to replay) alongside
+the fixtures, which `run` mode reads in preference to parsing a full
+fixture. Measured cost of the sidecar read: **93,637 Ir (~0.07%**
+of the isolated total) — genuinely negligible, comparable to the
+already-documented ~60K-instruction tokio-runtime-build cost. The
+full-fixture-parse function is kept as a fallback for a directory populated
+without going through `prepare_fixtures` at all (an edge case, not the
+blessed two-phase workflow), where paying that cost is the correct
+trade-off for correctness over an unmeasured directory.
+
+The isolated before/after pair above (127,543,706 / 122,281,078,
+**4.1261%**) is measured against the harness with *both* of these fixes
+applied — it is what `benches/verify_profile.rs` as committed actually
+produces, not a superseded intermediate state. The ~93,637 Ir sidecar-read
+cost appears in **both** the before and after measurement identically (it
+runs after `verify_dir` returns, independent of which `src/testing.rs` is
+linked in), so it shifts the total slightly but leaves the *reduction* and
+the conclusion unchanged from the first isolated pass (4.1957% → 4.1261%,
+both comfortably below the 5% floor).
 
 ### Why nothing else nearby was combined into this change
 
