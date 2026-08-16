@@ -393,9 +393,25 @@ fn collect_json_fixtures(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// Fallback for `read_prepared_meta` returning `None`: parse every `*.json`
 /// fixture found under `dir` (recursively, via `collect_json_fixtures`
 /// above -- matching `verify_dir`'s own discovery, so a nested fixture
-/// layout is not missed here) and derive each one's per-fixture activity
-/// count by counting its `WorkflowEvent::ActivityScheduled` events,
-/// validating that every fixture agrees.
+/// layout is not missed here), derive each one's per-fixture activity count
+/// by counting its `WorkflowEvent::ActivityScheduled` events (validating
+/// that every fixture agrees), and sum every fixture's *actual* recorded
+/// event count along the way.
+///
+/// Returns `(activities_per_fixture, total_events_across_all_fixtures)`.
+/// The second field exists because `run_verify`'s reported
+/// `total_events_verified` cannot be reconstructed from
+/// `activities_per_fixture` alone here the way it can on the sidecar-present
+/// path: a `prepare`-populated fixture is *guaranteed* to be exactly
+/// `build_fixture_json`'s synthetic `WorkflowStarted` + two events per
+/// activity shape, so `fixtures * (activities * 2 + 1)` is exact there --
+/// but a hand-populated directory reaching this fallback carries no such
+/// guarantee (retried activities' extra `ActivityStarted` events, timers,
+/// signals, or any other event `verify_dir` itself accepts can all inflate
+/// a fixture's real event count well past that synthetic formula), so the
+/// only way to report a truthful total is to sum what was actually parsed.
+/// This reuses the parse this function already pays for the heterogeneity
+/// check -- no extra pass over the fixtures is needed for it.
 ///
 /// Counts `ActivityScheduled` directly rather than inferring a count from
 /// the total event length -- `(events.len() - 1) / 2` only holds for this
@@ -427,13 +443,12 @@ fn collect_json_fixtures(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// hand-populated (no sidecar at all), where nothing guarantees every
 /// fixture shares one activity count: such a directory can legitimately mix
 /// e.g. 500- and 1,000-activity snapshots that each verify successfully on
-/// their own. `run_verify` multiplies whatever this function returns across
-/// the *entire* fixture set to print `total_events_verified`, so reporting
-/// only one sampled fixture's count would silently mislabel every fixture
-/// that disagrees with it. Every fixture found is therefore parsed and
-/// checked to agree with the first; a heterogeneous set panics naming the
-/// two disagreeing files rather than reporting one arbitrary shape as if it
-/// applied to all of them.
+/// their own. `run_verify` reports the returned activity count across the
+/// *entire* fixture set, so reporting only one sampled fixture's count would
+/// silently mislabel every fixture that disagrees with it. Every fixture
+/// found is therefore parsed and checked to agree with the first; a
+/// heterogeneous set panics naming the two disagreeing files rather than
+/// reporting one arbitrary shape as if it applied to all of them.
 ///
 /// Full JSON parse of every fixture is real, non-trivial cost (see
 /// `PROFILE_META_FILENAME`'s doc comment: ~3.9M instructions for *one*
@@ -441,7 +456,7 @@ fn collect_json_fixtures(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// function is already documented as unreachable from a normal two-phase
 /// `prepare`/`run` invocation (which always carries the sidecar); it is not
 /// the golden profiled path this harness exists to keep clean.
-fn activities_per_fixture_from_disk(dir: &std::path::Path) -> usize {
+fn activities_per_fixture_from_disk(dir: &std::path::Path) -> (usize, usize) {
     let mut fixture_paths = collect_json_fixtures(dir);
     fixture_paths.sort();
     assert!(
@@ -450,11 +465,18 @@ fn activities_per_fixture_from_disk(dir: &std::path::Path) -> usize {
         dir.display()
     );
     let mut first: Option<(std::path::PathBuf, usize)> = None;
+    let mut total_events = 0usize;
     for path in &fixture_paths {
         let json = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
         let snapshot: HistorySnapshot = serde_json::from_str(&json)
             .unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()));
+        // The fixture's real, actually-recorded event count -- never a
+        // formula derived from `activities_per_fixture`, since a fixture
+        // reaching this fallback is not guaranteed to have the synthetic
+        // "WorkflowStarted + 2 events per activity" shape (see the doc
+        // comment above).
+        total_events += snapshot.events.len();
         // One `ActivityScheduled` per logical activity dispatch, regardless
         // of how many `ActivityStarted`/`ActivityFailed` retry-attempt
         // events surround it -- see the doc comment above for why this must
@@ -481,7 +503,7 @@ fn activities_per_fixture_from_disk(dir: &std::path::Path) -> usize {
             }
         }
     }
-    first.expect("checked non-empty above").1
+    (first.expect("checked non-empty above").1, total_events)
 }
 
 /// Build the tokio runtime + call `verify_dir` on `dir`. This is the ONLY
@@ -514,10 +536,30 @@ fn run_verify(dir: &std::path::Path, fixtures: usize, activities: usize) {
     // simply trust the `activities` env-var argument, and why the cheap
     // sidecar read is preferred over the full-fixture-parse fallback inside
     // this profiled region.
-    let actual_activities = read_prepared_meta(dir).map_or_else(
-        || activities_per_fixture_from_disk(dir),
-        |(_prepared_fixtures, prepared_activities)| prepared_activities,
-    );
+    //
+    // The two paths disagree on how `total_events_verified` below must be
+    // derived, so both `actual_activities` and (on the fallback path only)
+    // the fixtures' real summed event count travel together:
+    // sidecar-present -> `None` here; every `prepare`-written fixture is
+    // *guaranteed* to be `build_fixture_json`'s exact synthetic
+    // `WorkflowStarted` + 2-events-per-activity shape, so the cheap
+    // `fixtures * (actual_activities * 2 + 1)` formula below is exact, and
+    // computing it costs nothing beyond the sidecar read already required.
+    // sidecar-absent -> `Some(sum of every parsed fixture's real event
+    // count)`; a hand-populated fixture reaching this fallback carries no
+    // such shape guarantee (retried activities' extra `ActivityStarted`
+    // events, timers, signals, or any other event `verify_dir` itself
+    // accepts can all inflate a fixture's true event count past that
+    // synthetic formula), so the true total must be read from what was
+    // actually parsed rather than reconstructed from `actual_activities`
+    // alone -- see `activities_per_fixture_from_disk`'s doc comment.
+    let (actual_activities, actual_total_events) =
+        if let Some((_prepared_fixtures, prepared_activities)) = read_prepared_meta(dir) {
+            (prepared_activities, None)
+        } else {
+            let (activities, total_events) = activities_per_fixture_from_disk(dir);
+            (activities, Some(total_events))
+        };
     if actual_activities != activities {
         eprintln!(
             "verify_profile: WARNING -- VERIFY_PROFILE_ACTIVITIES={activities} does not \
@@ -527,10 +569,12 @@ fn run_verify(dir: &std::path::Path, fixtures: usize, activities: usize) {
         );
     }
 
+    let total_events_verified =
+        actual_total_events.unwrap_or(fixtures * (actual_activities * 2 + 1));
+
     println!(
         "verify_profile: fixtures={fixtures} activities_per_fixture={actual_activities} \
-         total_events_verified={} succeeded={}",
-        fixtures * (actual_activities * 2 + 1),
+         total_events_verified={total_events_verified} succeeded={}",
         report.succeeded,
     );
 }
