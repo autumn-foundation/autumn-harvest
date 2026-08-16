@@ -4467,3 +4467,150 @@ async fn the_persisted_reason_comes_from_the_in_transaction_resolution() {
         1
     );
 }
+
+/// `EXPLAIN` a statement whose `$n` placeholders are filled with harmless
+/// literals, and return the plan text.
+///
+/// The bind values are irrelevant to plan *shape* for this query — what is
+/// under test is whether an index can serve the predicate at all — but they
+/// must be well-typed, so `$2` is cast to `text[]` to match `queue_name`.
+async fn explain_plan(conn: &mut AsyncPgConnection, statement: &str) -> String {
+    #[derive(diesel::QueryableByName)]
+    struct PlanLine {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        #[diesel(column_name = "QUERY PLAN")]
+        line: String,
+    }
+
+    let filled = statement
+        .replace("$1", "'probe-worker'")
+        .replace("$2", "ARRAY['scan-probe-q0','scan-probe-q1']::text[]");
+
+    // `enable_seqscan = off` only penalises sequential scans; Postgres still
+    // falls back to one when no index *can* serve the predicate. That is what
+    // makes this assertion independent of table size and planner cost
+    // thresholds.
+    diesel::sql_query("SET LOCAL enable_seqscan = off")
+        .execute(conn)
+        .await
+        .expect("disable seq scans for the duration of this transaction");
+
+    diesel::sql_query(format!("EXPLAIN {filled}"))
+        .load::<PlanLine>(conn)
+        .await
+        .expect("EXPLAIN must succeed")
+        .into_iter()
+        .map(|row| row.line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The startup invalidation must be servable by an index, not a full scan of
+/// the queue backlog (issue #804, Codex round-39 P2).
+///
+/// `invalidate_capability_miss_evidence_for_worker` runs inside
+/// `register_worker`'s transaction, so the worker is **not published to the
+/// fleet until it finishes**. Every pre-existing `harvest_task_queue` index
+/// narrows only by queue/state, and `$1 = ANY(capability_miss_workers)` is not
+/// an indexable predicate on its own — so before this fix Postgres had to
+/// inspect every `PENDING`/`RUNNING` row on each advertised queue. On a queue
+/// with a large backlog a rolling restart therefore serialised expensive scans
+/// and delayed the very workers meant to resolve the capability misses: the
+/// #804 remediation got slower exactly when it was needed most.
+///
+/// Measured on a 200k-row backlog with 20 matching rows, before the fix:
+/// `Seq Scan`, 3847 shared buffers, 84 ms. After: `Index Scan`, 9 buffers,
+/// 1.7 ms — and the partial index is 16 KB against a 45 MB table, because a row
+/// whose `capability_miss_workers` is empty never enters it at all. Capability
+/// misses are exceptional, so the discriminating predicate is "has this row
+/// recorded a miss?", not the array's contents; that is why a partial B-tree
+/// beats the GIN index review suggested, which would tax every enqueue into the
+/// hottest table in the system for no extra selectivity.
+///
+/// # Why `enable_seqscan = off`
+///
+/// It makes the assertion independent of table size and planner cost
+/// thresholds. Postgres falls back to a sequential scan when no index *can*
+/// serve a predicate, so with sequential scans penalised, "still a `Seq Scan`"
+/// means precisely "no index is able to serve this query" — the property under
+/// test, and the exact defect. Verified both ways on a 50-row table: without
+/// the index the plan is a `Seq Scan` even with the penalty; with it, an
+/// `Index Scan`.
+#[tokio::test]
+async fn the_startup_invalidation_is_index_servable_not_a_backlog_scan() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    // A handful of rows is enough: `enable_seqscan = off` removes the size
+    // dependence, so this asserts index *availability*, not a cost outcome.
+    for i in 0..8 {
+        seed_workflow(
+            &mut conn,
+            "scan_probe_wf",
+            serde_json::json!({}),
+            &format!("scan-probe-q{}", i % 2),
+        )
+        .await;
+    }
+
+    let plan = explain_plan(
+        &mut conn,
+        queue::invalidate_capability_miss_evidence_for_worker_query(),
+    )
+    .await;
+
+    assert!(
+        !plan.contains("Seq Scan on harvest_task_queue"),
+        "the startup invalidation must be servable by an index — it runs inside \
+         register_worker's transaction, so a backlog scan delays publishing the \
+         very worker that resolves the miss. Plan was:\n{plan}"
+    );
+}
+
+/// The empty-array guard in the invalidation's `WHERE` clause is
+/// **load-bearing**, not redundant (issue #804, Codex round-39 P2).
+///
+/// The partial index is gated on that predicate, and Postgres's implication
+/// prover cannot derive it from the array-membership test alone: dropping the
+/// conjunct silently returns the statement to a full backlog scan. Measured on
+/// the same 200k-row fixture, `Index Scan` / 9 buffers / 1.7 ms becomes
+/// `Seq Scan` / 3848 buffers / 83 ms.
+///
+/// This test exists so a future "simplify the WHERE clause" refactor fails
+/// loudly instead of quietly reintroducing the regression. It is also the
+/// control for the test above: without it, an always-index-scan mutant (an
+/// unconditional index over the whole table, say) would satisfy that assertion
+/// while hiding the fact that it is the *query shape* that makes a cheap
+/// partial index usable at all.
+#[tokio::test]
+async fn dropping_the_empty_array_guard_returns_the_invalidation_to_a_full_scan() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    for i in 0..8 {
+        seed_workflow(
+            &mut conn,
+            "scan_probe_wf",
+            serde_json::json!({}),
+            &format!("scan-probe-q{}", i % 2),
+        )
+        .await;
+    }
+
+    let guard = "AND capability_miss_workers <> '{}' ";
+    let statement = queue::invalidate_capability_miss_evidence_for_worker_query();
+    assert!(
+        statement.contains(guard),
+        "the guard this control removes must be present in the real statement; \
+         got:\n{statement}"
+    );
+    let without_guard = statement.replace(guard, "");
+
+    let plan = explain_plan(&mut conn, &without_guard).await;
+    assert!(
+        plan.contains("Seq Scan on harvest_task_queue"),
+        "without the empty-array guard the planner cannot match the partial \
+         index, so this variant must fall back to a scan — that is precisely \
+         why the conjunct is not redundant. Plan was:\n{plan}"
+    );
+}

@@ -2392,12 +2392,28 @@ pub async fn reset_capability_misses_after_inline_progress(
 /// fleet until it finishes, and the `queue_name` indexes are partial to pending
 /// rows (Codex round-35 P2). The `state` filter bounds the scan to the rows the
 /// evidence can actually affect.
+///
+/// # The empty-array guard is load-bearing
+///
+/// `capability_miss_workers <> '{}'` reads as redundant next to the membership
+/// test, and is not: it is the predicate that
+/// `idx_harvest_tq_capability_miss_workers` is partial on, and Postgres's
+/// implication prover cannot derive it from `$1 = ANY(...)`. Drop the conjunct
+/// and the index stops matching, silently returning this statement to the full
+/// backlog scan it exists to avoid — measured on a 200k-row backlog as
+/// `Index Scan` / 9 buffers / 1.7 ms versus `Seq Scan` / 3848 buffers / 83 ms
+/// (Codex round-39 P2). Pinned by
+/// `dropping_the_empty_array_guard_returns_the_invalidation_to_a_full_scan`.
+///
+/// It is correctness-neutral in its own right: a row that has recorded no miss
+/// cannot name `$1`, so the guard never changes which rows are updated.
 #[must_use]
 pub const fn invalidate_capability_miss_evidence_for_worker_query() -> &'static str {
     "UPDATE harvest_task_queue \
      SET capability_miss_workers = array_remove(capability_miss_workers, $1) \
      WHERE queue_name = ANY($2) \
        AND state IN ('PENDING', 'RUNNING') \
+       AND capability_miss_workers <> '{}' \
        AND $1 = ANY(capability_miss_workers)"
 }
 

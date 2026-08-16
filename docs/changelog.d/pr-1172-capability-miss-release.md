@@ -1391,3 +1391,62 @@ asserts the evidence classification, the resulting `Release` decision, **and**
 the round-15 control (an empty registry still resolves `Unavailable` and still
 escalates on the distinct bound) — so an always-withhold mutant cannot satisfy
 the fix while silently unbounding the small-fleet case.
+
+## Review round 39
+
+Fixed a Codex P2 — the startup capability-miss invalidation was a full scan of
+the queue backlog, and it runs where that costs the most.
+
+`invalidate_capability_miss_evidence_for_worker` executes in the **same
+transaction as `register_worker`**, so a worker is not published to the fleet
+until it finishes. Every pre-existing `harvest_task_queue` index narrows only by
+queue/state, and `$1 = ANY(capability_miss_workers)` is not an indexable
+predicate on its own, so Postgres had to inspect every `PENDING`/`RUNNING` row on
+each advertised queue. On a queue with a large backlog a rolling restart
+therefore serialised expensive scans and delayed the very workers meant to
+resolve the capability misses — the #804 remediation got *slower* exactly when
+it was needed most.
+
+Measured on a 200k-row backlog with 20 matching rows:
+
+| | plan | shared buffers | time |
+|---|---|---|---|
+| before | `Seq Scan` | 3847 | 84 ms |
+| after | `Index Scan` | 9 | 1.7 ms |
+
+**A partial B-tree, not the GIN index review suggested.** Capability misses are
+exceptional, so the discriminating predicate is "has this row recorded a miss at
+all?" — not the array's *contents*. Gating the index on a non-empty array
+confines it to the miss population: **16 KB against a 45 MB, 300k-row table**,
+and a normally enqueued row (empty array) never enters it, so the hottest write
+path in the system pays nothing. A GIN index over `capability_miss_workers`
+would instead index every `PENDING`/`RUNNING` row and tax every enqueue for no
+additional selectivity. `queue_name` leads because the statement narrows by
+`queue_name = ANY($2)`; the membership test is then a recheck over a handful of
+rows.
+
+The query gains `AND capability_miss_workers <> '{}'`, which is **load-bearing,
+not redundant**: it is the predicate the index is partial on, and Postgres's
+implication prover cannot derive it from the membership test. Dropping it
+silently returns the statement to the full scan (`Seq Scan` / 3848 buffers /
+83 ms on the same fixture). It is correctness-neutral — a row that recorded no
+miss cannot name `$1` — so it never changes which rows are updated.
+
+Migration `20260721000000_harvest_capability_miss_worker_index` is index-only:
+no column, no table, no data change. It carries the `CREATE INDEX CONCURRENTLY`
+form in a comment for live deployments, since that cannot run inside Diesel's
+migration transaction. The upgrade guide gained a matching inventory row.
+
+Tests (`enable_seqscan = off` makes both assertions independent of table size
+and planner cost thresholds — Postgres falls back to a sequential scan only when
+no index *can* serve a predicate, so "still a `Seq Scan`" means precisely "no
+index is able to serve this query"):
+
+* `the_startup_invalidation_is_index_servable_not_a_backlog_scan` — RED before
+  the fix with the exact defect in the plan.
+* `dropping_the_empty_array_guard_returns_the_invalidation_to_a_full_scan` —
+  pins the conjunct as load-bearing so a future "simplify the WHERE clause"
+  refactor fails loudly, and acts as the control: without it, an
+  always-index-scan mutant (an unconditional index over the whole table) would
+  satisfy the first assertion while hiding that the query shape is what makes a
+  cheap partial index usable.
