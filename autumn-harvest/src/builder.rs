@@ -3064,6 +3064,14 @@ pub struct WorkerConfig {
     /// How often the worker upserts its liveness row in `harvest_workers`.
     /// Defaults to **5 seconds**. The API classifies a worker as stale after
     /// `2 × worker_heartbeat_interval` without a heartbeat.
+    ///
+    /// Not every subsystem derives the same window from this knob. The
+    /// poison-pill reclaimer (#367) and the broken-session scanner (#606) use
+    /// the bare `2 ×` value, but the capability-miss fleet lookup (#804) floors
+    /// it at 120 s — see [`Self::capability_miss_max_redeliveries`] — because it
+    /// judges *peers* whose cadence it cannot read. Lowering this interval
+    /// therefore speeds the first two up and leaves the third unchanged for any
+    /// value at or under 60 s.
     pub worker_heartbeat_interval: Duration,
     /// Immutable build identifier for this worker binary (issue #171).
     ///
@@ -3143,10 +3151,27 @@ pub struct WorkerConfig {
     /// can hand `N + 1` distinct incapable ids to the budget while the capable
     /// pod is live and polling. So this budget may only terminate a task once
     /// the recorded miss set **covers the live fleet for the task's queue**
-    /// (`harvest_workers` rows with a fresh heartbeat advertising it, using the
-    /// same `2 × worker_heartbeat_interval` liveness window as
-    /// [`crate::poison_pill`] and the broken-session scanner). While any live
-    /// worker there has never missed the task, this bound is withheld.
+    /// (`harvest_workers` rows with a fresh heartbeat advertising it). That
+    /// liveness window is **not** the poison-pill one: it is
+    /// [`crate::worker::capability_miss_fleet_stale_secs`], which is
+    /// `2 × worker_heartbeat_interval` **floored at 120 s**
+    /// ([`crate::worker::CAPABILITY_MISS_MIN_FLEET_STALE_SECS`]). The reclaimer
+    /// and the broken-session scanner judge rows they own with a window they
+    /// chose; this query judges *peers*, whose cadence nothing in
+    /// `harvest_workers` records — so a fast-heartbeating claimant must not
+    /// declare a healthy peer on a slower cadence dead. At the default 5 s
+    /// cadence the two windows are 120 s and 10 s.
+    ///
+    /// The timing consequence worth predicting: after a pod dies, its row keeps
+    /// holding the evidence at "a capable peer may exist" for up to 120 s, and
+    /// in that interval **both** evidence-derived bounds are withheld — this
+    /// fleet-covering one *and* the distinct-worker one. The absolute release
+    /// ceiling (`10 ×` the budget) is what still fires, so AC3 holds, but a task
+    /// whose fleet cannot be shown covered waits on that ceiling rather than on
+    /// `max_redeliveries`. The delay costs redeliveries, never the run. Tuning
+    /// `worker_heartbeat_interval` *below* 60 s does not shorten it.
+    /// While any live worker there has never missed the task, this bound is
+    /// withheld.
     ///
     /// Two consequences: the effective bound is `max(N, live fleet size)`
     /// redeliveries — you cannot prove "no worker here has the handler" in

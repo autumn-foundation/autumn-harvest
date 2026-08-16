@@ -1887,3 +1887,79 @@ legitimately mentions the DLQ in order to rule it out and a bare substring check
 cannot tell a negation from a claim. Both were confirmed falsifiable by
 reverting each doc to its pre-fix wording and watching the corresponding pin
 fail.
+
+## Review round 48
+
+**P2, accepted: the docs described a liveness window the fleet lookup stopped
+using at round 19.** The capability-miss fleet query does not share the
+poison-pill reclaimer's staleness window. Round 19 gave it its own —
+`capability_miss_fleet_stale_secs`, which is `2 × worker_heartbeat_interval`
+floored at `CAPABILITY_MISS_MIN_FLEET_STALE_SECS` (120 s) — precisely because
+the two subsystems ask different questions: the reclaimer judges rows it owns
+with a window it chose, while this query judges *peers*, whose heartbeat cadence
+nothing in `harvest_workers` records, so a fast-heartbeating claimant applying
+its own window would declare a healthy peer on the default cadence dead. Three
+operator-reachable sites still described them as the same value: the
+`capability_miss_max_redeliveries` field doc, the safe-deploy runbook, and the
+alerts runbook. At the default 5 s cadence that is a 12× error — 10 s claimed
+against 120 s actual — so an operator predicting when the fleet-covering bound
+becomes available after a pod dies gets it wrong by nearly two minutes.
+
+Corrected at all three, each stating the floor, the reason for the divergence,
+and the timing consequence: for up to 120 s a dead pod's row still reads as *a
+capable peer may exist*, and in that interval **only** the fleet-covering bound
+is withheld — the distinct-worker bound and the absolute ceiling still fire, so
+AC3 holds and the delay costs redeliveries rather than the run. Also noted that
+tuning `worker_heartbeat_interval` below 60 s does not shorten it, since the
+floor dominates.
+
+A fourth site was added rather than corrected: the `worker_heartbeat_interval`
+field doc was not *wrong* (it describes the management API's own classification,
+which is the bare `2 ×` value) but it is the knob an operator turns, and it said
+nothing about the subsystems that derive different windows from it. It now names
+all three and which of them lowering the interval actually speeds up.
+
+Codex additionally named `docs/alerts/starter-pack-v0.1.0.json`. Checked and
+declined: its capability-miss rules never state a window at all. The two
+"two heartbeat windows" phrases in that file belong to the preflight and
+build-routing alerts, which are correct for their own subsystems.
+
+Pinned by `capability_miss_fleet_window_is_never_documented_as_the_poison_pill_window`,
+which reads all three surfaces, bans the *sameness* construction rather than the
+window value (a correct doc may name `2 × worker_heartbeat_interval` in order to
+say the capability lookup is not that), and requires each to state the floor.
+Prose assertions run over whitespace-squeezed text so a reflow cannot silently
+disarm them. Confirmed falsifiable at each surface independently — reverting any
+one fails the pin and names that surface.
+
+### Round 48, second finding: the correction was itself wrong
+
+Verifying the three doc fixes against the decision code — rather than against
+the rustdoc they were derived from — turned up a bug in the fix. The new prose
+said `CapablePeerMayExist` "withholds only the fleet-covering bound — the
+distinct-worker bound and the absolute ceiling still fire". That is false, and
+it came from the round-19 rustdoc on `CAPABILITY_MISS_MIN_FLEET_STALE_SECS`,
+which had carried the same wrong claim since it was written.
+
+`capability_miss_decision` gates the distinct bound on `!CapablePeerMayExist`
+and the configured-total bound on `AllLiveWorkersMissed` specifically, so a live
+untried peer withholds **both** evidence-derived bounds. What remains is the
+*ungated* set: the absolute `10 ×` release ceiling, the `i32::MAX` storage
+ceiling, the zero-budget fail-fast, and the session-pinned carve-out. The
+practical difference is an order of magnitude — an operator told the distinct
+bound still fires expects escalation after a handful of distinct incapable
+workers, when in fact nothing terminates the task until the ceiling.
+
+Two rustdocs in `worker.rs` disagreed about this: the one on
+`CAPABILITY_MISS_MIN_FLEET_STALE_SECS` was wrong, while the one on
+`resolve_capability_miss_with_confidence` stated it correctly ("withholds
+exactly the two evidence-derived bounds"). The inline comments inside
+`capability_miss_decision` are also correct. Only the const's doc had drifted,
+and it was the one this round happened to read.
+
+Corrected in all four places — the root rustdoc plus the three docs this round
+had just written it into — and pinned by
+`capable_peer_may_exist_is_never_documented_as_withholding_only_one_bound`,
+which bans the wrong construction across `worker.rs`, `builder.rs` and both
+runbooks. A single-source rustdoc is evidently not a safe thing to propagate
+from; the pin is what makes the four surfaces agree by construction.

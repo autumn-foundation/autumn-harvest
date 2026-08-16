@@ -4134,10 +4134,16 @@ pub const MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS: Duration = Durati
 /// Retaining a worker that is genuinely gone is the safe direction and is
 /// bounded: a stale row that is not in `capability_miss_workers` holds the
 /// evidence at [`FleetCapabilityEvidence::CapablePeerMayExist`], which withholds
-/// only the configured-total bound — the distinct-worker bound and the absolute
-/// ceiling still fire, so AC3 holds. The cost is a delayed escalation; the cost
-/// of the opposite error is the execution. That is the same trade every prior
-/// round took for unprovable coverage: release for longer, never fail sooner.
+/// **both** evidence-derived bounds — the distinct bound (gated on
+/// `!CapablePeerMayExist`) and the configured-total bound (gated on
+/// `AllLiveWorkersMissed`) — leaving the **ungated** ones in force: the absolute
+/// `10 ×` release ceiling, the `i32::MAX` storage ceiling, the zero-budget
+/// fail-fast, and the session-pinned carve-out. AC3 therefore still holds, but
+/// via the ceiling alone, so the delay this floor can impose is bounded by that
+/// ceiling rather than by `max_redeliveries`. The cost is a delayed escalation;
+/// the cost of the opposite error is the execution. That is the same trade every
+/// prior round took for unprovable coverage: release for longer, never fail
+/// sooner.
 pub const CAPABILITY_MISS_MIN_FLEET_STALE_SECS: i64 = 120;
 
 /// The liveness window the capability-miss fleet lookup must use.

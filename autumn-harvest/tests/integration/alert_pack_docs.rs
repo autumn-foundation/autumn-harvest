@@ -769,6 +769,128 @@ fn capability_miss_escalation_is_never_documented_as_dead_lettering() {
     );
 }
 
+/// The capability-miss fleet lookup uses a **floored** liveness window, and no
+/// doc may claim it shares the poison-pill one (issue #804, Codex round-48 P2).
+///
+/// `capability_miss_fleet_stale_secs` is
+/// `max(2 × worker_heartbeat_interval, CAPABILITY_MISS_MIN_FLEET_STALE_SECS)`,
+/// and the floor is 120 s — so at the default 5 s cadence the capability window
+/// is 120 s where the poison-pill reclaimer's is 10 s, a 12× divergence that
+/// round 19 introduced deliberately (judging *peers* whose cadence you cannot
+/// read needs a fleet-wide bound, not your own). An operator who reads
+/// "the same window" mispredicts when the configured-total bound becomes
+/// available: a pod silent for 30 s is long gone from poison-pill reclamation
+/// but still holds capability evidence at `CapablePeerMayExist`.
+#[test]
+fn capability_miss_fleet_window_is_never_documented_as_the_poison_pill_window() {
+    let builder = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/builder.rs"))
+        .expect("failed to read src/builder.rs");
+    let surfaces = [
+        (
+            "builder.rs",
+            rustdoc_above_field(&builder, "capability_miss_max_redeliveries"),
+        ),
+        (
+            "safe-deploy runbook",
+            fs::read_to_string(workspace_path("docs/runbooks/safe-deploy.md"))
+                .expect("failed to read the safe-deploy runbook"),
+        ),
+        (
+            "alerts runbook",
+            fs::read_to_string(workspace_path("docs/runbooks/harvest-alerts.md"))
+                .expect("failed to read the alerts runbook"),
+        ),
+    ];
+
+    for (surface, text) in &surfaces {
+        let flat = squeeze_whitespace(text);
+        // Ban the SAMENESS construction, not the window itself: a correct doc
+        // may well name `2 × worker_heartbeat_interval` in order to say the
+        // capability lookup is *not* that value.
+        for banned in [
+            "same `2 × worker_heartbeat_interval` liveness window as",
+            "same freshness window the poison-pill reclaimer uses",
+            "same `2 × worker_heartbeat_interval` window as",
+        ] {
+            assert!(
+                !flat.contains(banned),
+                "{surface}: the capability-miss fleet lookup floors its liveness window at \
+                 `CAPABILITY_MISS_MIN_FLEET_STALE_SECS` (120 s), so it is NOT the poison-pill \
+                 window -- at the default 5 s cadence they are 120 s and 10 s. Saying they \
+                 match makes escalation timing unpredictable. Found: {banned:?}"
+            );
+        }
+        // And it must state the floor, or a reader still derives the window
+        // from their configured cadence and gets the wrong answer.
+        assert!(
+            flat.contains("floored at 120 s"),
+            "{surface}: must state that the capability-miss fleet-liveness window is \
+             floored at 120 s, so an operator can predict when the configured-total bound \
+             becomes available after a pod dies"
+        );
+    }
+}
+
+/// `CapablePeerMayExist` withholds **both** evidence-derived bounds, and no doc
+/// may claim the distinct-worker one survives (issue #804, Codex round-48).
+///
+/// `capability_miss_decision` gates the distinct bound on
+/// `!CapablePeerMayExist` and the configured-total bound on
+/// `AllLiveWorkersMissed` specifically, so a live untried peer withholds them
+/// both and only the **ungated** bounds remain — chiefly the absolute `10 ×`
+/// release ceiling. Two rustdocs in `worker.rs` once disagreed about this and
+/// the wrong one reached three operator runbooks: an operator who believes the
+/// distinct bound still fires expects escalation after a handful of distinct
+/// incapable workers, when in fact nothing terminates the task until the
+/// ceiling — roughly an order of magnitude more redeliveries.
+#[test]
+fn capable_peer_may_exist_is_never_documented_as_withholding_only_one_bound() {
+    let worker = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/worker.rs"))
+        .expect("failed to read src/worker.rs");
+    let builder = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/builder.rs"))
+        .expect("failed to read src/builder.rs");
+    let surfaces = [
+        ("worker.rs", worker),
+        ("builder.rs", builder),
+        (
+            "safe-deploy runbook",
+            fs::read_to_string(workspace_path("docs/runbooks/safe-deploy.md"))
+                .expect("failed to read the safe-deploy runbook"),
+        ),
+        (
+            "alerts runbook",
+            fs::read_to_string(workspace_path("docs/runbooks/harvest-alerts.md"))
+                .expect("failed to read the alerts runbook"),
+        ),
+    ];
+
+    for (surface, text) in &surfaces {
+        let flat = squeeze_whitespace(text);
+        for banned in [
+            "the distinct-worker bound and the absolute ceiling still fire",
+            "the distinct-worker bound and the absolute release ceiling still fire",
+            "only the fleet-covering bound is withheld",
+            "only this fleet-covering bound is withheld",
+            "withholds only the configured-total bound",
+        ] {
+            assert!(
+                !flat.contains(banned),
+                "{surface}: `CapablePeerMayExist` withholds BOTH evidence-derived bounds -- \
+                 `capability_miss_decision` gates the distinct bound on `!CapablePeerMayExist` \
+                 and the total bound on `AllLiveWorkersMissed`. Saying the distinct bound \
+                 survives understates the wait by roughly the ceiling multiplier. Found: \
+                 {banned:?}"
+            );
+        }
+    }
+}
+
+/// Collapses every whitespace run to a single space so a prose assertion
+/// survives a reflow. Line breaks are a formatting artifact; the claim is not.
+fn squeeze_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Reads the contiguous `///` block immediately above a named `pub` struct
 /// field. Walks BACKWARD like [`rustdoc_above_const`], for the same reason.
 fn rustdoc_above_field(source: &str, field: &str) -> String {

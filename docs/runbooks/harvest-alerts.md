@@ -2129,11 +2129,20 @@ Distinct from two adjacent signals, deliberately:
    while the worker registry still lists a live worker on the queue that has
    never missed this task. Before the budget may terminate a task, the workers
    recorded as having missed it must *cover* the live fleet for its queue
-   (`harvest_workers`, same freshness window the poison-pill reclaimer uses:
-   `2 × worker_heartbeat_interval`). So "a capable pod was up the whole time and
-   simply kept losing the claim race" is not a way to reach rows 1a/1b below —
-   the only bound that can fire in that situation is the absolute ceiling, which
-   says so explicitly (row 2b).
+   (`harvest_workers`, using `2 × worker_heartbeat_interval` **floored at
+   120 s** — deliberately wider than the poison-pill reclaimer's window, since
+   this query judges peers whose heartbeat cadence it cannot read; at the
+   default 5 s cadence that is 120 s here against 10 s there). So "a capable pod
+   was up the whole time and simply kept losing the claim race" is not a way to
+   reach rows 1a/1b below — the only bound that can fire in that situation is
+   the absolute ceiling, which says so explicitly (row 2b).
+
+   That floor also sets how long the alert stays quiet after a pod genuinely
+   dies: for up to 120 s its row still reads as "a capable peer may exist", and
+   in that interval **both** evidence-derived bounds are withheld — the
+   fleet-covering one *and* the distinct-worker one. Only the absolute release
+   ceiling (`10 ×` the budget) can still escalate, so a task in that window
+   waits on the ceiling rather than on the configured `max_redeliveries`.
 
    The `error` distinguishes the **four** escalation causes, which have
    different fixes; two of them additionally state what the registry could or

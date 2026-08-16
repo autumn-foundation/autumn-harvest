@@ -349,11 +349,24 @@ actually up: a rollout with `budget + 1` old pods plus one new capable pod could
 hand `budget + 1` distinct incapable ids to the budget while the capable pod was
 live and polling. So before the budget may terminate a task, the workers
 recorded as having missed it must **cover the live fleet for its queue** —
-`harvest_workers` rows with a fresh heartbeat advertising that queue, using the
-same `2 × worker_heartbeat_interval` liveness window as the poison-pill
-reclaimer (#367) and the broken-session scanner (#606). While any live worker
-there has never missed the task, the budget is withheld and the task keeps
-being offered around.
+`harvest_workers` rows with a fresh heartbeat advertising that queue. While any
+live worker there has never missed the task, the budget is withheld and the
+task keeps being offered around.
+
+That freshness window is **not** the one the poison-pill reclaimer (#367) and
+the broken-session scanner (#606) use. Those judge rows they own, with a window
+derived from their own configured cadence; this query judges *peers*, whose
+cadence nothing in `harvest_workers` records — so it uses
+`2 × worker_heartbeat_interval` **floored at 120 s**. At the default 5 s
+cadence that is 120 s here against 10 s there, and dropping
+`worker_heartbeat_interval` below 60 s does not shorten it.
+
+Predict the timing accordingly: for up to 120 s after a pod dies, its row still
+reads as "a capable peer may exist", and in that interval **both** evidence-derived
+bounds are withheld — this fleet-covering one *and* the distinct-worker one. The
+absolute release ceiling (`10 ×` the budget) is what still fires, so the task is
+still bounded, but it waits on that ceiling rather than on your configured
+`max_redeliveries`. The delay costs extra redeliveries, never the run.
 
 This is the mechanism behind the guarantee: **as long as at least one capable
 worker is live on the queue, the budget cannot fail the run.** Two consequences
