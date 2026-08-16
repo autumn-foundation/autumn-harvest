@@ -354,10 +354,28 @@ fn prepare_fixtures(dir: &std::path::Path, fixtures: usize, activities: usize) {
     .expect("write profile meta sidecar");
 }
 
+/// A *genuinely absent* `VERIFY_PROFILE_DIR` panics unconditionally (unchanged).
+/// A *present but empty-string* value (`VERIFY_PROFILE_DIR=`, a common shell
+/// misconfiguration where a variable is exported but never assigned) is
+/// rejected too, rather than silently succeeding: `PathBuf::from("")` is not
+/// an error to construct, `std::fs::create_dir_all("")` is a silent no-op
+/// rather than an error, and `PathBuf::from("").join("fixture_00000.json")`
+/// resolves to the bare relative filename `"fixture_00000.json"` --
+/// `prepare`/`run` would then silently read and write profiling artifacts
+/// in the process's current working directory instead of the intended
+/// fixture directory, with no diagnostic that `VERIFY_PROFILE_DIR` was ever
+/// misconfigured.
 fn required_profile_dir(mode: &str) -> std::path::PathBuf {
-    std::env::var("VERIFY_PROFILE_DIR")
-        .unwrap_or_else(|_| panic!("VERIFY_PROFILE_DIR must be set in `{mode}` mode"))
-        .into()
+    let value = std::env::var("VERIFY_PROFILE_DIR")
+        .unwrap_or_else(|_| panic!("VERIFY_PROFILE_DIR must be set in `{mode}` mode"));
+    assert!(
+        !value.is_empty(),
+        "VERIFY_PROFILE_DIR is set but empty in `{mode}` mode; an empty value resolves to the \
+         process's current working directory rather than a real fixture directory (a bare \
+         relative filename, not an error, when joined with a fixture name) -- set it to an \
+         actual path"
+    );
+    value.into()
 }
 
 /// Recursively collect every `*.json` fixture file under `dir`, mirroring
