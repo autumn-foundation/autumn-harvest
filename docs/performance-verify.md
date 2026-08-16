@@ -3,13 +3,16 @@
 **Outcome: negative result.** A real, mechanism-backed hypothesis was formed,
 implemented, and measured — the targeted cost dropped by 76% exactly as
 predicted — but the change's impact on the overall workload (4.26%
-instructions) falls short of the ≥5% floor, so it was **reverted**. This note
-exists so a future pass does not re-discover and re-attempt the identical
-optimization. The benchmark harness that produced these numbers
-(`benches/verify_profile.rs`) is committed and kept, since it exercises a
-boundary (`ReplayVerifier`'s real filesystem I/O + JSON *deserialize* of
-`HistorySnapshot`/`WorkflowEvent`) no prior harness in this repo touched, and
-remains available for the next investigation of this code path.
+instructions, whole-process; **4.20% when measured against `verify_dir`'s
+own cost in isolation** — see "Isolating `verify_dir` from fixture-generation
+setup cost" below) falls short of the ≥5% floor either way, so it was
+**reverted**. This note exists so a future pass does not re-discover and
+re-attempt the identical optimization. The benchmark harness that produced
+these numbers (`benches/verify_profile.rs`) is committed and kept, since it
+exercises a boundary (`ReplayVerifier`'s real filesystem I/O + JSON
+*deserialize* of `HistorySnapshot`/`WorkflowEvent`) no prior harness in this
+repo touched, and remains available for the next investigation of this code
+path.
 
 Wall-clock timing is not admissible evidence on this (shared-vCPU) machine —
 every number below is a deterministic instruction count
@@ -34,8 +37,18 @@ a single callgrind run tractable — callgrind emulation is one to two orders
 of magnitude slower than native execution, and issue #251's full 1,000
 fixtures is calibrated against a 30-second *native* budget. Both the targeted
 cost and total cost scale linearly with fixture/event count (see
-"Why this can't be fixed by re-scaling" below), so the reduced run is
-representative, not merely convenient.
+"Isolating `verify_dir` from fixture-generation setup cost" below), so the
+reduced run is representative, not merely convenient.
+
+**A note on build profile.** All measurements below are against a **release**
+build (`cargo bench --no-run`, which uses the `bench` profile — inheriting
+from `release` by default — or an explicit `cargo build --release`). A plain
+`cargo build` (debug profile) compiles in extensive `core::ub_checks`
+pointer/overlap-precondition instrumentation that dominates this workload's
+instruction count (measured at ~47% of total in a debug build, versus being
+entirely absent from a release build's profile) and is not representative of
+what ships to production. Do not use a debug build to reproduce these
+numbers.
 
 ## Profile
 
@@ -222,16 +235,76 @@ change was reverted.** `benches/verify_profile.rs` and its `Cargo.toml`
 coverage, and they let a future attempt reproduce this exact measurement (or
 try a materially different mechanism) without rebuilding the harness first.
 
-### Why this can't be fixed by re-scaling the workload
+### Isolating `verify_dir` from fixture-generation setup cost
 
-Both the targeted cost (`.contains()`, O(document length) per call) and the
-dominant cost (`serde_json` deserialization, also O(document length) times
-the event count) scale with fixture size and fixture count in the same way,
-so the ~4.26% ratio is not an artifact of the reduced 20-fixture/500-activity
-scale chosen to keep a single callgrind run tractable — it holds at any
-representative scale, including the full 1,000-fixture shape issue #251
-documents. There is no free knob (more fixtures, larger fixtures, more
-activities per fixture) that would shift this ratio in either direction.
+The first cut of this note computed the 4.26% ratio against the *whole
+process's* instruction count, which also includes work `verify_dir` has
+nothing to do with: building the tokio runtime, constructing and
+JSON-serializing the fixture data, and `N` `std::fs::write` calls to lay it
+out on disk before `verify_dir` ever runs. That setup cost is roughly
+*fixed* per invocation (it does not scale with the fixture count the same
+way `verify_dir`'s own cost does), so a reviewer correctly flagged that
+computing the ratio against a total that includes it could understate
+`verify_dir`'s true share of the profile — and, since 4.26% was already
+close to the 5% floor, that this could be enough to flip the verdict.
+
+To answer this with evidence rather than algebra, `benches/verify_profile.rs`
+gained a two-phase mode: `VERIFY_PROFILE_MODE=prepare` writes the fixture
+files to a directory and exits, run **unprofiled**; `VERIFY_PROFILE_MODE=run`
+then does *only* `tokio::runtime::Builder::build()` (~60K instructions —
+0.05% of the isolated total below, genuinely negligible) followed by
+`verify_dir` on the pre-populated directory — no fixture generation, no
+`std::fs::write` loop, inside the profiled region at all. This is the
+harness's own recommended entry point for profiling; see the module doc
+comment in `benches/verify_profile.rs` for the exact commands.
+
+Re-measuring `VERIFY_PROFILE_FIXTURES=20 VERIFY_PROFILE_ACTIVITIES=500`
+through this isolated `run`-only path, before and after the same
+`src/testing.rs` diff described above:
+
+| | Instructions (Ir), `verify_dir` only |
+|---|---|
+| Isolated before | 127,450,069 |
+| Isolated after  | 122,102,182 |
+| **Reduction** | **5,347,887 (4.1957%)** |
+
+This is the properly-bracketed answer to the reviewer's question, and it
+**confirms rather than overturns** the negative result: isolating away the
+~2.74M instructions (2.1% of the naive total) of fixed setup cost moves the
+ratio from 4.2569% to **4.1957%** — slightly *smaller*, not larger, because
+the fixture-generation setup that got excluded from the denominator
+contributed essentially nothing to the delta (the `src/testing.rs` diff
+touches only code `verify_dir` calls, never the setup path), so removing it
+from both numerator and denominator alike leaves the ratio to standard
+before/after measurement noise (~3.7% relative, consistent with the small
+size of this change) rather than any systematic dilution effect. Both the
+naive (whole-process) and the properly-isolated (`verify_dir`-only) ratios
+land comfortably below the 5% floor — 5% of the isolated `verify_dir`-only
+denominator is 6,372,503 Ir, and the measured reduction (5,347,887) falls
+short of that by over 1,024,000 Ir, i.e. the change would need to be roughly
+19% *more* effective than what it actually achieves to clear the floor even
+under this most-favorable denominator.
+
+`callgrind_annotate` on the isolated trace shows the same flat-cost shape as
+the original whole-process listing above (same functions, same relative
+order, `is_contained_in` again the sole harvest-owned entry above the
+5%-of-*its own, smaller* total line) — isolating setup cost changes the
+total, not the composition of what remains.
+
+Because both `.contains()` (the targeted cost, O(document length) per call)
+and `serde_json` deserialization (the dominant cost, O(document length)
+times the event count) scale with fixture size and fixture count the same
+way, and setup cost is now demonstrated — not merely asserted — to be a
+small, roughly-fixed fraction of the isolated total, this ratio is
+representative at other fixture counts too, including the full 1,000-fixture
+shape issue #251 documents: at larger `N`, `verify_dir`'s own cost grows
+roughly linearly while the truly-fixed portion of setup (tokio runtime
+construction) shrinks as a fraction of any total that still includes it, so
+the isolated ratio above is, if anything, a slight underestimate of how
+close a larger run would land to 4.2%, not an overestimate. There is no free
+knob (more fixtures, larger fixtures, more activities per fixture) that
+would shift this ratio in either direction by anything close to the ~0.8
+percentage points needed to reach the floor.
 
 ### Why nothing else nearby was combined into this change
 
@@ -251,7 +324,7 @@ BIN=$(cargo bench -p autumn-harvest --no-default-features --features testing \
   --bench verify_profile --no-run --message-format=json 2>/dev/null \
   | jq -r 'select(.reason=="compiler-artifact" and .target.name=="verify_profile") | .executable')
 
-# Instruction count:
+# Whole-process instruction count (matches the "Profile"/"Measurement" numbers above):
 VERIFY_PROFILE_FIXTURES=20 VERIFY_PROFILE_ACTIVITIES=500 \
   valgrind --tool=callgrind --branch-sim=no --cache-sim=no --callgrind-out-file=cg.out "$BIN"
 callgrind_annotate --threshold=98 cg.out | head -30
@@ -265,3 +338,26 @@ VERIFY_PROFILE_FIXTURES=20 VERIFY_PROFILE_ACTIVITIES=500 \
 (default `500`) control the workload size; set `VERIFY_PROFILE_FIXTURES=1000`
 to reproduce issue #251's exact documented shape given enough valgrind
 wall-time headroom.
+
+**Reproducing the isolated `verify_dir`-only numbers** (the
+"Isolating `verify_dir` from fixture-generation setup cost" section above)
+requires the two-phase mode instead, so fixture generation runs unprofiled:
+
+```bash
+export VERIFY_PROFILE_DIR=/tmp/verify-fixtures
+export VERIFY_PROFILE_FIXTURES=20 VERIFY_PROFILE_ACTIVITIES=500
+mkdir -p "$VERIFY_PROFILE_DIR"
+
+VERIFY_PROFILE_MODE=prepare "$BIN"          # unprofiled setup
+
+VERIFY_PROFILE_MODE=run \
+  valgrind --tool=callgrind --branch-sim=no --cache-sim=no --callgrind-out-file=cg_run.out "$BIN"
+callgrind_annotate --threshold=90 cg_run.out | head -30
+```
+
+**A build-profile reminder** (see the note under "Workload" above): both of
+these must use the release-profile binary `cargo bench --no-run` resolves
+(or an explicit `cargo build --release ... --bench verify_profile`). A plain
+`cargo build` produces a debug binary whose instruction count is dominated
+by `core::ub_checks` safety instrumentation (~15x higher total, and a
+completely different cost distribution) and is not a valid substitute.

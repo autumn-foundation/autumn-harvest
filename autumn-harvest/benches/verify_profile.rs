@@ -39,7 +39,57 @@
 //! the compiled artifact is a plain executable a profiler can be pointed at
 //! directly, with no criterion wall-clock loop diluting the measured work.
 //!
-//! # Running
+//! # Two-phase mode (`prepare` / `run`) -- the profiling-correct entry point
+//!
+//! `verify_dir`'s runtime spawns one `tokio::task` per fixture (see
+//! `ReplayVerifier::verify_dir`'s implementation) and drives them on a
+//! multi-threaded runtime. Under callgrind, cost incurred while a *worker
+//! thread* executes a spawned task's poll is **not** attributed as a
+//! call-graph descendant of the `block_on` frame on the *spawning* thread --
+//! callgrind's flat/self-cost view (`callgrind_annotate`) still sums it
+//! correctly across all threads, but the `block_on` call site's own
+//! "inclusive cost" in the call-graph view undercounts. Do not use
+//! `block_on`'s call-graph inclusive cost as a proxy for `verify_dir`'s share
+//! of the profile; use `callgrind_annotate`'s flat totals as this crate's
+//! `docs/performance-verify.md` does.
+//!
+//! Fixture generation (`build_fixture_json` + `serde_json::to_string` + N
+//! `std::fs::write` calls) is real, non-trivial cost that has nothing to do
+//! with `ReplayVerifier` and must not be included in a `verify_dir`
+//! measurement. `VERIFY_PROFILE_MODE=prepare` runs *only* that fixture-writing
+//! step (no tokio runtime, no `ReplayVerifier`) against a directory named by
+//! `VERIFY_PROFILE_DIR`, so it can be run **unprofiled** as a setup step.
+//! `VERIFY_PROFILE_MODE=run` then does the reverse -- no fixture generation at
+//! all, just: build a tokio runtime (~60K instructions; negligible against
+//! `verify_dir`'s cost -- see `docs/performance-verify.md`'s reconciliation
+//! section) and call `verify_dir` on the pre-populated `VERIFY_PROFILE_DIR`.
+//! Point a profiler at the `run`-mode invocation only:
+//!
+//! ```text
+//! export VERIFY_PROFILE_DIR=/tmp/verify-fixtures
+//! export VERIFY_PROFILE_FIXTURES=20 VERIFY_PROFILE_ACTIVITIES=500
+//! mkdir -p "$VERIFY_PROFILE_DIR"
+//!
+//! # Unprofiled setup -- writes fixtures, does not touch ReplayVerifier:
+//! VERIFY_PROFILE_MODE=prepare <path-to-binary>
+//!
+//! # Profiled measurement -- ONLY tokio-runtime-build + verify_dir:
+//! valgrind --tool=callgrind --branch-sim=no --cache-sim=no \
+//!   --callgrind-out-file=callgrind.out \
+//!   env VERIFY_PROFILE_MODE=run <path-to-binary>
+//! callgrind_annotate callgrind.out
+//! ```
+//!
+//! `VERIFY_PROFILE_MODE` (default `full`, when unset) selects the mode:
+//! `prepare` (write fixtures only, no runtime), `run` (verify a pre-populated
+//! directory only, no fixture generation -- both `prepare` and `run` require
+//! `VERIFY_PROFILE_DIR` to be set to the same path), or the default `full`
+//! (build + write fixtures to a fresh tempdir + verify, all in one process --
+//! a convenience mode for a quick smoke run; NOT the mode to point a profiler
+//! at when isolating `verify_dir`'s own cost, since it also measures fixture
+//! generation).
+//!
+//! # Running (`full` convenience mode)
 //!
 //! ```text
 //! # Locate the compiled binary (no criterion timing loop runs; this just
@@ -57,10 +107,11 @@
 //! ```
 //!
 //! `VERIFY_PROFILE_FIXTURES` (default `20`) sets the number of fixture files
-//! written to a temp directory and verified. `VERIFY_PROFILE_ACTIVITIES`
-//! (default `500`, matching `replay_verifier_bench.rs`'s
-//! `bench_1000_fixtures` -- `500` activities = `1_001` events per fixture,
-//! issue #251's exact per-fixture shape) sets activities per fixture.
+//! written to a directory and verified. `VERIFY_PROFILE_ACTIVITIES` (default
+//! `500`, matching `replay_verifier_bench.rs`'s `bench_1000_fixtures` -- `500`
+//! activities = `1_001` events per fixture, issue #251's exact per-fixture
+//! shape) sets activities per fixture. Both env vars must match between a
+//! `prepare` invocation and its paired `run` invocation.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -136,34 +187,43 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn main() {
-    let fixtures = env_usize("VERIFY_PROFILE_FIXTURES", 20);
-    let activities = env_usize("VERIFY_PROFILE_ACTIVITIES", 500);
+/// Write `fixtures` copies of the same fixture JSON into `dir`. Pure
+/// filesystem I/O plus one one-time `serde_json::to_string` -- intentionally
+/// isolable so it can run **unprofiled** (`VERIFY_PROFILE_MODE=prepare`)
+/// ahead of a profiled `VERIFY_PROFILE_MODE=run` pass that measures only
+/// `ReplayVerifier::verify_dir`. Idempotent: `create_dir_all` + per-file
+/// `std::fs::write` (truncating), so re-running `prepare` against an
+/// existing directory is safe.
+fn prepare_fixtures(dir: &std::path::Path, fixtures: usize, activities: usize) {
+    std::fs::create_dir_all(dir).expect("create fixture dir");
+    let fixture_json = build_fixture_json(activities);
+    for i in 0..fixtures {
+        std::fs::write(dir.join(format!("fixture_{i:05}.json")), &fixture_json)
+            .expect("write fixture");
+    }
+}
 
+fn required_profile_dir(mode: &str) -> std::path::PathBuf {
+    std::env::var("VERIFY_PROFILE_DIR")
+        .unwrap_or_else(|_| panic!("VERIFY_PROFILE_DIR must be set in `{mode}` mode"))
+        .into()
+}
+
+/// Build the tokio runtime + call `verify_dir` on `dir`. This is the ONLY
+/// work `VERIFY_PROFILE_MODE=run` performs -- no fixture generation, no
+/// directory creation -- so it is the region a profiler should be pointed
+/// at when isolating `verify_dir`'s own cost. See the module doc comment.
+fn run_verify(dir: &std::path::Path, fixtures: usize, activities: usize) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .expect("tokio runtime");
 
-    // Setup: write `fixtures` copies of the same fixture JSON to a temp dir.
-    // Not part of the measured "verify" call, but unavoidably part of total
-    // process cost under a profiler with no way to bracket a sub-region --
-    // same caveat `replay_profile.rs` documents for `build_history`.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let fixture_json = build_fixture_json(activities);
-    for i in 0..fixtures {
-        std::fs::write(
-            dir.path().join(format!("fixture_{i:05}.json")),
-            &fixture_json,
-        )
-        .expect("write fixture");
-    }
-
     let report = rt.block_on(async {
         ReplayVerifier::new()
             .register_fn("sequential", sequential_workflow)
-            .verify_dir(dir.path())
+            .verify_dir(dir)
             .await
     });
 
@@ -180,4 +240,33 @@ fn main() {
         fixtures * (activities * 2 + 1),
         report.succeeded,
     );
+}
+
+fn main() {
+    let mode = std::env::var("VERIFY_PROFILE_MODE").unwrap_or_else(|_| "full".to_string());
+    let fixtures = env_usize("VERIFY_PROFILE_FIXTURES", 20);
+    let activities = env_usize("VERIFY_PROFILE_ACTIVITIES", 500);
+
+    match mode.as_str() {
+        "prepare" => {
+            let dir = required_profile_dir("prepare");
+            prepare_fixtures(&dir, fixtures, activities);
+            println!(
+                "verify_profile[prepare]: wrote {fixtures} fixtures to {}",
+                dir.display()
+            );
+        }
+        "run" => {
+            let dir = required_profile_dir("run");
+            run_verify(&dir, fixtures, activities);
+        }
+        _ => {
+            // Convenience mode: prepare + verify in one process against a
+            // fresh tempdir. NOT the mode to profile in isolation -- it also
+            // measures fixture generation. Use `prepare` + `run` for that.
+            let dir = tempfile::tempdir().expect("tempdir");
+            prepare_fixtures(dir.path(), fixtures, activities);
+            run_verify(dir.path(), fixtures, activities);
+        }
+    }
 }
