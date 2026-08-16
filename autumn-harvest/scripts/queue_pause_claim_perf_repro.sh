@@ -135,7 +135,30 @@ else
 the last commit predating the fix marker '${FIX_MARKER}' =="
   PRE_FIX_COMMIT=""
   while IFS= read -r sha; do
-    if ! git show "${sha}:${QUEUE_RS}" 2>/dev/null | grep -qF "$FIX_MARKER"; then
+    # `git show` failing here (a transient object-read error, a shallow clone
+    # missing history, ...) must abort loudly rather than be silently treated
+    # as "marker not found" -- the two cannot share one `!` on a piped
+    # command, or a transient failure on the fix commit itself would
+    # misattribute it as the pre-fix baseline and the "before"/"after"
+    # capture would silently compare the fixed query against itself. The
+    # content is captured only to check for the marker; materialization below
+    # re-runs `git show` with a raw file redirect so no shell string
+    # round-trip can alter the file's exact bytes (e.g. trailing newlines).
+    content="$(git show "${sha}:${QUEUE_RS}" 2>&1)" || {
+      echo "FATAL: 'git show ${sha}:${QUEUE_RS}' failed -- cannot walk \
+history to find a pre-fix revision:
+${content}" >&2
+      exit 1
+    }
+    # A herestring, not `printf ... | grep -q`: `-q` exits the instant it
+    # finds a match, closing its read end -- on content this size (~160KB)
+    # that can race the still-writing producer side of a real pipe and
+    # deliver it SIGPIPE before it finishes, which `pipefail` (set at the top
+    # of this script) then reports as pipeline failure even though `grep`
+    # itself matched successfully, silently flipping this `if !` backwards.
+    # A herestring hands `content` to `grep` directly with no second process
+    # in between, so there is nothing to race or receive SIGPIPE.
+    if ! grep -qF "$FIX_MARKER" <<<"$content"; then
       PRE_FIX_COMMIT="$sha"
       break
     fi
@@ -147,8 +170,17 @@ revision to reproduce the baseline from." >&2
     exit 1
   fi
   echo "== using ${QUEUE_RS} from ${PRE_FIX_COMMIT} (pre-fix) =="
-  git show "${PRE_FIX_COMMIT}:${QUEUE_RS}" > "$QUEUE_RS"
+  # RESTORE_MODE is set BEFORE the mutation below (not after) so a failure in
+  # the `git show` redirect itself still leaves the exit trap knowing to
+  # `git checkout -- $QUEUE_RS` -- the redirect can create/truncate the file
+  # before failing partway through.
   RESTORE_MODE="checkout"
+  git show "${PRE_FIX_COMMIT}:${QUEUE_RS}" > "$QUEUE_RS" || {
+    echo "FATAL: 'git show ${PRE_FIX_COMMIT}:${QUEUE_RS}' failed on the \
+materializing redirect, despite succeeding moments earlier during the \
+search above -- transient error; restoring ${QUEUE_RS} and aborting." >&2
+    exit 1
+  }
 fi
 capture "before"
 restore
