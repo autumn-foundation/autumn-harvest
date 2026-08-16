@@ -394,8 +394,31 @@ fn collect_json_fixtures(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// fixture found under `dir` (recursively, via `collect_json_fixtures`
 /// above -- matching `verify_dir`'s own discovery, so a nested fixture
 /// layout is not missed here) and derive each one's per-fixture activity
-/// count from its actual recorded event count (`WorkflowStarted` + two
-/// events per activity), validating that every fixture agrees.
+/// count by counting its `WorkflowEvent::ActivityScheduled` events,
+/// validating that every fixture agrees.
+///
+/// Counts `ActivityScheduled` directly rather than inferring a count from
+/// the total event length -- `(events.len() - 1) / 2` only holds for this
+/// file's own synthetic shape (`build_fixture_json`'s exact
+/// `WorkflowStarted` + one `ActivityScheduled`/`ActivityCompleted` pair per
+/// activity), which this fallback's own doc comment below says is *not*
+/// what reaches it. A real worker history instead emits one `ActivityStarted`
+/// per attempt: a *retryable* failure appends no event at all (`
+/// queue::requeue_for_retry` only updates the `harvest_task_queue` row --
+/// see its doc comment and `WorkflowTestEnv::mock_activity_retries`'s at
+/// `src/testing.rs:5278-5286`); the activity's only other history event is
+/// its single terminal `ActivityCompleted` or `ActivityFailed`. So a single
+/// activity retried a few times still inflates the raw event count -- via
+/// the repeated `ActivityStarted`s, which `HistoryMatcher::scan_activity_terminal`
+/// (`src/replay.rs`) skips as transparent noise while scanning for that one
+/// terminal event -- well past two per activity; halving it would badly
+/// overcount that fixture's activities, and two fixtures with the *same*
+/// logical activity count but *different* retry counts would (wrongly)
+/// disagree under the halved formula and trip the heterogeneity panic below
+/// on otherwise-valid, uniform input. `ActivityScheduled` is recorded
+/// exactly once per logical activity dispatch regardless of how many
+/// attempts it took, so counting it is robust to any event shape
+/// `verify_dir` itself accepts.
 ///
 /// A directory populated by `prepare_fixtures` writes identical fixture
 /// copies -- but it also *always* writes the `PROFILE_META_FILENAME`
@@ -432,9 +455,15 @@ fn activities_per_fixture_from_disk(dir: &std::path::Path) -> usize {
             .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
         let snapshot: HistorySnapshot = serde_json::from_str(&json)
             .unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()));
-        // WorkflowStarted (1 event) + ActivityScheduled/ActivityCompleted per
-        // activity (2 events each) -- the exact shape `build_fixture_json` emits.
-        let count = (snapshot.events.len() - 1) / 2;
+        // One `ActivityScheduled` per logical activity dispatch, regardless
+        // of how many `ActivityStarted`/`ActivityFailed` retry-attempt
+        // events surround it -- see the doc comment above for why this must
+        // not be inferred from the raw event count instead.
+        let count = snapshot
+            .events
+            .iter()
+            .filter(|event| matches!(event, WorkflowEvent::ActivityScheduled { .. }))
+            .count();
         match &first {
             None => first = Some((path.clone(), count)),
             Some((first_path, first_count)) => {
