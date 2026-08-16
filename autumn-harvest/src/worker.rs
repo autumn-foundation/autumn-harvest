@@ -4910,6 +4910,57 @@ fn first_persist_capability_miss(
     None
 }
 
+/// The cross-type continue-as-new target this worker cannot dispatch, if the
+/// cycle's outcome is a continuation into an unregistered type (issue #804,
+/// Codex round-45 P1).
+///
+/// Companion to [`first_persist_capability_miss`], and separate from it for a
+/// mechanical reason: `drive_workflow` `swap_remove`s the `ContinueAsNew`
+/// command out of the command list and returns it as the *outcome*, so the
+/// command-scanning pre-pass never sees it. Issue #803's cross-type
+/// continuation (`ctx.continue_as_new_as`) resolves the TARGET type's handler,
+/// which makes an unregistered target the same blameless fleet condition every
+/// other #804 site releases for — canonically a rolling deploy where the old
+/// pod runs the source phase and only the new peer registers the target phase.
+/// Without this, `check_continue_as_new_type` funnels it into
+/// `persist_workflow_failure` and the predecessor is terminally failed by a
+/// worker that simply arrived first.
+///
+/// **Only the unregistered case.** `classify_continue_as_new_target` rejects a
+/// target for five other reasons, and none of them is about this worker:
+///
+/// - **Blank target.** A config error; releasing would loop the task around a
+///   fleet where no peer can help, and an empty name would reach the
+///   `harvest.task.capability_miss` labels as a phantom workflow.
+/// - **Registered DAG target.** Excluded here by construction rather than by a
+///   second condition: a unified DAG's shadow `WorkflowInfo` lives in
+///   `registry.workflows` (issue #256), so `contains_key` already returns true
+///   and the target falls through to #803's terminal
+///   "trigger it with `POST /dags/{name}/trigger`" rejection. That is a scope
+///   decision, identical on every worker.
+/// - **Cross-shard routing, an unrepresentable successor deadline, and a
+///   `(target, workflow_id)` slot already held.** All resolved after this,
+///   inside `check_continue_as_new_type`, and all fleet-invariant: every peer
+///   would reach the same verdict, so releasing could only burn the budget and
+///   then escalate with a `no_capable_worker:` reason that misdescribes the
+///   fault.
+fn continue_as_new_target_capability_miss(
+    registry: &HandlerRegistry,
+    outcome: &WorkflowOutcome,
+) -> Option<(&'static str, String)> {
+    let WorkflowOutcome::ContinuedAsNew {
+        new_workflow_type: Some(target),
+        ..
+    } = outcome
+    else {
+        return None;
+    };
+    if target.trim().is_empty() || registry.workflows.contains_key(target.as_str()) {
+        return None;
+    }
+    Some((CapabilityMissKind::Workflow.as_str(), target.clone()))
+}
+
 /// The first local activity in this cycle's commands whose handler this worker
 /// does not register (issue #804, Codex round-19 P2).
 ///
@@ -12342,6 +12393,13 @@ enum ContinueAsNewTypeCheck<'a> {
 /// Consequence worth knowing: the target must be registered on the worker that
 /// runs the *transition*, so a new phase handler has to reach the whole fleet
 /// before code that continues into it does.
+///
+/// The **unregistered-target** case no longer normally reaches here: issue
+/// #804's persist gate ([`continue_as_new_target_capability_miss`]) runs
+/// earlier in `process_workflow_task` and releases the claim for a capable
+/// peer, since that case is a transient fleet condition rather than a fault.
+/// The arm below is kept as the fail-closed backstop for the narrow window
+/// where the target is *deregistered* between that gate and this call.
 async fn check_continue_as_new_type<'a>(
     conn: &mut AsyncPgConnection,
     registry: &'a HandlerRegistry,
@@ -15405,10 +15463,16 @@ async fn process_workflow_task(
     //
     // Placed before the history-cap check's DB round-trips too, so an incapable
     // worker releases the task without paying for work a capable peer will redo.
+    // Commands first, so the reported name stays deterministic in command order
+    // for every batch that carries one; then the outcome's cross-type
+    // continue-as-new target, which `drive_workflow` moved OUT of the command
+    // list and so cannot be seen by the scan above (issue #804, Codex round-45).
     if let Some((kind, name)) = first_persist_capability_miss(
         registry,
         update_result_command_source(&outcome, &pending_cmds),
-    ) {
+    )
+    .or_else(|| continue_as_new_target_capability_miss(registry, &outcome))
+    {
         return Err(HarvestError::HandlerNotRegistered {
             kind,
             name,
@@ -26117,6 +26181,100 @@ mod tests {
                 "missing_detached".to_string()
             )),
         );
+    }
+
+    #[test]
+    fn continue_as_new_to_an_unregistered_type_is_a_capability_miss() {
+        // Issue #804 (Codex round-45 P1). A cross-type continue-as-new (issue
+        // #803) resolves the TARGET type's handler, so during a rolling deploy
+        // an old pod that runs the source type but not the new target is in
+        // exactly the state #804 exists for: blameless, transient, and fixable
+        // by a peer that registers both. It must release, not seal the
+        // predecessor.
+        //
+        // It needs its own check because the `ContinueAsNew` command never
+        // reaches `first_persist_capability_miss`: `drive_workflow`
+        // `swap_remove`s it out of the command list and returns it as the
+        // OUTCOME, so the command-scanning pre-pass sees an empty batch.
+        let registry = registry_knowing("known_wf", "known_act");
+        assert_eq!(
+            continue_as_new_target_capability_miss(
+                &registry,
+                &WorkflowOutcome::ContinuedAsNew {
+                    input: serde_json::Value::Null,
+                    new_workflow_type: Some("paid_subscription".to_string()),
+                },
+            ),
+            Some((
+                CapabilityMissKind::Workflow.as_str(),
+                "paid_subscription".to_string()
+            )),
+        );
+    }
+
+    #[test]
+    fn continue_as_new_capability_miss_spares_every_terminal_rejection() {
+        // The other reasons `classify_continue_as_new_target` rejects a target
+        // are NOT capability misses, and releasing for them would loop the task
+        // around a fleet where no peer can help until the budget escalates it
+        // with a `no_capable_worker:` reason that misdescribes the fault.
+        let registry = registry_knowing("known_wf", "known_act");
+        let miss = |target: Option<&str>| {
+            continue_as_new_target_capability_miss(
+                &registry,
+                &WorkflowOutcome::ContinuedAsNew {
+                    input: serde_json::Value::Null,
+                    new_workflow_type: target.map(str::to_string),
+                },
+            )
+        };
+
+        // Same-type continuation: resolves no target handler at all.
+        assert_eq!(miss(None), None);
+        // Registered target: the happy cross-type path.
+        assert_eq!(miss(Some("known_wf")), None);
+        // Blank target: a config error no peer can fix, and an empty name would
+        // reach the `queue`/`task_type` metric as a phantom workflow.
+        assert_eq!(miss(Some("")), None);
+        assert_eq!(miss(Some("   ")), None);
+
+        // A unified DAG's shadow `WorkflowInfo` lives in `registry.workflows`
+        // (issue #256), so a DAG target is excluded here by construction and
+        // falls through to #803's terminal "trigger it with POST /dags/..."
+        // rejection -- which is a scope decision, not a fleet condition.
+        let mut dag_registry = registry_knowing("nightly_rollup", "known_act");
+        dag_registry
+            .dag_workflow_names
+            .insert("nightly_rollup".to_string());
+        assert_eq!(
+            continue_as_new_target_capability_miss(
+                &dag_registry,
+                &WorkflowOutcome::ContinuedAsNew {
+                    input: serde_json::Value::Null,
+                    new_workflow_type: Some("nightly_rollup".to_string()),
+                },
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn continue_as_new_capability_miss_ignores_non_continuation_outcomes() {
+        let registry = registry_knowing("known_wf", "known_act");
+        for outcome in [
+            WorkflowOutcome::Completed {
+                output: serde_json::Value::Null,
+                unhandled_signals: std::collections::BTreeMap::new(),
+            },
+            WorkflowOutcome::Suspended {
+                commands: Vec::new(),
+            },
+        ] {
+            assert_eq!(
+                continue_as_new_target_capability_miss(&registry, &outcome),
+                None
+            );
+        }
     }
 
     #[test]

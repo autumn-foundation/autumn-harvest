@@ -4816,3 +4816,144 @@ async fn dropping_the_empty_array_guard_returns_the_invalidation_to_a_full_scan(
          why the conjunct is not redundant. Plan was:\n{plan}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Codex round-45 P1 — a cross-type continue-as-new (issue #803) whose TARGET
+// type this worker does not register is a capability miss, not a terminal
+// failure.
+// ---------------------------------------------------------------------------
+
+const Q_CAN_CROSS: &str = "q804-can-cross";
+
+/// The source phase: it immediately continues into a DIFFERENT registered
+/// workflow type, which is what makes the target's handler load-bearing on the
+/// worker running the transition.
+fn workflow_continues_into_target(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.continue_as_new_as_type("can_cross_target_wf", input)
+            .await
+            .map_err(|e| e.to_string())?;
+        // `continue_as_new*` suspends the run and never resolves.
+        unreachable!("continue_as_new_as_type must suspend")
+    })
+}
+
+/// The target phase, registered only on the capable worker.
+fn workflow_target_phase(_ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move { Ok(serde_json::json!({"phase": "target", "carried": input})) })
+}
+
+/// Issue #803 requires the cross-type target to be registered on the worker
+/// that runs the transition, and shipped that as a **terminal** failure of the
+/// predecessor. During a rolling deploy that is precisely #804's blameless
+/// fleet condition — the old pod runs the source phase, only the new peer
+/// registers the target phase — so an entity that happens to transition while
+/// the deploy is in flight is killed by whichever worker claimed it first.
+///
+/// The command carrying the target never reaches the command-scanning
+/// pre-pass: `drive_workflow` `swap_remove`s `ContinueAsNew` out of the batch
+/// and returns it as the OUTCOME. So this needs its own check, and this test is
+/// what proves the check is on the live dispatch path rather than only in the
+/// pure matrix.
+///
+/// Phase 2 is load-bearing twice over: it shows the *same* execution completes
+/// once a peer registers both types (so phase 1 was a release, not a stall),
+/// and that the transition itself still works — a check that released
+/// unconditionally would pass phase 1 and hang here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_type_continue_as_new_missing_target_is_released_for_a_capable_peer() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let pool = build_pool(&url);
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "can_cross_source_wf",
+        serde_json::json!({"entity": "sub-1"}),
+        Q_CAN_CROSS,
+    )
+    .await;
+
+    let metrics = Arc::new(CapabilityMetrics::default());
+
+    // --- Phase 1: a worker that registers the SOURCE type only. ------------
+    let source_only = build_worker(
+        "worker-source-only",
+        &[Q_CAN_CROSS],
+        build_registry(
+            vec![workflow_info(
+                "can_cross_source_wf",
+                workflow_continues_into_target,
+            )],
+            vec![],
+            Arc::clone(&metrics),
+        ),
+        50,
+    );
+
+    let released = with_worker_running(&source_only, &pool, async {
+        wait_for_capability_misses(&url, exec_id, 1, Duration::from_secs(30)).await
+    })
+    .await;
+
+    assert_eq!(
+        released.task_type, "workflow",
+        "the transition is decided on the WORKFLOW task; no successor row exists yet"
+    );
+    assert_released_for_a_peer(&released);
+
+    // AC1 proper: the predecessor must NOT have been sealed. Before this fix
+    // `check_continue_as_new_type` reached `persist_workflow_failure` and this
+    // execution was FAILED with an "is not registered on this worker" reason.
+    let predecessor = load_execution(&url, exec_id).await;
+    assert_eq!(
+        predecessor.state, "RUNNING",
+        "the predecessor must stay live for a capable peer, not be sealed by a \
+         worker that merely lacks the target handler"
+    );
+    assert!(
+        predecessor.error.is_none(),
+        "no terminal reason may be recorded for a release: {:?}",
+        predecessor.error
+    );
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "AC1/AC7: a capability miss appends no terminal event: {history:?}"
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. })),
+        "the seal must not have been written either -- the whole point is that \
+         nothing is persisted before the target is known dispatchable: {history:?}"
+    );
+
+    // --- Phase 2: a peer registering BOTH phases completes the transition. --
+    let capable = build_worker(
+        "worker-both-phases",
+        &[Q_CAN_CROSS],
+        build_registry(
+            vec![
+                workflow_info("can_cross_source_wf", workflow_continues_into_target),
+                workflow_info("can_cross_target_wf", workflow_target_phase),
+            ],
+            vec![],
+            Arc::clone(&metrics),
+        ),
+        50,
+    );
+
+    let sealed = with_worker_running(&capable, &pool, async {
+        wait_for_state(&url, exec_id, "CONTINUED_AS_NEW", Duration::from_secs(30)).await
+    })
+    .await;
+    assert!(
+        sealed.error.is_none(),
+        "the predecessor seals cleanly once a capable peer runs the transition: {:?}",
+        sealed.error
+    );
+    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+}

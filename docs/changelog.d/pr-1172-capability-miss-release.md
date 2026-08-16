@@ -1708,3 +1708,60 @@ rustdoc attributed the ceiling's `Unavailable` case to "a fleet smaller than the
 budget". Under `Unavailable` the fleet's size is exactly what cannot be known —
 the bound is on the distinct *observed* incapable workers — so the clause now
 says that, with the reason it can say nothing stronger.
+
+## Review round 45
+
+**P1: a cross-type continue-as-new whose target handler is missing must
+release, not seal the predecessor.** Issue #803's `ctx.continue_as_new_as`
+resolves the **target** type's handler on the worker running the transition, and
+#803 shipped an unregistered target as a terminal failure of the predecessor.
+That is exactly the condition #804 exists for: during a rolling deploy the old
+pod runs the source phase while only the new peer registers the target phase, so
+a long-lived entity that happens to transition mid-deploy was killed by whichever
+worker claimed it first — blameless, transient, and fixable by a peer.
+
+**Why the existing pre-pass could not catch it.** `first_persist_capability_miss`
+scans the cycle's commands, but `drive_workflow` `swap_remove`s the
+`ContinueAsNew` command out of the batch and returns it as the *outcome*, so the
+scan sees an empty list. `WorkflowCommand::ContinueAsNew` sat in the pre-pass's
+"persists without resolving a handler" arm, which was true before #803 and
+stopped being true when cross-type continuation landed.
+
+New pure `continue_as_new_target_capability_miss` reads the outcome instead and
+is `or_else`-chained onto the same gate, so it runs at the same point — ahead of
+`record_workflow_completed`, the terminal telemetry, and the history-cap
+round-trips — and returns `HandlerNotRegistered { Workflow, AfterHandler }`. The
+phase is `AfterHandler` for the reason the phase exists: the body ran to a
+conclusion and only persisting its decision found an unregistered type.
+
+**Only the unregistered case.** `classify_continue_as_new_target` rejects a
+target for five other reasons and none is about *this* worker, so none may
+release: a blank target (a config error, and an empty name would reach the
+`capability_miss` labels as a phantom workflow); a registered **DAG** target
+(excluded by construction — a DAG's shadow `WorkflowInfo` lives in
+`registry.workflows`, so `contains_key` already returns true and it falls
+through to #803's terminal "trigger it with `POST /dags/{name}/trigger`"); and
+cross-shard routing, an unrepresentable successor deadline, or a
+`(target, workflow_id)` slot already held — all fleet-invariant, so releasing
+could only burn the budget and then escalate with a `no_capable_worker:` reason
+that misdescribes the fault. Each is pinned.
+
+`check_continue_as_new_type`'s own unregistered arm is kept as the fail-closed
+backstop for the narrow window where the target is *deregistered* between the
+gate and the call, and its rustdoc now says so.
+
+**Money test.** `cross_type_continue_as_new_missing_target_is_released_for_a_capable_peer`
+drives a real two-phase deploy: a worker registering only the source phase
+releases the task (`PENDING`, no owner, no crash strike), the predecessor stays
+`RUNNING` with a null `error` and neither a `WorkflowFailed` nor a
+`WorkflowContinuedAsNew` event, and a peer registering **both** phases then
+completes the transition to `CONTINUED_AS_NEW`. Phase 2 is load-bearing twice:
+it shows phase 1 was a release rather than a stall, and a check that released
+unconditionally would pass phase 1 and hang here. Confirmed falsifiable — with
+the gate wiring neutered the test fails, the predecessor sealed exactly as #803
+shipped it.
+
+Documentation follows the behavior: CLAUDE.md's #803 rollout-ordering note now
+separates the releasable case from the three that stay terminal, while keeping
+the ordering requirement (a target that never reaches any live worker still
+escalates).
