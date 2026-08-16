@@ -1546,3 +1546,72 @@ count, the configured total (gated on fleet-covering evidence, and why it must
 be gated on that specifically), and the ceiling — whose remaining job is the two
 cases neither gated bound can reach, a fleet the registry cannot describe and a
 live worker that never claims.
+
+## Review round 42
+
+One P2, **declined on the evidence** — with the invariant it questions now pinned
+by a test rather than left to reasoning.
+
+The finding read the unconditional rate-limit refund at the top of
+`handle_capability_miss` as an over-credit: a stale dispatcher resuming after
+`poison_pill::reclaim_orphaned_tasks` re-pended its task would "refund the
+replacement claim's token", letting an extra activity through and violating the
+configured rate limit. The suggested repair was to gate the refund on still
+owning the claim.
+
+Tokens are fungible, so there is no "replacement claim's token" to refund — the
+only meaningful question is the **balance**: outstanding debits must equal the
+activities that ran or are running. Traced against the code, with `A` the stale
+dispatcher and `B` the replacement:
+
+| step | bucket | running |
+|------|--------|---------|
+| `A` claims (`claim_task` debits) | `T-1` | 0 |
+| orphan reclaim re-pends — no refund | `T-1` | 0 |
+| `B` claims (debits) and runs | `T-2` | 1 |
+| `A` resumes and refunds | `T-1` | 1 |
+
+`T-1` for one running activity is correct. The refund does not take capacity
+from `B`; it returns the debit `A` **stranded**, because `requeue_orphan`
+rewrites state/`worker_id`/`started_at`/`crash_strikes` and never touches the
+bucket. Gating the refund on ownership would stop at `T-2` — a permanent leak on
+a `refill_rate = 0` bucket, and precisely the direction that starves the capable
+peer the release exists to hand the task to.
+
+Three facts were verified rather than assumed, since the conclusion depends on
+all of them:
+
+* **`requeue_orphan` does not refund.** Its `UPDATE` covers state, `worker_id`,
+  `started_at` and `crash_strikes` only.
+* **This is the only site that returns a claim-time debit.** The other worker
+  refund is guarded on `circuit_token.is_some() && activity.circuit_breaker.is_some()`
+  — a dispatch-time reservation for breaker activities, a disjoint token — and
+  the remaining call sites are the `start-throttle:` bucket family (#607). No
+  retry, timeout or cancel path refunds, so one debit cannot be credited twice.
+* **A capability miss always had a claim-time debit.** The miss fires exactly
+  when `registry.activities.get(name)` is `None`, and the breaker set that makes
+  `claim_task` skip the debit is built from that *same* map — so a worker
+  missing the handler is never breaker-tracked, never skips the debit, and
+  returns before the dispatch-time reservation. The refund can therefore never
+  fire without a matching debit.
+
+New DB test `stale_dispatcher_refund_leaves_one_debit_for_the_live_claim` drives
+the interleaving above deterministically through `queue::claim_task` (no worker
+poll-loop races) against a `burst 2 / refill 0` bucket, and asserts **both**
+failure directions: `2.0` would be the over-credit the finding describes, `0.0`
+the leak its suggested fix would introduce. Confirmed falsifiable — applying the
+ownership gate as a mutant fails the test at `0.0`. The reasoning is also
+recorded on `refund_capability_miss_rate_limit_token`, which is now
+`#[doc(hidden)] pub` so the test drives the real function rather than a copy.
+
+**Also fixed, surfaced by adding that test:** the round-39 index probes were not
+actually size-independent. `explain_plan` issued `SET LOCAL enable_seqscan = off`
+as a bare statement on an autocommit connection, so it was scoped to its own
+one-statement transaction and was already gone by the time `EXPLAIN` ran on the
+next. The probes were therefore measuring the planner's ordinary cost choice,
+which on a small table is a `Seq Scan` whether or not an index exists — they
+passed only on incidental row counts left by whichever tests ran before them,
+and the new test perturbed exactly that. Wrapped both statements in an explicit
+`BEGIN`/`ROLLBACK` so the setting survives to the `EXPLAIN`; both probes now pass
+against a pristine empty database, which the positive one could not have done
+before.

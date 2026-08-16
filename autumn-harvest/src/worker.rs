@@ -16374,7 +16374,42 @@ async fn read_live_fleet_or_degrade(
 /// strand the row `RUNNING` under a live worker, which is strictly worse than
 /// the leak (the poison-pill reclaimer only recovers rows whose worker has
 /// stopped heartbeating).
-async fn refund_capability_miss_rate_limit_token(
+///
+/// # Why this is deliberately NOT gated on still owning the claim
+///
+/// Codex round 42 read the unconditional refund as an over-credit: a stale
+/// dispatcher resuming after `poison_pill::reclaim_orphaned_tasks` re-pended
+/// its task would "refund the replacement claim's token", letting an extra
+/// activity through. Tokens are fungible, so the only meaningful question is
+/// the **balance**: outstanding debits must equal the number of activities that
+/// ran or are running. Trace it with a burst-`T` bucket, where `A` is the stale
+/// dispatcher and `B` the replacement:
+///
+/// | step                                   | bucket | running |
+/// |----------------------------------------|--------|---------|
+/// | `A` claims (debits)                    | `T-1`  | 0       |
+/// | orphan reclaim re-pends — **no refund**| `T-1`  | 0       |
+/// | `B` claims (debits) and runs           | `T-2`  | 1       |
+/// | `A` resumes and refunds *here*         | `T-1`  | 1       |
+///
+/// `T-1` for one running activity is the correct balance. The refund does not
+/// take capacity from `B`; it returns the debit `A` stranded, because
+/// `requeue_orphan` re-pends the row without touching the bucket. Gating this
+/// on ownership would stop at `T-2` — a permanent leak on a `refill_rate = 0`
+/// bucket, and the direction that starves the capable peer.
+///
+/// The refund is safe to make unconditional because it is exactly one refund
+/// per claim-time debit: `claim_task` debits every rate-limited claim it grants
+/// (bar the breaker-tracked ones, unreachable here — see above), this is the
+/// only site that returns a claim-time debit, and it runs once per dispatch. No
+/// other path — retry requeue, orphan reclaim, timeout, cancel — refunds, so a
+/// second credit for one debit cannot arise.
+///
+/// Pinned by `stale_dispatcher_refund_leaves_one_debit_for_the_live_claim` in
+/// `capability_miss_tests`, which drives the exact interleaving above and
+/// asserts the middle column.
+#[doc(hidden)]
+pub async fn refund_capability_miss_rate_limit_token(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
 ) {

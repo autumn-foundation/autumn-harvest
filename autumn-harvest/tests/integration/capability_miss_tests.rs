@@ -3634,6 +3634,111 @@ async fn releasing_a_rate_limited_activity_refunds_its_token() {
     );
 }
 
+/// A stale dispatcher's refund leaves exactly ONE outstanding debit for the
+/// one live claim (issue #804, Codex round-42 P2).
+///
+/// The finding read the unconditional refund in `handle_capability_miss` as an
+/// over-credit: a dispatcher that resumes after `reclaim_orphaned_tasks` has
+/// re-pended its task would "refund the replacement claim's token", letting an
+/// extra activity through. Tokens are fungible, so the property that actually
+/// matters is the balance — outstanding debits must equal the activities that
+/// ran or are running — and this drives the exact interleaving to measure it.
+///
+/// The bucket is `burst 2 / refill 0`: two tokens, ever. A refilling bucket
+/// would mint the difference on its own and make every assertion below vacuous.
+///
+/// Both failure directions are asserted, because they sit on opposite sides of
+/// the shipped behaviour:
+///
+///   * `2.0` would be the over-credit the finding describes — a token returned
+///     that no claim ever spent.
+///   * `0.0` is what gating the refund on still owning the claim would produce:
+///     `requeue_orphan` re-pends the row without touching the bucket, so the
+///     stale dispatcher's debit is stranded, and on `refill_rate = 0` it never
+///     comes back. That is the direction that starves the capable peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_dispatcher_refund_leaves_one_debit_for_the_live_claim() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    let exec_id = seed_execution(&mut conn, "stale_refund_wf", serde_json::json!({})).await;
+
+    // Unique per run: a shared key would let a task left behind by an earlier
+    // run race for these tokens, so a later run could fail for losing that race
+    // rather than for the property under test.
+    let key = format!("q804-stale-refund-{exec_id}");
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at) \
+         VALUES ($1, 0.0, 2.0, 2.0, NOW())",
+    )
+    .bind::<diesel::sql_types::Text, _>(key.as_str())
+    .execute(&mut conn)
+    .await
+    .expect("seed rate-limit bucket");
+
+    let mut params = EnqueueParams::new(Q_RATE, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.activity_name = Some("stale_refund_activity".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.rate_limit_key = Some(key.clone());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue rate-limited activity task");
+
+    let queues = vec![Q_RATE.to_string()];
+
+    // 1. The stale dispatcher `A` claims. `claim_task` debits: 2 -> 1.
+    let stale_claim = queue::claim_task(&mut conn, &queues, "worker-stale-A", "", None, &[], &[])
+        .await
+        .expect("claim as A")
+        .expect("a claimable task");
+    assert!(
+        (stored_tokens(&url, &key).await - 1.0).abs() < 0.01,
+        "A's claim must debit one token"
+    );
+
+    // 2. Orphan reclaim re-pends the row. Verified against `requeue_orphan`:
+    //    it rewrites state/worker_id/started_at and bumps `crash_strikes`, and
+    //    touches no bucket — so A's debit is now stranded.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, \
+         crash_strikes = crash_strikes + 1, scheduled_at = NOW() - INTERVAL '5 seconds' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(stale_claim.id)
+    .execute(&mut conn)
+    .await
+    .expect("simulate orphan re-pend");
+
+    // 3. The replacement `B` claims and (in the real fleet) runs it: 1 -> 0.
+    let live_claim = queue::claim_task(&mut conn, &queues, "worker-live-B", "", None, &[], &[])
+        .await
+        .expect("claim as B")
+        .expect("the re-pended task must be claimable");
+    assert_eq!(
+        live_claim.id, stale_claim.id,
+        "B must have taken the same row"
+    );
+    let both_debited = stored_tokens(&url, &key).await;
+    assert!(
+        both_debited.abs() < 0.01,
+        "both claims debited, so the bucket is empty before the refund; got {both_debited}"
+    );
+
+    // 4. `A` resumes and takes the capability-miss refund with its now-stale
+    //    snapshot — the exact call the finding flagged.
+    autumn_harvest::worker::refund_capability_miss_rate_limit_token(&mut conn, &stale_claim).await;
+
+    let after = stored_tokens(&url, &key).await;
+    assert!(
+        (after - 1.0).abs() < 0.01,
+        "the stale refund must leave exactly one outstanding debit for B's one live claim: \
+         2.0 would be the over-credit the finding describes, and 0.0 the permanent leak that \
+         gating the refund on ownership would cause; got {after}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A release must not launder a poison task's crash history (issue #804 x #367).
 // ---------------------------------------------------------------------------
@@ -4563,15 +4668,39 @@ async fn explain_plan(conn: &mut AsyncPgConnection, statement: &str) -> String {
     // falls back to one when no index *can* serve the predicate. That is what
     // makes this assertion independent of table size and planner cost
     // thresholds.
+    //
+    // The explicit `BEGIN`/`ROLLBACK` is load-bearing, not decoration. `SET
+    // LOCAL` is scoped to the enclosing transaction, and this connection is in
+    // autocommit — so issuing it as a bare statement scopes it to its own
+    // one-statement transaction and it is already gone by the time `EXPLAIN`
+    // runs on the next. That leaves the probe silently measuring the planner's
+    // ordinary cost choice, which on a small table is a `Seq Scan` whether or
+    // not an index exists: the assertion passes or fails on incidental row
+    // counts left by whichever tests ran before it, and says nothing about
+    // index-servability either way. `ROLLBACK` rather than `COMMIT` because
+    // `EXPLAIN` without `ANALYZE` executes nothing — this is a read-only probe
+    // and should leave no trace.
+    diesel::sql_query("BEGIN")
+        .execute(conn)
+        .await
+        .expect("open a transaction so SET LOCAL survives to the EXPLAIN");
     diesel::sql_query("SET LOCAL enable_seqscan = off")
         .execute(conn)
         .await
         .expect("disable seq scans for the duration of this transaction");
 
-    diesel::sql_query(format!("EXPLAIN {filled}"))
+    let plan = diesel::sql_query(format!("EXPLAIN {filled}"))
         .load::<PlanLine>(conn)
+        .await;
+
+    // Close the transaction before unwrapping, so a failed EXPLAIN does not
+    // strand the connection mid-transaction for the rest of the test.
+    diesel::sql_query("ROLLBACK")
+        .execute(conn)
         .await
-        .expect("EXPLAIN must succeed")
+        .expect("close the probe transaction");
+
+    plan.expect("EXPLAIN must succeed")
         .into_iter()
         .map(|row| row.line)
         .collect::<Vec<_>>()
