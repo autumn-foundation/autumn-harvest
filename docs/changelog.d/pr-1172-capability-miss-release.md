@@ -2318,3 +2318,27 @@ one connection and reuse it for the whole wait, and `wait_for_task_owner` dumps
 the task rows and the worker registry on timeout rather than panicking bare —
 an empty registry is a registration that never committed, which gates claiming
 outright and is invisible from the task row alone.
+
+## Review round 57
+
+**The claim-theft injection was starving itself, and failed silently when it
+did.** `a_claim_lost_mid_dispatch_makes_no_terminal_decision` proves the round-28
+P1: a dispatch whose task row is reassigned mid-flight must make no terminal
+decision. It does that by having the workflow body hand its own row to another
+worker in the window between `claim_task` committing and the `AfterHandler` miss
+being raised. That injection opened a *fresh* Postgres connection — a full
+TCP+auth handshake — inside that window, on a database the suite shares. Round
+56's diagnostic dump caught the consequence on the next CI run: the task ended
+`FAILED`, still owned by `pod-loses-claim`, with `capability_misses = 0` and the
+worker registered `Active` — the signature of a panicking body contained by the
+issue #782 handler-panic path, not of a suppressed escalation. The injection now
+checks a connection out of its own pre-built pool, so it reuses a warm connection
+and waits rather than failing.
+
+A zero-row theft was the one outcome that silently invalidated the whole test:
+the dispatch then still owned the row, the escalation was *correct* rather than
+suppressed, and the wait for the new owner timed out with nothing to say. The
+injection now asserts it reassigned exactly one row, and `wait_for_task_owner`'s
+timeout dump carries the task's `attempt`/`crash_strikes`/`capability_misses` and
+`error` alongside the execution's state and error — so whichever way the body
+fails, the failure names itself instead of arriving as a bare timeout.

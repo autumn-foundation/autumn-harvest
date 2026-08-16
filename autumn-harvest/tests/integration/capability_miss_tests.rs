@@ -637,18 +637,24 @@ async fn wait_for_task_owner(
         .load(&mut diag)
         .await
         .expect("dump worker registry");
+    let execution = load_execution_on(&mut diag, exec_id).await;
     panic!(
-        "no task row was claimed by {worker_id} within {timeout:?}; tasks={:?}; registry={workers:?}",
+        "no task row was claimed by {worker_id} within {timeout:?}; tasks={:?}; \
+         execution=({}, {:?}); registry={workers:?}",
         tasks
             .iter()
             .map(|t| (
                 t.id,
                 t.state.clone(),
                 t.worker_id.clone(),
-                t.scheduled_at,
-                t.capability_misses
+                t.attempt,
+                t.crash_strikes,
+                t.capability_misses,
+                t.error.clone(),
             ))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>(),
+        execution.state,
+        execution.error,
     )
 }
 
@@ -955,7 +961,16 @@ fn workflow_invalidates_peer_then_misses(
 
 /// Where `workflow_steals_own_claim_then_misses` reaches the database (issue
 /// #804 round 28). Same `OnceLock` rationale as [`RACE_INJECTION`].
-static CLAIM_THEFT_INJECTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// A **pool**, not a URL, deliberately. The theft has to land in the narrow
+/// window between the claim committing and the miss being decided, and it is
+/// the only thing standing between the stolen row and a terminal failure. A
+/// fresh `AsyncPgConnection::establish` per dispatch pays a full TCP+auth
+/// handshake inside that window on a database this suite shares — slow enough
+/// under load to miss the window (the theft then matches zero rows, because the
+/// row is no longer `RUNNING`), and able to fail outright, which panics the body
+/// and turns a precise assertion into a bare timeout. A pooled checkout reuses a
+/// warm connection and waits rather than failing.
+static CLAIM_THEFT_INJECTION: std::sync::OnceLock<DbPool> = std::sync::OnceLock::new();
 
 /// The deterministic injection point for the round-28 lost-claim P1: a workflow
 /// body that hands its own task row to another worker **while its dispatch is
@@ -971,11 +986,9 @@ fn workflow_steals_own_claim_then_misses(
     input: serde_json::Value,
 ) -> BoxFut<'_> {
     Box::pin(async move {
-        if let Some(url) = CLAIM_THEFT_INJECTION.get() {
-            let mut conn = AsyncPgConnection::establish(url)
-                .await
-                .expect("claim-theft injection connects");
-            diesel::sql_query(
+        if let Some(pool) = CLAIM_THEFT_INJECTION.get() {
+            let mut conn = pool.get().await.expect("claim-theft injection connects");
+            let stolen = diesel::sql_query(
                 "UPDATE harvest_task_queue SET worker_id = 'thief' \
                  WHERE queue_name = $1 AND state = 'RUNNING'",
             )
@@ -983,6 +996,14 @@ fn workflow_steals_own_claim_then_misses(
             .execute(&mut conn)
             .await
             .expect("claim-theft injection reassigns the row");
+            // A zero-row theft is the one outcome that silently invalidates the
+            // whole test: the dispatch then still owns the row, the escalation
+            // is correct rather than suppressed, and the wait for the new owner
+            // times out with nothing to say. Fail on the spot instead.
+            assert_eq!(
+                stolen, 1,
+                "claim-theft injection must reassign exactly the claimed row"
+            );
         }
         ctx.execute_activity_raw("never_registered_activity", input, Q_LOST_CLAIM)
             .await
@@ -2672,9 +2693,14 @@ async fn a_claim_lost_mid_dispatch_makes_no_terminal_decision() {
     )
     .await;
 
-    CLAIM_THEFT_INJECTION
-        .set(url.clone())
-        .expect("claim-theft injection is armed exactly once per process");
+    // Its own pool, not the worker's: the theft must not have to wait behind
+    // the dispatch it is racing for a connection. `is_ok()` rather than
+    // `expect()` because `OnceLock::set` hands the rejected value back in the
+    // `Err`, and a `DbPool` is not `Debug` (`AsyncPgConnection` is not).
+    assert!(
+        CLAIM_THEFT_INJECTION.set(build_pool(&url)).is_ok(),
+        "claim-theft injection is armed exactly once per process"
+    );
 
     let metrics = Arc::new(CapabilityMetrics::default());
     let worker = build_worker(
