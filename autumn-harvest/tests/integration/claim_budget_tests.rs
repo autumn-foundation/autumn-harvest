@@ -1762,3 +1762,276 @@ async fn a_template1_backend_blocks_create_database_but_ours_does_not() {
 
     db::drop_database_version_neutral(&mut creator, &probe).await;
 }
+
+/// Generates the committed before/after evidence for the queue-pause
+/// anti-join rewrite in `queue::claim_task_query()` (issue #619 / Ledger perf
+/// pass).
+///
+/// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
+/// repeatable CI assertion — its output is read by a human reviewing the PR,
+/// not asserted on. See
+/// `autumn-harvest/scripts/queue_pause_claim_perf_repro.sh`, which runs this
+/// exact test twice — once against the pre-fix shape of `queue.rs`, once
+/// against the current tree — to produce the paired
+/// `docs/perf-artifacts/queue-pause-claim-anti-join/` files the PR cites.
+///
+/// Self-detects which shape it is currently measuring by inspecting
+/// `queue::claim_task_query()`'s own text (`paused_queues AS MATERIALIZED`
+/// present or absent), so a single invocation always writes to the
+/// correctly-labelled `before-*`/`after-*` files regardless of which revision
+/// happens to be checked out — there is no separate "old" copy of the query
+/// text to drift out of sync with the real function.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[ignore = "evidence generator, not a CI assertion -- run via \
+            autumn-harvest/scripts/queue_pause_claim_perf_repro.sh"]
+#[allow(clippy::too_many_lines)] // one-shot evidence capture, not a CI assertion
+async fn zz_capture_queue_pause_claim_evidence() {
+    use diesel::QueryableByName;
+    use diesel_async::RunQueryDsl;
+
+    #[derive(QueryableByName)]
+    struct ExplainRow {
+        #[diesel(sql_type = diesel::sql_types::Text, column_name = "QUERY PLAN")]
+        query_plan: String,
+    }
+
+    #[derive(QueryableByName)]
+    struct StatRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        query: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        calls: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        shared_blks_hit: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        shared_blks_read: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        total_buffers: i64,
+    }
+
+    let Some(bench) = bench_db_or_skip().await else {
+        eprintln!("no database reachable; nothing captured");
+        return;
+    };
+
+    let raw = autumn_harvest::queue::claim_task_query();
+    let label = if raw.contains("paused_queues AS MATERIALIZED") {
+        "after"
+    } else {
+        "before"
+    };
+    eprintln!("== capturing label={label} (auto-detected from claim_task_query() text) ==");
+
+    let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("autumn-harvest/ has a workspace-root parent")
+        .join("docs")
+        .join("perf-artifacts")
+        .join("queue-pause-claim-anti-join");
+    std::fs::create_dir_all(&out_dir).expect("create artifact output directory");
+
+    let mut summary_lines: Vec<String> = vec![format!("label={label}")];
+
+    // One EXPLAIN capture per published backlog depth -- shows the cost is
+    // driven by candidate rows scanned (loops=N), not a fixed per-call
+    // overhead, corroborating the mechanism claim rather than just the
+    // headline number.
+    for backlog in super::claim_bench_support::BACKLOG_SWEEP {
+        let scenario = Scenario {
+            backlog,
+            claimers: 1,
+            queues: 4,
+            gate: ClaimGate::Baseline,
+        };
+
+        let mut conn = db::connect(&bench.url).await;
+        let seeded = db::seed(&mut conn, scenario).await;
+
+        let queues = db::queue_names(scenario);
+        // Pause the first polled queue: representative of an operator holding
+        // one queue, and it lets this same capture demonstrate the exclusion
+        // is still correct (that queue's rows never appear in a real claim)
+        // alongside the buffer cost -- see
+        // `queue_pause_tests.rs::claim_query_excludes_paused_queues_end_to_end`
+        // for the dedicated, permanent proof of that.
+        diesel::sql_query(format!(
+            "INSERT INTO harvest_queue_pauses (queue_name, reason) VALUES ('{}', 'ledger-evidence-capture')",
+            queues[0],
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("seed one active pause");
+
+        let queue_list = queues
+            .iter()
+            .map(|q| format!("'{q}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let cb = db::circuit_breaker_set(scenario.gate);
+        let cb_list = cb
+            .iter()
+            .map(|a| format!("'{a}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let literals = [
+            format!("'{}-worker-0'", db::BENCH_PREFIX),
+            format!("ARRAY[{queue_list}]::text[]"),
+            format!("'{}'", db::worker_build_id(scenario.gate)),
+            "NULL".to_string(),
+            format!("ARRAY[{cb_list}]::text[]"),
+            "ARRAY[]::text[]".to_string(),
+        ];
+        assert!(
+            !raw.contains(&format!("${}", literals.len() + 1)),
+            "claim_task_query() grew a seventh bind; extend `literals` before \
+             this capture can be trusted",
+        );
+        let mut sql = raw.to_string();
+        for (i, literal) in literals.iter().enumerate().rev() {
+            sql = sql.replace(&format!("${}", i + 1), literal);
+        }
+
+        // `EXPLAIN ANALYZE` really executes the statement -- including the
+        // UPDATE CTEs -- so it runs inside a transaction that is rolled back;
+        // otherwise producing the plan would itself consume a task.
+        diesel::sql_query("BEGIN")
+            .execute(&mut conn)
+            .await
+            .expect("begin");
+        let loaded: Result<Vec<ExplainRow>, _> = diesel::sql_query(format!(
+            "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF) {sql}"
+        ))
+        .load(&mut conn)
+        .await;
+        diesel::sql_query("ROLLBACK")
+            .execute(&mut conn)
+            .await
+            .expect("rollback");
+
+        let plan_text = match loaded {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|r| r.query_plan)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(e) => format!("EXPLAIN failed: {e}"),
+        };
+
+        let file_name = format!("{label}-claim-backlog-{backlog}.explain.txt");
+        std::fs::write(
+            out_dir.join(&file_name),
+            format!(
+                "-- {label}: claim_task_query() @ backlog={backlog}, 4 queues, \
+                 one queue paused --\n{plan_text}\n"
+            ),
+        )
+        .expect("write explain artifact");
+        eprintln!("wrote {file_name}");
+
+        summary_lines.push(format!(
+            "backlog={backlog} queues={} seeded_rows={} claimable_rows={} paused_queue={}",
+            scenario.queues, seeded.seeded_rows, seeded.claimable_rows, queues[0],
+        ));
+    }
+
+    // A `pg_stat_statements` snapshot from the *real* `claim_task()` production
+    // function (not the literal-substituted EXPLAIN text above), so the
+    // committed snapshot reflects exactly the code path a live worker takes.
+    // Fresh connection + fresh seed at the published headline scale.
+    let mut stats_conn = db::connect(&bench.url).await;
+    let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+        .execute(&mut stats_conn)
+        .await;
+    let _ = diesel::sql_query("SELECT pg_stat_statements_reset()")
+        .execute(&mut stats_conn)
+        .await;
+
+    let headline = headline_scenario();
+    let seeded = db::seed(&mut stats_conn, headline).await;
+    let queues = db::queue_names(headline);
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_queue_pauses (queue_name, reason) VALUES ('{}', 'ledger-evidence-capture')",
+        queues[0],
+    ))
+    .execute(&mut stats_conn)
+    .await
+    .expect("seed one active pause for the stat snapshot");
+
+    // Drive the real claim path repeatedly so pg_stat_statements accumulates
+    // real, attributed `calls`/buffer counters for the production query text
+    // -- not just the single literal-substituted EXPLAIN above.
+    let mut claimed = 0usize;
+    let ceiling = seeded.claimable_rows + 10;
+    loop {
+        let result = autumn_harvest::queue::claim_task(
+            &mut stats_conn,
+            &queues,
+            "ledger-evidence-worker",
+            "",
+            None,
+            &[],
+            &[],
+        )
+        .await
+        .expect("claim_task must not error");
+        match result {
+            Some(_) => {
+                claimed += 1;
+                assert!(
+                    claimed <= ceiling,
+                    "claimed more rows than were seeded -- bug in the capture loop"
+                );
+            }
+            None => break,
+        }
+    }
+    eprintln!(
+        "stat-snapshot claim loop: claimed={claimed} of {} claimable",
+        seeded.claimable_rows
+    );
+
+    let stats_rows: Vec<StatRow> = diesel::sql_query(
+        "SELECT query, calls, shared_blks_hit, shared_blks_read, \
+                (shared_blks_hit + shared_blks_read) AS total_buffers \
+         FROM pg_stat_statements WHERE query ILIKE '%harvest_task_queue%' \
+         ORDER BY total_buffers DESC LIMIT 10",
+    )
+    .load(&mut stats_conn)
+    .await
+    .unwrap_or_default();
+
+    let stats_text = if stats_rows.is_empty() {
+        "pg_stat_statements unavailable or returned no rows".to_string()
+    } else {
+        stats_rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "calls={} shared_blks_hit={} shared_blks_read={} total_buffers={}\nquery={}\n",
+                    r.calls, r.shared_blks_hit, r.shared_blks_read, r.total_buffers, r.query,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    std::fs::write(
+        out_dir.join(format!("{label}-pg_stat_statements.txt")),
+        format!("-- {label}: pg_stat_statements @ headline scenario ({} backlog, real claim_task() calls) --\n{stats_text}\n", headline.backlog),
+    )
+    .expect("write pg_stat_statements artifact");
+
+    summary_lines.push(format!(
+        "stat_snapshot: backlog={} claimed={} paused_queue={}",
+        headline.backlog, claimed, queues[0],
+    ));
+    std::fs::write(
+        out_dir.join(format!("{label}-fixture-summary.txt")),
+        summary_lines.join("\n") + "\n",
+    )
+    .expect("write fixture summary");
+
+    eprintln!(
+        "== capture complete: label={label}, artifacts in {} ==",
+        out_dir.display()
+    );
+}
