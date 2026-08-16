@@ -4416,6 +4416,35 @@ fn codec_opaque_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option
     ))
 }
 
+/// Literal prefix shared by every opaque-payload marker key this module scans
+/// for: `OFFLOAD_ENVELOPE_KEY`, `ERASURE_TOMBSTONE_KEY`, `CODEC_ENVELOPE_KEY`,
+/// and `UNDECODABLE_MARKER_KEY` all start with `_harvest_`. A miss on this
+/// prefix proves none of the four discriminators is present anywhere in the
+/// fixture's raw text, so it lets the three per-family scans below share a
+/// single upfront reject instead of each re-scanning the whole document.
+const OPAQUE_PAYLOAD_MARKER_PREFIX: &str = "_harvest_";
+
+/// Combines `offloaded_fixture_reason`, `codec_opaque_fixture_reason`, and
+/// `erased_fixture_reason` behind one shared prefix scan. Every healthy
+/// fixture -- the overwhelming majority replayed by `verify_dir` -- carries
+/// none of the three families' marker keys, so `json.contains(...)` on the
+/// shared `_harvest_` prefix lets a single substring scan reject all three
+/// at once instead of three independent `.contains()` passes over the same
+/// text (`offloaded_fixture_reason` and `erased_fixture_reason` already
+/// short-circuit on their own single key; `codec_opaque_fixture_reason` on
+/// either of its two). A prefix hit still runs full per-family confirmation
+/// via the delegated calls below -- this function narrows only the common
+/// case, and defers to the exact same three functions (in the exact same
+/// order the direct-call chain used) for anything a prefix hit could mean.
+fn opaque_payload_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<String> {
+    if !json.contains(OPAQUE_PAYLOAD_MARKER_PREFIX) {
+        return None;
+    }
+    offloaded_fixture_reason(json, snapshot)
+        .or_else(|| codec_opaque_fixture_reason(json, snapshot))
+        .or_else(|| erased_fixture_reason(json, snapshot))
+}
+
 fn unreplayable_fixture_reason(
     guard: &FixtureGuardFields,
     mode: FixtureReplayMode,
@@ -4608,9 +4637,7 @@ async fn replay_fixture_file(
     // legacy export) parses to all-`None` and is treated as replayable.
     let guard: FixtureGuardFields = serde_json::from_str(&json).unwrap_or_default();
     if let Some(reason) = unreplayable_fixture_reason(&guard, mode)
-        .or_else(|| offloaded_fixture_reason(&json, &snapshot))
-        .or_else(|| codec_opaque_fixture_reason(&json, &snapshot))
-        .or_else(|| erased_fixture_reason(&json, &snapshot))
+        .or_else(|| opaque_payload_fixture_reason(&json, &snapshot))
     {
         return FixtureResult {
             path: path.to_owned(),
@@ -7109,5 +7136,145 @@ mod tests {
         let s = format!("{report}");
         assert!(s.contains("NonDeterminism"));
         assert!(s.contains("ActivityScheduleMismatch"));
+    }
+
+    // -----------------------------------------------------------------
+    // opaque_payload_fixture_reason — the invariant, the fast path, a
+    // prefix-present-without-a-real-marker false-positive guard, and a
+    // genuine erased-tombstone fixture routed through the wrapper.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn opaque_payload_marker_prefix_is_a_true_prefix_of_every_family() {
+        // The optimization's whole correctness rests on this: if any marker
+        // key stops starting with OPAQUE_PAYLOAD_MARKER_PREFIX, the upfront
+        // scan in opaque_payload_fixture_reason silently produces FALSE
+        // NEGATIVES for that family (a genuinely opaque fixture with no
+        // other "_harvest_" occurrence would short-circuit past the
+        // delegated per-family scan that would otherwise have caught it).
+        // Pin the precondition explicitly so a future rename of any of
+        // these four constants fails loudly here instead of silently
+        // degrading detection in production.
+        for key in [
+            crate::payload_store::OFFLOAD_ENVELOPE_KEY,
+            crate::erase::ERASURE_TOMBSTONE_KEY,
+            crate::payload_codec::CODEC_ENVELOPE_KEY,
+            crate::payload_codec::UNDECODABLE_MARKER_KEY,
+        ] {
+            assert!(
+                key.starts_with(OPAQUE_PAYLOAD_MARKER_PREFIX),
+                "{key:?} no longer starts with {OPAQUE_PAYLOAD_MARKER_PREFIX:?} -- \
+                 opaque_payload_fixture_reason's upfront scan must be updated \
+                 (or removed) or it will silently stop detecting this family"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_payload_fixture_reason_fast_path_on_healthy_fixture() {
+        let snapshot = HistorySnapshot {
+            workflow_name: "healthy_wf".to_string(),
+            execution_id: ExecutionId::new(),
+            events: vec![WorkflowEvent::WorkflowStarted {
+                input: serde_json::json!({"order_id": 42}),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+            context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
+            queue_name: None,
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            !json.contains(OPAQUE_PAYLOAD_MARKER_PREFIX),
+            "sanity: a healthy fixture must not accidentally contain the shared marker prefix"
+        );
+        assert_eq!(opaque_payload_fixture_reason(&json, &snapshot), None);
+    }
+
+    #[test]
+    fn opaque_payload_fixture_reason_prefix_hit_without_a_real_marker_falls_through_to_none() {
+        // A prefix hit must NOT short-circuit straight to `Some(...)`: it
+        // must still run the full per-family confirmation, exactly like
+        // calling offloaded_fixture_reason / codec_opaque_fixture_reason /
+        // erased_fixture_reason directly would. This fixture's `input`
+        // contains the FULL erasure-tombstone key text as an ordinary
+        // string value -- not as the key of a genuine tombstone object --
+        // so the shared prefix scan (and even erased_fixture_reason's own
+        // single-key fast-reject) both see a raw-text hit, and only the
+        // structured per-event walk can tell this apart from a real
+        // erasure.
+        let snapshot = HistorySnapshot {
+            workflow_name: "healthy_wf".to_string(),
+            execution_id: ExecutionId::new(),
+            events: vec![WorkflowEvent::WorkflowStarted {
+                input: serde_json::json!({
+                    "note": format!(
+                        "internal policy name {} is not a real tombstone",
+                        crate::erase::ERASURE_TOMBSTONE_KEY,
+                    ),
+                }),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+            context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
+            queue_name: None,
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            json.contains(crate::erase::ERASURE_TOMBSTONE_KEY),
+            "sanity: the fixture must actually trip the raw-text substring scan"
+        );
+        assert_eq!(
+            opaque_payload_fixture_reason(&json, &snapshot),
+            None,
+            "a bare textual mention of a marker key must not be mistaken for a real marker"
+        );
+    }
+
+    #[test]
+    fn opaque_payload_fixture_reason_detects_a_genuine_erased_tombstone() {
+        // The genuine-detection half of the wrapper: a real erasure
+        // tombstone (issue #495), built via the same canonical helper
+        // production erasure code uses, must still be caught after routing
+        // through the combined wrapper -- confirming the shared prefix scan
+        // doesn't accidentally reject what erased_fixture_reason alone
+        // would have caught.
+        let snapshot = HistorySnapshot {
+            workflow_name: "erased_wf".to_string(),
+            execution_id: ExecutionId::new(),
+            events: vec![WorkflowEvent::WorkflowStarted {
+                input: crate::erase::erasure_tombstone(),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+            context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
+            queue_name: None,
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let reason = opaque_payload_fixture_reason(&json, &snapshot).expect(
+            "a genuine erasure tombstone must still be detected through the combined wrapper",
+        );
+        assert!(
+            reason.contains("erased-payload tombstone"),
+            "the routed-through reason should be erased_fixture_reason's message, got: {reason:?}"
+        );
     }
 }
