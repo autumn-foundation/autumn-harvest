@@ -1951,12 +1951,38 @@ async fn zz_capture_queue_pause_claim_evidence() {
     // committed snapshot reflects exactly the code path a live worker takes.
     // Fresh connection + fresh seed at the published headline scale.
     let mut stats_conn = db::connect(&bench.url).await;
+    // A failure here is caught downstream: if the extension genuinely
+    // couldn't be created, the SELECT against `pg_stat_statements` below
+    // (guarded by its own `.expect(...)`) fails with "relation does not
+    // exist" -- so discarding this particular result does not let a broken
+    // capture pass.
     let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
         .execute(&mut stats_conn)
         .await;
-    let _ = diesel::sql_query("SELECT pg_stat_statements_reset()")
+    // Unlike the CREATE EXTENSION above, a failed reset here has NO
+    // downstream signal to catch it: `pg_stat_statements` is a per-cluster
+    // shared-memory table (only `CREATE EXTENSION` is per-database), so a
+    // stale, unreset entry from an EARLIER run of this exact harness -- every
+    // invocation creates a fresh `harvest_claim_bench_*` database with
+    // identical schema and literal query text -- would still be sitting
+    // there and could be picked up by the query below instead of (or mixed
+    // with) this run's real capture. `pg_stat_statements_reset()` with no
+    // arguments is restricted to superusers by default, so this is a real
+    // failure mode against an external HARVEST_TEST_DATABASE_URL role that
+    // isn't one -- propagate it rather than silently proceeding on
+    // unreliably-scoped statistics.
+    diesel::sql_query("SELECT pg_stat_statements_reset()")
         .execute(&mut stats_conn)
-        .await;
+        .await
+        .expect(
+            "pg_stat_statements_reset() failed -- without a clean reset, a \
+             stale entry from a prior run of this exact harness (same \
+             schema, same literal query text, different ephemeral database) \
+             could corrupt this capture's top-10-by-buffers ranking; the \
+             HARVEST_TEST_DATABASE_URL role must be able to reset cluster-wide \
+             statistics (superuser, or explicitly granted EXECUTE on this \
+             function)",
+        );
 
     let headline = headline_scenario();
     let seeded = db::seed(&mut stats_conn, headline).await;
@@ -2008,10 +2034,21 @@ async fn zz_capture_queue_pause_claim_evidence() {
     // from "ran fine, genuinely zero matching rows" -- see
     // `setup_container_bench_db` for how the Docker-fallback container is
     // configured to make this query actually succeed.
+    // Scoped to the CURRENT database's `dbid`, not just the query-text
+    // pattern: `pg_stat_statements` is per-cluster, and every database this
+    // harness ever creates shares the exact same schema and literal
+    // `claim_task_query()` text, so an unscoped match could otherwise pull
+    // in a stale row from a different (already-dropped) ephemeral bench
+    // database sharing this cluster -- belt-and-braces alongside the reset
+    // above, since the reset alone only protects against a PRIOR run of
+    // this same test, not concurrent runs against other databases on the
+    // same cluster.
     let stats_rows: Vec<StatRow> = diesel::sql_query(
         "SELECT query, calls, shared_blks_hit, shared_blks_read, \
                 (shared_blks_hit + shared_blks_read) AS total_buffers \
-         FROM pg_stat_statements WHERE query ILIKE '%harvest_task_queue%' \
+         FROM pg_stat_statements \
+         WHERE query ILIKE '%harvest_task_queue%' \
+           AND dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
          ORDER BY total_buffers DESC LIMIT 10",
     )
     .load(&mut stats_conn)
