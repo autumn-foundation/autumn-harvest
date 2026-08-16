@@ -7,7 +7,7 @@
 //! The API layer queries this table (per-shard) to surface fleet status to
 //! operators via the management HTTP routes.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1261,19 +1261,16 @@ pub async fn drain_preview(
 // Background heartbeat task
 // ---------------------------------------------------------------------------
 
-/// Spawn a background task that upserts worker heartbeats on a regular interval.
-///
-/// The task reads the current `in_flight_count` from the semaphores, then
-/// writes it to the database. If the worker row is missing (0 rows updated —
-/// e.g. because startup registration failed transiently), the task re-registers
-/// the worker automatically. It stops when `cancel` is triggered.
-#[must_use]
-#[allow(clippy::too_many_arguments)]
-// The shared applied-set uses the worker's own fixed hasher; no need to generalize.
-#[allow(clippy::implicit_hasher)]
 /// Execute one heartbeat DB tick: update `last_heartbeat_at`, handle
 /// re-registration / drain transitions, and refresh the drain deadline.
-async fn do_heartbeat_tick(
+///
+/// `#[doc(hidden)] pub` so the round-49 regression test can drive the real tick
+/// against a live database rather than a reimplementation of it — the defect it
+/// guards lives in this function's arm selection, so a test that recreated the
+/// arms would prove nothing.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn do_heartbeat_tick(
     conn: &mut AsyncPgConnection,
     registration: &WorkerRegistration,
     in_flight: i32,
@@ -1282,7 +1279,40 @@ async fn do_heartbeat_tick(
     drain_deadline_max: &Mutex<Option<DateTime<Utc>>>,
     remote_drain_deadline: &Mutex<Option<std::time::Instant>>,
     in_use_sessions: i32,
+    registration_pending: &AtomicBool,
 ) {
+    // Retry a startup registration that failed and rolled the atomic pair back,
+    // BEFORE the heartbeat below observes a row (issue #804, Codex round-49 P1).
+    // The `Ok(0)` arm heals the absent-row case, but a reused `worker_id` leaves
+    // the PREVIOUS row alive, so the heartbeat succeeds, returns `Ok(1)`, and
+    // that arm is never reached — leaving this worker advertising the old
+    // build's `build_id`/queues while its id stays in `capability_miss_workers`
+    // as affirmative fleet evidence against itself.
+    //
+    // `register_worker_and_clear_stale_miss_evidence` upserts, so this is
+    // correct whether or not a row survives. The flag is cleared only on
+    // success, so a still-failing database is retried on the next tick rather
+    // than silently given up on; a worker that registered cleanly at startup
+    // never enters this branch and its tick is byte-for-byte unchanged.
+    if registration_pending.load(Ordering::Relaxed) && !worker_shutdown.is_cancelled() {
+        match register_worker_and_clear_stale_miss_evidence(conn, registration).await {
+            Ok(cleared) => {
+                registration_pending.store(false, Ordering::Relaxed);
+                tracing::info!(
+                    worker_id = %registration.worker_id,
+                    cleared_capability_miss_evidence = cleared,
+                    "startup registration retried successfully on heartbeat"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    worker_id = %registration.worker_id,
+                    error = %error,
+                    "startup registration retry failed; will retry on the next heartbeat"
+                );
+            }
+        }
+    }
     match heartbeat_worker(
         conn,
         &registration.worker_id,
@@ -1378,7 +1408,16 @@ async fn do_heartbeat_tick(
     }
 }
 
+/// Spawn a background task that upserts worker heartbeats on a regular interval.
+///
+/// The task reads the current `in_flight_count` from the semaphores, then
+/// writes it to the database. If the worker row is missing (0 rows updated —
+/// e.g. because startup registration failed transiently), the task re-registers
+/// the worker automatically. It stops when `cancel` is triggered.
+#[must_use]
 #[allow(clippy::too_many_arguments)]
+// The shared applied-set uses the worker's own fixed hasher; no need to generalize.
+#[allow(clippy::implicit_hasher)]
 pub fn spawn_worker_heartbeat(
     pool: DbPool,
     registration: WorkerRegistration,
@@ -1404,6 +1443,16 @@ pub fn spawn_worker_heartbeat(
     // — previously always written as a literal `0` — reflects this worker's
     // actual live session count.
     session_slots_in_use: crate::sessions::SessionSlotRegistry,
+    // Set by startup when the atomic register+invalidate pair failed and rolled
+    // back (issue #804, Codex round-49 P1). The `Ok(0)` arm below already heals
+    // that when the row is ABSENT, but a reused `worker_id` — a configured
+    // stable id such as a pod name, not the random default — leaves the PREVIOUS
+    // row alive, so `heartbeat_worker` updates it, returns `Ok(1)`, and the pair
+    // is never retried. This worker would then poll indefinitely while the
+    // registry advertises the old build's `build_id`/queues and its id remains
+    // in `capability_miss_workers`, letting a peer read the live fleet as
+    // `AllLiveWorkersMissed` and terminally fail a task this worker can run.
+    registration_pending: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
@@ -1437,6 +1486,7 @@ pub fn spawn_worker_heartbeat(
                         &drain_deadline_max,
                         &remote_drain_deadline,
                         in_use_sessions,
+                        &registration_pending,
                     )
                     .await;
                 }

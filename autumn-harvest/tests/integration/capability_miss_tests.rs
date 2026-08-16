@@ -2759,6 +2759,167 @@ async fn a_failed_evidence_cleanup_rolls_back_the_registration() {
     );
 }
 
+/// Dedicated queue for the round-49 reused-`worker_id` test, so seeding a row
+/// that advertises it cannot perturb an adjacent test's fleet evidence.
+const Q_REUSED_ID: &str = "q804-reused-id";
+/// The pod name reused across the two instances — a *configured stable* id,
+/// which is what makes the old row survive at all.
+const REUSED_WORKER_ID: &str = "pod-reused";
+/// What the surviving row advertises, and what the new instance is running.
+const OLD_BUILD: &str = "build-old-804r49";
+const NEW_BUILD: &str = "build-new-804r49";
+
+/// Drive one real heartbeat tick with everything but the pending flag fixed.
+async fn tick_once(
+    conn: &mut AsyncPgConnection,
+    registration: &autumn_harvest::workers::WorkerRegistration,
+    registration_pending: &std::sync::atomic::AtomicBool,
+) {
+    autumn_harvest::workers::do_heartbeat_tick(
+        conn,
+        registration,
+        0,
+        &serde_json::json!({}),
+        &tokio_util::sync::CancellationToken::new(),
+        &Mutex::new(None),
+        &Mutex::new(None),
+        0,
+        registration_pending,
+    )
+    .await;
+}
+
+/// Does the task still carry this worker's capability-miss evidence?
+async fn evidence_names_worker(url: &str, exec_id: ExecutionId, worker_id: &str) -> bool {
+    load_tasks(url, exec_id).await[0]
+        .capability_miss_workers
+        .iter()
+        .any(|w| w == worker_id)
+}
+
+/// A failed startup registration is retried on the next heartbeat even when a
+/// PREVIOUS row for the same `worker_id` survived (issue #804, Codex round-49
+/// P1).
+///
+/// [`autumn_harvest::workers::do_heartbeat_tick`] already heals an **absent**
+/// row through its `Ok(0)` re-registration arm. But a reused `worker_id` — a
+/// *configured stable* id such as a pod name or hostname, not the random UUID
+/// default — leaves the OLD row alive when the atomic register+invalidate pair
+/// rolls back. `heartbeat_worker` then updates that surviving row, returns
+/// `Ok(1)`, and the `Ok(0)` arm is never reached.
+///
+/// The harm is the exact false terminal failure issue #804 exists to prevent:
+/// the worker polls indefinitely while the registry advertises the OLD build's
+/// `build_id`/queues *and* its id stays in `capability_miss_workers` as
+/// affirmative fleet evidence against itself, so a peer reads the live fleet as
+/// [`autumn_harvest::worker::FleetCapabilityEvidence::AllLiveWorkersMissed`] and
+/// terminally fails a task this worker can run.
+///
+/// This drives the **real** tick rather than a reimplementation of it, because
+/// the defect is in that function's arm selection — recreating the arms would
+/// prove nothing. The control leg runs the identical tick with the flag CLEAR
+/// (exactly the pre-fix behaviour) and asserts the stale state survives, so the
+/// test fails against the unfixed function rather than passing vacuously.
+#[tokio::test]
+async fn a_surviving_old_row_still_retries_the_failed_startup_registration() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    let worker_id = REUSED_WORKER_ID;
+
+    // The row that survived the rolled-back registration: same pod name, same
+    // queue, the PREVIOUS build.
+    diesel::sql_query(
+        "INSERT INTO harvest_workers \
+         (worker_id, started_at, last_heartbeat_at, queues, shard_assignments, \
+          max_concurrency, in_flight_count, host, status, build_id, labels) \
+         VALUES ($1, NOW(), NOW(), $2::jsonb, '[]'::jsonb, 4, 0, 'test-host', 'Active', $3, '{}'::jsonb) \
+         ON CONFLICT (worker_id) DO UPDATE SET build_id = EXCLUDED.build_id",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .bind::<diesel::sql_types::Text, _>(format!("[\"{Q_REUSED_ID}\"]"))
+    .bind::<diesel::sql_types::Text, _>(OLD_BUILD)
+    .execute(&mut conn)
+    .await
+    .expect("seed the surviving old worker row");
+
+    // A task on that queue carrying this id's stale capability-miss evidence.
+    let exec_id = seed_execution(&mut conn, "reused_id_wf", serde_json::json!({})).await;
+    let mut params = EnqueueParams::new(Q_REUSED_ID, TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue the evidence-carrying task");
+    seed_prior_missing_workers(&url, exec_id, &[worker_id], "reused_id_wf").await;
+
+    let registration = autumn_harvest::workers::WorkerRegistration {
+        worker_id: worker_id.to_string(),
+        queues: vec![Q_REUSED_ID.to_string()],
+        shard_assignments: vec![0],
+        max_concurrency: 1,
+        host: "test-host".to_string(),
+        version: None,
+        build_id: NEW_BUILD.to_string(),
+        deployment_name: None,
+        labels: HashMap::new(),
+        max_concurrent_sessions: 0,
+    };
+
+    // --- Control: flag CLEAR is the pre-fix arm selection. The surviving row
+    //     makes `heartbeat_worker` return `Ok(1)`, so nothing is re-registered.
+    let not_pending = AtomicBool::new(false);
+    tick_once(&mut conn, &registration, &not_pending).await;
+
+    assert_eq!(
+        live_build_id(&url, worker_id).await,
+        OLD_BUILD,
+        "control: a plain heartbeat over a surviving row must not re-register, \
+         which is precisely why the `Ok(0)` arm alone cannot heal a reused id"
+    );
+    assert!(
+        evidence_names_worker(&url, exec_id, worker_id).await,
+        "control: without the retry the stale evidence survives, so this id is \
+         still affirmative fleet evidence against itself"
+    );
+
+    // --- Fix: the flag records that startup's atomic pair rolled back, so the
+    //     tick retries it before the heartbeat can mask the absence.
+    let pending = AtomicBool::new(true);
+    tick_once(&mut conn, &registration, &pending).await;
+
+    assert_eq!(
+        live_build_id(&url, worker_id).await,
+        NEW_BUILD,
+        "the retried registration must publish the build this worker is actually \
+         running, not the one whose row happened to survive"
+    );
+    assert!(
+        !evidence_names_worker(&url, exec_id, worker_id).await,
+        "the retry must carry its evidence invalidation with it -- publishing the \
+         new build while the stale miss survives is the `AllLiveWorkersMissed` \
+         false terminal this pair exists to prevent"
+    );
+    // Fully qualified: `diesel::prelude::*` puts a blanket `RunQueryDsl::load`
+    // in scope, which shadows the inherent atomic `load` by method resolution.
+    assert!(
+        !AtomicBool::load(&pending, Ordering::Relaxed),
+        "a successful retry must clear the flag so later ticks are unchanged"
+    );
+}
+
+/// The `build_id` `harvest_workers` currently advertises for `worker_id`.
+async fn live_build_id(url: &str, worker_id: &str) -> String {
+    let mut conn = connect(url).await;
+    harvest_workers::table
+        .find(worker_id)
+        .select(harvest_workers::build_id)
+        .first(&mut conn)
+        .await
+        .expect("read advertised build_id")
+}
+
 // ---------------------------------------------------------------------------
 // Session hard-pin carve-out (#606) — release is impossible, so escalate now.
 // ---------------------------------------------------------------------------

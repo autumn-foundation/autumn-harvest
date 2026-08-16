@@ -18293,6 +18293,20 @@ pub struct Worker {
     /// Total permits behind `activity_semaphore` (issue #548). See
     /// `workflow_permit_total`.
     activity_permit_total: usize,
+    /// Set when the startup registration's atomic register+invalidate pair
+    /// failed and rolled back, so the heartbeat retries it (issue #804, Codex
+    /// round-49 P1).
+    ///
+    /// The heartbeat's own `Ok(0)` re-registration only fires when the
+    /// `harvest_workers` row is ABSENT. A reused `worker_id` — a configured
+    /// stable id such as a pod name, not the random default — leaves the
+    /// PREVIOUS row alive, so the heartbeat updates it, returns `Ok(1)`, and
+    /// that arm is never reached. Without this flag the worker would poll
+    /// indefinitely while the registry advertised the old build's
+    /// `build_id`/queues and its id remained in `capability_miss_workers`,
+    /// letting a peer read the live fleet as `AllLiveWorkersMissed` and
+    /// terminally fail a task this worker can actually run.
+    registration_pending: Arc<std::sync::atomic::AtomicBool>,
     /// Longest claim-to-dispatch permit-wait observed since the slot tuner's
     /// last tick, in microseconds (issue #548). `None` when no tuner is
     /// configured, so the hot dispatch path performs no extra work in the
@@ -19032,6 +19046,7 @@ impl Worker {
             activity_semaphore: activity_parts.semaphore,
             workflow_permit_total: workflow_parts.permit_total,
             activity_permit_total: activity_parts.permit_total,
+            registration_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             workflow_permit_wait_micros: workflow_parts.permit_wait_micros,
             activity_permit_wait_micros: activity_parts.permit_wait_micros,
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
@@ -20176,6 +20191,7 @@ impl Worker {
             Arc::clone(&self.remote_drain_deadline),
             Arc::clone(&self.drain_deadline_max),
             Arc::clone(&self.session_slots_in_use),
+            Arc::clone(&self.registration_pending),
         )
     }
 
@@ -20421,6 +20437,14 @@ impl Worker {
                         );
                     }
                     Err(error) => {
+                        // Arm the heartbeat retry. Necessary because the
+                        // heartbeat's own `Ok(0)` re-registration only fires
+                        // when the row is ABSENT: a reused `worker_id` leaves
+                        // the previous row alive, the heartbeat updates it, and
+                        // without this flag the atomic pair would never be
+                        // retried (issue #804, Codex round-49 P1).
+                        self.registration_pending
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!(
                             worker_id = %self.config.worker_id,
                             error = %error,

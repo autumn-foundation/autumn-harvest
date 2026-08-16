@@ -184,6 +184,11 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = "1"
 tempfile = "3"
+# Already a normal dependency at the same version (the heartbeat task takes a
+# `CancellationToken`), so this unifies rather than widening the graph. Declared
+# here because a `[dependencies]` entry is not visible to integration test
+# binaries, and the round-49 regression test drives the real `do_heartbeat_tick`.
+tokio-util = { version = "0.7", features = ["rt"] }
 schemars = { version = "0.8" }
 # Assemble `.wat` text into `.wasm` bytes in the `wasm-activities` integration
 # tests. Already a (feature-gated) dependency of the crate; a plain dev-dep here

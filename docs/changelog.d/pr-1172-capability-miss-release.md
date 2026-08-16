@@ -1963,3 +1963,48 @@ had just written it into — and pinned by
 which bans the wrong construction across `worker.rs`, `builder.rs` and both
 runbooks. A single-source rustdoc is evidently not a safe thing to propagate
 from; the pin is what makes the four surfaces agree by construction.
+
+## Review round 49
+
+**A failed startup registration was retried only when the worker's row was
+absent, so a reused `worker_id` never healed.**
+
+`Worker::run` registers through the atomic register+invalidate pair, and a
+failure rolls both back (round 28) — leaving the worker unpublished *and* its
+stale capability-miss evidence intact. `do_heartbeat_tick` is meant to heal
+that, and does: `heartbeat_worker` returns `Ok(0)` when the row is missing, and
+that arm re-registers.
+
+But `Ok(0)` only fires when the row is genuinely absent. A **reused**
+`worker_id` — a configured stable id such as a pod name or hostname, not the
+random UUID default — leaves the PREVIOUS instance's row alive. The heartbeat
+updates that row, returns `Ok(1)`, and the re-registration arm is never reached.
+The worker then polls indefinitely while the registry advertises the *old*
+build's `build_id` and queues, and its id stays in `capability_miss_workers`.
+
+That is affirmative fleet evidence against itself. A peer reading the live fleet
+derives `AllLiveWorkersMissed` and terminally fails a task this worker can
+actually run — the precise outcome issue #804 exists to prevent, arriving at the
+moment the capable build did.
+
+Fixed by tracking the failure rather than inferring it: `Worker` carries a
+`registration_pending` flag set when startup's pair rolls back, and
+`do_heartbeat_tick` retries the pair *before* the heartbeat can mask the
+absence. `register_worker_and_clear_stale_miss_evidence` upserts, so the retry
+is correct whether or not a row survives; the flag clears only on success, so a
+still-failing database is retried next tick rather than given up on. A worker
+that registered cleanly never enters the branch and its tick is unchanged.
+
+`do_heartbeat_tick` is now `#[doc(hidden)] pub` so the regression test drives
+the real tick: the defect is in this function's arm selection, so a test that
+reimplemented the arms would prove nothing. The test's control leg runs the
+identical tick with the flag clear — exactly the pre-fix path — and asserts the
+stale state survives, so it fails against the unfixed function rather than
+passing vacuously (verified: `left: "build-old-804r49"`, `right:
+"build-new-804r49"`).
+
+Making the function public also surfaced a pre-existing attribute misplacement:
+`spawn_worker_heartbeat`'s doc comment, `#[must_use]` and
+`#[allow(clippy::implicit_hasher)]` had drifted onto `do_heartbeat_tick`, which
+was harmless while it was private but emitted an `unused_must_use` warning at
+every new call site. Moved back to the function they describe.
