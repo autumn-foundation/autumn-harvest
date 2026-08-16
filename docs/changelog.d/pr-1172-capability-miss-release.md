@@ -1840,3 +1840,50 @@ takes the workflow its misses are about, which is what keeps the eight
 escalation tests it feeds honest: seeding evidence without its handler would
 read as a fresh budget and every escalation they assert would silently become a
 release.
+
+## Review round 47 — two documentation-vs-behavior corrections
+
+**(a) The escalation prose still made the unconditional fleet claim.** Round 43
+corrected the alert rule and round 44 the metric-label constant, but the alerts
+runbook's *overview* paragraph and the dashboard panel description both still
+said `outcome="escalated"` means "no live worker on that queue registers the
+handler at all". That is true only for the `BudgetExhausted` bound with
+confirmed coverage. The absolute release ceiling fires under
+`CapablePeerMayExist` / `Unavailable` — precisely when a live, untried worker
+may well be capable — so the unconditional form sends on-call toward a
+missing-deploy investigation when the actual next step is to check that worker.
+
+Both now state the outcome (executions are being failed) and direct the reader
+to the `no_capable_worker:` reason string before drawing any fleet conclusion,
+pointing at the cause table that tells the two bounds apart. The `never_offered`
+section's contrast sentence was corrected the same way — it asserted the budget
+bound is "real evidence" unconditionally, where only the confirmed-coverage case
+is.
+
+**(b) The effective-config field named a DLQ destination that does not exist.**
+`capability_miss_max_redeliveries`'s rustdoc described escalation as reaching the
+"terminal-failure / DLQ path". It does not: `escalate_capability_miss` routes
+through `fail_task_and_execution_with_history`, which fails the task and the
+execution without inserting a `harvest_dead_letters` row — the property the DB
+test `capability_miss_escalates_after_the_budget_with_no_capable_worker` has
+asserted since the first round ("escalation must not dead-letter; the reason
+lives on the execution row"). An operator consulting `GET /admin/config` while
+diagnosing an exhausted budget would have been sent to an empty recovery
+surface. The field now rules the DLQ out **positively** rather than merely
+omitting it, because the neighbouring poison-pill knob really does quarantine
+(#367) and silence would invite the reader to assume this one behaves the same.
+
+**Anti-drift.** This is the third round in which the same cause-neutrality claim
+survived in a surface the previous round did not touch, so both fixes are pinned
+across their whole operator-reachable surface rather than at the site that
+happened to be flagged: `capability_miss_escalation_prose_is_cause_neutral`
+checks the runbook *and* the dashboard (an on-call engineer reads whichever one
+their tooling put in front of them), and requires each to name the reason string
+as the discriminator — silence would let a reader who never reaches the cause
+table keep the old default conclusion.
+`capability_miss_escalation_is_never_documented_as_dead_lettering` bans the
+DLQ-as-*destination* constructions rather than the token, since the corrected doc
+legitimately mentions the DLQ in order to rule it out and a bare substring check
+cannot tell a negation from a claim. Both were confirmed falsifiable by
+reverting each doc to its pre-fix wording and watching the corresponding pin
+fail.

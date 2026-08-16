@@ -679,6 +679,117 @@ fn capability_miss_escalated_label_docs_are_cause_neutral() {
     );
 }
 
+/// The **operator-facing prose** must be cause-neutral too (issue #804, Codex
+/// round-47 P2).
+///
+/// Round 43 corrected the alert rule, round 44 the metric-label constant, and
+/// round 47 the runbook overview and the dashboard panel — three rounds of the
+/// same claim surviving in a surface the previous round did not touch. So this
+/// pins ALL of the operator-reachable prose at once: an on-call engineer reads
+/// whichever one their tooling put in front of them, and repairing one while
+/// leaving another still sends them toward a missing-deploy investigation when
+/// the real cause is an untried worker.
+///
+/// The claim is only false for the `ReleaseCeilingExhausted` bound, which fires
+/// under `CapablePeerMayExist` / `Unavailable` — where a live, untried worker
+/// may well be capable. `BudgetExhausted` with confirmed coverage does support
+/// it, which is why the fix is to *condition* the claim rather than delete it.
+#[test]
+fn capability_miss_escalation_prose_is_cause_neutral() {
+    let runbook = fs::read_to_string(workspace_path("docs/runbooks/harvest-alerts.md"))
+        .expect("failed to read the alerts runbook");
+    let dashboard = fs::read_to_string(workspace_path("docs/dashboards/starter-pack-v0.1.0.json"))
+        .expect("failed to read the dashboard pack");
+
+    for (surface, text) in [("runbook", &runbook), ("dashboard", &dashboard)] {
+        // The exact unconditional forms rounds 43/44/47 each had to remove.
+        for banned in [
+            "Escalation means **no live worker on that queue
+registers the handler at all**",
+            "the redelivery budget was exhausted: NO live worker on that queue registers the handler",
+        ] {
+            assert!(
+                !text.contains(banned),
+                "{surface}: `outcome=\"escalated\"` is recorded by two bounds with different \
+                 evidential strength, so it must not assert fleet exhaustion unconditionally. \
+                 Condition it on the bound (the reason string names which) rather than \
+                 restoring: {banned}"
+            );
+        }
+        // And it must actively point the reader at the discriminator, or a
+        // reader who never reaches the cause table draws the old conclusion by
+        // default.
+        assert!(
+            text.contains("reason") && (text.contains("bound") || text.contains("cause table")),
+            "{surface}: the escalation prose must direct the operator to the \
+             `no_capable_worker:` reason string before they conclude anything about the fleet"
+        );
+    }
+}
+
+/// The escalation writes **no** dead-letter row, and no doc may say otherwise
+/// (issue #804, Codex round-47 P2).
+///
+/// `escalate_capability_miss` routes through `fail_task_and_execution_with_history`,
+/// which fails the task and the execution without inserting into
+/// `harvest_dead_letters` — asserted end to end by the DB test
+/// `capability_miss_escalates_after_the_budget_with_no_capable_worker`. Naming a
+/// DLQ destination anywhere sends an operator to an empty recovery surface
+/// during exactly the incident this feature exists to make legible.
+#[test]
+fn capability_miss_escalation_is_never_documented_as_dead_lettering() {
+    let config =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/effective_config.rs"))
+            .expect("failed to read src/effective_config.rs");
+    let doc = rustdoc_above_field(&config, "capability_miss_max_redeliveries");
+    // Ban the DESTINATION constructions, not the token: this doc legitimately
+    // mentions the DLQ in order to rule it out, and a bare `contains("dlq")`
+    // cannot tell a negation from a claim.
+    for banned in [
+        "/ DLQ path",
+        "DLQ path",
+        "to the DLQ with",
+        "dead-letter path",
+    ] {
+        assert!(
+            !doc.contains(banned),
+            "the capability-miss escalation writes no `harvest_dead_letters` row \
+             (`fail_task_and_execution_with_history` inserts none), so this field must \
+             not name a DLQ destination -- it would send an operator to an empty \
+             recovery surface mid-incident. Found {banned:?} in: {doc}"
+        );
+    }
+    // And it must rule the DLQ out POSITIVELY. Silence is not enough: an
+    // operator who has just read the poison-pill knob (which really does
+    // quarantine, #367) will otherwise assume this one behaves the same way.
+    assert!(
+        doc.contains("No dead-letter row is written"),
+        "the field must state outright that no dead-letter row is written, so an \
+         operator diagnosing an exhausted budget queries failed workflows: {doc}"
+    );
+}
+
+/// Reads the contiguous `///` block immediately above a named `pub` struct
+/// field. Walks BACKWARD like [`rustdoc_above_const`], for the same reason.
+fn rustdoc_above_field(source: &str, field: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let decl = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with(&format!("pub {field}:")))
+        .unwrap_or_else(|| panic!("`pub {field}` must exist in the scanned source"));
+    let mut doc: Vec<&str> = Vec::new();
+    for line in lines[..decl].iter().rev() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("///") {
+            break;
+        }
+        doc.push(trimmed.trim_start_matches("///").trim());
+    }
+    assert!(!doc.is_empty(), "`{field}` must carry a rustdoc block");
+    doc.reverse();
+    doc.join(" ")
+}
+
 /// Reads the contiguous `///` block immediately above a `pub const` in
 /// `src/telemetry.rs`.
 ///

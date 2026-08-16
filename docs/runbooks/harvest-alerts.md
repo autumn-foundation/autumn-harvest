@@ -2037,8 +2037,14 @@ exponential, 1 s doubling to 30 s) and records the releasing worker in the
 task's **distinct-miss set**; once that set would exceed
 `WorkerConfig::capability_miss_max_redeliveries` (default **5**) the task falls
 through to the normal terminal-failure path with a stable, greppable
-`no_capable_worker:` reason. Escalation means **no live worker on that queue
-registers the handler at all** — executions are being failed.
+`no_capable_worker:` reason. Escalation means **executions are being failed**,
+and the reason string on the execution row names *why* — read it before drawing
+any conclusion about the fleet. Only one of the two bounds that reach this
+outcome supports "no live worker here has the handler"; the other trips when
+coverage could not be confirmed at all, and a live, untried worker may well be
+capable. The cause table in triage step 4 below tells them apart. No dead-letter
+row is written on this path — the reason lives on the failed execution, so
+diagnose from `GET /api/harvest/workflows?state=FAILED`, not from the DLQ.
 
 The budget counts *distinct* workers, not total releases, precisely so that one
 incapable pod repeatedly winning the claim race cannot page you while a capable
@@ -2274,10 +2280,11 @@ offering it to a peer.** This is the ticket-severity sibling of
 that carry the *opposite* conclusion. Read that section first for the mechanism.
 
 Normally a capability miss is released back to `PENDING` for a capable peer, and
-escalation only happens after the per-task redelivery budget is spent — which is
-real evidence that no live worker on that queue registers the handler. **This
-rule fires when the task was released zero times**, so that conclusion is not
-supported: a capable worker may be live and idle on the queue the entire time.
+escalation only happens after the per-task redelivery budget is spent — which,
+*when the registry confirmed the missers cover the live fleet*, is real evidence
+that no live worker on that queue registers the handler. **This rule fires when
+the task was released zero times**, so not even that much is available: a capable
+worker may be live and idle on the queue the entire time.
 
 Two causes reach it, and the `no_capable_worker:` reason on the execution row
 names which:
