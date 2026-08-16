@@ -3155,12 +3155,23 @@ pub struct WorkerConfig {
     /// queue name advertised) falls back to bounding on `N` alone, with the
     /// escalation reason saying so rather than claiming a fleet conclusion.
     ///
-    /// A secondary absolute ceiling of `10 ×` this value on *total* releases is
-    /// **ungated**, and terminates what the gated bound cannot: a fleet smaller
-    /// than the budget (where the distinct set can never grow far enough), and
-    /// a live worker that never claims. It reports the counts it actually
-    /// observed rather than a fleet-wide conclusion, and the sustained-release
-    /// alert fires long before it.
+    /// A *second* bound on **total** releases keeps `N` a real maximum for the
+    /// common small deployment. Once the registry confirms every live worker on
+    /// the queue has already missed the task, the distinct set cannot grow, so
+    /// with a fleet smaller than the budget the distinct bound is unreachable —
+    /// one incapable worker pins `distinct_after` at 1 forever. This bound
+    /// therefore escalates at `N` total releases, but only on that same
+    /// fleet-covering evidence: on evidence the registry cannot supply it would
+    /// let a single worker exhaust the budget by winning the claim race
+    /// repeatedly, which is exactly what the distinct count exists to prevent.
+    ///
+    /// Only a third, **ungated** absolute ceiling of `10 ×` this value remains
+    /// for the cases neither gated bound can reach: a fleet the registry cannot
+    /// describe at all, and a live worker that never claims (which keeps the
+    /// evidence at "a capable peer may exist" and withholds *both* gated
+    /// bounds). It reports the counts it actually observed rather than a
+    /// fleet-wide conclusion, and the sustained-release alert fires long before
+    /// it.
     ///
     /// Both the set and the total are reset by every path that proves the
     /// claiming worker *was* capable, so they measure **consecutive** misses —

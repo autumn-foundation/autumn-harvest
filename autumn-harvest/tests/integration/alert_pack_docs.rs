@@ -435,6 +435,36 @@ fn scanner_stalled_retention_expression_cannot_fire_during_the_startup_hour() {
     );
 }
 
+/// Shared accessor for the capability-miss alert-shape pins below.
+///
+/// Hoisted out of the test body when the pin was split in two (issue #804,
+/// review round 41) so both halves read the same rule set through the same
+/// severity check, rather than duplicating the closure.
+fn capability_miss_rule_exprs(id: &str) -> Vec<String> {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+    let rule = rules
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some(id))
+        .unwrap_or_else(|| panic!("{id} alert must exist"));
+    assert_eq!(
+        rule["severity"].as_str(),
+        Some(if id == "harvest_no_capable_worker" {
+            "page"
+        } else {
+            "ticket"
+        }),
+        "{id} severity is load-bearing for this pin"
+    );
+    rule["prometheus"]["expressions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{id} must carry PromQL expressions"))
+        .iter()
+        .filter_map(|expr| expr["expr"].as_str())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 /// Issue #804, Codex review: the capability-miss counter is deliberately
 /// two-outcome. `outcome="escalated"` means a task exhausted its redelivery
 /// budget and an execution was FAILED — that is the page. `outcome="released"`
@@ -456,34 +486,8 @@ fn scanner_stalled_retention_expression_cannot_fire_during_the_startup_hour() {
 /// reintroduce a rule that pages on every deploy.
 #[test]
 fn capability_miss_released_outcome_never_pages() {
-    let pack = read_pack();
-    let rules = pack["rules"].as_array().expect("rules must be an array");
-
-    let rule_exprs = |id: &str| -> Vec<String> {
-        let rule = rules
-            .iter()
-            .find(|rule| rule["id"].as_str() == Some(id))
-            .unwrap_or_else(|| panic!("{id} alert must exist"));
-        assert_eq!(
-            rule["severity"].as_str(),
-            Some(if id == "harvest_no_capable_worker" {
-                "page"
-            } else {
-                "ticket"
-            }),
-            "{id} severity is load-bearing for this pin"
-        );
-        rule["prometheus"]["expressions"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{id} must carry PromQL expressions"))
-            .iter()
-            .filter_map(|expr| expr["expr"].as_str())
-            .map(ToOwned::to_owned)
-            .collect()
-    };
-
     // Half 1: the PAGING rule must carry no `released` expression at all.
-    let paging = rule_exprs("harvest_no_capable_worker");
+    let paging = capability_miss_rule_exprs("harvest_no_capable_worker");
     assert!(
         paging.iter().all(|expr| !expr.contains("released")),
         "the page-severity capability-miss rule must not select outcome=\"released\" -- a single \
@@ -526,7 +530,7 @@ fn capability_miss_released_outcome_never_pages() {
 
     // Half 1c: ...but the never-offered escalations must not be SILENT either --
     // they fail executions. They get their own ticket-severity rule.
-    let never_offered = rule_exprs("harvest_capability_miss_never_offered");
+    let never_offered = capability_miss_rule_exprs("harvest_capability_miss_never_offered");
     assert!(
         never_offered
             .iter()
@@ -540,9 +544,19 @@ fn capability_miss_released_outcome_never_pages() {
         "...and must not double-count the budget-exhausted escalations the \
          paging rule already owns: {never_offered:?}"
     );
+}
 
+/// Half 2 of the capability-miss alert-shape pin (issue #804).
+///
+/// Split from [`capability_miss_released_outcome_never_pages`] along the seam
+/// its doc already describes: half 1 pins WHICH outcomes may page, this pins
+/// that the released-outcome rule HOLDS rather than firing on a single sample.
+/// They are independent properties over different rules, so a failure in one
+/// should not mask the other.
+#[test]
+fn capability_miss_release_sustained_rule_holds_for_a_full_window() {
     // Half 2: the sustained-release rule must hold, not fire on a single sample.
-    let sustained = rule_exprs("harvest_capability_miss_release_sustained");
+    let sustained = capability_miss_rule_exprs("harvest_capability_miss_release_sustained");
     let expr = sustained
         .first()
         .expect("the sustained-release rule must carry an expression");
@@ -551,10 +565,13 @@ fn capability_miss_released_outcome_never_pages() {
         "the sustained-release rule must select the released outcome: {expr}"
     );
     assert!(
-        expr.contains("min_over_time(") && expr.contains("[15m:"),
-        "the hold must live in the expression (the pack schema has no `for:` field): a subquery \
-         asserting the rate was non-zero at EVERY step is what distinguishes `still skewed` from \
-         `one release happened`: {expr}"
+        expr.contains("min_over_time(") && expr.contains(":1m]"),
+        "the hold must live in the expression (the pack schema has no `for:` field): a \
+         `min_over_time` over a SUBQUERY -- asserting the rate was non-zero at EVERY step -- \
+         is what distinguishes `still skewed` from `one release happened`. The `:1m]` step is \
+         what makes it a subquery rather than a plain range vector (`min_over_time(x[15m])` \
+         would take the min over raw samples, not over per-step rates); the window LENGTH is \
+         pinned separately in Half 2c: {expr}"
     );
     assert!(
         !expr.contains("increase("),
@@ -578,12 +595,43 @@ fn capability_miss_released_outcome_never_pages() {
         expr.contains("count_over_time("),
         "min_over_time over a subquery silently ignores steps with no sample, so a \
          newly-created series can satisfy it in minutes; the expression must also \
-         require a full 15m of samples (count_over_time(...) >= 15): {expr}"
+         require the window to be present (count_over_time(...)): {expr}"
+    );
+    // Half 2c: the presence guard must actually deliver 15 minutes, and must
+    // stay satisfiable at every evaluation offset (issue #804, Codex round-41).
+    //
+    // Prometheus aligns a subquery's steps to absolute multiples of the
+    // resolution, so `expr[Rm:1m]` yields `R` or `R + 1` points depending on
+    // whether the evaluation instant happens to land on a minute boundary. Two
+    // consequences, and they pull in opposite directions:
+    //
+    //   * `[15m:1m] >= 15` is satisfiable by 15 points, which span only 14
+    //     minutes — so it opens the ticket a minute before the hold it promises.
+    //   * `[15m:1m] >= 16` would demand the aligned case, so on a rule group
+    //     evaluating off a minute boundary the count is 15 and the alert could
+    //     never fire at all. Tightening the count on a 15m window is therefore
+    //     the wrong repair — strictly worse than the bug.
+    //
+    // Widening the window instead fixes both: `[16m:1m]` yields at least 16
+    // points at every alignment, and 16 points one minute apart span a full 15
+    // minutes. So `>= 16` over a 16m window is both honest and always reachable.
+    assert!(
+        expr.contains("[16m:1m]"),
+        "the hold must be measured over a 16m subquery: subquery steps are aligned \
+         to absolute minute boundaries, so a 15m window yields 15 OR 16 points and \
+         cannot both guarantee 15 minutes and stay satisfiable at every evaluation \
+         offset: {expr}"
     );
     assert!(
-        expr.contains(">= 15"),
-        "the presence guard must require the whole 15m window (>= 15 one-minute \
-         steps), otherwise it is not a hold: {expr}"
+        expr.contains(">= 16"),
+        "the presence guard must require 16 one-minute steps -- the minimum a 16m \
+         subquery yields at any alignment, and exactly the count that spans a full \
+         15 minutes; anything less is not the advertised hold: {expr}"
+    );
+    assert!(
+        !expr.contains("[15m:1m]"),
+        "the 15m subquery is the off-by-one this guard exists to prevent -- its \
+         `>= 15` is satisfied by 15 points spanning only 14 minutes: {expr}"
     );
     // Both halves are load-bearing and must be ANDed, not alternatives.
     assert!(

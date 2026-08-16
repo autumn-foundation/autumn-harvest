@@ -1501,3 +1501,48 @@ Two changes:
 A 12-run local reproduction loop passed 12/12, which is consistent with (and
 too small to distinguish) a ~12 % rate; the arithmetic above, not the loop, is
 what establishes the cause.
+
+## Review round 41
+
+Two P2 findings, both documentation-vs-behavior mismatches rather than product
+defects.
+
+**1. The sustained-release alert's presence guard was a minute short of the hold
+it promised.** `harvest_capability_miss_release_sustained` asserted the release
+rate was continuously non-zero over `[15m:1m]` and required `>= 15` steps. But
+Prometheus aligns a subquery's steps to absolute multiples of the resolution, so
+`expr[Rm:1m]` yields `R` **or** `R + 1` points depending on whether the
+evaluation instant lands on a minute boundary. Fifteen points one minute apart
+span only **fourteen** minutes, so the rule could open its ticket a minute before
+the hold it documents.
+
+The literal repair — tightening to `>= 16` on the same 15m window — is strictly
+worse than the bug: it demands the aligned case, so a rule group evaluating off a
+minute boundary counts 15 and the alert can **never fire at all**. Widening the
+window fixes both directions instead: `[16m:1m]` yields at least 16 points at
+every alignment, and 16 points one minute apart span a full 15 minutes. The rule
+now reads `[16m:1m]` in both halves with `>= 16`, and its `default_threshold`
+states the guarantee in those terms.
+
+The pin test that failed on this change turned out to hardcode `[15m:` in an
+older, *structural* assertion ("the hold lives in the expression, as a
+`min_over_time` over a subquery"). That assertion is now window-agnostic — it
+pins the `:1m]` subquery step, which is what distinguishes a subquery from a
+plain range vector — and the window **length** is owned solely by the new
+alignment assertions, so the two no longer duplicate (or contradict) each other. The added prose
+pushed the pin past the 100-line clippy bound, so it was split along the
+`Half 1 / Half 2` seam its own doc comment already described — which outcomes
+may page, versus whether the released-outcome rule holds — with the shared rule
+accessor hoisted to a module-level helper. They are independent properties over
+different rules, so a failure in one no longer masks the other.
+
+**2. `capability_miss_max_redeliveries` misattributed the small-fleet bound.**
+The rustdoc claimed the ungated `10 ×` absolute ceiling "terminates what the
+gated bound cannot: a fleet smaller than the budget". That was true when written
+but stopped being true at review round 15, which added the configured-total
+bound precisely so a *registered* small fleet escalates at `N` rather than after
+50 releases. The doc now describes all three bounds accurately: the distinct
+count, the configured total (gated on fleet-covering evidence, and why it must
+be gated on that specifically), and the ceiling — whose remaining job is the two
+cases neither gated bound can reach, a fleet the registry cannot describe and a
+live worker that never claims.
