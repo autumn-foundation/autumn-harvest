@@ -2237,3 +2237,43 @@ only the endpoint forms an operator would copy. No positive
 `harvest_capability_miss_release_sustained` concerns non-terminal releases and
 has no failed execution to look up, so such a rule would encode a wrong
 assumption.
+
+## Review round 55
+
+**P1 accepted — round 54's own gate covered only half the ways a worker goes
+absent.** `may_claim_tasks` is seeded from `register_in_fleet`'s **startup**
+result, so it engages when registration never committed at boot. It does not
+engage on the *runtime* path: `do_heartbeat_tick`'s `Ok(0)` arm exists precisely
+because a fleet row can vanish later — an operator cleanup, a retention sweep, a
+truncated table — and re-registers to heal it. When that heal failed, the arm
+logged a warning and left the flag clear, so the worker kept claiming while
+absent from `harvest_workers`. That is the identical end state round 54 was
+written to prevent, reached by a different route.
+
+The harm is the one round 54 recorded, unchanged. The worker is invisible to a
+peer's fleet evidence, so an incapable claimant can derive
+`AllLiveWorkersMissed` and terminally fail work this worker can run; and its own
+claims match `orphaned_running_tasks_query()` — `RUNNING` rows whose `worker_id`
+has no fresh heartbeat — so `reclaim_orphaned_tasks` burns a `crash_strikes`
+increment on each until `poison_pill_threshold` quarantines the task and fails
+the workflow, manufacturing a #367 quarantine out of a capability problem.
+
+The failure arm now arms the flag, which does two things at once: it gates
+claiming until a later tick commits the pair, and it routes that tick through
+the **top-of-function** retry rather than back through `Ok(0)` — the same heal,
+but carrying the reused-`worker_id` protections round 49 and round 51 added
+(withdraw the unverified row; never refresh a row known to be wrong). The
+success arm clears the flag, because a worker that heals itself must be able to
+claim again without a restart.
+
+Verified RED on the exact assertion. The failure is forced the way a contended
+database would produce it — a second connection holds the row the invalidation
+half must update and `lock_timeout` fires — rather than by injecting an error
+the production path cannot generate, and the test asserts the precondition (the
+pair really did roll back) so it cannot pass on a no-op. The control leg runs
+the identical tick with nothing blocking and requires the gate to stay **open**,
+so a fix that armed unconditionally fails it.
+
+Refactor: the heal is now `heal_missing_worker_row`, extracted so the gate
+transition has a name and a place to carry its rationale — and because the arm's
+new failure handling pushed `do_heartbeat_tick` past the 100-line clippy bound.

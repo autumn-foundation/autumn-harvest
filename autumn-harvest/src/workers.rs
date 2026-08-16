@@ -1288,6 +1288,60 @@ async fn withdraw_unverified_worker_row(
         .map_err(crate::error::database_error)
 }
 
+/// Re-register a worker whose fleet row has vanished at runtime, and leave the
+/// claim gate matching the outcome.
+///
+/// Registration is atomic with the capability-miss invalidation, exactly as
+/// startup is: republishing this id without clearing the evidence it may still
+/// carry would make it affirmative fleet evidence against itself (issue #804,
+/// Codex round-28 P1). This is also the retry that heals a startup registration
+/// whose invalidation failed and rolled the pair back.
+///
+/// The gate (issue #804, Codex round-55 P1) is why the failure arm is not just
+/// a log line. Round 54 seeded `registration_pending` only from the *startup*
+/// registration result, so this runtime path — the fleet row vanishing later
+/// and the heal failing — left a worker claiming while absent from
+/// `harvest_workers`, which is the exact state that gate exists to prevent.
+///
+/// Absent is harmful twice over. The worker is invisible to a peer's fleet
+/// evidence, so an incapable claimant can derive
+/// [`crate::worker::FleetCapabilityEvidence::AllLiveWorkersMissed`] and
+/// terminally fail work this worker can run. And its own claims match
+/// `orphaned_running_tasks_query()` — `RUNNING` rows whose `worker_id` has no
+/// fresh heartbeat — so `reclaim_orphaned_tasks` burns a `crash_strikes`
+/// increment on each until `poison_pill_threshold` quarantines the task,
+/// manufacturing a #367 quarantine out of a capability problem.
+///
+/// Arming also routes the next tick through [`do_heartbeat_tick`]'s
+/// top-of-function retry, which is the same heal carrying the reused-`worker_id`
+/// protections (withdraw the unverified row; never refresh a row known to be
+/// wrong). The success arm clears the flag, because a worker that heals itself
+/// must be able to claim again without a restart.
+async fn heal_missing_worker_row(
+    conn: &mut AsyncPgConnection,
+    registration: &WorkerRegistration,
+    registration_pending: &AtomicBool,
+) {
+    match register_worker_and_clear_stale_miss_evidence(conn, registration).await {
+        Ok(cleared) => {
+            registration_pending.store(false, Ordering::Relaxed);
+            tracing::debug!(
+                worker_id = %registration.worker_id,
+                cleared_capability_miss_evidence = cleared,
+                "worker row re-registered"
+            );
+        }
+        Err(error) => {
+            registration_pending.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                worker_id = %registration.worker_id,
+                error = %error,
+                "worker re-registration failed; pausing task claiming until it commits"
+            );
+        }
+    }
+}
+
 /// Execute one heartbeat DB tick: update `last_heartbeat_at`, handle
 /// re-registration / drain transitions, and refresh the drain deadline.
 ///
@@ -1402,17 +1456,7 @@ pub async fn do_heartbeat_tick(
                 );
             } else {
                 tracing::info!(worker_id = %registration.worker_id, "worker row missing; re-registering");
-                // Atomically, exactly as startup does: republishing this id
-                // without clearing the capability-miss evidence it may still
-                // carry would make it affirmative fleet evidence against
-                // itself (issue #804, Codex round-28 P1). This branch is also
-                // the retry that heals a startup registration whose
-                // invalidation failed and rolled the pair back.
-                if let Err(error) =
-                    register_worker_and_clear_stale_miss_evidence(conn, registration).await
-                {
-                    tracing::warn!(worker_id = %registration.worker_id, error = %error, "worker re-registration failed");
-                }
+                heal_missing_worker_row(conn, registration, registration_pending).await;
             }
         }
         Ok(_) => {

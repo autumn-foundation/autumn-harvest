@@ -5388,3 +5388,138 @@ async fn evidence_recorded_against_another_handler_does_not_spend_this_frontiers
     assert_eq!(metrics.quarantine_count(), 0);
     assert_eq!(load_task(&url, task_id).await.crash_strikes, 0);
 }
+
+/// Dedicated queue for the round-55 runtime re-registration test, so blocking
+/// its task row cannot stall an adjacent test.
+const Q_RUNTIME_REREG: &str = "q804-runtime-rereg";
+/// The worker whose fleet row vanishes at runtime.
+const RUNTIME_REREG_WORKER_ID: &str = "pod-runtime-rereg";
+
+/// A **runtime** re-registration failure arms the claim gate, not just a startup
+/// one (issue #804, Codex round-55 P1).
+///
+/// Round 54 gated claiming on `may_claim_tasks`, but seeded the flag only from
+/// the *startup* `register_in_fleet` result. [`do_heartbeat_tick`]'s `Ok(0)`
+/// arm heals a fleet row that vanishes later — an operator cleanup, a retention
+/// sweep, a truncated table — and when that heal fails it logged a warning and
+/// left the flag clear. The worker then kept claiming while absent from
+/// `harvest_workers`, which is the exact state round 54 exists to prevent, and
+/// it is harmful twice over: the worker is invisible to a peer's fleet
+/// evidence (so an incapable claimant can derive `AllLiveWorkersMissed` and
+/// terminally fail work this worker can run), and its own claims match
+/// `orphaned_running_tasks_query()`, so `reclaim_orphaned_tasks` burns a
+/// `crash_strikes` increment on each until `poison_pill_threshold` quarantines
+/// the task — manufacturing a #367 quarantine out of a capability problem,
+/// which is the AC4 confusion in reverse.
+///
+/// This drives the **real** tick, because the defect is in that function's arm
+/// handling; recreating the arms would prove nothing. The failure is forced the
+/// way the fleet would actually see it — the invalidation half of the atomic
+/// pair blocks on a row another transaction holds, and `lock_timeout` fires —
+/// rather than by injecting an error type the production path cannot produce.
+/// The control leg runs the identical tick with nothing blocking and asserts
+/// the gate stays **open**, so a fix that armed unconditionally would fail.
+///
+/// [`do_heartbeat_tick`]: autumn_harvest::workers::do_heartbeat_tick
+#[tokio::test]
+async fn a_failed_runtime_reregistration_arms_the_claim_gate() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    let worker_id = RUNTIME_REREG_WORKER_ID;
+
+    // The runtime case: this worker registered cleanly, so its startup flag is
+    // clear -- and then its row vanished.
+    diesel::sql_query("DELETE FROM harvest_workers WHERE worker_id = $1")
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .execute(&mut conn)
+        .await
+        .expect("ensure the fleet row is absent");
+
+    // A task on this worker's queue carrying its stale evidence, so the
+    // invalidation half of the pair has a row it must lock -- and can block on.
+    let exec_id = seed_execution(&mut conn, "runtime_rereg_wf", serde_json::json!({})).await;
+    let mut params = EnqueueParams::new(Q_RUNTIME_REREG, TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue the evidence-carrying task");
+    seed_prior_missing_workers(&url, exec_id, &[worker_id], "runtime_rereg_wf").await;
+
+    let registration = autumn_harvest::workers::WorkerRegistration {
+        worker_id: worker_id.to_string(),
+        queues: vec![Q_RUNTIME_REREG.to_string()],
+        shard_assignments: vec![0],
+        max_concurrency: 1,
+        host: "test-host".to_string(),
+        version: None,
+        build_id: "build-804r55".to_string(),
+        deployment_name: None,
+        labels: HashMap::new(),
+        max_concurrent_sessions: 0,
+    };
+
+    // --- Fix leg: hold the invalidation's target row so the atomic pair cannot
+    //     commit, exactly as a contended database would.
+    let mut blocker = connect(&url).await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut blocker)
+        .await
+        .expect("open the blocking transaction");
+    diesel::sql_query("SELECT id FROM harvest_task_queue WHERE queue_name = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Text, _>(Q_RUNTIME_REREG)
+        .execute(&mut blocker)
+        .await
+        .expect("hold the row the invalidation must update");
+
+    diesel::sql_query("SET lock_timeout = '250ms'")
+        .execute(&mut conn)
+        .await
+        .expect("bound the wait so the pair fails rather than hanging");
+
+    let gate = AtomicBool::new(false);
+    tick_once(&mut conn, &registration, &gate).await;
+
+    diesel::sql_query("SET lock_timeout = DEFAULT")
+        .execute(&mut conn)
+        .await
+        .expect("restore the session default");
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut blocker)
+        .await
+        .expect("release the held row");
+
+    assert_eq!(
+        live_worker_count(&url, worker_id).await,
+        0,
+        "precondition: the pair must have rolled back, leaving this worker \
+         absent from the fleet -- otherwise there is nothing to gate"
+    );
+    assert!(
+        // Fully qualified: with `diesel::prelude::*` in scope, a bare
+        // `.load(..)` resolves to diesel's blanket `RunQueryDsl::load`.
+        AtomicBool::load(&gate, Ordering::Relaxed),
+        "a worker whose runtime re-registration failed is absent from \
+         harvest_workers, so it must stop claiming: its claims are invisible to \
+         a peer's fleet evidence and are reclaimed as orphans, burning crash \
+         strikes toward a poison-pill quarantine it never earned"
+    );
+
+    // --- Control: nothing blocking, so the same arm heals the row and the gate
+    //     stays open. Guards against a fix that simply always arms.
+    let gate = AtomicBool::new(true);
+    tick_once(&mut conn, &registration, &gate).await;
+
+    assert_eq!(
+        live_worker_count(&url, worker_id).await,
+        1,
+        "control: with nothing blocking, the Ok(0) arm must heal the fleet row"
+    );
+    assert!(
+        !AtomicBool::load(&gate, Ordering::Relaxed),
+        "control: a re-registration that committed must reopen the gate, or a \
+         worker that healed itself would never claim again"
+    );
+}
