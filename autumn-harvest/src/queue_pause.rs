@@ -18,10 +18,10 @@
 //!
 //! # Enforcement model — anti-join, not cache
 //!
-//! A pause is durable queue metadata enforced by a `NOT EXISTS` conjunct on the
-//! claim path ([`QUEUE_PAUSE_CLAIM_PREDICATE`]), exactly like the
-//! PAUSED-execution skip (#383) and the rate-limit gate (#332). It is
-//! deliberately **not** an in-process cache like the admission gate's:
+//! A pause is durable queue metadata enforced on the claim path
+//! ([`QUEUE_PAUSE_CLAIM_PREDICATE`]), exactly like the PAUSED-execution skip
+//! (#383) and the rate-limit gate (#332). It is deliberately **not** an
+//! in-process cache like the admission gate's:
 //!
 //! - "Durable and re-applied before the worker pool begins claiming" is true
 //!   **by construction** — there is no boot window to lose a pause in, no
@@ -29,8 +29,21 @@
 //! - There is no global static, no fail-closed reasoning, and no write-through
 //!   path that can diverge from the database.
 //!
-//! The cost is one primary-key probe per claim against a table bounded by the
-//! number of distinct queue names.
+//! The cost is meant to be one probe per claim against a table bounded by the
+//! number of distinct queue names — but the *shape* that delivers that cost
+//! matters. `claim_task` originally embedded [`queue_pause_anti_join`]
+//! verbatim as a per-row correlated `NOT EXISTS`, which the planner evaluates
+//! once for every *candidate row* it walks while sorting toward `LIMIT 1`, not
+//! once per claim; at a 10k-row backlog that accounted for ~99% of the
+//! query's buffer touches (`docs/performance.md`). `claim_task_query` now
+//! pre-filters `harvest_queue_pauses` once, up front, into a small array
+//! (`paused_queues`) and tests membership per row instead of re-probing the
+//! table per row — the cost model this section describes, actually delivered.
+//! [`queue_pause_anti_join`] and [`QUEUE_PAUSE_CLAIM_PREDICATE`] remain the
+//! correct choice for a **mirror** query that only ever loads a handful of
+//! rows (`oldest_pending_ages`, `claimable_pending_demand_by_queue`) — the
+//! rewrite is only worth its complexity on `claim_task`'s own high-cardinality
+//! candidate scan.
 //!
 //! # Replay contract
 //!

@@ -497,19 +497,34 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 
     Ok(task_id)
 }
-// NOTE (issue #619): the queue-pause anti-join above is embedded verbatim
-// rather than interpolated so this stays a `const fn` with no per-claim
-// allocation. It is drift-locked to
-// `queue_pause::queue_pause_anti_join("harvest_task_queue")` by
-// `claim_query_embeds_the_shared_queue_pause_predicate` below.
+// NOTE (issue #619 / Ledger perf pass, buffers -98% @10k): the queue-pause
+// exclusion used to be a per-row correlated `NOT EXISTS`, embedded verbatim
+// and drift-locked literally to
+// `queue_pause::queue_pause_anti_join("harvest_task_queue")`. Measurement
+// (docs/performance.md) showed the planner re-probing `harvest_queue_pauses`
+// once for every *candidate row* it walked while sorting toward `LIMIT 1` —
+// not once per claim as the module doc for issue #619 assumes — accounted for
+// ~99% of this query's buffer touches at a 10k-row backlog. `paused_queues`
+// below pre-filters the (already `$2`-bounded) pause table into one small
+// array in a `MATERIALIZED` CTE — evaluated once, not once per row — and the
+// per-row check becomes a plain array-membership test with identical
+// semantics: a queue is excluded from `candidate` iff it has an active pause
+// row, exactly as before. This is deliberately NOT textually drift-locked to
+// `queue_pause::queue_pause_anti_join` any more; see
+// `claim_query_excludes_every_paused_queue_via_a_prefiltered_array` below for
+// the shape this is held to instead, and
+// `tests/queue_pause_tests.rs::claim_query_excludes_paused_queues_end_to_end`
+// for the DB-backed equivalence proof.
 /// The task-claim query — extracted as a `const fn` (mirroring the
 /// `timeout.rs` `*_query()` convention) so its eligibility predicate is
 /// shape-testable without a database.
 ///
 /// Binds: `$1` worker id, `$2` queue names, `$3` worker build id,
 /// `$4` priority-aging seconds, `$5` circuit-breaker-tracked activities,
-/// `$6` ineligible activities. The queue-pause anti-join (issue #619) needs no
-/// bind — it correlates purely on `queue_name`.
+/// `$6` ineligible activities. The queue-pause exclusion (issue #619) needs no
+/// new bind — it reuses `$2`, pre-filtering `harvest_queue_pauses` to the
+/// worker's own polled queues once via `paused_queues` rather than probing it
+/// once per candidate row (see the `NOTE` above `claim_task_query` for why).
 // The body is one SQL string literal; the line count is the query's, not
 // control flow's. `claim_task` carried the same allow before this query was
 // extracted for shape-testing.
@@ -519,15 +534,20 @@ pub const fn claim_task_query() -> &'static str {
     "WITH worker_info AS ( \
              SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels \
          ), \
+         paused_queues AS MATERIALIZED ( \
+             SELECT COALESCE(array_agg(queue_name), ARRAY[]::text[]) AS names \
+             FROM harvest_queue_pauses \
+             WHERE queue_name = ANY($2) \
+         ), \
          candidate AS ( \
              SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name \
              FROM harvest_task_queue \
              CROSS JOIN worker_info \
+             CROSS JOIN paused_queues \
              WHERE queue_name = ANY($2) \
                AND state = 'PENDING' \
                AND scheduled_at <= NOW() \
-               AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
-         WHERE qp.queue_name = harvest_task_queue.queue_name) \
+               AND NOT (harvest_task_queue.queue_name = ANY(paused_queues.names)) \
                AND ( \
                    schedule_to_close_at IS NULL \
                    OR schedule_to_close_at > NOW() \
@@ -3064,15 +3084,42 @@ mod tests {
 
     // ── Queue pause: claim gate + its mirrors (issue #619) ──────────────────
 
-    /// The hot claim path embeds the pause anti-join as a literal (no
-    /// per-claim allocation); this locks that literal to the shared renderer so
-    /// the two can never drift.
+    /// The hot claim path pre-filters `harvest_queue_pauses` into one small
+    /// array (`paused_queues`, evaluated once via `MATERIALIZED`) instead of
+    /// embedding the shared `queue_pause_anti_join` literal, which the
+    /// planner was re-probing once per *candidate row* rather than once per
+    /// claim — see the `NOTE` above `claim_task_query` and
+    /// `docs/performance.md` for the measured buffer cost this replaced.
+    ///
+    /// This is therefore a deliberate, evidence-backed exception to "every
+    /// mirror embeds the shared predicate verbatim" — pinned to the new shape
+    /// (not the old literal) so a future refactor can't silently regress back
+    /// to the per-row form without this test catching the shape change, and
+    /// so a reviewer sees exactly what invariant replaces the drift-lock.
     #[test]
-    fn claim_query_embeds_the_shared_queue_pause_predicate() {
-        let rendered = crate::queue_pause::queue_pause_anti_join("harvest_task_queue");
+    fn claim_query_excludes_every_paused_queue_via_a_prefiltered_array() {
+        let sql = claim_task_query();
         assert!(
-            claim_task_query().contains(&rendered),
-            "claim_task_query() must embed the shared queue-pause anti-join verbatim"
+            sql.contains("paused_queues AS MATERIALIZED"),
+            "the pause pre-filter must be forced to materialize once, not be \
+             inlined back into a per-row correlated subquery; got:\n{sql}"
+        );
+        assert!(
+            sql.contains(
+                "FROM harvest_queue_pauses \
+             WHERE queue_name = ANY($2)"
+            ),
+            "paused_queues must pre-filter to the worker's own polled queues \
+             (bounded by $2), not scan the whole pause table; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("NOT (harvest_task_queue.queue_name = ANY(paused_queues.names))"),
+            "the per-row check must be a plain array-membership test against \
+             the pre-filtered array, not a correlated NOT EXISTS; got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("NOT EXISTS (SELECT 1 FROM harvest_queue_pauses"),
+            "the per-row correlated anti-join must be gone entirely; got:\n{sql}"
         );
     }
 
