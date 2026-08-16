@@ -702,6 +702,36 @@ fn main() {
          instead of exercising the documented verification workload -- set it to a positive \
          value (the default is 20)"
     );
+    // `activities == 0` is a distinct but analogous methodological trap: unlike
+    // `fixtures == 0`, `verify_dir` genuinely does real work here -- it still
+    // spawns one task per fixture, reads and parses each `*.json` file, and
+    // replays each one -- so this isn't a literal empty-batch no-op. But
+    // `build_fixture_json(0)` produces a fixture containing only a single
+    // `WorkflowStarted` event (see the `for i in 0..activity_count` loop
+    // above, which runs zero times), so every fixture collapses to the
+    // cheapest possible replay: no `ActivityScheduled`/`ActivityCompleted`
+    // pair, no `HistoryMatcher` event-by-event matching, nothing beyond one
+    // trivial deserialize + an immediate `Ok` return. That's precisely the
+    // event-processing/replay-matching cost this harness exists to measure
+    // (the module doc comment's stated purpose: issue #251's "1k events
+    // each" workload, and `VERIFY_PROFILE_ACTIVITIES`'s own doc comment:
+    // "500 activities = 1,001 events per fixture, issue #251's exact
+    // per-fixture shape") -- an accidental zero here would still print a
+    // plausible, honestly-labeled `activities_per_fixture=0` line, but the
+    // resulting Ir count would be dominated by fixed per-fixture overhead
+    // (task spawn, file I/O, a near-empty JSON parse) rather than the
+    // per-event cost a change under review is meant to move, making it just
+    // as capable of producing a misleading "5% floor" verdict as the
+    // `fixtures == 0` case above.
+    assert!(
+        activities > 0,
+        "VERIFY_PROFILE_ACTIVITIES=0 bypasses the event-heavy workload this harness exists to \
+         measure: every generated fixture would contain only a single `WorkflowStarted` event \
+         (no activities to schedule or complete), so `verify_dir` would still run but the \
+         measurement would be dominated by fixed per-fixture overhead rather than the \
+         per-event replay cost issue #251's workload is defined by -- set it to a positive \
+         value (the default is 500)"
+    );
 
     match mode.as_str() {
         "prepare" => {
