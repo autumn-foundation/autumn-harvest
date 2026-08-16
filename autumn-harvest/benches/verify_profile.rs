@@ -677,6 +677,31 @@ fn main() {
     let mode = resolve_mode();
     let fixtures = env_usize("VERIFY_PROFILE_FIXTURES", 20);
     let activities = env_usize("VERIFY_PROFILE_ACTIVITIES", 500);
+    // `fixtures == 0` would silently "succeed" rather than signal a
+    // misconfiguration: `prepare_fixtures` writes zero `fixture_*.json`
+    // files (and still writes a `PROFILE_META_FILENAME` sidecar claiming
+    // `fixtures=0`), and `ReplayVerifier::replay_dir` deliberately treats an
+    // empty fixture directory as a successful *empty* report --
+    // `fixtures_total: 0, succeeded: 0, failed: 0, harness_errors: 0` (see
+    // the `if files.is_empty()` branch in `replay_dir`, `src/testing.rs`) --
+    // rather than an error. So `run`/`full` mode would print a
+    // plausible-looking `verify_profile: fixtures=0 ... succeeded=0` line
+    // and exit 0 while Callgrind/DHAT recorded only tokio-runtime-build and
+    // harness overhead, not one byte of the documented `verify_dir`
+    // fixture-verification workload this file exists to measure. Rejecting
+    // it here -- before the `prepare`/`run`/`full` dispatch below, so it
+    // applies uniformly to all three modes -- turns a silently-vacuous
+    // "measurement" into a loud, immediate configuration error instead of a
+    // near-zero instruction count that could be mistaken for a genuine (and
+    // wildly optimistic) profiling result.
+    assert!(
+        fixtures > 0,
+        "VERIFY_PROFILE_FIXTURES=0 verifies nothing: `verify_dir` reports a trivially \
+         successful empty batch for a fixture directory with zero `*.json` files, so this \
+         would silently produce a plausible-looking but methodologically invalid measurement \
+         instead of exercising the documented verification workload -- set it to a positive \
+         value (the default is 20)"
+    );
 
     match mode.as_str() {
         "prepare" => {
