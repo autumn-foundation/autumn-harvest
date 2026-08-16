@@ -245,6 +245,17 @@ required-features = ["db"]
 harness = false
 
 # Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `ReplayVerifier::verify_dir` (issue #251's batch-fixture-verification
+# budget). Exercises real filesystem I/O and `serde_json` deserialize of
+# `WorkflowEvent`/`HistorySnapshot` -- a boundary `replay_profile.rs` (which
+# builds events as Rust struct literals) never crosses. See
+# `benches/verify_profile.rs` and `docs/performance-verify.md`.
+[[bench]]
+name = "verify_profile"
+required-features = ["testing"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
 # for `info::validate_against_schema` (issue #373's boundary validator). No
 # feature requirement: the function is unconditional, so this measures the
 # same code every deployment runs on the HTTP start/signal/update path when a
