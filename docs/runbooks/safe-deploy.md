@@ -472,6 +472,28 @@ of `0` exactly one worker demonstrated it lacks the handler and no peer was
 ever asked. That matters if you reach for `0` as a rollback switch *during* an
 incident: the resulting terminal error names the knob, not a missing deploy.
 
+**The budget is per *frontier*, not per task.** A workflow can be stuck on a
+different handler on each dispatch — it advances through local activities
+inline, it parks and is woken by a signal, a durable timer fires. Each of those
+is a new question for the fleet ("who has handler *Y*?"), so it gets its own
+budget rather than inheriting the spend of a question that has already been
+answered. Harvest records which handler the counters are about
+(`harvest_task_queue.capability_miss_handler`) and applies them only to that
+one; a miss on a handler the row was not recorded against starts at 1. Without
+this, a run that had spent its budget looking for *X*, then moved on and got
+stuck on *Y*, would be failed on the **first** worker to miss *Y* — while a peer
+that could have run *Y* was live and never asked. This is invisible in the
+reason string, which always names the handler the run was actually stuck on;
+the observable effect is simply that a long-lived workflow does not accumulate
+budget pressure across unrelated deploys.
+
+This does not weaken the bound AC3 asks for. A frontier is a pure function of
+the recorded history, so consecutive dispatches with no new events land on the
+same handler and cannot oscillate; the frontier only moves when history grows,
+and every such event is appended once and consumed once. The number of
+frontiers one task can present is therefore bounded by the history hard cap,
+and no single frontier can release forever.
+
 ### Interactions and carve-outs
 
 - **Not a poison pill (#367).** A capability miss is a clean "wrong pod", not a

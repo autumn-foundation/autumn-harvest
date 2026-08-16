@@ -52,3 +52,36 @@ ALTER TABLE harvest_task_queue
 -- `capability_misses`, so the two counters stay consistent.
 ALTER TABLE harvest_task_queue
     ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';
+
+-- issue #804 (review round 46): WHICH handler the counters above are about.
+--
+-- `capability_misses` / `capability_miss_workers` describe ONE frontier -- the
+-- position the workflow is stuck at, and therefore the single handler a
+-- claiming worker must register to move it. Nothing recorded that handler, so
+-- the evidence was reusable across frontiers that have nothing to do with each
+-- other.
+--
+-- Reachable without any local-activity progress (which
+-- `reset_capability_misses_after_inline_progress` already covers):
+-- `prepare_workflow_task_with_cache` ingests due timers and pending signals
+-- BEFORE the persist-time capability gate, appending durable history. A signal
+-- that arrives while the task is bouncing on a missing handler X can move the
+-- replay onto a branch needing a DIFFERENT handler Y, with no park and no
+-- inline progress in between -- so X's missers stayed on the row and were
+-- counted as evidence about Y. Once they filled the budget, the first worker
+-- to miss Y read as `AllLiveWorkersMissed` and terminally failed a run the
+-- fleet could still finish, even though a worker recorded against X may well
+-- register Y. That is the exact inversion issue #804 exists to prevent.
+--
+-- Stored as `{kind}:{name}` (`workflow:foo` / `activity:bar`); `kind` is a
+-- bounded `&'static str`. NULL means "no frontier recorded yet", which reads
+-- as a mismatch and therefore as a fresh budget -- the safe direction.
+--
+-- Deliberately NOT cleared by the paths that zero the two counters above: with
+-- the counts already at 0 a stale key is inert, because both branches of the
+-- release then agree (a match increments 0 -> 1, a mismatch resets to 1).
+--
+-- Task-queue state only: no `WorkflowEvent` variant, no change to the
+-- adjacently-tagged event JSON contract, no replay-determinism impact.
+ALTER TABLE harvest_task_queue
+    ADD COLUMN IF NOT EXISTS capability_miss_handler TEXT;

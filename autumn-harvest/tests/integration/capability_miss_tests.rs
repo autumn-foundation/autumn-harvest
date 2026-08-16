@@ -466,7 +466,24 @@ async fn dead_letter_errors(url: &str, exec_id: ExecutionId) -> Vec<String> {
 /// prior set models the fleet without standing up N worker runtimes, and drives
 /// the real decision path: `resolve_capability_miss` reads this column back off
 /// the claimed row.
-async fn seed_prior_missing_workers(url: &str, exec_id: ExecutionId, workers: &[&str]) {
+/// The frontier key the direct-`queue` release tests below pass.
+///
+/// These tests exercise clauses that are not about the frontier (cardinality,
+/// the error column, crash strikes, the claim guard), so they all use one key
+/// and seed it where the row's counters have to survive the release -- the
+/// SAME-frontier arm (issue #804, Codex round-46 P1).
+const TEST_FRONTIER: &str = "workflow:noop_wf";
+
+async fn seed_prior_missing_workers(
+    url: &str,
+    exec_id: ExecutionId,
+    workers: &[&str],
+    // The workflow these misses were recorded against (issue #804, Codex
+    // round-46 P1). Evidence is keyed by frontier, so seeding it without the
+    // handler it is about would read as a mismatch -- a fresh budget -- and
+    // every escalation these tests assert would silently become a release.
+    missing_workflow: &str,
+) {
     let mut conn = connect(url).await;
     let owned: Vec<String> = workers.iter().map(|w| (*w).to_string()).collect();
     let misses = i32::try_from(owned.len()).expect("small");
@@ -477,6 +494,10 @@ async fn seed_prior_missing_workers(url: &str, exec_id: ExecutionId, workers: &[
     .set((
         harvest_task_queue::capability_miss_workers.eq(owned),
         harvest_task_queue::capability_misses.eq(misses),
+        harvest_task_queue::capability_miss_handler.eq(Some(format!(
+            "{}:{missing_workflow}",
+            autumn_harvest::worker::CapabilityMissKind::Workflow.as_str()
+        ))),
     ))
     .execute(&mut conn)
     .await
@@ -1854,6 +1875,7 @@ async fn capability_miss_escalates_after_the_budget_with_no_capable_worker() {
         &url,
         exec_id,
         &["pod-a-incapable", "pod-b-incapable", "pod-c-incapable"],
+        "never_registered_wf",
     )
     .await;
 
@@ -2259,7 +2281,7 @@ async fn stale_miss_evidence_from_a_worker_that_never_restarted_still_escalates(
     .await;
 
     // `pod-a` missed this frontier on a previous deploy...
-    seed_prior_missing_workers(&url, exec_id, &["pod-a"]).await;
+    seed_prior_missing_workers(&url, exec_id, &["pod-a"], "restart_target_wf").await;
     // ...and is live, but was never restarted, so its evidence is still true.
     seed_live_worker(&url, "pod-a", Q_RESTART).await;
 
@@ -2341,7 +2363,7 @@ async fn restart_onto_a_capable_build_clears_its_stale_miss_evidence() {
     .await;
 
     // `pod-a` missed this frontier on its OLD build, exhausting the budget.
-    seed_prior_missing_workers(&url, exec_id, &["pod-a"]).await;
+    seed_prior_missing_workers(&url, exec_id, &["pod-a"], "restart_target_wf").await;
 
     // Phase 1: `pod-a` restarts onto a build that DOES register the handler.
     // Deferred out of claim range so it registers without claiming — a claim
@@ -2494,7 +2516,7 @@ async fn peer_reregistering_mid_dispatch_is_seen_by_the_decision() {
 
     // `pod-a` missed this frontier on its old build, exhausting the budget, and
     // is live (it is about to restart onto a capable build, mid-dispatch).
-    seed_prior_missing_workers(&url, exec_id, &["pod-a"]).await;
+    seed_prior_missing_workers(&url, exec_id, &["pod-a"], "claim_race_wf").await;
     seed_live_worker(&url, "pod-a", Q_CLAIM_RACE).await;
 
     // Arm the injection the workflow body performs while holding the claim.
@@ -3132,6 +3154,7 @@ async fn a_same_worker_reclaim_after_a_requeue_is_not_released_by_the_stale_disp
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
         task.crash_strikes,
+        TEST_FRONTIER,
     )
     .await
     .expect("release query runs");
@@ -3188,7 +3211,8 @@ async fn the_release_reports_the_cardinality_it_actually_committed() {
     diesel::sql_query(
         "UPDATE harvest_task_queue \
          SET state = 'RUNNING', worker_id = 'incapable', started_at = NOW(), attempt = 1, \
-             capability_miss_workers = ARRAY['stale-a', 'stale-b'] \
+             capability_miss_workers = ARRAY['stale-a', 'stale-b'], \
+             capability_miss_handler = 'workflow:noop_wf' \
          WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(task_id)
@@ -3226,6 +3250,7 @@ async fn the_release_reports_the_cardinality_it_actually_committed() {
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
         0,
+        TEST_FRONTIER,
     )
     .await
     .expect("release query runs");
@@ -3287,6 +3312,7 @@ async fn release_never_writes_the_error_column() {
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
         0,
+        TEST_FRONTIER,
     )
     .await
     .expect("release query runs");
@@ -3331,6 +3357,7 @@ async fn release_never_writes_the_error_column() {
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
         0,
+        TEST_FRONTIER,
     )
     .await
     .expect("release query runs");
@@ -3379,6 +3406,7 @@ async fn release_is_a_noop_when_the_claim_was_already_taken() {
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
         0,
+        TEST_FRONTIER,
     )
     .await
     .expect("release query runs");
@@ -3488,7 +3516,7 @@ async fn budget_never_escalates_while_a_capable_worker_is_live() {
     .await;
     // Budget of 1, already spent by one distinct incapable worker: the next
     // distinct worker crosses the raw bound.
-    seed_prior_missing_workers(&url, exec_id, &["pod-a-incapable"]).await;
+    seed_prior_missing_workers(&url, exec_id, &["pod-a-incapable"], "never_registered_wf").await;
     // ... but a capable worker is live on this queue and has never missed it.
     seed_live_worker(&url, "pod-capable-live", Q_LIVE_PEER).await;
 
@@ -3791,6 +3819,7 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
         CapabilityMissPhase::BeforeHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
         2,
+        TEST_FRONTIER,
     )
     .await
     .expect("release query runs");
@@ -3839,6 +3868,7 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
         CapabilityMissPhase::AfterHandler,
         // The claim epoch this seeded row was claimed at (Codex round-37 P1).
         2,
+        TEST_FRONTIER,
     )
     .await
     .expect("release query runs");
@@ -4421,7 +4451,7 @@ async fn a_peer_that_re_registers_before_the_lock_withdraws_the_escalation() {
     // Both live workers have missed: the evidence supports escalating.
     seed_live_worker(&url, "worker-a", queue).await;
     seed_live_worker(&url, "worker-b", queue).await;
-    seed_prior_missing_workers(&url, exec_id, &["worker-a", "worker-b"]).await;
+    seed_prior_missing_workers(&url, exec_id, &["worker-a", "worker-b"], "round31_wf").await;
 
     // worker-b re-registers onto a capable build: registration atomically drops
     // its stale evidence. Ownership is untouched, so the claim guard cannot see
@@ -4456,6 +4486,11 @@ async fn a_peer_that_re_registers_before_the_lock_withdraws_the_escalation() {
                     worker_stale_secs: 600,
                 },
                 frontier_reset_committed: false,
+                // The frontier the seeded evidence is recorded against
+                // (Codex round-46 P1): a mismatch would read as a fresh
+                // budget and the escalation these tests are about would
+                // never be reached.
+                frontier: "workflow:round31_wf",
             },
             derive_reason: &|_| {
                 "no_capable_worker: activity 'charge' is not registered".to_string()
@@ -4506,7 +4541,7 @@ async fn evidence_that_still_supports_escalation_under_the_lock_still_commits() 
     let (exec_id, task) = seed_claimed_task(&url, queue, "worker-a").await;
     seed_live_worker(&url, "worker-a", queue).await;
     seed_live_worker(&url, "worker-b", queue).await;
-    seed_prior_missing_workers(&url, exec_id, &["worker-a", "worker-b"]).await;
+    seed_prior_missing_workers(&url, exec_id, &["worker-a", "worker-b"], "round31_wf").await;
 
     let mut conn = connect(&url).await;
     let preloaded = preload_failure_history(&mut conn, &task).await;
@@ -4527,6 +4562,11 @@ async fn evidence_that_still_supports_escalation_under_the_lock_still_commits() 
                     worker_stale_secs: 600,
                 },
                 frontier_reset_committed: false,
+                // The frontier the seeded evidence is recorded against
+                // (Codex round-46 P1): a mismatch would read as a fresh
+                // budget and the escalation these tests are about would
+                // never be reached.
+                frontier: "workflow:round31_wf",
             },
             derive_reason: &|_| {
                 "no_capable_worker: activity 'charge' is not registered".to_string()
@@ -4584,7 +4624,7 @@ async fn the_persisted_reason_comes_from_the_in_transaction_resolution() {
     let (exec_id, task) = seed_claimed_task(&url, queue, "worker-a").await;
     seed_live_worker(&url, "worker-a", queue).await;
     seed_live_worker(&url, "worker-b", queue).await;
-    seed_prior_missing_workers(&url, exec_id, &["worker-a", "worker-b"]).await;
+    seed_prior_missing_workers(&url, exec_id, &["worker-a", "worker-b"], "round31_wf").await;
 
     let fresh_reason = format!("{NO_CAPABLE_WORKER_PREFIX} derived-under-the-lock");
     let expected = fresh_reason.clone();
@@ -4609,6 +4649,11 @@ async fn the_persisted_reason_comes_from_the_in_transaction_resolution() {
                     worker_stale_secs: 600,
                 },
                 frontier_reset_committed: false,
+                // The frontier the seeded evidence is recorded against
+                // (Codex round-46 P1): a mismatch would read as a fresh
+                // budget and the escalation these tests are about would
+                // never be reached.
+                frontier: "workflow:round31_wf",
             },
             derive_reason: &|_resolution| fresh_reason.clone(),
         }),
@@ -4956,4 +5001,137 @@ async fn cross_type_continue_as_new_missing_target_is_released_for_a_capable_pee
         sealed.error
     );
     assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+}
+
+// -- Codex round-46 P1: evidence is keyed to the handler it is about ---------
+
+const Q_FRONTIER_KEY: &str = "q804-frontier-key";
+
+/// A frontier the fleet has never been offered must not inherit a *different*
+/// frontier's spent budget (issue #804, Codex round-46 P1).
+///
+/// The counters describe ONE frontier — "the position the workflow is stuck
+/// at, and therefore the single handler a claiming worker must register to move
+/// it". Two reset paths retire a frontier explicitly (a park, and inline
+/// local-activity progress), but a third retires one with neither: newly
+/// ingested history. `prepare_workflow_task_with_cache` appends a due timer
+/// fire, a pending signal, or an external delta *before* the capability gate,
+/// so the very next replay can be stuck on a different handler with nothing
+/// having reset the columns. Without the key, the first worker to miss the NEW
+/// handler inherits the old one's exhausted budget and can terminally fail a
+/// run the fleet could still finish.
+///
+/// Driven end to end through the real dispatch path, so the assertion is about
+/// what a worker actually does with a row rather than what a pure function
+/// returns for a struct.
+///
+/// Falsifiable: with the key removed (in `frontier_miss_state` and the two SQL
+/// statements), the seeded budget applies and the very first claim escalates —
+/// the execution goes FAILED and the `RUNNING` assertion below fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evidence_recorded_against_another_handler_does_not_spend_this_frontiers_budget() {
+    let (url, _container) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+
+    let exec_id = seed_workflow(
+        &mut conn,
+        "never_registered_wf",
+        serde_json::json!({}),
+        Q_FRONTIER_KEY,
+    )
+    .await;
+    let task_id = load_tasks(&url, exec_id).await[0].id;
+
+    // A budget of 1, fully spent — but against a handler this dispatch is NOT
+    // missing. This is the state newly ingested history leaves behind: the
+    // counters are real, they are simply about a position the run has moved
+    // past.
+    seed_prior_missing_workers(
+        &url,
+        exec_id,
+        &["pod-a-incapable", "pod-b-incapable"],
+        "a_frontier_we_moved_past",
+    )
+    .await;
+    let seeded = load_task(&url, task_id).await;
+    assert_eq!(seeded.capability_misses, 2);
+    assert_eq!(
+        seeded.capability_miss_handler.as_deref(),
+        Some("workflow:a_frontier_we_moved_past"),
+    );
+
+    // A single incapable worker, with a budget SMALLER than the seeded spend.
+    // If the stale evidence applied, this worker's first claim would escalate.
+    let metrics = Arc::new(CapabilityMetrics::default());
+    let worker = build_worker(
+        "worker-on-the-new-frontier",
+        &[Q_FRONTIER_KEY],
+        build_registry(
+            vec![workflow_info("some_other_wf", decoy_workflow)],
+            vec![],
+            Arc::clone(&metrics),
+        ),
+        1,
+    );
+
+    let released = with_worker_running(&worker, &pool, async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let task = load_task(&url, task_id).await;
+                // The release rewrites the frontier to the one actually missed.
+                if task.capability_miss_handler.as_deref() == Some("workflow:never_registered_wf") {
+                    return task;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the miss must RELEASE and re-key the evidence to this frontier")
+    })
+    .await;
+
+    // The count restarts at 1: this frontier has been offered to exactly one
+    // worker, not to the two that missed the previous one.
+    assert_eq!(
+        released.capability_misses, 1,
+        "a frontier no peer has been offered starts its budget at the base, \
+         rather than inheriting a spend nobody made against it"
+    );
+    assert_eq!(
+        released.capability_miss_workers,
+        vec!["worker-on-the-new-frontier".to_string()],
+        "the distinct-worker set must be the workers that missed THIS handler, \
+         got {:?}",
+        released.capability_miss_workers
+    );
+
+    // AC1: released for a peer, not terminally failed.
+    assert_eq!(
+        load_execution(&url, exec_id).await.state,
+        "RUNNING",
+        "the run stays alive for a capable peer"
+    );
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "no terminal event may be appended while the budget is genuinely \
+         unspent for this frontier, got {history:?}"
+    );
+    assert_eq!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_ESCALATED),
+        0,
+        "another frontier's spend must not escalate this one, got {:?}",
+        metrics.samples()
+    );
+    assert!(
+        metrics.count_with_outcome(CAPABILITY_MISS_OUTCOME_RELEASED) >= 1,
+        "the miss must be counted as a release (AC5), got {:?}",
+        metrics.samples()
+    );
+    // AC4: still never mistaken for a poison pill.
+    assert_eq!(metrics.quarantine_count(), 0);
+    assert_eq!(load_task(&url, task_id).await.crash_strikes, 0);
 }

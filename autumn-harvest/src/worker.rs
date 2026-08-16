@@ -5090,13 +5090,48 @@ pub struct CapabilityMissResolution {
 /// `queue::invalidate_capability_miss_evidence_for_worker` broke that invariant
 /// on purpose: it must reach a row under an active claim, because that is the
 /// row whose decision stale evidence poisons.
+///
+/// # AC3 (bounded) still holds per task, not just per frontier
+///
+/// Keying by frontier (round 46) means the absolute ceiling
+/// (`CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER`) counts per frontier rather than
+/// per task, so it is worth stating why the release loop is still bounded.
+///
+/// A frontier is a pure function of the recorded history: with no new events
+/// and no park, the replay is deterministic and lands on the SAME handler, so
+/// two dispatches cannot oscillate between frontiers on their own. The frontier
+/// moves only when history grows — an ingested timer fire or signal, an
+/// activity or local-activity terminal — and every one of those appends an
+/// event that is consumed once and never re-appended. So the number of
+/// frontiers a single task can present is bounded by the history hard cap, the
+/// same argument `reset_capability_misses_after_inline_progress` already makes
+/// for the inline-progress reset. The total release count is therefore bounded
+/// by (frontiers × ceiling), and — the property AC3 actually asks for — no
+/// frontier can release forever.
 #[must_use]
-fn frontier_miss_state(task: &TaskQueueItem, reset_committed: bool) -> (i32, Vec<String>) {
+fn frontier_miss_state(
+    task: &TaskQueueItem,
+    reset_committed: bool,
+    frontier: &str,
+) -> (i32, Vec<String>) {
     if reset_committed {
-        (0, Vec::new())
-    } else {
-        (task.capability_misses, task.capability_miss_workers.clone())
+        return (0, Vec::new());
     }
+    // The snapshot's counters are evidence about the frontier the row RECORDS,
+    // which is not necessarily the one this dispatch is missing (issue #804,
+    // Codex round-46 P1) -- `prepare_workflow_task_with_cache` can ingest a
+    // timer fire or a pending signal ahead of the capability gate and move the
+    // replay onto a branch needing a different handler, with no park and no
+    // inline progress to reset anything. Charging the old frontier's spend to a
+    // frontier no peer has ever been offered is what terminally fails a run the
+    // fleet can still finish, so a mismatch reads as a fresh budget. A `None`
+    // key (nothing recorded yet) is a mismatch too, which is the safe
+    // direction. This mirrors the SQL in `read_capability_miss_state_query`,
+    // which applies the identical rule to the authoritative read.
+    if task.capability_miss_handler.as_deref() != Some(frontier) {
+        return (0, Vec::new());
+    }
+    (task.capability_misses, task.capability_miss_workers.clone())
 }
 
 /// The capability-miss counters to decide on, refreshed from the row
@@ -5130,8 +5165,9 @@ async fn current_frontier_miss_state(
     task: &TaskQueueItem,
     worker_id: &str,
     reset_committed: bool,
+    frontier: &str,
 ) -> CurrentMissState {
-    match queue::read_capability_miss_state(conn, task.id, worker_id).await {
+    match queue::read_capability_miss_state(conn, task.id, worker_id, frontier).await {
         Ok(Some((misses, workers))) => CurrentMissState::Owned { misses, workers },
         Ok(None) => CurrentMissState::ClaimLost,
         Err(error) => {
@@ -5141,7 +5177,7 @@ async fn current_frontier_miss_state(
                 "failed to re-read capability-miss state; suppressing evidence-derived \
                  escalation and deciding on the claim-time snapshot"
             );
-            let (misses, workers) = frontier_miss_state(task, reset_committed);
+            let (misses, workers) = frontier_miss_state(task, reset_committed, frontier);
             CurrentMissState::Unreadable { misses, workers }
         }
     }
@@ -16275,6 +16311,22 @@ impl MissingHandler<'_> {
     pub fn detail(&self) -> String {
         format!("no {} handler registered for '{}'", self.kind, self.name)
     }
+
+    /// The durable identity of the frontier this miss is about (issue #804,
+    /// Codex round-46 P1).
+    ///
+    /// `capability_misses` / `capability_miss_workers` describe **one**
+    /// frontier — the position the workflow is stuck at, and therefore the
+    /// single handler a claiming worker must register to move it. This is what
+    /// the row records so that claim can be checked, rather than assumed.
+    ///
+    /// `kind` is included, not just `name`: the two registries are separate
+    /// namespaces, so an activity and a workflow may legitimately share a name
+    /// and are different frontiers.
+    #[must_use]
+    pub fn frontier_key(&self) -> String {
+        format!("{}:{}", self.kind, self.name)
+    }
 }
 
 /// The two knobs that govern the capability-miss path (issue #804).
@@ -16324,13 +16376,18 @@ async fn observe_miss_and_fleet(
     worker_id: &str,
     policy: CapabilityMissPolicy,
     frontier_reset_committed: bool,
+    frontier: &str,
 ) -> BracketedMissObservation {
-    let before = current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed).await;
+    let before =
+        current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed, frontier)
+            .await;
     // Fleet evidence for the distinct-worker bound (issue #804, Codex round-8
     // P1). See `read_live_fleet_or_degrade` for why a failure here degrades to
     // an empty set instead of propagating.
     let live_workers = read_live_fleet_or_degrade(conn, task, policy.worker_stale_secs).await;
-    let after = current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed).await;
+    let after =
+        current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed, frontier)
+            .await;
     let confidence = miss_evidence_confidence(&before, &after);
     BracketedMissObservation {
         before,
@@ -16521,6 +16578,15 @@ async fn handle_capability_miss(
     // charged to a dispatch that did nothing.
     refund_capability_miss_rate_limit_token(conn, task).await;
 
+    // The handler this dispatch is stuck on, which is what the row's counters
+    // are evidence ABOUT (issue #804, Codex round-46 P1). Newly ingested
+    // history — a pending signal, a due timer, an external delta — can move the
+    // replay onto a different branch between two dispatches of the same task
+    // without any park or inline progress in between, so the counters can carry
+    // a prior frontier's missers. Keying by this makes them apply only to the
+    // handler a claiming worker must actually register.
+    let frontier = missing.frontier_key();
+
     // Issue #804 (Codex rounds 20, 22, 27 and 28): decide on the counters as
     // they stand NOW, which is not the claim-time snapshot in `task` — this
     // dispatch may have retired a frontier, and a peer's re-registration may
@@ -16534,7 +16600,15 @@ async fn handle_capability_miss(
         after: after_fleet,
         live_workers,
         confidence,
-    } = observe_miss_and_fleet(conn, task, worker_id, policy, frontier_reset_committed).await;
+    } = observe_miss_and_fleet(
+        conn,
+        task,
+        worker_id,
+        policy,
+        frontier_reset_committed,
+        &frontier,
+    )
+    .await;
 
     // A lost claim is not a decision to make. The escalation write is not
     // ownership-guarded, so deciding here would let a stale dispatcher
@@ -16670,6 +16744,11 @@ async fn release_capability_miss(
                 // alone would also match that replacement claim (Codex
                 // round-37 P1).
                 task.crash_strikes,
+                // The frontier these counters are evidence about (Codex
+                // round-46 P1): a release that lands on a DIFFERENT handler
+                // than the row records restarts the count at 1 rather than
+                // inheriting the prior frontier's missers.
+                &missing.frontier_key(),
             )
             .await?;
             let Some(durable_distinct_workers) = released else {
@@ -16796,8 +16875,12 @@ async fn prepare_escalation_commit(
     frontier_reset_committed: bool,
 ) -> (PreloadedFailureHistory, EscalationRevalidation) {
     let CapabilityMissCtx {
-        task, worker_id, ..
+        task,
+        worker_id,
+        missing,
+        ..
     } = ctx;
+    let frontier = missing.frontier_key();
     let preloaded = preload_failure_history(conn, task).await;
     let revalidation = revalidate_escalation_evidence(
         conn,
@@ -16806,6 +16889,7 @@ async fn prepare_escalation_commit(
             worker_id,
             policy,
             frontier_reset_committed,
+            frontier: &frontier,
         },
     )
     .await;
@@ -16816,8 +16900,11 @@ async fn prepare_escalation_commit(
 ///
 /// Deliberately narrower than [`CapabilityMissCtx`]: the re-decision reads
 /// evidence, so it must not carry a metrics recorder (a re-read is not an
-/// emission point) or the missing-handler detail (which is what was *already*
-/// decided from).
+/// emission point) or the missing-handler *detail* — the human-facing rendering
+/// is what was already decided from. It does carry the frontier KEY, because
+/// that is not a rendering: it is the identity the counters are evidence about,
+/// and without it the re-read cannot tell whose missers it is looking at
+/// (Codex round-46 P1).
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct EscalationEvidenceRecheck<'a> {
@@ -16829,6 +16916,10 @@ pub struct EscalationEvidenceRecheck<'a> {
     pub policy: CapabilityMissPolicy,
     /// Whether this dispatch already committed a frontier reset.
     pub frontier_reset_committed: bool,
+    /// The frontier this miss is about (`{kind}:{name}`), so the re-read
+    /// applies the row's counters only if they are evidence about THIS handler
+    /// (issue #804, Codex round-46 P1).
+    pub frontier: &'a str,
 }
 
 /// The escalation half of a terminal write: what to re-decide from, and how to
@@ -16863,6 +16954,7 @@ async fn revalidate_escalation_evidence(
         worker_id,
         policy,
         frontier_reset_committed,
+        frontier,
     } = recheck;
     // The revalidation uses the SAME bracketed observation the decision does
     // (issue #804, Codex round-30 P1). Round 29 re-derived a single miss read
@@ -16875,7 +16967,15 @@ async fn revalidate_escalation_evidence(
         after,
         live_workers,
         confidence,
-    } = observe_miss_and_fleet(conn, task, worker_id, policy, frontier_reset_committed).await;
+    } = observe_miss_and_fleet(
+        conn,
+        task,
+        worker_id,
+        policy,
+        frontier_reset_committed,
+        frontier,
+    )
+    .await;
     // Either read observing a lost claim is enough — the claim does not come
     // back — so `before` decides and `after` only has to agree it is still ours.
     // Re-decide from the fresh reads and carry the WHOLE resolution, not just
@@ -17231,6 +17331,8 @@ async fn escalate_capability_miss(
         missing,
     } = ctx;
     let max_redeliveries = policy.max_redeliveries;
+    // The identity the row's counters are evidence about (Codex round-46 P1).
+    let frontier = missing.frontier_key();
 
     let (preloaded, revalidation) =
         prepare_escalation_commit(conn, ctx, policy, frontier_reset_committed).await;
@@ -17314,6 +17416,7 @@ async fn escalate_capability_miss(
                 worker_id,
                 policy,
                 frontier_reset_committed,
+                frontier: &frontier,
             },
             derive_reason: &reason_of,
         }),
@@ -26334,12 +26437,21 @@ mod tests {
         );
     }
 
-    /// A `TaskQueueItem` carrying only the two capability-miss columns this
-    /// rule reads; every other field is irrelevant to it.
+    /// The frontier [`frontier_task`] records its counters against. Tests that
+    /// mean "these counters are about the handler I am missing" pass this.
+    const SAME_FRONTIER: &str = "workflow:stuck_here";
+
+    /// A `TaskQueueItem` carrying only the capability-miss columns this rule
+    /// reads; every other field is irrelevant to it.
+    ///
+    /// The recorded frontier is [`SAME_FRONTIER`], so a test asserting the
+    /// snapshot is *preserved* must pass that key — passing anything else is
+    /// the round-46 mismatch, which zeroes.
     fn frontier_task(misses: i32, workers: &[&str]) -> TaskQueueItem {
         TaskQueueItem {
             capability_misses: misses,
             capability_miss_workers: workers.iter().map(|w| (*w).to_owned()).collect(),
+            capability_miss_handler: Some(SAME_FRONTIER.to_string()),
             ..retry_after_test_task(1, 5)
         }
     }
@@ -26356,14 +26468,14 @@ mod tests {
         // Deciding on that snapshot terminally fails a run whose new frontier
         // no peer has ever been offered -- this control is what makes the rule
         // worth having.
-        let (stale_misses, stale_workers) = frontier_miss_state(&task, false);
+        let (stale_misses, stale_workers) = frontier_miss_state(&task, false, SAME_FRONTIER);
         let stale =
             resolve_capability_miss(&stale_workers, stale_misses, "worker-c", 2, None, &live);
         assert_eq!(stale.action, CapabilityMissAction::Escalate);
 
         // With the reset committed, the row really holds (0, []), so the miss
         // releases and the persisted count lands at 1.
-        let (misses, workers) = frontier_miss_state(&task, true);
+        let (misses, workers) = frontier_miss_state(&task, true, SAME_FRONTIER);
         assert_eq!((misses, workers.as_slice()), (0, [].as_slice()));
         let clean = resolve_capability_miss(&workers, misses, "worker-c", 2, None, &live);
         assert_eq!(
@@ -26383,7 +26495,7 @@ mod tests {
         // Reporting the snapshot when no reset committed keeps the guard on the
         // value the column actually holds.
         let task = frontier_task(i32::MAX, &["worker-a"]);
-        let (misses, workers) = frontier_miss_state(&task, false);
+        let (misses, workers) = frontier_miss_state(&task, false, SAME_FRONTIER);
         assert_eq!(misses, i32::MAX, "the ceiling must survive the rule");
         let at_ceiling = resolve_capability_miss(&workers, misses, "worker-b", 5, None, &[]);
         assert_eq!(
@@ -26395,12 +26507,107 @@ mod tests {
 
         // And a spent-but-representable budget still escalates on its own terms.
         let spent = frontier_task(5, &["w0", "w1", "w2", "w3", "w4"]);
-        let (m, w) = frontier_miss_state(&spent, false);
+        let (m, w) = frontier_miss_state(&spent, false, SAME_FRONTIER);
         let over = resolve_capability_miss(&w, m, "w5", 5, None, &[]);
         assert_eq!(
             over.action,
             CapabilityMissAction::Escalate,
             "without a reset the configured budget is enforced on the true count"
+        );
+    }
+
+    /// Counters recorded against a DIFFERENT handler are not evidence about
+    /// this one (issue #804, Codex round-46 P1).
+    ///
+    /// The reset flag only covers the two ways a dispatch can *itself* retire a
+    /// frontier: a park, or inline local-activity progress. Newly ingested
+    /// history retires one without either — `prepare_workflow_task_with_cache`
+    /// appends a due timer fire or a pending signal ahead of the capability
+    /// gate, so the very next replay can be stuck on a different handler with
+    /// nothing having reset the columns. Charging the old frontier's spend to a
+    /// handler no peer has ever been offered is what terminally fails a run the
+    /// fleet can still finish.
+    #[test]
+    fn counters_recorded_against_another_handler_are_not_evidence_about_this_one() {
+        // The budget is fully spent -- against `SAME_FRONTIER`.
+        let task = frontier_task(2, &["worker-a", "worker-b"]);
+        let live = vec!["worker-a".to_string(), "worker-b".to_string()];
+
+        // Read as evidence about that same frontier, it escalates. This control
+        // is what makes the rule falsifiable: without the key, EVERY read below
+        // would look like this one.
+        let (same_misses, same_workers) = frontier_miss_state(&task, false, SAME_FRONTIER);
+        assert_eq!((same_misses, same_workers.len()), (2, 2));
+        let spent = resolve_capability_miss(&same_workers, same_misses, "worker-c", 2, None, &live);
+        assert_eq!(spent.action, CapabilityMissAction::Escalate);
+
+        // Read as evidence about the frontier we are ACTUALLY stuck on, the
+        // same row yields a fresh budget and the miss releases for a peer.
+        let (misses, workers) = frontier_miss_state(&task, false, "activity:moved_on_to");
+        assert_eq!(
+            (misses, workers.as_slice()),
+            (0, [].as_slice()),
+            "another handler's missers must not be charged to this frontier"
+        );
+        let fresh = resolve_capability_miss(&workers, misses, "worker-c", 2, None, &live);
+        assert_eq!(
+            (fresh.action, fresh.total_after),
+            (CapabilityMissAction::Release, 1),
+            "a frontier no peer has been offered starts its budget at the base"
+        );
+    }
+
+    /// A row with no frontier recorded yet reads as a mismatch, which is the
+    /// safe direction: a full budget releases, where a fabricated match could
+    /// charge a spend nobody made (issue #804, Codex round-46 P1).
+    #[test]
+    fn an_unrecorded_frontier_reads_as_a_fresh_budget() {
+        let task = TaskQueueItem {
+            capability_miss_handler: None,
+            ..frontier_task(2, &["worker-a", "worker-b"])
+        };
+        assert_eq!(
+            frontier_miss_state(&task, false, SAME_FRONTIER),
+            (0, Vec::new()),
+            "a NULL handler is not a claim that these counters are about us"
+        );
+    }
+
+    /// The two registries are separate namespaces, so a same-named activity and
+    /// workflow are different frontiers and must not share a budget.
+    #[test]
+    fn the_frontier_key_separates_the_two_handler_namespaces() {
+        let workflow = MissingHandler {
+            kind: CapabilityMissKind::Workflow.as_str(),
+            name: "shared_name",
+            phase: CapabilityMissPhase::BeforeHandler,
+        };
+        let activity = MissingHandler {
+            kind: CapabilityMissKind::Activity.as_str(),
+            name: "shared_name",
+            phase: CapabilityMissPhase::BeforeHandler,
+        };
+        assert_ne!(
+            workflow.frontier_key(),
+            activity.frontier_key(),
+            "a workflow and an activity sharing a name are different frontiers"
+        );
+
+        // And the key a task records is matched by an equal key, so a genuine
+        // re-dispatch on the SAME frontier keeps accumulating.
+        let task = TaskQueueItem {
+            capability_miss_handler: Some(workflow.frontier_key()),
+            ..frontier_task(1, &["worker-a"])
+        };
+        assert_eq!(
+            frontier_miss_state(&task, false, &workflow.frontier_key()),
+            (1, vec!["worker-a".to_string()]),
+            "the same frontier must carry its own evidence forward"
+        );
+        assert_eq!(
+            frontier_miss_state(&task, false, &activity.frontier_key()),
+            (0, Vec::new()),
+            "the other namespace's same-named handler must not inherit it"
         );
     }
 
@@ -26415,7 +26622,7 @@ mod tests {
     #[test]
     fn a_lost_claim_is_distinguished_from_an_unreadable_row() {
         let task = frontier_task(3, &["worker-a"]);
-        let (misses, workers) = frontier_miss_state(&task, false);
+        let (misses, workers) = frontier_miss_state(&task, false, SAME_FRONTIER);
 
         let lost = CurrentMissState::ClaimLost;
         assert!(
@@ -26844,7 +27051,7 @@ mod tests {
         // The reset path must not become a way to dodge the two escalations
         // that are decided BEFORE any budget bound.
         let task = frontier_task(2, &["worker-a", "worker-b"]);
-        let (misses, workers) = frontier_miss_state(&task, true);
+        let (misses, workers) = frontier_miss_state(&task, true, SAME_FRONTIER);
 
         let pinned = resolve_capability_miss(
             &workers,
@@ -28146,6 +28353,7 @@ mod tests {
             session_id: None,
             capability_misses: 0,
             capability_miss_workers: Vec::new(),
+            capability_miss_handler: None,
         }
     }
 

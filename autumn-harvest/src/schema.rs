@@ -243,6 +243,12 @@ diesel::table! {
         /// redelivery budget is consumed per entry, so one incapable worker
         /// repeatedly winning the claim race cannot exhaust it.
         capability_miss_workers -> Array<Text>,
+        /// Issue #804 (round 46): WHICH handler the two counters above are
+        /// about, as `{kind}:{name}`. The counters describe one frontier, and
+        /// a frontier is identified by the single handler that would move it;
+        /// a mismatch means the evidence belongs to a frontier now behind us.
+        /// `NULL` = none recorded yet, which reads as a mismatch.
+        capability_miss_handler -> Nullable<Text>,
     }
 }
 

@@ -2122,11 +2122,16 @@ pub const fn release_task_for_capability_miss_query(
              started_at = NULL, \
              last_heartbeat_at = NULL, \
              crash_strikes = 0, \
-             capability_misses = LEAST(capability_misses, 2147483646) + 1, \
+             capability_misses = CASE \
+                 WHEN capability_miss_handler IS DISTINCT FROM $5 THEN 1 \
+                 ELSE LEAST(capability_misses, 2147483646) + 1 \
+             END, \
              capability_miss_workers = CASE \
+                 WHEN capability_miss_handler IS DISTINCT FROM $5 THEN ARRAY[$2] \
                  WHEN $2 = ANY(capability_miss_workers) THEN capability_miss_workers \
                  ELSE array_append(capability_miss_workers, $2) \
              END, \
+             capability_miss_handler = $5, \
              scheduled_at = NOW() + make_interval(secs => $3), \
              sticky_worker_id = NULL, \
              sticky_until = NULL, \
@@ -2149,11 +2154,16 @@ pub const fn release_task_for_capability_miss_query(
              started_at = NULL, \
              last_heartbeat_at = NULL, \
              attempt = GREATEST(attempt - 1, 0), \
-             capability_misses = LEAST(capability_misses, 2147483646) + 1, \
+             capability_misses = CASE \
+                 WHEN capability_miss_handler IS DISTINCT FROM $5 THEN 1 \
+                 ELSE LEAST(capability_misses, 2147483646) + 1 \
+             END, \
              capability_miss_workers = CASE \
+                 WHEN capability_miss_handler IS DISTINCT FROM $5 THEN ARRAY[$2] \
                  WHEN $2 = ANY(capability_miss_workers) THEN capability_miss_workers \
                  ELSE array_append(capability_miss_workers, $2) \
              END, \
+             capability_miss_handler = $5, \
              scheduled_at = NOW() + make_interval(secs => $3), \
              sticky_worker_id = NULL, \
              sticky_until = NULL, \
@@ -2175,11 +2185,16 @@ pub const fn release_task_for_capability_miss_query(
              worker_id = NULL, \
              started_at = NULL, \
              last_heartbeat_at = NULL, \
-             capability_misses = LEAST(capability_misses, 2147483646) + 1, \
+             capability_misses = CASE \
+                 WHEN capability_miss_handler IS DISTINCT FROM $5 THEN 1 \
+                 ELSE LEAST(capability_misses, 2147483646) + 1 \
+             END, \
              capability_miss_workers = CASE \
+                 WHEN capability_miss_handler IS DISTINCT FROM $5 THEN ARRAY[$2] \
                  WHEN $2 = ANY(capability_miss_workers) THEN capability_miss_workers \
                  ELSE array_append(capability_miss_workers, $2) \
              END, \
+             capability_miss_handler = $5, \
              scheduled_at = NOW() + make_interval(secs => $3), \
              sticky_worker_id = NULL, \
              sticky_until = NULL, \
@@ -2287,6 +2302,7 @@ pub async fn release_task_for_capability_miss(
     backoff: StdDuration,
     phase: crate::error::CapabilityMissPhase,
     claim_crash_strikes: i32,
+    frontier: &str,
 ) -> HarvestResult<Option<i32>> {
     // Bounded by `capability_miss_backoff`'s 30s cap; the clamp is defensive.
     let backoff_secs = f64::min(backoff.as_secs_f64(), 3600.0);
@@ -2295,6 +2311,7 @@ pub async fn release_task_for_capability_miss(
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .bind::<diesel::sql_types::Double, _>(backoff_secs)
         .bind::<diesel::sql_types::Integer, _>(claim_crash_strikes)
+        .bind::<diesel::sql_types::Text, _>(frontier)
         .get_results::<DistinctMissWorkersRow>(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -2355,6 +2372,18 @@ pub const fn reset_capability_misses_after_inline_progress_query() -> &'static s
 /// local-activity call sites (itself bounded by the history hard cap). The
 /// budget therefore becomes "per frontier" rather than "per task", which is what
 /// it always meant.
+///
+/// This reset covers the frontier moves a *dispatch* makes. A third mover needs
+/// no reset at all: newly INGESTED history (a due timer fire, a pending signal,
+/// an external delta appended by `prepare_workflow_task_with_cache` before the
+/// capability gate) can move the frontier with no park and no inline progress
+/// in between. That one is handled by keying the evidence to the missed handler
+/// (`capability_miss_handler`, Codex round-46 P1) rather than by resetting: the
+/// counters simply do not apply to a handler they were not recorded against, so
+/// a stale key needs no cleanup. It also makes THIS reset belt-and-braces for
+/// the inline case — a row left keyed to a retired frontier reads as a fresh
+/// budget either way — while the reset keeps its independent job of clearing
+/// the absolute-ceiling count, which the key alone does not touch.
 ///
 /// # Errors
 ///
@@ -2495,7 +2524,22 @@ pub async fn invalidate_capability_miss_evidence_for_worker(
 /// claim it no longer holds.
 #[must_use]
 pub const fn read_capability_miss_state_query() -> &'static str {
-    "SELECT capability_misses, capability_miss_workers \
+    // `$3` is the frontier this dispatch is missing (`{kind}:{name}`, from
+    // `MissingHandler::frontier_key`). When it differs from the one the row
+    // records, the stored counters are evidence about a frontier that is now
+    // behind us, and charging their spend to a frontier no peer has ever been
+    // offered is what terminally fails a run the fleet can still finish
+    // (issue #804, Codex round-46 P1). Zeroing here rather than in the caller
+    // keeps the comparison ATOMIC with the read: the row cannot change frontier
+    // between deciding which counters apply and reading them.
+    //
+    // `IS DISTINCT FROM` (not `<>`) so a `NULL` handler — no frontier recorded
+    // yet — reads as a mismatch and therefore as a full budget.
+    "SELECT \
+         CASE WHEN capability_miss_handler IS DISTINCT FROM $3 \
+             THEN 0 ELSE capability_misses END AS capability_misses, \
+         CASE WHEN capability_miss_handler IS DISTINCT FROM $3 \
+             THEN '{}'::text[] ELSE capability_miss_workers END AS capability_miss_workers \
      FROM harvest_task_queue \
      WHERE id = $1 \
        AND state = 'RUNNING' \
@@ -2530,6 +2574,7 @@ pub async fn read_capability_miss_state(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     worker_id: &str,
+    frontier: &str,
 ) -> HarvestResult<Option<(i32, Vec<String>)>> {
     #[derive(diesel::QueryableByName)]
     struct MissStateRow {
@@ -2542,6 +2587,7 @@ pub async fn read_capability_miss_state(
     let rows: Vec<MissStateRow> = diesel::sql_query(read_capability_miss_state_query())
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Text, _>(frontier)
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -4342,6 +4388,38 @@ mod tests {
         );
     }
 
+    /// The re-read must apply the row's counters only when they are evidence
+    /// about the handler this dispatch is actually stuck on (issue #804, Codex
+    /// round-46 P1).
+    ///
+    /// Doing the comparison in SQL rather than in the caller keeps it ATOMIC
+    /// with the read: the row cannot change frontier between deciding which
+    /// counters apply and reading them.
+    #[test]
+    fn miss_state_read_is_keyed_to_the_frontier() {
+        let sql = read_capability_miss_state_query();
+        assert!(
+            sql.contains("capability_miss_handler IS DISTINCT FROM $3"),
+            "the read must compare the row's recorded frontier against the one \
+             this dispatch is missing: {sql}"
+        );
+        // `IS DISTINCT FROM`, never `<>`: a NULL handler must read as a
+        // mismatch (a fresh budget), and `<> $3` is NULL -- neither branch --
+        // for a NULL left side.
+        assert!(
+            !sql.contains("capability_miss_handler <> $3")
+                && !sql.contains("capability_miss_handler != $3"),
+            "a plain inequality yields NULL for an unrecorded frontier, which \
+             is neither arm of the CASE: {sql}"
+        );
+        assert!(
+            sql.contains("THEN 0 ELSE capability_misses END")
+                && sql.contains("THEN '{}'::text[] ELSE capability_miss_workers END"),
+            "BOTH counters must be zeroed on a mismatch, or the pair would \
+             disagree about which frontier it describes: {sql}"
+        );
+    }
+
     /// The commit-boundary guard must hold the row's lock (an unlocked check
     /// merely narrows the window before an unguarded `fail_task`), must key on
     /// the CLAIM rather than the worker, and must never WAIT for the lock.
@@ -4540,8 +4618,10 @@ mod tests {
                 "worker_id = NULL",
                 "started_at = NULL",
                 "last_heartbeat_at = NULL",
-                "capability_misses = LEAST(capability_misses, 2147483646) + 1",
+                "ELSE LEAST(capability_misses, 2147483646) + 1",
+                "capability_misses = CASE",
                 "capability_miss_workers = CASE",
+                "capability_miss_handler = $5",
                 "scheduled_at = NOW() + make_interval(secs => $3)",
                 "sticky_worker_id = NULL",
                 "sticky_until = NULL",
@@ -4621,12 +4701,31 @@ mod tests {
             release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler),
         ] {
             assert!(
-                sql.contains("capability_misses = LEAST(capability_misses, 2147483646) + 1"),
+                sql.contains("ELSE LEAST(capability_misses, 2147483646) + 1"),
                 "the bounded-redelivery counter is the only counter a capability \
                  miss advances (AC3/AC4), and it must SATURATE rather than raise: \
                  a bare `+ 1` at i32::MAX aborts the statement, leaving the row \
                  RUNNING under a live worker that orphan reclamation skips \
                  (issue #804, Codex round-22 P2)",
+            );
+            // The saturating increment is the SAME-frontier arm: a release that
+            // lands on a different handler than the row records restarts at 1
+            // rather than inheriting a prior frontier's spend (Codex round-46
+            // P1). Both arms are pinned so neither can be dropped alone.
+            assert!(
+                sql.contains("WHEN capability_miss_handler IS DISTINCT FROM $5 THEN 1"),
+                "a miss on a NEW frontier must start its budget at 1, not \
+                 continue the previous frontier's count: {sql}"
+            );
+            assert!(
+                sql.contains("WHEN capability_miss_handler IS DISTINCT FROM $5 THEN ARRAY[$2]"),
+                "a miss on a NEW frontier must start a fresh distinct-worker \
+                 set, not inherit workers that missed a different handler: {sql}"
+            );
+            assert!(
+                sql.contains("capability_miss_handler = $5"),
+                "the release must RECORD the frontier its counters are evidence \
+                 about, or the next dispatch cannot tell whose they are: {sql}"
             );
         }
     }

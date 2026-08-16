@@ -1765,3 +1765,78 @@ Documentation follows the behavior: CLAUDE.md's #803 rollout-ordering note now
 separates the releasable case from the three that stay terminal, while keeping
 the ordering requirement (a target that never reaches any live worker still
 escalates).
+
+## Review round 46 — capability-miss evidence is keyed to the handler it is about
+
+`capability_misses` / `capability_miss_workers` have always described **one
+frontier** — the position a workflow is stuck at, and therefore the single
+handler a claiming worker must register to move it. Two paths retired a frontier
+explicitly (a park, round 20; inline local-activity progress, round 20/22), and
+both reset the counters. A third retires one with neither:
+`prepare_workflow_task_with_cache` ingests a due timer fire, a pending signal, or
+an external delta **before** the capability gate, so the very next replay can be
+stuck on a different handler with nothing having reset anything.
+
+The row recorded counts and worker ids but never *whose* they were, so the new
+frontier inherited the old one's spend. After a budget was exhausted looking for
+`X`, the first worker to miss `Y` could produce `AllLiveWorkersMissed` and
+terminally fail the execution — while a worker that missed `X` may well register
+`Y` and was never asked. That is the exact inversion #804 exists to prevent, one
+step removed: not "a capable peer lost the claim race" but "a capable peer was
+never asked the question".
+
+**The fix is a key, not another reset.** A new nullable
+`harvest_task_queue.capability_miss_handler` records the `{kind}:{name}` the
+counters are evidence about (`MissingHandler::frontier_key`; `kind` is included
+because the two registries are separate namespaces, so a same-named activity and
+workflow are different frontiers). The comparison lives in **SQL**, on both
+sides:
+
+- `read_capability_miss_state_query` returns `0` / `'{}'` when
+  `capability_miss_handler IS DISTINCT FROM $3`, so the authoritative read is
+  keyed **atomically** — the row cannot change frontier between deciding which
+  counters apply and reading them.
+- All three release-statement variants restart at `1` / `ARRAY[$2]` on a
+  mismatch and stamp the new key, so a frontier's budget begins where it is
+  first asked.
+
+`IS DISTINCT FROM` rather than `<>`: a `NULL` key (nothing recorded yet, and
+every row written before this change) must read as a mismatch — a full budget —
+and a plain inequality yields `NULL`, which is neither arm of the `CASE`. That
+direction is the safe one, and it is pinned.
+
+Because a stale key with zeroed counters is inert (a match increments `0 → 1`, a
+mismatch resets to `1` — the same row either way), the ~6 existing reset paths
+needed no edit at all. `frontier_miss_state` applies the identical rule to the
+claim-time snapshot it falls back to, so the fallback cannot disagree with the
+authoritative read.
+
+**AC3 (bounded) still holds per task.** Keying moves the absolute ceiling from
+per-task to per-frontier, so the bound is worth restating: a frontier is a pure
+function of recorded history, so two dispatches with no new events land on the
+same handler and cannot oscillate. The frontier moves only when history grows,
+and every such event is appended once and consumed once — so the number of
+frontiers one task can present is bounded by the history hard cap (the same
+argument `reset_capability_misses_after_inline_progress` already makes), and no
+single frontier can release forever. Documented at `frontier_miss_state` and in
+the runbook's "Sizing the budget" section.
+
+**Money test.**
+`evidence_recorded_against_another_handler_does_not_spend_this_frontiers_budget`
+drives the real dispatch path: a task carrying a fully-spent two-worker budget
+recorded against `workflow:a_frontier_we_moved_past` is claimed by a single
+incapable worker configured with a budget of **1**. It releases rather than
+escalating, re-keys the row to the frontier it actually missed, restarts the
+count at `1` with a fresh worker set, leaves the execution `RUNNING` with no
+`WorkflowFailed`, and touches no crash strike. Confirmed falsifiable at both
+layers — with the Rust check and the read-query `CASE` neutered it escalates and
+the test fails in 30 s.
+
+Three pure tests pin the rule without a database (mismatch zeroes, a `NULL` key
+zeroes, the two namespaces do not share a budget), and three SQL-shape tests pin
+both arms of the release statement and all three properties of the read query,
+so neither can be half-removed. The DB suite's `seed_prior_missing_workers` now
+takes the workflow its misses are about, which is what keeps the eight
+escalation tests it feeds honest: seeding evidence without its handler would
+read as a fresh budget and every escalation they assert would silently become a
+release.

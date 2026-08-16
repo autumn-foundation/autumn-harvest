@@ -463,6 +463,28 @@ pub struct TaskQueueItem {
     /// it escalates.
     #[serde(default)]
     pub capability_miss_workers: Vec<String>,
+
+    /// Which handler the two counters above are evidence about, as
+    /// `{kind}:{name}` (issue #804, Codex round-46 P1).
+    ///
+    /// The counters describe **one frontier** — the position the workflow is
+    /// stuck at, and so the single handler a claiming worker must register to
+    /// move it. Without this, evidence survived a frontier change that no
+    /// reset covered: `prepare_workflow_task_with_cache` ingests due timers and
+    /// pending signals *before* the persist-time capability gate, so a signal
+    /// arriving while the task bounces on missing handler X can move the replay
+    /// onto a branch needing Y — no park, no inline progress, and X's missers
+    /// still on the row, counted as evidence about Y.
+    ///
+    /// A mismatch is treated as a **fresh** frontier by both the decision (the
+    /// read zeroes the counters) and the release (it resets them to this one
+    /// miss). `None` reads as a mismatch, which is the safe direction.
+    ///
+    /// Deliberately **not** cleared by the paths that zero the counters: with
+    /// the counts already `0` a stale key is inert, since a match increments
+    /// `0 -> 1` and a mismatch resets to `1` — the same row either way.
+    #[serde(default)]
+    pub capability_miss_handler: Option<String>,
 }
 
 /// Insert struct for enqueuing a new task.
