@@ -109,8 +109,13 @@ RESTORE_MODE="none"
 restore() {
   case "$RESTORE_MODE" in
     stash)
-      echo "== restoring ${QUEUE_RS} (git stash pop) =="
-      git stash pop
+      echo "== restoring ${QUEUE_RS} (git stash pop --index) =="
+      # `--index` is required, not cosmetic: without it, `git stash pop`
+      # reapplies the stashed content as a plain unstaged modification
+      # regardless of whether it was staged, unstaged, or a mix when
+      # `git stash push` captured it -- silently collapsing the caller's
+      # index state on every dev-loop run of this script.
+      git stash pop --index
       ;;
     checkout)
       echo "== restoring ${QUEUE_RS} (git checkout) =="

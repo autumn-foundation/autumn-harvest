@@ -1908,14 +1908,26 @@ async fn zz_capture_queue_pause_claim_evidence() {
             .await
             .expect("rollback");
 
-        let plan_text = match loaded {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|r| r.query_plan)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            Err(e) => format!("EXPLAIN failed: {e}"),
-        };
+        // The transaction is already rolled back above regardless of whether
+        // `loaded` is `Ok` or `Err`, so panicking here on failure leaves no
+        // dangling transaction. A failure must abort the capture, not get
+        // serialized as plan text: the shell harness only checks for the
+        // trailing completion marker, so a swallowed EXPLAIN failure here
+        // would let a run with no real plan for this backlog depth pass as
+        // successfully reproduced evidence.
+        let plan_text = loaded
+            .unwrap_or_else(|e| {
+                panic!(
+                    "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF) \
+                     failed for backlog={backlog}: {e} -- the literal \
+                     substitution of claim_task_query() above is likely stale \
+                     against a query shape change; see the `literals` array"
+                )
+            })
+            .into_iter()
+            .map(|r| r.query_plan)
+            .collect::<Vec<_>>()
+            .join("\n");
 
         let file_name = format!("{label}-claim-backlog-{backlog}.explain.txt");
         std::fs::write(
@@ -1990,6 +2002,12 @@ async fn zz_capture_queue_pause_claim_evidence() {
         seeded.claimable_rows
     );
 
+    // A query failure here (extension not preloaded, view missing, ...) must
+    // fail the capture loudly rather than collapse into an empty snapshot
+    // that the shell harness's marker-only success check cannot distinguish
+    // from "ran fine, genuinely zero matching rows" -- see
+    // `setup_container_bench_db` for how the Docker-fallback container is
+    // configured to make this query actually succeed.
     let stats_rows: Vec<StatRow> = diesel::sql_query(
         "SELECT query, calls, shared_blks_hit, shared_blks_read, \
                 (shared_blks_hit + shared_blks_read) AS total_buffers \
@@ -1998,7 +2016,13 @@ async fn zz_capture_queue_pause_claim_evidence() {
     )
     .load(&mut stats_conn)
     .await
-    .unwrap_or_default();
+    .expect(
+        "pg_stat_statements query failed -- it must be preloaded via \
+         shared_preload_libraries (the Docker fallback container already \
+         does this; an external HARVEST_TEST_DATABASE_URL target must too) \
+         for this capture to produce real evidence rather than a silent \
+         placeholder",
+    );
 
     let stats_text = if stats_rows.is_empty() {
         "pg_stat_statements unavailable or returned no rows".to_string()
