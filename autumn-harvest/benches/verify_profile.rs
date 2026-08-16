@@ -284,12 +284,54 @@ fn read_prepared_meta(dir: &std::path::Path) -> Option<(usize, usize)> {
 /// derives the true shape from what's actually on disk), instead of a
 /// stale-but-well-formed sidecar silently lying about it.
 fn remove_stale_meta(dir: &std::path::Path) {
-    let path = dir.join(PROFILE_META_FILENAME);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => panic!("failed to remove stale {}: {e}", path.display()),
+    for path in [
+        dir.join(PROFILE_META_FILENAME),
+        dir.join(profile_meta_tmp_filename()),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("failed to remove stale {}: {e}", path.display()),
+        }
     }
+}
+
+/// Filename for the temp sidecar `write_meta_atomically` writes and syncs
+/// before renaming it into place as `PROFILE_META_FILENAME`. Also removed by
+/// `remove_stale_meta`, so a leftover temp file from a `prepare` invocation
+/// that crashed *during* the temp-write step (before ever reaching the
+/// rename) does not linger in the directory across a later `prepare`.
+fn profile_meta_tmp_filename() -> String {
+    format!("{PROFILE_META_FILENAME}.tmp")
+}
+
+/// Write `PROFILE_META_FILENAME` atomically: the contents are written to and
+/// `sync_all`'d on a temp file in the same directory first, then published
+/// via `std::fs::rename` -- an atomic filesystem operation (on the same
+/// filesystem, which `dir` and the temp file always share here) -- so a
+/// reader (`read_prepared_meta`) can only ever observe the fully-old sidecar
+/// or the fully-new one, never a partial write.
+///
+/// Without this, a `prepare` invocation interrupted (crash, kill, OOM, or
+/// simply a short write) *during* the sidecar write can leave a
+/// *syntactically valid but wrong* truncated prefix on disk -- e.g. an
+/// intended `activities=500` truncated to `activities=50` still parses as a
+/// legitimate `usize`. `read_prepared_meta`'s malformed-sidecar panic cannot
+/// catch this case (the truncated content is not malformed, just
+/// incomplete-and-coincidentally-valid), so `run` would silently report the
+/// wrong workload shape with no diagnostic that the sidecar was ever
+/// interrupted mid-write.
+fn write_meta_atomically(dir: &std::path::Path, fixtures: usize, activities: usize) {
+    let tmp_path = dir.join(profile_meta_tmp_filename());
+    let final_path = dir.join(PROFILE_META_FILENAME);
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp_path).expect("create temp profile meta sidecar");
+        file.write_all(format!("fixtures={fixtures}\nactivities={activities}\n").as_bytes())
+            .expect("write temp profile meta sidecar");
+        file.sync_all().expect("sync temp profile meta sidecar");
+    }
+    std::fs::rename(&tmp_path, &final_path).expect("publish profile meta sidecar");
 }
 
 /// Remove any pre-existing `fixture_*.json` files from `dir` before
@@ -347,11 +389,7 @@ fn prepare_fixtures(dir: &std::path::Path, fixtures: usize, activities: usize) {
         std::fs::write(dir.join(format!("fixture_{i:05}.json")), &fixture_json)
             .expect("write fixture");
     }
-    std::fs::write(
-        dir.join(PROFILE_META_FILENAME),
-        format!("fixtures={fixtures}\nactivities={activities}\n"),
-    )
-    .expect("write profile meta sidecar");
+    write_meta_atomically(dir, fixtures, activities);
 }
 
 /// A *genuinely absent* `VERIFY_PROFILE_DIR` panics unconditionally (unchanged).
@@ -387,6 +425,20 @@ fn required_profile_dir(mode: &str) -> std::path::PathBuf {
 /// replay-drift-bundle manifest filename `verify_dir` excludes, so pointing
 /// this fallback at a `replay_bundle`-produced directory (issue #798) does
 /// not misparse the manifest file as a fixture.
+///
+/// Classifies each entry via `DirEntry::file_type()`, not `path.is_dir()` --
+/// the latter follows symlinks (`Path::is_dir()` is backed by
+/// `fs::metadata`), while `verify_dir`'s own `collect_json_files`
+/// (`src/testing.rs`) classifies via `entry.file_type()`, which does *not*
+/// follow symlinks. Using `path.is_dir()` here would recurse into a
+/// directory reached only through a symlink that `verify_dir` itself never
+/// traverses (so this fallback could report metadata for fixtures `verify_dir`
+/// never actually measured, or spin on a symlink cycle `verify_dir` handles
+/// gracefully by simply not recursing into it) -- `entry.file_type()` makes
+/// this fallback's traversal match what was actually verified, entry for
+/// entry. An entry whose type can't be determined (a race, a broken
+/// symlink) is silently skipped rather than panicking, matching
+/// `collect_json_files`'s own tolerant `if let Ok(file_type) = ...` handling.
 fn collect_json_fixtures(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     let mut dirs_to_visit = vec![dir.to_path_buf()];
@@ -395,13 +447,15 @@ fn collect_json_fixtures(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
             .unwrap_or_else(|e| panic!("read {}: {e}", current_dir.display()));
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
-            if path.is_dir() {
-                dirs_to_visit.push(path);
-            } else if path.extension().and_then(|ext| ext.to_str()) == Some("json")
-                && path.file_name().and_then(|name| name.to_str())
-                    != Some(SampleManifest::FILE_NAME)
-            {
-                files.push(path);
+            if let Ok(file_type) = entry.file_type() {
+                if file_type.is_dir() {
+                    dirs_to_visit.push(path);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("json")
+                    && path.file_name().and_then(|name| name.to_str())
+                        != Some(SampleManifest::FILE_NAME)
+                {
+                    files.push(path);
+                }
             }
         }
     }
