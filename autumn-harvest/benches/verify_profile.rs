@@ -386,8 +386,30 @@ fn run_verify(dir: &std::path::Path, fixtures: usize, activities: usize) {
     );
 }
 
+/// Read `VERIFY_PROFILE_MODE`, defaulting an *absent* variable to `"full"`.
+/// A *non-UTF-8* value panics rather than being silently folded into the
+/// same default as "absent" -- `std::env::var`'s `Err` covers both
+/// `VarError::NotPresent` and `VarError::NotUnicode`, and collapsing both
+/// into `.unwrap_or_else(|_| "full")` would let a non-UTF-8 mode value (a
+/// launcher passing a raw, invalid-UTF-8 `OsString`, reachable on Unix)
+/// silently run the un-isolated `full` mode inside what the caller believes
+/// is a profiled, isolated `run`-mode invocation -- exactly the failure this
+/// file's other two workload-shape checks (`env_usize` and the `match
+/// mode.as_str()` catch-all just below) already guard against. Mirrors
+/// `env_usize`'s `NotPresent`/`NotUnicode` split.
+fn resolve_mode() -> String {
+    match std::env::var("VERIFY_PROFILE_MODE") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => "full".to_string(),
+        Err(std::env::VarError::NotUnicode(raw)) => panic!(
+            "VERIFY_PROFILE_MODE is not valid UTF-8: {}",
+            raw.to_string_lossy()
+        ),
+    }
+}
+
 fn main() {
-    let mode = std::env::var("VERIFY_PROFILE_MODE").unwrap_or_else(|_| "full".to_string());
+    let mode = resolve_mode();
     let fixtures = env_usize("VERIFY_PROFILE_FIXTURES", 20);
     let activities = env_usize("VERIFY_PROFILE_ACTIVITIES", 500);
 
