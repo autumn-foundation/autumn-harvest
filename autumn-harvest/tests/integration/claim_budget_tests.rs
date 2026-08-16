@@ -1966,23 +1966,34 @@ async fn zz_capture_queue_pause_claim_evidence() {
     // invocation creates a fresh `harvest_claim_bench_*` database with
     // identical schema and literal query text -- would still be sitting
     // there and could be picked up by the query below instead of (or mixed
-    // with) this run's real capture. `pg_stat_statements_reset()` with no
-    // arguments is restricted to superusers by default, so this is a real
-    // failure mode against an external HARVEST_TEST_DATABASE_URL role that
-    // isn't one -- propagate it rather than silently proceeding on
-    // unreliably-scoped statistics.
-    diesel::sql_query("SELECT pg_stat_statements_reset()")
-        .execute(&mut stats_conn)
-        .await
-        .expect(
-            "pg_stat_statements_reset() failed -- without a clean reset, a \
+    // with) this run's real capture.
+    //
+    // Scoped to THIS database's dbid (`pg_stat_statements_reset(userid,
+    // dbid, queryid)`, all three params defaulting to 0 = "match all" when
+    // omitted; passing only `dbid` restricts the reset to it) rather than
+    // the argument-free cluster-wide form: this harness may share an
+    // external cluster with a concurrent capture (a second worktree, a CI
+    // job running the same script against the same HARVEST_TEST_DATABASE_URL
+    // host), and a cluster-wide reset would wipe that run's
+    // still-accumulating counters out from under it mid-claim-loop. The
+    // permission requirement is unchanged by scoping -- `EXECUTE` on this
+    // function is superuser-only by default regardless of which overload is
+    // called, so a role without it still needs an explicit grant.
+    diesel::sql_query(
+        "SELECT pg_stat_statements_reset(0, \
+                (SELECT oid FROM pg_database WHERE datname = current_database()), 0)",
+    )
+    .execute(&mut stats_conn)
+    .await
+    .expect(
+        "pg_stat_statements_reset(...) failed -- without a clean reset, a \
              stale entry from a prior run of this exact harness (same \
              schema, same literal query text, different ephemeral database) \
              could corrupt this capture's top-10-by-buffers ranking; the \
-             HARVEST_TEST_DATABASE_URL role must be able to reset cluster-wide \
-             statistics (superuser, or explicitly granted EXECUTE on this \
-             function)",
-        );
+             HARVEST_TEST_DATABASE_URL role must be able to reset \
+             statistics for its own database (superuser, or explicitly \
+             granted EXECUTE on this function)",
+    );
 
     let headline = headline_scenario();
     let seeded = db::seed(&mut stats_conn, headline).await;

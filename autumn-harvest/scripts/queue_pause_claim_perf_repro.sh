@@ -73,7 +73,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 QUEUE_RS="autumn-harvest/src/queue.rs"
-OUT_DIR="${1:-$REPO_ROOT/docs/perf-artifacts/queue-pause-claim-anti-join}"
+# Must match the fixed path the Rust test itself writes to (derived from
+# CARGO_MANIFEST_DIR at compile time, not overridable from here) -- this is
+# display-only, used for the final `ls` below, not passed into the test.
+OUT_DIR="$REPO_ROOT/docs/perf-artifacts/queue-pause-claim-anti-join"
 TEST_FILTER="claim_budget_tests::zz_capture_queue_pause_claim_evidence"
 FIX_MARKER="paused_queues AS MATERIALIZED"
 
