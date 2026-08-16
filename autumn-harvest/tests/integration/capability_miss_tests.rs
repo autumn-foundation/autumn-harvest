@@ -2909,16 +2909,22 @@ async fn a_surviving_old_row_still_retries_the_failed_startup_registration() {
     );
 }
 
-/// A retry that fails again must not refresh the unverified row (issue #804,
-/// Codex round-50 P1).
+/// A retry that fails again must withdraw the unverified row (issue #804,
+/// Codex rounds 50 and 51 P1).
 ///
 /// With a reused `worker_id` the previous row is still there, so falling
 /// through to `heartbeat_worker` would *succeed* — republishing the old build's
 /// `build_id`/queues as live while this id's stale capability-miss evidence is
 /// still uncleared. That is affirmative false fleet evidence, and it is exactly
 /// what produces `AllLiveWorkersMissed` and a terminal failure of a task this
-/// worker can run. Publishing nothing is more honest than republishing
-/// something known-false, so the tick returns and the row ages out.
+/// worker can run.
+///
+/// Not heartbeating is necessary but not sufficient (round 51): the
+/// capability-miss fleet window is floored at 120 s, so for that whole window
+/// the surviving row is still read as a live worker that has already missed.
+/// The tick therefore *withdraws* the row outright, which is the truthful
+/// state while the registration is unverified — an absent worker is simply not
+/// part of the fleet read.
 ///
 /// The failure is injected the same way round 28's atomicity test does —
 /// renaming `harvest_task_queue` out from under the invalidation on a separate
@@ -2946,12 +2952,11 @@ async fn a_failed_retry_does_not_refresh_the_unverified_row() {
     .await
     .expect("seed the surviving old worker row");
 
-    let before: chrono::DateTime<Utc> = harvest_workers::table
-        .find(worker_id)
-        .select(harvest_workers::last_heartbeat_at)
-        .first(&mut conn)
-        .await
-        .expect("read the seeded heartbeat");
+    assert_eq!(
+        live_worker_count(&url, worker_id).await,
+        1,
+        "precondition: the previous instance's row survives the rolled-back pair"
+    );
 
     let registration = autumn_harvest::workers::WorkerRegistration {
         worker_id: worker_id.to_string(),
@@ -2981,23 +2986,15 @@ async fn a_failed_retry_does_not_refresh_the_unverified_row() {
         .await
         .expect("restores the table for any later test");
 
-    let after: chrono::DateTime<Utc> = harvest_workers::table
-        .find(worker_id)
-        .select(harvest_workers::last_heartbeat_at)
-        .first(&mut conn)
-        .await
-        .expect("re-read the heartbeat");
-
     assert_eq!(
-        after, before,
-        "a failed retry must not refresh the unverified row -- a fresh heartbeat \
-         republishes the old build as live and is affirmative false fleet evidence"
+        live_worker_count(&url, worker_id).await,
+        0,
+        "a failed retry must WITHDRAW the unverified row: leaving it live for the \
+         120s fleet window keeps it readable as a worker that already missed, which \
+         is what lets a peer derive AllLiveWorkersMissed"
     );
-    assert_eq!(
-        live_build_id(&url, worker_id).await,
-        OLD_BUILD,
-        "the failed pair is atomic, so nothing about the row may change"
-    );
+    // This also proves the heartbeat never ran: `heartbeat_worker` refreshes the
+    // surviving row, it never removes one.
     assert!(
         AtomicBool::load(&pending, Ordering::Relaxed),
         "the flag must stay armed so the next tick retries rather than giving up"

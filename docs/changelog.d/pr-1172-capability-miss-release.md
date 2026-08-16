@@ -2058,3 +2058,42 @@ round 28's atomicity test does, and asserts `last_heartbeat_at` is byte-identica
 `registration_arms_the_retry_when_the_connection_cannot_be_acquired` and
 `registration_pending_is_answered_per_pool`, which drive `register_in_fleet`
 against pools pointed at a dead port.
+
+## Review round 51
+
+**Not heartbeating was necessary but not sufficient — the surviving row had to
+be withdrawn, not merely left to expire.**
+
+Round 50 stopped refreshing a row whose registration could not be verified, on
+the reasoning that publishing nothing beats republishing something known-false.
+True, but incomplete: the capability-miss fleet window is **floored at 120 s**
+(round 19), and for that entire window the surviving row is still read as a
+*live* worker — one that appears in `capability_miss_workers`, and therefore one
+that has *already missed*. That is precisely the shape a peer needs to derive
+`AllLiveWorkersMissed`, so the budget can still be exhausted and the run still
+terminally failed while the replacement is up and capable.
+
+The distinction that matters: a live row carrying stale evidence is
+*affirmative false evidence*, while an **absent** row is neutral — the worker is
+simply not part of the fleet read, which is the truth while its registration is
+unverified. So the tick now withdraws the row outright rather than waiting for
+it to age out.
+
+The withdrawal is deliberately a single-table `DELETE` on `harvest_workers`, so
+it can still succeed when the register+invalidate transaction cannot — that
+transaction's `harvest_task_queue` half is the usual failure. It is best-effort:
+if it fails too, round 50's ageing-out path remains the fallback and the next
+tick retries both. `register_worker` re-inserts on the first successful retry.
+
+**Gating the poll loop was the other suggestion, and was declined.** Tracing the
+evidence logic shows it would not prevent the escalation: `AllLiveWorkersMissed`
+is decided over the *other* live workers, and a worker absent from the fleet
+read is neutral either way. Gating would only stop this — possibly capable —
+worker from rescuing the task, which is the opposite of what issue #804 is for,
+and would take an entire worker offline on a transient startup blip.
+
+Pinned by the round-50 test, strengthened from "was not refreshed" to
+"was withdrawn": it asserts the row is present before the tick and absent after,
+which also proves the heartbeat never ran (`heartbeat_worker` refreshes a
+surviving row, it never removes one). Verified RED against a neutered withdrawal
+(`left: 1`, `right: 0`).

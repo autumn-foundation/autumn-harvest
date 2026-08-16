@@ -1261,6 +1261,33 @@ pub async fn drain_preview(
 // Background heartbeat task
 // ---------------------------------------------------------------------------
 
+/// Remove a worker row whose registration could not be verified (issue #804,
+/// Codex round-51 P1).
+///
+/// A row that survives a rolled-back registration is not merely out of date —
+/// it is *affirmative false evidence*. The capability-miss fleet read counts a
+/// live worker that appears in `capability_miss_workers` as one that has
+/// already missed the task, so a surviving row keeps a peer's
+/// `AllLiveWorkersMissed` conclusion alive for the whole 120 s liveness floor
+/// while this worker is unable to publish the build it is actually running.
+/// An **absent** row is neutral: the worker is simply not part of the fleet
+/// read, which is the truth while its registration is unverified.
+///
+/// Deliberately a single-table `DELETE`, so it can still succeed when the
+/// register+invalidate transaction cannot — the failure is usually in that
+/// transaction's `harvest_task_queue` half. It is best-effort: on failure the
+/// caller falls back to letting the row age out, and the next heartbeat
+/// retries both. `register_worker` re-inserts on the first successful retry.
+async fn withdraw_unverified_worker_row(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<usize> {
+    diesel::delete(harvest_workers::table.find(worker_id))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
 /// Execute one heartbeat DB tick: update `last_heartbeat_at`, handle
 /// re-registration / drain transitions, and refresh the drain deadline.
 ///
@@ -1328,11 +1355,27 @@ pub async fn do_heartbeat_tick(
                 // execution") settles the ordering. Remote-drain detection is
                 // likewise skipped for this tick; a worker that cannot register
                 // is already invisible to the fleet.
+                //
+                // Ageing out is not fast enough on its own (issue #804, Codex
+                // round-51 P1): the capability-miss fleet window is floored at
+                // 120 s, and for that whole window the surviving row is still
+                // read as a LIVE worker carrying this id's stale miss evidence
+                // — i.e. as a worker that has already missed — which is what
+                // lets a peer derive `AllLiveWorkersMissed`. So withdraw the
+                // row now rather than waiting for it to expire.
+                //
+                // Best-effort and deliberately narrow: a single-table DELETE
+                // on `harvest_workers`, which can still succeed when the
+                // two-table transaction cannot (its `harvest_task_queue` half
+                // is the usual failure). If it too fails, the ageing-out path
+                // above is the fallback and the next tick retries both.
+                let withdrawn = withdraw_unverified_worker_row(conn, &registration.worker_id).await;
                 tracing::warn!(
                     worker_id = %registration.worker_id,
                     error = %error,
-                    "startup registration retry failed; skipping this heartbeat so the \
-                     unverified row ages out, and retrying on the next tick"
+                    row_withdrawn = ?withdrawn,
+                    "startup registration retry failed; withdrew the unverified row so it \
+                     cannot be read as live fleet evidence, and will retry on the next tick"
                 );
                 return;
             }
