@@ -3013,6 +3013,84 @@ async fn a_timed_out_workflow_task_reset_preserves_the_capability_miss_budget() 
     );
 }
 
+/// A stale dispatcher must not release a claim that is no longer its own
+/// (issue #804, Codex round-37 P1).
+///
+/// `poison_pill::requeue_orphan` hands an orphaned row back as `PENDING` /
+/// `worker_id = NULL` with `crash_strikes + 1`, and nothing stops the SAME
+/// worker from winning it again. Guarding the release on `(state, worker_id)`
+/// alone matches that new claim, so the stale dispatcher would re-`PENDING` a
+/// row whose replacement handler is already running -- inviting a second
+/// concurrent claim of the same task, and decrementing an `attempt` belonging
+/// to the new dispatch.
+///
+/// This is the release-path twin of
+/// `a_same_worker_reclaim_after_a_requeue_is_not_failed_by_the_stale_escalation`,
+/// which pins the same rule for the terminal write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_same_worker_reclaim_after_a_requeue_is_not_released_by_the_stale_dispatcher() {
+    let (url, _container) = setup_db().await;
+
+    let (_exec_id, task) = seed_claimed_task(&url, "q804-round37", "worker-a").await;
+    assert_eq!(
+        task.crash_strikes, 0,
+        "the dispatcher's snapshot is the pre-requeue claim"
+    );
+
+    // Requeue (strike bumped), then the SAME worker re-claims and starts running.
+    let mut mover = connect(&url).await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET state = 'RUNNING', worker_id = 'worker-a', crash_strikes = crash_strikes + 1, \
+             attempt = 3 \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task.id)
+    .execute(&mut mover)
+    .await
+    .expect("requeue then re-claim with the same worker");
+
+    // The stale dispatcher, still holding its pre-requeue snapshot, releases.
+    let mut conn = connect(&url).await;
+    let released = queue::release_task_for_capability_miss(
+        &mut conn,
+        task.id,
+        "worker-a",
+        Duration::from_secs(1),
+        CapabilityMissPhase::BeforeHandler,
+        task.crash_strikes,
+    )
+    .await
+    .expect("release query runs");
+
+    assert!(
+        released.is_none(),
+        "the strike bump means this is a NEW claim -- matching worker_id alone \
+         would re-PENDING a row whose replacement handler is already running"
+    );
+
+    let after = load_task(&url, task.id).await;
+    assert_eq!(
+        after.state, "RUNNING",
+        "the live replacement claim must survive; releasing it would let a \
+         second worker claim the same task concurrently"
+    );
+    assert_eq!(
+        after.worker_id.as_deref(),
+        Some("worker-a"),
+        "the replacement claim's ownership must be untouched"
+    );
+    assert_eq!(
+        after.attempt, 3,
+        "the stale dispatcher must not decrement an attempt belonging to the \
+         new dispatch"
+    );
+    assert_eq!(
+        after.capability_misses, task.capability_misses,
+        "a withdrawn release must not burn the redelivery budget either"
+    );
+}
+
 /// The number the release logs must be the one its own `UPDATE` wrote
 /// (issue #804, Codex round-36 P2).
 ///
@@ -3073,6 +3151,8 @@ async fn the_release_reports_the_cardinality_it_actually_committed() {
         "incapable",
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
+        // The claim epoch this seeded row was claimed at (Codex round-37 P1).
+        0,
     )
     .await
     .expect("release query runs");
@@ -3132,6 +3212,8 @@ async fn release_never_writes_the_error_column() {
         // counter is preserved (Codex round-12 P1) and `attempt` is restored
         // (Codex round-17 P2).
         CapabilityMissPhase::BeforeHandler,
+        // The claim epoch this seeded row was claimed at (Codex round-37 P1).
+        0,
     )
     .await
     .expect("release query runs");
@@ -3174,6 +3256,8 @@ async fn release_never_writes_the_error_column() {
         // counter is preserved (Codex round-12 P1) and `attempt` is restored
         // (Codex round-17 P2).
         CapabilityMissPhase::BeforeHandler,
+        // The claim epoch this seeded row was claimed at (Codex round-37 P1).
+        0,
     )
     .await
     .expect("release query runs");
@@ -3220,6 +3304,8 @@ async fn release_is_a_noop_when_the_claim_was_already_taken() {
         "worker-we-are",
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
+        // The claim epoch this seeded row was claimed at (Codex round-37 P1).
+        0,
     )
     .await
     .expect("release query runs");
@@ -3525,6 +3611,8 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
         "incapable",
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
+        // The claim epoch this seeded row was claimed at (Codex round-37 P1).
+        2,
     )
     .await
     .expect("release query runs");
@@ -3571,6 +3659,8 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
         "incapable",
         Duration::from_secs(1),
         CapabilityMissPhase::AfterHandler,
+        // The claim epoch this seeded row was claimed at (Codex round-37 P1).
+        2,
     )
     .await
     .expect("release query runs");

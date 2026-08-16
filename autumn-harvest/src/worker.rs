@@ -16547,6 +16547,11 @@ async fn release_capability_miss(
                 worker_id,
                 delay,
                 missing.phase,
+                // The claim epoch this dispatch holds. A poison-pill requeue
+                // bumps it and lets the SAME worker re-claim, so `worker_id`
+                // alone would also match that replacement claim (Codex
+                // round-37 P1).
+                task.crash_strikes,
             )
             .await?;
             let Some(durable_distinct_workers) = released else {

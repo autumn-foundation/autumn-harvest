@@ -1285,3 +1285,60 @@ incapable}` and the reported count is 2, not the snapshot-derived 3. The
 two invalidations so the durable count coincides with neither snapshot field;
 with a single invalidation it equals `distinct_before` numerically and the
 assertions could not discriminate.
+
+## Review round 37
+
+**Codex P1 — the release was guarded on the claim's *worker*, not its *claim*.**
+`release_task_for_capability_miss` matched `WHERE id = $1 AND state = 'RUNNING'
+AND worker_id = $2`. `poison_pill::requeue_orphan` hands an orphaned row back as
+`PENDING` / `worker_id = NULL` with `crash_strikes + 1`, and nothing stops the
+*same* worker from winning it again — so that guard also matches the **new**
+claim. A stale dispatcher's release would then re-`PENDING` a row whose
+replacement handler is already running, inviting a second concurrent claim of
+the same task (duplicate side effects), and rolling back an `attempt` belonging
+to the new dispatch.
+
+This is the same hole round 32 closed on the terminal-write path, which is why
+`claim_still_held_for_update_query` already keys on `crash_strikes`. The release
+is the far more common path and did not get the same treatment. All three
+phase-selected release statements now carry `AND crash_strikes = $4`, bound from
+the dispatcher's claim-time snapshot (`task.crash_strikes`).
+
+`crash_strikes` is the right discriminator because the requeue that creates the
+race is precisely what bumps it. An audit of every writer confirms it is stable
+within a claim: `poison_pill` is the only incrementer and only acts on orphans
+(no live heartbeat), in which case the claim genuinely *is* gone and refusing
+the release is the correct outcome; the only other writer is the `AfterHandler`
+release's own `crash_strikes = 0`. A refused release is already handled by the
+existing `None` arm — the worker logs, returns `Released` without counting the
+metric, and the reclaimer re-pends the row — so the failure mode is self-healing
+rather than a stuck task.
+
+RED, on the no-DB SQL-shape pin:
+
+```
+a poison-pill requeue lets the SAME worker re-claim the row, so `worker_id`
+alone does not identify the claim this dispatcher holds -- releasing a live
+replacement claim risks a concurrent second dispatch
+```
+
+RED, on the DB test, with the guard neutralised:
+
+```
+the strike bump means this is a NEW claim -- matching worker_id alone would
+re-PENDING a row whose replacement handler is already running
+```
+
+`a_same_worker_reclaim_after_a_requeue_is_not_released_by_the_stale_dispatcher`
+is the release-path twin of the round-32 terminal-path test, and additionally
+asserts the replacement claim's `attempt` and the redelivery budget are both
+untouched.
+
+**Note on `mixed_fleet_completes_every_execution_with_zero_spurious_failures`.**
+One full-suite run failed this test while the machine was loaded (92.8 s, versus
+35.8–63.7 s for three subsequent clean runs). It did not reproduce in isolation
+or across those reruns. The guard's refusal path was audited rather than
+assumed: a mid-claim `crash_strikes` bump can only come from a poison-pill
+reclaim, which means the claim is genuinely gone, and the reclaimer re-pends the
+row — so a refused release yields a correct, self-healing outcome, not a stuck
+task.

@@ -2136,6 +2136,7 @@ pub const fn release_task_for_capability_miss_query(
          WHERE id = $1 \
            AND state = 'RUNNING' \
            AND worker_id = $2 \
+           AND crash_strikes = $4 \
          RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
              AS distinct_miss_workers"
     } else if phase.restores_dispatch_attempt() {
@@ -2162,6 +2163,7 @@ pub const fn release_task_for_capability_miss_query(
          WHERE id = $1 \
            AND state = 'RUNNING' \
            AND worker_id = $2 \
+           AND crash_strikes = $4 \
          RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
              AS distinct_miss_workers"
     } else {
@@ -2187,6 +2189,7 @@ pub const fn release_task_for_capability_miss_query(
          WHERE id = $1 \
            AND state = 'RUNNING' \
            AND worker_id = $2 \
+           AND crash_strikes = $4 \
          RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
              AS distinct_miss_workers"
     }
@@ -2261,6 +2264,19 @@ pub const fn release_task_for_capability_miss_query(
 /// `{B,C}`. Reporting what the write produced makes the rollout diagnostic true
 /// by construction instead of by a timing assumption.
 ///
+/// `claim_crash_strikes` is the `crash_strikes` value the dispatcher observed
+/// when it claimed the row, and is what makes this release apply to **that**
+/// claim rather than merely to that *worker* (Codex round-37 P1).
+/// [`crate::poison_pill::requeue_orphan`] hands an orphaned row back as
+/// `PENDING` / `worker_id = NULL` with `crash_strikes + 1`, and nothing stops
+/// the same worker from winning it again — so a `(state, worker_id)` guard also
+/// matches that *new* claim. Releasing it would re-`PENDING` a row whose
+/// replacement handler is already running, inviting a second concurrent claim
+/// of the same task and rolling back an `attempt` that belongs to the new
+/// dispatch. `crash_strikes` is the right discriminator because the requeue
+/// that creates the race is what bumps it; the terminal escalation guard
+/// ([`claim_still_held_for_update_query`]) already keys on it.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
@@ -2270,6 +2286,7 @@ pub async fn release_task_for_capability_miss(
     worker_id: &str,
     backoff: StdDuration,
     phase: crate::error::CapabilityMissPhase,
+    claim_crash_strikes: i32,
 ) -> HarvestResult<Option<i32>> {
     // Bounded by `capability_miss_backoff`'s 30s cap; the clamp is defensive.
     let backoff_secs = f64::min(backoff.as_secs_f64(), 3600.0);
@@ -2277,6 +2294,7 @@ pub async fn release_task_for_capability_miss(
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .bind::<diesel::sql_types::Double, _>(backoff_secs)
+        .bind::<diesel::sql_types::Integer, _>(claim_crash_strikes)
         .get_results::<DistinctMissWorkersRow>(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -4456,6 +4474,40 @@ mod tests {
         }
     }
 
+    /// The release must be guarded on the **claim epoch**, not just the claim's
+    /// worker id (issue #804, Codex round-37 P1).
+    ///
+    /// `poison_pill::requeue_orphan` hands an orphaned row back to the pool as
+    /// `PENDING` / `worker_id = NULL` with `crash_strikes + 1`, and nothing
+    /// stops the *same* worker from winning it again. A guard keyed on
+    /// `(state, worker_id)` alone therefore matches that **new** claim, so a
+    /// stale dispatcher's release would re-`PENDING` a row whose replacement
+    /// handler is already running — inviting a second concurrent claim and
+    /// duplicate side effects, and decrementing an `attempt` that belongs to
+    /// the new dispatch.
+    ///
+    /// `crash_strikes` is the discriminator because the requeue that creates
+    /// this race is the thing that bumps it. The terminal escalation guard
+    /// ([`claim_still_held_for_update_query`]) already keys on it for exactly
+    /// this reason; the release is the far more common path and must match.
+    #[test]
+    fn capability_miss_release_is_guarded_on_the_claim_epoch() {
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+            CapabilityMissPhase::AfterHandler,
+        ] {
+            let sql = release_task_for_capability_miss_query(phase);
+            assert!(
+                sql.contains("AND crash_strikes = $4"),
+                "{phase:?}: a poison-pill requeue lets the SAME worker re-claim \
+                 the row, so `worker_id` alone does not identify the claim this \
+                 dispatcher holds -- releasing a live replacement claim risks a \
+                 concurrent second dispatch: {sql}",
+            );
+        }
+    }
+
     /// Every phase-selected literal must keep the clauses that are not about
     /// `attempt` or `crash_strikes` — three statements can drift where two
     /// could.
@@ -4515,11 +4567,20 @@ mod tests {
     /// every time, so `poison_pill_threshold` is never reached in a
     /// heterogeneous fleet and the poison task crashes replacement workers
     /// indefinitely.
+    ///
+    /// Scoped to the `SET` clause: since round 37 the `WHERE` clause *reads*
+    /// `crash_strikes` as the claim-epoch discriminator
+    /// ([`capability_miss_release_is_guarded_on_the_claim_epoch`]), which is a
+    /// different concern and does not weaken this one. The invariant here is
+    /// that the release must not **write** the column.
     #[test]
     fn capability_miss_release_query_preserves_crash_strikes_for_a_pre_handler_miss() {
         let preserving = release_task_for_capability_miss_query(CapabilityMissPhase::BeforeHandler);
+        let (preserving_set, _) = preserving
+            .split_once(" WHERE ")
+            .expect("the release statement must be guarded by a WHERE clause");
         assert!(
-            !preserving.contains("crash_strikes"),
+            !preserving_set.contains("crash_strikes"),
             "a pre-/mid-handler miss must not write the column AT ALL -- the \
              handler never ran, so this dispatch is not evidence about whether \
              the task still crashes workers: {preserving}",
