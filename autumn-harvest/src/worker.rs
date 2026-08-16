@@ -4430,19 +4430,35 @@ pub fn fleet_capability_evidence(
     miss_workers: &[String],
     claiming_worker: &str,
 ) -> FleetCapabilityEvidence {
+    let every_live_worker_missed = live_workers
+        .iter()
+        .all(|live| miss_workers.iter().any(|missed| missed == live));
+    if !every_live_worker_missed {
+        // An untried live peer wins over the claimant-absent check below
+        // (Codex round-38 P1). `Unavailable` is detected self-referentially,
+        // so it says nothing about whether the REST of the set is readable: a
+        // claimant whose registration failed, or whose heartbeats went stale
+        // while it kept polling, yields `Unavailable` from a registry that is
+        // otherwise perfectly readable and may be naming a live peer that has
+        // never missed this task.
+        //
+        // Round 15 lets the distinct bound fire on `Unavailable` because
+        // `budget + 1` distinct missers is strong evidence *on its own*,
+        // independent of the registry. That holds when the registry tells us
+        // nothing, and breaks here, where it is actively naming an untried
+        // peer — escalating would terminally fail a task while a worker that
+        // may hold the handler is live and polling, which is the round-8 P1
+        // failure mode reached through the `Unavailable` door.
+        return FleetCapabilityEvidence::CapablePeerMayExist;
+    }
     if !live_workers.iter().any(|w| w == claiming_worker) {
         // Includes the empty-set case: a registry that cannot see the worker
         // currently holding the claim cannot be used to reason about peers.
+        // Reached only when nobody live is untried, so round 15's bound still
+        // has nothing to yield to.
         return FleetCapabilityEvidence::Unavailable;
     }
-    if live_workers
-        .iter()
-        .all(|live| miss_workers.iter().any(|missed| missed == live))
-    {
-        FleetCapabilityEvidence::AllLiveWorkersMissed
-    } else {
-        FleetCapabilityEvidence::CapablePeerMayExist
-    }
+    FleetCapabilityEvidence::AllLiveWorkersMissed
 }
 
 /// Why a capability miss escalated instead of being released (issue #804).
@@ -25489,6 +25505,75 @@ mod tests {
             narrow_live_fleet(&mixed, None, required, Some(&caps)),
             ids(&["gpu"]),
             "only the build axis is suppressed; labels are still readable"
+        );
+    }
+
+    /// An untried live peer withholds the distinct bound even when the registry
+    /// cannot see the claimant (issue #804, Codex round-38 P1).
+    ///
+    /// `Unavailable` is detected self-referentially — the claimant is missing
+    /// from the live set — but that says nothing about whether the *rest* of the
+    /// set is readable. A worker whose registration failed, or whose heartbeats
+    /// went stale while it kept polling, produces `Unavailable` from a registry
+    /// that is otherwise perfectly readable and may be listing a live peer that
+    /// has never missed this task.
+    ///
+    /// Round 15 lets the distinct bound fire on `Unavailable` because `budget +
+    /// 1` distinct missers is strong evidence *on its own*, independent of the
+    /// registry. That reasoning holds when the registry tells us nothing — and
+    /// breaks here, where it is actively naming an untried peer. Escalating
+    /// would terminally fail a task while a worker that may well hold the
+    /// handler is live and polling: the round-8 P1 failure mode, reached
+    /// through the `Unavailable` door.
+    ///
+    /// So an untried peer wins over the claimant-absent check. A registry that
+    /// names nobody untried still resolves `Unavailable` and keeps round 15's
+    /// bound.
+    #[test]
+    fn an_untried_live_peer_withholds_the_bound_even_if_the_claimant_is_missing() {
+        const BUDGET: u32 = 5;
+
+        // Claimant "zz" is absent from the live set (=> would be `Unavailable`),
+        // but "peer" is live and has never missed this task.
+        assert_eq!(
+            fleet_capability_evidence(&ids(&["a", "peer"]), &ids(&["a", "zz"]), "zz"),
+            FleetCapabilityEvidence::CapablePeerMayExist,
+            "a live peer that never missed this task may be capable; the \
+             claimant's own absence from the registry does not make that peer \
+             disappear"
+        );
+
+        // ... and the decision must therefore withhold the distinct bound.
+        assert_eq!(
+            capability_miss_decision(
+                BUDGET.cast_signed() + 1,
+                6,
+                BUDGET,
+                fleet_capability_evidence(&ids(&["a", "peer"]), &ids(&["a", "zz"]), "zz"),
+            ),
+            CapabilityMissAction::Release,
+            "escalating here asserts `no_capable_worker` while the registry is \
+             naming a live worker that has never missed this task"
+        );
+
+        // The control that keeps round 15 honest: a registry naming NOBODY
+        // untried still resolves `Unavailable`, and the distinct bound still
+        // fires. Without this, always-withholding would satisfy the assertion
+        // above while silently unbounding the small-fleet case.
+        assert_eq!(
+            fleet_capability_evidence(&[], &ids(&["a"]), "a"),
+            FleetCapabilityEvidence::Unavailable
+        );
+        assert_eq!(
+            capability_miss_decision(
+                BUDGET.cast_signed() + 1,
+                6,
+                BUDGET,
+                FleetCapabilityEvidence::Unavailable,
+            ),
+            CapabilityMissAction::Escalate,
+            "a registry that names no untried peer gives the distinct bound \
+             nothing to yield to (round 15)"
         );
     }
 

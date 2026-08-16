@@ -1342,3 +1342,52 @@ assumed: a mid-claim `crash_strikes` bump can only come from a poison-pill
 reclaim, which means the claim is genuinely gone, and the reclaimer re-pends the
 row — so a refused release yields a correct, self-healing outcome, not a stuck
 task.
+
+## Review round 38
+
+**Codex P1 — `Unavailable` evidence permitted the distinct bound even when the
+registry was naming an untried live peer.**
+
+`fleet_capability_evidence` detects `Unavailable` *self-referentially*: the
+claimant is missing from the live set, so the registry "is not describing this
+fleet". But that check says nothing about whether the **rest** of the set is
+readable. A worker whose startup registration failed, or whose heartbeats went
+stale while it kept polling, produces `Unavailable` from a registry that is
+otherwise perfectly readable — and that registry may be listing a live peer
+which has never missed this task. The distinct bound then fired after
+`budget + 1` distinct missers and terminally failed the task while that peer was
+live and polling: the round-8 P1 failure mode, reached through the `Unavailable`
+door.
+
+Round 15 deliberately allows the distinct bound on `Unavailable`, on the grounds
+that `budget + 1` distinct missers is strong evidence *on its own*, independent
+of the registry. That reasoning is sound when the registry tells us nothing, and
+breaks precisely here, where the registry is actively naming an untried peer.
+
+So rather than requiring `AllLiveWorkersMissed` outright — which would undo
+round 15's choice for the genuinely-unreadable case — the untried-peer check now
+runs **first**: any live worker that has never missed this task yields
+`CapablePeerMayExist` regardless of whether the claimant appears in the set. A
+registry naming nobody untried still resolves `Unavailable`, so round 15's bound
+keeps exactly the case it was written for.
+
+This is the narrower of the two remedies Codex offered ("or at least suppress
+escalation whenever the returned fleet contains an unaccounted peer"), and it
+also reconciles the code with the distinct bound's own doc comment, which
+already claimed the bound is withheld "even when coverage is unreachable".
+
+RED:
+
+```
+assertion `left == right` failed: a live peer that never missed this task may be
+capable; the claimant's own absence from the registry does not make that peer
+disappear
+  left: Unavailable
+ right: CapablePeerMayExist
+```
+
+`an_untried_live_peer_withholds_the_bound_even_if_the_claimant_is_missing`
+asserts the evidence classification, the resulting `Release` decision, **and**
+the round-15 control (an empty registry still resolves `Unavailable` and still
+escalates on the distinct bound) — so an always-withhold mutant cannot satisfy
+the fix while silently unbounding the small-fleet case.
