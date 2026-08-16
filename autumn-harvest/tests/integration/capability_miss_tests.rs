@@ -600,7 +600,7 @@ async fn wait_for_terminal(
     exec_id: ExecutionId,
     timeout: Duration,
 ) -> WorkflowExecution {
-    tokio::time::timeout(timeout, async {
+    let waited = tokio::time::timeout(timeout, async {
         loop {
             let e = load_execution(url, exec_id).await;
             if autumn_harvest::erase::is_terminal_state(&e.state) {
@@ -609,8 +609,50 @@ async fn wait_for_terminal(
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| panic!("execution {exec_id} reached no terminal state within {timeout:?}"))
+    .await;
+
+    if let Ok(execution) = waited {
+        execution
+    } else {
+        {
+            // Dump the state that distinguishes the plausible causes instead of
+            // panicking bare: a `PENDING` row with `scheduled_at` in the future
+            // and a high `capability_misses` is the backoff tail; a `RUNNING`
+            // row owned by a live worker is a stranded claim (a real defect).
+            // A bare timeout costs a whole round of log archaeology to tell
+            // those apart.
+            let execution = load_execution(url, exec_id).await;
+            let tasks = load_tasks(url, exec_id).await;
+            let rows: Vec<String> = tasks
+                .iter()
+                .map(|t| {
+                    format!(
+                        "task {} type={} state={} worker={:?} attempt={} \
+                         capability_misses={} miss_workers={:?} crash_strikes={} \
+                         scheduled_at={} error={:?}",
+                        t.id,
+                        t.task_type,
+                        t.state,
+                        t.worker_id,
+                        t.attempt,
+                        t.capability_misses,
+                        t.capability_miss_workers,
+                        t.crash_strikes,
+                        t.scheduled_at,
+                        t.error,
+                    )
+                })
+                .collect();
+            panic!(
+                "execution {exec_id} reached no terminal state within {timeout:?}\n  \
+                 execution state={} error={:?}\n  now={}\n  {}",
+                execution.state,
+                execution.error,
+                Utc::now(),
+                rows.join("\n  "),
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -730,6 +772,37 @@ const Q_MIXED: &str = "q804-mixed";
 /// Budget for the success-metric test. Deliberately far above the shipped
 /// default: see the rationale at its use site.
 const MIXED_FLEET_BUDGET: u32 = 50;
+
+/// How long `mixed_fleet_completes_every_execution_with_zero_spurious_failures`
+/// waits for one execution to reach a terminal state.
+///
+/// **Sized from the backoff curve, not picked as a round number.** The claim
+/// query has no capability filter — that is issue #804's premise — so on every
+/// redelivery the incapable and the capable worker race 50/50 for the task, and
+/// a run of consecutive incapable claims is a normal, expected outcome rather
+/// than a fault. Each miss defers the task by `capability_miss_backoff`, which
+/// runs 1s, 2s, 4s, 8s, 16s and then caps at 30s, so the cumulative deferral
+/// after `k` misses is `31 + 30(k - 5)` seconds for `k >= 5`:
+///
+/// | misses | cumulative | P(a given task) | P(any of the 8) |
+/// |--------|-----------|-----------------|-----------------|
+/// | 6      | 61 s      | 1.56 %          | **11.8 %**      |
+/// | 10     | 181 s     | 0.098 %         | 0.78 %          |
+/// | 14     | 301 s     | 0.0061 %        | **0.049 %**     |
+///
+/// At the previous 60s bound the test therefore failed roughly **one run in
+/// eight** — observed once locally and once on CI — with a bare timeout that
+/// looked like a hang but was just the feature's own (deliberate, capped)
+/// backoff outrunning the harness. 300s tolerates 14 misses per task, putting
+/// the false-failure rate near 1-in-2000, and CI latency on a contended runner
+/// stacks on top of the backoff, which is why the margin is generous.
+///
+/// This costs nothing in the common case: the wait returns the moment the row
+/// goes terminal, so a healthy run still finishes in seconds. Only a genuine
+/// stall spends the full budget — and `wait_for_terminal` now dumps the task
+/// rows on timeout, so that case is diagnosable in one shot instead of needing
+/// a round of log archaeology to tell a backoff tail from a stranded claim.
+const MIXED_FLEET_TERMINAL_WAIT: Duration = Duration::from_secs(300);
 const Q_NOOP: &str = "q804-noop";
 const Q_PARK: &str = "q804-park";
 const Q_LIVE_PEER: &str = "q804-live-peer";
@@ -2836,7 +2909,7 @@ async fn mixed_fleet_completes_every_execution_with_zero_spurious_failures() {
             &pool,
             Box::pin(async {
                 for exec_id in &exec_ids {
-                    wait_for_terminal(&url, *exec_id, Duration::from_secs(60)).await;
+                    wait_for_terminal(&url, *exec_id, MIXED_FLEET_TERMINAL_WAIT).await;
                 }
             }),
         )

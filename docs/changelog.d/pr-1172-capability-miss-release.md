@@ -1450,3 +1450,54 @@ index is able to serve this query"):
   always-index-scan mutant (an unconditional index over the whole table) would
   satisfy the first assertion while hiding that the query shape is what makes a
   cheap partial index usable.
+
+## Review round 40 — CI flake root-caused (test sizing, not a product defect)
+
+`mixed_fleet_completes_every_execution_with_zero_spurious_failures` failed once
+locally during round 37 and once on CI at round 39, both times as a bare
+`reached no terminal state within 60s`. Two occurrences is a signal, so rather
+than re-run until green I derived the failure rate from the feature's own
+backoff curve.
+
+The claim query has **no capability filter** — that is issue #804's premise — so
+on every redelivery the incapable and the capable worker race 50/50 for the
+task. A run of consecutive incapable claims is therefore a normal outcome, not a
+fault. Each miss defers the task by `capability_miss_backoff`: 1s, 2s, 4s, 8s,
+16s, then capped at 30s, so the cumulative deferral after `k` misses is
+`31 + 30(k - 5)` seconds for `k >= 5`.
+
+| misses | cumulative | P(a given task) | P(any of the 8) |
+|--------|-----------|-----------------|-----------------|
+| 6      | 61 s      | 1.56 %          | **11.8 %**      |
+| 10     | 181 s     | 0.098 %         | 0.78 %          |
+| 14     | 301 s     | 0.0061 %        | **0.049 %**     |
+
+At the previous 60s bound the test crossed its own timeout at **six** misses —
+roughly **one run in eight**, which matches the observed rate exactly (once in
+~17 local runs, once on CI). CI latency on a contended runner stacks on top of
+the backoff, which is why it surfaced there.
+
+This is a **test-sizing defect, not a product defect**. The engine is doing
+precisely what #804 specifies — release rather than fail, with dwell capped at
+30s — and the property the test asserts (`COMPLETED`, zero spurious `FAILED`) is
+untouched. The harness bound was simply mis-sized against the feature's own
+backoff.
+
+Two changes:
+
+* `MIXED_FLEET_TERMINAL_WAIT` is now a named constant of **300s**, sized from
+  the table above (14 tolerated misses, ~1-in-2000) with the arithmetic recorded
+  on the constant so it is not "tidied" back down. This costs nothing in the
+  common case: the wait returns the moment the row goes terminal, so a healthy
+  run still finishes in seconds, and only a genuine stall spends the budget.
+* `wait_for_terminal` now dumps the execution state and every task row —
+  `state`, `worker_id`, `attempt`, `capability_misses`, `capability_miss_workers`,
+  `crash_strikes`, `scheduled_at`, `error` — on timeout. A bare timeout cannot
+  distinguish a backoff tail (`PENDING`, future `scheduled_at`, high
+  `capability_misses`) from a stranded claim (`RUNNING`, live worker — a real
+  defect), and telling those apart previously cost a round of log archaeology.
+  The dump was verified by forcing the timeout path with a 1ms bound.
+
+A 12-run local reproduction loop passed 12/12, which is consistent with (and
+too small to distinguish) a ~12 % rate; the arithmetic above, not the loop, is
+what establishes the cause.
