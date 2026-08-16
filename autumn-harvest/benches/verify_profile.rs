@@ -121,6 +121,7 @@ use std::pin::Pin;
 
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::replay_sample::SampleManifest;
 use autumn_harvest::testing::{HistorySnapshot, ReplayVerifier};
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use chrono::Utc;
@@ -265,6 +266,32 @@ fn read_prepared_meta(dir: &std::path::Path) -> Option<(usize, usize)> {
     ))
 }
 
+/// Delete any pre-existing `PROFILE_META_FILENAME` sidecar from `dir` before
+/// `prepare_fixtures` starts rewriting fixture files -- run first, ahead of
+/// `remove_stale_fixtures` and the fixture-write loop below, so the sidecar
+/// is gone for the *entire* window during which the fixtures on disk are
+/// changing. Without this, a `prepare` invocation interrupted (crash, kill,
+/// OOM) anywhere between finishing the fixture-write loop and finishing its
+/// own fresh sidecar write leaves the *previous* invocation's sidecar
+/// behind: well-formed, but describing a workload shape (e.g. a different
+/// `activities` value) that no longer matches the now-rewritten fixtures.
+/// `read_prepared_meta`'s malformed-sidecar panic cannot catch this -- a
+/// leftover-from-a-previous-run sidecar is not malformed, just stale --  so
+/// `run_verify` would trust it and silently report the wrong shape. Deleting
+/// it first turns that whole interruption window into the already-supported
+/// "sidecar genuinely absent" case (`read_prepared_meta` returns `None`,
+/// `run_verify` falls back to `activities_per_fixture_from_disk`, which now
+/// derives the true shape from what's actually on disk), instead of a
+/// stale-but-well-formed sidecar silently lying about it.
+fn remove_stale_meta(dir: &std::path::Path) {
+    let path = dir.join(PROFILE_META_FILENAME);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("failed to remove stale {}: {e}", path.display()),
+    }
+}
+
 /// Remove any pre-existing `fixture_*.json` files from `dir` before
 /// `prepare_fixtures` writes a fresh set. Without this, re-running `prepare`
 /// with a *smaller* `VERIFY_PROFILE_FIXTURES` than a previous run against the
@@ -305,12 +332,15 @@ fn remove_stale_fixtures(dir: &std::path::Path) {
 /// isolable so it can run **unprofiled** (`VERIFY_PROFILE_MODE=prepare`)
 /// ahead of a profiled `VERIFY_PROFILE_MODE=run` pass that measures only
 /// `ReplayVerifier::verify_dir`. Idempotent regardless of growing or
-/// shrinking `fixtures`/`activities` between runs: `remove_stale_fixtures`
-/// clears any pre-existing `fixture_*.json` files first, so re-running
-/// `prepare` against an existing directory always leaves it in exactly the
-/// state a single `prepare` call with the current arguments would produce.
+/// shrinking `fixtures`/`activities` between runs: `remove_stale_meta` and
+/// `remove_stale_fixtures` clear any pre-existing sidecar/`fixture_*.json`
+/// files first, so re-running `prepare` against an existing directory always
+/// leaves it in exactly the state a single `prepare` call with the current
+/// arguments would produce -- and never in a state where a *stale* sidecar
+/// survives alongside freshly (or partially) rewritten fixtures.
 fn prepare_fixtures(dir: &std::path::Path, fixtures: usize, activities: usize) {
     std::fs::create_dir_all(dir).expect("create fixture dir");
+    remove_stale_meta(dir);
     remove_stale_fixtures(dir);
     let fixture_json = build_fixture_json(activities);
     for i in 0..fixtures {
@@ -330,31 +360,99 @@ fn required_profile_dir(mode: &str) -> std::path::PathBuf {
         .into()
 }
 
-/// Fallback for `read_prepared_meta` returning `None`: read one fixture file
-/// already on disk in `dir` and derive its per-fixture activity count from
-/// the actual recorded event count (`WorkflowStarted` + two events per
-/// activity). Every fixture written by `prepare_fixtures` is an identical
-/// copy, so sampling exactly one is fully representative, not merely
-/// convenient. Costs a full JSON parse of a realistic-size fixture (see
-/// `PROFILE_META_FILENAME`'s doc comment for the measured cost) -- correct
-/// as a fallback for a directory not populated via `prepare_fixtures`, but
-/// not the path a normal two-phase `prepare`/`run` invocation should take.
+/// Recursively collect every `*.json` fixture file under `dir`, mirroring
+/// `ReplayVerifier::verify_dir`'s own directory-walk semantics (its private
+/// `collect_json_files` helper -- not a `pub` item this external bench
+/// binary can call, so this mirrors rather than reuses it) so a nested
+/// layout (e.g. `suite/fixture.json`) that `verify_dir` itself accepts is
+/// not silently invisible to this fallback. Also excludes the same
+/// replay-drift-bundle manifest filename `verify_dir` excludes, so pointing
+/// this fallback at a `replay_bundle`-produced directory (issue #798) does
+/// not misparse the manifest file as a fixture.
+fn collect_json_fixtures(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs_to_visit = vec![dir.to_path_buf()];
+    while let Some(current_dir) = dirs_to_visit.pop() {
+        let entries = std::fs::read_dir(&current_dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", current_dir.display()));
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs_to_visit.push(path);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("json")
+                && path.file_name().and_then(|name| name.to_str())
+                    != Some(SampleManifest::FILE_NAME)
+            {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// Fallback for `read_prepared_meta` returning `None`: parse every `*.json`
+/// fixture found under `dir` (recursively, via `collect_json_fixtures`
+/// above -- matching `verify_dir`'s own discovery, so a nested fixture
+/// layout is not missed here) and derive each one's per-fixture activity
+/// count from its actual recorded event count (`WorkflowStarted` + two
+/// events per activity), validating that every fixture agrees.
+///
+/// A directory populated by `prepare_fixtures` writes identical fixture
+/// copies -- but it also *always* writes the `PROFILE_META_FILENAME`
+/// sidecar this fallback exists to substitute for, so that path never
+/// actually reaches this function. The only directories that do are
+/// hand-populated (no sidecar at all), where nothing guarantees every
+/// fixture shares one activity count: such a directory can legitimately mix
+/// e.g. 500- and 1,000-activity snapshots that each verify successfully on
+/// their own. `run_verify` multiplies whatever this function returns across
+/// the *entire* fixture set to print `total_events_verified`, so reporting
+/// only one sampled fixture's count would silently mislabel every fixture
+/// that disagrees with it. Every fixture found is therefore parsed and
+/// checked to agree with the first; a heterogeneous set panics naming the
+/// two disagreeing files rather than reporting one arbitrary shape as if it
+/// applied to all of them.
+///
+/// Full JSON parse of every fixture is real, non-trivial cost (see
+/// `PROFILE_META_FILENAME`'s doc comment: ~3.9M instructions for *one*
+/// realistic-size fixture) -- acceptable here because, as above, this whole
+/// function is already documented as unreachable from a normal two-phase
+/// `prepare`/`run` invocation (which always carries the sidecar); it is not
+/// the golden profiled path this harness exists to keep clean.
 fn activities_per_fixture_from_disk(dir: &std::path::Path) -> usize {
-    let mut fixture_paths: Vec<_> = std::fs::read_dir(dir)
-        .expect("read fixture dir")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .collect();
+    let mut fixture_paths = collect_json_fixtures(dir);
     fixture_paths.sort();
-    let sample_path = fixture_paths
-        .first()
-        .expect("at least one *.json fixture file in the profile dir");
-    let json = std::fs::read_to_string(sample_path).expect("read sample fixture");
-    let snapshot: HistorySnapshot = serde_json::from_str(&json).expect("parse sample fixture");
-    // WorkflowStarted (1 event) + ActivityScheduled/ActivityCompleted per
-    // activity (2 events each) -- the exact shape `build_fixture_json` emits.
-    (snapshot.events.len() - 1) / 2
+    assert!(
+        !fixture_paths.is_empty(),
+        "at least one *.json fixture file (searched recursively) in the profile dir {}",
+        dir.display()
+    );
+    let mut first: Option<(std::path::PathBuf, usize)> = None;
+    for path in &fixture_paths {
+        let json = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+        let snapshot: HistorySnapshot = serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()));
+        // WorkflowStarted (1 event) + ActivityScheduled/ActivityCompleted per
+        // activity (2 events each) -- the exact shape `build_fixture_json` emits.
+        let count = (snapshot.events.len() - 1) / 2;
+        match &first {
+            None => first = Some((path.clone(), count)),
+            Some((first_path, first_count)) => {
+                assert_eq!(
+                    count,
+                    *first_count,
+                    "heterogeneous fixture activity counts under {}: {} has {first_count} \
+                     activities but {} has {count}; this fallback (used only when no \
+                     `{PROFILE_META_FILENAME}` sidecar is present) requires every fixture to \
+                     share one activity count so a single workload shape can be reported",
+                    dir.display(),
+                    first_path.display(),
+                    path.display()
+                );
+            }
+        }
+    }
+    first.expect("checked non-empty above").1
 }
 
 /// Build the tokio runtime + call `verify_dir` on `dir`. This is the ONLY
