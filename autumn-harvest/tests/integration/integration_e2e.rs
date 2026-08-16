@@ -1085,6 +1085,33 @@ fn build_runtime_worker_with_task_timeout(
     )
 }
 
+/// Same as [`build_runtime_worker`], but with a caller-supplied
+/// `capability_miss_max_redeliveries` instead of the default 5.
+///
+/// The issue #804 release budget is spent against a capped exponential backoff
+/// (`1s * 2^n`, capped at 30s), so the default budget of 5 costs
+/// `1 + 2 + 4 + 8 + 16 = 31s` of dwell before the task escalates -- well past
+/// the 10s default [`wait_for_execution_state`] bound. A test that asserts the
+/// *escalation* (rather than an individual release) should therefore set a
+/// small budget so the terminal verdict lands promptly, instead of widening its
+/// wait and paying the dwell for real.
+pub(crate) fn build_runtime_worker_with_capability_miss_budget(
+    worker_id: &str,
+    max_concurrent_workflows: usize,
+    max_concurrent_activities: usize,
+    registry: Arc<HandlerRegistry>,
+    capability_miss_max_redeliveries: u32,
+) -> Arc<Worker> {
+    let mut config = runtime_config(
+        worker_id,
+        max_concurrent_workflows,
+        max_concurrent_activities,
+        Duration::from_secs(10),
+    );
+    config.capability_miss_max_redeliveries = capability_miss_max_redeliveries;
+    Arc::new(Worker::new(config, registry).expect("worker should build"))
+}
+
 /// Build a `WorkerRuntimeConfig` with the standard test defaults.
 ///
 /// Extracted so tests that need to inspect `Worker::new`'s `Result` (e.g. the

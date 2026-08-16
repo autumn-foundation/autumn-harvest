@@ -411,31 +411,57 @@ async fn seed_workflow(
 
 async fn load_execution(url: &str, exec_id: ExecutionId) -> WorkflowExecution {
     let mut conn = connect(url).await;
+    load_execution_on(&mut conn, exec_id).await
+}
+
+/// [`load_execution`] on a caller-owned connection.
+///
+/// The polling helpers below reuse one connection for the whole wait instead of
+/// establishing a fresh one per iteration. At a 25ms poll interval a 30s bound
+/// is up to 1,200 TCP+auth handshakes against the database for a single wait,
+/// and this suite runs against a *shared* Postgres. That storm competes for
+/// connection slots with the very worker the wait is waiting on — including its
+/// startup fleet registration, which gates task claiming (issue #804, round 54)
+/// — so the polling can starve the progress it is polling for.
+async fn load_execution_on(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> WorkflowExecution {
     harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select(WorkflowExecution::as_select())
-        .first(&mut conn)
+        .first(conn)
         .await
         .expect("reload workflow execution")
 }
 
 async fn load_tasks(url: &str, exec_id: ExecutionId) -> Vec<TaskQueueItem> {
     let mut conn = connect(url).await;
+    load_tasks_on(&mut conn, exec_id).await
+}
+
+/// [`load_tasks`] on a caller-owned connection. See [`load_execution_on`].
+async fn load_tasks_on(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Vec<TaskQueueItem> {
     harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
         .order(harvest_task_queue::scheduled_at.asc())
         .select(TaskQueueItem::as_select())
-        .load(&mut conn)
+        .load(conn)
         .await
         .expect("reload task rows")
 }
 
 async fn load_task(url: &str, task_id: Uuid) -> TaskQueueItem {
     let mut conn = connect(url).await;
+    load_task_on(&mut conn, task_id).await
+}
+
+/// [`load_task`] on a caller-owned connection. See [`load_execution_on`].
+async fn load_task_on(conn: &mut AsyncPgConnection, task_id: Uuid) -> TaskQueueItem {
     harvest_task_queue::table
         .find(task_id)
         .select(TaskQueueItem::as_select())
-        .first(&mut conn)
+        .first(conn)
         .await
         .expect("reload task row")
 }
@@ -511,9 +537,10 @@ async fn wait_for_capability_misses(
     want: i32,
     timeout: Duration,
 ) -> TaskQueueItem {
+    let mut conn = connect(url).await;
     tokio::time::timeout(timeout, async {
         loop {
-            if let Some(task) = load_tasks(url, exec_id)
+            if let Some(task) = load_tasks_on(&mut conn, exec_id)
                 .await
                 .into_iter()
                 .find(|t| t.capability_misses >= want)
@@ -544,16 +571,19 @@ async fn wait_for_miss_by(
     worker_id: &str,
     timeout: Duration,
 ) -> Option<TaskQueueItem> {
+    let mut conn = connect(url).await;
     tokio::time::timeout(timeout, async {
         loop {
-            if let Some(task) = load_tasks(url, exec_id)
+            if let Some(task) = load_tasks_on(&mut conn, exec_id)
                 .await
                 .into_iter()
                 .find(|t| t.capability_miss_workers.iter().any(|w| w == worker_id))
             {
                 break Some(task);
             }
-            if autumn_harvest::erase::is_terminal_state(&load_execution(url, exec_id).await.state) {
+            if autumn_harvest::erase::is_terminal_state(
+                &load_execution_on(&mut conn, exec_id).await.state,
+            ) {
                 break None;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -576,9 +606,10 @@ async fn wait_for_task_owner(
     worker_id: &str,
     timeout: Duration,
 ) -> TaskQueueItem {
-    tokio::time::timeout(timeout, async {
+    let mut conn = connect(url).await;
+    let waited = tokio::time::timeout(timeout, async {
         loop {
-            if let Some(task) = load_tasks(url, exec_id)
+            if let Some(task) = load_tasks_on(&mut conn, exec_id)
                 .await
                 .into_iter()
                 .find(|t| t.worker_id.as_deref() == Some(worker_id))
@@ -588,8 +619,37 @@ async fn wait_for_task_owner(
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| panic!("no task row was claimed by {worker_id} within {timeout:?}"))
+    .await;
+
+    if let Ok(task) = waited {
+        return task;
+    }
+    // Dump what distinguishes the plausible causes rather than panicking bare
+    // (same rationale as `wait_for_terminal`): a row still `PENDING` with a
+    // future `scheduled_at` is a backoff, a row owned by someone else is a lost
+    // race, and an EMPTY worker registry is a registration that never committed
+    // — which gates claiming outright (issue #804, round 54) and is invisible
+    // from the task row alone.
+    let mut diag = connect(url).await;
+    let tasks = load_tasks_on(&mut diag, exec_id).await;
+    let workers: Vec<(String, String)> = harvest_workers::table
+        .select((harvest_workers::worker_id, harvest_workers::status))
+        .load(&mut diag)
+        .await
+        .expect("dump worker registry");
+    panic!(
+        "no task row was claimed by {worker_id} within {timeout:?}; tasks={:?}; registry={workers:?}",
+        tasks
+            .iter()
+            .map(|t| (
+                t.id,
+                t.state.clone(),
+                t.worker_id.clone(),
+                t.scheduled_at,
+                t.capability_misses
+            ))
+            .collect::<Vec<_>>()
+    )
 }
 
 async fn wait_for_state(
@@ -598,9 +658,10 @@ async fn wait_for_state(
     want: &str,
     timeout: Duration,
 ) -> WorkflowExecution {
+    let mut conn = connect(url).await;
     tokio::time::timeout(timeout, async {
         loop {
-            let e = load_execution(url, exec_id).await;
+            let e = load_execution_on(&mut conn, exec_id).await;
             if e.state == want {
                 break e;
             }
@@ -621,9 +682,10 @@ async fn wait_for_terminal(
     exec_id: ExecutionId,
     timeout: Duration,
 ) -> WorkflowExecution {
+    let mut conn = connect(url).await;
     let waited = tokio::time::timeout(timeout, async {
         loop {
-            let e = load_execution(url, exec_id).await;
+            let e = load_execution_on(&mut conn, exec_id).await;
             if autumn_harvest::erase::is_terminal_state(&e.state) {
                 break e;
             }
@@ -3260,10 +3322,11 @@ async fn a_capable_worker_that_parks_resets_the_capability_miss_budget() {
         5,
     );
 
+    let mut watch = connect(&url).await;
     with_worker_running(&capable, &pool, async {
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                if load_task(&url, task_id).await.capability_misses == 0 {
+                if load_task_on(&mut watch, task_id).await.capability_misses == 0 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -3723,9 +3786,9 @@ async fn live_worker_count(url: &str, worker_id: &str) -> i64 {
 }
 
 async fn wait_for_live_worker(url: &str, worker_id: &str, timeout: Duration) {
+    let mut conn = connect(url).await;
     tokio::time::timeout(timeout, async {
         loop {
-            let mut conn = connect(url).await;
             let found: i64 = harvest_workers::table
                 .filter(harvest_workers::worker_id.eq(worker_id))
                 .count()
@@ -5328,10 +5391,11 @@ async fn evidence_recorded_against_another_handler_does_not_spend_this_frontiers
         1,
     );
 
+    let mut watch = connect(&url).await;
     let released = with_worker_running(&worker, &pool, async {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let task = load_task(&url, task_id).await;
+                let task = load_task_on(&mut watch, task_id).await;
                 // The release rewrites the frontier to the one actually missed.
                 if task.capability_miss_handler.as_deref() == Some("workflow:never_registered_wf") {
                     return task;

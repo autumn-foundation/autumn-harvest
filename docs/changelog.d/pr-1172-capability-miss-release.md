@@ -2277,3 +2277,44 @@ so a fix that armed unconditionally fails it.
 Refactor: the heal is now `heal_missing_worker_row`, extracted so the gate
 transition has a name and a place to carry its rationale — and because the arm's
 new failure handling pushed `do_heartbeat_tick` past the 100-line clippy bound.
+
+## Review round 56
+
+The first `Test (ubuntu-latest)` leg to *complete* on this branch in many rounds
+(every earlier run was cancelled by a newer push) reported two failures. Both
+are test-side; neither is a defect in the release path.
+
+**The cross-type continue-as-new AC5 test was asserting the pre-#804 contract.**
+Round 45 reclassified the first claim by a worker lacking a `continue_as_new_as`
+target handler: rather than sealing the predecessor, that worker now RELEASES
+the task for a capable peer — the canonical rolling-deploy shape, where the old
+pod runs the source phase and only the new peer registers the target. Issue
+#803's `continuing_into_an_unregistered_type_fails_terminally_without_a_successor`
+still waited 10s for `FAILED` and matched on the old reason text, so it timed
+out deterministically. Issue #803's AC5 is unchanged and is what the test now
+pins: with no capable peer the release is *bounded*, the predecessor is failed
+terminally with a `no_capable_worker:` reason naming the missing type, and no
+successor row is ever created. The budget is set to 1 (new
+`build_runtime_worker_with_capability_miss_budget`) so the escalation lands
+inside the wait instead of paying the default 31s of backoff dwell for real.
+
+That test also has to make "no capable peer" true of the *registry*, not just of
+its own intent. `live_workers_on_queue_query` selects on heartbeat freshness
+alone — a `Draining` worker is a rollback away from being capable, so excluding
+it could fabricate an escalation — and every worker in that module shares the
+`default` queue. A sibling test's worker therefore reads as an untried live peer
+for the whole freshness window after it stops, which correctly *withholds* the
+escalation bound (round-38 P1). In production those pods are gone and age out;
+here the shared database keeps their last heartbeat, so the test clears the
+fleet explicitly to leave the single incapable worker it is written for.
+
+**The lost-claim test was starving the worker it was waiting on.** Its
+`wait_for_task_owner` polled every 25ms through helpers that establish a *fresh*
+Postgres connection per call — up to 1,200 TCP+auth handshakes in one 30s wait,
+against a database this suite shares. That storm competes for connection slots
+with the very worker the wait is waiting on, including the startup fleet
+registration that now gates claiming (round 54). The polling helpers now open
+one connection and reuse it for the whole wait, and `wait_for_task_owner` dumps
+the task rows and the worker registry on timeout rather than panicking bare —
+an empty registry is a registration that never committed, which gates claiming
+outright and is invisible from the task row alone.

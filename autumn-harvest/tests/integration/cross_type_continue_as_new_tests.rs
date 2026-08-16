@@ -42,7 +42,7 @@ use autumn_harvest::schema::{harvest_signals, harvest_workflow_executions};
 use autumn_harvest::types::{
     ExecutionId, Priority, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
-use autumn_harvest::worker::HandlerRegistry;
+use autumn_harvest::worker::{HandlerRegistry, NO_CAPABLE_WORKER_PREFIX};
 use autumn_harvest::{WorkflowContext, WorkflowInfo};
 use chrono::{Duration as ChronoDuration, Utc};
 use diesel::prelude::*;
@@ -50,8 +50,9 @@ use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncC
 use uuid::Uuid;
 
 use crate::integration_e2e::{
-    build_runtime_worker, build_test_pool, load_history_from_url, setup_test_database_url_or_env,
-    spawn_test_worker, wait_for_execution_state,
+    build_runtime_worker, build_runtime_worker_with_capability_miss_budget, build_test_pool,
+    load_history_from_url, setup_test_database_url_or_env, spawn_test_worker,
+    wait_for_execution_state,
 };
 
 // ---------------------------------------------------------------------------
@@ -805,6 +806,31 @@ async fn a_live_run_of_the_target_type_blocks_the_transition_terminally() {
 // AC5 — an unregistered target fails terminally and creates NO successor
 // ---------------------------------------------------------------------------
 
+/// Issue #804 reclassified the *first* claim by a worker lacking the target
+/// handler: rather than sealing the predecessor immediately, that worker now
+/// RELEASES the task so a capable peer can run the transition (the canonical
+/// rolling-deploy shape, where the old pod runs the source phase and only the
+/// new peer registers the target phase). See
+/// `capability_miss_tests::cross_type_continue_as_new_missing_target_is_released_for_a_capable_peer`.
+///
+/// #803's AC5 still holds, and is what this test now pins: with **no** capable
+/// peer the release is bounded, and once the budget is spent the predecessor is
+/// failed terminally — with a `no_capable_worker:` reason naming the missing
+/// type — and **no** successor row is ever created. The budget is set to 1 so
+/// the escalation lands inside the default wait rather than paying the default
+/// 31s of backoff dwell for real.
+///
+/// "No capable peer" has to be true of the *registry*, not just of this test's
+/// intent. `live_workers_on_queue_query` deliberately selects on heartbeat
+/// freshness alone (a `Draining` worker is a rollback away from being capable,
+/// so excluding it could fabricate an escalation), and every worker this module
+/// runs shares the `default` queue. A sibling test's worker therefore stays
+/// "live" for the whole freshness window after it stops — far longer than the
+/// gap between two tests — and reads as an untried peer that may hold the
+/// handler, which correctly *withholds* the escalation bound (issue #804,
+/// round-38 P1). In production those pods are gone and age out on their own;
+/// here the shared database keeps their last heartbeat, so the fleet is cleared
+/// explicitly to leave the single incapable worker this test is written for.
 #[tokio::test]
 async fn continuing_into_an_unregistered_type_fails_terminally_without_a_successor() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -822,9 +848,23 @@ async fn continuing_into_an_unregistered_type_fails_terminally_without_a_success
     )
     .await;
 
+    // Retire the stopped workers of sibling tests (see the doc comment). Safe
+    // under the suite's `--test-threads=1`: every one of them has already been
+    // shut down and joined.
+    conn.batch_execute("DELETE FROM harvest_workers")
+        .await
+        .expect("clear the ghost fleet");
+
     // Deliberately register ONLY phase 1.
     let reg = registry(vec![wf(phase1, phase_one)]);
-    let worker = build_runtime_worker("w-803-unregistered", 2, 1, reg);
+    let worker = build_runtime_worker_with_capability_miss_budget(
+        "w-803-unregistered",
+        2,
+        1,
+        reg,
+        // One release to a (nonexistent) peer, then escalate.
+        1,
+    );
     let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
     let failed = wait_for_execution_state(&url, predecessor, "FAILED").await;
     worker.shutdown();
@@ -834,8 +874,9 @@ async fn continuing_into_an_unregistered_type_fails_terminally_without_a_success
         .error
         .expect("a terminal failure must carry an error");
     assert!(
-        error.contains(missing) && error.contains("not registered"),
-        "the operator message must name the missing type and the reason, got: {error}"
+        error.starts_with(NO_CAPABLE_WORKER_PREFIX) && error.contains(missing),
+        "the operator message must be the bounded-release escalation and must \
+         name the missing type, got: {error}"
     );
 
     // A terminal `WorkflowFailed` event, never a silent no-op.
