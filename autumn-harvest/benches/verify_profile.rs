@@ -226,21 +226,43 @@ fn env_usize(key: &str, default: usize) -> usize {
 const PROFILE_META_FILENAME: &str = "verify_profile_meta.txt";
 
 /// Read the `fixtures`/`activities` values `prepare_fixtures` persisted to
-/// `PROFILE_META_FILENAME`. `None` when the sidecar is missing (a directory
-/// populated without going through `VERIFY_PROFILE_MODE=prepare` at all),
-/// in which case the caller falls back to `activities_per_fixture_from_disk`.
+/// `PROFILE_META_FILENAME`. `None` only when the sidecar is genuinely
+/// *missing* (a directory populated without going through
+/// `VERIFY_PROFILE_MODE=prepare` at all), in which case the caller falls
+/// back to `activities_per_fixture_from_disk`. A sidecar that *exists* but
+/// is malformed or truncated (a bad number, or a missing `fixtures=`/
+/// `activities=` line -- e.g. from a `prepare` invocation that crashed or
+/// was killed mid-write) panics rather than being silently treated the same
+/// as "missing": collapsing both cases to the same `None` would route a
+/// *damaged* sidecar into the same expensive full-fixture-parse fallback
+/// this sidecar mechanism exists to avoid inside the profiled `run`-mode
+/// region (`activities_per_fixture_from_disk`'s doc comment measures that
+/// fallback at ~3.9M instructions / ~3% of the isolated total) -- silently,
+/// with no diagnostic that the sidecar was ever damaged in the first place.
 fn read_prepared_meta(dir: &std::path::Path) -> Option<(usize, usize)> {
-    let text = std::fs::read_to_string(dir.join(PROFILE_META_FILENAME)).ok()?;
+    let path = dir.join(PROFILE_META_FILENAME);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!("failed to read {}: {e}", path.display()),
+    };
     let mut fixtures = None;
     let mut activities = None;
     for line in text.lines() {
         if let Some(value) = line.strip_prefix("fixtures=") {
-            fixtures = value.trim().parse().ok();
+            fixtures = Some(value.trim().parse::<usize>().unwrap_or_else(|e| {
+                panic!("malformed `fixtures=` line in {}: {e}", path.display())
+            }));
         } else if let Some(value) = line.strip_prefix("activities=") {
-            activities = value.trim().parse().ok();
+            activities = Some(value.trim().parse::<usize>().unwrap_or_else(|e| {
+                panic!("malformed `activities=` line in {}: {e}", path.display())
+            }));
         }
     }
-    Some((fixtures?, activities?))
+    Some((
+        fixtures.unwrap_or_else(|| panic!("{} is missing a `fixtures=` line", path.display())),
+        activities.unwrap_or_else(|| panic!("{} is missing an `activities=` line", path.display())),
+    ))
 }
 
 /// Remove any pre-existing `fixture_*.json` files from `dir` before
