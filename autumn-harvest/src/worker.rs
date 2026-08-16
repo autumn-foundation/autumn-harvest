@@ -205,9 +205,10 @@ pub struct WorkerRuntimeConfig {
     /// `0` disables quarantine (reclaimed poison pills are re-queued forever).
     pub poison_pill_threshold: i32,
     /// Consecutive claims by workers with no handler registered for a task's
-    /// workflow/activity type before it escalates to the terminal-failure /
-    /// dead-letter path with a `no_capable_worker:` reason (issue #804).
-    /// `0` escalates on the first miss (pre-#804 fail-fast behaviour).
+    /// workflow/activity type before it escalates to the ordinary
+    /// terminal-failure path with a `no_capable_worker:` reason (issue #804).
+    /// Writes no dead-letter row. `0` escalates on the first miss (pre-#804
+    /// fail-fast behaviour).
     pub capability_miss_max_redeliveries: u32,
     /// Maximum wall-clock time a single workflow-task dispatch may run before
     /// the worker reclaims the concurrency slot (issue #494).

@@ -736,37 +736,58 @@ registers the handler at all**",
 /// `capability_miss_escalates_after_the_budget_with_no_capable_worker`. Naming a
 /// DLQ destination anywhere sends an operator to an empty recovery surface
 /// during exactly the incident this feature exists to make legible.
+///
+/// The knob's rustdoc is **mirrored across three files**, and round 47 corrected
+/// only `effective_config.rs` — scoping this guard to that one file is what let
+/// the stale wording survive in the other two until Codex round 52. Every
+/// surface an operator can read the knob from is checked here, so the class
+/// cannot recur on whichever copy the next edit misses.
 #[test]
 fn capability_miss_escalation_is_never_documented_as_dead_lettering() {
-    let config =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/effective_config.rs"))
-            .expect("failed to read src/effective_config.rs");
-    let doc = rustdoc_above_field(&config, "capability_miss_max_redeliveries");
-    // Ban the DESTINATION constructions, not the token: this doc legitimately
-    // mentions the DLQ in order to rule it out, and a bare `contains("dlq")`
-    // cannot tell a negation from a claim.
-    for banned in [
-        "/ DLQ path",
-        "DLQ path",
-        "to the DLQ with",
-        "dead-letter path",
-    ] {
-        assert!(
-            !doc.contains(banned),
-            "the capability-miss escalation writes no `harvest_dead_letters` row \
-             (`fail_task_and_execution_with_history` inserts none), so this field must \
-             not name a DLQ destination -- it would send an operator to an empty \
-             recovery surface mid-incident. Found {banned:?} in: {doc}"
-        );
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let surfaces = [
+        // The operator-facing effective-config projection (`GET /admin/config`).
+        ("src/effective_config.rs", true),
+        // The public builder knob an embedder sets.
+        ("src/builder.rs", true),
+        // The internal runtime mirror. Terse by convention — it carries no
+        // positive rule-out, so only the destination constructions are banned.
+        ("src/worker.rs", false),
+    ];
+
+    for (path, requires_positive_rule_out) in surfaces {
+        let source = fs::read_to_string(manifest.join(path))
+            .unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+        let doc = rustdoc_above_field(&source, "capability_miss_max_redeliveries");
+        // Ban the DESTINATION constructions, not the token: these docs
+        // legitimately mention the DLQ in order to rule it out, and a bare
+        // `contains("dlq")` cannot tell a negation from a claim.
+        for banned in [
+            "/ DLQ path",
+            "DLQ path",
+            "to the DLQ with",
+            "dead-letter path",
+        ] {
+            assert!(
+                !doc.contains(banned),
+                "{path}: the capability-miss escalation writes no `harvest_dead_letters` \
+                 row (`fail_task_and_execution_with_history` inserts none), so this field \
+                 must not name a DLQ destination -- it would send an operator to an empty \
+                 recovery surface mid-incident. Found {banned:?} in: {doc}"
+            );
+        }
+        // And the operator-facing surfaces must rule the DLQ out POSITIVELY.
+        // Silence is not enough: an operator who has just read the poison-pill
+        // knob (which really does quarantine, #367) will otherwise assume this
+        // one behaves the same way.
+        if requires_positive_rule_out {
+            assert!(
+                doc.contains("No dead-letter row is written"),
+                "{path}: the field must state outright that no dead-letter row is written, \
+                 so an operator diagnosing an exhausted budget queries failed workflows: {doc}"
+            );
+        }
     }
-    // And it must rule the DLQ out POSITIVELY. Silence is not enough: an
-    // operator who has just read the poison-pill knob (which really does
-    // quarantine, #367) will otherwise assume this one behaves the same way.
-    assert!(
-        doc.contains("No dead-letter row is written"),
-        "the field must state outright that no dead-letter row is written, so an \
-         operator diagnosing an exhausted budget queries failed workflows: {doc}"
-    );
 }
 
 /// The capability-miss fleet lookup uses a **floored** liveness window, and no

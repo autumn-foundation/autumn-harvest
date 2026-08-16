@@ -3118,8 +3118,17 @@ pub struct WorkerConfig {
     pub poison_pill_threshold: i32,
     /// Maximum number of **distinct workers** that may release a task back to
     /// `PENDING` because they had no handler registered for its
-    /// workflow/activity type, before it is escalated to the terminal-failure /
-    /// dead-letter path with a `no_capable_worker:` reason (issue #804).
+    /// workflow/activity type, before it is escalated to the ordinary
+    /// terminal-failure path with a `no_capable_worker:` reason (issue #804).
+    ///
+    /// **No dead-letter row is written.** The escalation routes through
+    /// `fail_task_and_execution_with_history`, which fails the task and the
+    /// execution without inserting into `harvest_dead_letters` — the reason
+    /// lives on the failed execution row, so an operator diagnosing an
+    /// exhausted budget queries failed workflows, not the DLQ. (A DLQ entry on
+    /// this path would also be indistinguishable from a poison-pill
+    /// quarantine, [`poison_pill_threshold`], which a capability miss
+    /// deliberately is not.)
     ///
     /// Any worker polling a queue can claim any task on it — the queue's
     /// non-blocking claim query has no capability filter, and cannot have one

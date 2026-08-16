@@ -2097,3 +2097,40 @@ Pinned by the round-50 test, strengthened from "was not refreshed" to
 which also proves the heartbeat never ran (`heartbeat_worker` refreshes a
 surviving row, it never removes one). Verified RED against a neutered withdrawal
 (`left: 1`, `right: 0`).
+
+## Review round 52
+
+**P2 accepted — and the guard that was supposed to prevent it had the wrong
+scope.** Round 47 corrected a doc that named a dead-letter destination for
+capability-miss escalation, and added
+`capability_miss_escalation_is_never_documented_as_dead_lettering` to keep it
+corrected. But the knob's rustdoc is **mirrored across three files** and that
+guard read only one of them (`effective_config.rs`), so the stale wording
+survived for five more rounds in the two Codex has now flagged — the public
+`WorkerConfig::capability_miss_max_redeliveries` in `builder.rs` (the copy an
+embedder actually reads when configuring the knob) and its
+`WorkerRuntimeConfig` mirror in `worker.rs`. Codex named the first; the second
+is the same defect and was fixed with it rather than left for a round 53.
+
+The claim is accurate: escalation calls `fail_task_and_execution_with_history`,
+which fails the task and seals the execution `FAILED` without inserting a
+`harvest_dead_letters` row (verified in the function body — it contains no
+dead-letter reference at all, and the DB test
+`capability_miss_escalates_after_the_budget_with_no_capable_worker` has asserted
+the absence since round 1). An operator following the doc during an exhausted-
+budget page would query `GET /dead-letters`, find nothing, and reasonably read
+that emptiness as evidence the alert was spurious — at precisely the moment
+this feature exists to make the situation legible.
+
+Both docs now say "the ordinary terminal-failure path", and the two
+operator-facing surfaces (`builder.rs`, `effective_config.rs`) additionally rule
+the DLQ out **positively**, because silence is not enough: an embedder who has
+just read `poison_pill_threshold` — which really does quarantine (#367) — will
+otherwise carry that assumption across. The terse internal `worker.rs` mirror
+states the negative in one clause without the full rationale, matching its
+surrounding convention.
+
+**The real fix is the guard's scope, not the two strings.** It now iterates all
+three surfaces, with the positive rule-out required only of the two an operator
+reads, so whichever copy the next edit misses is caught. Verified RED at
+`builder.rs` with the widened guard against the unfixed docs.
