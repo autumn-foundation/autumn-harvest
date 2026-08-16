@@ -1795,7 +1795,7 @@ async fn zz_capture_queue_pause_claim_evidence() {
         query_plan: String,
     }
 
-    #[derive(QueryableByName)]
+    #[derive(QueryableByName, Debug)]
     struct StatRow {
         #[diesel(sql_type = diesel::sql_types::Text)]
         query: String,
@@ -2061,20 +2061,67 @@ async fn zz_capture_queue_pause_claim_evidence() {
          placeholder",
     );
 
-    let stats_text = if stats_rows.is_empty() {
-        "pg_stat_statements unavailable or returned no rows".to_string()
-    } else {
-        stats_rows
-            .iter()
-            .map(|r| {
-                format!(
-                    "calls={} shared_blks_hit={} shared_blks_read={} total_buffers={}\nquery={}\n",
-                    r.calls, r.shared_blks_hit, r.shared_blks_read, r.total_buffers, r.query,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    // An empty result set here is not "genuinely zero matching statements"
+    // the way it might be for an ad-hoc query -- the `claimed + 1` real
+    // claim_task() calls immediately above are guaranteed to have executed
+    // the production claim_task_query() text, which always matches
+    // `%harvest_task_queue%`. Unlike a missing preload (already guarded by
+    // the `.expect()` on the query above), a zero-row result here means the
+    // extension is loaded but not tracking (e.g.
+    // `pg_stat_statements.track = none`, which doesn't error, it just
+    // silently returns nothing) or some other scoping problem -- either way
+    // this must abort the capture, not fall back to a placeholder the shell
+    // harness's marker-only success check would accept.
+    assert!(
+        !stats_rows.is_empty(),
+        "pg_stat_statements returned zero rows matching '%harvest_task_queue%' \
+         for the current database, even though {claimed} real claim_task() \
+         calls (plus one terminal None) were just driven above -- check \
+         pg_stat_statements.track (must be 'all' or 'top', not 'none')",
+    );
+
+    // Beyond "some row matched the pattern": find the specific row for the
+    // production claim_task_query() shape -- its `rate_limit_debit` CTE name
+    // is unique to this statement among everything else this harness runs
+    // (INSERT/UPDATE/TRUNCATE/ANALYZE, none of which share it), and is
+    // present in both the pre-fix and post-fix shapes of the query, so this
+    // check works for either capture label -- and assert its call count is
+    // exactly `claimed + 1` (the loop above's successful claims plus the
+    // final call that returned None and broke it). A capture that
+    // accidentally snapshotted buffers from an unrelated statement, or a
+    // stale entry the reset above somehow missed, fails loudly here instead
+    // of silently reporting someone else's numbers as this query's cost.
+    let expected_calls =
+        i64::try_from(claimed + 1).expect("claimed count fits in i64 at this test's scale");
+    let claim_row = stats_rows
+        .iter()
+        .find(|r| r.query.contains("rate_limit_debit"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no pg_stat_statements row matched the production \
+                 claim_task_query() shape (looked for the `rate_limit_debit` \
+                 CTE); got: {stats_rows:?}"
+            )
+        });
+    assert_eq!(
+        claim_row.calls, expected_calls,
+        "pg_stat_statements reports {} calls for the production claim_task_query() \
+         row, expected {expected_calls} ({claimed} successful claims + 1 terminal \
+         None) -- the snapshot may include stale or foreign calls despite the \
+         reset and dbid scope above",
+        claim_row.calls,
+    );
+
+    let stats_text = stats_rows
+        .iter()
+        .map(|r| {
+            format!(
+                "calls={} shared_blks_hit={} shared_blks_read={} total_buffers={}\nquery={}\n",
+                r.calls, r.shared_blks_hit, r.shared_blks_read, r.total_buffers, r.query,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     std::fs::write(
         out_dir.join(format!("{label}-pg_stat_statements.txt")),
         format!("-- {label}: pg_stat_statements @ headline scenario ({} backlog, real claim_task() calls) --\n{stats_text}\n", headline.backlog),
