@@ -1041,7 +1041,7 @@
         "GET /api/harvest/admin/workflow-types/reachability (issue #520 \u2014 verdict orphaned means a type has live executions but no registered handler anywhere)",
         "GET /api/harvest/admin/queue-coverage (issue #774 \u2014 confirm the queue has any live worker at all)",
         "GET /api/harvest/workers (confirm which build_id / deployment is polling the affected queue)",
-        "GET /api/harvest/dead-letters?queue={queue} (escalated runs are FAILED with a no_capable_worker: reason on the execution row; they are NOT dead-lettered)"
+        "GET /api/harvest/workflows?state=FAILED (grep the error column for no_capable_worker: -- escalated runs are FAILED with that reason on the execution row and are NOT dead-lettered, so /dead-letters cannot surface them)"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_no_capable_worker"
     },

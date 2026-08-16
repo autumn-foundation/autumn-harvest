@@ -1196,3 +1196,70 @@ fn markdown_section<'a>(document: &'a str, heading: &str) -> Option<&'a str> {
         .map_or(document.len(), |relative| after_start + relative);
     Some(&document[start..end])
 }
+
+/// A capability-miss alert must never send a responder to `/dead-letters`
+/// (issue #804, Codex round-54 P2).
+///
+/// Escalation routes through `fail_task_and_execution_with_history`, which
+/// inserts no `harvest_dead_letters` row, so that endpoint physically cannot
+/// surface the affected execution or its `no_capable_worker:` reason. A
+/// `management_checks` entry naming it hands the on-call an empty result set
+/// mid-incident — worse than saying nothing, because an empty DLQ reads as
+/// evidence the alert was spurious.
+///
+/// This is the *endpoint* half of the round-47/52 prose guard: those ban a
+/// dead-letter DESTINATION in rustdoc, and a check-list entry saying
+/// "GET /dead-letters" trips neither of them. The failed-workflows lookup the
+/// sibling `harvest_capability_miss_never_offered` rule already uses is the
+/// correct target, so this also keeps the two rules consistent.
+///
+/// Bans the DIRECTIVE (`GET .../dead-letters`), not the token: a check may
+/// legitimately *mention* `/dead-letters` in order to rule it out, and a bare
+/// `contains("/dead-letters")` cannot tell a negation from a referral. That is
+/// the same distinction the round-47 prose guard draws, and writing this one
+/// naively tripped on its own corrected text during development.
+#[test]
+fn capability_miss_alerts_never_send_responders_to_the_dead_letter_endpoint() {
+    let pack: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(workspace_path("docs/alerts/starter-pack-v0.1.0.json"))
+            .expect("failed to read the alert pack"),
+    )
+    .expect("alert pack must be valid JSON");
+
+    let rules = pack["rules"]
+        .as_array()
+        .expect("alert pack must carry a rules array");
+    let capability_rules: Vec<&serde_json::Value> = rules
+        .iter()
+        .filter(|r| {
+            r["id"].as_str().is_some_and(|id| {
+                id.starts_with("harvest_capability_miss") || id == "harvest_no_capable_worker"
+            })
+        })
+        .collect();
+    assert!(
+        !capability_rules.is_empty(),
+        "expected at least one capability-miss rule; the filter must have drifted \
+         from the rule ids, which would make this guard vacuous"
+    );
+
+    for rule in capability_rules {
+        let id = rule["id"].as_str().unwrap_or("<unknown>");
+        for check in rule["management_checks"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            let text = check.as_str().unwrap_or_default();
+            assert!(
+                !["GET /api/harvest/dead-letters", "GET /dead-letters"]
+                    .iter()
+                    .any(|directive| text.contains(directive)),
+                "{id}: capability-miss escalation writes no dead-letter row, so this \
+                 management check sends the on-call to an endpoint that cannot surface \
+                 the affected execution. Use the failed-workflows lookup \
+                 (GET /api/harvest/workflows?state=FAILED) instead. Found: {text:?}"
+            );
+        }
+    }
+}

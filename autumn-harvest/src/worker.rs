@@ -12,7 +12,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -4158,6 +4158,44 @@ pub const CAPABILITY_MISS_MIN_FLEET_STALE_SECS: i64 = 120;
 #[must_use]
 pub fn capability_miss_fleet_stale_secs(heartbeat_interval: Duration) -> i64 {
     worker_stale_secs(heartbeat_interval).max(CAPABILITY_MISS_MIN_FLEET_STALE_SECS)
+}
+
+/// Whether a shard's poll loop may claim tasks, given that shard's pending
+/// fleet-registration state (issue #804, Codex round-54 P1).
+///
+/// A worker whose atomic register+invalidate pair has not committed is **not a
+/// fleet member**, and claiming while unregistered is actively harmful in two
+/// compounding ways:
+///
+/// 1. **It is invisible to peers' capability evidence.** `live_workers_on_queue`
+///    reads `harvest_workers`, so a worker with no row is absent from the live
+///    fleet. An incapable peer can then see only itself, derive
+///    `AllLiveWorkersMissed`, and terminally fail a task *this* worker could
+///    have run. Round 51 stopped an unverified row from being read as
+///    affirmative *false* evidence; it could not make an absent row count as a
+///    live claimant, because nothing records that the worker exists.
+///
+/// 2. **Its claims cannot be durably held.** With no `harvest_workers` row,
+///    every task it claims matches
+///    [`crate::poison_pill::orphaned_running_tasks_query`] — `RUNNING` with a
+///    `worker_id` that has no fresh heartbeat — so the reclaimer takes it back
+///    *and increments `crash_strikes`*. After `poison_pill_threshold` strikes
+///    (default 3) the task is quarantined to the dead-letter queue and its
+///    workflow failed terminally. So an unregistered worker does not merely
+///    fail to help: repeatedly claiming work it cannot hold manufactures the
+///    very terminal failures issue #804 exists to prevent.
+///
+/// Together those retire the round-51 argument for letting it keep polling
+/// ("it might be capable and rescue the task"): it cannot reliably rescue
+/// anything, and each attempt burns a strike toward a terminal quarantine.
+///
+/// Only the **claim** is gated, never the worker. The heartbeat task keeps
+/// running — it is what retries the registration — so the gate lifts by itself
+/// on the first tick that commits the pair, with no restart and no operator
+/// action. A worker that registered cleanly never observes the gate.
+#[must_use]
+pub const fn may_claim_tasks(registration_pending: bool) -> bool {
+    !registration_pending
 }
 
 /// The redelivery budget as an `i32`, clamped for the persisted counter's type.
@@ -19358,9 +19396,16 @@ impl Worker {
         // Register + rate-limit buckets on every shard pool. Each shard keeps
         // its OWN pending flag: a shard whose registration failed must retry
         // even when a sibling shard succeeded (issue #804, Codex round-50 P1).
-        let mut registration_pending_per_shard: Vec<bool> = Vec::with_capacity(shard_targets.len());
+        // Each flag is SHARED (not copied) between that shard's heartbeat task
+        // and that shard's slot in the poll loop: the heartbeat retries and
+        // eventually clears it, and the poll loop must observe the clearing to
+        // resume claiming on that shard. See `may_claim_tasks`.
+        let mut registration_pending_per_shard: Vec<Arc<AtomicBool>> =
+            Vec::with_capacity(shard_targets.len());
         for (_, shard_pool) in &shard_targets {
-            registration_pending_per_shard.push(self.register_in_fleet(shard_pool).await);
+            registration_pending_per_shard.push(Arc::new(AtomicBool::new(
+                self.register_in_fleet(shard_pool).await,
+            )));
             self.register_rate_limit_buckets(shard_pool).await;
         }
 
@@ -19390,7 +19435,7 @@ impl Worker {
                     Arc::clone(&monitors.workflow_slot_target),
                     Arc::clone(&monitors.activity_slot_target),
                     heartbeat_cancel.clone(),
-                    *pending,
+                    Arc::clone(pending),
                 )
             })
             .collect();
@@ -19430,8 +19475,12 @@ impl Worker {
             shard_listeners.push(listener);
         }
 
-        self.run_poll_loop_multi(shard_targets.clone(), shard_listeners)
-            .await;
+        self.run_poll_loop_multi(
+            shard_targets.clone(),
+            shard_listeners,
+            &registration_pending_per_shard,
+        )
+        .await;
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received (multi-shard)");
 
@@ -19477,6 +19526,7 @@ impl Worker {
         &self,
         shard_targets: Vec<(crate::types::ShardId, DbPool)>,
         mut shard_listeners: Vec<Option<crate::notify::QueueListener>>,
+        registration_pending_per_shard: &[Arc<AtomicBool>],
     ) {
         let n = shard_targets.len();
         // Rotating start index prevents the first shard from being permanently
@@ -19487,6 +19537,19 @@ impl Worker {
             let mut any_claimed = false;
             for i in 0..n {
                 let idx = (start_idx + i) % n;
+                // Skip a shard whose own registration is still unverified: on
+                // that shard this worker is not a fleet member, so it must not
+                // claim (see `may_claim_tasks`). Sibling shards are unaffected,
+                // which is why the flag is per shard (round-50 P1).
+                // Fully qualified: diesel's blanket `RunQueryDsl::load` is in
+                // scope here and shadows the inherent `AtomicBool::load` through
+                // the `Arc` deref.
+                if !may_claim_tasks(AtomicBool::load(
+                    &registration_pending_per_shard[idx],
+                    Ordering::Relaxed,
+                )) {
+                    continue;
+                }
                 if self.poll_once(&shard_targets[idx].1).await {
                     any_claimed = true;
                     // Advance start past the shard that just claimed so the
@@ -19649,7 +19712,12 @@ impl Worker {
 
         // Register this worker in the fleet table. The returned flag arms this
         // pool's heartbeat retry when the atomic pair did not commit.
-        let registration_pending = self.register_in_fleet(pool).await;
+        //
+        // The flag is shared (not copied) between this pool's heartbeat task and
+        // its poll loop: the heartbeat is what retries and eventually clears it,
+        // and the poll loop must observe that clearing to resume claiming. See
+        // `may_claim_tasks` for why an unregistered worker must not claim.
+        let registration_pending = Arc::new(AtomicBool::new(self.register_in_fleet(pool).await));
 
         // Auto-register rate limit buckets for the activities configured on this worker.
         self.register_rate_limit_buckets(pool).await;
@@ -19661,10 +19729,11 @@ impl Worker {
             Arc::clone(&monitors.workflow_slot_target),
             Arc::clone(&monitors.activity_slot_target),
             heartbeat_cancel.clone(),
-            registration_pending,
+            Arc::clone(&registration_pending),
         );
 
-        self.run_poll_loop(pool, listener).await;
+        self.run_poll_loop(pool, listener, &registration_pending)
+            .await;
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
 
@@ -20150,7 +20219,7 @@ impl Worker {
         workflow_slot_target: Arc<AtomicUsize>,
         activity_slot_target: Arc<AtomicUsize>,
         heartbeat_cancel: CancellationToken,
-        registration_pending: bool,
+        registration_pending: Arc<AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
         // Spawn the heartbeat background task with a dedicated cancel token so
         // that liveness updates continue during the Draining phase and only stop
@@ -20191,7 +20260,7 @@ impl Worker {
             Arc::clone(&self.remote_drain_deadline),
             Arc::clone(&self.drain_deadline_max),
             Arc::clone(&self.session_slots_in_use),
-            Arc::new(std::sync::atomic::AtomicBool::new(registration_pending)),
+            registration_pending,
         )
     }
 
@@ -20199,8 +20268,22 @@ impl Worker {
         &self,
         pool: &DbPool,
         mut listener: Option<crate::notify::QueueListener>,
+        registration_pending: &AtomicBool,
     ) {
         while !self.shutdown.is_cancelled() {
+            // Do not claim while this pool's registration is unverified: an
+            // unregistered worker is invisible to peers' capability evidence AND
+            // cannot durably hold a claim (the orphan reclaimer takes it back and
+            // charges a crash strike). See `may_claim_tasks`. The heartbeat task
+            // keeps retrying, so the gate lifts on its own.
+            if !may_claim_tasks(registration_pending.load(Ordering::Relaxed)) {
+                tokio::select! {
+                    () = self.shutdown.cancelled() => break,
+                    () = tokio::time::sleep(self.config.poll_interval) => {}
+                }
+                continue;
+            }
+
             if self.poll_once(pool).await {
                 continue;
             }
@@ -22828,7 +22911,7 @@ mod tests {
         let cleanup = Duration::from_millis(150);
 
         // The shipped shape: budget wraps the cycle only.
-        let cleanup_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_ran = std::sync::Arc::new(AtomicBool::new(false));
         let flag = std::sync::Arc::clone(&cleanup_ran);
         let cycle = run_under_workflow_body_budget(Some(budget), async { 7 }).await;
         assert_eq!(
@@ -22846,7 +22929,7 @@ mod tests {
 
         // The control: one timeout spanning cycle + cleanup cancels the
         // cleanup, which is exactly the defect this scoping removes.
-        let control_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let control_ran = std::sync::Arc::new(AtomicBool::new(false));
         let control_flag = std::sync::Arc::clone(&control_ran);
         let spanned = tokio::time::timeout(budget, async move {
             tokio::time::sleep(cleanup).await;
@@ -26184,6 +26267,28 @@ mod tests {
             worker_stale_secs(fast_claimant) < worker_stale_secs(default_peer),
             "pre-fix, the claimant's own window was narrower than the default \
              peer's -- without that gap this test proves nothing"
+        );
+    }
+
+    #[test]
+    fn an_unregistered_worker_may_not_claim_tasks() {
+        // Issue #804, Codex round-54 P1. A worker whose atomic register+
+        // invalidate pair has not committed is not a fleet member: it is
+        // invisible to peers' capability evidence, AND every task it claims
+        // matches the orphan-reclaim predicate (RUNNING with a worker_id that
+        // has no fresh `harvest_workers` heartbeat), so the reclaimer takes the
+        // task back and charges a crash strike toward a poison-pill quarantine.
+        assert!(
+            !may_claim_tasks(true),
+            "a worker whose fleet registration has not committed must not claim: \
+             it cannot durably hold the claim, and each attempt burns a crash \
+             strike toward a terminal quarantine"
+        );
+        // And the gate must be exactly that condition -- a registered worker is
+        // never slowed down by it, so the common path is unchanged.
+        assert!(
+            may_claim_tasks(false),
+            "a registered worker must claim normally; the gate is not a throttle"
         );
     }
 

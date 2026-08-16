@@ -2174,3 +2174,66 @@ constructions. Verified RED at the alert pack, on the phrasing-normalized
 A repo-wide sweep for the claim across `src`, the plugin and `docs` (excluding
 this changelog) confirms the alert pack was the **only** remaining offender, so
 this closes the class rather than one more instance of it.
+
+## Review round 54
+
+**P1 accepted, reversing round 51's decline — a worker that never registers
+must not claim tasks.** Round 50 made fleet registration atomic and round 51
+made a failed registration withdraw its row rather than leave stale evidence
+behind. Both left `run_with_listener` entering the poll loop unconditionally, on
+the reasoning I gave in round 51: gating would only stop a *possibly capable*
+worker from rescuing a task, and an absent row is already neutral for the
+evidence lookup. That reasoning was wrong, and re-reading the reclaim path is
+what retired it.
+
+`live_workers_on_queue` reads `harvest_workers`, so a withdrawn row is indeed
+neutral for false evidence — but it is also **invisible as an untried live
+peer**, which is the lesser of two harms. The decisive one is that
+`orphaned_running_tasks_query()` selects `RUNNING` rows whose `worker_id` has no
+fresh `harvest_workers` heartbeat, and `reclaim_orphaned_tasks` **increments
+`crash_strikes`** on every such row. An unregistered worker's claims match that
+query by construction, so each claim it takes burns a strike, and after
+`poison_pill_threshold` (default 3) the task is quarantined to the DLQ and its
+workflow terminally failed. Such a worker cannot rescue anything *and*
+manufactures the exact terminal failures this feature exists to prevent —
+misattributed to a poison pill, which is the AC4 confusion in reverse.
+
+The fix gates the **claim**, never the worker. New pure
+`may_claim_tasks(registration_pending) -> bool` is consulted at the top of both
+`run_poll_loop` and `run_poll_loop_multi`; while pending, the loop sleeps one
+`poll_interval` (still cancellation-responsive) and claims nothing. The
+heartbeat task keeps running throughout — it is what retries registration — so
+the gate lifts by itself on the first tick that commits the pair, with no
+restart and no operator action.
+
+Round 50 deliberately removed the worker-wide `Arc<AtomicBool>` because a shard
+whose registration succeeded could clear a failed shard's flag. That ownership
+model is preserved: `register_in_fleet` still returns its answer per pool, and
+the `Arc` is now constructed **per pool** by the caller and shared between only
+that pool's heartbeat task and that pool's poll-loop slot. In the multi-shard
+loop the flag is read through a fully-qualified `AtomicBool::load` — with
+`diesel::prelude::*` in scope, `.load(Ordering::Relaxed)` through the `Arc`
+deref resolves to diesel's blanket `RunQueryDsl::load` and fails with
+`Arc<AtomicBool>: Query`.
+
+**P2 accepted — the alert told responders to look where the feature guarantees
+nothing is.** `harvest_no_capable_worker`'s `management_checks` pointed at
+`GET /api/harvest/dead-letters?queue={queue}` while the same rule's own text
+says escalation writes no dead-letter row. Round 52 corrected exactly this claim
+in the two rustdoc surfaces; the alert pack's *action* still contradicted it, so
+an on-call engineer following the firing alert queries an endpoint that is empty
+by design and reads that emptiness as a spurious page. It now points at
+`GET /api/harvest/workflows?state=FAILED` with the `no_capable_worker:` reason
+grep, matching the sibling `harvest_capability_miss_never_offered` rule.
+
+The new guard bans the **directive**, not the token. A correct doc legitimately
+names the DLQ in order to rule it out — the corrected text itself ends "so
+/dead-letters cannot surface them" — so a bare substring ban cannot tell a
+negation from a claim. Writing this guard naively tripped on my own corrected
+text during development, which is recorded in its rustdoc. It filters the
+capability-miss rules, asserts that filter is non-empty (anti-vacuity), and bans
+only the endpoint forms an operator would copy. No positive
+"must-reference-failed-workflows" assertion was added:
+`harvest_capability_miss_release_sustained` concerns non-terminal releases and
+has no failed execution to look up, so such a rule would encode a wrong
+assumption.
