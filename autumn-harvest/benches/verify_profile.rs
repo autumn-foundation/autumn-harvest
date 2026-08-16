@@ -183,11 +183,29 @@ fn build_fixture_json(activity_count: usize) -> String {
     serde_json::to_string(&snapshot).unwrap()
 }
 
+/// Read `key` as a `usize`. An *absent* variable uses `default`; a
+/// *present but unparseable* value panics rather than silently falling back
+/// to `default` -- a typo like `VERIFY_PROFILE_FIXTURES=2O` (letter O) or
+/// `VERIFY_PROFILE_ACTIVITIES=1000x` must not silently select a different
+/// workload and produce a plausible-looking but methodologically invalid
+/// measurement (the same principle `VERIFY_PROFILE_MODE`'s dispatch below
+/// applies to a malformed mode string). Runs at the very top of `main()`,
+/// before the `prepare`/`run` mode split, so it executes in the profiled
+/// `run`-mode process too -- but the success-path work (one env lookup, one
+/// `parse()` call) is byte-for-byte what the previous
+/// `.ok().and_then(...).unwrap_or(default)` chain already did; only the
+/// error-handling branches differ, and those don't execute for a
+/// correctly-configured measurement run, so this needed no re-measurement.
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|e| panic!("{key}={value:?} is not a valid usize: {e}")),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            panic!("{key} is not valid UTF-8: {}", raw.to_string_lossy())
+        }
+    }
 }
 
 /// Filename for the tiny sidecar `prepare_fixtures` writes alongside the
@@ -225,16 +243,53 @@ fn read_prepared_meta(dir: &std::path::Path) -> Option<(usize, usize)> {
     Some((fixtures?, activities?))
 }
 
+/// Remove any pre-existing `fixture_*.json` files from `dir` before
+/// `prepare_fixtures` writes a fresh set. Without this, re-running `prepare`
+/// with a *smaller* `VERIFY_PROFILE_FIXTURES` than a previous run against the
+/// same `VERIFY_PROFILE_DIR` leaves higher-numbered files behind (e.g. a
+/// prior `fixtures=50` run's `fixture_00020.json`..`fixture_00049.json`
+/// survive a later `fixtures=20` run, which only rewrites indices 0..19).
+/// `verify_dir` globs every `*.json` file in the directory, so those stale
+/// leftovers -- possibly written with a *different* `VERIFY_PROFILE_ACTIVITIES`
+/// value -- would silently be included in the next `run`-mode measurement,
+/// producing a non-uniform, partially-stale workload instead of the
+/// requested one; `report.fixtures_total`'s equality assert only catches
+/// this when the stale count happens to disagree with the *new* run's
+/// `VERIFY_PROFILE_FIXTURES`, not when it happens to coincide. Only removes
+/// files matching the exact naming pattern `prepare_fixtures` itself writes
+/// -- the sidecar (non-`.json` extension) and any unrelated file are left
+/// alone. Runs only from `prepare`/`full` mode, never from `run` mode, so
+/// this adds zero cost to the profiled measurement region.
+fn remove_stale_fixtures(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let starts_with_fixture = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("fixture_"));
+        let is_json = path.extension().and_then(|ext| ext.to_str()) == Some("json");
+        if starts_with_fixture && is_json {
+            std::fs::remove_file(&path).expect("remove stale fixture");
+        }
+    }
+}
+
 /// Write `fixtures` copies of the same fixture JSON into `dir`, plus the
 /// `PROFILE_META_FILENAME` sidecar recording the exact values used. Pure
 /// filesystem I/O plus one one-time `serde_json::to_string` -- intentionally
 /// isolable so it can run **unprofiled** (`VERIFY_PROFILE_MODE=prepare`)
 /// ahead of a profiled `VERIFY_PROFILE_MODE=run` pass that measures only
-/// `ReplayVerifier::verify_dir`. Idempotent: `create_dir_all` + per-file
-/// `std::fs::write` (truncating), so re-running `prepare` against an
-/// existing directory is safe.
+/// `ReplayVerifier::verify_dir`. Idempotent regardless of growing or
+/// shrinking `fixtures`/`activities` between runs: `remove_stale_fixtures`
+/// clears any pre-existing `fixture_*.json` files first, so re-running
+/// `prepare` against an existing directory always leaves it in exactly the
+/// state a single `prepare` call with the current arguments would produce.
 fn prepare_fixtures(dir: &std::path::Path, fixtures: usize, activities: usize) {
     std::fs::create_dir_all(dir).expect("create fixture dir");
+    remove_stale_fixtures(dir);
     let fixture_json = build_fixture_json(activities);
     for i in 0..fixtures {
         std::fs::write(dir.join(format!("fixture_{i:05}.json")), &fixture_json)
