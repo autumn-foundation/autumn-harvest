@@ -2909,6 +2909,101 @@ async fn a_surviving_old_row_still_retries_the_failed_startup_registration() {
     );
 }
 
+/// A retry that fails again must not refresh the unverified row (issue #804,
+/// Codex round-50 P1).
+///
+/// With a reused `worker_id` the previous row is still there, so falling
+/// through to `heartbeat_worker` would *succeed* — republishing the old build's
+/// `build_id`/queues as live while this id's stale capability-miss evidence is
+/// still uncleared. That is affirmative false fleet evidence, and it is exactly
+/// what produces `AllLiveWorkersMissed` and a terminal failure of a task this
+/// worker can run. Publishing nothing is more honest than republishing
+/// something known-false, so the tick returns and the row ages out.
+///
+/// The failure is injected the same way round 28's atomicity test does —
+/// renaming `harvest_task_queue` out from under the invalidation on a separate
+/// connection, deterministic and reversible within the test. The DB suite runs
+/// `--test-threads=1`, so no sibling can observe it.
+#[tokio::test]
+async fn a_failed_retry_does_not_refresh_the_unverified_row() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    let worker_id = "pod-unverified";
+    diesel::sql_query(
+        "INSERT INTO harvest_workers \
+         (worker_id, started_at, last_heartbeat_at, queues, shard_assignments, \
+          max_concurrency, in_flight_count, host, status, build_id, labels) \
+         VALUES ($1, NOW(), NOW() - INTERVAL '90 seconds', $2::jsonb, '[]'::jsonb, 4, 0, \
+                 'test-host', 'Active', $3, '{}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .bind::<diesel::sql_types::Text, _>(format!("[\"{Q_REUSED_ID}\"]"))
+    .bind::<diesel::sql_types::Text, _>(OLD_BUILD)
+    .execute(&mut conn)
+    .await
+    .expect("seed the surviving old worker row");
+
+    let before: chrono::DateTime<Utc> = harvest_workers::table
+        .find(worker_id)
+        .select(harvest_workers::last_heartbeat_at)
+        .first(&mut conn)
+        .await
+        .expect("read the seeded heartbeat");
+
+    let registration = autumn_harvest::workers::WorkerRegistration {
+        worker_id: worker_id.to_string(),
+        queues: vec![Q_REUSED_ID.to_string()],
+        shard_assignments: vec![0],
+        max_concurrency: 1,
+        host: "test-host".to_string(),
+        version: None,
+        build_id: NEW_BUILD.to_string(),
+        deployment_name: None,
+        labels: HashMap::new(),
+        max_concurrent_sessions: 0,
+    };
+
+    // Break the invalidation's target table so the retry fails.
+    let mut side = connect(&url).await;
+    diesel::sql_query("ALTER TABLE harvest_task_queue RENAME TO harvest_task_queue_hidden")
+        .execute(&mut side)
+        .await
+        .expect("hides the invalidation's target");
+
+    let pending = AtomicBool::new(true);
+    tick_once(&mut conn, &registration, &pending).await;
+
+    diesel::sql_query("ALTER TABLE harvest_task_queue_hidden RENAME TO harvest_task_queue")
+        .execute(&mut side)
+        .await
+        .expect("restores the table for any later test");
+
+    let after: chrono::DateTime<Utc> = harvest_workers::table
+        .find(worker_id)
+        .select(harvest_workers::last_heartbeat_at)
+        .first(&mut conn)
+        .await
+        .expect("re-read the heartbeat");
+
+    assert_eq!(
+        after, before,
+        "a failed retry must not refresh the unverified row -- a fresh heartbeat \
+         republishes the old build as live and is affirmative false fleet evidence"
+    );
+    assert_eq!(
+        live_build_id(&url, worker_id).await,
+        OLD_BUILD,
+        "the failed pair is atomic, so nothing about the row may change"
+    );
+    assert!(
+        AtomicBool::load(&pending, Ordering::Relaxed),
+        "the flag must stay armed so the next tick retries rather than giving up"
+    );
+}
+
 /// The `build_id` `harvest_workers` currently advertises for `worker_id`.
 async fn live_build_id(url: &str, worker_id: &str) -> String {
     let mut conn = connect(url).await;

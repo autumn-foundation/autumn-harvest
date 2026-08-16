@@ -2008,3 +2008,53 @@ Making the function public also surfaced a pre-existing attribute misplacement:
 `#[allow(clippy::implicit_hasher)]` had drifted onto `do_heartbeat_tick`, which
 was harmless while it was private but emitted an `unused_must_use` warning at
 every new call site. Moved back to the function they describe.
+
+## Review round 50
+
+Three P1s, all against round 49's own fix. Each was verified in code before
+being accepted.
+
+**(a) A failed retry must not refresh the unverified row.** Round 49's `Err`
+arm logged and fell through to `heartbeat_worker` — which, with a reused
+`worker_id`, *succeeds*, because the previous instance's row is still there. So
+a retry that failed again republished the old build's `build_id` and queues as
+live while this id's stale capability-miss evidence was still uncleared. That is
+affirmative false fleet evidence: exactly what produces `AllLiveWorkersMissed`
+and a terminal failure of a task this worker can run. The tick now returns
+without heartbeating, so the unverified row ages out of the liveness window
+until the atomic pair succeeds — publishing nothing is more honest than
+republishing something known-false.
+
+The trade-off is real and is recorded at the site rather than glossed: a stale
+row also makes this worker's in-flight rows look orphaned to the poison-pill
+reclaimer (#367), which re-queues them, and remote-drain detection is skipped
+for that tick. Both are recoverable — at-least-once is the documented activity
+contract, and a worker that cannot register is already invisible to the fleet —
+whereas the false `AllLiveWorkersMissed` is a terminal `WorkflowFailed` needing
+operator action. Issue #804's own stated preference ("prefer holding a task over
+terminally failing an execution") settles the ordering.
+
+**(b) The pending flag was worker-wide, but registration is per shard.**
+`run_multi_shard` registers against every shard pool and spawns one heartbeat
+per shard, all sharing one `Arc<AtomicBool>`. A shard whose registration
+succeeded would clear the flag before a *failed* shard's heartbeat ever read it,
+leaving that shard advertising the old build forever.
+
+Fixed structurally rather than by keying a map: `register_in_fleet` now
+**returns** whether the pair is pending, and each `spawn_heartbeat_task` is
+handed its own pool's answer. There is no shared cell left to share, so the bug
+cannot recur by construction. The `Worker::registration_pending` field is gone.
+
+**(c) A failed `pool.get()` never armed the retry at all.** That arm attempts
+nothing, so under a reused `worker_id` the surviving row keeps advertising the
+old build and keeps carrying the stale evidence — the same end state, reached
+by a path round 49 did not cover. It now returns `true` like the transaction
+failure does.
+
+Tests: `a_failed_retry_does_not_refresh_the_unverified_row` (DB; injects the
+failure by renaming `harvest_task_queue` out from under the invalidation, as
+round 28's atomicity test does, and asserts `last_heartbeat_at` is byte-identical
+— verified RED against the fall-through), plus
+`registration_arms_the_retry_when_the_connection_cannot_be_acquired` and
+`registration_pending_is_answered_per_pool`, which drive `register_in_fleet`
+against pools pointed at a dead port.

@@ -1305,11 +1305,36 @@ pub async fn do_heartbeat_tick(
                 );
             }
             Err(error) => {
+                // Do NOT fall through to the heartbeat (issue #804, Codex
+                // round-50 P1). A reused `worker_id` leaves the previous row
+                // alive, so `heartbeat_worker` would succeed and refresh a row
+                // we know is wrong — republishing the old build's `build_id`
+                // and queues as live while this id's stale capability-miss
+                // evidence is still uncleared. That is affirmative false fleet
+                // evidence, and it is exactly what can produce
+                // `AllLiveWorkersMissed` and a terminal failure of a task this
+                // worker can run. Publishing nothing is strictly more honest
+                // than republishing something known-false, so the unverified
+                // row is left to age out of the liveness window until the
+                // atomic pair succeeds.
+                //
+                // Accepted trade-off: a stale row also makes this worker's
+                // in-flight rows look orphaned to the poison-pill reclaimer
+                // (#367), which re-queues them. That is recoverable —
+                // at-least-once is the documented activity contract — whereas
+                // the false `AllLiveWorkersMissed` is a terminal `WorkflowFailed`
+                // needing operator action, so issue #804's own preference
+                // ("prefer holding a task over terminally failing an
+                // execution") settles the ordering. Remote-drain detection is
+                // likewise skipped for this tick; a worker that cannot register
+                // is already invisible to the fleet.
                 tracing::warn!(
                     worker_id = %registration.worker_id,
                     error = %error,
-                    "startup registration retry failed; will retry on the next heartbeat"
+                    "startup registration retry failed; skipping this heartbeat so the \
+                     unverified row ages out, and retrying on the next tick"
                 );
+                return;
             }
         }
     }

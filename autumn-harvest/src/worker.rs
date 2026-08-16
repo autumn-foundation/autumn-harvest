@@ -18293,20 +18293,6 @@ pub struct Worker {
     /// Total permits behind `activity_semaphore` (issue #548). See
     /// `workflow_permit_total`.
     activity_permit_total: usize,
-    /// Set when the startup registration's atomic register+invalidate pair
-    /// failed and rolled back, so the heartbeat retries it (issue #804, Codex
-    /// round-49 P1).
-    ///
-    /// The heartbeat's own `Ok(0)` re-registration only fires when the
-    /// `harvest_workers` row is ABSENT. A reused `worker_id` — a configured
-    /// stable id such as a pod name, not the random default — leaves the
-    /// PREVIOUS row alive, so the heartbeat updates it, returns `Ok(1)`, and
-    /// that arm is never reached. Without this flag the worker would poll
-    /// indefinitely while the registry advertised the old build's
-    /// `build_id`/queues and its id remained in `capability_miss_workers`,
-    /// letting a peer read the live fleet as `AllLiveWorkersMissed` and
-    /// terminally fail a task this worker can actually run.
-    registration_pending: Arc<std::sync::atomic::AtomicBool>,
     /// Longest claim-to-dispatch permit-wait observed since the slot tuner's
     /// last tick, in microseconds (issue #548). `None` when no tuner is
     /// configured, so the hot dispatch path performs no extra work in the
@@ -19046,7 +19032,6 @@ impl Worker {
             activity_semaphore: activity_parts.semaphore,
             workflow_permit_total: workflow_parts.permit_total,
             activity_permit_total: activity_parts.permit_total,
-            registration_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             workflow_permit_wait_micros: workflow_parts.permit_wait_micros,
             activity_permit_wait_micros: activity_parts.permit_wait_micros,
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
@@ -19369,9 +19354,12 @@ impl Worker {
             "worker starting (multi-shard)"
         );
 
-        // Register + rate-limit buckets on every shard pool.
+        // Register + rate-limit buckets on every shard pool. Each shard keeps
+        // its OWN pending flag: a shard whose registration failed must retry
+        // even when a sibling shard succeeded (issue #804, Codex round-50 P1).
+        let mut registration_pending_per_shard: Vec<bool> = Vec::with_capacity(shard_targets.len());
         for (_, shard_pool) in &shard_targets {
-            self.register_in_fleet(shard_pool).await;
+            registration_pending_per_shard.push(self.register_in_fleet(shard_pool).await);
             self.register_rate_limit_buckets(shard_pool).await;
         }
 
@@ -19394,12 +19382,14 @@ impl Worker {
         // above, so every shard's row reports the same tuned in-flight view.
         let heartbeat_handles: Vec<_> = shard_targets
             .iter()
-            .map(|(_, shard_pool)| {
+            .zip(&registration_pending_per_shard)
+            .map(|((_, shard_pool), pending)| {
                 self.spawn_heartbeat_task(
                     shard_pool,
                     Arc::clone(&monitors.workflow_slot_target),
                     Arc::clone(&monitors.activity_slot_target),
                     heartbeat_cancel.clone(),
+                    *pending,
                 )
             })
             .collect();
@@ -19656,8 +19646,9 @@ impl Worker {
             "worker starting"
         );
 
-        // Register this worker in the fleet table.
-        self.register_in_fleet(pool).await;
+        // Register this worker in the fleet table. The returned flag arms this
+        // pool's heartbeat retry when the atomic pair did not commit.
+        let registration_pending = self.register_in_fleet(pool).await;
 
         // Auto-register rate limit buckets for the activities configured on this worker.
         self.register_rate_limit_buckets(pool).await;
@@ -19669,6 +19660,7 @@ impl Worker {
             Arc::clone(&monitors.workflow_slot_target),
             Arc::clone(&monitors.activity_slot_target),
             heartbeat_cancel.clone(),
+            registration_pending,
         );
 
         self.run_poll_loop(pool, listener).await;
@@ -20145,12 +20137,19 @@ impl Worker {
     // that value at any time. Untuned workers pass an atomic fixed at the
     // configured max, so `compute_in_flight`'s accounting is byte-identical
     // to before this field existed.
+    ///
+    /// `registration_pending` is this **pool's own** flag, returned by
+    /// `register_in_fleet` for this same pool. It is deliberately not a field
+    /// on `Worker`: `run_multi_shard` spawns one heartbeat per shard, and a
+    /// shared flag would let a shard whose registration succeeded clear the
+    /// retry a *failed* shard still needs (issue #804, Codex round-50 P1).
     fn spawn_heartbeat_task(
         &self,
         pool: &DbPool,
         workflow_slot_target: Arc<AtomicUsize>,
         activity_slot_target: Arc<AtomicUsize>,
         heartbeat_cancel: CancellationToken,
+        registration_pending: bool,
     ) -> tokio::task::JoinHandle<()> {
         // Spawn the heartbeat background task with a dedicated cancel token so
         // that liveness updates continue during the Draining phase and only stop
@@ -20191,7 +20190,7 @@ impl Worker {
             Arc::clone(&self.remote_drain_deadline),
             Arc::clone(&self.drain_deadline_max),
             Arc::clone(&self.session_slots_in_use),
-            Arc::clone(&self.registration_pending),
+            Arc::new(std::sync::atomic::AtomicBool::new(registration_pending)),
         )
     }
 
@@ -20376,7 +20375,18 @@ impl Worker {
     }
 
     /// Register or re-register this worker in the fleet table.
-    async fn register_in_fleet(&self, pool: &DbPool) {
+    ///
+    /// Returns `true` when the atomic register+invalidate pair did **not**
+    /// commit, so the caller must arm this pool's heartbeat retry (issue #804,
+    /// Codex rounds 49 and 50).
+    ///
+    /// The answer is returned rather than stored on `Worker` because
+    /// registration is **per shard pool**: `run_multi_shard` registers against
+    /// every shard, and a single worker-wide flag would let a shard that
+    /// succeeded clear a flag a *different* shard still needs, leaving that
+    /// shard advertising the old build forever. A returned value cannot be
+    /// shared by construction.
+    async fn register_in_fleet(&self, pool: &DbPool) -> bool {
         let shard_ids: Vec<i32> = self
             .config
             .shard_assignments
@@ -20435,16 +20445,15 @@ impl Worker {
                             cleared_capability_miss_evidence = cleared,
                             "worker registered in fleet"
                         );
+                        false
                     }
                     Err(error) => {
                         // Arm the heartbeat retry. Necessary because the
                         // heartbeat's own `Ok(0)` re-registration only fires
                         // when the row is ABSENT: a reused `worker_id` leaves
                         // the previous row alive, the heartbeat updates it, and
-                        // without this flag the atomic pair would never be
-                        // retried (issue #804, Codex round-49 P1).
-                        self.registration_pending
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        // without this the atomic pair would never be retried
+                        // (issue #804, Codex round-49 P1).
                         tracing::warn!(
                             worker_id = %self.config.worker_id,
                             error = %error,
@@ -20452,15 +20461,25 @@ impl Worker {
                              capability-miss cleanup are atomic, so neither landed); the \
                              heartbeat will retry"
                         );
+                        true
                     }
                 }
             }
             Err(error) => {
+                // Also arms the retry (issue #804, Codex round-50 P1). Nothing
+                // was even attempted, so a surviving row from a previous
+                // instance under a reused `worker_id` still advertises the old
+                // build and still carries this id's stale capability-miss
+                // evidence — exactly the state the retry exists to clear. The
+                // heartbeat's `Ok(0)` arm cannot see it, because that row is
+                // present.
                 tracing::warn!(
                     worker_id = %self.config.worker_id,
                     error = %error,
-                    "failed to get pool connection for fleet registration"
+                    "failed to get pool connection for fleet registration; the \
+                     heartbeat will retry"
                 );
+                true
             }
         }
     }
@@ -23315,6 +23334,79 @@ mod tests {
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
         let worker = Worker::new(cfg, registry);
         assert!(worker.is_ok());
+    }
+
+    /// A registration that cannot even acquire a connection must arm the
+    /// heartbeat retry (issue #804, Codex round-50 P1).
+    ///
+    /// Nothing is attempted in that arm, so with a reused `worker_id` a
+    /// surviving row still advertises the old build and still carries this
+    /// id's stale capability-miss evidence — precisely the state the retry
+    /// exists to clear, and one the heartbeat's `Ok(0)` arm cannot see because
+    /// that row is present.
+    #[tokio::test]
+    async fn registration_arms_the_retry_when_the_connection_cannot_be_acquired() {
+        let cfg = default_runtime_config();
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+
+        // A pool pointed at a port nothing listens on: `pool.get()` fails, so
+        // the `Err` arm under test is the one taken.
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://127.0.0.1:1/nonexistent");
+        // No timeouts configured: deadpool only demands an explicit `Runtime`
+        // when it has a timeout to schedule, and a connect to a dead local port
+        // fails immediately with ECONNREFUSED, so `pool.get()` cannot hang.
+        let pool: DbPool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting");
+
+        assert!(
+            worker.register_in_fleet(&pool).await,
+            "an unattempted registration must still arm the retry -- otherwise a \
+             surviving row under a reused worker_id advertises the old build forever"
+        );
+    }
+
+    /// The pending flag is per pool, not per worker (issue #804, Codex
+    /// round-50 P1).
+    ///
+    /// `run_multi_shard` registers against every shard. A single worker-wide
+    /// flag would let a shard whose registration succeeded clear the retry a
+    /// *different*, failed shard still needs, leaving that shard advertising
+    /// the old build forever. Returning the answer makes sharing impossible by
+    /// construction; this pins that two pools genuinely get independent
+    /// answers rather than one shared cell.
+    #[tokio::test]
+    async fn registration_pending_is_answered_per_pool() {
+        let cfg = default_runtime_config();
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+
+        let unreachable = |url: &str| -> DbPool {
+            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+                diesel_async::AsyncPgConnection,
+            >::new(url);
+            deadpool::managed::Pool::builder(manager)
+                .max_size(1)
+                .build()
+                .expect("pool builds without connecting")
+        };
+
+        let a = unreachable("postgres://127.0.0.1:1/shard_a");
+        let b = unreachable("postgres://127.0.0.1:1/shard_b");
+
+        // Both fail here, which is enough to prove the shape: each call
+        // produces its own answer, so no shard can clear another's retry.
+        let pending_a = worker.register_in_fleet(&a).await;
+        let pending_b = worker.register_in_fleet(&b).await;
+        assert!(
+            pending_a && pending_b,
+            "each shard pool must be answered independently; a shared flag would \
+             let one shard's outcome speak for another's"
+        );
     }
 
     /// Build a bare `ActivityInfo` with the rate-limit fields overridden,
