@@ -632,6 +632,37 @@ fn run_verify(dir: &std::path::Path, fixtures: usize, activities: usize) {
             let (activities, total_events) = activities_per_fixture_from_disk(dir);
             (activities, Some(total_events))
         };
+    // `actual_activities` -- not the `activities` env-var argument above -- is
+    // the authoritative value: it's derived from what's *actually on disk*
+    // (via the sidecar `prepare` wrote, or, on the no-sidecar fallback path,
+    // parsed directly out of the fixtures found there), i.e. the exact
+    // workload `verify_dir` is about to profile on the very next line. The
+    // `activities > 0` assert in `main()` only rejects a misconfigured
+    // *current invocation*'s env var; it cannot see that this `run`
+    // invocation's `VERIFY_PROFILE_DIR` was populated separately -- a
+    // directory `prepare`d by an older binary predating that assert, one
+    // reused across sessions without a matching `prepare` re-run, or a
+    // hand-populated one -- and so may hold zero-activity fixtures on disk
+    // regardless of what the current process's `VERIFY_PROFILE_ACTIVITIES`
+    // says. Without this check, such a directory falls into the mismatch
+    // warning just below (a mismatch between a *positive* actual count and
+    // the requested one is intentionally only a warning, not a hard failure
+    // -- see that branch), then silently profiles the exact same degenerate,
+    // single-`WorkflowStarted`-event-per-fixture workload the
+    // `VERIFY_PROFILE_ACTIVITIES=0` check in `main()` exists to reject,
+    // printing a plausible `activities_per_fixture=0 ... succeeded=N` line
+    // and exiting 0.
+    assert!(
+        actual_activities > 0,
+        "the fixtures actually found in {} have 0 activities each -- \
+         VERIFY_PROFILE_ACTIVITIES={activities} for this invocation only governs a fresh \
+         `prepare` run, not fixtures already on disk, so it cannot retroactively fix up a stale \
+         or hand-populated directory; `verify_dir` would profile the same degenerate, \
+         near-zero-cost workload the `activities > 0` check in main() exists to reject -- \
+         re-run `VERIFY_PROFILE_MODE=prepare` against this directory, or point \
+         VERIFY_PROFILE_DIR at one that was",
+        dir.display()
+    );
     if actual_activities != activities {
         eprintln!(
             "verify_profile: WARNING -- VERIFY_PROFILE_ACTIVITIES={activities} does not \
