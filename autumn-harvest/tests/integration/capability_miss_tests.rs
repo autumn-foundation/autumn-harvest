@@ -72,7 +72,7 @@ use autumn_harvest::{RetryPolicy, WorkflowContext, store};
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -2883,6 +2883,117 @@ async fn a_stale_dispatcher_with_zero_emitted_commands_makes_no_terminal_decisio
         reloaded.worker_id.as_deref(),
         Some("thief"),
         "the claim transfer must be untouched by the stale dispatcher's write"
+    );
+}
+
+/// A `ClaimLost` result is ambiguous between a genuine ownership transfer and
+/// a concurrent, *unrelated* transaction merely holding the row's lock for a
+/// moment -- `claim_still_held_for_update`'s `SKIP LOCKED` guard reads both
+/// the same way (Codex review of #1182). This reproduces the second case
+/// deterministically: a still-legitimate owner (`worker_id` and
+/// `crash_strikes` both untouched) is falsely reported as having lost the
+/// claim purely because another transaction (standing in for
+/// `wake_workflow_task`'s `wake_requested` fallback) happens to be holding
+/// the row's lock at that exact instant.
+///
+/// If the fix simply logged and returned on `ClaimLost` -- which is what an
+/// incomplete version of this change did -- the task would strand: still
+/// `RUNNING`, still claimed by `dispatcher-a`, but with this dispatcher
+/// having already made its "no terminal decision" call and moved on. Nothing
+/// would ever re-claim a `RUNNING` row, so it would sit forever. The
+/// production fix instead attempts a blocking, ownership-guarded release,
+/// which must succeed once the contending lock is released, since ownership
+/// never actually moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_a_false_positive() {
+    let (url, _container) = setup_db().await;
+
+    let (exec_id, task) = seed_claimed_task(&url, "q1182-lock-contention", "dispatcher-a").await;
+
+    // Stand in for a concurrent, unrelated transaction (e.g.
+    // `wake_workflow_task`'s `wake_requested` fallback) that happens to hold
+    // this exact row's lock for a moment -- without touching `worker_id` or
+    // `crash_strikes`, so ownership never actually changes hands.
+    let mut conn_lock = connect(&url).await;
+    conn_lock
+        .batch_execute("BEGIN")
+        .await
+        .expect("begin should succeed");
+    diesel::sql_query("UPDATE harvest_task_queue SET wake_requested = TRUE WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task.id)
+        .execute(&mut conn_lock)
+        .await
+        .expect("hold the row's lock without changing ownership");
+
+    // The live dispatch cycle suspended having emitted no commands, exactly
+    // as in the test above -- but this time the SKIP LOCKED guard will read
+    // the row as contended (by `conn_lock`, above), not transferred. The
+    // guarded write blocks on the fallback release rather than skipping it,
+    // so this task must be spawned to run concurrently with the lock hold.
+    let dispatch_handle = tokio::spawn({
+        let url = url.clone();
+        let task = task.clone();
+        async move {
+            let mut conn = connect(&url).await;
+            fail_suspended_workflow_if_still_claimed(
+                &mut conn,
+                &task,
+                exec_id,
+                1,
+                "dispatcher-a",
+                "workflow suspended without emitted commands; resumption is not implemented yet",
+            )
+            .await
+        }
+    });
+
+    // Give the spawned dispatch time to reach `claim_still_held_for_update`
+    // (finding the row contended) and then block on the release's plain,
+    // non-`SKIP LOCKED` `UPDATE`.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    conn_lock
+        .batch_execute("COMMIT")
+        .await
+        .expect("release the held row lock");
+
+    dispatch_handle
+        .await
+        .expect("the dispatch task must not panic")
+        .expect("the guarded write and its release fallback must not error");
+
+    // No terminal decision was made -- the run is untouched.
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "a false-positive ClaimLost must never terminally fail the run; got {history:?}"
+    );
+    let execution = load_execution(&url, exec_id).await;
+    assert_eq!(execution.state, "RUNNING");
+
+    // The task was released back to the pool for a fresh dispatch attempt --
+    // this is the part an incomplete fix (log-and-return on `ClaimLost`)
+    // would fail: the row would still show `state = "RUNNING"`,
+    // `worker_id = Some("dispatcher-a")`, forever.
+    let reloaded = load_tasks(&url, exec_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("the task row survives an undecided dispatch");
+    assert_eq!(
+        reloaded.state, "PENDING",
+        "a claim that was never actually lost must be released, not stranded RUNNING"
+    );
+    assert_eq!(
+        reloaded.worker_id, None,
+        "the release must clear ownership so any capable worker can re-claim it"
+    );
+    assert!(
+        !reloaded.wake_requested,
+        "the wake that landed in the contention window must be reconciled by the \
+         release, not left set with nothing left to ever consume it"
     );
 }
 

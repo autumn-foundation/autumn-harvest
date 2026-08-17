@@ -2678,6 +2678,112 @@ pub async fn claim_still_held_for_update(
     Ok(!rows.is_empty())
 }
 
+/// SQL for [`release_suspended_workflow_claim`]. Extracted as a `const fn` so
+/// its `WHERE` clause is unit-testable without a database.
+///
+/// Deliberately mirrors [`primary_repend_workflow_task_query`]'s column list
+/// (refresh `created_at` for the schedule-to-start latency metric, preserve
+/// rather than clear sticky affinity, clear the `activity_name` sentinel) --
+/// this is "the task made no progress, try it again", not "this worker is
+/// incapable" (contrast [`release_task_for_capability_miss_query`], which
+/// deliberately clears sticky affinity because the worker it releases FROM
+/// was just found unable to run the handler at all).
+const fn release_suspended_workflow_claim_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET state = 'PENDING', \
+         worker_id = NULL, \
+         started_at = NULL, \
+         last_heartbeat_at = NULL, \
+         scheduled_at = NOW(), \
+         created_at = clock_timestamp(), \
+         wake_requested = FALSE, \
+         activity_name = NULL, \
+         sticky_until = CASE \
+             WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
+             THEN NOW() + sticky_timeout \
+             ELSE sticky_until \
+         END \
+     WHERE id = $1 \
+       AND state = 'RUNNING' \
+       AND worker_id = $2 \
+       AND crash_strikes = $3 \
+     RETURNING id"
+}
+
+/// Release a still-claimed, but replay-suspended-empty-handed, workflow task
+/// back to `PENDING` for a fresh dispatch attempt (issue #1182 follow-up,
+/// Codex review).
+///
+/// [`claim_still_held_for_update`]'s `SKIP LOCKED` guard cannot distinguish a
+/// genuine ownership transfer from a concurrent, *unrelated* lock holder
+/// (e.g. [`wake_workflow_task`]'s `wake_requested` fallback UPDATE, which
+/// touches this exact row for a moment while a sibling event wakes the same
+/// execution) merely contending for the row at that instant -- both read back
+/// as "not ours right now". Treating the second case identically to the first
+/// -- doing nothing -- strands the row: it stays `RUNNING` under a worker who
+/// has already moved on (this dispatch already returned, having made its
+/// "no terminal decision" call), and nothing else ever re-claims a `RUNNING`
+/// row, so it sits forever until an unrelated poison-pill/heartbeat sweep
+/// eventually notices.
+///
+/// This is called only *after* [`crate::worker::commit_terminal_failure_if_still_claimed`]
+/// has already returned [`crate::worker::TerminalWriteOutcome::ClaimLost`] --
+/// i.e. after its own transaction (which held the execution row first, then
+/// attempted the task row via `SKIP LOCKED`) has already committed and
+/// released every lock it held. This call therefore never holds the execution
+/// row while waiting for the task row: it is a single, standalone task-row
+/// lock acquisition, so it cannot participate in the execution-row/task-row
+/// ABBA cycle `SKIP LOCKED` exists to avoid there (see
+/// [`claim_still_held_for_update`]'s doc comment) -- there is no *second* lock
+/// for it to be the other half of.
+///
+/// Deliberately **not** `FOR UPDATE SKIP LOCKED`: a plain `UPDATE` blocks
+/// behind whatever transiently holds the row instead of skipping it, then
+/// re-evaluates its `WHERE` clause against the row's *post-commit* state. If
+/// ownership genuinely moved in the interim, the guard (`worker_id` +
+/// `crash_strikes`, the same claim token [`claim_still_held_for_update`]
+/// checks) no longer matches and this updates nothing -- the new owner keeps
+/// the row, exactly as if this call were never made. If it did not move, the
+/// row is released, and `wake_requested` is cleared in the very same write so
+/// a wake that landed in the contention window is reconciled rather than
+/// silently lost. This mirrors the established, doubly-reviewed
+/// [`release_task_for_capability_miss`] fallback -- the pattern this crate
+/// already relies on whenever a `SKIP LOCKED` guard's ambiguous "not ours"
+/// answer needs an authoritative, blocking follow-up -- but touches none of
+/// that function's capability-miss-specific bookkeeping columns, since the
+/// handler here DID run; it simply made no replay-significant progress.
+///
+/// Returns `true` when a row was actually released, `false` when the claim
+/// had genuinely moved by the time this ran (a legitimate outcome, not an
+/// error -- the new owner is responsible for the row).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the query fails.
+pub async fn release_suspended_workflow_claim(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    worker_id: &str,
+    crash_strikes: i32,
+) -> HarvestResult<bool> {
+    // Only the row's *existence* matters -- the id is bound, not read back.
+    #[derive(diesel::QueryableByName)]
+    struct IdRow {
+        #[allow(dead_code)]
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+
+    let rows: Vec<IdRow> = diesel::sql_query(release_suspended_workflow_claim_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Integer, _>(crash_strikes)
+        .get_results(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(!rows.is_empty())
+}
+
 /// Hint for sticky cross-worker routing when parking or enqueueing a task.
 ///
 /// When both fields are set, the task is pinned to `worker_id` for `timeout`
@@ -4196,6 +4302,38 @@ mod tests {
             sql.contains("worker_id IS NOT NULL"),
             "fallback must only mark a row that is currently claimed (mid-processing), \
              never a genuinely parked or PENDING row",
+        );
+    }
+
+    #[test]
+    fn release_suspended_workflow_claim_query_is_ownership_guarded_and_not_skip_locked() {
+        let sql = release_suspended_workflow_claim_query();
+        assert!(sql.contains("SET state = 'PENDING'"));
+        assert!(sql.contains("worker_id = NULL"));
+        assert!(sql.contains("started_at = NULL"));
+        assert!(
+            sql.contains("wake_requested = FALSE"),
+            "a wake that landed in the SKIP LOCKED contention window must be \
+             reconciled by this release, not left set with nothing to consume it",
+        );
+        assert!(
+            sql.contains("id = $1")
+                && sql.contains("state = 'RUNNING'")
+                && sql.contains("worker_id = $2")
+                && sql.contains("crash_strikes = $3"),
+            "must be guarded on the exact claim token (worker_id AND crash_strikes), \
+             the same pair claim_still_held_for_update checks",
+        );
+        assert!(
+            !sql.contains("SKIP LOCKED"),
+            "must block behind a transient lock holder and reconcile against the \
+             post-commit row, not skip it and report a false ownership transfer",
+        );
+        assert!(
+            sql.contains("sticky_until = CASE"),
+            "must preserve/refresh sticky affinity like a normal re-pend, not clear \
+             it like the capability-miss release (this worker was never found \
+             incapable, so there is no reason to stop routing to it)",
         );
     }
 

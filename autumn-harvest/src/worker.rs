@@ -12197,11 +12197,25 @@ async fn fail_execution_on_error<T>(
 /// This reuses the same commit-if-still-claimed guarantee
 /// ([`commit_terminal_failure_if_still_claimed`]) with no escalation
 /// attached, so a [`TerminalWriteOutcome::ClaimLost`] result writes nothing
-/// and this dispatcher makes no terminal decision -- the row's new owner is
-/// free to drive the run to completion. `EvidenceChanged` cannot occur here
-/// (it is only produced when an `escalation` is supplied) but is handled
-/// identically for completeness and to keep this function robust to a future
-/// change in that guarantee.
+/// terminal. `EvidenceChanged` cannot occur here (it is only produced when an
+/// `escalation` is supplied) but is handled identically for completeness and
+/// to keep this function robust to a future change in that guarantee.
+///
+/// `ClaimLost` does not, by itself, mean the row's new owner is free to drive
+/// the run to completion -- [`queue::claim_still_held_for_update`]'s `SKIP
+/// LOCKED` guard cannot distinguish a genuine ownership transfer from a
+/// concurrent, *unrelated* lock holder (e.g. [`queue::wake_workflow_task`]'s
+/// `wake_requested` fallback, momentarily locking this exact row for a
+/// sibling event) merely contending for it at that instant; both read back
+/// as "not ours right now" (Codex review of #1182). If this dispatch simply
+/// returned in that second case, the row would strand `RUNNING` under a
+/// worker who has already given up on it, with nothing left to ever re-claim
+/// it. So a lost claim also attempts
+/// [`queue::release_suspended_workflow_claim`] -- a blocking, ownership-
+/// guarded release that reconciles against the row's true post-contention
+/// state: a genuine transfer still updates nothing (the new owner keeps the
+/// row, unchanged), while a spurious `SKIP LOCKED` miss is released back to
+/// `PENDING` for a fresh dispatch attempt.
 #[doc(hidden)]
 pub async fn fail_suspended_workflow_if_still_claimed(
     conn: &mut AsyncPgConnection,
@@ -12228,11 +12242,21 @@ pub async fn fail_suspended_workflow_if_still_claimed(
     match write {
         TerminalWriteOutcome::Committed(_) => {}
         TerminalWriteOutcome::ClaimLost | TerminalWriteOutcome::EvidenceChanged(_) => {
+            let released = queue::release_suspended_workflow_claim(
+                conn,
+                task.id,
+                worker_id,
+                task.crash_strikes,
+            )
+            .await?;
             tracing::info!(
                 task_id = %task.id,
                 queue = %task.queue_name,
-                "a suspended workflow dispatch made no replay-significant progress, but the \
-                 claim moved to another worker in the meantime; making no terminal decision"
+                released,
+                "a suspended workflow dispatch made no replay-significant progress; the claim \
+                 guard could not confirm ownership (a genuine transfer, or a concurrent, \
+                 unrelated lock holder), so no terminal decision was made; the task was \
+                 released back to the queue if it was still ours"
             );
         }
     }
