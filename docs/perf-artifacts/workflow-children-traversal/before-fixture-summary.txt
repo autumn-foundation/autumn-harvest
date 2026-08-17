@@ -1,0 +1,7 @@
+label=before
+fixture: root + 300 gen1 + 1200 gen2 + 2400 gen3 = 3901 total nodes, round-robined across 2 shards, every 20th leaf FAILED
+request: GET /workflows/{root}/children?depth=2
+returned_rows=500
+traversal_statement_shapes=2
+total_calls=3002
+total_buffers=9276
