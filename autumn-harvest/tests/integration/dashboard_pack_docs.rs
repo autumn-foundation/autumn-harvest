@@ -118,6 +118,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_retention_deleted_total",
     "harvest_retention_summary_deleted_total",
     "harvest_task_quarantined_total",
+    "harvest_task_capability_miss_total",
     "harvest_dlq_redriven_total",
     "harvest_payload_rejected_total",
     "harvest_payload_offloaded_total",
@@ -306,6 +307,10 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_retention_summary_deleted", &["workflow"]),
     ("harvest_query_duration", &["query_name", "status"]),
     ("harvest_task_quarantined", &["queue", "reason"]),
+    (
+        "harvest_task_capability_miss",
+        &["queue", "task_type", "outcome"],
+    ),
     ("harvest_concurrency_in_flight", &["key"]),
     ("harvest_concurrency_deferred", &["key"]),
     ("harvest_rate_limit_tokens_available", &["key"]),

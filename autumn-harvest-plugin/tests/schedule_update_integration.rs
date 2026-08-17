@@ -203,6 +203,14 @@ const INIT_SQL: &str = concat!(
     // issue #759: triage_note column on harvest_workflow_executions, referenced
     // by every WorkflowExecution::as_select() read-back in this suite.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS triage_note TEXT NULL;\n",
+    // issue #804: capability_misses column on harvest_task_queue, referenced by
+    // every TaskQueueItem read (this suite drives a real `Worker`, whose
+    // `claim_task` deserializes `RETURNING harvest_task_queue.*`).
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_misses INT NOT NULL DEFAULT 0;\n",
+    // issue #804 (round 6): the companion distinct-misser set. `TaskQueueItem`
+    // selects it too, so omitting it fails every read in this suite the same
+    // way omitting `capability_misses` would.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';\n",
     // 20260706000001_harvest_start_throttle is deliberately omitted: the tick's
     // dispatch path probes `to_regclass('harvest_start_throttle')` and treats a
     // missing table as "no pending throttled starts" (see

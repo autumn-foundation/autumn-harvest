@@ -229,6 +229,26 @@ diesel::table! {
         /// expires, since the session's local state only exists on that one
         /// worker.
         session_id -> Nullable<Uuid>,
+        /// Consecutive claims by workers with no handler registered for this
+        /// task's type (issue #804). Incremented by
+        /// `queue::release_task_for_capability_miss` when a worker releases a
+        /// task it cannot run so a capable peer can claim it; reset to 0 by
+        /// every path that proves the claiming worker WAS capable. Bounds the
+        /// bounce: at `WorkerConfig::capability_miss_max_redeliveries` the task
+        /// escalates to the terminal-failure path with a `no_capable_worker:`
+        /// reason. Deliberately separate from `attempt` (retry budget) and
+        /// `crash_strikes` (poison-pill quarantine).
+        capability_misses -> Int4,
+        /// Issue #804: the DISTINCT worker ids that have missed this task. The
+        /// redelivery budget is consumed per entry, so one incapable worker
+        /// repeatedly winning the claim race cannot exhaust it.
+        capability_miss_workers -> Array<Text>,
+        /// Issue #804 (round 46): WHICH handler the two counters above are
+        /// about, as `{kind}:{name}`. The counters describe one frontier, and
+        /// a frontier is identified by the single handler that would move it;
+        /// a mismatch means the evidence belongs to a frontier now behind us.
+        /// `NULL` = none recorded yet, which reads as a mismatch.
+        capability_miss_handler -> Nullable<Text>,
     }
 }
 

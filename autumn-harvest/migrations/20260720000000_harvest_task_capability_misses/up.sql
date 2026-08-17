@@ -1,0 +1,87 @@
+-- issue #804: bounded capability-miss redelivery counter.
+--
+-- Any worker polling a queue can claim any task on it (SKIP LOCKED has no
+-- capability filter). When the claiming worker has no handler registered for
+-- that task's workflow/activity type, the engine used to terminally FAIL the
+-- run -- turning a routine, blameless fleet condition (a rolling deploy that
+-- introduces a new type; a heterogeneous pool that shares a queue but
+-- registers different handler subsets) into lost executions and a DLQ flood.
+--
+-- The claim is now RELEASED back to PENDING for a capable peer instead. This
+-- counter bounds that bounce: after `capability_miss_max_redeliveries`
+-- (WorkerConfig, default 5) releases the task falls through to the existing
+-- terminal-failure path with a `no_capable_worker:` reason, so a genuinely
+-- unregistered type cannot bounce forever.
+--
+-- Deliberately a SEPARATE column rather than reusing `attempt` or
+-- `crash_strikes`:
+--   * `attempt` drives the retry budget -- a capability miss never ran the
+--     handler, so it must not consume one (the release decrements the
+--     claim-time `attempt + 1`, mirroring `defer_rate_limited_task`).
+--   * `crash_strikes` drives poison-pill quarantine (issue #367) -- a clean
+--     "handler not registered" miss is not a worker crash and must never
+--     quarantine a perfectly healthy task.
+--
+-- Reset to 0 by every path that proves the claiming worker WAS capable
+-- (retry requeue, ND-block re-pend, panic re-dispatch, rate-limit defer,
+-- reschedule), so the counter measures *consecutive* capability misses --
+-- the same "consecutive" semantics `crash_strikes` uses.
+--
+-- Task-queue state only: no `WorkflowEvent` variant, no change to the
+-- adjacently-tagged event JSON contract, no replay-determinism impact.
+ALTER TABLE harvest_task_queue
+    ADD COLUMN IF NOT EXISTS capability_misses INT NOT NULL DEFAULT 0;
+
+-- issue #804 (review round 6): the DISTINCT workers that have missed this task.
+--
+-- `capability_misses` alone is a *shared* budget: the release backoff makes the
+-- task eligible to every worker again -- including the one that just released
+-- it -- and the claim query has no capability filter, so one incapable worker
+-- winning the claim race N+1 times in a row exhausted the budget and terminally
+-- failed the run even while a capable peer was live. That is the exact
+-- rolling-deploy outage #804 exists to prevent.
+--
+-- The budget is therefore consumed per DISTINCT worker: a repeat miss by a
+-- worker already in this set does not consume one (it still backs off and still
+-- increments `capability_misses`, which drives the backoff and the absolute
+-- ceiling). `capability_misses` remains the absolute termination guarantee for
+-- a fleet too small to ever grow this set to the budget.
+--
+-- Bounded in practice by `capability_miss_max_redeliveries + 1` entries, since
+-- exceeding the budget escalates. Cleared by exactly the same paths that reset
+-- `capability_misses`, so the two counters stay consistent.
+ALTER TABLE harvest_task_queue
+    ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';
+
+-- issue #804 (review round 46): WHICH handler the counters above are about.
+--
+-- `capability_misses` / `capability_miss_workers` describe ONE frontier -- the
+-- position the workflow is stuck at, and therefore the single handler a
+-- claiming worker must register to move it. Nothing recorded that handler, so
+-- the evidence was reusable across frontiers that have nothing to do with each
+-- other.
+--
+-- Reachable without any local-activity progress (which
+-- `reset_capability_misses_after_inline_progress` already covers):
+-- `prepare_workflow_task_with_cache` ingests due timers and pending signals
+-- BEFORE the persist-time capability gate, appending durable history. A signal
+-- that arrives while the task is bouncing on a missing handler X can move the
+-- replay onto a branch needing a DIFFERENT handler Y, with no park and no
+-- inline progress in between -- so X's missers stayed on the row and were
+-- counted as evidence about Y. Once they filled the budget, the first worker
+-- to miss Y read as `AllLiveWorkersMissed` and terminally failed a run the
+-- fleet could still finish, even though a worker recorded against X may well
+-- register Y. That is the exact inversion issue #804 exists to prevent.
+--
+-- Stored as `{kind}:{name}` (`workflow:foo` / `activity:bar`); `kind` is a
+-- bounded `&'static str`. NULL means "no frontier recorded yet", which reads
+-- as a mismatch and therefore as a fresh budget -- the safe direction.
+--
+-- Deliberately NOT cleared by the paths that zero the two counters above: with
+-- the counts already at 0 a stale key is inert, because both branches of the
+-- release then agree (a match increments 0 -> 1, a mismatch resets to 1).
+--
+-- Task-queue state only: no `WorkflowEvent` variant, no change to the
+-- adjacently-tagged event JSON contract, no replay-determinism impact.
+ALTER TABLE harvest_task_queue
+    ADD COLUMN IF NOT EXISTS capability_miss_handler TEXT;

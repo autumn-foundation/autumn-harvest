@@ -145,6 +145,19 @@ pub struct WorkerConfigView {
     pub poison_pill_threshold: i32,
     /// Whether poison-pill quarantine is enabled (`poison_pill_threshold > 0`).
     pub poison_pill_quarantine_enabled: bool,
+    /// Consecutive capability misses (claims by a worker with no handler
+    /// registered for the task's type) before a task escalates to the ordinary
+    /// terminal-failure path with a `no_capable_worker:` reason (issue #804).
+    /// `0` escalates on the first miss.
+    ///
+    /// **No dead-letter row is written.** The escalation routes through
+    /// `fail_task_and_execution_with_history`, which fails the task and the
+    /// execution without inserting into `harvest_dead_letters` — the reason
+    /// lives on the failed execution row, so an operator diagnosing an
+    /// exhausted budget queries failed workflows, not the DLQ. (A DLQ entry on
+    /// this path would also be indistinguishable from a poison-pill
+    /// quarantine, #367, which a capability miss deliberately is not.)
+    pub capability_miss_max_redeliveries: u32,
     /// Wall-clock budget for a single workflow-task dispatch, milliseconds (0 = disabled).
     pub workflow_task_timeout_ms: u64,
     /// Bounded-pause auto-resume ceiling, milliseconds.
@@ -268,6 +281,7 @@ impl WorkerConfigView {
             max_workflow_start_delay,
             unknown_target_grace_window,
             poison_pill_threshold,
+            capability_miss_max_redeliveries,
             workflow_task_timeout,
             max_workflow_pause_duration,
             labels,
@@ -309,6 +323,7 @@ impl WorkerConfigView {
             unknown_target_grace_window_ms: dur_ms(*unknown_target_grace_window),
             poison_pill_threshold: *poison_pill_threshold,
             poison_pill_quarantine_enabled: *poison_pill_threshold > 0,
+            capability_miss_max_redeliveries: *capability_miss_max_redeliveries,
             workflow_task_timeout_ms: dur_ms(*workflow_task_timeout),
             max_workflow_pause_duration_ms: dur_ms(*max_workflow_pause_duration),
             labels: labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),

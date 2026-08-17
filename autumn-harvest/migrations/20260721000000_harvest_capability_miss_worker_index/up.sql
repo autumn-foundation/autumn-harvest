@@ -1,0 +1,45 @@
+-- issue #804 (review round 39): make the startup capability-miss invalidation
+-- index-servable instead of a full backlog scan.
+--
+-- `invalidate_capability_miss_evidence_for_worker` runs in the SAME transaction
+-- as `register_worker`, so a worker is not published to the fleet until it
+-- finishes. Every pre-existing `harvest_task_queue` index narrows only by
+-- queue/state, and `$1 = ANY(capability_miss_workers)` is not indexable on its
+-- own -- so Postgres had to inspect every PENDING/RUNNING row on each advertised
+-- queue. On a queue with a large backlog a rolling restart therefore serialised
+-- expensive scans and delayed the very workers meant to resolve the capability
+-- misses: the #804 remediation got slower exactly when it was needed most.
+--
+-- Measured on a 200k-row backlog with 20 matching rows:
+--   before  Seq Scan,   3847 shared buffers,  84 ms
+--   after   Index Scan,    9 shared buffers, 1.7 ms
+--
+-- A PARTIAL B-TREE, not a GIN index over the array. Capability misses are
+-- exceptional, so the discriminating predicate is "has this row recorded a miss
+-- at all?" -- not the array's contents. Gating on a non-empty array keeps the
+-- index to the miss population only: 16 KB against a 45 MB, 300k-row table, and
+-- a row enqueued normally (empty array) never enters it, so the hottest write
+-- path in the system pays nothing. A GIN index over `capability_miss_workers`
+-- would instead index every PENDING/RUNNING row and tax every enqueue for no
+-- additional selectivity.
+--
+-- `queue_name` leads because the statement narrows by `queue_name = ANY($2)`;
+-- the array-membership test is then a recheck over a handful of rows.
+--
+-- NOTE: the query must carry `capability_miss_workers <> '{}'` as an explicit
+-- conjunct. Postgres's predicate-implication prover cannot derive it from the
+-- membership test, so without it this index is not matched and the plan silently
+-- returns to a sequential scan. That is pinned by
+-- `dropping_the_empty_array_guard_returns_the_invalidation_to_a_full_scan`.
+--
+-- Index only: no new column, no new table, no `WorkflowEvent` variant, and no
+-- change to the adjacently-tagged event JSON contract.
+--
+-- On a live deployment prefer the concurrent form, which cannot run inside
+-- Diesel's migration transaction:
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_tq_capability_miss_workers
+--       ON harvest_task_queue (queue_name)
+--       WHERE state IN ('PENDING', 'RUNNING') AND capability_miss_workers <> '{}';
+CREATE INDEX IF NOT EXISTS idx_harvest_tq_capability_miss_workers
+    ON harvest_task_queue (queue_name)
+    WHERE state IN ('PENDING', 'RUNNING') AND capability_miss_workers <> '{}';

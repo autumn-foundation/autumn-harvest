@@ -57,15 +57,15 @@ module counts at the audited revision, recomputed by CI:
 | `diesel` query layer | 42 modules | Query construction is mechanical; the *type* layer is not. |
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 13 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 15 modules | Subsumed by the single write lock. |
-| `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 8 modules | Yes — integer epoch milliseconds. |
+| `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 9 modules | Yes — integer epoch milliseconds. |
 | `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 26 modules | Case by case — the SQL must be read, not inferred from the ORM. |
-| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 18 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
+| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 19 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
 | `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 9 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 6 modules | Yes — `sqlite_master` lookup. |
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
 | `gen_random_uuid` server-side ids | 1 module | Yes — mint application-side. |
 
-Plus **83 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
+Plus **85 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
 `INTERVAL`, `UUID`, partial indexes, `gen_random_uuid()` defaults), none of
 which apply to SQLite. The SQLite crate does not translate them; it declares
 its own schema.
@@ -101,6 +101,11 @@ changed**, because the closed rule had already caught all eighteen: every one
 was already (b) or (c) on the strength of hand-written SQL alone. The open rule
 kept being wrong about *how much*; the closed rule was never wrong about *which
 class* — which is the only thing a reader makes a decision on.
+
+That has held every time since. The table above quotes the live counts, which
+have grown past that round's 18 as new Postgres-only syntax lands; each module
+the open rule newly catches has so far already been (b) or (c). The counts move;
+the classifications do not.
 
 That 26 of the 43 coupled modules hand-write SQL is therefore the more
 decision-relevant number than any dialect tally. It is the volume of query text
@@ -188,7 +193,7 @@ Classification rule:
 | `version_usage` | diesel, raw-pg-sql, raw-sql | (b) | Same JSONB-path + POSIX-regex shape as `version_gate_retirement`. |
 | `wasm_store` | diesel, advisory-lock, raw-pg-sql, raw-sql | (b) | Content-hash upsert; advisory lock subsumed. |
 | `worker` | diesel, row-lock, advisory-lock, listen/notify, raw-pg-sql, raw-sql | (c) | The dispatch loop; wakeups and persistence are interleaved. |
-| `workers` | diesel, raw-sql | (b) | Fleet registry rows, but the sticky-lease filter embeds `NOW()`. SQLite: `CURRENT_TIMESTAMP`/epoch ms. |
+| `workers` | diesel, interval-sql, raw-pg-sql, raw-sql | (b) | Fleet registry rows, but the sticky-lease filter embeds `NOW()` and the capability-miss fleet lookup adds an `INTERVAL` liveness window plus a `queues @> to_jsonb($2::text)` containment test. SQLite: `CURRENT_TIMESTAMP`/epoch ms; JSON1 `EXISTS (SELECT 1 FROM json_each(queues) …)` for the containment. |
 
 **Totals: (a) 8 · (b) 17 · (c) 18.**
 

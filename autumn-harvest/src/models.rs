@@ -433,6 +433,58 @@ pub struct TaskQueueItem {
     /// ordinary activity dispatch.
     #[serde(default)]
     pub session_id: Option<Uuid>,
+    /// Consecutive claims by workers with no handler registered for this task's
+    /// type (issue #804).
+    ///
+    /// Incremented each time a worker releases this task back to `PENDING`
+    /// because it has no handler for the workflow/activity type, so a capable
+    /// peer can claim it. Reset to `0` by every path that proves the claiming
+    /// worker *was* capable, so it measures **consecutive** capability misses.
+    /// At `WorkerConfig::capability_miss_max_redeliveries` the task escalates to
+    /// the existing terminal-failure path with a `no_capable_worker:` reason.
+    ///
+    /// Deliberately distinct from `attempt` (retry budget) and `crash_strikes`
+    /// (poison-pill quarantine): a clean "handler not registered" miss must
+    /// consume neither.
+    #[serde(default)]
+    pub capability_misses: i32,
+    /// Distinct worker ids that have missed this task (issue #804).
+    ///
+    /// The redelivery budget is consumed **per distinct worker**: a repeat miss
+    /// by a worker already in this set still backs off and still increments
+    /// `capability_misses`, but does not consume budget. Without that, one
+    /// incapable worker winning the claim race `N + 1` times in a row could
+    /// terminally fail a run while a capable peer was live — the released task
+    /// is eligible to every worker again and the claim query has no capability
+    /// filter.
+    ///
+    /// Cleared by exactly the paths that reset `capability_misses`, so the two
+    /// stay consistent. Bounded in practice by the budget + 1, since exceeding
+    /// it escalates.
+    #[serde(default)]
+    pub capability_miss_workers: Vec<String>,
+
+    /// Which handler the two counters above are evidence about, as
+    /// `{kind}:{name}` (issue #804, Codex round-46 P1).
+    ///
+    /// The counters describe **one frontier** — the position the workflow is
+    /// stuck at, and so the single handler a claiming worker must register to
+    /// move it. Without this, evidence survived a frontier change that no
+    /// reset covered: `prepare_workflow_task_with_cache` ingests due timers and
+    /// pending signals *before* the persist-time capability gate, so a signal
+    /// arriving while the task bounces on missing handler X can move the replay
+    /// onto a branch needing Y — no park, no inline progress, and X's missers
+    /// still on the row, counted as evidence about Y.
+    ///
+    /// A mismatch is treated as a **fresh** frontier by both the decision (the
+    /// read zeroes the counters) and the release (it resets them to this one
+    /// miss). `None` reads as a mismatch, which is the safe direction.
+    ///
+    /// Deliberately **not** cleared by the paths that zero the counters: with
+    /// the counts already `0` a stale key is inert, since a match increments
+    /// `0 -> 1` and a mismatch resets to `1` — the same row either way.
+    #[serde(default)]
+    pub capability_miss_handler: Option<String>,
 }
 
 /// Insert struct for enqueuing a new task.

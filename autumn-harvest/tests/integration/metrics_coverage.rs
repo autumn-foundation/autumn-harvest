@@ -15,11 +15,12 @@ use autumn_harvest::telemetry::{
     METRIC_LABEL_SHARD, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_PAUSED,
     METRIC_RETENTION_DELETED, METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED,
     METRIC_SCANNER_TICK, METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS,
-    METRIC_SCHEDULE_SKIPPED, METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED, METRIC_TIMER_STARTED,
-    METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION, METRIC_UPDATE_FAILED,
-    METRIC_UPDATE_REJECTED, METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_CONTINUE_AS_NEW,
-    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
-    METRIC_WORKFLOW_TASK_TIMEOUT, MetricsRecorder, NoOpMetrics, WorkflowStatus,
+    METRIC_SCHEDULE_SKIPPED, METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED,
+    METRIC_TASK_CAPABILITY_MISS, METRIC_TIMER_STARTED, METRIC_UPDATE_ADMITTED,
+    METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION, METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED,
+    METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION,
+    METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
+    MetricsRecorder, NoOpMetrics, WorkflowStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -141,6 +142,17 @@ impl MetricsRecorder for RecordingMetrics {
             labels: vec![
                 ("queue", queue.to_owned()),
                 ("paused", u8::from(paused).to_string()),
+            ],
+        });
+    }
+
+    fn record_task_capability_miss(&self, queue: &str, task_type: &str, outcome: &str) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_TASK_CAPABILITY_MISS,
+            labels: vec![
+                ("queue", queue.to_owned()),
+                ("task_type", task_type.to_owned()),
+                ("outcome", outcome.to_owned()),
             ],
         });
     }
@@ -736,4 +748,45 @@ fn noop_metrics_implements_all_catalogue_methods() {
     rec.record_retention_tick(0, 0, 0, 0.0);
     rec.record_concurrency_key_in_flight("key", 0);
     rec.record_concurrency_key_deferred("key", 0);
+}
+
+#[test]
+fn capability_miss_counter_reachable_with_bounded_labels() {
+    // Issue #804 (AC5): the capability-miss counter must be reachable via the
+    // trait with exactly the bounded label set queue/task_type/outcome —
+    // execution.id is forbidden by construction (ADR-0001 §7). Scope note
+    // (mirrors the saga/signal/update tests above): the asserted keys belong to
+    // the RecordingMetrics test double, so this pins the trait's reachable
+    // surface; production label content is pinned by the metrics_rs_adapter
+    // bridge test.
+    let rec = RecordingMetrics::default();
+    rec.record_task_capability_miss("email-workers", "workflow", "released");
+    rec.record_task_capability_miss("email-workers", "activity", "escalated");
+
+    let samples = rec.drain();
+    assert_eq!(samples.len(), 2, "both bounded outcomes must be reachable");
+
+    for sample in &samples {
+        assert_eq!(sample.name, METRIC_TASK_CAPABILITY_MISS);
+        let keys: Vec<&str> = sample.labels.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            vec!["queue", "task_type", "outcome"],
+            "capability-miss labels must be exactly queue/task_type/outcome"
+        );
+    }
+
+    // AC5 requires alerting specifically on the escalation, so the two outcomes
+    // must be separable on the counter.
+    let outcomes: Vec<&str> = samples
+        .iter()
+        .map(|s| {
+            s.labels
+                .iter()
+                .find(|(k, _)| *k == "outcome")
+                .map(|(_, v)| v.as_str())
+                .expect("outcome label present")
+        })
+        .collect();
+    assert_eq!(outcomes, vec!["released", "escalated"]);
 }

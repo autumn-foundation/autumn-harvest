@@ -7,7 +7,7 @@
 //! The API layer queries this table (per-shard) to surface fleet status to
 //! operators via the management HTTP routes.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -359,6 +359,71 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
     Ok(())
 }
 
+/// Register a worker **and** clear the stale capability-miss evidence its id
+/// may still carry, atomically (issue #804, Codex rounds 26 and 28).
+///
+/// The two writes must land together or not at all, for two independent
+/// reasons.
+///
+/// **A published-but-uncleaned worker is affirmative fleet evidence against
+/// itself.** `register_worker` upserts on `worker_id`, so a pod restarting
+/// under the same configured id onto a build that *does* register the missing
+/// handler republishes itself as live. Capability-miss evidence stores bare
+/// ids, so until the invalidation lands, every task that id missed on its
+/// previous build still names it — and another claimant reading the registry
+/// sees the whole live fleet as already covered, derives
+/// [`crate::worker::FleetCapabilityEvidence::AllLiveWorkersMissed`], and
+/// terminally fails a run at exactly the moment the fix arrived. Committing the
+/// registration while the invalidation fails is therefore strictly worse than
+/// not registering at all, and "log and continue" leaves precisely that state.
+/// Rolling back keeps the worker unpublished until the pair succeeds, and the
+/// heartbeat's `Ok(0)` self-heal retries it within one interval.
+///
+/// **Atomicity is also what makes a claimant's reads coherent.** A decision
+/// brackets its fleet read between two miss-state reads and requires them to
+/// agree (see `worker::miss_evidence_confidence`). That check is only sound if
+/// registration and invalidation are a single commit: split them, and a
+/// claimant can observe a world where the peer is already in the fleet but its
+/// evidence is not yet cleared — which reads as covered, agrees across both
+/// miss reads, and escalates.
+///
+/// Returns the number of task rows whose evidence was cleared.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on serialization or database failure. Either write
+/// failing rolls back both.
+pub async fn register_worker_and_clear_stale_miss_evidence(
+    conn: &mut AsyncPgConnection,
+    registration: &WorkerRegistration,
+) -> HarvestResult<usize> {
+    use diesel_async::AsyncConnection;
+
+    Box::pin(conn.transaction(async |tx| {
+        register_worker(
+            tx,
+            &registration.worker_id,
+            &registration.queues,
+            &registration.shard_assignments,
+            registration.max_concurrency,
+            &registration.host,
+            registration.version.as_deref(),
+            &registration.build_id,
+            registration.deployment_name.as_deref(),
+            &registration.labels,
+            registration.max_concurrent_sessions,
+        )
+        .await?;
+        crate::queue::invalidate_capability_miss_evidence_for_worker(
+            tx,
+            &registration.worker_id,
+            &registration.queues,
+        )
+        .await
+    }))
+    .await
+}
+
 /// Upsert `last_heartbeat_at` and `in_flight_count` for a worker.
 ///
 /// Returns the number of rows updated (1 if the worker row exists, 0 if it is
@@ -610,6 +675,115 @@ pub async fn fleet_health(
         by_queue,
         by_shard,
     })
+}
+
+/// SQL for [`live_workers_on_queue`], exposed for no-DB shape tests (issue #804).
+///
+/// `$1` = the staleness window in seconds, `$2` = the queue name.
+///
+/// The predicate — a fresh `last_heartbeat_at` inside a caller-supplied window
+/// — is the same *shape* the poison-pill orphan reclaimer uses
+/// ([`crate::poison_pill::orphaned_running_tasks_query`]), but the **window is
+/// not the same value**, and that divergence is deliberate (Codex round-19 P1).
+///
+/// The reclaimer judges a row it is entitled to judge, with a window derived
+/// from its own configured cadence. This query judges *peers*, whose cadence the
+/// caller does not know and cannot read — nothing in `harvest_workers` records
+/// it. Applying the caller's own `2 × worker_heartbeat_interval` here would let
+/// a worker heartbeating every second declare a live peer on the **default**
+/// five-second cadence dead, which the capability-miss path then reads as "no
+/// capable worker is live" and turns into a terminal failure. Callers therefore
+/// pass [`crate::worker::capability_miss_fleet_stale_secs`], which floors the
+/// window at a fleet-wide bound that covers any peer at the supported cadence.
+///
+/// The error directions are what make one window unsafe for both: too *narrow*
+/// here fabricates an escalation, while too *wide* only delays one (the
+/// distinct-worker bound and the absolute ceiling still fire).
+///
+/// `status` is deliberately **not** filtered. A `Draining` worker still
+/// belongs in the live set: it is a worker the fleet may still be told to keep,
+/// and excluding it would let a capability-miss escalation conclude "no capable
+/// worker" while a capable drainer is a rollback away. A genuinely gone worker
+/// stops heartbeating and ages out of this query on its own, which is the
+/// self-healing behaviour the freshness window already provides.
+/// `build_id` and `labels` come back too, because advertising the queue is
+/// only the *first* of `claim_task`'s gates. The task's own `required_build_id`
+/// (#171) and `required_capabilities` (#522) are checked against these in
+/// [`crate::worker::claim_eligible_workers`]; a worker that fails them can
+/// never claim, so counting it as a possible capable peer would withhold the
+/// redelivery budget forever. Those gates are **not** applied here because they
+/// depend on the task, not the queue — this query answers "who is live on this
+/// queue", and the caller narrows it to "who could claim *this task*".
+#[must_use]
+pub const fn live_workers_on_queue_query() -> &'static str {
+    "SELECT worker_id, build_id, labels FROM harvest_workers \
+     WHERE last_heartbeat_at > NOW() - ($1::bigint * INTERVAL '1 second') \
+       AND queues @> to_jsonb($2::text)"
+}
+
+/// A live worker's inputs to `claim_task`'s per-task eligibility gates
+/// (issue #804).
+///
+/// Deliberately just the three columns those gates read, rather than a whole
+/// [`HarvestWorker`]: the capability-miss path runs on every miss, and the
+/// fleet read is pure overhead on the way to a decision.
+#[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct LiveWorker {
+    /// The worker's registered id — the value that lands in a task's
+    /// `capability_miss_workers` set when it misses.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub worker_id: String,
+    /// The worker's build id (#171). Empty for a legacy worker, which may
+    /// claim anything.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub build_id: String,
+    /// The worker's labels, matched against a task's `required_capabilities`
+    /// (#522).
+    #[diesel(sql_type = diesel::sql_types::Jsonb)]
+    pub labels: serde_json::Value,
+}
+
+impl LiveWorker {
+    /// Construct a row without a database, for pure eligibility tests.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn for_test(worker_id: &str, build_id: &str, labels: serde_json::Value) -> Self {
+        Self {
+            worker_id: worker_id.to_owned(),
+            build_id: build_id.to_owned(),
+            labels,
+        }
+    }
+}
+
+/// Worker ids with a fresh heartbeat that advertise `queue_name` (issue #804).
+///
+/// This is the *fleet* half of the capability-miss decision: the task's
+/// `capability_miss_workers` array says which workers have demonstrably no
+/// handler for it, and this says which workers could claim it at all. Only when
+/// the first covers the second is "no capable worker is live" an actual
+/// conclusion rather than an assumption drawn from a fixed redelivery budget.
+///
+/// Pass [`crate::worker::capability_miss_fleet_stale_secs`] for
+/// `worker_stale_secs`, never the bare [`crate::worker::worker_stale_secs`] —
+/// see [`live_workers_on_queue_query`] for why judging peers by the caller's own
+/// cadence turns a healthy fleet into a terminal failure.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the query fails.
+pub async fn live_workers_on_queue(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+    worker_stale_secs: i64,
+) -> HarvestResult<Vec<LiveWorker>> {
+    let stale = worker_stale_secs.clamp(0, crate::poison_pill::MAX_WORKER_STALE_SECS);
+    diesel::sql_query(live_workers_on_queue_query())
+        .bind::<diesel::sql_types::BigInt, _>(stale)
+        .bind::<diesel::sql_types::Text, _>(queue_name)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,19 +1261,97 @@ pub async fn drain_preview(
 // Background heartbeat task
 // ---------------------------------------------------------------------------
 
-/// Spawn a background task that upserts worker heartbeats on a regular interval.
+/// Remove a worker row whose registration could not be verified (issue #804,
+/// Codex round-51 P1).
 ///
-/// The task reads the current `in_flight_count` from the semaphores, then
-/// writes it to the database. If the worker row is missing (0 rows updated —
-/// e.g. because startup registration failed transiently), the task re-registers
-/// the worker automatically. It stops when `cancel` is triggered.
-#[must_use]
-#[allow(clippy::too_many_arguments)]
-// The shared applied-set uses the worker's own fixed hasher; no need to generalize.
-#[allow(clippy::implicit_hasher)]
+/// A row that survives a rolled-back registration is not merely out of date —
+/// it is *affirmative false evidence*. The capability-miss fleet read counts a
+/// live worker that appears in `capability_miss_workers` as one that has
+/// already missed the task, so a surviving row keeps a peer's
+/// `AllLiveWorkersMissed` conclusion alive for the whole 120 s liveness floor
+/// while this worker is unable to publish the build it is actually running.
+/// An **absent** row is neutral: the worker is simply not part of the fleet
+/// read, which is the truth while its registration is unverified.
+///
+/// Deliberately a single-table `DELETE`, so it can still succeed when the
+/// register+invalidate transaction cannot — the failure is usually in that
+/// transaction's `harvest_task_queue` half. It is best-effort: on failure the
+/// caller falls back to letting the row age out, and the next heartbeat
+/// retries both. `register_worker` re-inserts on the first successful retry.
+async fn withdraw_unverified_worker_row(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<usize> {
+    diesel::delete(harvest_workers::table.find(worker_id))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Re-register a worker whose fleet row has vanished at runtime, and leave the
+/// claim gate matching the outcome.
+///
+/// Registration is atomic with the capability-miss invalidation, exactly as
+/// startup is: republishing this id without clearing the evidence it may still
+/// carry would make it affirmative fleet evidence against itself (issue #804,
+/// Codex round-28 P1). This is also the retry that heals a startup registration
+/// whose invalidation failed and rolled the pair back.
+///
+/// The gate (issue #804, Codex round-55 P1) is why the failure arm is not just
+/// a log line. Round 54 seeded `registration_pending` only from the *startup*
+/// registration result, so this runtime path — the fleet row vanishing later
+/// and the heal failing — left a worker claiming while absent from
+/// `harvest_workers`, which is the exact state that gate exists to prevent.
+///
+/// Absent is harmful twice over. The worker is invisible to a peer's fleet
+/// evidence, so an incapable claimant can derive
+/// [`crate::worker::FleetCapabilityEvidence::AllLiveWorkersMissed`] and
+/// terminally fail work this worker can run. And its own claims match
+/// `orphaned_running_tasks_query()` — `RUNNING` rows whose `worker_id` has no
+/// fresh heartbeat — so `reclaim_orphaned_tasks` burns a `crash_strikes`
+/// increment on each until `poison_pill_threshold` quarantines the task,
+/// manufacturing a #367 quarantine out of a capability problem.
+///
+/// Arming also routes the next tick through [`do_heartbeat_tick`]'s
+/// top-of-function retry, which is the same heal carrying the reused-`worker_id`
+/// protections (withdraw the unverified row; never refresh a row known to be
+/// wrong). The success arm clears the flag, because a worker that heals itself
+/// must be able to claim again without a restart.
+async fn heal_missing_worker_row(
+    conn: &mut AsyncPgConnection,
+    registration: &WorkerRegistration,
+    registration_pending: &AtomicBool,
+) {
+    match register_worker_and_clear_stale_miss_evidence(conn, registration).await {
+        Ok(cleared) => {
+            registration_pending.store(false, Ordering::Relaxed);
+            tracing::debug!(
+                worker_id = %registration.worker_id,
+                cleared_capability_miss_evidence = cleared,
+                "worker row re-registered"
+            );
+        }
+        Err(error) => {
+            registration_pending.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                worker_id = %registration.worker_id,
+                error = %error,
+                "worker re-registration failed; pausing task claiming until it commits"
+            );
+        }
+    }
+}
+
 /// Execute one heartbeat DB tick: update `last_heartbeat_at`, handle
 /// re-registration / drain transitions, and refresh the drain deadline.
-async fn do_heartbeat_tick(
+///
+/// `#[doc(hidden)] pub` so the round-49 regression test can drive the real tick
+/// against a live database rather than a reimplementation of it — the defect it
+/// guards lives in this function's arm selection, so a test that recreated the
+/// arms would prove nothing.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn do_heartbeat_tick(
     conn: &mut AsyncPgConnection,
     registration: &WorkerRegistration,
     in_flight: i32,
@@ -1108,7 +1360,81 @@ async fn do_heartbeat_tick(
     drain_deadline_max: &Mutex<Option<DateTime<Utc>>>,
     remote_drain_deadline: &Mutex<Option<std::time::Instant>>,
     in_use_sessions: i32,
+    registration_pending: &AtomicBool,
 ) {
+    // Retry a startup registration that failed and rolled the atomic pair back,
+    // BEFORE the heartbeat below observes a row (issue #804, Codex round-49 P1).
+    // The `Ok(0)` arm heals the absent-row case, but a reused `worker_id` leaves
+    // the PREVIOUS row alive, so the heartbeat succeeds, returns `Ok(1)`, and
+    // that arm is never reached — leaving this worker advertising the old
+    // build's `build_id`/queues while its id stays in `capability_miss_workers`
+    // as affirmative fleet evidence against itself.
+    //
+    // `register_worker_and_clear_stale_miss_evidence` upserts, so this is
+    // correct whether or not a row survives. The flag is cleared only on
+    // success, so a still-failing database is retried on the next tick rather
+    // than silently given up on; a worker that registered cleanly at startup
+    // never enters this branch and its tick is byte-for-byte unchanged.
+    if registration_pending.load(Ordering::Relaxed) && !worker_shutdown.is_cancelled() {
+        match register_worker_and_clear_stale_miss_evidence(conn, registration).await {
+            Ok(cleared) => {
+                registration_pending.store(false, Ordering::Relaxed);
+                tracing::info!(
+                    worker_id = %registration.worker_id,
+                    cleared_capability_miss_evidence = cleared,
+                    "startup registration retried successfully on heartbeat"
+                );
+            }
+            Err(error) => {
+                // Do NOT fall through to the heartbeat (issue #804, Codex
+                // round-50 P1). A reused `worker_id` leaves the previous row
+                // alive, so `heartbeat_worker` would succeed and refresh a row
+                // we know is wrong — republishing the old build's `build_id`
+                // and queues as live while this id's stale capability-miss
+                // evidence is still uncleared. That is affirmative false fleet
+                // evidence, and it is exactly what can produce
+                // `AllLiveWorkersMissed` and a terminal failure of a task this
+                // worker can run. Publishing nothing is strictly more honest
+                // than republishing something known-false, so the unverified
+                // row is left to age out of the liveness window until the
+                // atomic pair succeeds.
+                //
+                // Accepted trade-off: a stale row also makes this worker's
+                // in-flight rows look orphaned to the poison-pill reclaimer
+                // (#367), which re-queues them. That is recoverable —
+                // at-least-once is the documented activity contract — whereas
+                // the false `AllLiveWorkersMissed` is a terminal `WorkflowFailed`
+                // needing operator action, so issue #804's own preference
+                // ("prefer holding a task over terminally failing an
+                // execution") settles the ordering. Remote-drain detection is
+                // likewise skipped for this tick; a worker that cannot register
+                // is already invisible to the fleet.
+                //
+                // Ageing out is not fast enough on its own (issue #804, Codex
+                // round-51 P1): the capability-miss fleet window is floored at
+                // 120 s, and for that whole window the surviving row is still
+                // read as a LIVE worker carrying this id's stale miss evidence
+                // — i.e. as a worker that has already missed — which is what
+                // lets a peer derive `AllLiveWorkersMissed`. So withdraw the
+                // row now rather than waiting for it to expire.
+                //
+                // Best-effort and deliberately narrow: a single-table DELETE
+                // on `harvest_workers`, which can still succeed when the
+                // two-table transaction cannot (its `harvest_task_queue` half
+                // is the usual failure). If it too fails, the ageing-out path
+                // above is the fallback and the next tick retries both.
+                let withdrawn = withdraw_unverified_worker_row(conn, &registration.worker_id).await;
+                tracing::warn!(
+                    worker_id = %registration.worker_id,
+                    error = %error,
+                    row_withdrawn = ?withdrawn,
+                    "startup registration retry failed; withdrew the unverified row so it \
+                     cannot be read as live fleet evidence, and will retry on the next tick"
+                );
+                return;
+            }
+        }
+    }
     match heartbeat_worker(
         conn,
         &registration.worker_id,
@@ -1130,23 +1456,7 @@ async fn do_heartbeat_tick(
                 );
             } else {
                 tracing::info!(worker_id = %registration.worker_id, "worker row missing; re-registering");
-                if let Err(error) = register_worker(
-                    conn,
-                    &registration.worker_id,
-                    &registration.queues,
-                    &registration.shard_assignments,
-                    registration.max_concurrency,
-                    &registration.host,
-                    registration.version.as_deref(),
-                    &registration.build_id,
-                    registration.deployment_name.as_deref(),
-                    &registration.labels,
-                    registration.max_concurrent_sessions,
-                )
-                .await
-                {
-                    tracing::warn!(worker_id = %registration.worker_id, error = %error, "worker re-registration failed");
-                }
+                heal_missing_worker_row(conn, registration, registration_pending).await;
             }
         }
         Ok(_) => {
@@ -1210,7 +1520,16 @@ async fn do_heartbeat_tick(
     }
 }
 
+/// Spawn a background task that upserts worker heartbeats on a regular interval.
+///
+/// The task reads the current `in_flight_count` from the semaphores, then
+/// writes it to the database. If the worker row is missing (0 rows updated —
+/// e.g. because startup registration failed transiently), the task re-registers
+/// the worker automatically. It stops when `cancel` is triggered.
+#[must_use]
 #[allow(clippy::too_many_arguments)]
+// The shared applied-set uses the worker's own fixed hasher; no need to generalize.
+#[allow(clippy::implicit_hasher)]
 pub fn spawn_worker_heartbeat(
     pool: DbPool,
     registration: WorkerRegistration,
@@ -1236,6 +1555,16 @@ pub fn spawn_worker_heartbeat(
     // — previously always written as a literal `0` — reflects this worker's
     // actual live session count.
     session_slots_in_use: crate::sessions::SessionSlotRegistry,
+    // Set by startup when the atomic register+invalidate pair failed and rolled
+    // back (issue #804, Codex round-49 P1). The `Ok(0)` arm below already heals
+    // that when the row is ABSENT, but a reused `worker_id` — a configured
+    // stable id such as a pod name, not the random default — leaves the PREVIOUS
+    // row alive, so `heartbeat_worker` updates it, returns `Ok(1)`, and the pair
+    // is never retried. This worker would then poll indefinitely while the
+    // registry advertises the old build's `build_id`/queues and its id remains
+    // in `capability_miss_workers`, letting a peer read the live fleet as
+    // `AllLiveWorkersMissed` and terminally fail a task this worker can run.
+    registration_pending: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
@@ -1269,6 +1598,7 @@ pub fn spawn_worker_heartbeat(
                         &drain_deadline_max,
                         &remote_drain_deadline,
                         in_use_sessions,
+                        &registration_pending,
                     )
                     .await;
                 }
@@ -1372,6 +1702,30 @@ pub fn local_hostname() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The fleet lookup that gates the capability-miss redelivery budget
+    /// (issue #804) must keep using the SAME liveness predicate as the
+    /// poison-pill orphan reclaimer, and must scope to the task's own queue.
+    /// Two subsystems disagreeing about "is this worker alive" would let one
+    /// escalate on a fleet the other still considers healthy.
+    #[test]
+    fn live_workers_on_queue_query_matches_the_shared_liveness_predicate() {
+        let sql = super::live_workers_on_queue_query();
+        assert!(
+            sql.contains("last_heartbeat_at > NOW() - ($1::bigint * INTERVAL '1 second')"),
+            "must reuse the poison-pill freshness window verbatim: {sql}"
+        );
+        assert!(
+            sql.contains("queues @> to_jsonb($2::text)"),
+            "a worker polling a DIFFERENT queue is not a candidate claimant: {sql}"
+        );
+        assert!(
+            !sql.contains("status"),
+            "a Draining worker is still live enough to be a capable peer, and \
+             excluding it would let escalation conclude 'no capable worker' one \
+             rollback too early: {sql}"
+        );
+    }
+
     use super::*;
 
     // -- WorkerStatus --

@@ -345,7 +345,7 @@ pub use det_check::{
     check_paths, check_source,
 };
 pub use diagnostic::{DiagnosticReport, SimulatorResultExt};
-pub use error::{HarvestError, HarvestResult, TimeoutType};
+pub use error::{CapabilityMissPhase, HarvestError, HarvestResult, TimeoutType};
 pub use event::{SideEffectKind, WorkflowEvent};
 #[cfg(feature = "db")]
 pub use execution::{

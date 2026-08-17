@@ -204,7 +204,15 @@ const INIT_SQL: &str = concat!(
     // such call in this suite (and in every suite that borrows
     // `setup_test_database_url_or_env` from here) fails with
     // `column harvest_workflow_executions.triage_note does not exist`.
-    include_str!("../../migrations/20260717000000_harvest_workflow_triage_note/up.sql")
+    include_str!("../../migrations/20260717000000_harvest_workflow_triage_note/up.sql"),
+    "\n",
+    // issue #804: capability_misses column on harvest_task_queue. REQUIRED, not
+    // optional -- `TaskQueueItem` (which `claim_task`'s `RETURNING
+    // harvest_task_queue.*` deserializes into) references this column on every
+    // claim, so without it every claim in this suite (and in every suite that
+    // borrows `setup_test_database_url_or_env` from here) fails with
+    // `column "capability_misses" does not exist`.
+    include_str!("../../migrations/20260720000000_harvest_task_capability_misses/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -311,7 +319,15 @@ const LEGACY_INIT_SQL: &str = concat!(
     // issue #759: WorkflowExecution::as_select() (the modern start path's
     // read-back) references the operator-mutable triage note column even for
     // a fresh (never-annotated) execution.
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS triage_note TEXT NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS triage_note TEXT NULL;\n",
+    // issue #804: `TaskQueueItem` (what `claim_task`'s `RETURNING
+    // harvest_task_queue.*` deserializes into) references capability_misses on
+    // every claim, so the legacy start path's enqueue+claim needs it too.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_misses INT NOT NULL DEFAULT 0;\n",
+    // issue #804 (round 6): `TaskQueueItem` selects the companion distinct-misser
+    // set on the same claim, so omitting it fails the legacy path's claim exactly
+    // as omitting `capability_misses` would.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -1069,6 +1085,33 @@ fn build_runtime_worker_with_task_timeout(
     )
 }
 
+/// Same as [`build_runtime_worker`], but with a caller-supplied
+/// `capability_miss_max_redeliveries` instead of the default 5.
+///
+/// The issue #804 release budget is spent against a capped exponential backoff
+/// (`1s * 2^n`, capped at 30s), so the default budget of 5 costs
+/// `1 + 2 + 4 + 8 + 16 = 31s` of dwell before the task escalates -- well past
+/// the 10s default [`wait_for_execution_state`] bound. A test that asserts the
+/// *escalation* (rather than an individual release) should therefore set a
+/// small budget so the terminal verdict lands promptly, instead of widening its
+/// wait and paying the dwell for real.
+pub(crate) fn build_runtime_worker_with_capability_miss_budget(
+    worker_id: &str,
+    max_concurrent_workflows: usize,
+    max_concurrent_activities: usize,
+    registry: Arc<HandlerRegistry>,
+    capability_miss_max_redeliveries: u32,
+) -> Arc<Worker> {
+    let mut config = runtime_config(
+        worker_id,
+        max_concurrent_workflows,
+        max_concurrent_activities,
+        Duration::from_secs(10),
+    );
+    config.capability_miss_max_redeliveries = capability_miss_max_redeliveries;
+    Arc::new(Worker::new(config, registry).expect("worker should build"))
+}
+
 /// Build a `WorkerRuntimeConfig` with the standard test defaults.
 ///
 /// Extracted so tests that need to inspect `Worker::new`'s `Result` (e.g. the
@@ -1099,6 +1142,7 @@ pub(crate) fn runtime_config(
         priority_aging_secs: None,
         unknown_target_grace_window: Duration::from_secs(5),
         poison_pill_threshold: 3,
+        capability_miss_max_redeliveries: 5,
 
         workflow_task_timeout,
         workflow_panic_max_attempts: 3,
@@ -2028,6 +2072,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
                 workflow_task_timeout: Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
@@ -2257,6 +2302,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
                 workflow_task_timeout: Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
@@ -2421,6 +2467,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -2557,6 +2604,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -2727,6 +2775,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -2962,6 +3011,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -3221,6 +3271,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -3392,6 +3443,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -7746,6 +7798,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -7877,6 +7930,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,
@@ -7997,6 +8051,7 @@ async fn workflow_schedule_pause_and_resume() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 workflow_panic_max_attempts: 3,

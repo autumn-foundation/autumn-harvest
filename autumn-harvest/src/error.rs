@@ -578,6 +578,218 @@ pub enum HarvestError {
         /// The lock key the workflow already holds.
         key: String,
     },
+
+    /// The worker that claimed a task has **no handler registered** for its
+    /// workflow or activity type (issue #804).
+    ///
+    /// This is a **blameless fleet condition, not a workload failure**: any
+    /// worker polling a queue can claim any task on it (the queue's
+    /// non-blocking claim query has no capability filter, and cannot have one
+    /// — a worker can enumerate the handlers it *has* registered, never the
+    /// ones it has not).
+    /// The routine trigger is the transient window of a rolling deploy that
+    /// introduces a new workflow or activity type.
+    ///
+    /// The worker's dispatch path intercepts this variant specifically and
+    /// **releases** the claim back to `PENDING` for a capable peer, up to
+    /// `WorkerConfig::capability_miss_max_redeliveries`, before falling through
+    /// to the ordinary terminal-failure path with a `no_capable_worker:` reason.
+    ///
+    /// It is a **dedicated variant rather than a `Config` string match** on
+    /// purpose: `Config` is a broad catch-all, and classifying on its message
+    /// would swallow every genuine configuration error into an infinite
+    /// release-and-retry loop.
+    #[error("no {kind} handler registered for '{name}' on this worker")]
+    HandlerNotRegistered {
+        /// `"workflow"` or `"activity"` — the kind of missing handler. A
+        /// `&'static str` (not a `String`) so the value is bounded by
+        /// construction and safe to use as a metric label.
+        kind: &'static str,
+        /// The workflow or activity type name that has no registered handler.
+        name: String,
+        /// Where in the dispatch cycle the miss was detected. Decides whether
+        /// the release may clear the issue #494 timeout strike; see
+        /// [`CapabilityMissPhase`].
+        phase: CapabilityMissPhase,
+    },
+}
+
+/// Where in a task's dispatch cycle a capability miss (issue #804) was
+/// detected, relative to the workflow handler's own execution.
+///
+/// The distinction exists to answer one underlying question — *did this
+/// dispatch actually watch the handler reach a conclusion?* — on which three
+/// independent strike counters depend:
+///
+/// - the issue #494 consecutive-workflow-task-timeout strike map, which answers
+///   *"is this workflow body still hanging?"*
+///   ([`Self::clears_workflow_timeout_strike`]);
+/// - the issue #367 `crash_strikes` column, which answers *"does this task keep
+///   killing the worker process that runs it?"*
+///   ([`Self::clears_crash_strikes`]);
+/// - the issue #782 consecutive-workflow-handler-panic strike map, which answers
+///   *"does this workflow body keep panicking?"*
+///   ([`Self::clears_panic_strike`]).
+///
+/// All three are evidence about *execution*, so only a dispatch that ran the
+/// handler to a conclusion is entitled to reset any of them.
+///
+/// Getting this wrong is a two-sided hazard, which is why it is a phase rather
+/// than a blanket rule:
+/// - Always preserving lets a *healthy* workflow accumulate strikes from
+///   post-handler misses it had nothing to do with (its body finished fine;
+///   only persistence found an unregistered child/activity type), so a single
+///   later transient timeout can tip it into poison-pill quarantine.
+/// - Always clearing lets an incapable worker erase a *genuinely hung* — or
+///   genuinely worker-killing — execution's streak every time it happens to
+///   claim the row, so `poison_pill_threshold` is never reached in a mixed
+///   fleet and #494/#367's protection is silently defeated by a blameless third
+///   party.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityMissPhase {
+    /// Detected before the handler was invoked — the workflow-type lookup in
+    /// `process_workflow_task`, or the activity-type lookup in
+    /// `process_activity_task`. The handler never ran.
+    BeforeHandler,
+    /// Detected *while* the workflow body was executing: a local activity
+    /// (issue #98) is resolved inline, mid-suspension, so a worker without its
+    /// handler cannot carry the body forward. The body has **not** returned.
+    DuringHandler,
+    /// Detected after the workflow body returned its commands, while persisting
+    /// the decision — an unregistered activity to schedule, or an unregistered
+    /// child workflow type to start. The body ran to a conclusion inside its
+    /// deadline.
+    AfterHandler,
+}
+
+impl CapabilityMissPhase {
+    /// Did this dispatch watch the handler run to a conclusion?
+    ///
+    /// The single fact all three strike predicates below are derived from,
+    /// stated once so they cannot drift apart. Only [`Self::AfterHandler`]
+    /// qualifies: [`Self::DuringHandler`] is deliberately conservative because a
+    /// mid-body miss is not a completed body.
+    #[must_use]
+    const fn handler_ran_to_conclusion(self) -> bool {
+        matches!(self, Self::AfterHandler)
+    }
+
+    /// Did this dispatch get far enough to *begin* the workflow handler?
+    ///
+    /// Deliberately a **different** fact from
+    /// [`Self::handler_ran_to_conclusion`], and the two disagree on exactly one
+    /// phase — [`Self::DuringHandler`], which began the body but did not finish
+    /// it. The strike counters ask "did it finish?"; the dispatch-attempt
+    /// question below asks "did it begin?", because everything that fires at
+    /// the *start* of a dispatch has already fired by then.
+    #[must_use]
+    const fn handler_was_reached(self) -> bool {
+        matches!(self, Self::DuringHandler | Self::AfterHandler)
+    }
+
+    /// May a release at this phase roll `task.attempt` back to undo
+    /// [`crate::queue::claim_task`]'s claim-time increment?
+    ///
+    /// Only [`Self::BeforeHandler`]. `attempt` does double duty on a task row:
+    ///
+    /// - it is the **retry budget** for an activity task, which a miss must not
+    ///   drain because the handler never ran (the exact bug issue #369 fixed
+    ///   for rate-limit deferrals); and
+    /// - it is the **"is this the first dispatch?"** signal `record_workflow_started`
+    ///   reads on a workflow task (`task.attempt == 1` plus "no scheduling
+    ///   events in history").
+    ///
+    /// Those two roles want opposite things once the handler has run. A
+    /// post-handler miss — the persist-time pre-pass finding an unregistered
+    /// activity or child type — happens *after* the start metric fired, and its
+    /// persistence transaction rolls back, so no scheduling event lands either.
+    /// Restoring `attempt` there would leave the next capable claim looking
+    /// exactly like a first dispatch, and `harvest.workflow.started` would be
+    /// emitted a **second** time for one execution, inflating start counts and
+    /// every SLO derived from them (Codex round-17 P2).
+    ///
+    /// Splitting on the phase satisfies both roles at once, because the two
+    /// populations do not overlap:
+    ///
+    /// - Every **activity**-task miss is [`Self::BeforeHandler`] (the
+    ///   activity-handler lookup in `process_activity_task`), so the retry
+    ///   budget is still always restored where it is a budget.
+    /// - Every [`Self::DuringHandler`]/[`Self::AfterHandler`] miss is on a
+    ///   **workflow** task, where `attempt` is read only by the metric gate
+    ///   above and the informational `attempts` field of a dead-letter row. It
+    ///   is not a claim filter (`claim_task` never selects on it) and not the
+    ///   issue #523 workflow-level retry budget, which counts the
+    ///   `harvest_workflow_executions.workflow_attempt` column instead.
+    ///
+    /// So letting a workflow row's `attempt` grow across post-handler releases
+    /// costs nothing and is exactly what suppresses the duplicate metric.
+    #[must_use]
+    pub const fn restores_dispatch_attempt(self) -> bool {
+        !self.handler_was_reached()
+    }
+
+    /// May a release at this phase clear the issue #494 consecutive-timeout
+    /// strike for the owning execution?
+    ///
+    /// Only [`Self::AfterHandler`]. [`Self::DuringHandler`] is deliberately
+    /// conservative: a mid-body miss is not a completed body, so a workflow
+    /// that hangs *after* its first local activity must not be able to reset
+    /// its own streak on every redelivery.
+    #[must_use]
+    pub const fn clears_workflow_timeout_strike(self) -> bool {
+        self.handler_ran_to_conclusion()
+    }
+
+    /// May a release at this phase clear the task row's issue #367
+    /// `crash_strikes` counter?
+    ///
+    /// `crash_strikes` counts how many times a task was found orphaned under a
+    /// worker that stopped heartbeating — i.e. how many worker processes it has
+    /// killed. Only an execution that *ran* is evidence about that, so a
+    /// pre-/mid-handler miss must leave the counter alone.
+    ///
+    /// Clearing it unconditionally would let an incapable worker launder a
+    /// poison task's history: in a heterogeneous fleet, an incapable claim
+    /// landing between two capable crashes resets the streak to zero every
+    /// time, so `poison_pill_threshold` is never reached and the task goes on
+    /// crashing replacement workers indefinitely. That is the same
+    /// blameless-third-party defeat this type exists to prevent for #494.
+    ///
+    /// Preserving is still strictly weaker than *incrementing*: AC4 requires
+    /// only that a clean miss never advances a crash counter, and the release
+    /// never does. It is also invisible to the sole writer of the column —
+    /// `poison_pill::reclaim_orphaned_tasks` scans `RUNNING AND worker_id IS
+    /// NOT NULL`, and a released row is `PENDING` with a NULL worker.
+    #[must_use]
+    pub const fn clears_crash_strikes(self) -> bool {
+        self.handler_ran_to_conclusion()
+    }
+
+    /// May a release at this phase clear the execution's issue #782
+    /// consecutive-workflow-handler-panic strike?
+    ///
+    /// The panic strike map counts how many times in a row this execution's
+    /// *body* panicked, so — exactly like the two counters above — only a
+    /// dispatch that ran the body to a conclusion is evidence the streak is
+    /// broken.
+    ///
+    /// A capability miss that surfaces before or during the handler is a
+    /// **non-terminal** condition: the dispatch path releases the task for a
+    /// capable peer instead of failing the execution. Clearing the strike there
+    /// would let a worker that alternates between panicking on the body and
+    /// missing an unregistered local activity reset `workflow_panic_max_attempts`
+    /// forever, so the panic budget is never reached and #782's containment is
+    /// silently defeated — the same blameless-third-party defeat this type
+    /// already prevents for #494 and #367.
+    ///
+    /// A *terminal* failure still clears the entry regardless of phase, because
+    /// the execution ends there and a retained entry would leak one `u32` per
+    /// such execution; that decision belongs to the caller, which only consults
+    /// this predicate for a capability miss.
+    #[must_use]
+    pub const fn clears_panic_strike(self) -> bool {
+        self.handler_ran_to_conclusion()
+    }
 }
 
 /// The Postgres constraint name backing the `harvest_events`
@@ -825,6 +1037,39 @@ impl HarvestError {
     #[must_use]
     pub fn is_event_id_unique_violation(&self) -> bool {
         matches!(self, Self::Database(msg) if msg.contains(EVENTS_EVENT_ID_UNIQUE_CONSTRAINT))
+    }
+
+    /// Classify this error as a **capability miss** — the claiming worker has
+    /// no handler registered for the task's workflow/activity type (issue #804).
+    ///
+    /// Returns `Some((kind, name))` for [`Self::HandlerNotRegistered`] and
+    /// `None` for every other variant. This is the single predicate the
+    /// worker's dispatch path keys on to decide release-vs-terminal-fail, so it
+    /// is deliberately **narrow**: a broad match (e.g. on [`Self::Config`]'s
+    /// message text) would sweep genuine configuration bugs into an infinite
+    /// release-and-retry loop instead of surfacing them.
+    #[must_use]
+    pub const fn handler_not_registered(&self) -> Option<(&'static str, &str)> {
+        match self {
+            Self::HandlerNotRegistered { kind, name, .. } => Some((kind, name.as_str())),
+            _ => None,
+        }
+    }
+
+    /// Where in the dispatch cycle a capability miss (issue #804) was detected,
+    /// or `None` for every other variant.
+    ///
+    /// Split from [`Self::handler_not_registered`] rather than folded into its
+    /// tuple: that predicate is the release-vs-fail interception check and is
+    /// called on the hot error path, while the phase is consulted once, only by
+    /// the dispatch site deciding whether the release may also clear the issue
+    /// #494 timeout strike.
+    #[must_use]
+    pub const fn capability_miss_phase(&self) -> Option<CapabilityMissPhase> {
+        match self {
+            Self::HandlerNotRegistered { phase, .. } => Some(*phase),
+            _ => None,
+        }
     }
 }
 
@@ -1457,5 +1702,269 @@ mod tests {
             HarvestError::SessionAcquireTimeout { .. }
         ));
         assert!(!matches!(timeout, HarvestError::SessionBroken { .. }));
+    }
+
+    // ── Capability-miss classification (issue #804) ──────────────────────
+
+    #[test]
+    fn handler_not_registered_carries_the_kind_and_name() {
+        let wf = HarvestError::HandlerNotRegistered {
+            kind: "workflow",
+            name: "onboarding".into(),
+            phase: CapabilityMissPhase::BeforeHandler,
+        };
+        let act = HarvestError::HandlerNotRegistered {
+            kind: "activity",
+            name: "send_email".into(),
+            phase: CapabilityMissPhase::BeforeHandler,
+        };
+        assert!(wf.to_string().contains("workflow"));
+        assert!(wf.to_string().contains("onboarding"));
+        assert!(act.to_string().contains("activity"));
+        assert!(act.to_string().contains("send_email"));
+    }
+
+    #[test]
+    fn handler_not_registered_is_classified_as_a_capability_miss() {
+        // The classifier is the single interception predicate the worker's
+        // dispatch path keys on. Anything else must be classified as a genuine
+        // failure, or a real bug would be silently released and retried forever
+        // instead of surfacing.
+        let miss = HarvestError::HandlerNotRegistered {
+            kind: "workflow",
+            name: "onboarding".into(),
+            phase: CapabilityMissPhase::BeforeHandler,
+        };
+        assert_eq!(
+            miss.handler_not_registered(),
+            Some(("workflow", "onboarding"))
+        );
+    }
+
+    #[test]
+    fn capability_miss_phase_clears_the_strike_only_after_the_handler_ran() {
+        // The issue #494 consecutive-workflow-task-timeout strike map answers
+        // "is this workflow body still hanging?". A dispatch may only clear it
+        // if it actually observed the body run to a conclusion.
+        assert!(
+            CapabilityMissPhase::AfterHandler.clears_workflow_timeout_strike(),
+            "the body returned its commands before the miss, so this dispatch \
+             IS evidence the workflow is not hanging"
+        );
+        assert!(
+            !CapabilityMissPhase::BeforeHandler.clears_workflow_timeout_strike(),
+            "the handler never ran, so this dispatch observed nothing"
+        );
+        // Deliberately conservative: an inline local-activity miss happens
+        // MID-body, so the body has NOT returned. Treating it as evidence
+        // would let a workflow that hangs *after* its first local activity
+        // reset its own streak on every redelivery.
+        assert!(
+            !CapabilityMissPhase::DuringHandler.clears_workflow_timeout_strike(),
+            "a mid-body miss is not a completed body"
+        );
+    }
+
+    /// Durable inline progress at an *earlier* frontier does not license
+    /// clearing any of the three strikes at a *later* mid-body miss (issue
+    /// #804, Codex round-24 P2 — declined, pinned here so the decline is
+    /// enforced rather than only argued).
+    ///
+    /// The scenario: a task with a strike already recorded completes local
+    /// activity 1, then hits an unregistered local activity 2 and is released.
+    /// That release is `DuringHandler`, and it must leave all three counters
+    /// alone.
+    ///
+    /// The progress is real, but it is not evidence about what the counters
+    /// measure, because the crash / hang / panic they track happens *after* the
+    /// frontier that was retired. Worse, it is progress the task makes on
+    /// **every** dispatch: a body that hangs after local activity 1 completes
+    /// that activity every redelivery, so treating it as a streak-breaker makes
+    /// the #494 threshold unreachable for exactly the hang it exists to
+    /// contain — and identically for #367 and #782. It would also let an
+    /// incapable worker that registers local activity 1 but not 2 (the ordinary
+    /// rolling-deploy shape) zero a capable peer's streak on every claim, which
+    /// is the blameless-third-party defeat this whole type exists to prevent.
+    ///
+    /// The counters are preserved, never incremented, so AC4 holds; genuine
+    /// progress still clears them through the clean continuation, which fires
+    /// when the body carries forward to a suspension instead of stalling at a
+    /// later frontier.
+    #[test]
+    fn inline_progress_at_an_earlier_frontier_does_not_clear_any_strike() {
+        let after_progress = CapabilityMissPhase::DuringHandler;
+        assert!(
+            !after_progress.clears_crash_strikes(),
+            "the crash the counter tracks can still be ahead of the retired \
+             frontier, and the progress repeats on every dispatch"
+        );
+        assert!(
+            !after_progress.clears_workflow_timeout_strike(),
+            "a body that hangs AFTER its first local activity completes that \
+             activity on every redelivery, so clearing here makes the #494 \
+             threshold unreachable for exactly that hang"
+        );
+        assert!(
+            !after_progress.clears_panic_strike(),
+            "likewise for a body that panics after its first local activity"
+        );
+    }
+
+    #[test]
+    fn capability_miss_phase_clears_crash_strikes_only_after_the_handler_ran() {
+        // Issue #367's `crash_strikes` counts worker processes this task has
+        // killed. Only a dispatch that RAN the handler is evidence about that,
+        // and the truth table must therefore match the #494 one exactly --
+        // both are derived from `handler_ran_to_conclusion`.
+        assert!(
+            CapabilityMissPhase::AfterHandler.clears_crash_strikes(),
+            "the body ran to a conclusion without killing this worker, so the \
+             consecutive-crash streak is genuinely broken"
+        );
+        assert!(
+            !CapabilityMissPhase::BeforeHandler.clears_crash_strikes(),
+            "the handler never ran, so this dispatch proves nothing about \
+             whether the task still crashes workers -- clearing here lets an \
+             incapable claim landing between two capable crashes launder the \
+             poison task's history forever (Codex round-12 P1)"
+        );
+        assert!(
+            !CapabilityMissPhase::DuringHandler.clears_crash_strikes(),
+            "a mid-body miss is not a completed body: the very crash the \
+             counter tracks could still be ahead of it"
+        );
+        // The predicates answer different questions but share one fact, so
+        // they must never disagree about a phase.
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+            CapabilityMissPhase::AfterHandler,
+        ] {
+            assert_eq!(
+                phase.clears_crash_strikes(),
+                phase.clears_workflow_timeout_strike(),
+                "both strike predicates derive from `handler_ran_to_conclusion`; \
+                 a divergence for {phase:?} means one of them was special-cased \
+                 without stating why"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_miss_phase_clears_panic_strike_only_after_the_handler_ran() {
+        // Issue #782's strike map counts consecutive panics of this execution's
+        // BODY. A capability miss detected before/during the handler is
+        // non-terminal (the task is released for a capable peer), so it must not
+        // reset a streak it observed nothing about -- otherwise a worker
+        // alternating "panic" and "unregistered local activity" resets
+        // `workflow_panic_max_attempts` forever (Codex round-13 P2).
+        assert!(
+            CapabilityMissPhase::AfterHandler.clears_panic_strike(),
+            "the body returned its commands without panicking, so the \
+             consecutive-panic streak is genuinely broken"
+        );
+        assert!(
+            !CapabilityMissPhase::BeforeHandler.clears_panic_strike(),
+            "the handler never ran, so this dispatch proves nothing about \
+             whether the body still panics"
+        );
+        assert!(
+            !CapabilityMissPhase::DuringHandler.clears_panic_strike(),
+            "an inline local-activity miss happens MID-body: the very panic the \
+             counter tracks could still be ahead of it"
+        );
+        // All three predicates share `handler_ran_to_conclusion`, so a
+        // divergence means one was special-cased without stating why.
+        for phase in [
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+            CapabilityMissPhase::AfterHandler,
+        ] {
+            assert_eq!(
+                phase.clears_panic_strike(),
+                phase.clears_workflow_timeout_strike(),
+                "all strike predicates derive from `handler_ran_to_conclusion`; \
+                 a divergence for {phase:?} means one of them was special-cased \
+                 without stating why"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_miss_phase_restores_the_attempt_only_before_the_handler_ran() {
+        // Issue #804 Codex round-17 P2. `task.attempt` is what
+        // `record_workflow_started` reads to decide whether a workflow dispatch
+        // is the FIRST one. Restoring it after the handler already ran makes the
+        // next capable claim look like a first dispatch and double-counts the
+        // metric.
+        assert!(
+            CapabilityMissPhase::BeforeHandler.restores_dispatch_attempt(),
+            "nothing ran and `harvest.workflow.started` was never emitted, so \
+             the budget must be restored AND the next dispatch must still be \
+             able to emit the metric"
+        );
+        assert!(
+            !CapabilityMissPhase::DuringHandler.restores_dispatch_attempt(),
+            "an inline local-activity miss is MID-body: the start metric already \
+             fired for this execution, so a restored attempt would re-emit it"
+        );
+        assert!(
+            !CapabilityMissPhase::AfterHandler.restores_dispatch_attempt(),
+            "the body ran to a conclusion, so the start metric already fired"
+        );
+        // This predicate is deliberately NOT the inverse of
+        // `handler_ran_to_conclusion`: the three strike predicates ask "did the
+        // body FINISH?" while this one asks "did the body BEGIN?".
+        // `DuringHandler` is the single phase that separates the two facts --
+        // it began but did not finish, so BOTH answers are `false` there. Pin
+        // that, or a later refactor could "simplify" this to
+        // `!clears_panic_strike()` and silently re-introduce the round-17
+        // double-count for every mid-body local-activity miss.
+        assert!(
+            !CapabilityMissPhase::DuringHandler.restores_dispatch_attempt()
+                && !CapabilityMissPhase::DuringHandler.clears_panic_strike(),
+            "DuringHandler must answer `false` to BOTH questions -- it is where \
+             'began' and 'finished' come apart, so this predicate cannot be \
+             expressed as the negation of a strike predicate"
+        );
+    }
+
+    #[test]
+    fn handler_not_registered_reports_its_phase() {
+        let after = HarvestError::HandlerNotRegistered {
+            kind: "activity",
+            name: "send_email".into(),
+            phase: CapabilityMissPhase::AfterHandler,
+        };
+        assert_eq!(
+            after.capability_miss_phase(),
+            Some(CapabilityMissPhase::AfterHandler)
+        );
+        // Every other variant has no phase at all.
+        assert_eq!(
+            HarvestError::NotFound("nope".into()).capability_miss_phase(),
+            None
+        );
+    }
+
+    #[test]
+    fn other_errors_are_not_capability_misses() {
+        // Deliberately includes `Config`, which is what the handler-miss sites
+        // returned BEFORE issue #804 — a broad, catch-all variant. Classifying
+        // on it would swallow every genuine configuration error into an
+        // infinite release loop, which is exactly why #804 introduces a
+        // dedicated variant rather than string-matching `Config`.
+        for err in [
+            HarvestError::Config("no activity handler registered for 'x'".into()),
+            HarvestError::NotFound("nope".into()),
+            HarvestError::non_deterministic_simple("drift"),
+            HarvestError::MutexSelfDeadlock { key: "k".into() },
+        ] {
+            assert_eq!(
+                err.handler_not_registered(),
+                None,
+                "only the dedicated variant may classify as a capability miss: {err}"
+            );
+        }
     }
 }

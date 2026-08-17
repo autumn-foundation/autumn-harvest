@@ -208,6 +208,12 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260717000000_harvest_workflow_triage_note/up.sql"
     ),
+    // issue #804: capability_misses column on harvest_task_queue, referenced by
+    // every TaskQueueItem read (claim_task's `RETURNING harvest_task_queue.*`)
+    // in this suite.
+    include_str!(
+        "../../autumn-harvest/migrations/20260720000000_harvest_task_capability_misses/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;

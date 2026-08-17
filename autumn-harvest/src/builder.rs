@@ -2078,6 +2078,11 @@ impl HarvestBuilder {
                 "worker_heartbeat_interval must be greater than zero".to_string(),
             ));
         }
+        // Issue #804 (Codex round-19 P1): surface a cadence the fleet-wide
+        // capability-miss liveness window cannot vouch for. Never rejects — an
+        // already-deployed slow fleet must keep booting.
+        #[cfg(feature = "db")]
+        warn_if_heartbeat_outruns_fleet_liveness(self.worker_config.worker_heartbeat_interval);
 
         validate_concurrency_keys(&self.activities)?;
         validate_workflow_concurrency_limits(&self.workflows)?;
@@ -2381,6 +2386,43 @@ fn validate_completion_triggers(
         }
     }
     Ok(())
+}
+
+/// Warn when this worker heartbeats more slowly than the fleet-wide liveness
+/// window its peers judge it by (issue #804, Codex round-19 P1).
+///
+/// Nothing in `harvest_workers` records a worker's cadence, so a peer running
+/// the capability-miss fleet lookup cannot ask "is this row fresh *for the
+/// worker that wrote it*" — it applies one fleet-wide window
+/// ([`crate::worker::CAPABILITY_MISS_MIN_FLEET_STALE_SECS`]) to every row. A
+/// worker configured past
+/// [`crate::worker::MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS`] can
+/// therefore look dead to a peer while it is perfectly healthy, and be omitted
+/// from the fleet that decides whether "no capable worker is live" is true.
+///
+/// A warning rather than a rejection: an existing deployment already running a
+/// slow cadence must keep booting (the same warn-never-error posture the
+/// degenerate slot-tuner band and `queue_weights` take), and the consequence is
+/// confined to one escalation bound — the distinct-worker bound and the absolute
+/// ceiling are unaffected.
+///
+/// Returns whether the warning fired so the decision is testable without a
+/// tracing subscriber.
+#[cfg(feature = "db")]
+fn warn_if_heartbeat_outruns_fleet_liveness(interval: Duration) -> bool {
+    let ceiling = crate::worker::MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS;
+    if interval <= ceiling {
+        return false;
+    }
+    tracing::warn!(
+        worker_heartbeat_interval_secs = interval.as_secs(),
+        supported_ceiling_secs = ceiling.as_secs(),
+        "harvest: worker_heartbeat_interval exceeds the cadence the capability-miss fleet \
+         lookup can vouch for (issue #804); a peer may treat this worker as dead while it is \
+         healthy and escalate a task this worker could have run. Lower the interval, or accept \
+         that the configured-total redelivery bound may fire early for this fleet."
+    );
+    true
 }
 
 /// Validates that every per-workflow-type retention override (issue #737)
@@ -3022,6 +3064,14 @@ pub struct WorkerConfig {
     /// How often the worker upserts its liveness row in `harvest_workers`.
     /// Defaults to **5 seconds**. The API classifies a worker as stale after
     /// `2 × worker_heartbeat_interval` without a heartbeat.
+    ///
+    /// Not every subsystem derives the same window from this knob. The
+    /// poison-pill reclaimer (#367) and the broken-session scanner (#606) use
+    /// the bare `2 ×` value, but the capability-miss fleet lookup (#804) floors
+    /// it at 120 s — see [`Self::capability_miss_max_redeliveries`] — because it
+    /// judges *peers* whose cadence it cannot read. Lowering this interval
+    /// therefore speeds the first two up and leaves the third unchanged for any
+    /// value at or under 60 s.
     pub worker_heartbeat_interval: Duration,
     /// Immutable build identifier for this worker binary (issue #171).
     ///
@@ -3066,6 +3116,108 @@ pub struct WorkerConfig {
     /// poison pills are re-queued indefinitely — the legacy retry-loop
     /// behaviour).
     pub poison_pill_threshold: i32,
+    /// Maximum number of **distinct workers** that may release a task back to
+    /// `PENDING` because they had no handler registered for its
+    /// workflow/activity type, before it is escalated to the ordinary
+    /// terminal-failure path with a `no_capable_worker:` reason (issue #804).
+    ///
+    /// **No dead-letter row is written.** The escalation routes through
+    /// `fail_task_and_execution_with_history`, which fails the task and the
+    /// execution without inserting into `harvest_dead_letters` — the reason
+    /// lives on the failed execution row, so an operator diagnosing an
+    /// exhausted budget queries failed workflows, not the DLQ. (A DLQ entry on
+    /// this path would also be indistinguishable from a poison-pill
+    /// quarantine, [`poison_pill_threshold`], which a capability miss
+    /// deliberately is not.)
+    ///
+    /// Any worker polling a queue can claim any task on it — the queue's
+    /// non-blocking claim query has no capability filter, and cannot have one
+    /// (a worker can enumerate the handlers it *has* registered, never the
+    /// ones it has not).
+    /// A claim by an incapable worker is therefore released for a capable peer
+    /// rather than terminally failing the execution, which makes the routine
+    /// mid-rolling-deploy window blameless.
+    ///
+    /// Each release defers the task by a capped exponential backoff (1 s
+    /// doubling to 30 s), so the budget buys a dwell window comfortably longer
+    /// than a pod flip.
+    ///
+    /// # The budget is per distinct worker
+    ///
+    /// The backoff makes a released task eligible to *every* worker again — the
+    /// one that just released it included. If the budget counted total
+    /// releases, one incapable worker winning the claim race `N + 1` times in a
+    /// row would terminally fail a run while a capable peer sat live and idle,
+    /// which is the very outage this setting exists to prevent. So the task
+    /// records the **set** of workers that have missed it
+    /// (`capability_miss_workers`), and a repeat miss by a worker already in
+    /// that set is free: it still backs off, but consumes no budget.
+    ///
+    /// # The budget is gated on the live fleet
+    ///
+    /// A distinct count still has no relationship to how many workers are
+    /// actually up: a rollout with `N + 1` old pods plus one new capable pod
+    /// can hand `N + 1` distinct incapable ids to the budget while the capable
+    /// pod is live and polling. So this budget may only terminate a task once
+    /// the recorded miss set **covers the live fleet for the task's queue**
+    /// (`harvest_workers` rows with a fresh heartbeat advertising it). That
+    /// liveness window is **not** the poison-pill one: it is
+    /// [`crate::worker::capability_miss_fleet_stale_secs`], which is
+    /// `2 × worker_heartbeat_interval` **floored at 120 s**
+    /// ([`crate::worker::CAPABILITY_MISS_MIN_FLEET_STALE_SECS`]). The reclaimer
+    /// and the broken-session scanner judge rows they own with a window they
+    /// chose; this query judges *peers*, whose cadence nothing in
+    /// `harvest_workers` records — so a fast-heartbeating claimant must not
+    /// declare a healthy peer on a slower cadence dead. At the default 5 s
+    /// cadence the two windows are 120 s and 10 s.
+    ///
+    /// The timing consequence worth predicting: after a pod dies, its row keeps
+    /// holding the evidence at "a capable peer may exist" for up to 120 s, and
+    /// in that interval **both** evidence-derived bounds are withheld — this
+    /// fleet-covering one *and* the distinct-worker one. The absolute release
+    /// ceiling (`10 ×` the budget) is what still fires, so AC3 holds, but a task
+    /// whose fleet cannot be shown covered waits on that ceiling rather than on
+    /// `max_redeliveries`. The delay costs redeliveries, never the run. Tuning
+    /// `worker_heartbeat_interval` *below* 60 s does not shorten it.
+    /// While any live worker there has never missed the task, this bound is
+    /// withheld.
+    ///
+    /// Two consequences: the effective bound is `max(N, live fleet size)`
+    /// redeliveries — you cannot prove "no worker here has the handler" in
+    /// fewer redeliveries than there are workers to ask — and a fleet whose
+    /// workers are not registered at all (heartbeats disabled, or a different
+    /// queue name advertised) falls back to bounding on `N` alone, with the
+    /// escalation reason saying so rather than claiming a fleet conclusion.
+    ///
+    /// A *second* bound on **total** releases keeps `N` a real maximum for the
+    /// common small deployment. Once the registry confirms every live worker on
+    /// the queue has already missed the task, the distinct set cannot grow, so
+    /// with a fleet smaller than the budget the distinct bound is unreachable —
+    /// one incapable worker pins `distinct_after` at 1 forever. This bound
+    /// therefore escalates at `N` total releases, but only on that same
+    /// fleet-covering evidence: on evidence the registry cannot supply it would
+    /// let a single worker exhaust the budget by winning the claim race
+    /// repeatedly, which is exactly what the distinct count exists to prevent.
+    ///
+    /// Only a third, **ungated** absolute ceiling of `10 ×` this value remains
+    /// for the cases neither gated bound can reach: a fleet the registry cannot
+    /// describe at all, and a live worker that never claims (which keeps the
+    /// evidence at "a capable peer may exist" and withholds *both* gated
+    /// bounds). It reports the counts it actually observed rather than a
+    /// fleet-wide conclusion, and the sustained-release alert fires long before
+    /// it.
+    ///
+    /// Both the set and the total are reset by every path that proves the
+    /// claiming worker *was* capable, so they measure **consecutive** misses —
+    /// the same semantics [`poison_pill_threshold`] has for crashes.
+    ///
+    /// Defaults to **5**. Set to `0` to escalate on the **first** miss (the
+    /// pre-#804 fail-fast behaviour) — note this is *not* an "unlimited
+    /// releases" switch; releasing forever would let a genuinely-unregistered
+    /// type bounce indefinitely, which is exactly what the budget bounds.
+    ///
+    /// [`poison_pill_threshold`]: Self::poison_pill_threshold
+    pub capability_miss_max_redeliveries: u32,
     /// Maximum wall-clock time a single workflow-task dispatch may run before
     /// the worker reclaims the concurrency slot (issue #494).
     ///
@@ -3226,6 +3378,7 @@ impl Default for WorkerConfig {
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            capability_miss_max_redeliveries: 5,
             workflow_task_timeout: Duration::from_secs(10),
             workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: DEFAULT_MAX_WORKFLOW_PAUSE_DURATION,
@@ -3422,6 +3575,40 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_poison_pill_threshold(mut self, threshold: i32) -> Self {
         self.poison_pill_threshold = threshold;
+        self
+    }
+
+    /// Override the capability-miss redelivery budget (default 5, issue #804).
+    ///
+    /// A task claimed by a worker with no handler registered for its
+    /// workflow/activity type is released back to `PENDING` for a capable peer,
+    /// with capped exponential backoff. A budget of `N` grants exactly `N`
+    /// releases; the `N + 1`th claim escalates to the ordinary terminal-failure
+    /// path with a `no_capable_worker:` reason on the execution row. (That path
+    /// writes no dead-letter entry.)
+    ///
+    /// Raise this if your rollouts legitimately take longer than the default
+    /// dwell window — the five backoffs the default grants sum to ~31 s
+    /// (1 + 2 + 4 + 8 + 16) on a single worker, and less in wall-clock terms on
+    /// a wide fleet, where incapable peers consume releases in parallel. This
+    /// trades a longer time-to-detect for fewer spurious escalations.
+    ///
+    /// `0` escalates on the **first** miss — the pre-#804 fail-fast behaviour.
+    /// It is not an "off" switch for the feature; there is deliberately no
+    /// unlimited-release mode, since that would let a genuinely-unregistered
+    /// workflow type bounce around the fleet forever.
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_capability_miss_max_redeliveries(10);
+    /// assert_eq!(config.capability_miss_max_redeliveries, 10);
+    /// ```
+    #[must_use]
+    pub const fn with_capability_miss_max_redeliveries(mut self, budget: u32) -> Self {
+        self.capability_miss_max_redeliveries = budget;
         self
     }
 
@@ -3835,6 +4022,36 @@ mod tests {
         assert!(
             matches!(result, Err(HarvestBuilderError::InvalidWorkerConfig(_))),
             "expected InvalidWorkerConfig but got {result:?}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn slow_heartbeat_warns_but_never_blocks_the_build() {
+        // The default cadence -- and anything up to the supported ceiling --
+        // must stay silent, or the warning is noise operators learn to ignore.
+        assert!(!warn_if_heartbeat_outruns_fleet_liveness(
+            WorkerConfig::default().worker_heartbeat_interval
+        ));
+        assert!(!warn_if_heartbeat_outruns_fleet_liveness(
+            crate::worker::MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS
+        ));
+        // One second past the ceiling is where a peer can start mistaking this
+        // worker for a dead one.
+        assert!(warn_if_heartbeat_outruns_fleet_liveness(
+            crate::worker::MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS
+                + Duration::from_secs(1)
+        ));
+        // Warn, never reject: an already-deployed slow fleet must keep booting.
+        assert!(
+            HarvestBuilder::new()
+                .worker(
+                    WorkerConfig::default()
+                        .with_worker_heartbeat_interval(Duration::from_secs(600))
+                )
+                .try_build()
+                .is_ok(),
+            "a slow heartbeat is a warning, not a build failure"
         );
     }
 
@@ -4968,6 +5185,57 @@ mod tests {
     fn worker_config_poison_pill_threshold_zero_disables() {
         let config = WorkerConfig::default().with_poison_pill_threshold(0);
         assert_eq!(config.poison_pill_threshold, 0);
+    }
+
+    // ── Capability-miss redelivery budget tests (issue #804) ──────────────
+
+    #[test]
+    fn worker_config_capability_miss_max_redeliveries_defaults_to_5() {
+        // AC3 asks for a "configurable number ... (default small, e.g. 5)".
+        assert_eq!(
+            WorkerConfig::default().capability_miss_max_redeliveries,
+            5,
+            "the default redelivery budget must be small but large enough to \
+             outlast a rolling pod flip"
+        );
+    }
+
+    #[test]
+    fn worker_config_with_capability_miss_max_redeliveries_overrides() {
+        let config = WorkerConfig::default().with_capability_miss_max_redeliveries(12);
+        assert_eq!(config.capability_miss_max_redeliveries, 12);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn worker_config_capability_miss_zero_escalates_immediately() {
+        // `0` is NOT an off-switch for the feature: it means "escalate on the
+        // first miss", i.e. the pre-#804 fail-fast behaviour. Pinned so nobody
+        // later reinterprets 0 as "release forever" (which would let a
+        // genuinely-unregistered type bounce indefinitely — the exact hazard
+        // the budget exists to bound).
+        let config = WorkerConfig::default().with_capability_miss_max_redeliveries(0);
+        assert_eq!(config.capability_miss_max_redeliveries, 0);
+        assert_eq!(
+            crate::worker::capability_miss_decision(
+                1,
+                1,
+                config.capability_miss_max_redeliveries,
+                crate::worker::FleetCapabilityEvidence::AllLiveWorkersMissed,
+            ),
+            crate::worker::CapabilityMissAction::Escalate
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn worker_config_capability_miss_budget_is_threaded_into_the_runtime_config() {
+        // The knob is inert unless it reaches WorkerRuntimeConfig — the struct
+        // the worker's dispatch path actually reads. This is the same threading
+        // contract `poison_pill_threshold` has.
+        let config = WorkerConfig::default().with_capability_miss_max_redeliveries(9);
+        let runtime: crate::worker::WorkerRuntimeConfig = config.into();
+        assert_eq!(runtime.capability_miss_max_redeliveries, 9);
     }
 
     // ── Workflow panic-retry budget tests (issue #782) ────────────────────
