@@ -369,7 +369,73 @@ pub const fn resume_shift_scheduled_at_query() -> &'static str {
      WHERE task_type = 'activity' \
        AND activity_name = $1 \
        AND state = 'PENDING' \
-       AND scheduled_at <= clock_timestamp()"
+       AND scheduled_at <= clock_timestamp() \
+     RETURNING id"
+}
+
+/// Second resume pass: credit every due `PENDING` task of `$1` that the primary
+/// pass did **not** shift, excluded by `$3` (the ids it reported) rather than by
+/// predicate.
+///
+/// # Why a second pass exists at all (issue #807 review, Codex P1)
+///
+/// Under READ COMMITTED each statement takes its own snapshot, so a task
+/// enqueued *after* the primary shift began — but before this transaction's
+/// pause `DELETE` commits — is invisible to that pass while still being
+/// genuinely held (every other session still sees the uncommitted pause row and
+/// still skips it). With a single pass such a row thaws carrying its whole held
+/// wait, and the `schedule_to_start` scanner can terminally fail it the instant
+/// the hold lifts — the exact failure the credit exists to prevent. The window
+/// is widest exactly where it hurts: a large backlog keeps the bulk `UPDATE`
+/// and the per-queue notification pass running longest.
+///
+/// # Why exclude by id rather than by predicate
+///
+/// The primary pass already handles *both* sides of the `created_at` partition
+/// inline, so a predicate-based exclusion here would have to re-derive which
+/// rows it saw — and "which rows a statement saw" is a question about
+/// visibility, not about the row. Excluding the ids it actually reported makes
+/// coverage total for **any** commit order: a row it shifted is skipped here (a
+/// second application of the relative `+=` formula would erase the very
+/// pre-pause wait it preserves), and every other due `PENDING` row is credited
+/// here. An empty `$3` correctly leaves every row to this pass.
+///
+/// Spelled `NOT EXISTS (… unnest …)` rather than `id <> ALL(<array>)`
+/// deliberately: the latter is a per-row linear scan of the array, the former
+/// lets the planner build a hash anti-join, so cost is O(rows + ids) rather
+/// than O(rows × ids). Mirrors [`crate::queue_pause::resume_shift_late_arrivals_query`].
+///
+/// # Irreducible residual
+///
+/// This narrows the uncredited window from "the whole bulk `UPDATE` plus the
+/// notification pass" to "this final, small statement", but cannot close it: a
+/// row committed after *this* statement's snapshot and before this transaction
+/// commits is still held and still gets no credit. The under-credit is bounded
+/// by the remaining duration of this statement (microseconds for an activity
+/// with no late arrivals) and errs in the same safe direction as the primary
+/// pass. Closing it completely would require serializing **enqueue** behind an
+/// activity-scoped lock, putting a serialization point on the hot enqueue path
+/// for every task, paused or not — the exact trade this module's design notes
+/// reject for the claim path.
+///
+/// Binds: `$1` = activity name, `$2` = the hold's `paused_at`, `$3` = the ids
+/// the primary pass reported shifting.
+#[must_use]
+pub const fn resume_shift_late_arrivals_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET scheduled_at = CASE \
+           WHEN created_at IS NULL OR created_at < $2 \
+             THEN scheduled_at + (clock_timestamp() - GREATEST(scheduled_at, $2)) \
+           ELSE clock_timestamp() \
+         END \
+     WHERE task_type = 'activity' \
+       AND activity_name = $1 \
+       AND state = 'PENDING' \
+       AND scheduled_at <= clock_timestamp() \
+       AND NOT EXISTS ( \
+             SELECT 1 FROM unnest($3::uuid[]) AS already(id) \
+             WHERE already.id = harvest_task_queue.id \
+           )"
 }
 
 /// SQL for [`is_activity_paused`], exposed for shape tests.
@@ -732,6 +798,15 @@ struct DeletedPauseRow {
     paused_at: DateTime<Utc>,
 }
 
+/// One id returned by [`resume_shift_scheduled_at_query`], so the second pass
+/// can exclude exactly the rows the first one shifted.
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct ShiftedTaskIdRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
+}
+
 #[cfg(feature = "db")]
 #[derive(diesel::QueryableByName)]
 struct NotifyTaskRow {
@@ -787,9 +862,29 @@ pub async fn resume_activity(
                 });
             };
 
-            let released: usize = diesel::sql_query(resume_shift_scheduled_at_query())
+            let shifted: Vec<ShiftedTaskIdRow> =
+                diesel::sql_query(resume_shift_scheduled_at_query())
+                    .bind::<diesel::sql_types::Text, _>(&name)
+                    .bind::<diesel::sql_types::Timestamptz, _>(pause.paused_at)
+                    .load(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            let released = shifted.len();
+            let shifted_ids: Vec<uuid::Uuid> = shifted.into_iter().map(|r| r.id).collect();
+
+            // Second pass, before the doorbell so it sees the freshest snapshot:
+            // a task still held (our DELETE has not committed, so every other
+            // session still sees the pause row) may be invisible to the primary
+            // shift above -- whether it was created during the hold, or created
+            // before it by an enqueue that only committed just now. This pass
+            // covers every due row the primary pass did not report shifting, so
+            // the two are disjoint by construction and no row is credited twice.
+            // See `resume_shift_late_arrivals_query` for the irreducible
+            // residual this narrows but cannot close.
+            let late: usize = diesel::sql_query(resume_shift_late_arrivals_query())
                 .bind::<diesel::sql_types::Text, _>(&name)
                 .bind::<diesel::sql_types::Timestamptz, _>(pause.paused_at)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -813,7 +908,8 @@ pub async fn resume_activity(
             Ok(ActivityResumeOutcome {
                 activity_name: name,
                 newly_resumed: true,
-                released_task_count: i64::try_from(released).unwrap_or(i64::MAX),
+                released_task_count: i64::try_from(released.saturating_add(late))
+                    .unwrap_or(i64::MAX),
                 paused_duration_secs,
                 released_reason: Some(pause.reason),
                 released_paused_by: Some(pause.paused_by),

@@ -797,3 +797,159 @@ async fn the_post_claim_recheck_only_releases_this_workers_own_claim() {
         "and the owning worker's in-flight task is untouched"
     );
 }
+
+/// A task enqueued *during* the resume transaction — after the primary shift
+/// took its snapshot, before the pause DELETE commits — is genuinely held and
+/// is owed a credit (issue #807 review, Codex P1).
+///
+/// The primary shift cannot see it: under READ COMMITTED each statement takes
+/// its own snapshot, so a row committed after that statement began is invisible
+/// to it. With a single pass such a row thaws with its entire held wait
+/// uncredited, and the `schedule_to_start` scanner can terminally fail it the
+/// instant the hold lifts — the exact failure the credit exists to prevent, and
+/// worst on a large backlog where the bulk `UPDATE` and the per-queue
+/// notification pass keep the transaction open longest.
+///
+/// This drives the two passes by hand across two connections so the window is
+/// deterministic rather than raced. Mirrors
+/// `queue_pause_tests::resume_credits_a_task_that_arrives_between_the_two_passes`,
+/// whose two-pass design (issue #619 rounds 16/19) this fix adopts.
+#[tokio::test]
+async fn resume_credits_a_task_that_arrives_between_the_two_passes() {
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    let mut resumer = connect(&url).await;
+
+    let q = unique("q_late");
+    let activity = unique("act_late");
+
+    // A pre-existing held task: the primary pass's row.
+    let early = enqueue_activity(&mut conn, &q, &activity, None).await;
+    backdate_scheduled_at(&mut conn, early, 100).await;
+    assert!(pause(&mut conn, &activity).await);
+    backdate_paused_at(&mut conn, &activity, 100).await;
+
+    #[derive(diesel::QueryableByName)]
+    struct PausedAtRow {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        paused_at: chrono::DateTime<chrono::Utc>,
+    }
+    let paused_at = {
+        use diesel_async::RunQueryDsl;
+        let rows: Vec<PausedAtRow> = diesel::sql_query(
+            "SELECT paused_at FROM harvest_activity_pauses WHERE activity_name = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(&activity)
+        .load(&mut conn)
+        .await
+        .expect("read paused_at");
+        rows[0].paused_at
+    };
+
+    // Open the resume transaction and release the hold — uncommitted, so every
+    // other session still sees the pause row and still holds.
+    resumer
+        .batch_execute(&format!(
+            "BEGIN; DELETE FROM harvest_activity_pauses WHERE activity_name = '{activity}'"
+        ))
+        .await
+        .expect("begin and release the hold");
+
+    // Pass 1 — the primary shift.
+    #[derive(diesel::QueryableByName)]
+    struct ShiftedTaskIdRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+    let primary_ids: Vec<ShiftedTaskIdRow> = {
+        use diesel_async::RunQueryDsl;
+        diesel::sql_query(activity_pause::resume_shift_scheduled_at_query())
+            .bind::<diesel::sql_types::Text, _>(&activity)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .load(&mut resumer)
+            .await
+            .expect("primary shift")
+    };
+    let primary = primary_ids.len();
+    let shifted_ids: Vec<Uuid> = primary_ids.into_iter().map(|r| r.id).collect();
+
+    // ── THE WINDOW ──────────────────────────────────────────────────────────
+    let late = enqueue_activity(&mut conn, &q, &activity, None).await;
+    backdate_scheduled_at(&mut conn, late, 100).await;
+    assert_eq!(
+        claim_one(&mut conn, &q).await,
+        None,
+        "the hold is still in force mid-resume: the DELETE has not committed, so \
+         a task enqueued now is genuinely held and owed a credit"
+    );
+    // Prove the primary pass genuinely missed it, so the pass-2 assertion below
+    // cannot be vacuous.
+    let before_pass2 = (chrono::Utc::now() - scheduled_at_of(&mut conn, late).await).num_seconds();
+    assert!(
+        (99..=101).contains(&before_pass2),
+        "the primary shift cannot see a row enqueued after its snapshot; if this \
+         already read ~0s the second pass would be untested. apparent wait \
+         {before_pass2}s"
+    );
+
+    // Pass 2 — the late-arrivals credit, excluding by id rather than predicate.
+    let late_shifted = {
+        use diesel_async::RunQueryDsl;
+        diesel::sql_query(activity_pause::resume_shift_late_arrivals_query())
+            .bind::<diesel::sql_types::Text, _>(&activity)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
+            .execute(&mut resumer)
+            .await
+            .expect("late-arrivals shift")
+    };
+    resumer
+        .batch_execute("COMMIT")
+        .await
+        .expect("commit resume");
+
+    // The passes partition: exactly one row each, never both on one row.
+    assert_eq!(
+        primary, 1,
+        "the pre-existing backlog is the primary pass's row"
+    );
+    assert_eq!(
+        late_shifted, 1,
+        "the row that arrived mid-resume is pass 2's"
+    );
+
+    // Both are credited: neither carries its held wait past the thaw.
+    for (id, label) in [(early, "pre-existing"), (late, "late-arriving")] {
+        let wait = (chrono::Utc::now() - scheduled_at_of(&mut conn, id).await).num_seconds();
+        assert!(
+            wait <= 2,
+            "the {label} task must be credited for the held time, else the \
+             schedule_to_start scanner can fail it the instant the hold lifts; \
+             apparent wait {wait}s"
+        );
+    }
+
+    // And the whole backlog is claimable again.
+    assert_eq!(
+        claim_all(&mut conn, &q).await.len(),
+        2,
+        "both tasks are claimable once the resume commits"
+    );
+}
+
+/// `scheduled_at` of one task — how long the claim gate believes it has waited.
+async fn scheduled_at_of(conn: &mut AsyncPgConnection, id: Uuid) -> chrono::DateTime<chrono::Utc> {
+    use diesel_async::RunQueryDsl;
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        scheduled_at: chrono::DateTime<chrono::Utc>,
+    }
+    let rows: Vec<Row> =
+        diesel::sql_query("SELECT scheduled_at FROM harvest_task_queue WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(id)
+            .load(conn)
+            .await
+            .expect("read scheduled_at");
+    rows[0].scheduled_at
+}
