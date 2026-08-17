@@ -22,7 +22,7 @@
 //! won't show up in a buffers ranking, only in a `calls` ranking."
 //!
 //! This file is the harness + evidence generator for that investigation, and
-//! (in its non-`#[ignore]`d test) a permanent regression guard for the fix's
+//! (in its non-skipped test) a permanent regression guard for the fix's
 //! correctness under real branching (multiple parents at one depth level,
 //! spread across shards -- exactly the code path the batched query replaces).
 //! It is not a duplicate of the 7 functional-correctness tests already
@@ -33,10 +33,11 @@
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a Postgres **admin** URL (a
 //! per-test database is created off it) to run without Docker; otherwise a
-//! fresh testcontainers Postgres is booted for the non-ignored test (the
-//! `#[ignore]`d evidence-capture test additionally needs `pg_stat_statements`
-//! preloaded via `shared_preload_libraries`, which the Docker fallback does
-//! not configure -- run it against a `HARVEST_TEST_DATABASE_URL` target with
+//! fresh testcontainers Postgres is booted for the non-skipped test (the
+//! skipped-by-default evidence-capture test additionally needs
+//! `pg_stat_statements` preloaded via `shared_preload_libraries`, which the
+//! Docker fallback does not configure -- run it against a
+//! `HARVEST_TEST_DATABASE_URL` target with
 //! `shared_preload_libraries = 'pg_stat_statements'`). See
 //! `docs/performance-workflow-children-traversal.md` for how the committed
 //! evidence in `docs/perf-artifacts/workflow-children-traversal/` was
