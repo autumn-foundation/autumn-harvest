@@ -525,6 +525,25 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 /// new bind — it reuses `$2`, pre-filtering `harvest_queue_pauses` to the
 /// worker's own polled queues once via `paused_queues` rather than probing it
 /// once per candidate row (see the `NOTE` above `claim_task_query` for why).
+///
+/// The per-activity-type pause (issue #807) needs no bind either: unlike
+/// `paused_queues` there is no natural bound to pre-filter by — a worker's
+/// polled queues say nothing about which activity types are held — so
+/// `paused_activities` reads the whole table. That is deliberate and cheap: the
+/// table is keyed by activity name and holds one row per *currently paused*
+/// activity, so it is empty in steady state and a handful of rows during an
+/// incident. It is `MATERIALIZED` for the same reason `paused_queues` is —
+/// evaluated once per claim, never once per candidate row.
+///
+/// **Both activity-name gates (`$6` and `paused_activities`) are guarded by
+/// `task_type != 'activity' OR activity_name IS NULL` and this is load-bearing,
+/// not defensive noise.** `activity_name` is `NULL` for workflow tasks, and in
+/// SQL `NULL = ANY(array)` is `NULL` — so `NOT (activity_name = ANY(...))` is
+/// `NULL`, which is not `TRUE`, which excludes the row. Without the guard a
+/// single paused activity would silently stop every *workflow* task in the
+/// fleet from being claimed: a total orchestration outage produced by a
+/// surgical containment control. Pinned by
+/// `claim_query_activity_pause_gate_never_holds_workflow_tasks`.
 // The body is one SQL string literal; the line count is the query's, not
 // control flow's. `claim_task` carried the same allow before this query was
 // extracted for shape-testing.
@@ -539,11 +558,16 @@ pub const fn claim_task_query() -> &'static str {
              FROM harvest_queue_pauses \
              WHERE queue_name = ANY($2) \
          ), \
+         paused_activities AS MATERIALIZED ( \
+             SELECT COALESCE(array_agg(activity_name), ARRAY[]::text[]) AS names \
+             FROM harvest_activity_pauses \
+         ), \
          candidate AS ( \
              SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name \
              FROM harvest_task_queue \
              CROSS JOIN worker_info \
              CROSS JOIN paused_queues \
+             CROSS JOIN paused_activities \
              WHERE queue_name = ANY($2) \
                AND state = 'PENDING' \
                AND scheduled_at <= NOW() \
@@ -597,6 +621,11 @@ pub const fn claim_task_query() -> &'static str {
                    OR activity_name IS NULL \
                    OR required_capabilities IS NOT NULL \
                    OR NOT (activity_name = ANY($6)) \
+               ) \
+               AND ( \
+                   task_type != 'activity' \
+                   OR activity_name IS NULL \
+                   OR NOT (activity_name = ANY(paused_activities.names)) \
                ) \
                AND ( \
                    required_capabilities IS NULL \
@@ -905,6 +934,33 @@ pub async fn claim_task(
                 // why an exclusive lock inside the claim itself was rejected: it
                 // would serialize all claims for a queue and defeat `SKIP LOCKED`.
                 if crate::queue_pause::release_claim_if_queue_paused(conn, task.id, worker_id)
+                    .await?
+                {
+                    return Ok(None);
+                }
+
+                // Authoritative activity-pause re-check (issue #807). Same
+                // reasoning as the queue-pause re-check directly above: the
+                // `paused_activities` pre-filter in the claim is evaluated
+                // against that statement's snapshot, so a pause committing
+                // while the claim was in flight is invisible to it. This is a
+                // separate statement and therefore takes a fresh snapshot.
+                //
+                // Gated on `task_type` so a workflow task -- which can never be
+                // held by an activity pause -- pays no extra round trip on the
+                // hot claim path. The guard is not merely an optimization: it
+                // makes the added cost fall only on the rows the feature can
+                // actually hold.
+                //
+                // Unlike the queue-pause path there is no advisory-lock barrier
+                // here, so this verdict is authoritative as of its own snapshot
+                // rather than through commit. See the "Residual window" section
+                // on `activity_pause::release_claim_if_activity_paused` for the
+                // precise bound and why it is accepted.
+                if task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE
+                    && crate::activity_pause::release_claim_if_activity_paused(
+                        conn, task.id, worker_id,
+                    )
                     .await?
                 {
                     return Ok(None);
@@ -1369,6 +1425,9 @@ pub const fn oldest_pending_ages_query() -> &'static str {
            AND scheduled_at <= NOW() \
            AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
          WHERE qp.queue_name = harvest_task_queue.queue_name) \
+           AND NOT EXISTS (SELECT 1 FROM harvest_activity_pauses ap \
+         WHERE ap.activity_name = harvest_task_queue.activity_name \
+           AND harvest_task_queue.task_type = 'activity') \
            AND ( \
                schedule_to_close_at IS NULL \
                OR schedule_to_close_at > NOW() \
@@ -3381,8 +3440,8 @@ pub struct ClaimablePendingDemand {
 /// site and the drift test share one source of truth.
 ///
 /// Mirrors **every** claim-time gate in [`claim_task_query`], including the
-/// issue #619 queue-pause anti-join. Bind: `$1` circuit-breaker-tracked
-/// activities.
+/// issue #619 queue-pause and issue #807 activity-pause anti-joins. Bind: `$1`
+/// circuit-breaker-tracked activities.
 #[must_use]
 pub fn claimable_pending_demand_query() -> String {
     // `sticky_owner` is NULL unless an unexpired lease binds the row to a
@@ -3399,6 +3458,16 @@ pub fn claimable_pending_demand_query() -> String {
     // worker-capacity alert during the hold). Generated from the shared
     // renderer, correlated against this query's `tq` alias.
     let queue_pause_gate = crate::queue_pause::queue_pause_anti_join("tq");
+    // Issue #807: identically, a paused activity type's backlog is held rather
+    // than stalled. The rendered anti-join carries `task_type = 'activity'`, and
+    // that predicate is REQUIRED, not redundant: a workflow row's
+    // `activity_name` is not reliably NULL -- the engine stamps the
+    // `'mixed_signal_suspension'` sentinel into that very column -- so
+    // NULL-safety alone would leave this query silently under-reporting demand
+    // whenever an activity happened to share that sentinel's name. See
+    // `activity_pause::activity_pause_anti_join`, and the shape assertion in
+    // `claim_gate_mirrors_carry_the_activity_pause_predicate` below.
+    let activity_pause_gate = crate::activity_pause::activity_pause_anti_join("tq");
     format!(
         "SELECT tq.queue_name, tq.required_capabilities, tq.required_build_id, \
                 {sticky_owner_expr} AS sticky_owner, tq.activity_name, \
@@ -3408,6 +3477,7 @@ pub fn claimable_pending_demand_query() -> String {
          WHERE tq.state = 'PENDING' \
            AND tq.scheduled_at <= NOW() \
            AND {queue_pause_gate} \
+           AND {activity_pause_gate} \
            AND ( \
                tq.schedule_to_close_at IS NULL \
                OR tq.schedule_to_close_at > NOW() \
@@ -3921,6 +3991,119 @@ mod tests {
             claim_task_query().matches("harvest_queue_pauses").count(),
             1,
             "the pause gate belongs only in the candidate (PENDING) scan"
+        );
+    }
+
+    // ── Activity pause: claim gate + its mirrors (issue #807) ───────────────
+
+    /// The per-activity pause gate must use the same pre-filtered-array shape
+    /// the queue gate was rewritten to, never a per-row correlated subquery.
+    ///
+    /// The `NOTE` above [`claim_task_query`] records that the correlated form
+    /// accounted for ~99% of this query's buffer touches at a 10k-row backlog,
+    /// because the planner re-probes the pause table once per *candidate row*
+    /// walked while sorting toward `LIMIT 1`. An activity pause is enforced on
+    /// the same scan, so it inherits the same cost model — and the same
+    /// prohibition.
+    #[test]
+    fn claim_query_excludes_paused_activities_via_a_prefiltered_array() {
+        let sql = claim_task_query();
+        assert!(
+            sql.contains("paused_activities AS MATERIALIZED"),
+            "the activity-pause pre-filter must be forced to materialize once, \
+             not be inlined back into a per-row correlated subquery; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("FROM harvest_activity_pauses"),
+            "paused_activities must read the durable pause table; got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("NOT EXISTS (SELECT 1 FROM harvest_activity_pauses"),
+            "the per-row correlated anti-join must never appear on the hot \
+             claim path; got:\n{sql}"
+        );
+    }
+
+    /// **A paused activity must never hold a workflow task.**
+    ///
+    /// `harvest_task_queue.activity_name` is `Nullable<Text>`: workflow tasks
+    /// carry `NULL`. In SQL, `NULL = ANY(array)` is `NULL`, and `NOT NULL` is
+    /// `NULL` — which is not `TRUE`, so a bare
+    /// `NOT (activity_name = ANY(paused))` silently filters out **every
+    /// workflow task in the fleet** the instant any one activity is paused.
+    /// That is a total orchestration outage produced by a surgical containment
+    /// control — the exact inverse of this feature's purpose.
+    ///
+    /// The `$6` capability-miss gate already defends against this with a
+    /// `task_type != 'activity' OR activity_name IS NULL` prefix; this test
+    /// pins the same defence onto the pause gate so it can never be dropped.
+    #[test]
+    fn claim_query_activity_pause_gate_never_holds_workflow_tasks() {
+        let sql = claim_task_query();
+        let gate = "task_type != 'activity' \
+                   OR activity_name IS NULL \
+                   OR NOT (activity_name = ANY(paused_activities.names))";
+        let normalized: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected: String = gate.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains(&expected),
+            "the activity-pause gate must short-circuit on non-activity rows \
+             and on a NULL activity_name before testing array membership, or a \
+             single paused activity halts every workflow task in the fleet. \
+             expected to find:\n  {expected}\nin:\n{sql}"
+        );
+    }
+
+    /// A pause holds *dispatch*: the gate lives in the PENDING-selection
+    /// predicate, never in the terminal/RUNNING paths, so in-flight work is
+    /// untouched (issue #807 AC4). Mirrors
+    /// `queue_pause_gate_appears_once_in_the_claim_candidate_scan`.
+    #[test]
+    fn activity_pause_gate_appears_once_in_the_claim_candidate_scan() {
+        assert_eq!(
+            claim_task_query()
+                .matches("harvest_activity_pauses")
+                .count(),
+            1,
+            "the activity-pause gate belongs only in the candidate (PENDING) \
+             scan, so an already-RUNNING instance runs to completion"
+        );
+    }
+
+    /// Both queries that document "mirrors every claim-time gate" must mirror
+    /// the activity-pause gate too, or a deliberately-held backlog surfaces as
+    /// unmet demand / a stale oldest-pending age and drives a false capacity
+    /// alert during exactly the incident the hold exists for.
+    #[test]
+    fn claim_gate_mirrors_carry_the_activity_pause_predicate() {
+        assert!(
+            oldest_pending_ages_query().contains(&crate::activity_pause::activity_pause_anti_join(
+                "harvest_task_queue"
+            )),
+            "oldest_pending_ages must mirror the activity-pause gate"
+        );
+        assert!(
+            claimable_pending_demand_query()
+                .contains(&crate::activity_pause::activity_pause_anti_join("tq")),
+            "claimable_pending_demand_by_queue must mirror the activity-pause gate"
+        );
+        // Pin the `task_type` scoping explicitly, not just via the renderer:
+        // these are read paths with no behavioural test asserting their
+        // predicate shape, so a contributor "simplifying" the guard away (on
+        // the mistaken belief that a workflow row's `activity_name` is always
+        // NULL) would otherwise reintroduce the `mixed_signal_suspension`
+        // sentinel hazard here with CI still green.
+        let scoping = format!(
+            "task_type = '{}'",
+            crate::activity_pause::ACTIVITY_TASK_TYPE
+        );
+        assert!(
+            oldest_pending_ages_query().contains(&scoping),
+            "oldest_pending_ages must scope the activity-pause gate by task_type"
+        );
+        assert!(
+            claimable_pending_demand_query().contains(&scoping),
+            "claimable_pending_demand_by_queue must scope the activity-pause gate by task_type"
         );
     }
 

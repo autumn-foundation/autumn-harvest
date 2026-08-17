@@ -141,6 +141,22 @@ pub const fn start_to_close_timeout_query() -> &'static str {
 /// The absolute `schedule_to_close` deadline keeps ticking during a queue pause
 /// (an explicit out-of-scope decision in #619), so that scanner is deliberately
 /// *not* given a matching carve-out.
+///
+/// Activity-pause carve-out (issue #807): identical reasoning one level down. A
+/// task held because an operator paused its *activity type* is unclaimable by
+/// construction, so its schedule-to-start clock is not a genuine
+/// worker-capacity signal, and enforcing it would terminally fail exactly the
+/// work the hold exists to preserve — violating AC3 ("remain `PENDING` (not
+/// failed, not DLQ'd)"). On resume,
+/// [`crate::activity_pause::resume_shift_scheduled_at_query`] credits the held
+/// time back so the thaw does not immediately kill the released backlog
+/// instead.
+///
+/// The anti-join carries its own `task_type = 'activity'` scope, so a workflow
+/// task's schedule-to-start stays enforced even though such a row can carry a
+/// non-NULL `activity_name` (the `'mixed_signal_suspension'` sentinel). See
+/// [`crate::activity_pause::activity_pause_anti_join`] for why that scope is
+/// structural rather than a NULL-semantics coincidence.
 #[must_use]
 pub const fn schedule_to_start_timeout_query() -> &'static str {
     "SELECT t.* FROM harvest_task_queue t \
@@ -149,6 +165,9 @@ pub const fn schedule_to_start_timeout_query() -> &'static str {
      AND t.scheduled_at + t.schedule_to_start < NOW() \
      AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
          WHERE qp.queue_name = t.queue_name) \
+     AND NOT EXISTS (SELECT 1 FROM harvest_activity_pauses ap \
+         WHERE ap.activity_name = t.activity_name \
+           AND t.task_type = 'activity') \
      AND NOT (\
          t.schedule_to_close_at IS NOT NULL \
          AND t.schedule_to_close_at <= NOW() \
@@ -1022,11 +1041,45 @@ async fn enforce_activity_timeout(
             ) {
                 return Ok(false);
             }
-            // A *completed* pause/resume cycle leaves nothing for the check
+            // Authoritative ACTIVITY-pause re-check (issue #807), the
+            // per-activity-type sibling of the queue re-check above. Same
+            // staleness problem, same fix: the scan predicate is a non-locking
+            // snapshot, so a pause committing after the scan would otherwise let
+            // this transaction schedule-to-start-fail a task the hold protects.
+            //
+            // No advisory lock (unlike the queue path): this is authoritative as
+            // of its own snapshot rather than through commit, leaving a bounded
+            // residual that is documented in full on
+            // `activity_pause::is_activity_paused`. Placed *after* the queue
+            // re-check so the two are evaluated coarse-to-fine, and after the
+            // `schedule_to_start_still_expired_unlocked` re-read below would be
+            // wrong -- a held task must bail before paying for the execution row
+            // lock and history load.
+            //
+            // Scoped by `task_type = 'activity'` to match the scan predicate
+            // exactly. A *workflow* task can carry a non-NULL `activity_name` —
+            // the engine stamps the `'mixed_signal_suspension'` sentinel there —
+            // so without this an activity paused under that name would suppress
+            // a workflow task's schedule-to-start timeout. That is unreachable
+            // today only because workflow tasks are enqueued with
+            // `schedule_to_start: None` and so never reach this scan; relying on
+            // that would leave the enforcer silently disagreeing with its own
+            // scan predicate the moment a workflow task gains one.
+            if task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE
+                && let Some(activity_name) = task.activity_name.as_deref()
+                && crate::activity_pause::activity_pause_suppresses_timeout(
+                    reason,
+                    crate::activity_pause::is_activity_paused(conn, activity_name).await?,
+                )
+            {
+                return Ok(false);
+            }
+            // A *completed* pause/resume cycle leaves nothing for either check
             // above to suppress on, but resume has already credited the held
             // time back into `scheduled_at`. Re-read the row-current deadline
             // before trusting the scan snapshot, or a task is timed out the
-            // instant its deadline was extended.
+            // instant its deadline was extended. Covers both the queue (#619)
+            // and activity (#807) resume paths, which shift the same column.
             //
             // Unlocked here (round-22 review): locking the task row before the
             // execution row below would invert the documented
@@ -4023,6 +4076,22 @@ mod tests {
             locked.trim_end_matches(" FOR UPDATE"),
             unlocked,
             "the two deadline queries must be identical apart from FOR UPDATE"
+        );
+    }
+
+    /// This query is a `const fn` and so must hardcode its anti-join rather
+    /// than calling the renderer. Pin the two together, or a fix applied to
+    /// [`crate::activity_pause::activity_pause_anti_join`] silently misses the
+    /// scan that decides whether a held task is terminally failed (issue #807
+    /// AC3) — the highest-consequence of the three copies.
+    #[test]
+    fn schedule_to_start_scan_matches_the_shared_activity_pause_renderer() {
+        let rendered = crate::activity_pause::activity_pause_anti_join("t");
+        assert!(
+            schedule_to_start_timeout_query().contains(&rendered),
+            "the hardcoded activity-pause anti-join has drifted from the shared \
+             renderer.\nexpected to find:\n  {rendered}\nin:\n{}",
+            schedule_to_start_timeout_query()
         );
     }
 

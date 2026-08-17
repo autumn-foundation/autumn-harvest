@@ -34,12 +34,13 @@ use autumn_harvest::admission_gate::db as admission_gate_db;
 use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::{
     self, AuditFilters, CLASSIFIED_ROUTES, HEADER_ACTOR, HEADER_IDEMPOTENCY_KEY, HEADER_REQUEST_ID,
-    HEADER_SOURCE, OP_ACTIVITY_FAIL_NOW, OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT,
-    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR,
-    OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN,
-    OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY,
-    OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE,
-    OP_GATE_LIFT, OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_QUEUE_PAUSE,
+    HEADER_SOURCE, OP_ACTIVITY_FAIL_NOW, OP_ACTIVITY_PAUSE, OP_ACTIVITY_RESUME,
+    OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE,
+    OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE,
+    OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER,
+    OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
+    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
+    OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_QUEUE_PAUSE,
     OP_QUEUE_RESUME, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
     OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN,
@@ -5001,6 +5002,28 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/admin/queues/{queue_name}/resume",
             post(resume_queue_handler).route_layer(require_admin.clone()),
         )
+        // Per-activity-type pause/resume (issue #807): the surgical sibling of
+        // the queue hold above — stop dispatching ONE broken activity without
+        // touching the healthy work sharing its queue. All four are admin-gated:
+        // the two mutations are a fleet-wide dispatch kill switch, and the two
+        // reads expose operator-authored hold reasons and the shape of the
+        // registered activity catalogue.
+        .route(
+            "/activities",
+            get(list_activities_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/activities/{activity_name}",
+            get(get_activity_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/activities/{activity_name}/pause",
+            post(pause_activity_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/activities/{activity_name}/resume",
+            post(resume_activity_handler).route_layer(require_admin.clone()),
+        )
         .route("/admin/metrics", get(prometheus_metrics))
         .route("/admin/history/exports", get(export_workflow_histories))
         // Stratified in-flight sample export for the replay-drift gate
@@ -6075,6 +6098,11 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/queues/paused"),
         ("POST", "/admin/queues/{queue_name}/pause"),
         ("POST", "/admin/queues/{queue_name}/resume"),
+        // ── per-activity-type pause/resume (issue #807) ───────────────────
+        ("GET", "/activities"),
+        ("GET", "/activities/{activity_name}"),
+        ("POST", "/activities/{activity_name}/pause"),
+        ("POST", "/activities/{activity_name}/resume"),
         ("GET", "/admin/metrics"),
         ("GET", "/admin/history/exports"),
         ("GET", "/admin/history/export-sample"),
@@ -6550,6 +6578,15 @@ pub const fn management_api_request_fields()
             "/admin/queues/{queue_name}/resume",
             Some(&["shard_id"]),
         ),
+        // ── per-activity-type pause/resume (issue #807) ───────────────────
+        // Both bodies are optional; resume carries no fields at all (it deletes
+        // the pause row, so there is no provenance for a field to set).
+        (
+            "POST",
+            "/activities/{activity_name}/pause",
+            Some(&["reason", "actor"]),
+        ),
+        ("POST", "/activities/{activity_name}/resume", Some(&[])),
         // ── scoped API tokens (issue #942) ────────────────────────────────────
         (
             "POST",
@@ -7474,6 +7511,52 @@ pub const fn management_api_response_fields()
                 "ok",
                 "status",
                 "queue_name",
+                "newly_resumed",
+                "released_task_count",
+                "paused_duration_secs",
+                "released_reason",
+                "released_paused_by",
+                "provenance_uniform",
+                "shards",
+                "partial_failures",
+            ]),
+        ),
+        // ── per-activity-type pause/resume (issue #807) ───────────────────
+        (
+            "GET",
+            "/activities",
+            Some(&["activities", "status", "unavailable_shards"]),
+        ),
+        (
+            "GET",
+            "/activities/{activity_name}",
+            Some(&["activity", "status", "unavailable_shards"]),
+        ),
+        (
+            "POST",
+            "/activities/{activity_name}/pause",
+            Some(&[
+                "ok",
+                "status",
+                "activity_name",
+                "newly_paused",
+                "reason",
+                "paused_by",
+                "paused_at",
+                "scope_shard_id",
+                "held_task_count",
+                "provenance_uniform",
+                "shards",
+                "partial_failures",
+            ]),
+        ),
+        (
+            "POST",
+            "/activities/{activity_name}/resume",
+            Some(&[
+                "ok",
+                "status",
+                "activity_name",
                 "newly_resumed",
                 "released_task_count",
                 "paused_duration_secs",
@@ -31248,7 +31331,17 @@ fn queue_pause_audit_context(reason: Option<&str>, partial: Option<&str>) -> Opt
 /// `(reason, operator)` group there is nothing distinguishing to attribute, and
 /// the response already reports the counts.
 fn resume_released_audit_reason(provenance: &ResumeProvenance) -> Option<String> {
-    let (leading, rest) = provenance.released_groups.split_first()?;
+    released_holds_audit_reason(&provenance.released_groups)
+}
+
+/// Render a set of released holds for the durable audit trail.
+///
+/// Extracted from [`resume_released_audit_reason`] so the per-activity-type
+/// resume (issue #807) renders a byte-identical line for a byte-identical
+/// situation — the two features present the same information to the same
+/// operator, so they must never drift on how it reads.
+fn released_holds_audit_reason(groups: &[ReleasedHoldGroup]) -> Option<String> {
+    let (leading, rest) = groups.split_first()?;
     if rest.is_empty() {
         return Some(format!(
             "released hold by {}: {}",
@@ -31256,9 +31349,8 @@ fn resume_released_audit_reason(provenance: &ResumeProvenance) -> Option<String>
             leading.reason
         ));
     }
-    let count = provenance.released_groups.len();
-    let detail = provenance
-        .released_groups
+    let count = groups.len();
+    let detail = groups
         .iter()
         .map(ReleasedHoldGroup::render)
         .collect::<Vec<_>>()
@@ -31749,6 +31841,1217 @@ fn merge_paused_queue_rows(
             })
         })
         .collect()
+}
+
+// ── Per-activity-type pause / resume (issue #807) ────────────────────────────
+//
+// The queue-pause sibling (#619) is the direct prior art for every helper in
+// this block and the shapes are deliberately identical, one granularity down:
+// same fleet-wide fan-out, same collect-don't-abort per-shard loop, same 207
+// partial-application contract, same earliest-hold / longest-hold provenance
+// rules, same audited-rejection path. Where a helper is genuinely
+// feature-neutral it is REUSED rather than copied (see
+// `queue_pause_partial_status`, `queue_pause_attach_partial`,
+// `HoldGroupFold`/`ReleasedHoldGroup`, `released_holds_audit_reason`), so the
+// two features can never drift on the parts an operator reads.
+//
+// The one structural difference is the read side: a queue is only ever visible
+// through its pause row, whereas an activity **type** has a registered
+// catalogue, so `GET /activities` is driven by the registry and the pause table
+// is a cross-reference. See `merge_activity_catalog_rows`.
+
+/// Body of `POST /activities/{activity_name}/pause` — entirely optional.
+///
+/// Unlike the queue-pause sibling, which *requires* a reason, both fields here
+/// are optional and a bare `POST` with no body at all is a valid fleet-wide
+/// hold. During an incident the operator's first move is to stop the bleeding;
+/// rejecting that with a `400` because a reason was not typed would put
+/// paperwork ahead of containment. The reason still has a durable home — it
+/// defaults to [`DEFAULT_ACTIVITY_PAUSE_REASON`] so the read API, the CLI and
+/// the audit row always have *something* to show, and the row is never `NULL`.
+///
+/// `deny_unknown_fields` for the reason the queue sibling documents: a field
+/// this route silently ignores is a field an operator believes took effect.
+/// A typo'd `{"reasons": "..."}` must be a `400`, not an unexplained hold.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PauseActivityRequest {
+    /// Human-readable reason for the hold, surfaced on the read API and in the
+    /// audit trail. Defaults to [`DEFAULT_ACTIVITY_PAUSE_REASON`].
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Operator identity to record as `paused_by`.
+    ///
+    /// This is a **label**, not authentication: it lets an automation
+    /// ("oncall-bot") attribute a hold to the human it acted for. The durable
+    /// audit row always carries the *authenticated* actor derived from the
+    /// request headers, and records the on-behalf-of relationship when the two
+    /// differ, so a body field can never rewrite the security trail. Defaults
+    /// to the authenticated actor.
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+/// Body of `POST /activities/{activity_name}/resume` — must be empty or `{}`.
+///
+/// A resume records no provenance of its own: it `DELETE`s the pause row, so
+/// there is no column an `actor` field could set. Rather than accept a field
+/// that would be silently dropped, the struct carries none and
+/// `deny_unknown_fields` turns one into an audited `400`. The audit row's actor
+/// comes from the authenticated request, exactly as it does for pause.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResumeActivityRequest {}
+
+/// Reason stored when an operator pauses without supplying one.
+///
+/// A pause row's `reason` is `NOT NULL` and is the only durable record of *why*
+/// dispatch is held (the row is deleted on resume), so the optional-body
+/// contract above needs a default rather than an empty string — "(no reason
+/// given)" tells the next operator that nobody typed one, where `""` would read
+/// as a rendering bug.
+const DEFAULT_ACTIVITY_PAUSE_REASON: &str = "operator pause (no reason given)";
+
+/// Resolve every shard an activity pause/resume must touch, plus any shard the
+/// router knows about that this process has no pool for.
+///
+/// Always fleet-wide. Issue #807's contract is that a hold "applies on every
+/// shard and every worker", so — unlike the queue sibling, which exposes a
+/// `shard_id` scope — there is no per-shard variant to resolve here and no
+/// `unknown shard_id` rejection. The core still carries a `scope_shard_id`
+/// column (a future scoped surface, and the CLI, can write it), so the read and
+/// mutation responses report it verbatim; this route always writes `NULL`.
+///
+/// The expected-shard set comes from [`shard_fanout::expected_shards`], not the
+/// local pool map: a shard the router knows but this process has no pool for
+/// (mid a shard-add rollout) must be *reported*, never silently omitted.
+/// Omitting it would let a hold return an unqualified success while that shard
+/// kept dispatching into the outage.
+fn activity_pause_target_pools(
+    api_state: &HarvestApiState,
+) -> Result<QueuePauseTargets, AutumnError> {
+    if api_state.storage_pool().is_err() {
+        return Err(AutumnError::service_unavailable_msg(
+            "harvest storage pool is not configured",
+        ));
+    }
+    let pools = shard_fanout::pools_by_shard(api_state);
+    let expected = shard_fanout::expected_shards(api_state, &pools);
+    let mut targets = Vec::new();
+    let mut unreachable = Vec::new();
+    for shard in expected {
+        if let Some(pool) = pools.get(&shard) {
+            targets.push((shard, pool.clone()));
+        } else {
+            unreachable.push(shard);
+        }
+    }
+    Ok((targets, unreachable))
+}
+
+/// Audit a rejected activity pause/resume and turn the error into a response.
+///
+/// Every rejection path is audited: a *refused* attempt on a fleet-wide
+/// dispatch kill switch is exactly what an incident review needs to see, and
+/// without it a mistyped activity name during an outage leaves no trace at all.
+async fn reject_activity_pause(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    operation: &'static str,
+    route: &'static str,
+    activity_name: &str,
+    status_error: AutumnError,
+    summary: &str,
+) -> axum::response::Response {
+    let (actor, source, request_id) = audit;
+    // A rejection happens before any shard target is resolved, so it writes to
+    // the first shard pool it can reach (the queue sibling's
+    // `write_queue_pause_rejection_audit` shape).
+    let pools: Vec<_> = shard_fanout::pools_by_shard(api_state)
+        .into_iter()
+        .collect();
+    write_activity_pause_audit(
+        &pools,
+        actor,
+        source,
+        request_id.as_deref(),
+        operation,
+        route,
+        activity_name,
+        STATUS_FAILED,
+        Some(summary),
+    )
+    .await;
+    status_error.into_response()
+}
+
+/// Validate the activity name and resolve the target shards for a
+/// pause/resume.
+///
+/// On rejection the audit row is written here and a ready-to-send response is
+/// returned in `Err`, so both handlers share one rejection contract. The
+/// returned `Vec<String>` seeds the per-shard failure list with any shard the
+/// router knows about but this process cannot reach.
+///
+/// The name is validated but **not** required to be registered on this node.
+/// A management API process need not register every activity the fleet runs
+/// (a heterogeneous deployment is the norm), so 404-ing an unregistered name
+/// would make a legitimately-remote activity unpausable during exactly the
+/// outage the operator is containing. The invisible-typo hazard that trade
+/// creates is closed on the read side instead: `GET /activities` surfaces a
+/// paused-but-unregistered activity with `registered: false` rather than
+/// dropping it (see [`merge_activity_catalog_rows`]).
+async fn prepare_activity_pause_targets(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    activity_name: &str,
+    operation: &'static str,
+    route: &'static str,
+) -> Result<
+    (
+        String,
+        Vec<(i32, ::autumn_harvest::worker::DbPool)>,
+        Vec<String>,
+    ),
+    axum::response::Response,
+> {
+    let canonical = match ::autumn_harvest::activity_pause::validate_activity_name(activity_name) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            let summary = error.to_string();
+            return Err(reject_activity_pause(
+                api_state,
+                audit,
+                operation,
+                route,
+                activity_name,
+                map_error(error),
+                &summary,
+            )
+            .await);
+        }
+    };
+    let (targets, unreachable) = match activity_pause_target_pools(api_state) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let summary = format!("{error:?}");
+            return Err(reject_activity_pause(
+                api_state,
+                audit,
+                operation,
+                route,
+                activity_name,
+                error,
+                &summary,
+            )
+            .await);
+        }
+    };
+    let failures = unreachable
+        .iter()
+        .map(|shard| format!("shard {shard}: known to the router but has no pool in this process"))
+        .collect();
+    Ok((canonical, targets, failures))
+}
+
+/// Best-effort audit row for an activity pause/resume.
+///
+/// Written on the first reachable target shard — the operation is a fleet-wide
+/// control, so one row per request (not per shard) is the honest record.
+/// Mirrors [`write_queue_pause_audit`]; a separate function rather than a
+/// parameterised one only because the target type differs
+/// ([`TARGET_ACTIVITY`] vs [`TARGET_QUEUE`]) and that helper is already at its
+/// argument limit.
+///
+/// `shard_id` is always `None`: this route is fleet-wide by construction, so
+/// there is no single shard the record belongs to.
+#[allow(clippy::too_many_arguments)]
+async fn write_activity_pause_audit(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    operation: &str,
+    route: &'static str,
+    activity_name: &str,
+    status: &str,
+    error_summary: Option<&str>,
+) {
+    for (_, pool) in targets {
+        if let Ok(mut conn) = acquire_conn(pool).await {
+            let ar = NewAuditRecord {
+                actor,
+                operation,
+                target_type: TARGET_ACTIVITY,
+                target_id: Some(activity_name),
+                route_or_command: route,
+                request_id,
+                idempotency_key: None,
+                status,
+                error_summary,
+                shard_id: None,
+                source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return;
+        }
+    }
+}
+
+/// Emit the issue #807 pause/resume counter, best-effort.
+///
+/// `changed_state` implements [`METRIC_ACTIVITY_PAUSE_ACTIONS`]'s documented
+/// emission contract: count only when the action genuinely flipped the hold,
+/// gating on `newly_paused` / `newly_resumed`. Both mutations are idempotent by
+/// design, so an operator retry after a lost response must not read as a second
+/// hold. On a fleet-wide fan-out "genuinely flipped" means *any* shard flipped,
+/// which is exactly what the response's own `newly_*` field reports.
+///
+/// Telemetry must never decide whether an outage can be contained, so a runtime
+/// that is not installed yet (the boot window) is skipped silently rather than
+/// failing the hold — the same posture as the audit write above.
+///
+/// [`METRIC_ACTIVITY_PAUSE_ACTIONS`]: ::autumn_harvest::telemetry::METRIC_ACTIVITY_PAUSE_ACTIONS
+fn record_activity_pause_metric(
+    api_state: &HarvestApiState,
+    activity_name: &str,
+    action: ::autumn_harvest::telemetry::ActivityPauseAction,
+    changed_state: bool,
+) {
+    if !changed_state {
+        return;
+    }
+    if let Ok(runtime) = api_state.runtime() {
+        // Bucket an UNREGISTERED name to the sentinel before it becomes a metric
+        // label. The pause routes accept unregistered names on purpose (an
+        // operator must be able to pre-pause an activity before its fleet rolls
+        // out, and a paused-but-unregistered hold must stay inspectable), so the
+        // raw name is caller-controlled free text — bounded in length, but not
+        // in CARDINALITY, which is what ADR-0001 §7 actually forbids. A
+        // remediation script templating a tenant id into the name would
+        // otherwise mint one permanent series per tenant. Same fix as the #684
+        // update-name label. The durable row and the read API keep the raw name.
+        let label = if runtime.registry.activities.contains_key(activity_name) {
+            activity_name
+        } else {
+            ::autumn_harvest::telemetry::UNREGISTERED_ACTIVITY_NAME
+        };
+        runtime
+            .registry
+            .telemetry()
+            .metrics
+            .record_activity_pause_action(label, action);
+    }
+}
+
+/// The fleet-wide roll-up of an activity pause applied shard by shard.
+struct ActivityPauseApplication {
+    /// True when at least one shard transitioned from dispatching to held.
+    newly_paused: bool,
+    /// Held tasks summed across every shard the hold reached.
+    held_task_count: i64,
+    /// Every shard that applied the hold, with its own effective row.
+    ///
+    /// Kept per-shard rather than collapsed to the first success: a re-pause
+    /// preserves each shard's ORIGINAL provenance, so a request landing over a
+    /// pre-existing hold leaves the shards disagreeing, and labelling the
+    /// fleet-wide `held_task_count` with one shard's reason, actor and
+    /// timestamp would then be untrue for the rest of the fleet.
+    per_shard: Vec<(i32, ::autumn_harvest::activity_pause::ActivityPauseOutcome)>,
+}
+
+/// Apply the hold on every target shard, appending any per-shard error to
+/// `failures` rather than aborting — one unreachable shard must not stop the
+/// others from being held.
+async fn apply_activity_pause_across_shards(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    canonical_activity: &str,
+    reason: &str,
+    paused_by: &str,
+    failures: &mut Vec<String>,
+) -> ActivityPauseApplication {
+    let mut applied = ActivityPauseApplication {
+        newly_paused: false,
+        held_task_count: 0,
+        per_shard: Vec::new(),
+    };
+    for (shard_id, pool) in targets {
+        let mut conn = match acquire_conn(pool).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                failures.push(format!("shard {shard_id}: {error}"));
+                continue;
+            }
+        };
+        match ::autumn_harvest::activity_pause::pause_activity(
+            &mut conn,
+            canonical_activity,
+            reason,
+            paused_by,
+            // Always fleet-wide — see `activity_pause_target_pools`.
+            None,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                applied.newly_paused |= outcome.newly_paused;
+                applied.held_task_count += outcome.held_task_count;
+                applied.per_shard.push((*shard_id, outcome));
+            }
+            Err(error) => failures.push(format!("shard {shard_id}: {error}")),
+        }
+    }
+    applied
+}
+
+/// The cross-shard provenance summary of an activity pause, plus each shard's
+/// own row.
+struct ActivityPauseProvenance<'a> {
+    /// The earliest hold — the deterministic top-level summary.
+    effective: &'a ::autumn_harvest::activity_pause::ActivityPauseOutcome,
+    /// False when the shards disagree on `(reason, paused_by, scope_shard_id)`.
+    uniform: bool,
+    /// Per-shard detail, so a divergent hold loses nothing.
+    shards: Vec<Value>,
+}
+
+/// Summarise a fleet-wide activity pause without discarding any shard's
+/// provenance.
+///
+/// The top-level summary is the **earliest** hold, tie-broken by shard id — the
+/// same rule [`merge_activity_catalog_rows`] uses, so the mutation response and
+/// the read endpoints can never tell an operator two different stories about
+/// one hold. `uniform` compares `(reason, paused_by, scope_shard_id)` and
+/// deliberately **not** `paused_at`: each shard stamps its own `NOW()`, so
+/// including it would flag essentially every healthy fleet-wide hold as
+/// divergent.
+///
+/// Returns `None` only when every target shard failed.
+fn summarise_activity_pause_provenance(
+    per_shard: &[(i32, ::autumn_harvest::activity_pause::ActivityPauseOutcome)],
+) -> Option<ActivityPauseProvenance<'_>> {
+    let (_, effective) = per_shard
+        .iter()
+        .min_by_key(|(shard_id, outcome)| (outcome.paused_at, *shard_id))?;
+    let uniform = per_shard.iter().all(|(_, outcome)| {
+        outcome.reason == effective.reason
+            && outcome.paused_by == effective.paused_by
+            && outcome.scope_shard_id == effective.scope_shard_id
+    });
+    let shards = per_shard
+        .iter()
+        .map(|(shard_id, outcome)| {
+            serde_json::json!({
+                "shard_id": shard_id,
+                "newly_paused": outcome.newly_paused,
+                "reason": outcome.reason,
+                "paused_by": outcome.paused_by,
+                "paused_at": outcome.paused_at,
+                "scope_shard_id": outcome.scope_shard_id,
+                "held_task_count": outcome.held_task_count,
+            })
+        })
+        .collect();
+    Some(ActivityPauseProvenance {
+        effective,
+        uniform,
+        shards,
+    })
+}
+
+/// The fleet-wide roll-up of an activity resume applied shard by shard.
+struct ActivityResumeApplication {
+    /// True when at least one shard actually released a hold.
+    newly_resumed: bool,
+    /// Tasks credited their held time back, summed across shards.
+    released_task_count: i64,
+    /// The longest hold released, in seconds.
+    paused_duration_secs: i64,
+    /// Every shard that completed, with the provenance it released.
+    ///
+    /// Per-shard rather than first-success: the resume DELETEs the pause rows,
+    /// so anything dropped here is gone for good.
+    per_shard: Vec<(i32, ::autumn_harvest::activity_pause::ActivityResumeOutcome)>,
+    /// True when at least one shard completed without error.
+    any_ok: bool,
+}
+
+/// Release the hold on every target shard, appending any per-shard error to
+/// `failures` rather than aborting.
+async fn apply_activity_resume_across_shards(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    canonical_activity: &str,
+    failures: &mut Vec<String>,
+) -> ActivityResumeApplication {
+    let mut applied = ActivityResumeApplication {
+        newly_resumed: false,
+        released_task_count: 0,
+        paused_duration_secs: 0,
+        per_shard: Vec::new(),
+        any_ok: false,
+    };
+    for (shard_id, pool) in targets {
+        let mut conn = match acquire_conn(pool).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                failures.push(format!("shard {shard_id}: {error}"));
+                continue;
+            }
+        };
+        match ::autumn_harvest::activity_pause::resume_activity(&mut conn, canonical_activity).await
+        {
+            Ok(outcome) => {
+                applied.any_ok = true;
+                applied.newly_resumed |= outcome.newly_resumed;
+                applied.released_task_count += outcome.released_task_count;
+                applied.paused_duration_secs = applied
+                    .paused_duration_secs
+                    .max(outcome.paused_duration_secs);
+                applied.per_shard.push((*shard_id, outcome));
+            }
+            Err(error) => failures.push(format!("shard {shard_id}: {error}")),
+        }
+    }
+    applied
+}
+
+/// The cross-shard provenance summary of an activity resume, plus each shard's
+/// own row.
+struct ActivityResumeProvenance {
+    /// Reason of the longest-held released hold.
+    released_reason: Option<String>,
+    /// Operator who placed that same hold.
+    released_paused_by: Option<String>,
+    /// Every released hold, deduplicated by `(reason, operator)` and ordered
+    /// longest-held first.
+    ///
+    /// The pause rows are already deleted by the time this exists, so this —
+    /// not the transient [`Self::shards`] response array — is what the durable
+    /// audit row must carry. Reuses the queue sibling's
+    /// [`ReleasedHoldGroup`]/[`HoldGroupFold`] so the two features render an
+    /// identical audit line for an identical situation.
+    released_groups: Vec<ReleasedHoldGroup>,
+    /// Per-shard detail for the HTTP response.
+    shards: Vec<Value>,
+}
+
+impl ActivityResumeProvenance {
+    /// False when the shards that actually released disagree on
+    /// `(released_reason, released_paused_by)`.
+    ///
+    /// Derived from the grouping rather than computed separately, so the flag
+    /// and the audit rendering can never disagree about what "uniform" means.
+    /// A fleet-wide no-op releases nothing and is trivially uniform.
+    const fn uniform(&self) -> bool {
+        self.released_groups.len() <= 1
+    }
+}
+
+/// Summarise a fleet-wide activity resume without discarding any shard's
+/// provenance.
+///
+/// The top-level reason/operator come from the **longest** hold released,
+/// tie-broken by shard id — deliberately the same shard the
+/// `paused_duration_secs` maximum describes, so the duration and the story it
+/// is paired with always come from one shard.
+///
+/// Only shards that actually released a hold carry provenance (a shard that was
+/// not paused returns `None`), so both the summary and the grouping consider
+/// just those.
+fn summarise_activity_resume_provenance(
+    per_shard: &[(i32, ::autumn_harvest::activity_pause::ActivityResumeOutcome)],
+) -> ActivityResumeProvenance {
+    let mut grouped: std::collections::BTreeMap<ReleasedHoldKey, HoldGroupFold> =
+        std::collections::BTreeMap::new();
+    for (shard_id, outcome) in per_shard {
+        let Some(reason) = outcome.released_reason.as_ref() else {
+            continue;
+        };
+        let fold = grouped
+            .entry((reason.clone(), outcome.released_paused_by.clone()))
+            .or_insert_with(HoldGroupFold::new);
+        fold.observe(*shard_id, outcome.paused_duration_secs);
+    }
+    let mut released_groups: Vec<ReleasedHoldGroup> = grouped
+        .into_iter()
+        .map(|(key, fold)| fold.finish(key))
+        .collect();
+    released_groups
+        .sort_by_key(|group| (std::cmp::Reverse(group.anchor_secs), group.anchor_shard_id));
+    let shards = per_shard
+        .iter()
+        .map(|(shard_id, outcome)| {
+            serde_json::json!({
+                "shard_id": shard_id,
+                "newly_resumed": outcome.newly_resumed,
+                "released_task_count": outcome.released_task_count,
+                "paused_duration_secs": outcome.paused_duration_secs,
+                "released_reason": outcome.released_reason,
+                "released_paused_by": outcome.released_paused_by,
+            })
+        })
+        .collect();
+    ActivityResumeProvenance {
+        // `.as_slice()` and not `Vec::first`: diesel's `QueryDsl::first` is in
+        // scope here and shadows the inherent slice method on `Vec`.
+        released_reason: released_groups
+            .as_slice()
+            .first()
+            .map(|group| group.reason.clone()),
+        released_paused_by: released_groups
+            .as_slice()
+            .first()
+            .and_then(|group| group.paused_by.clone()),
+        released_groups,
+        shards,
+    }
+}
+
+/// `POST /activities/{activity_name}/pause` — hold dispatch for one activity
+/// type, fleet-wide (issue #807).
+///
+/// Held tasks stay `PENDING`: a pause never fails, retries, or dead-letters
+/// work, and never aborts an already-`RUNNING` activity. Idempotent —
+/// re-pausing an already-paused type is a `200` no-op that preserves the
+/// original reason and operator (`newly_paused: false`).
+async fn pause_activity_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(activity_name): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    const ROUTE: &str = "POST /activities/{activity_name}/pause";
+    let audit = audit_context(&headers, &api_state);
+
+    let request = match parse_activity_pause_request(
+        &api_state,
+        &audit,
+        &activity_name,
+        &body,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let reason = resolve_activity_pause_reason(request.reason.as_deref());
+
+    let (canonical_activity, targets, mut failures) = match prepare_activity_pause_targets(
+        &api_state,
+        &audit,
+        &activity_name,
+        OP_ACTIVITY_PAUSE,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let (actor, source, request_id) = audit;
+
+    // `paused_by` is the operator LABEL (body-supplied when present); the audit
+    // row below always carries the AUTHENTICATED actor, and names the
+    // on-behalf-of relationship when the two differ, so a body field can never
+    // rewrite the security trail.
+    let paused_by = request
+        .actor
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map_or_else(|| actor.clone(), truncate_operator_reason);
+    let on_behalf_of = (paused_by != actor).then(|| format!("on behalf of: {paused_by}"));
+
+    let ActivityPauseApplication {
+        newly_paused,
+        held_task_count,
+        per_shard,
+    } = apply_activity_pause_across_shards(
+        &targets,
+        &canonical_activity,
+        &reason,
+        &paused_by,
+        &mut failures,
+    )
+    .await;
+
+    let Some(provenance) = summarise_activity_pause_provenance(&per_shard) else {
+        // Every target shard failed: report it rather than claiming a hold that
+        // is not in effect anywhere.
+        let summary = failures.join("; ");
+        write_activity_pause_audit(
+            &targets,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_ACTIVITY_PAUSE,
+            ROUTE,
+            &canonical_activity,
+            STATUS_FAILED,
+            activity_pause_audit_context(Some(&reason), on_behalf_of.as_deref(), Some(&summary))
+                .as_deref(),
+        )
+        .await;
+        return AutumnError::internal_server_error_msg(format!("activity pause failed: {summary}"))
+            .into_response();
+    };
+
+    let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    // Carry the operator's reason into the audit row: the pause row that holds
+    // it is deleted on resume, so this is its only permanent home.
+    let audit_context =
+        activity_pause_audit_context(Some(&reason), on_behalf_of.as_deref(), partial.as_deref());
+    write_activity_pause_audit(
+        &targets,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP_ACTIVITY_PAUSE,
+        ROUTE,
+        &canonical_activity,
+        if partial.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        audit_context.as_deref(),
+    )
+    .await;
+    record_activity_pause_metric(
+        &api_state,
+        &canonical_activity,
+        ::autumn_harvest::telemetry::ActivityPauseAction::Pause,
+        newly_paused,
+    );
+
+    activity_pause_response(
+        &canonical_activity,
+        newly_paused,
+        held_task_count,
+        &provenance,
+        partial,
+    )
+}
+
+/// Parse the optional `POST /activities/{activity_name}/pause` body.
+///
+/// An absent body is the documented fleet-wide default, not an error. A body
+/// that is present but malformed (including one carrying an unknown field — see
+/// [`PauseActivityRequest`]) is an audited `400`, matching the queue sibling's
+/// `parse_pause_request` contract: on rejection the audit row is written here
+/// and a ready-to-send response is returned in `Err`.
+async fn parse_activity_pause_request(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    activity_name: &str,
+    body: &axum::body::Bytes,
+    route: &'static str,
+) -> Result<PauseActivityRequest, axum::response::Response> {
+    if body.is_empty() {
+        return Ok(PauseActivityRequest::default());
+    }
+    match serde_json::from_slice(body) {
+        Ok(request) => Ok(request),
+        Err(error) => {
+            let summary = format!("invalid request body: {error}");
+            Err(reject_activity_pause(
+                api_state,
+                audit,
+                OP_ACTIVITY_PAUSE,
+                route,
+                activity_name,
+                AutumnError::bad_request_msg(summary.clone()),
+                &summary,
+            )
+            .await)
+        }
+    }
+}
+
+/// Resolve the durable pause reason from the optional body field.
+///
+/// Trims **before** truncating so the value that was checked for emptiness IS
+/// the value that gets stored, and so leading whitespace cannot eat the
+/// operator's actual words out of the 500-character budget. A missing or
+/// whitespace-only reason falls back to [`DEFAULT_ACTIVITY_PAUSE_REASON`]
+/// rather than storing `""`, which would read as a rendering bug on every
+/// surface that shows it.
+fn resolve_activity_pause_reason(reason: Option<&str>) -> String {
+    reason
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map_or_else(
+            || DEFAULT_ACTIVITY_PAUSE_REASON.to_string(),
+            truncate_operator_reason,
+        )
+}
+
+/// Build the `POST /activities/{activity_name}/pause` response body.
+///
+/// Split out of the handler so the handler stays under the line cap (the same
+/// treatment `resume_queue_response` gives its sibling); the response shape is
+/// also the interesting part to read on its own.
+fn activity_pause_response(
+    canonical_activity: &str,
+    newly_paused: bool,
+    held_task_count: i64,
+    provenance: &ActivityPauseProvenance<'_>,
+    partial: Option<String>,
+) -> axum::response::Response {
+    // `queue_pause_partial_status` / `queue_pause_attach_partial` are reused
+    // verbatim from the queue sibling — the partial-application contract is
+    // identical, so sharing them keeps the two features from drifting.
+    let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    let mut payload = serde_json::json!({
+        "ok": ok,
+        "status": status,
+        "activity_name": canonical_activity,
+        "newly_paused": newly_paused,
+        // The EFFECTIVE provenance, not the request's, and the EARLIEST hold
+        // rather than whichever shard the fan-out reached first: `pause_activity`
+        // preserves each shard's original row on an idempotent re-pause, so
+        // echoing the request would pair one story with a fleet-wide
+        // `held_task_count` that is untrue for other shards.
+        "reason": provenance.effective.reason,
+        "paused_by": provenance.effective.paused_by,
+        "paused_at": provenance.effective.paused_at,
+        "scope_shard_id": provenance.effective.scope_shard_id,
+        "held_task_count": held_task_count,
+        "provenance_uniform": provenance.uniform,
+        "shards": provenance.shards,
+    });
+    queue_pause_attach_partial(&mut payload, partial);
+    (status_code, Json(payload)).into_response()
+}
+
+/// Build the durable audit `error_summary` for an activity pause/resume.
+///
+/// The pause row holds the reason only while the hold is in effect — a resume
+/// `DELETE`s it — so without this the audit trail could say who paused an
+/// activity but never *why*, which is precisely the question a post-incident
+/// review asks. `harvest_audit_log` has no metadata column, so the reason
+/// (plus the on-behalf-of label and any partial-failure text) is carried in the
+/// one free-text field the record already has, each contribution labelled so
+/// they stay distinguishable.
+///
+/// `error_summary` is therefore non-`None` on a fully successful pause. That is
+/// deliberate: `status` remains the outcome discriminator, and the labelled
+/// prefixes keep a `reason:` context row from reading as a failure. Same shape
+/// and rationale as [`queue_pause_audit_context`], with the extra
+/// `on_behalf_of` contribution this route's body-supplied `actor` needs.
+fn activity_pause_audit_context(
+    reason: Option<&str>,
+    on_behalf_of: Option<&str>,
+    partial: Option<&str>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(reason) = reason.map(str::trim).filter(|r| !r.is_empty()) {
+        parts.push(format!("reason: {reason}"));
+    }
+    if let Some(label) = on_behalf_of.map(str::trim).filter(|l| !l.is_empty()) {
+        parts.push(label.to_string());
+    }
+    if let Some(partial) = partial.map(str::trim).filter(|p| !p.is_empty()) {
+        parts.push(format!("failures: {partial}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
+/// `POST /activities/{activity_name}/resume` — release the hold (issue #807).
+///
+/// Held tasks become immediately claimable again, and the time they spent held
+/// is credited back to `scheduled_at` so the thaw does not retroactively
+/// schedule-to-start-time-out the whole backlog. Idempotent — resuming an
+/// activity that is not paused is a `200` no-op (`newly_resumed: false`).
+async fn resume_activity_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(activity_name): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    const ROUTE: &str = "POST /activities/{activity_name}/resume";
+    let audit = audit_context(&headers, &api_state);
+
+    // The body is optional; when present it must be `{}` (see
+    // `ResumeActivityRequest`).
+    if !body.is_empty()
+        && let Err(error) = serde_json::from_slice::<ResumeActivityRequest>(&body)
+    {
+        let summary = format!("invalid request body: {error}");
+        return reject_activity_pause(
+            &api_state,
+            &audit,
+            OP_ACTIVITY_RESUME,
+            ROUTE,
+            &activity_name,
+            AutumnError::bad_request_msg(summary.clone()),
+            &summary,
+        )
+        .await;
+    }
+
+    let (canonical_activity, targets, mut failures) = match prepare_activity_pause_targets(
+        &api_state,
+        &audit,
+        &activity_name,
+        OP_ACTIVITY_RESUME,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let (actor, source, request_id) = audit;
+
+    let applied =
+        apply_activity_resume_across_shards(&targets, &canonical_activity, &mut failures).await;
+    let provenance = summarise_activity_resume_provenance(&applied.per_shard);
+
+    if !applied.any_ok {
+        let summary = failures.join("; ");
+        write_activity_pause_audit(
+            &targets,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_ACTIVITY_RESUME,
+            ROUTE,
+            &canonical_activity,
+            STATUS_FAILED,
+            activity_pause_audit_context(
+                released_holds_audit_reason(&provenance.released_groups).as_deref(),
+                None,
+                Some(&summary),
+            )
+            .as_deref(),
+        )
+        .await;
+        return AutumnError::internal_server_error_msg(format!(
+            "activity resume failed: {summary}"
+        ))
+        .into_response();
+    }
+
+    // A resume that did not reach every shard leaves work still held on the
+    // shards it missed. That is the safe direction, but reporting it as an
+    // unqualified success would leave an operator believing the thaw is
+    // complete while a backlog sits frozen, so it is surfaced with the same
+    // 207 / `status` vocabulary as a partial pause.
+    let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    let audit_context = activity_pause_audit_context(
+        released_holds_audit_reason(&provenance.released_groups).as_deref(),
+        None,
+        partial.as_deref(),
+    );
+    write_activity_pause_audit(
+        &targets,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP_ACTIVITY_RESUME,
+        ROUTE,
+        &canonical_activity,
+        if partial.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        audit_context.as_deref(),
+    )
+    .await;
+    record_activity_pause_metric(
+        &api_state,
+        &canonical_activity,
+        ::autumn_harvest::telemetry::ActivityPauseAction::Resume,
+        applied.newly_resumed,
+    );
+
+    activity_resume_response(&canonical_activity, &applied, &provenance, partial)
+}
+
+/// Build the `POST /activities/{activity_name}/resume` response body.
+///
+/// Split out of the handler for the same reason as
+/// [`activity_pause_response`] and `resume_queue_response`.
+fn activity_resume_response(
+    canonical_activity: &str,
+    applied: &ActivityResumeApplication,
+    provenance: &ActivityResumeProvenance,
+    partial: Option<String>,
+) -> axum::response::Response {
+    let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    let mut payload = serde_json::json!({
+        "ok": ok,
+        "status": status,
+        "activity_name": canonical_activity,
+        "newly_resumed": applied.newly_resumed,
+        "released_task_count": applied.released_task_count,
+        "paused_duration_secs": applied.paused_duration_secs,
+        // The resume DELETES the pause rows, so this is the only surviving
+        // record of what was released. The summary describes the LONGEST hold
+        // (the same shard `paused_duration_secs` reports, so the two are
+        // coherent) and `shards` keeps every shard's own released provenance.
+        "released_reason": provenance.released_reason,
+        "released_paused_by": provenance.released_paused_by,
+        "provenance_uniform": provenance.uniform(),
+        "shards": provenance.shards,
+    });
+    queue_pause_attach_partial(&mut payload, partial);
+    (status_code, Json(payload)).into_response()
+}
+
+/// The registered-catalogue facts `GET /activities` reports for an activity
+/// type, independent of whether it is paused.
+#[derive(Clone, Copy)]
+struct ActivityCatalogEntry {
+    /// The queue this activity dispatches on (`"default"` when undeclared) —
+    /// the context an operator needs to decide between this per-type hold and
+    /// the coarser queue pause (#619).
+    queue_name: &'static str,
+    /// Local activities run inline on the workflow worker and never take a
+    /// `harvest_task_queue` row, so a pause cannot hold one. Reported so the
+    /// read makes that visible rather than leaving an operator to wonder why a
+    /// hold is holding nothing.
+    is_local: bool,
+}
+
+/// Snapshot the registered activity catalogue for the read endpoints.
+fn registered_activity_catalog(
+    runtime: &HarvestApiRuntime,
+) -> std::collections::BTreeMap<String, ActivityCatalogEntry> {
+    runtime
+        .registry
+        .activities
+        .values()
+        .map(|info| {
+            (
+                info.name.to_string(),
+                ActivityCatalogEntry {
+                    queue_name: info.default_queue.unwrap_or("default"),
+                    is_local: info.is_local,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Merge the registered activity catalogue with the cross-shard pause rows into
+/// one entry per activity type.
+///
+/// The list is driven by the **registered catalogue**, not the pause table, so a
+/// healthy activity appears with `paused: false` — the read is a fleet
+/// inventory an operator scans during an incident, and one that only listed the
+/// already-broken things could not answer "is `charge_card` held?".
+///
+/// A paused activity that this process does **not** have registered is still
+/// listed, flagged `registered: false`. Pause deliberately does not require
+/// registration (a management node need not register every activity the fleet
+/// runs — see [`prepare_activity_pause_targets`]), so without this a mistyped
+/// hold would be invisible on the one surface an operator uses to find it, and
+/// would keep silently holding nothing forever.
+///
+/// Per-activity pause provenance follows the same rules as the mutation
+/// response: the top-level summary is the **earliest** hold (tie-broken by
+/// shard id), `held_task_count` is the fleet-wide sum, `shards` carries every
+/// shard's own row, and `provenance_uniform` compares
+/// `(reason, paused_by, scope_shard_id)` — deliberately not `paused_at`, since
+/// each shard stamps its own `NOW()`.
+fn merge_activity_catalog_rows(
+    catalog: &std::collections::BTreeMap<String, ActivityCatalogEntry>,
+    rows: Vec<(i32, ::autumn_harvest::activity_pause::PausedActivity)>,
+) -> Vec<Value> {
+    let mut paused_by_activity: std::collections::BTreeMap<
+        String,
+        Vec<(i32, ::autumn_harvest::activity_pause::PausedActivity)>,
+    > = std::collections::BTreeMap::new();
+    for (shard_id, row) in rows {
+        paused_by_activity
+            .entry(row.activity_name.clone())
+            .or_default()
+            .push((shard_id, row));
+    }
+
+    // `BTreeMap` keys are already sorted, so the union is emitted in a stable
+    // name order without a second sort. Owned keys, because the loop below
+    // drains `paused_by_activity` as it goes.
+    let names: std::collections::BTreeSet<String> = catalog
+        .keys()
+        .chain(paused_by_activity.keys())
+        .cloned()
+        .collect();
+
+    names
+        .into_iter()
+        .map(|name| {
+            let name = name.as_str();
+            let registered = catalog.get(name);
+            let mut entry = serde_json::json!({
+                "activity_name": name,
+                "registered": registered.is_some(),
+                "queue_name": registered.map(|e| e.queue_name),
+                "is_local": registered.map(|e| e.is_local),
+            });
+
+            let mut shard_rows = paused_by_activity.remove(name).unwrap_or_default();
+            shard_rows.sort_by_key(|(shard_id, _)| *shard_id);
+
+            let map = entry
+                .as_object_mut()
+                .expect("json! object literal is an object");
+            if let Some((_, earliest)) = shard_rows
+                .iter()
+                .min_by_key(|(shard_id, row)| (row.paused_at, *shard_id))
+            {
+                let uniform = shard_rows.iter().all(|(_, row)| {
+                    row.reason == earliest.reason
+                        && row.paused_by == earliest.paused_by
+                        && row.scope_shard_id == earliest.scope_shard_id
+                });
+                let held_total: i64 = shard_rows.iter().map(|(_, row)| row.held_task_count).sum();
+                map.insert("paused".to_string(), Value::Bool(true));
+                map.insert(
+                    "paused_at".to_string(),
+                    serde_json::json!(earliest.paused_at),
+                );
+                map.insert(
+                    "paused_reason".to_string(),
+                    Value::String(earliest.reason.clone()),
+                );
+                map.insert(
+                    "paused_actor".to_string(),
+                    Value::String(earliest.paused_by.clone()),
+                );
+                map.insert(
+                    "scope_shard_id".to_string(),
+                    serde_json::json!(earliest.scope_shard_id),
+                );
+                map.insert("held_task_count".to_string(), serde_json::json!(held_total));
+                map.insert("provenance_uniform".to_string(), Value::Bool(uniform));
+                map.insert(
+                    "shards".to_string(),
+                    serde_json::json!(
+                        shard_rows
+                            .iter()
+                            .map(|(shard_id, row)| serde_json::json!({
+                                "shard_id": shard_id,
+                                "reason": row.reason,
+                                "paused_by": row.paused_by,
+                                "paused_at": row.paused_at,
+                                "scope_shard_id": row.scope_shard_id,
+                                "held_task_count": row.held_task_count,
+                            }))
+                            .collect::<Vec<_>>()
+                    ),
+                );
+            } else {
+                map.insert("paused".to_string(), Value::Bool(false));
+                map.insert("paused_at".to_string(), Value::Null);
+                map.insert("paused_reason".to_string(), Value::Null);
+                map.insert("paused_actor".to_string(), Value::Null);
+                map.insert("scope_shard_id".to_string(), Value::Null);
+                map.insert("held_task_count".to_string(), serde_json::json!(0));
+                map.insert("provenance_uniform".to_string(), Value::Bool(true));
+                map.insert("shards".to_string(), serde_json::json!([]));
+            }
+            entry
+        })
+        .collect()
+}
+
+/// Read every activity's pause state across the fleet, degrading gracefully.
+///
+/// An unreachable shard is named in `unavailable_shards` and drops `status` to
+/// `partial` rather than failing the read — but a `paused: false` on a partial
+/// read is only "not paused on the shards we could reach", which is why both
+/// read endpoints surface `status` alongside the data.
+async fn observe_activity_pause_rows(
+    api_state: &HarvestApiState,
+) -> Result<FanoutRows<(i32, ::autumn_harvest::activity_pause::PausedActivity)>, AutumnError> {
+    let observations = observe_shards(api_state, |shard_id, mut conn| async move {
+        ::autumn_harvest::activity_pause::list_paused_activities(&mut conn)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (shard_id, row))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    Ok(collect_fanout_rows(observations))
+}
+
+/// `GET /activities` — every registered activity type with its pause state
+/// (issue #807).
+async fn list_activities_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Value>, AutumnError> {
+    let runtime = api_state.runtime()?;
+    let catalog = registered_activity_catalog(&runtime);
+    let collected = observe_activity_pause_rows(&api_state).await?;
+
+    Ok(Json(serde_json::json!({
+        "activities": merge_activity_catalog_rows(&catalog, collected.rows),
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
+}
+
+/// `GET /activities/{activity_name}` — one activity type's pause state
+/// (issue #807).
+///
+/// `404` when the name is neither registered on this node **nor** currently
+/// paused anywhere the read could reach. The pause arm of that rule matters: an
+/// activity that is actively holding work is a real thing an operator must be
+/// able to inspect (and then resume), so 404-ing it merely because this
+/// process does not have its handler registered would be a lie told during
+/// exactly the incident the endpoint exists for.
+async fn get_activity_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(activity_name): Path<String>,
+) -> Result<Json<Value>, AutumnError> {
+    let runtime = api_state.runtime()?;
+    // Validate before looking anything up, so the read and the two writes agree
+    // on what a valid name is. Without this, `GET /activities/%20charge_card%20`
+    // answers 404 ("not registered and not paused") while
+    // `POST /activities/%20charge_card%20/pause` answers 400 — the same input
+    // diagnosed two different ways, and the 404 is the misleading one: it
+    // implies the activity does not exist rather than that the name is invalid.
+    let activity_name = ::autumn_harvest::activity_pause::validate_activity_name(&activity_name)
+        .map_err(|e| AutumnError::bad_request_msg(e.to_string()))?;
+    let catalog = registered_activity_catalog(&runtime);
+    let collected = observe_activity_pause_rows(&api_state).await?;
+
+    // Filter to the requested name BEFORE merging so an unrelated activity's
+    // rows can never leak into a single-record read.
+    let rows: Vec<_> = collected
+        .rows
+        .into_iter()
+        .filter(|(_, row)| row.activity_name == activity_name)
+        .collect();
+    let narrowed_catalog: std::collections::BTreeMap<String, ActivityCatalogEntry> = catalog
+        .get(&activity_name)
+        .map(|found| (activity_name.clone(), *found))
+        .into_iter()
+        .collect();
+    let mut merged = merge_activity_catalog_rows(&narrowed_catalog, rows);
+
+    // `merge_activity_catalog_rows` emits one entry per name in the union of
+    // (catalogue, pause rows); both are already narrowed to this name, so an
+    // empty result means the name is genuinely unknown here.
+    let Some(activity) = merged.pop() else {
+        return Err(AutumnError::not_found_msg(format!(
+            "activity '{activity_name}' is not registered and is not paused"
+        )));
+    };
+
+    Ok(Json(serde_json::json!({
+        "activity": activity,
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
 }
 
 async fn prometheus_metrics(
@@ -39044,19 +40347,21 @@ pub struct TaskEligibilityResponse {
 
 /// Order a merged `reason_codes` array for the eligibility explainer.
 ///
-/// The operator's own deliberate queue hold (`queue_paused`, issue #619) leads;
-/// everything else is alphabetical so the array is stable across polls.
+/// The operator's own deliberate holds ([`OPERATOR_PAUSE_REASON_CODES`]) lead;
+/// everything else is alphabetical so the array is stable across polls. Within
+/// the leading group the order is alphabetical too, so a task held by *both* a
+/// queue pause and an activity pause reports them deterministically.
 ///
-/// This exists because [`task_intrinsic_impediment_reasons`] pushes
-/// `queue_paused` first but *both* eligibility merges collapse the per-task
-/// reason lists through a `HashSet` — destroying insertion order — and then
-/// re-sort. A plain `sort()` puts `concurrency_saturated` ahead of
-/// `queue_paused`, so the helper's documented priority never reached the
-/// response an operator actually reads (issue #619 review). Both merge sites
-/// call *this* function rather than sorting by hand, so they cannot drift.
+/// This exists because [`task_intrinsic_impediment_reasons`] pushes the pause
+/// codes first but *both* eligibility merges collapse the per-task reason lists
+/// through a `HashSet` — destroying insertion order — and then re-sort. A plain
+/// `sort()` puts `concurrency_saturated` ahead of `queue_paused`, so the
+/// helper's documented priority never reached the response an operator actually
+/// reads (issue #619 review). Both merge sites call *this* function rather than
+/// sorting by hand, so they cannot drift.
 fn sort_reason_codes(reason_codes: &mut [String]) {
     reason_codes.sort_by(|a, b| {
-        let rank = |code: &str| u8::from(code != QUEUE_PAUSED_REASON_CODE);
+        let rank = |code: &str| u8::from(!is_operator_pause_reason(code));
         rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
     });
 }
@@ -39067,19 +40372,89 @@ fn sort_reason_codes(reason_codes: &mut [String]) {
 /// cannot disagree about the string that carries the priority.
 const QUEUE_PAUSED_REASON_CODE: &str = "queue_paused";
 
+/// The eligibility reason code for a task held by an operator activity pause
+/// (issue #807), the per-activity-type sibling of
+/// [`QUEUE_PAUSED_REASON_CODE`].
+const ACTIVITY_PAUSED_REASON_CODE: &str = "activity_paused";
+
+/// Every reason code that represents a deliberate *operator hold* rather than a
+/// capacity or compatibility impediment.
+///
+/// These share two behaviours — they lead [`sort_reason_codes`], and they are
+/// excluded from [`is_worker_draining_only`] — so they are listed once here
+/// rather than enumerated at each site, where a future third hold would
+/// otherwise have to be remembered twice.
+const OPERATOR_PAUSE_REASON_CODES: [&str; 2] =
+    [QUEUE_PAUSED_REASON_CODE, ACTIVITY_PAUSED_REASON_CODE];
+
+/// Whether `code` is one of [`OPERATOR_PAUSE_REASON_CODES`].
+fn is_operator_pause_reason(code: &str) -> bool {
+    OPERATOR_PAUSE_REASON_CODES.contains(&code)
+}
+
+/// Whether an activity pause holds this task (issue #807).
+///
+/// **Mirrors the authoritative claim gate in `queue::claim_task` exactly**, and
+/// must keep doing so or the explainer lies about why a task is not moving:
+///
+/// - Scoped by `task_type == "activity"`. A **workflow** task can legitimately
+///   carry a non-NULL `activity_name` — the engine stamps the
+///   `'mixed_signal_suspension'` sentinel there — so keying on `activity_name`
+///   alone would report `activity_paused` on mixed-signal-suspended workflow
+///   tasks the gate never holds. The core pins this with
+///   `anti_join_is_scoped_by_task_type_not_by_a_null_activity_name`.
+/// - Not filtered by `scope_shard_id`. That column records operator *intent*
+///   and is consulted by neither the claim gate nor the anti-join; the row's
+///   presence on *this shard's database* is the hold, and
+///   `evaluate_eligibility_for_shard` already runs per-shard on that shard's
+///   connection.
+fn task_is_activity_paused(
+    task_type: &str,
+    activity_name: Option<&str>,
+    paused_activities: &std::collections::HashSet<String>,
+) -> bool {
+    task_type == autumn_harvest::activity_pause::ACTIVITY_TASK_TYPE
+        && activity_name.is_some_and(|name| paused_activities.contains(name))
+}
+
+/// Which operator holds apply to one task, for
+/// [`task_intrinsic_impediment_reasons`].
+///
+/// Grouped into a struct rather than passed as two more positional `bool`s
+/// because the helper already takes three (`has_cb`, `concurrency_saturated`,
+/// and formerly `queue_paused`): a fourth would put four bare booleans in a row
+/// at every call site, where transposing two is a silent semantic bug no type
+/// check catches. It also keeps the argument count at clippy's default
+/// `too_many_arguments` threshold instead of needing an `allow`.
+#[derive(Debug, Clone, Copy, Default)]
+struct OperatorPauseHolds {
+    /// The task's queue is held by an operator queue pause (issue #619).
+    queue: bool,
+    /// The task's activity type is held by an operator activity pause
+    /// (issue #807).
+    activity: bool,
+}
+
 /// Whether a worker's only *worker-level* impediment is that it is draining.
 ///
-/// [`QUEUE_PAUSED_REASON_CODE`] is filtered out because it describes the QUEUE,
-/// not the worker: the `all_draining` diagnosis is a statement about fleet
-/// state, and it stays true when an operator additionally holds the queue
-/// (issue #619). Reporting the pause therefore never silently downgrades the
-/// diagnosis — the two independent facts surface on their own channels, the
-/// diagnosis and the worker's `reason_codes`.
+/// The [`OPERATOR_PAUSE_REASON_CODES`] are filtered out because they describe
+/// the WORK, not the worker: the `all_draining` diagnosis is a statement about
+/// fleet state, and it stays true when an operator additionally holds the queue
+/// (issue #619) or one of its activity types (issue #807). Reporting a pause
+/// therefore never silently downgrades the diagnosis — the independent facts
+/// surface on their own channels, the diagnosis and the worker's
+/// `reason_codes`.
+///
+/// `activity_paused` is filtered for the same reason as `queue_paused` even
+/// though it is a *task*-level rather than a queue-level fact: on the
+/// worker-reason short-circuit there is no per-task context anyway, and the
+/// question this predicate answers ("is the fleet merely draining?") is about
+/// workers either way.
 fn is_worker_draining_only(reason_codes: &[String]) -> bool {
     let worker_level: Vec<&str> = reason_codes
         .iter()
         .map(String::as_str)
-        .filter(|code| *code != QUEUE_PAUSED_REASON_CODE)
+        .filter(|code| !is_operator_pause_reason(code))
         .collect();
     worker_level == ["worker_draining"]
 }
@@ -39100,9 +40475,12 @@ fn is_worker_draining_only(reason_codes: &[String]) -> bool {
 /// stale `rate_limit_exhausted` reason is never surfaced for it — its
 /// impediment is the circuit reason instead.
 ///
-/// Queue pause (issue #619): a held queue is reported as `queue_paused`. It is
-/// listed first because it is the *operator's own deliberate action* — the one
-/// impediment a triaging operator should see before anything else.
+/// Operator pauses (issues #619 and #807): a held queue is reported as
+/// `queue_paused` and a held activity type as `activity_paused`. They are
+/// listed first because they are the *operator's own deliberate action* — the
+/// impediments a triaging operator should see before anything else. Both are
+/// reported when both apply; a pause reorders the array, it never suppresses a
+/// co-occurring impediment.
 fn task_intrinsic_impediment_reasons(
     activity_name: Option<&str>,
     rate_limit_key: Option<&str>,
@@ -39110,15 +40488,22 @@ fn task_intrinsic_impediment_reasons(
     saturated_rate_limits: &std::collections::HashSet<String>,
     concurrency_saturated: bool,
     cb_phase: &std::collections::HashMap<String, &'static str>,
-    queue_paused: bool,
+    pauses: OperatorPauseHolds,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
 
-    // Issue #619: an operator queue pause blocks every worker equally, so
-    // without this the explainer would report an EMPTY reason set for a held
+    // Issues #619 / #807: an operator pause blocks every worker equally, so
+    // without these the explainer would report an EMPTY reason set for a held
     // task — a false "no impediment" during exactly the idle-worker triage
     // this endpoint exists for.
-    if queue_paused {
+    //
+    // Pushed in the same alphabetical order `sort_reason_codes` restores after
+    // the merges, so the producer and the response agree even for a task held
+    // by both.
+    if pauses.activity {
+        reasons.push(ACTIVITY_PAUSED_REASON_CODE.to_string());
+    }
+    if pauses.queue {
         reasons.push(QUEUE_PAUSED_REASON_CODE.to_string());
     }
 
@@ -39423,6 +40808,17 @@ async fn evaluate_eligibility_for_shard(
             .into_iter()
             .collect();
 
+    // Issue #807: the per-activity-type sibling of the read above, and
+    // propagating for the same reason. Unfiltered by `queue_name`, matching the
+    // `paused_activities` CTE in `queue::claim_task`: an activity pause holds
+    // that activity type across every queue on the shard.
+    let paused_activities: std::collections::HashSet<String> =
+        autumn_harvest::activity_pause::paused_activity_names(&mut conn)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .collect();
+
     // Hoisted out of the worker loop: the pause is a property of the queue under
     // evaluation, so both the worker-reason short-circuit and the per-task loop
     // below read the same answer.
@@ -39442,6 +40838,15 @@ async fn evaluate_eligibility_for_shard(
                     || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
         })
         .collect();
+
+    // Issue #807, for the worker-reason short-circuit below, which has no
+    // per-task context the way the per-task loop does. The queue-level analogue
+    // of "this task is held" is "the backlog under evaluation contains a held
+    // task", which is a true and actionable statement about why nothing is
+    // dispatching.
+    let any_pending_task_activity_paused = pending_tasks.iter().any(|t| {
+        task_is_activity_paused(&t.task_type, t.activity_name.as_deref(), &paused_activities)
+    });
 
     for w in &online_workers {
         let w_id = w.worker.worker_id.clone();
@@ -39511,7 +40916,13 @@ async fn evaluate_eligibility_for_shard(
             if queue_is_paused {
                 worker_reasons.push(QUEUE_PAUSED_REASON_CODE.to_string());
             }
-            // The per-task path below sorts; this one did not, so the pause
+            // Issue #807: same argument, one level down. A fleet drained for the
+            // very outage the operator paused an *activity type* for would
+            // otherwise never surface that hold either.
+            if any_pending_task_activity_paused {
+                worker_reasons.push(ACTIVITY_PAUSED_REASON_CODE.to_string());
+            }
+            // The per-task path below sorts; this one did not, so the pauses
             // would trail the worker reasons alphabetically instead of leading.
             sort_reason_codes(&mut worker_reasons);
             ineligible_workers.push(IneligibleWorkerInfo {
@@ -39567,7 +40978,14 @@ async fn evaluate_eligibility_for_shard(
                     &saturated_rate_limits,
                     concurrency_saturated,
                     &cb_phase,
-                    paused_queues.contains(&t.queue_name),
+                    OperatorPauseHolds {
+                        queue: paused_queues.contains(&t.queue_name),
+                        activity: task_is_activity_paused(
+                            &t.task_type,
+                            t.activity_name.as_deref(),
+                            &paused_activities,
+                        ),
+                    },
                 ));
 
                 let parsed_reqs = if t.task_type == "activity" {
@@ -39916,7 +41334,7 @@ async fn get_task_eligibility(
 
 #[cfg(test)]
 mod eligibility_reason_tests {
-    use super::task_intrinsic_impediment_reasons;
+    use super::{OperatorPauseHolds, task_intrinsic_impediment_reasons};
     use std::collections::{HashMap, HashSet};
 
     fn saturated(keys: &[&str]) -> HashSet<String> {
@@ -39936,14 +41354,19 @@ mod eligibility_reason_tests {
     fn queue_paused_is_reported_first_and_composes_with_other_reasons() {
         let saturated = std::collections::HashSet::new();
         let cb_phase = std::collections::HashMap::new();
+        let queue_held = OperatorPauseHolds {
+            queue: true,
+            activity: false,
+        };
 
         let only_pause = task_intrinsic_impediment_reasons(
-            None, None, false, &saturated, false, &cb_phase, true,
+            None, None, false, &saturated, false, &cb_phase, queue_held,
         );
         assert_eq!(only_pause, vec!["queue_paused".to_string()]);
 
-        let with_concurrency =
-            task_intrinsic_impediment_reasons(None, None, false, &saturated, true, &cb_phase, true);
+        let with_concurrency = task_intrinsic_impediment_reasons(
+            None, None, false, &saturated, true, &cb_phase, queue_held,
+        );
         assert_eq!(
             with_concurrency,
             vec![
@@ -39954,9 +41377,143 @@ mod eligibility_reason_tests {
         );
 
         let unpaused = task_intrinsic_impediment_reasons(
-            None, None, false, &saturated, false, &cb_phase, false,
+            None,
+            None,
+            false,
+            &saturated,
+            false,
+            &cb_phase,
+            OperatorPauseHolds::default(),
         );
         assert!(unpaused.is_empty(), "an unpaused queue contributes nothing");
+    }
+
+    /// Issue #807: an activity held by an operator pause must surface as
+    /// `activity_paused`, lead the array like its queue-level sibling, and
+    /// never suppress a co-occurring impediment.
+    #[test]
+    fn activity_paused_is_reported_first_and_composes_with_other_reasons() {
+        let saturated = std::collections::HashSet::new();
+        let cb_phase = std::collections::HashMap::new();
+        let activity_held = OperatorPauseHolds {
+            queue: false,
+            activity: true,
+        };
+
+        let only_pause = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            false,
+            &saturated,
+            false,
+            &cb_phase,
+            activity_held,
+        );
+        assert_eq!(only_pause, vec!["activity_paused".to_string()]);
+
+        let with_concurrency = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            false,
+            &saturated,
+            true,
+            &cb_phase,
+            activity_held,
+        );
+        assert_eq!(
+            with_concurrency,
+            vec![
+                "activity_paused".to_string(),
+                "concurrency_saturated".to_string()
+            ],
+            "a pause is listed first but never hides a co-occurring impediment"
+        );
+
+        let unpaused = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            false,
+            &saturated,
+            false,
+            &cb_phase,
+            OperatorPauseHolds::default(),
+        );
+        assert!(
+            unpaused.is_empty(),
+            "an unpaused activity contributes nothing"
+        );
+    }
+
+    /// A task held by BOTH pauses reports BOTH codes (issue #807).
+    ///
+    /// The two holds are independent — an operator can pause a queue and an
+    /// activity type during the same incident — so surfacing one must never
+    /// mask the other, or resuming the reported hold leaves the task still
+    /// stuck with no explanation on the endpoint built to give one.
+    #[test]
+    fn both_pauses_report_both_codes_ahead_of_other_impediments() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            false,
+            &HashSet::new(),
+            true,
+            &phases(&[("charge_card", "open")]),
+            OperatorPauseHolds {
+                queue: true,
+                activity: true,
+            },
+        );
+        assert_eq!(
+            reasons,
+            vec![
+                "activity_paused".to_string(),
+                "queue_paused".to_string(),
+                "concurrency_saturated".to_string(),
+                "circuit_open".to_string(),
+            ],
+            "both deliberate holds lead (alphabetically among themselves, so the \
+             producer agrees with sort_reason_codes after the merges), and \
+             neither suppresses a co-occurring impediment; got {reasons:?}"
+        );
+    }
+
+    /// The explainer must key on `task_type` exactly as `queue::claim_task`'s
+    /// gate does (issue #807).
+    ///
+    /// A **workflow** task can legitimately carry a non-NULL `activity_name` —
+    /// the engine stamps the `'mixed_signal_suspension'` sentinel there — and
+    /// the claim gate is scoped by `task_type = 'activity'` precisely so a
+    /// pause never holds those. An explainer keyed on `activity_name` alone
+    /// would report `activity_paused` on tasks that are not held at all.
+    #[test]
+    fn activity_pause_predicate_matches_the_claim_gate_scoping() {
+        let held: HashSet<String> = ["charge_card", "mixed_signal_suspension"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        assert!(super::task_is_activity_paused(
+            "activity",
+            Some("charge_card"),
+            &held
+        ));
+        assert!(
+            !super::task_is_activity_paused("workflow", Some("mixed_signal_suspension"), &held),
+            "a workflow task carrying the sentinel is never held by the claim \
+             gate, so it must never be reported as activity_paused"
+        );
+        assert!(!super::task_is_activity_paused("activity", None, &held));
+        assert!(!super::task_is_activity_paused(
+            "activity",
+            Some("send_email"),
+            &held
+        ));
+        assert!(!super::task_is_activity_paused(
+            "activity",
+            Some("charge_card"),
+            &HashSet::new()
+        ));
     }
 
     #[test]
@@ -39968,7 +41525,7 @@ mod eligibility_reason_tests {
             &saturated(&["rl-key"]),
             false,
             &HashMap::new(),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert_eq!(reasons, vec!["rate_limit_exhausted".to_string()]);
     }
@@ -39984,7 +41541,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             true,
             &HashMap::new(),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert_eq!(reasons, vec!["concurrency_saturated".to_string()]);
     }
@@ -40000,7 +41557,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &phases(&[("charge_card", "open")]),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert!(
             reasons.contains(&"circuit_open".to_string()),
@@ -40019,7 +41576,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &phases(&[("charge_card", "half_open")]),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert!(
             reasons.contains(&"circuit_half_open".to_string()),
@@ -40037,7 +41594,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &phases(&[("charge_card", "closed")]),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
     }
@@ -40053,7 +41610,7 @@ mod eligibility_reason_tests {
             &saturated(&["rl-key"]),
             false,
             &phases(&[("charge_card", "open")]),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert!(
             reasons.contains(&"circuit_open".to_string()),
@@ -40075,7 +41632,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             true,
             &phases(&[("charge_card", "open")]),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert!(
             reasons.contains(&"concurrency_saturated".to_string()),
@@ -40097,7 +41654,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &HashMap::new(),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
     }
@@ -40116,7 +41673,7 @@ mod eligibility_reason_tests {
             &saturated(&["k"]),
             false,
             &phases(&[("a", "closed")]),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
     }
@@ -40138,15 +41695,35 @@ mod eligibility_reason_tests {
             "worker_draining"
         ])));
 
+        // Issue #807: the activity-level hold is filtered for the same reason,
+        // alone and alongside its queue-level sibling.
+        assert!(super::is_worker_draining_only(&owned(&[
+            "activity_paused",
+            "worker_draining"
+        ])));
+        assert!(super::is_worker_draining_only(&owned(&[
+            "activity_paused",
+            "queue_paused",
+            "worker_draining"
+        ])));
+
         // A genuine second worker-level condition still disqualifies it.
         assert!(!super::is_worker_draining_only(&owned(&[
             "queue_paused",
             "worker_draining",
             "wrong_shard_assignment"
         ])));
+        assert!(!super::is_worker_draining_only(&owned(&[
+            "activity_paused",
+            "worker_draining",
+            "wrong_shard_assignment"
+        ])));
         assert!(!super::is_worker_draining_only(&owned(&["worker_stopped"])));
-        // A queue hold alone is not a draining fleet.
+        // A hold alone is not a draining fleet.
         assert!(!super::is_worker_draining_only(&owned(&["queue_paused"])));
+        assert!(!super::is_worker_draining_only(&owned(&[
+            "activity_paused"
+        ])));
         assert!(!super::is_worker_draining_only(&[]));
     }
 }
@@ -40861,6 +42438,28 @@ mod tests {
         let mut empty: Vec<String> = Vec::new();
         sort_reason_codes(&mut empty);
         assert!(empty.is_empty());
+
+        // Issue #807: the activity-level hold leads too, and a task held by
+        // BOTH reports them in a deterministic order rather than whichever the
+        // HashSet merge happened to yield.
+        let mut both = vec![
+            "concurrency_saturated".to_string(),
+            "queue_paused".to_string(),
+            "worker_draining".to_string(),
+            "activity_paused".to_string(),
+        ];
+        sort_reason_codes(&mut both);
+        assert_eq!(
+            both,
+            vec![
+                "activity_paused".to_string(),
+                "queue_paused".to_string(),
+                "concurrency_saturated".to_string(),
+                "worker_draining".to_string(),
+            ],
+            "both deliberate holds lead, alphabetical within the group and \
+             within the remainder, so the array is stable across polls"
+        );
     }
 
     fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {

@@ -1508,3 +1508,79 @@ fn queue_pause_routes_are_classified_and_audited() {
         "{read_route} is read-only and must be listed in EXCLUDED_ROUTES"
     );
 }
+
+/// The four per-activity-type pause/resume routes (issue #807) must be
+/// registered in the management route list AND correctly classified in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`: the two mutating routes mapped to
+/// their audit operations, and the two read routes mapped to `None` and listed
+/// in `EXCLUDED_ROUTES`.
+///
+/// Mirrors `queue_pause_routes_are_classified_and_audited`, and exists for the
+/// same reason: `audit.rs`'s own exhaustiveness tests only cross-check its lists
+/// against each OTHER, so a route dropped from BOTH stays green there — this
+/// pins them against the live router.
+///
+/// The classification is load-bearing beyond the audit trail: the read-only
+/// operator role (issue #776) denies exactly the routes classified `Mutating`,
+/// so a pause route that silently lost its class would become reachable by a
+/// read-only principal — a fleet-wide dispatch kill switch handed to a triage
+/// account.
+#[test]
+fn activity_pause_routes_are_classified_and_audited() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, EXCLUDED_ROUTES, OP_ACTIVITY_PAUSE,
+        OP_ACTIVITY_RESUME, RouteClass,
+    };
+
+    for (route, op) in [
+        ("POST /activities/{activity_name}/pause", OP_ACTIVITY_PAUSE),
+        (
+            "POST /activities/{activity_name}/resume",
+            OP_ACTIVITY_RESUME,
+        ),
+    ] {
+        assert!(
+            management_api_routes()
+                .iter()
+                .any(|(m, p)| format!("{m} {p}") == route),
+            "{route} must be registered in management_api_routes()"
+        );
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, class)| *r == route && *class == RouteClass::Mutating),
+            "{route} must be classified Mutating in autumn_harvest::audit::CLASSIFIED_ROUTES"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, mapped)| *r == route && *mapped == Some(op)),
+            "{route} must be mapped to {op} in ALL_MUTATION_ROUTES"
+        );
+    }
+
+    for read_route in ["GET /activities", "GET /activities/{activity_name}"] {
+        assert!(
+            management_api_routes()
+                .iter()
+                .any(|(m, p)| format!("{m} {p}") == read_route),
+            "{read_route} must be registered in management_api_routes()"
+        );
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, class)| *r == read_route && matches!(class, RouteClass::ReadOnly)),
+            "{read_route} must be classified ReadOnly in CLASSIFIED_ROUTES"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == read_route && op.is_none()),
+            "{read_route} must appear in ALL_MUTATION_ROUTES with no audit operation (None)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&read_route),
+            "{read_route} is read-only and must be listed in EXCLUDED_ROUTES"
+        );
+    }
+}
