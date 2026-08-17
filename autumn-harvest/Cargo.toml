@@ -272,5 +272,14 @@ harness = false
 name = "schema_validate_profile"
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `det_check::check_paths` -- the source-scanning engine behind
+# `harvest det-check` (issue #778), the CI governance gate for the determinism
+# guardrails. No feature requirement: `det_check` is unconditional. See
+# `benches/det_check_profile.rs`.
+[[bench]]
+name = "det_check_profile"
+harness = false
+
 [lints]
 workspace = true
