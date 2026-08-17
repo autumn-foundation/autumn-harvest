@@ -10727,25 +10727,37 @@ async fn load_workflow_children_tree_from_shards(
             break;
         }
 
+        // Batch the WHOLE frontier into one `parent_id = ANY($1)` query per
+        // shard per depth level, instead of one query per *parent* per shard
+        // per depth level -- `O(depth × shards)` round trips instead of
+        // `O(nodes × shards)`, mirroring `load_workflow_children_batch`
+        // (the same batching `GET /workflows/{id}/tree`, issue #621, already
+        // does for this exact traversal shape). Which specific parent in the
+        // frontier produced a given child is never needed here: the next
+        // frontier is just the union of everyone's children, deduped by
+        // `seen`, and result filters only ever inspect the row itself.
+        let parent_uuids: Vec<uuid::Uuid> = frontier.iter().map(ExecutionId::as_uuid).collect();
         let mut next_frontier = Vec::new();
-        for parent in &frontier {
-            for (_shard, shard_pool) in pool.iter_shards() {
-                let mut conn = acquire_conn(shard_pool).await?;
-                let shard_rows =
-                    store::load_workflow_children(&mut conn, *parent, &traversal_filters, depth)
-                        .await
-                        .map_err(map_error)?;
-                for row in shard_rows {
-                    if !seen.insert(row.exec_id.as_uuid()) {
-                        continue;
-                    }
+        for (_shard, shard_pool) in pool.iter_shards() {
+            let mut conn = acquire_conn(shard_pool).await?;
+            let shard_rows = store::load_workflow_children_multi(
+                &mut conn,
+                &parent_uuids,
+                &traversal_filters,
+                depth,
+            )
+            .await
+            .map_err(map_error)?;
+            for row in shard_rows {
+                if !seen.insert(row.exec_id.as_uuid()) {
+                    continue;
+                }
 
-                    next_frontier.push(row.exec_id);
-                    if workflow_child_matches_filters(&row, filters)
-                        && workflow_child_is_after_cursor(&row, filters.cursor.as_ref())
-                    {
-                        rows.push(row);
-                    }
+                next_frontier.push(row.exec_id);
+                if workflow_child_matches_filters(&row, filters)
+                    && workflow_child_is_after_cursor(&row, filters.cursor.as_ref())
+                {
+                    rows.push(row);
                 }
             }
         }
