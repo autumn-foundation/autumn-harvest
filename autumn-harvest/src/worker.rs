@@ -12214,7 +12214,7 @@ async fn fail_execution_on_error<T>(
 /// [`queue::release_suspended_workflow_claim`] -- a blocking, ownership-
 /// guarded release that reconciles against the row's true post-contention
 /// state: a genuine transfer still updates nothing (the new owner keeps the
-/// row, unchanged), while a spurious `SKIP LOCKED` miss is released back to
+/// row, unchanged), while a spurious skip-locked miss is released back to
 /// `PENDING` for a fresh dispatch attempt.
 #[doc(hidden)]
 pub async fn fail_suspended_workflow_if_still_claimed(
