@@ -12172,6 +12172,14 @@ async fn fail_execution_on_error<T>(
     if error.handler_not_registered().is_some() {
         return Err(error);
     }
+    // Issue #1182 (Codex review round 2): an ambiguous suspended-dispatch
+    // claim is the identical "blameless, no decision made" shape as a
+    // capability miss -- pass it through un-failed so the caller can roll
+    // back the enclosing transaction and perform the standalone claim
+    // release afterward, rather than terminally failing the run here.
+    if error.suspended_claim_ambiguous().is_some() {
+        return Err(error);
+    }
     fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
     Err(error)
 }
@@ -12208,14 +12216,37 @@ async fn fail_execution_on_error<T>(
 /// `wake_requested` fallback, momentarily locking this exact row for a
 /// sibling event) merely contending for it at that instant; both read back
 /// as "not ours right now" (Codex review of #1182). If this dispatch simply
-/// returned in that second case, the row would strand `RUNNING` under a
-/// worker who has already given up on it, with nothing left to ever re-claim
-/// it. So a lost claim also attempts
-/// [`queue::release_suspended_workflow_claim`] -- a blocking, ownership-
-/// guarded release that reconciles against the row's true post-contention
-/// state: a genuine transfer still updates nothing (the new owner keeps the
-/// row, unchanged), while a spurious skip-locked miss is released back to
-/// `PENDING` for a fresh dispatch attempt.
+/// returned `Ok(())` in that second case, the row would strand `RUNNING`
+/// under a worker who has already given up on it, with nothing left to ever
+/// re-claim it -- so a lost claim (or a changed evidence snapshot) must
+/// still be released.
+///
+/// **The release itself does not happen here.** This function is called
+/// from inside `process_workflow_task`'s persistence transaction, which
+/// holds the *execution* row's lock for its whole duration
+/// ([`check_paused_and_park`]'s `FOR UPDATE`). `commit_terminal_failure_if_
+/// still_claimed` opens its own transaction internally, but since one is
+/// already open here, Diesel issues a `SAVEPOINT` rather than a fresh
+/// `BEGIN` -- and Postgres does **not** release a lock held by the outer
+/// transaction when a nested savepoint is released, only when the
+/// *outermost* transaction ends. Attempting the blocking, non-`SKIP LOCKED`
+/// [`queue::release_suspended_workflow_claim`] from here would therefore
+/// contend for the task row *while still holding the execution row* -- the
+/// exact ABBA cycle against `poison_pill::quarantine_orphan`'s reversed
+/// (task-row-first) lock order that `SKIP LOCKED` exists to avoid in the
+/// first place (Codex review round 2 of #1182).
+///
+/// So an ambiguous claim is surfaced as [`HarvestError::SuspendedClaimAmbiguous`]
+/// instead, and propagated with `?`. This forces the *entire* enclosing
+/// transaction to roll back -- releasing the execution-row lock, and
+/// discarding any bookkeeping write [`handle_suspended_workflow`] made
+/// earlier in the same dispatch cycle, so a rolled-back "no decision" can
+/// never commit half of one -- before the release is even attempted. Only
+/// after that rollback and the enclosing `.await` have both returned does
+/// the caller invoke [`queue::release_suspended_workflow_claim`] standalone,
+/// holding no other lock: a genuine transfer updates nothing (the new owner
+/// keeps the row, unchanged), while a spurious skip-locked miss is released
+/// back to `PENDING` for a fresh dispatch attempt.
 #[doc(hidden)]
 pub async fn fail_suspended_workflow_if_still_claimed(
     conn: &mut AsyncPgConnection,
@@ -12240,27 +12271,11 @@ pub async fn fail_suspended_workflow_if_still_claimed(
     )
     .await?;
     match write {
-        TerminalWriteOutcome::Committed(_) => {}
+        TerminalWriteOutcome::Committed(_) => Ok(()),
         TerminalWriteOutcome::ClaimLost | TerminalWriteOutcome::EvidenceChanged(_) => {
-            let released = queue::release_suspended_workflow_claim(
-                conn,
-                task.id,
-                worker_id,
-                task.crash_strikes,
-            )
-            .await?;
-            tracing::info!(
-                task_id = %task.id,
-                queue = %task.queue_name,
-                released,
-                "a suspended workflow dispatch made no replay-significant progress; the claim \
-                 guard could not confirm ownership (a genuine transfer, or a concurrent, \
-                 unrelated lock holder), so no terminal decision was made; the task was \
-                 released back to the queue if it was still ours"
-            );
+            Err(HarvestError::SuspendedClaimAmbiguous { task_id: task.id })
         }
     }
-    Ok(())
 }
 
 /// Terminal-fail wrapper for the `process_workflow_task` drive loop that also
@@ -16157,6 +16172,37 @@ async fn process_workflow_task(
             .await;
         }
         Err(error) => {
+            // Issue #1182 (Codex review round 2): the suspended-dispatch
+            // claim guard could not confirm ownership, and `?` inside the
+            // transaction closure has already rolled the *whole* persistence
+            // transaction back -- releasing the execution row's lock and
+            // discarding any bookkeeping write made earlier in this cycle
+            // (see `fail_suspended_workflow_if_still_claimed`'s doc comment
+            // for why the release cannot happen from inside that
+            // transaction). Only now, standalone and holding no other lock,
+            // is the actual claim release attempted; it is never a terminal
+            // decision, so this always returns `Ok(())` regardless of
+            // `is_terminal_with_commands`.
+            if let Some(task_id) = error.suspended_claim_ambiguous() {
+                let released = queue::release_suspended_workflow_claim(
+                    conn,
+                    task_id,
+                    worker_id,
+                    task.crash_strikes,
+                )
+                .await?;
+                tracing::info!(
+                    task_id = %task_id,
+                    queue = %task.queue_name,
+                    released,
+                    "a suspended workflow dispatch made no replay-significant progress; the \
+                     claim guard could not confirm ownership (a genuine transfer, or a \
+                     concurrent, unrelated lock holder), so the enclosing transaction was \
+                     rolled back and no terminal decision was made; the task was released \
+                     back to the queue if it was still ours"
+                );
+                return Ok(());
+            }
             // Preserve per-path error handling: a terminal-with-commands persist
             // failure durably fails the task + execution (matching the prior
             // `fail_execution_on_error` wrapping); a suspended/simple-terminal

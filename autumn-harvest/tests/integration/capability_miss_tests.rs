@@ -921,9 +921,35 @@ fn decoy_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'
 /// Where `workflow_invalidates_peer_then_misses` reaches the database, and the
 /// peer whose evidence it clears (issue #804 round 27).
 ///
+/// A **pool**, not a URL, for the exact reason [`CLAIM_THEFT_INJECTION`]
+/// documents: the whole body has only `executor::SUSPENSION_TIMEOUT` (100 ms)
+/// to reach a command-emitting suspension, and a fresh
+/// `AsyncPgConnection::establish` per dispatch pays a full TCP+auth handshake
+/// inside that window — slow enough under load to blow the budget outright
+/// (issue #1182, Codex round-3: this test failed the exact same way the
+/// primary #1182 regression did, `"workflow suspended without emitted
+/// commands"`, because the raw connect never resolved in time and the miss
+/// this test exists to exercise was never reached). A pooled, pre-warmed
+/// checkout reuses a live connection and pays only the `UPDATE`.
+///
 /// A `OnceLock` rather than a parameter because a `WorkflowHandlerFn` is a bare
 /// `fn` pointer with a fixed signature and cannot capture.
-static RACE_INJECTION: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+static RACE_INJECTION: std::sync::OnceLock<(DbPool, String)> = std::sync::OnceLock::new();
+
+/// Force [`RACE_INJECTION`]'s lazy `deadpool` to establish a connection now,
+/// mirroring [`prewarm_claim_theft_injection`] for the identical reason: an
+/// unwarmed pool pays the TCP+auth handshake on its first `get()`, which is
+/// exactly the handshake the pool exists to keep out of the 100 ms window.
+async fn prewarm_race_injection() {
+    let (pool, _peer) = RACE_INJECTION
+        .get()
+        .expect("race injection is armed before it is pre-warmed");
+    let mut conn = pool.get().await.expect("race injection pre-warm connects");
+    diesel::sql_query("SELECT 1")
+        .execute(&mut conn)
+        .await
+        .expect("race injection pre-warm round-trips");
+}
 
 /// The deterministic injection point for the round-27 race: a workflow body
 /// that clears a peer's capability-miss evidence **while its own dispatch holds
@@ -940,10 +966,8 @@ fn workflow_invalidates_peer_then_misses(
     input: serde_json::Value,
 ) -> BoxFut<'_> {
     Box::pin(async move {
-        if let Some((url, peer)) = RACE_INJECTION.get() {
-            let mut conn = AsyncPgConnection::establish(url)
-                .await
-                .expect("race injection connects");
+        if let Some((pool, peer)) = RACE_INJECTION.get() {
+            let mut conn = pool.get().await.expect("race injection connects");
             queue::invalidate_capability_miss_evidence_for_worker(
                 &mut conn,
                 peer,
@@ -2631,10 +2655,19 @@ async fn peer_reregistering_mid_dispatch_is_seen_by_the_decision() {
     seed_prior_missing_workers(&url, exec_id, &["pod-a"], "claim_race_wf").await;
     seed_live_worker(&url, "pod-a", Q_CLAIM_RACE).await;
 
-    // Arm the injection the workflow body performs while holding the claim.
-    RACE_INJECTION
-        .set((url.clone(), "pod-a".to_string()))
-        .expect("race injection is armed exactly once per process");
+    // Arm the injection the workflow body performs while holding the claim,
+    // and pre-warm its pool so the in-body checkout pays only the `UPDATE`
+    // (see `RACE_INJECTION`'s doc comment for why an unwarmed raw connect
+    // blows the 100 ms suspension budget under load). `is_ok()` rather than
+    // `expect()` because `OnceLock::set` hands the rejected value back in the
+    // `Err`, and a `DbPool` is not `Debug` (`AsyncPgConnection` is not).
+    assert!(
+        RACE_INJECTION
+            .set((build_pool(&url), "pod-a".to_string()))
+            .is_ok(),
+        "race injection is armed exactly once per process"
+    );
+    prewarm_race_injection().await;
 
     let metrics = Arc::new(CapabilityMetrics::default());
     let pod_b = build_worker(
@@ -2818,6 +2851,15 @@ async fn a_claim_lost_mid_dispatch_makes_no_terminal_decision() {
 /// Before issue #1182's fix, this branch called `persist_workflow_failure`
 /// with no ownership check at all, so a stale dispatcher whose claim had
 /// already moved to another worker would terminally fail the run regardless.
+///
+/// Codex review round 2: the function now surfaces this as
+/// `Err(HarvestError::SuspendedClaimAmbiguous)` rather than performing a
+/// release and returning `Ok(())` itself -- it must never touch the row a
+/// genuine transfer already handed to a new owner, and propagating instead
+/// of writing lets a real caller's enclosing transaction (which is never
+/// present here) roll back cleanly first. This test therefore asserts the
+/// error shape directly; the release path itself has its own dedicated test
+/// below.
 #[tokio::test]
 async fn a_stale_dispatcher_with_zero_emitted_commands_makes_no_terminal_decision_when_the_claim_moved()
  {
@@ -2844,7 +2886,7 @@ async fn a_stale_dispatcher_with_zero_emitted_commands_makes_no_terminal_decisio
     // the exact error text it builds for an empty command set.
     let error = "workflow suspended without emitted commands; resumption is not implemented yet";
     let mut conn = connect(&url).await;
-    fail_suspended_workflow_if_still_claimed(
+    let outcome = fail_suspended_workflow_if_still_claimed(
         &mut conn,
         &task,
         exec_id,
@@ -2852,11 +2894,18 @@ async fn a_stale_dispatcher_with_zero_emitted_commands_makes_no_terminal_decisio
         "dispatcher-a",
         error,
     )
-    .await
-    .expect("the guarded write must not error");
+    .await;
 
-    // Nothing was written: the row and run the new owner picked up are
-    // untouched.
+    assert_eq!(
+        outcome
+            .expect_err("an ambiguous claim must surface, not be swallowed to Ok(())")
+            .suspended_claim_ambiguous(),
+        Some(task.id),
+        "the sentinel must name the exact task whose ownership is ambiguous"
+    );
+
+    // The function itself performs no write at all now -- the row and run
+    // the new owner picked up are untouched by this call.
     let history = load_history(&url, exec_id).await;
     assert!(
         !history
@@ -2904,6 +2953,18 @@ async fn a_stale_dispatcher_with_zero_emitted_commands_makes_no_terminal_decisio
 /// production fix instead attempts a blocking, ownership-guarded release,
 /// which must succeed once the contending lock is released, since ownership
 /// never actually moved.
+///
+/// Codex review round 2 split the fix into two calls:
+/// [`fail_suspended_workflow_if_still_claimed`] itself must return
+/// **immediately**, without blocking on anything -- it only probes via
+/// `SKIP LOCKED`, so it can never be the thing waiting inside a transaction
+/// that also holds another lock -- and the blocking, ownership-guarded
+/// release is a **separate**, standalone call
+/// ([`queue::release_suspended_workflow_claim`]) made only afterward, exactly
+/// mirroring what `process_workflow_task`'s post-transaction `match` arm now
+/// does. This test drives both calls in that order and asserts the fast
+/// return is genuinely fast (bounded well under the lock-hold window) before
+/// asserting the release itself blocks and then succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_a_false_positive() {
     let (url, _container) = setup_db().await;
@@ -2928,14 +2989,17 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
     // The live dispatch cycle suspended having emitted no commands, exactly
     // as in the test above -- but this time the SKIP LOCKED guard will read
     // the row as contended (by `conn_lock`, above), not transferred. The
-    // guarded write blocks on the fallback release rather than skipping it,
-    // so this task must be spawned to run concurrently with the lock hold.
+    // second call (the standalone release) blocks on the held lock rather
+    // than skipping it, so this task must be spawned to run concurrently
+    // with the lock hold.
     let dispatch_handle = tokio::spawn({
         let url = url.clone();
         let task = task.clone();
         async move {
             let mut conn = connect(&url).await;
-            fail_suspended_workflow_if_still_claimed(
+
+            let probe_started = std::time::Instant::now();
+            let ambiguous_task_id = fail_suspended_workflow_if_still_claimed(
                 &mut conn,
                 &task,
                 exec_id,
@@ -2944,12 +3008,28 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
                 "workflow suspended without emitted commands; resumption is not implemented yet",
             )
             .await
+            .expect_err("SKIP LOCKED never waits, so the row reads as contended immediately")
+            .suspended_claim_ambiguous()
+            .expect("must be the ambiguous-claim sentinel");
+            let probe_elapsed = probe_started.elapsed();
+
+            // The standalone release, exactly as `process_workflow_task`'s
+            // post-transaction match arm performs it -- this is the call
+            // that actually blocks on `conn_lock`'s held lock, never the
+            // probe above.
+            let released = queue::release_suspended_workflow_claim(
+                &mut conn,
+                ambiguous_task_id,
+                "dispatcher-a",
+                task.crash_strikes,
+            )
+            .await?;
+            Ok::<_, autumn_harvest::HarvestError>((probe_elapsed, released))
         }
     });
 
-    // Give the spawned dispatch time to reach `claim_still_held_for_update`
-    // (finding the row contended) and then block on the release's plain,
-    // non-`SKIP LOCKED` `UPDATE`.
+    // Give the spawned probe time to run and reach the blocking release
+    // before the lock is released.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     conn_lock
@@ -2957,10 +3037,20 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
         .await
         .expect("release the held row lock");
 
-    dispatch_handle
+    let (probe_elapsed, released) = dispatch_handle
         .await
         .expect("the dispatch task must not panic")
         .expect("the guarded write and its release fallback must not error");
+    assert!(
+        probe_elapsed < Duration::from_millis(250),
+        "the ambiguity probe must never wait on the row's lock -- it took \
+         {probe_elapsed:?}, but the lock was held for 300ms before this test even \
+         released it, so a probe that blocked would exceed that bound"
+    );
+    assert!(
+        released,
+        "a claim that was never actually lost must be released"
+    );
 
     // No terminal decision was made -- the run is untouched.
     let history = load_history(&url, exec_id).await;
@@ -2994,6 +3084,265 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
         !reloaded.wake_requested,
         "the wake that landed in the contention window must be reconciled by the \
          release, not left set with nothing left to ever consume it"
+    );
+}
+
+/// A rolled-back ambiguous-claim decision discards **every** write made
+/// earlier in the same enclosing transaction, not just its own (issue #1182,
+/// Codex review round 2, "Finding 2").
+///
+/// `process_workflow_task` wraps its whole persistence flow -- including
+/// bookkeeping unrelated to this dispatch's own outcome, e.g. `clear_nd_block`
+/// clearing a previously-blocked execution's non-determinism marker (issue
+/// #603) when this cycle happened to replay clean -- in one
+/// `conn.transaction::<WorkflowPersistFlow, HarvestError, _>(async |conn| {
+/// .. })` closure. `fail_suspended_workflow_if_still_claimed` is reached deep
+/// inside that same closure; its doc comment states that propagating
+/// `SuspendedClaimAmbiguous` via `?` "forces the *entire* enclosing
+/// transaction to roll back .. discarding any bookkeeping write
+/// [`handle_suspended_workflow`] made earlier in the same dispatch cycle, so
+/// a rolled-back 'no decision' can never commit half of one" -- but neither
+/// existing test above drives that claim through an actual `conn.
+/// transaction()` closure: both call the guard directly, with nothing else in
+/// scope to roll back. This test reproduces the shape byte-for-byte -- an
+/// unrelated write, then the ambiguous-claim guard, both inside one
+/// transaction closure whose `Err` is propagated with `?` -- and asserts the
+/// unrelated write is genuinely gone afterward, not merely that the function
+/// itself returns an error.
+///
+/// `current_details` (issue #473/#593) stands in for the earlier bookkeeping
+/// write: an ordinary, freely-writable execution-row column with no relation
+/// to the claim guard at all, so a survival here could only be explained by
+/// the transaction failing to roll back.
+#[tokio::test]
+async fn an_ambiguous_claim_rolls_back_every_earlier_write_in_the_same_transaction() {
+    let (url, _container) = setup_db().await;
+
+    let (exec_id, task) = seed_claimed_task(&url, "q1182-rollback-scope", "dispatcher-a").await;
+
+    // The claim moves to another worker while this dispatcher is still
+    // mid-flight, exactly as in the sibling tests above.
+    let mut mover = connect(&url).await;
+    diesel::sql_query("UPDATE harvest_task_queue SET worker_id = 'thief' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task.id)
+        .execute(&mut mover)
+        .await
+        .expect("transfer the claim");
+
+    let mut conn = connect(&url).await;
+    let error = "workflow suspended without emitted commands; resumption is not implemented yet";
+
+    // Reproduce `process_workflow_task`'s shape exactly: one
+    // `conn.transaction(async |conn| { .. })` closure containing an unrelated
+    // write followed by the ambiguous-claim guard, with the guard's `Err`
+    // propagated out of the closure with `?` -- never caught or logged inside
+    // it, exactly as the real code does.
+    let result: Result<(), autumn_harvest::HarvestError> =
+        Box::pin(conn.transaction(async |conn| {
+            diesel::sql_query(
+                "UPDATE harvest_workflow_executions SET current_details = $1 WHERE id = $2",
+            )
+            .bind::<diesel::sql_types::Text, _>("about to be rolled back")
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .execute(conn)
+            .await
+            .map_err(autumn_harvest::error::database_error)?;
+
+            fail_suspended_workflow_if_still_claimed(
+                conn,
+                &task,
+                exec_id,
+                1,
+                "dispatcher-a",
+                error,
+            )
+            .await?;
+
+            Ok(())
+        }))
+        .await;
+
+    assert_eq!(
+        result
+            .expect_err("the ambiguous-claim guard must still surface")
+            .suspended_claim_ambiguous(),
+        Some(task.id),
+        "the propagated error must be the exact sentinel the guard produced"
+    );
+
+    // The unrelated write made earlier in the SAME transaction closure must
+    // not have survived the rollback the propagated `?` triggered.
+    let execution = load_execution(&url, exec_id).await;
+    assert_eq!(
+        execution.current_details, None,
+        "an earlier write in the same enclosing transaction as an ambiguous \
+         claim decision must be rolled back with it, not committed alone -- \
+         got {:?}",
+        execution.current_details
+    );
+
+    // The claim transfer itself, made on an entirely separate connection
+    // before the transaction ever opened, is of course untouched.
+    let reloaded = load_tasks(&url, exec_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("the task row survives an undecided dispatch");
+    assert_eq!(reloaded.worker_id.as_deref(), Some("thief"));
+}
+
+/// A concurrent task-row-first actor (standing in for
+/// [`crate::poison_pill::quarantine_orphan`], which locks the task row and
+/// then goes on to touch the execution row) never deadlocks against this
+/// dispatch's claim-release path, because this dispatch never holds the
+/// execution row while it waits on the task row (issue #1182, Codex review
+/// round 2, "Finding 1").
+///
+/// The doc comments on [`fail_suspended_workflow_if_still_claimed`] and
+/// [`queue::release_suspended_workflow_claim`] both describe the cycle a
+/// broken implementation would create: `process_workflow_task`'s persistence
+/// transaction holds the **execution** row (via `check_paused_and_park`'s
+/// `FOR UPDATE`) for its whole duration, so if the blocking
+/// [`queue::release_suspended_workflow_claim`] were ever called from *inside*
+/// that transaction, this dispatch would hold the execution row while
+/// blocking on the **task** row -- and a peer that locks the task row first
+/// (poison-pill's own order) and then needs the execution row would be
+/// blocked on this dispatch in turn. Two connections each holding one lock
+/// and waiting on the other is a textbook ABBA deadlock, and Postgres would
+/// eventually abort one side with a `deadlock detected` error rather than let
+/// either progress.
+///
+/// The production fix's two-call split makes that cycle structurally
+/// impossible: `fail_suspended_workflow_if_still_claimed`'s own probe is
+/// `SKIP LOCKED` (never blocks, so it never becomes half of a cycle), and the
+/// blocking release only runs *after* the whole enclosing transaction --
+/// execution-row lock included -- has already ended. This test drives both
+/// halves of the would-be cycle concurrently and for real: connection A locks
+/// the task row **then** the execution row (poison-pill's own order), while
+/// the dispatch's blocking release waits on connection A's task-row lock
+/// while holding nothing at all. If the fix regressed and the release call
+/// were ever made from inside a transaction still holding the execution row,
+/// this reproduces the exact interleaving that would deadlock; bounding the
+/// whole thing in [`tokio::time::timeout`] turns a would-be hang (or a
+/// silent, slow `deadlock detected` abort several seconds later) into an
+/// immediate, loud test failure instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_row_first_peer_touching_the_execution_row_never_deadlocks_the_release() {
+    let (url, _container) = setup_db().await;
+
+    let (exec_id, task) = seed_claimed_task(&url, "q1182-abba", "dispatcher-a").await;
+
+    // Connection A: acquire the locks in poison-pill's own order -- task row
+    // first, execution row second -- and hold both for a window long enough
+    // for the dispatch below to reach its blocking release call and start
+    // waiting on the task row.
+    let mut conn_a = connect(&url).await;
+    conn_a
+        .batch_execute("BEGIN")
+        .await
+        .expect("begin should succeed");
+    diesel::sql_query("SELECT id FROM harvest_task_queue WHERE id = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Uuid, _>(task.id)
+        .execute(&mut conn_a)
+        .await
+        .expect("lock the task row first, mirroring quarantine_orphan's own order");
+
+    // The live dispatch cycle suspended having emitted no commands, and the
+    // task row now reads as contended by connection A rather than
+    // transferred -- the same false-positive `ClaimLost` shape as the
+    // sibling lock-contention test above, so the guard's own probe never
+    // blocks.
+    let dispatch_handle = tokio::spawn({
+        let url = url.clone();
+        let task = task.clone();
+        async move {
+            let mut conn = connect(&url).await;
+
+            let ambiguous_task_id = fail_suspended_workflow_if_still_claimed(
+                &mut conn,
+                &task,
+                exec_id,
+                1,
+                "dispatcher-a",
+                "workflow suspended without emitted commands; resumption is not implemented yet",
+            )
+            .await
+            .expect_err("SKIP LOCKED never waits, so the row reads as contended immediately")
+            .suspended_claim_ambiguous()
+            .expect("must be the ambiguous-claim sentinel");
+
+            // The standalone, blocking release -- reached only after
+            // `process_workflow_task`'s whole enclosing transaction (execution
+            // row included) has already ended, so this dispatch holds no lock
+            // at all while it blocks here.
+            queue::release_suspended_workflow_claim(
+                &mut conn,
+                ambiguous_task_id,
+                "dispatcher-a",
+                task.crash_strikes,
+            )
+            .await
+        }
+    });
+
+    // Give the release time to reach and start blocking on the task row
+    // before connection A goes on to also lock the execution row -- if the
+    // fix regressed and the dispatch were somehow holding the execution row
+    // at this point, this is exactly where the second half of the cycle
+    // would close.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn_a)
+        .await
+        .expect(
+            "connection A's own execution-row lock must be acquired uncontended -- the \
+             dispatch never holds it, so there is nothing on this side of a cycle to wait on",
+        );
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    conn_a
+        .batch_execute("COMMIT")
+        .await
+        .expect("release both of connection A's locks");
+
+    // Bounded well above the ~300ms this scenario needs when nothing
+    // deadlocks, and well below Postgres's own multi-second deadlock-timeout
+    // retry/abort cycle -- a regression here fails loudly and immediately
+    // instead of hanging the test suite or surfacing as a slow, confusing
+    // `deadlock detected` database error several seconds later.
+    let released = tokio::time::timeout(Duration::from_secs(5), dispatch_handle)
+        .await
+        .expect("the release must not deadlock against connection A")
+        .expect("the dispatch task must not panic")
+        .expect("the release itself must not error");
+
+    assert!(
+        released,
+        "the claim was never actually lost (only contended), so the release must succeed \
+         once connection A commits"
+    );
+
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "no terminal decision was made on either side of this race; got {history:?}"
+    );
+    let execution = load_execution(&url, exec_id).await;
+    assert_eq!(execution.state, "RUNNING");
+
+    let reloaded = load_tasks(&url, exec_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("the task row survives an undecided dispatch");
+    assert_eq!(
+        reloaded.state, "PENDING",
+        "released back to the queue, never stranded RUNNING under either connection"
     );
 }
 

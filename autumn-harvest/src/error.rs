@@ -612,6 +612,36 @@ pub enum HarvestError {
         /// [`CapabilityMissPhase`].
         phase: CapabilityMissPhase,
     },
+
+    /// A live dispatch cycle suspended making no replay-significant progress,
+    /// and the worker could not confirm it still owns the task's claim
+    /// (issue #1182, Codex review round 2).
+    ///
+    /// This is a **blameless, not-a-real-failure sentinel**, exactly like
+    /// [`Self::HandlerNotRegistered`]: it means "no terminal decision can be
+    /// made from here," never "the workflow failed." It exists so that
+    /// propagating it with `?` out of the *entire* persistence transaction —
+    /// including any lock the transaction holds and any bookkeeping write
+    /// made earlier in the same cycle — forces a full rollback before any
+    /// claim-release attempt runs.
+    ///
+    /// That ordering matters because Postgres does not release a row lock
+    /// when a nested `SAVEPOINT` is released, only when the *outermost*
+    /// transaction ends. The persistence transaction locks the execution row
+    /// (`check_paused_and_park`'s `FOR UPDATE`) for its whole duration, so a
+    /// claim-release attempted *while still inside* that transaction would
+    /// contend for the task row while still holding the execution row —
+    /// the exact ABBA cycle against `poison_pill::quarantine_orphan`'s
+    /// reversed (task-row-first) lock order that `SKIP LOCKED` exists to
+    /// avoid in the first place. Surfacing this variant instead lets the
+    /// transaction roll back and release the execution row *first*; the
+    /// actual release then runs standalone, after `?` and the `.await` on
+    /// the transaction have both returned, with no other lock held.
+    #[error("suspended workflow dispatch made no progress and could not confirm claim ownership")]
+    SuspendedClaimAmbiguous {
+        /// The task-queue row whose ownership could not be confirmed.
+        task_id: Uuid,
+    },
 }
 
 /// Where in a task's dispatch cycle a capability miss (issue #804) was
@@ -1052,6 +1082,23 @@ impl HarvestError {
     pub const fn handler_not_registered(&self) -> Option<(&'static str, &str)> {
         match self {
             Self::HandlerNotRegistered { kind, name, .. } => Some((kind, name.as_str())),
+            _ => None,
+        }
+    }
+
+    /// Classify this error as an **ambiguous suspended-dispatch claim**
+    /// (issue #1182): the dispatch made no progress and could not confirm it
+    /// still owns the task, so no terminal decision was made.
+    ///
+    /// Returns `Some(task_id)` for [`Self::SuspendedClaimAmbiguous`] and
+    /// `None` for every other variant — the same blameless-sentinel pattern as
+    /// [`Self::handler_not_registered`]. The caller uses this to skip the
+    /// ordinary terminal-failure path and instead perform the standalone claim
+    /// release *after* the enclosing transaction has rolled back.
+    #[must_use]
+    pub const fn suspended_claim_ambiguous(&self) -> Option<Uuid> {
+        match self {
+            Self::SuspendedClaimAmbiguous { task_id } => Some(*task_id),
             _ => None,
         }
     }

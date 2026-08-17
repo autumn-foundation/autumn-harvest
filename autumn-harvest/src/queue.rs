@@ -2688,6 +2688,22 @@ pub async fn claim_still_held_for_update(
 /// incapable" (contrast [`release_task_for_capability_miss_query`], which
 /// deliberately clears sticky affinity because the worker it releases FROM
 /// was just found unable to run the handler at all).
+///
+/// Resets `capability_misses = 0, capability_miss_workers = '{}'` (Codex
+/// review round 2 of #1182), matching [`park_workflow_task_sticky_query`]'s
+/// established `reset_capability_misses = true` precedent rather than
+/// [`release_task_for_capability_miss_query`]'s (which always *increments*
+/// it, since that release specifically records THIS worker's own
+/// incapability). This function's caller reaches it only after
+/// `handle_suspended_workflow`'s handler dispatch has already run -- the
+/// same "reached only after the handler lookup succeeded" condition that
+/// makes every park caller except [`crate::worker::requeue_parent_on_
+/// transient_ingest_conflict`] a proof of capability -- so a release here is
+/// unconditionally proof-of-capability too, and stale evidence from a prior,
+/// genuinely incapable worker must not survive it: leaving it would let the
+/// next dispatcher's capability-miss decision undercount the live,
+/// unaccounted fleet by one, based on a peer this exact release just proved
+/// wrong.
 const fn release_suspended_workflow_claim_query() -> &'static str {
     "UPDATE harvest_task_queue \
      SET state = 'PENDING', \
@@ -2698,6 +2714,8 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
          created_at = clock_timestamp(), \
          wake_requested = FALSE, \
          activity_name = NULL, \
+         capability_misses = 0, \
+         capability_miss_workers = '{}', \
          sticky_until = CASE \
              WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
              THEN NOW() + sticky_timeout \
@@ -2726,16 +2744,21 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
 /// row, so it sits forever until an unrelated poison-pill/heartbeat sweep
 /// eventually notices.
 ///
-/// This is called only *after* [`crate::worker::commit_terminal_failure_if_still_claimed`]
-/// has already returned [`crate::worker::TerminalWriteOutcome::ClaimLost`] --
-/// i.e. after its own transaction (which held the execution row first, then
-/// attempted the task row via `SKIP LOCKED`) has already committed and
-/// released every lock it held. This call therefore never holds the execution
-/// row while waiting for the task row: it is a single, standalone task-row
-/// lock acquisition, so it cannot participate in the execution-row/task-row
-/// ABBA cycle `SKIP LOCKED` exists to avoid there (see
-/// [`claim_still_held_for_update`]'s doc comment) -- there is no *second* lock
-/// for it to be the other half of.
+/// This is called only *after* the entire enclosing persistence transaction
+/// -- the one that holds the execution row's `FOR UPDATE` lock for its whole
+/// duration -- has rolled back, in response to
+/// [`crate::error::HarvestError::SuspendedClaimAmbiguous`] propagating out of
+/// [`crate::worker::fail_suspended_workflow_if_still_claimed`] with `?`
+/// (Codex review round 2 of #1182). A nested `SAVEPOINT` release inside that
+/// transaction does not release the execution row, so this release has to
+/// wait for the *outermost* transaction to end, not merely
+/// [`crate::worker::commit_terminal_failure_if_still_claimed`]'s own internal
+/// one. Once it has, this call therefore never holds the execution row while
+/// waiting for the task row: it is a single, standalone task-row lock
+/// acquisition, so it cannot participate in the execution-row/task-row ABBA
+/// cycle `SKIP LOCKED` exists to avoid there (see
+/// [`claim_still_held_for_update`]'s doc comment) -- there is no *second*
+/// lock for it to be the other half of.
 ///
 /// Deliberately **not** `FOR UPDATE SKIP LOCKED`: a plain `UPDATE` blocks
 /// behind whatever transiently holds the row instead of skipping it, then
@@ -4334,6 +4357,14 @@ mod tests {
             "must preserve/refresh sticky affinity like a normal re-pend, not clear \
              it like the capability-miss release (this worker was never found \
              incapable, so there is no reason to stop routing to it)",
+        );
+        assert!(
+            sql.contains("capability_misses = 0") && sql.contains("capability_miss_workers = '{}'"),
+            "a release here is reached only after the handler dispatch already ran, \
+             so it is unconditionally proof of capability -- like every park caller \
+             except the pre-handler-lookup ingest one -- and must reset stale \
+             evidence from a prior incapable worker, matching \
+             park_workflow_task_sticky_query(true)'s established precedent",
         );
     }
 
