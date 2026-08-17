@@ -12176,7 +12176,7 @@ async fn fail_execution_on_error<T>(
     Err(error)
 }
 
-/// Fails a suspended workflow dispatch that made **zero** replay-significant
+/// Fail a suspended workflow dispatch that made **zero** replay-significant
 /// progress -- an empty command set, or a command combination this worker
 /// does not know how to persist -- but only when this worker still holds the
 /// claim (issue #1182).
@@ -12215,9 +12215,16 @@ pub async fn fail_suspended_workflow_if_still_claimed(
         exec_id,
         next_event_id,
     };
-    let write =
-        commit_terminal_failure_if_still_claimed(conn, task, worker_id, error, preloaded, None, |_| {})
-            .await?;
+    let write = commit_terminal_failure_if_still_claimed(
+        conn,
+        task,
+        worker_id,
+        error,
+        preloaded,
+        None,
+        |_| {},
+    )
+    .await?;
     match write {
         TerminalWriteOutcome::Committed(_) => {}
         TerminalWriteOutcome::ClaimLost | TerminalWriteOutcome::EvidenceChanged(_) => {
