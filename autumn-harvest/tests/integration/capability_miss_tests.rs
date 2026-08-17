@@ -64,7 +64,8 @@ use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{
     CapabilityMissPolicy, DbPool, EscalationCommit, EscalationEvidenceRecheck, HandlerRegistry,
     NO_CAPABLE_WORKER_PREFIX, SESSION_PINNED_ESCALATION_MARKER, TerminalWriteOutcome, Worker,
-    WorkerRuntimeConfig, commit_terminal_failure_if_still_claimed, preload_failure_history,
+    WorkerRuntimeConfig, commit_terminal_failure_if_still_claimed,
+    fail_suspended_workflow_if_still_claimed, preload_failure_history,
 };
 use autumn_harvest::{RetryPolicy, WorkflowContext, store};
 
@@ -2795,6 +2796,93 @@ async fn a_claim_lost_mid_dispatch_makes_no_terminal_decision() {
         task.capability_miss_workers,
         Vec::<String>::new(),
         "a dispatch that owns nothing records nothing"
+    );
+}
+
+/// Deterministic companion to
+/// [`a_claim_lost_mid_dispatch_makes_no_terminal_decision`] (issue #1182).
+///
+/// That test relies on winning a real race between a slow in-body database
+/// round trip and `executor::SUSPENSION_TIMEOUT`, so it exercises
+/// [`handle_suspended_workflow`]'s catch-all branch -- reached when a live
+/// dispatch cycle suspends having emitted **zero** commands at all -- only
+/// when the round trip happens to land on the wrong side of that 100 ms
+/// budget. Under a loaded CI runner it reliably does (issue #1182); under a
+/// fast one it can just as reliably not, silently skipping this branch for
+/// months without anyone noticing. This test drives the exact same primitive
+/// the branch now delegates to,
+/// [`fail_suspended_workflow_if_still_claimed`], directly and
+/// unconditionally: the claim theft is committed for real *before* the call,
+/// so there is no timing to win or lose.
+///
+/// Before issue #1182's fix, this branch called `persist_workflow_failure`
+/// with no ownership check at all, so a stale dispatcher whose claim had
+/// already moved to another worker would terminally fail the run regardless.
+#[tokio::test]
+async fn a_stale_dispatcher_with_zero_emitted_commands_makes_no_terminal_decision_when_the_claim_moved()
+ {
+    let (url, _container) = setup_db().await;
+
+    let (exec_id, task) = seed_claimed_task(&url, "q1182-empty-commands", "dispatcher-a").await;
+
+    // The claim moves to another worker while this dispatcher is still
+    // mid-flight -- exactly the shape of a concurrent poison-pill reclaim, an
+    // operator action, or (issue #1182) a slow in-body database round trip
+    // racing the same row. `task` is the STALE snapshot `dispatcher-a`
+    // claimed with; it has no way to know this happened.
+    let mut mover = connect(&url).await;
+    diesel::sql_query("UPDATE harvest_task_queue SET worker_id = 'thief' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task.id)
+        .execute(&mut mover)
+        .await
+        .expect("transfer the claim");
+
+    // The live dispatch cycle suspended having emitted no commands at all --
+    // the shape produced when a handler's whole `SUSPENSION_TIMEOUT` budget is
+    // spent on something other than a command-emitting await point. This is
+    // `handle_suspended_workflow`'s catch-all `else` branch, driven here via
+    // the exact error text it builds for an empty command set.
+    let error = "workflow suspended without emitted commands; resumption is not implemented yet";
+    let mut conn = connect(&url).await;
+    fail_suspended_workflow_if_still_claimed(
+        &mut conn,
+        &task,
+        exec_id,
+        1, // next_event_id: irrelevant on ClaimLost, and re-derived under the guard
+        "dispatcher-a",
+        error,
+    )
+    .await
+    .expect("the guarded write must not error");
+
+    // Nothing was written: the row and run the new owner picked up are
+    // untouched.
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "a dispatcher that lost the claim must append no terminal event; got {history:?}"
+    );
+    let execution = load_execution(&url, exec_id).await;
+    assert_eq!(
+        execution.state, "RUNNING",
+        "a dispatcher that no longer owns the row must not fail the run it \
+         stopped being responsible for"
+    );
+    let reloaded = load_tasks(&url, exec_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("the task row survives an undecided dispatch");
+    assert_eq!(
+        reloaded.state, "RUNNING",
+        "the stolen row belongs to its new owner, not to this dispatch"
+    );
+    assert_eq!(
+        reloaded.worker_id.as_deref(),
+        Some("thief"),
+        "the claim transfer must be untouched by the stale dispatcher's write"
     );
 }
 

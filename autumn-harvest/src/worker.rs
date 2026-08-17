@@ -12134,22 +12134,15 @@ async fn handle_suspended_workflow(
         .await
     } else {
         let error = suspended_workflow_error(commands);
-        persist_workflow_failure(
+        fail_suspended_workflow_if_still_claimed(
             conn,
-            context.persistence.task.id,
+            context.persistence.task,
             context.persistence.exec_id,
             context.persistence.next_event_id,
             context.persistence.worker_id,
             &error,
-            None,
-            None,
-            None,
-            None,
-            None,
-            crate::types::Priority::default(),
         )
         .await
-        .map(|_| ())
     };
 
     fail_execution_on_error(
@@ -12181,6 +12174,62 @@ async fn fail_execution_on_error<T>(
     }
     fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
     Err(error)
+}
+
+/// Fails a suspended workflow dispatch that made **zero** replay-significant
+/// progress -- an empty command set, or a command combination this worker
+/// does not know how to persist -- but only when this worker still holds the
+/// claim (issue #1182).
+///
+/// [`handle_suspended_workflow`]'s catch-all branch used to reach straight for
+/// [`persist_workflow_failure`], with no ownership recheck at all. A live
+/// dispatch that suspends empty-handed because it was still mid-flight on
+/// some other I/O -- a slow downstream call, a database round trip -- when
+/// [`crate::executor::SUSPENSION_TIMEOUT`] elapses would then be failed
+/// terminally under the **stale** `worker_id`, even when the row had already
+/// changed hands to a concurrent poison-pill reclaim, an operator action, or
+/// exactly the claim-theft race issue #804's round-28 fix guards the
+/// `AfterHandler` capability-miss branch against. That guard covers only the
+/// path reached via [`persist_scheduled_activities`]; a handler that never
+/// got far enough to push a single command skips that branch and lands here,
+/// where nothing checked the claim.
+///
+/// This reuses the same commit-if-still-claimed guarantee
+/// ([`commit_terminal_failure_if_still_claimed`]) with no escalation
+/// attached, so a [`TerminalWriteOutcome::ClaimLost`] result writes nothing
+/// and this dispatcher makes no terminal decision -- the row's new owner is
+/// free to drive the run to completion. `EvidenceChanged` cannot occur here
+/// (it is only produced when an `escalation` is supplied) but is handled
+/// identically for completeness and to keep this function robust to a future
+/// change in that guarantee.
+#[doc(hidden)]
+pub async fn fail_suspended_workflow_if_still_claimed(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    worker_id: &str,
+    error: &str,
+) -> HarvestResult<()> {
+    let preloaded = PreloadedFailureHistory::Loaded {
+        exec_id,
+        next_event_id,
+    };
+    let write =
+        commit_terminal_failure_if_still_claimed(conn, task, worker_id, error, preloaded, None, |_| {})
+            .await?;
+    match write {
+        TerminalWriteOutcome::Committed(_) => {}
+        TerminalWriteOutcome::ClaimLost | TerminalWriteOutcome::EvidenceChanged(_) => {
+            tracing::info!(
+                task_id = %task.id,
+                queue = %task.queue_name,
+                "a suspended workflow dispatch made no replay-significant progress, but the \
+                 claim moved to another worker in the meantime; making no terminal decision"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Terminal-fail wrapper for the `process_workflow_task` drive loop that also
