@@ -327,7 +327,7 @@ HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 * Issue #621 — `GET /workflows/{id}/tree`, whose `store::load_workflow_children_batch`
   is the pre-existing, already-shipped precedent this fix mirrors.
 
-[before-stats]: ../perf-artifacts/workflow-children-traversal/before-pg_stat_statements.txt
-[before-single]: ../perf-artifacts/workflow-children-traversal/before-explain-single-parent.txt
-[after-stats]: ../perf-artifacts/workflow-children-traversal/after-pg_stat_statements.txt
-[after-batched]: ../perf-artifacts/workflow-children-traversal/after-explain-batched-frontier.txt
+[before-stats]: perf-artifacts/workflow-children-traversal/before-pg_stat_statements.txt
+[before-single]: perf-artifacts/workflow-children-traversal/before-explain-single-parent.txt
+[after-stats]: perf-artifacts/workflow-children-traversal/after-pg_stat_statements.txt
+[after-batched]: perf-artifacts/workflow-children-traversal/after-explain-batched-frontier.txt
