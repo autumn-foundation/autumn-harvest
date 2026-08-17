@@ -2096,6 +2096,146 @@ pub(crate) fn remaining_secs_until(deadline: DateTime<Utc>, now: DateTime<Utc>) 
     u64::try_from(secs.saturating_add(round_up)).unwrap_or(u64::MAX)
 }
 
+/// Reserved `side_effect` name prefix for business-day freezes (issue #806).
+///
+/// Follows the `__harvest_deadline_probe` convention (issue #772) so an author's
+/// own `ctx.side_effect("business_day:x", ..)` can never collide with an
+/// engine-recorded business-day resolution.
+pub(crate) const BUSINESS_DAY_SIDE_EFFECT_PREFIX: &str = "__harvest_business_day:";
+
+/// The frozen outcome of a business-day resolution (issue #806).
+///
+/// Serialized into a single `SideEffectRecorded { kind: Custom, name:
+/// "__harvest_business_day:{seq}:{id}" }` event. The `v` tag follows the
+/// `harvest_activity_failure_v1` precedent so the payload schema can evolve
+/// without breaking already-recorded histories.
+///
+/// **Every arm is a deterministic function of `(anchor, n, calendar snapshot)`**
+/// — including the rejections — so replaying the recorded value reproduces the
+/// caller's `Result` exactly, without ever re-reading the calendar.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct FrozenBusinessDay {
+    /// Payload schema version.
+    v: u8,
+    #[serde(flatten)]
+    outcome: FrozenBusinessDayOutcome,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub(crate) enum FrozenBusinessDayOutcome {
+    /// The resolution succeeded.
+    Resolved {
+        anchor: DateTime<Utc>,
+        deadline: DateTime<Utc>,
+        calendar: String,
+        /// Non-business dates stepped over — the audit trail that answers
+        /// "why did this land on Tuesday?" from history alone.
+        skipped: Vec<chrono::NaiveDate>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        coverage_end: Option<chrono::NaiveDate>,
+    },
+    /// The named calendar is not in the registered snapshot.
+    UnknownCalendar {
+        anchor: DateTime<Utc>,
+        calendar: String,
+    },
+    /// The calendar could not cover the requested span.
+    Rejected {
+        anchor: DateTime<Utc>,
+        calendar: String,
+        rejection: crate::calendar::BusinessDayRejection,
+    },
+}
+
+impl FrozenBusinessDay {
+    fn resolved(
+        anchor: DateTime<Utc>,
+        calendar: String,
+        res: &crate::calendar::BusinessDayResolution,
+        coverage_end: Option<chrono::NaiveDate>,
+    ) -> Self {
+        Self {
+            v: 1,
+            outcome: FrozenBusinessDayOutcome::Resolved {
+                anchor,
+                deadline: res.deadline,
+                calendar,
+                skipped: res.skipped.clone(),
+                coverage_end,
+            },
+        }
+    }
+
+    const fn unknown_calendar(anchor: DateTime<Utc>, calendar: String) -> Self {
+        Self {
+            v: 1,
+            outcome: FrozenBusinessDayOutcome::UnknownCalendar { anchor, calendar },
+        }
+    }
+
+    const fn rejected(
+        anchor: DateTime<Utc>,
+        calendar: String,
+        rejection: crate::calendar::BusinessDayRejection,
+    ) -> Self {
+        Self {
+            v: 1,
+            outcome: FrozenBusinessDayOutcome::Rejected {
+                anchor,
+                calendar,
+                rejection,
+            },
+        }
+    }
+
+    /// The anchor captured at resolution time, whichever arm was frozen.
+    const fn anchor(&self) -> DateTime<Utc> {
+        match &self.outcome {
+            FrozenBusinessDayOutcome::Resolved { anchor, .. }
+            | FrozenBusinessDayOutcome::UnknownCalendar { anchor, .. }
+            | FrozenBusinessDayOutcome::Rejected { anchor, .. } => *anchor,
+        }
+    }
+
+    /// Map the frozen record back to the caller's `Result`.
+    ///
+    /// A rejection maps to a typed `HarvestError` — **never** to a zero-duration
+    /// "fire now", which would silently escalate immediately instead of at the
+    /// intended business deadline.
+    fn into_result(self) -> HarvestResult<ResolvedBusinessDay> {
+        let anchor = self.anchor();
+        match self.outcome {
+            FrozenBusinessDayOutcome::Resolved { deadline, .. } => {
+                Ok(ResolvedBusinessDay { anchor, deadline })
+            }
+            FrozenBusinessDayOutcome::UnknownCalendar { calendar, .. } => {
+                Err(HarvestError::NotFound(format!(
+                    "business calendar '{calendar}' is not in the registered BusinessCalendars \
+                     snapshot; this resolution is frozen in history, so fixing the name requires \
+                     a workflow reset"
+                )))
+            }
+            FrozenBusinessDayOutcome::Rejected {
+                calendar,
+                rejection,
+                ..
+            } => Err(HarvestError::Config(format!(
+                "business calendar '{calendar}': {rejection}; this resolution is frozen in \
+                 history, so extending the calendar requires a workflow reset"
+            ))),
+        }
+    }
+}
+
+/// A successfully frozen business-day resolution.
+pub(crate) struct ResolvedBusinessDay {
+    /// The instant the resolution was anchored on.
+    pub(crate) anchor: DateTime<Utc>,
+    /// The resolved fire instant.
+    pub(crate) deadline: DateTime<Utc>,
+}
+
 /// Options for [`WorkflowContext::create_session`] (issue #606).
 ///
 /// # Example
@@ -2402,6 +2542,22 @@ pub struct WorkflowContext {
     /// so each session has a stable, unique `session:{seq}` marker name across
     /// replays, mirroring `fan_out_seq`/`race_seq`.
     session_seq: Mutex<u32>,
+    /// Monotonically increasing counter for naming business-day freeze
+    /// side-effects (issue #806). Each `timer_business_days` /
+    /// `business_days_from_now` call increments this once so each *invocation*
+    /// gets a distinct `__harvest_business_day:{seq}:{id}` name across replays,
+    /// mirroring `fan_out_seq`/`race_seq`/`session_seq`.
+    ///
+    /// This is load-bearing, not cosmetic: the prologue's "is this call already
+    /// frozen?" peek is a whole-history *name* scan, while `side_effect` matches
+    /// *positionally*. Keying the name on the caller-supplied `id` alone would
+    /// make those two questions diverge the moment an `id` is reused across
+    /// iterations of a loop — the second iteration is a genuinely fresh dispatch
+    /// but the peek would find the first iteration's freeze and skip the
+    /// prologue's snapshot guard, durably recording a rejection that can only be
+    /// undone by a workflow reset. The per-invocation seq makes the name unique,
+    /// so the name scan and the positional match answer the same question.
+    business_day_seq: Mutex<u32>,
     /// Per-cycle 0-based local index for progress `seq` generation (issue #791).
     /// Incremented once per live [`publish_progress`](Self::publish_progress)
     /// call; combined with the loaded-history-length epoch by
@@ -2972,6 +3128,7 @@ impl WorkflowContext {
             child_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
+            business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
@@ -3122,6 +3279,7 @@ impl WorkflowContext {
             child_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
+            business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
@@ -3187,6 +3345,7 @@ impl WorkflowContext {
             child_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
+            business_day_seq: Mutex::new(0),
             progress_local_index: std::sync::atomic::AtomicU64::new(0),
             log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
             log_commands_queued: std::sync::atomic::AtomicU64::new(0),
@@ -5056,6 +5215,18 @@ impl WorkflowContext {
         *seq
     }
 
+    /// Allocate the next business-day freeze sequence number (issue #806;
+    /// mirrors `next_fan_out_seq`/`next_race_seq`/`next_session_seq`). Numbers
+    /// are never released once allocated.
+    fn next_business_day_seq(&self) -> u32 {
+        let mut seq = self
+            .business_day_seq
+            .lock()
+            .expect("business_day_seq lock poisoned");
+        *seq += 1;
+        *seq
+    }
+
     /// `true` when this context is a [`WorkflowReplayer`](crate::testing::WorkflowReplayer)
     /// strict/canary probe rather than an engine decision cycle.
     ///
@@ -5884,6 +6055,265 @@ impl WorkflowContext {
         let now = self.system_now();
         let remaining_secs = remaining_secs_until(deadline, now);
         self.timer(timer_id, remaining_secs).await
+    }
+
+    // ── Business-day timers (issue #806) ──────────────────────────────────
+
+    /// The wall-clock instant a business-day resolution is anchored on.
+    ///
+    /// Production reads the real clock. Under the test harness (when the
+    /// advancing virtual clock is enabled) it reads that clock instead, so
+    /// business-day tests are hermetic across all seven weekdays rather than
+    /// resolving differently depending on the day CI happens to run.
+    ///
+    /// Mirrors [`Self::deadline_frontier_now_millis`]'s precedent (issue #772).
+    /// The value is captured **inside** the freeze closure and never escapes as
+    /// its own event, so a failed resolution leaves no orphaned anchor behind.
+    fn business_day_anchor(&self) -> DateTime<Utc> {
+        #[cfg(any(test, feature = "testing"))]
+        if self.timer_clock_elapsed_secs.is_some() {
+            return self.now();
+        }
+        Utc::now()
+    }
+
+    /// Resolve and **freeze** a business-day deadline, without arming a timer.
+    ///
+    /// Records exactly one `SideEffectRecorded` event named
+    /// `__harvest_business_day:{seq}:{id}` carrying the anchor, the resolved deadline,
+    /// the calendar name, and the dates stepped over. On replay the recorded
+    /// value is returned verbatim and the resolution is **never re-run**, so an
+    /// operator calendar edit can never move an already-resolved deadline.
+    ///
+    /// Business days are computed on **UTC dates** and the deadline preserves
+    /// the anchor's UTC time-of-day; Saturday and Sunday are always non-business
+    /// days. See [`Self::timer_business_days`] for the full semantics.
+    ///
+    /// `id` scopes the freeze to this call site. Reusing one `id` for two
+    /// distinct call sites still replays correctly (side effects match in
+    /// command order) but produces worse drift diagnostics — prefer a distinct
+    /// `id` per call site.
+    ///
+    /// # Errors
+    ///
+    /// **Prologue** errors record nothing, so a redeploy that fixes the
+    /// configuration lets the call succeed with no per-execution reset:
+    ///
+    /// - [`HarvestError::Config`] when no [`BusinessCalendars`](crate::BusinessCalendars)
+    ///   snapshot is registered on the builder, or `n` exceeds
+    ///   [`MAX_BUSINESS_DAYS`](crate::MAX_BUSINESS_DAYS).
+    /// - [`HarvestError::NotFound`] when `calendar` is not in the registered
+    ///   snapshot — the same class of deployment misconfiguration as registering
+    ///   no snapshot at all.
+    ///
+    /// **Frozen** errors are recorded and replay identically forever; recover
+    /// with a workflow reset:
+    ///
+    /// - [`HarvestError::Config`] when the calendar cannot cover the requested
+    ///   span (see [`BusinessCalendars::with_calendar_covering`](crate::BusinessCalendars::with_calendar_covering)).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub fn business_days_from_now(
+        &self,
+        id: &str,
+        n: u32,
+        calendar: &str,
+    ) -> HarvestResult<DateTime<Utc>> {
+        Ok(self.freeze_business_day(id, n, calendar, false)?.deadline)
+    }
+
+    /// Arm a durable timer that fires `n` business days from now.
+    ///
+    /// The one-call answer to "escalate this ticket after 2 business days":
+    /// weekends and the named calendar's holidays are stepped over, and the
+    /// resolved instant is frozen so it survives replay, worker failover, and
+    /// any later operator edit to the calendar.
+    ///
+    /// Returns the resolved fire instant.
+    ///
+    /// # Semantics
+    ///
+    /// - **Weekends are always non-business days**, whatever the calendar is
+    ///   named — the named calendar contributes *holidays*. (This deliberately
+    ///   differs from the scheduler's `"weekends-off"` naming convention; see
+    ///   [`crate::is_business_day`].)
+    /// - **UTC dates, anchor time-of-day.** Business days are counted on UTC
+    ///   dates and the deadline preserves the anchor's UTC time-of-day. This
+    ///   matches the `DATE`-typed calendar exclusions and is DST-free.
+    ///   *Known limitation:* a deployment whose business hours straddle UTC
+    ///   midnight is off by one business day near that boundary; a per-call
+    ///   timezone is a named follow-up.
+    /// - **`n = 0` rolls forward**: fires at the anchor when the anchor's UTC
+    ///   date is a business day, otherwise at the next business date at the same
+    ///   time-of-day. It never fires "one business day later".
+    /// - **Coverage horizon.** A calendar registered with a *declared* horizon
+    ///   (`with_calendar_covering`, and the shipped built-ins) only answers for
+    ///   dates it covers; a resolution needing a later date is *rejected*, never
+    ///   silently answered weekends-only. The shipped built-ins declare
+    ///   [`BusinessCalendars::BUILTIN_COVERAGE_END`](crate::BusinessCalendars::BUILTIN_COVERAGE_END)
+    ///   (**2026-12-31**). A calendar registered with plain `with_calendar` has
+    ///   no declared horizon and is never rejected on coverage grounds.
+    ///
+    /// # Determinism
+    ///
+    /// The resolution runs **once**, on the first live execution, from an anchor
+    /// captured inside the freeze — never a fresh `Utc::now()` on replay. It is
+    /// recorded in the existing `SideEffectRecorded` event (issue #384) and the
+    /// wait is carried by the existing `TimerStarted` event: **no new
+    /// `WorkflowEvent` variant and no migration**.
+    ///
+    /// # Composition
+    ///
+    /// Sequential composition is supported (arm one, await it, arm the next).
+    /// Racing a business-day timer against `receive_signal_timeout` in a single
+    /// suspension is **not** supported — the engine allows exactly one
+    /// `StartTimer` per suspension batch and rejects the mixed batch loudly.
+    ///
+    /// Registration is one builder call:
+    /// `HarvestBuilder::state(BusinessCalendars::builtin())`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::business_days_from_now`], plus
+    /// [`HarvestError::NonDeterministic`] if the timer at this history position
+    /// does not match, and [`HarvestError::Cancelled`] if the oneshot sender was
+    /// dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// // Escalate an unacknowledged ticket after two business days:
+    /// ctx.timer_business_days("sla-escalation", 2, "us-federal-holidays").await?;
+    /// ```
+    pub async fn timer_business_days(
+        &self,
+        timer_id: &str,
+        n: u32,
+        calendar: &str,
+    ) -> HarvestResult<DateTime<Utc>> {
+        let frozen = self.freeze_business_day(timer_id, n, calendar, true)?;
+        let remaining_secs = remaining_secs_until(frozen.deadline, frozen.anchor);
+        self.timer(timer_id, remaining_secs).await?;
+        Ok(frozen.deadline)
+    }
+
+    /// Shared prologue + freeze for the two business-day entry points.
+    ///
+    /// **DO NOT REORDER.** Every validation that is *not* a deterministic
+    /// function of the frozen record must run BEFORE the `side_effect` call, so
+    /// a rejected call records **zero** commands. A validation that slipped
+    /// below the freeze would leave an orphaned `SideEffectRecorded` in history
+    /// with no matching consumer on the next replay cycle (issue #806 C1/C2).
+    fn freeze_business_day(
+        &self,
+        id: &str,
+        n: u32,
+        calendar: &str,
+        arms_timer: bool,
+    ) -> HarvestResult<ResolvedBusinessDay> {
+        // (1) Bound `n` before anything else: a typo'd `u32::MAX` must be a loud
+        //     rejection, not a multi-million-iteration stall inside the 100 ms
+        //     suspension budget.
+        if n > crate::calendar::MAX_BUSINESS_DAYS {
+            return Err(HarvestError::Config(format!(
+                "timer_business_days: n = {n} exceeds MAX_BUSINESS_DAYS ({})",
+                crate::calendar::MAX_BUSINESS_DAYS
+            )));
+        }
+        // (2) Claim the timer-id namespace before the freeze, so a collision with
+        //     the cancellable `start_timer` API cannot record an orphaned freeze.
+        //
+        //     Only for the timer-arming entry point. `business_days_from_now`
+        //     arms no timer — it records only `__harvest_business_day:{seq}:{id}`,
+        //     a namespace disjoint from `harvest_timers` — so rejecting it here
+        //     would force an author to rename an id for no reason, citing three
+        //     APIs the call never touches.
+        if arms_timer && self.timer_logically_armed(id).is_some() {
+            return Err(HarvestError::Config(format!(
+                "timer id '{id}' is used for both a cancellable start_timer/reset_timer \
+                 and a classic ctx.timer/sleep_until/timer_business_days in the same \
+                 workflow task — use distinct timer ids across the two APIs"
+            )));
+        }
+        // (3) On a FRESH dispatch the snapshot must be registered on this worker;
+        //     absent means the primitive is unavailable here (a deployment
+        //     condition), so this is a prologue error and NOT frozen — a redeploy
+        //     fixes it and the call retries cleanly.
+        //
+        //     On REPLAY the snapshot is legitimately absent: replay and canary
+        //     contexts carry empty shared state by design, and the frozen value
+        //     answers instead. Gating on the read-only history peek is therefore
+        //     load-bearing — without it every replay of a business-day history
+        //     would fail on a worker that does not happen to hold the snapshot,
+        //     which is exactly the deploy-canary false-failure this design exists
+        //     to avoid. The peek is non-consuming; `side_effect` below still
+        //     matches and consumes the event itself.
+        //
+        //     The name carries a per-invocation sequence number so the whole-history
+        //     name scan and `side_effect`'s positional match answer the SAME
+        //     question. Keying on `id` alone would let a loop that reuses one id
+        //     find iteration 1's freeze while dispatching iteration 2 freshly,
+        //     skipping this guard and durably recording a rejection.
+        let freeze_name = format!(
+            "{BUSINESS_DAY_SIDE_EFFECT_PREFIX}{}:{id}",
+            self.next_business_day_seq()
+        );
+        let already_frozen = {
+            let matcher = self
+                .matcher
+                .lock()
+                .expect("history matcher lock poisoned in freeze_business_day");
+            matcher.history_contains_custom_side_effect(&freeze_name)
+        };
+        let snapshot = self.state::<crate::calendar::BusinessCalendars>();
+        if !already_frozen {
+            let Some(cals) = snapshot else {
+                return Err(HarvestError::Config(format!(
+                    "timer_business_days('{calendar}'): no BusinessCalendars snapshot is \
+                     registered on this worker — add `.state(BusinessCalendars::builtin())` \
+                     (or a snapshot loaded from the database) to the HarvestBuilder"
+                )));
+            };
+            // A calendar NAME that is not in the snapshot is the same class of
+            // deployment misconfiguration as no snapshot at all (a typo, or a
+            // worker built from a partial registration), so it gets the same
+            // retryable treatment: record nothing, fix the name, redeploy. The
+            // alternative — freezing it — would durably poison every in-flight
+            // execution and force a per-execution workflow reset even after the
+            // operator corrects the registration.
+            if cals.get(calendar).is_none() {
+                let mut known: Vec<&str> = cals.names().collect();
+                known.sort_unstable();
+                return Err(HarvestError::NotFound(format!(
+                    "business calendar '{calendar}' is not in the registered BusinessCalendars \
+                     snapshot (registered: {known:?}) — fix the calendar name (or register it) \
+                     and redeploy; nothing was recorded, so the call retries cleanly"
+                )));
+            }
+        }
+        // (4) Freeze. The anchor is captured INSIDE the closure so no separate
+        //     `Now` event can be orphaned by a later failure, and the closure is
+        //     never invoked on replay — which is what makes an operator calendar
+        //     edit structurally unable to move an armed deadline.
+        let holidays = snapshot.and_then(|c| c.get(calendar).cloned());
+        let coverage_end = snapshot.and_then(|c| c.coverage_end(calendar));
+        let calendar_owned = calendar.to_string();
+        let frozen: FrozenBusinessDay = self.side_effect(&freeze_name, move || {
+            let anchor = self.business_day_anchor();
+            let Some(holidays) = holidays else {
+                return FrozenBusinessDay::unknown_calendar(anchor, calendar_owned);
+            };
+            match crate::calendar::add_business_days_bounded(anchor, n, &holidays, coverage_end) {
+                Ok(res) => FrozenBusinessDay::resolved(anchor, calendar_owned, &res, coverage_end),
+                Err(rejection) => FrozenBusinessDay::rejected(anchor, calendar_owned, rejection),
+            }
+        })?;
+        frozen.into_result()
     }
 
     // ── Cancellable / renewable durable timers (issue #768) ───────────────
@@ -18046,6 +18476,671 @@ mod tests {
             "replay must not emit new commands"
         );
         assert!(ctx.take_deferred_nd_error().is_none());
+    }
+
+    // ── timer_business_days (issue #806) ──────────────────────────────────
+
+    /// A live context frozen at `anchor`, carrying `cals` in shared state.
+    ///
+    /// The `WorkflowStarted` timestamp seeds `start_time`, and
+    /// `with_advancing_timer_clock` makes `business_day_anchor()` read that
+    /// virtual clock instead of the real wall clock — so every business-day
+    /// test is hermetic across all seven weekdays (issue #806 R6).
+    #[cfg(test)]
+    fn bd_ctx(anchor: DateTime<Utc>, cals: crate::calendar::BusinessCalendars) -> WorkflowContext {
+        bd_ctx_with_events(anchor, cals, vec![])
+    }
+
+    #[cfg(test)]
+    fn bd_ctx_with_events(
+        anchor: DateTime<Utc>,
+        cals: crate::calendar::BusinessCalendars,
+        mut tail: Vec<WorkflowEvent>,
+    ) -> WorkflowContext {
+        let mut events = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: anchor,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+        events.append(&mut tail);
+        let mut map: SharedStateMap = HashMap::new();
+        map.insert(
+            std::any::TypeId::of::<crate::calendar::BusinessCalendars>(),
+            Box::new(cals),
+        );
+        WorkflowContext::for_replay_with_state(ExecutionId::new(), events, std::sync::Arc::new(map))
+            .with_advancing_timer_clock()
+    }
+
+    #[cfg(test)]
+    fn bd_utc(s: &str) -> DateTime<Utc> {
+        s.parse::<DateTime<Utc>>().expect("valid RFC 3339 instant")
+    }
+
+    #[cfg(test)]
+    fn bd_poll_pending(fut: impl std::future::Future<Output = HarvestResult<DateTime<Utc>>>) {
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut poll_cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+            "a live business-day timer must suspend on the durable timer"
+        );
+    }
+
+    #[tokio::test]
+    async fn business_day_reused_id_second_call_is_still_a_prologue_error() {
+        // REVIEW P2 (replay): the prologue's "is a snapshot registered?" guard
+        // was skipped whenever ANY freeze under this name already existed in
+        // history -- a GLOBAL name scan. But `side_effect` matches
+        // POSITIONALLY, so in the documented poll-loop idiom
+        //
+        //     loop { ctx.timer_business_days("poll", 1, cal).await?; ... }
+        //
+        // iteration 2+ is a FRESH dispatch that the scan nonetheless reported as
+        // already-frozen. On a worker without the snapshot it therefore fell
+        // through to the freeze with `holidays: None`, DURABLY recording an
+        // `UnknownCalendar` rejection that replays forever and needs a workflow
+        // reset -- precisely the permanent poisoning the guard exists to
+        // prevent, and the opposite of the retryable prologue error iteration 1
+        // would have produced.
+        //
+        // Build iteration 1's real recorded history WITH a snapshot, then
+        // re-drive it WITHOUT one.
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let warm = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        bd_poll_pending(warm.timer_business_days("poll", 1, "biz"));
+        let freeze_name = match &warm.drain_commands()[0] {
+            WorkflowCommand::RecordSideEffect { name: Some(n), .. } => n.clone(),
+            other => panic!("expected a freeze command, got {other:?}"),
+        };
+
+        // History as iteration 1 left it: freeze + armed timer + fired timer.
+        let recorded = vec![
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: Some(freeze_name),
+                value: serde_json::to_value(FrozenBusinessDay::resolved(
+                    bd_utc("2026-07-02T09:00:00Z"),
+                    "biz".into(),
+                    &crate::calendar::BusinessDayResolution {
+                        deadline: bd_utc("2026-07-03T09:00:00Z"),
+                        skipped: vec![],
+                    },
+                    None,
+                ))
+                .expect("serializes"),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("poll"),
+                duration_secs: 86_400,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: crate::types::TimerId::new("poll"),
+            },
+        ];
+
+        // A worker that does NOT hold the snapshot (heterogeneous fleet
+        // mid-deploy, or the DB-loaded-snapshot path).
+        let ctx = WorkflowContext::for_replay_with_state(
+            ExecutionId::new(),
+            {
+                let mut ev = vec![WorkflowEvent::WorkflowStarted {
+                    input: Value::Null,
+                    timestamp: bd_utc("2026-07-02T09:00:00Z"),
+                    last_completion_result: None,
+                    last_error: None,
+                    scheduled_time: None,
+                }];
+                ev.extend(recorded);
+                ev
+            },
+            std::sync::Arc::new(HashMap::new()),
+        )
+        .with_advancing_timer_clock();
+
+        // Iteration 1 replays from the frozen record -- no snapshot needed.
+        ctx.timer_business_days("poll", 1, "biz")
+            .await
+            .expect("iteration 1 must replay from its frozen record");
+
+        // Iteration 2 is a FRESH dispatch. It must be a retryable PROLOGUE
+        // error recording ZERO commands -- never a durable frozen rejection.
+        let err = ctx
+            .timer_business_days("poll", 1, "biz")
+            .await
+            .expect_err("iteration 2 is a fresh dispatch with no snapshot");
+        assert!(
+            matches!(&err, HarvestError::Config(m) if m.contains("no BusinessCalendars snapshot")),
+            "a fresh dispatch without a snapshot must be the RETRYABLE prologue \
+             Config error, not a frozen rejection; got {err:?}"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "a prologue rejection must record ZERO commands"
+        );
+    }
+
+    #[tokio::test]
+    async fn timer_business_days_live_records_one_freeze_then_timer() {
+        // Thursday 2026-07-02T09:00Z + 2 business days = Monday 2026-07-06T09:00Z
+        // (Sat 07-04 / Sun 07-05 stepped over) = 4 calendar days = 345_600s.
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+
+        bd_poll_pending(ctx.timer_business_days("t1", 2, "biz"));
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(
+            cmds.len(),
+            2,
+            "exactly ONE freeze + ONE timer -- no separate Now capture: {cmds:?}"
+        );
+        assert!(
+            matches!(
+                &cmds[0],
+                WorkflowCommand::RecordSideEffect {
+                    kind: SideEffectKind::Custom,
+                    name: Some(n),
+                    ..
+                } if n == "__harvest_business_day:1:t1"
+            ),
+            "first command must be the single business-day freeze, got {cmds:?}"
+        );
+        let WorkflowCommand::StartTimer {
+            timer_id,
+            duration_secs,
+            ..
+        } = &cmds[1]
+        else {
+            panic!("second command must be StartTimer, got {cmds:?}");
+        };
+        assert_eq!(timer_id.as_str(), "t1");
+        assert_eq!(*duration_secs, 4 * 86_400, "Thu 09:00Z -> Mon 09:00Z");
+    }
+
+    #[tokio::test]
+    async fn timer_business_days_skips_a_holiday() {
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar(
+            "biz",
+            [chrono::NaiveDate::from_ymd_opt(2026, 7, 6).expect("valid")],
+        );
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+
+        bd_poll_pending(ctx.timer_business_days("t1", 2, "biz"));
+
+        let cmds = ctx.drain_commands();
+        let WorkflowCommand::StartTimer { duration_secs, .. } = &cmds[1] else {
+            panic!("expected StartTimer, got {cmds:?}");
+        };
+        assert_eq!(
+            *duration_secs,
+            5 * 86_400,
+            "Mon 07-06 is a holiday -> Tue 07-07"
+        );
+    }
+
+    #[tokio::test]
+    async fn business_days_from_now_records_only_the_freeze() {
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+
+        let deadline = ctx
+            .business_days_from_now("d1", 2, "biz")
+            .expect("resolves");
+        assert_eq!(deadline, bd_utc("2026-07-06T09:00:00Z"));
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1, "no timer is armed: {cmds:?}");
+        assert!(matches!(
+            &cmds[0],
+            WorkflowCommand::RecordSideEffect {
+                kind: SideEffectKind::Custom,
+                name: Some(n),
+                ..
+            } if n == "__harvest_business_day:1:d1"
+        ));
+    }
+
+    // ── Prologue records NOTHING (issue #806 C1/C2) ───────────────────────
+
+    #[tokio::test]
+    async fn business_day_missing_calendars_records_no_command() {
+        // No BusinessCalendars in shared state: the primitive is unavailable on
+        // this worker. This must be a PROLOGUE error -- zero commands -- so a
+        // redeploy that registers the snapshot lets the call succeed. A freeze
+        // here would poison the run forever over a deployment slip.
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .timer_business_days("t1", 2, "biz")
+            .await
+            .expect_err("must reject");
+        assert!(
+            matches!(&err, HarvestError::Config(m) if m.contains("BusinessCalendars")),
+            "expected a Config error naming the missing snapshot, got {err:?}"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "a prologue rejection must record NOTHING -- an orphaned freeze would \
+             have no consumer on the next replay cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn business_day_namespace_collision_records_no_command() {
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        // Arm a cancellable timer on the same id first (issue #768 namespace).
+        let _handle = ctx.start_timer("t1", 60);
+        let before = ctx.drain_commands().len();
+        assert_eq!(before, 1, "start_timer records its own arm command");
+
+        let err = ctx
+            .timer_business_days("t1", 2, "biz")
+            .await
+            .expect_err("must reject the cross-API id collision");
+        assert!(
+            matches!(&err, HarvestError::Config(m) if m.contains("distinct timer ids")),
+            "expected the cross-API collision Config error, got {err:?}"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "the collision check must be HOISTED ABOVE the freeze -- otherwise a \
+             collision records an orphaned SideEffectRecorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn business_day_invalid_n_records_no_command() {
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        let err = ctx
+            .timer_business_days("t1", u32::MAX, "biz")
+            .await
+            .expect_err("must reject an out-of-range n");
+        assert!(
+            matches!(&err, HarvestError::Config(m) if m.contains("MAX_BUSINESS_DAYS")),
+            "expected a Config error naming the bound, got {err:?}"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "an out-of-range n must record nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_failure_path_pushes_zero_start_timer_commands() {
+        // The other half of the "never silently fire now" pair: a regression
+        // that mapped a rejection to Ok(0) would still pass
+        // `n_zero_on_business_day_yields_duration_zero`, but fails here.
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar_covering(
+            "biz",
+            [],
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 3).expect("valid"),
+        );
+        for (label, id, n, cal) in [
+            ("missing calendar name", "a", 2_u32, "typo"),
+            ("coverage exhausted", "b", 5, "biz"),
+            ("n out of range", "c", u32::MAX, "biz"),
+        ] {
+            let ctx = bd_ctx(
+                bd_utc("2026-07-02T09:00:00Z"),
+                crate::calendar::BusinessCalendars::clone(&cals),
+            );
+            let res = ctx.timer_business_days(id, n, cal).await;
+            assert!(res.is_err(), "{label} must be an Err, never Ok");
+            let start_timers = ctx
+                .drain_commands()
+                .into_iter()
+                .filter(|c| matches!(c, WorkflowCommand::StartTimer { .. }))
+                .count();
+            assert_eq!(
+                start_timers, 0,
+                "{label} must never arm a timer (a zero-duration timer would \
+                 escalate IMMEDIATELY instead of at the business deadline)"
+            );
+        }
+    }
+
+    // ── Frozen rejections replay identically (issue #806) ─────────────────
+
+    /// Drive once against `cals`, capture the recorded freeze, then re-drive the
+    /// recorded history against `corrected` and return both errors.
+    #[cfg(test)]
+    async fn bd_frozen_rejection_round_trip(
+        cals: crate::calendar::BusinessCalendars,
+        corrected: crate::calendar::BusinessCalendars,
+        n: u32,
+        calendar: &str,
+    ) -> (HarvestError, HarvestError) {
+        let anchor = bd_utc("2026-07-02T09:00:00Z");
+        let ctx = bd_ctx(anchor, cals);
+        let first = ctx
+            .timer_business_days("t1", n, calendar)
+            .await
+            .expect_err("first drive must reject");
+
+        let cmds = ctx.drain_commands();
+        let WorkflowCommand::RecordSideEffect { kind, name, value } = &cmds[0] else {
+            panic!("expected the rejection to be FROZEN as a side effect, got {cmds:?}");
+        };
+        let recorded = WorkflowEvent::SideEffectRecorded {
+            kind: *kind,
+            name: name.clone(),
+            value: value.clone(),
+        };
+
+        // Re-drive with a calendar that WOULD resolve successfully.
+        let replay = bd_ctx_with_events(anchor, corrected, vec![recorded]);
+        let second = replay
+            .timer_business_days("t1", n, calendar)
+            .await
+            .expect_err("the frozen rejection must replay identically");
+        (first, second)
+    }
+
+    /// An unknown calendar NAME is a **prologue** error, not a frozen one: it is
+    /// the same class of deployment misconfiguration as registering no snapshot
+    /// at all (a typo, or a worker built from a partial registration), so it
+    /// records nothing and a redeploy that fixes the name lets the call succeed.
+    ///
+    /// Freezing it instead would durably poison every in-flight execution and
+    /// force a per-execution workflow reset even after the operator corrected
+    /// the registration (issue #806 review).
+    #[tokio::test]
+    async fn business_day_unknown_calendar_is_a_retryable_prologue_error() {
+        let anchor = bd_utc("2026-07-02T09:00:00Z");
+        let ctx = bd_ctx(
+            anchor,
+            crate::calendar::BusinessCalendars::new().with_calendar("biz", []),
+        );
+        let err = ctx
+            .timer_business_days("t1", 2, "typo")
+            .await
+            .expect_err("an unknown calendar must reject");
+        assert!(
+            matches!(&err, HarvestError::NotFound(m) if m.contains("typo") && m.contains("biz")),
+            "unknown calendar must be a typed NotFound naming the requested and \
+             registered names, got {err:?}"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "a PROLOGUE error must record ZERO commands — nothing may be frozen"
+        );
+
+        // Fix the registration: the very same call now succeeds, with no reset.
+        let fixed = bd_ctx(
+            anchor,
+            crate::calendar::BusinessCalendars::new().with_calendar("typo", []),
+        );
+        bd_poll_pending(fixed.timer_business_days("t1", 2, "typo"));
+        let cmds = fixed.drain_commands();
+        assert!(
+            matches!(cmds.first(), Some(WorkflowCommand::RecordSideEffect { .. })),
+            "after the redeploy the call must freeze a real resolution, got {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn business_day_coverage_exhausted_is_frozen_rejection() {
+        let horizon = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).expect("valid");
+        let (first, second) = bd_frozen_rejection_round_trip(
+            crate::calendar::BusinessCalendars::new().with_calendar_covering("biz", [], horizon),
+            // The corrected snapshot extends coverage well past the deadline.
+            crate::calendar::BusinessCalendars::new().with_calendar_covering(
+                "biz",
+                [],
+                chrono::NaiveDate::from_ymd_opt(2027, 12, 31).expect("valid"),
+            ),
+            5,
+            "biz",
+        )
+        .await;
+        assert!(
+            matches!(&first, HarvestError::Config(m) if m.contains("2026-07-03")),
+            "coverage exhaustion must name the horizon, got {first:?}"
+        );
+        assert_eq!(
+            first.to_string(),
+            second.to_string(),
+            "extending the calendar must NOT retroactively resolve a frozen rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_error_variants_for_prologue_vs_frozen() {
+        // A future consolidation that collapsed these onto one variant would
+        // silently change which failures are retryable-after-redeploy.
+
+        // Prologue: no snapshot at all -> Config, zero commands.
+        let ctx = WorkflowContext::new_test();
+        let prologue = ctx
+            .timer_business_days("t1", 2, "biz")
+            .await
+            .expect_err("prologue");
+        assert!(
+            matches!(prologue, HarvestError::Config(_)),
+            "prologue (snapshot absent, retryable) => Config"
+        );
+        assert!(ctx.drain_commands().is_empty(), "prologue records nothing");
+
+        // Prologue: snapshot present but the NAME is absent -> NotFound, zero
+        // commands. Same deployment-misconfiguration class as the above.
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        let unknown = ctx
+            .timer_business_days("t2", 2, "nope")
+            .await
+            .expect_err("unknown calendar name");
+        assert!(
+            matches!(unknown, HarvestError::NotFound(_)),
+            "prologue (unknown calendar NAME, retryable) => NotFound"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "an unknown calendar name must NOT be frozen"
+        );
+
+        // Frozen: coverage exhausted -> Config, and it IS recorded.
+        let horizon = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).expect("valid");
+        let cals =
+            crate::calendar::BusinessCalendars::new().with_calendar_covering("biz", [], horizon);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        let frozen = ctx
+            .timer_business_days("t3", 5, "biz")
+            .await
+            .expect_err("coverage exhausted");
+        assert!(
+            matches!(frozen, HarvestError::Config(_)),
+            "frozen (coverage exhausted, needs a reset) => Config"
+        );
+        assert!(
+            matches!(
+                ctx.drain_commands().first(),
+                Some(WorkflowCommand::RecordSideEffect { .. })
+            ),
+            "a coverage rejection MUST be frozen so a catching workflow replays \
+             the same branch"
+        );
+    }
+
+    // ── Semantics + boundary pins (issue #806) ────────────────────────────
+
+    #[tokio::test]
+    async fn n_zero_on_business_day_yields_duration_zero() {
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        bd_poll_pending(ctx.timer_business_days("t1", 0, "biz"));
+        let cmds = ctx.drain_commands();
+        let WorkflowCommand::StartTimer { duration_secs, .. } = &cmds[1] else {
+            panic!("expected StartTimer, got {cmds:?}");
+        };
+        assert_eq!(
+            *duration_secs, 0,
+            "n = 0 on a business instant fires at the anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn n_zero_on_a_weekend_rolls_forward_to_monday() {
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        // Saturday 2026-07-04.
+        let ctx = bd_ctx(bd_utc("2026-07-04T09:00:00Z"), cals);
+        bd_poll_pending(ctx.timer_business_days("t1", 0, "biz"));
+        let cmds = ctx.drain_commands();
+        let WorkflowCommand::StartTimer { duration_secs, .. } = &cmds[1] else {
+            panic!("expected StartTimer, got {cmds:?}");
+        };
+        assert_eq!(
+            *duration_secs,
+            2 * 86_400,
+            "Sat -> Mon, never 'one day later'"
+        );
+    }
+
+    #[tokio::test]
+    async fn utc_midnight_boundary_anchor_shifts_a_business_day() {
+        // KNOWN LIMITATION pin (issue #806): business days are counted on UTC
+        // dates, so two anchors two seconds apart across UTC midnight resolve
+        // one business day apart. Documented, not fixed -- a per-call timezone
+        // is a named follow-up. This test exists so the limitation cannot
+        // silently change without someone noticing.
+        let mk = |anchor: &str| {
+            let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+            let ctx = bd_ctx(bd_utc(anchor), cals);
+            let deadline = ctx.business_days_from_now("d", 1, "biz").expect("resolves");
+            deadline.date_naive()
+        };
+        // Friday 23:59:59Z -> +1 business day = Monday.
+        assert_eq!(
+            mk("2026-07-03T23:59:59Z"),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 6).expect("valid"),
+        );
+        // Two seconds later it is Saturday in UTC -> +1 business day = Tuesday.
+        assert_eq!(
+            mk("2026-07-04T00:00:01Z"),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 7).expect("valid"),
+        );
+
+        // The SHARPER form of the same limitation: `n = 0`'s roll-forward can be
+        // entirely SUPPRESSED for a deployment east of UTC. Sat 2026-07-04 08:00
+        // in UTC+10 is Fri 2026-07-03 22:00 UTC -- a UTC business day -- so
+        // `n = 0` fires immediately even though it is locally a Saturday, rather
+        // than rolling forward to the local Monday.
+        let mk0 = |anchor: &str| {
+            let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+            let ctx = bd_ctx(bd_utc(anchor), cals);
+            ctx.business_days_from_now("d", 0, "biz").expect("resolves")
+        };
+        let local_saturday_in_utc_plus_10 = bd_utc("2026-07-03T22:00:00Z");
+        assert_eq!(
+            mk0("2026-07-03T22:00:00Z"),
+            local_saturday_in_utc_plus_10,
+            "n = 0 fires at the anchor because the UTC date is Friday -- the \
+             local-Saturday roll-forward is suppressed (known limitation)"
+        );
+    }
+
+    #[tokio::test]
+    async fn business_day_history_event_types_are_exact() {
+        // AC: no new WorkflowEvent variant. The live command sequence maps onto
+        // exactly the two EXISTING event types.
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        bd_poll_pending(ctx.timer_business_days("t1", 2, "biz"));
+        let kinds: Vec<&'static str> = ctx
+            .drain_commands()
+            .iter()
+            .map(|c| match c {
+                WorkflowCommand::RecordSideEffect { .. } => "SideEffectRecorded",
+                WorkflowCommand::StartTimer { .. } => "TimerStarted",
+                other => panic!("unexpected command {other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, vec!["SideEffectRecorded", "TimerStarted"]);
+    }
+
+    #[test]
+    fn frozen_business_day_payload_round_trips() {
+        // R11: the frozen payload carries a `v` schema tag so it can evolve
+        // without breaking already-recorded histories.
+        let anchor = bd_utc("2026-07-02T09:00:00Z");
+        let res = crate::calendar::BusinessDayResolution {
+            deadline: bd_utc("2026-07-06T09:00:00Z"),
+            skipped: vec![chrono::NaiveDate::from_ymd_opt(2026, 7, 4).expect("valid")],
+        };
+        for original in [
+            FrozenBusinessDay::resolved(anchor, "biz".into(), &res, None),
+            FrozenBusinessDay::unknown_calendar(anchor, "biz".into()),
+            FrozenBusinessDay::rejected(
+                anchor,
+                "biz".into(),
+                crate::calendar::BusinessDayRejection::ScanExhausted { scanned_days: 21 },
+            ),
+        ] {
+            let json = serde_json::to_value(&original).expect("serializes");
+            assert_eq!(json["v"], 1, "schema version tag is present: {json}");
+            let back: FrozenBusinessDay = serde_json::from_value(json).expect("round-trips");
+            assert_eq!(back, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn freeze_completes_well_under_suspension_timeout_at_max_n() {
+        // R10: the executor gives a decision cycle a 100 ms budget. The scan is
+        // bounded and uses BTreeSet lookups, so even MAX_BUSINESS_DAYS is cheap.
+        let holidays: Vec<chrono::NaiveDate> = (0..400)
+            .filter_map(|i| {
+                chrono::NaiveDate::from_ymd_opt(2026, 1, 1)?.checked_add_days(chrono::Days::new(i))
+            })
+            .collect();
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", holidays);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        let start = std::time::Instant::now();
+        let out = ctx.business_days_from_now("d", crate::calendar::MAX_BUSINESS_DAYS, "biz");
+        let elapsed = start.elapsed();
+        // Assert the outcome, not just the timing: discarding the Result would
+        // let the scan bail out immediately with an error and still "pass".
+        // With no declared coverage horizon the resolution must SUCCEED, and it
+        // must land past the 400 blocked days.
+        let deadline = out.expect("MAX_BUSINESS_DAYS must resolve, not reject");
+        assert!(
+            deadline > bd_utc("2027-02-05T00:00:00Z"),
+            "MAX_BUSINESS_DAYS (~14 years) must land far in the future, got {deadline}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "the bounded scan must stay far under the 100 ms suspension budget, took {elapsed:?}"
+        );
+    }
+
+    /// The `MAX_BUSINESS_DAYS` boundary: exactly the cap is accepted, one past
+    /// it is a prologue rejection with **zero** commands recorded.
+    #[test]
+    fn max_business_days_boundary_accepts_cap_and_rejects_cap_plus_one() {
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let at_cap = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals.clone());
+        assert!(
+            at_cap
+                .business_days_from_now("ok", crate::calendar::MAX_BUSINESS_DAYS, "biz")
+                .is_ok(),
+            "exactly MAX_BUSINESS_DAYS must be accepted"
+        );
+
+        let over = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
+        let err = over
+            .business_days_from_now("bad", crate::calendar::MAX_BUSINESS_DAYS + 1, "biz")
+            .expect_err("one past the cap must be rejected");
+        assert!(
+            matches!(err, HarvestError::Config(ref m) if m.contains("MAX_BUSINESS_DAYS")),
+            "the over-cap rejection must name the bound, got: {err}"
+        );
+        assert!(
+            over.drain_commands().is_empty(),
+            "an over-cap rejection is a PROLOGUE error: it must record no commands"
+        );
     }
 
     #[test]

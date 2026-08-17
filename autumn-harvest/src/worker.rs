@@ -24668,6 +24668,32 @@ mod tests {
     }
 
     #[test]
+    fn extract_started_timer_for_suspension_accepts_freeze_plus_timer() {
+        // ONE DECISION CYCLE (issue #806). `timer_business_days` emits exactly
+        // [RecordSideEffect(the frozen resolution), StartTimer] in one batch. If
+        // `RecordSideEffect` ever left this allow-list the extractor would return
+        // None, the batch would fall through to the fail-loud "unsupported
+        // commands" path, and arming a business-day timer would silently need a
+        // second decision cycle (or fail outright).
+        let batch = vec![
+            WorkflowCommand::RecordSideEffect {
+                kind: crate::event::SideEffectKind::Custom,
+                name: Some("__harvest_business_day:sla".to_string()),
+                value: serde_json::json!({"v": 1, "outcome": "resolved"}),
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: TimerId::new("sla"),
+                duration_secs: 345_600,
+                result_tx: oneshot::channel::<()>().0,
+            },
+        ];
+        let extracted = extract_started_timer_for_suspension(&batch)
+            .expect("a business-day freeze + timer must ride ONE suspension batch");
+        assert_eq!(extracted.timer_id.as_str(), "sla");
+        assert_eq!(extracted.duration_secs, 345_600);
+    }
+
+    #[test]
     fn extract_child_timeout_race_rejects_second_timer_or_signal_wait() {
         // A second StartTimer means this is not the canonical one-child /
         // one-timer race — fall through to fail-loud rather than silently

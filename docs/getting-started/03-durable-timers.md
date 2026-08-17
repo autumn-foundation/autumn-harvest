@@ -134,6 +134,140 @@ or use `receive_signal_timeout` for the pure two-branch shape.
 
 See `examples/cancellable_timer_sla.rs` for a complete, tested example.
 
+## Business-day timers
+
+Support SLAs, contractual response windows, and settlement deadlines are written
+in **business days**, not calendar days. `ctx.timer("escalate", 2 * 86_400)` is
+wrong the moment the window straddles a weekend or a public holiday.
+`ctx.timer_business_days()` (issue #806) is the one-call answer:
+
+```rust
+#[workflow]
+async fn ticket_sla(ctx: &WorkflowContext, ticket: Ticket) -> HarvestResult<String> {
+    // "Escalate after 2 business days" — weekends and holidays stepped over.
+    let deadline = ctx.timer_business_days("escalate", 2, "us-support").await?;
+    // ... escalate ...
+    Ok(format!("escalated at {deadline}"))
+}
+```
+
+There is also a non-suspending sibling, `ctx.business_days_from_now(id, n, cal)`,
+which resolves and freezes the deadline **without** arming a timer — useful when
+you want to record or return a business-day date rather than wait for it.
+
+### Registering a calendar
+
+The holiday set is resolved **on the worker** from a `BusinessCalendars`
+snapshot in shared state — one builder call, no per-call DB read:
+
+```rust
+// Load the operator-managed holiday set once at startup and DECLARE how far it
+// covers, so a resolution past the data's end fails loudly instead of quietly
+// answering weekends-only.
+let holidays = calendar::load_exclusions_for_calendar(&mut conn, "us-support").await?;
+let covers_through = NaiveDate::from_ymd_opt(2027, 12, 31).expect("valid date");
+
+let calendars = BusinessCalendars::new()
+    .with_calendar_covering("us-support", holidays, covers_through);
+
+HarvestBuilder::new().state(calendars) /* ... */;
+```
+
+`with_calendar(name, holidays)` is the horizon-less sibling: convenient for
+tests and correct for a genuinely weekends-only calendar, but for a holiday set
+loaded from a finite data source it silently answers weekends-only past the
+data's end. Prefer `with_calendar_covering` in production — `harvest_calendars`
+carries no coverage column, so the horizon is a deliberate operator declaration,
+not something the loader can infer.
+
+`BusinessCalendars::builtin()` ships `"us-federal-holidays"` and `"nyse"` for
+demos and tests; see the expiry warning below before using it in production.
+
+### Semantics
+
+- **Weekends are always non-business days**, whatever the calendar is named —
+  the named calendar contributes *holidays*. This deliberately differs from the
+  scheduler's `"weekends-off"` calendar-naming convention (issue #337): the
+  scheduler decides whether to *skip a firing*, while this primitive decides
+  *when a deadline lands*, so weekends are unconditional here.
+- **UTC dates, anchor time-of-day.** Business days are counted on UTC dates and
+  the deadline preserves the anchor's UTC time-of-day. This matches the
+  `DATE`-typed calendar exclusion rows and is DST-free. *Known limitation:* a
+  deployment whose local business day is offset from UTC is off by one business
+  day near the UTC-midnight boundary — and for `n = 0` the roll-forward can be
+  suppressed entirely (a local Saturday morning east of UTC is still a UTC
+  Friday, so `n = 0` fires immediately instead of rolling to the local Monday).
+  Register a calendar and choose `n` in UTC terms, or wait for the per-call
+  timezone follow-up.
+- **`n = 0` rolls forward** — it fires at the anchor when the anchor's UTC date
+  is a business day, otherwise at the next business date at the same
+  time-of-day. It never means "one business day later".
+- **Coverage horizon.** A calendar registered with a *declared* horizon
+  (`with_calendar_covering`, and the shipped built-ins, which declare
+  **2026-12-31**) only answers for dates it covers. A resolution needing a later
+  date is **rejected**, never silently answered weekends-only — a silently-wrong
+  SLA date is worse than a loud failure. A calendar registered with plain
+  `with_calendar` declares no horizon and is never rejected on coverage grounds.
+- **Unknown calendar name** → a typed `HarvestError::NotFound`. Never a panic,
+  never a silent fire-now.
+
+### Determinism — the calendar is read once
+
+The resolution runs **once**, on the first live execution, from an anchor
+captured at that moment. The resolved deadline is frozen into history using the
+existing `SideEffectRecorded` event (issue #384) and the wait is carried by the
+existing `TimerStarted` event — so there is **no new `WorkflowEvent` variant and
+no migration**.
+
+On every replay the frozen deadline is used **verbatim** and the resolution is
+**never re-run**. An operator adding a holiday after a timer is armed therefore
+can *never* move that timer's deadline; it only affects timers armed afterwards.
+Both halves ride a single suspension batch, so arming a business-day timer costs
+**one** decision cycle, not two.
+
+Errors split into two classes on purpose:
+
+| Class | Examples | Recorded? | Recovery |
+|---|---|---|---|
+| **Prologue** | no `BusinessCalendars` registered; the calendar **name** is not in the registered snapshot; `n` over `MAX_BUSINESS_DAYS`; the timer id collides with a **live cancellable `ctx.start_timer` handle** | No — zero commands | Fix config and redeploy; the call then succeeds |
+| **Frozen** | coverage exhausted (the calendar cannot reach the resolved date) | Yes — replays identically forever | Workflow reset |
+
+Every *deployment* misconfiguration is a prologue error, so correcting it and
+redeploying is enough — no per-execution reset. Only the coverage rejection is
+frozen, because it is a function of the captured anchor and a workflow that
+catches it has already committed to a fallback branch.
+
+> **`BusinessCalendars::builtin()` has an expiry date.** Its arrays declare a
+> horizon (currently 2026-12-31), so once wall-clock time approaches it, every
+> `builtin()`-backed resolution starts freezing coverage rejections fleet-wide —
+> and extending the arrays later does not recover executions that already froze
+> one. Treat the built-ins as demo/test data and register an operator-owned
+> calendar (loaded from `harvest_calendar_exclusions`) in production.
+
+Reusing one timer id across two *business-day* calls is permitted (each
+invocation freezes under its own sequence number); it only makes a drift
+diagnostic harder to read. The prologue rejects only a collision with the
+**cancellable** `ctx.start_timer` API.
+
+### Relationship to the other timer primitives
+
+| Use | Reach for |
+|---|---|
+| Wait a fixed number of seconds | `ctx.timer(id, secs)` |
+| Wait until an **absolute instant** you already have | `ctx.sleep_until(id, deadline)` (issue #749) |
+| Wait **N business days**, skipping weekends + holidays | `ctx.timer_business_days(id, n, cal)` |
+| A timer you can **cancel or reset** | `ctx.start_timer(id, secs)` → `TimerHandle` (issue #768) |
+| Skip a *scheduled firing* on a holiday | Calendar-aware schedules (issue #337) |
+
+Business-day timers are **fire-once**, like `ctx.timer` and `ctx.sleep_until` —
+there is no cancellable business-day variant today. Sequential composition works
+(arm one, await it, arm the next, each with its own timer id). Racing a
+business-day timer against `receive_signal_timeout` in a *single* suspension is
+**not supported**: the engine allows one `StartTimer` per suspension batch and
+rejects the mixed batch loudly rather than silently mis-arming.
+
+See `examples/business_day_escalation.rs` for a complete, tested example.
+
 ---
 
 [← Your first workflow and activity](02-first-workflow.md) · [Index](README.md) · [Next: Signals →](04-signals.md)

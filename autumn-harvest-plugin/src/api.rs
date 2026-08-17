@@ -29731,7 +29731,12 @@ async fn run_replay_canary_handler(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let runtime = api_state.runtime().map_err(map_error)?;
 
-    let mut replayer = WorkflowReplayer::new();
+    // Issue #806: thread the runtime's shared state, mirroring the single-execution
+    // replay-diagnosis route below. A workflow that reads typed shared state during
+    // replay — `ctx.state::<BusinessCalendars>()` is the motivating case — sees an
+    // empty map without this and fails a prologue guard, so the canary would report
+    // `workflow_failed` for code that replays cleanly on every real worker.
+    let mut replayer = WorkflowReplayer::new().with_shared_state(runtime.registry().shared_state());
     // Issue #798: thread this process's own configured build id. The canary runs
     // *inside* the deployed candidate, so `WorkerConfig::build_id` here IS the
     // candidate build — and the live worker reports that same value through span

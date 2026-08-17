@@ -56,6 +56,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          activity_interceptor_tests
 linux        autumn-harvest         integration                      -                          admission_gate_authoritative
 linux        autumn-harvest         integration                      -                          auto_heartbeat_tests
+linux        autumn-harvest         integration                      -                          business_day_timer_tests
 linux        autumn-harvest         integration                      -                          canary_tests
 linux        autumn-harvest         integration                      -                          capability_miss_tests
 linux        autumn-harvest         integration                      -                          chain_timeout_tests
