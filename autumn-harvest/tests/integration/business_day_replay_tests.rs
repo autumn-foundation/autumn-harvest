@@ -136,9 +136,11 @@ fn replayer(calendars: Option<BusinessCalendars>) -> WorkflowReplayer {
 /// snapshot is registered on the live worker's builder, and replay paths default
 /// to empty shared state.
 ///
-/// If the resolution closure re-ran on replay it would hit the prologue's
-/// "no snapshot registered" error and the workflow would fail; because the value
-/// is frozen, the closure is never invoked and the replay succeeds.
+/// If the resolution closure re-ran on replay it would find no calendar and
+/// freeze an `UnknownCalendar` outcome instead of the recorded deadline; because
+/// the value is frozen, the closure is never invoked and the replay succeeds.
+/// This is what makes replay and deploy-canary contexts safe *by construction*
+/// rather than by a special-case guard.
 #[tokio::test]
 async fn replay_business_day_history_with_no_calendars_registered_succeeds() {
     let report = replayer(None).replay_from_events(canonical_history()).await;

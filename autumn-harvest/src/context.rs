@@ -6096,21 +6096,30 @@ impl WorkflowContext {
     ///
     /// # Errors
     ///
-    /// **Prologue** errors record nothing, so a redeploy that fixes the
-    /// configuration lets the call succeed with no per-execution reset:
+    /// **Prologue** errors record nothing. They are pure functions of the
+    /// arguments and this execution's own state, so they fire identically on
+    /// every worker and every replay — fixing the *call* and redeploying is
+    /// enough, with no per-execution reset:
     ///
-    /// - [`HarvestError::Config`] when no [`BusinessCalendars`](crate::BusinessCalendars)
-    ///   snapshot is registered on the builder, or `n` exceeds
-    ///   [`MAX_BUSINESS_DAYS`](crate::MAX_BUSINESS_DAYS).
-    /// - [`HarvestError::NotFound`] when `calendar` is not in the registered
-    ///   snapshot — the same class of deployment misconfiguration as registering
-    ///   no snapshot at all.
+    /// - [`HarvestError::Config`] when `n` exceeds
+    ///   [`MAX_BUSINESS_DAYS`](crate::MAX_BUSINESS_DAYS), or when `id` collides
+    ///   with a live cancellable [`Self::start_timer`] handle.
     ///
-    /// **Frozen** errors are recorded and replay identically forever; recover
-    /// with a workflow reset:
+    /// **Frozen** errors are recorded into history and replay identically
+    /// forever; recover with a workflow reset:
     ///
+    /// - [`HarvestError::NotFound`] when `calendar` is unavailable on this
+    ///   worker — either no [`BusinessCalendars`](crate::BusinessCalendars)
+    ///   snapshot is registered, or the name is not in the registered snapshot.
     /// - [`HarvestError::Config`] when the calendar cannot cover the requested
     ///   span (see [`BusinessCalendars::with_calendar_covering`](crate::BusinessCalendars::with_calendar_covering)).
+    ///
+    /// Calendar availability is **worker-local deployment state**, so it is
+    /// frozen rather than returned early. Returning early looks retryable but is
+    /// not: a workflow that propagates the error is sealed terminally, and one
+    /// that catches it and records anything afterwards diverges on replay once
+    /// the calendar is registered. Register calendars **before** deploying
+    /// workflows that name them.
     ///
     /// # Panics
     ///
@@ -6240,72 +6249,88 @@ impl WorkflowContext {
                  workflow task — use distinct timer ids across the two APIs"
             )));
         }
-        // (3) On a FRESH dispatch the snapshot must be registered on this worker;
-        //     absent means the primitive is unavailable here (a deployment
-        //     condition), so this is a prologue error and NOT frozen — a redeploy
-        //     fixes it and the call retries cleanly.
+        // (3) Freeze. EVERY outcome that depends on worker-local deployment
+        //     state — including "no snapshot registered" and "calendar name not
+        //     in the snapshot" — is resolved INSIDE the closure and frozen.
         //
-        //     On REPLAY the snapshot is legitimately absent: replay and canary
-        //     contexts carry empty shared state by design, and the frozen value
-        //     answers instead. Gating on the read-only history peek is therefore
-        //     load-bearing — without it every replay of a business-day history
-        //     would fail on a worker that does not happen to hold the snapshot,
-        //     which is exactly the deploy-canary false-failure this design exists
-        //     to avoid. The peek is non-consuming; `side_effect` below still
-        //     matches and consumes the event itself.
+        //     This split is the load-bearing invariant, and it is not a stylistic
+        //     choice (issue #806, Codex P1 review). The rule is:
         //
-        //     The name carries a per-invocation sequence number so the whole-history
-        //     name scan and `side_effect`'s positional match answer the SAME
-        //     question. Keying on `id` alone would let a loop that reuses one id
-        //     find iteration 1's freeze while dispatching iteration 2 freshly,
-        //     skipping this guard and durably recording a rejection.
+        //       * A check that is a pure function of (code, history, arguments)
+        //         may be a PROLOGUE error — it records nothing, and because it is
+        //         deterministic it fires identically on every worker and every
+        //         replay. `n > MAX_BUSINESS_DAYS` and the timer-id collision above
+        //         qualify.
+        //       * A check that depends on WORKER-LOCAL deployment state must be
+        //         FROZEN. Returning early from it looks retryable but is not: the
+        //         two workers disagree, so the recording worker and the replaying
+        //         worker take different branches.
+        //
+        //     Concretely, an earlier cut returned early here on a missing snapshot
+        //     or an unknown calendar name, on the theory that recording nothing
+        //     made the call "retryable after a redeploy". It does not:
+        //
+        //       * If the workflow propagates the error, `process_workflow_task`
+        //         treats an author `Err` as a TERMINAL failure — the run is sealed
+        //         FAILED and a redeploy cannot revive it.
+        //       * If the workflow CATCHES the error and records anything after it
+        //         (an activity, a timer, a completion), the corrected deployment
+        //         replays down the other branch and emits this side effect where
+        //         history holds that recorded command — a replay divergence, which
+        //         issue #603 turns into a non-terminal block that clears only by
+        //         rolling BACK the fix.
+        //
+        //     Freezing instead makes both shapes replay-stable: the recorded
+        //     outcome answers on every later cycle, so a caught error keeps taking
+        //     the same branch forever. The cost is honest and documented — a
+        //     config error frozen into an in-flight run needs a workflow reset,
+        //     because the run has already committed to its fallback path. The
+        //     strictly better answer is a capability-miss release that re-pends
+        //     the task without recording (the issue #804 pattern); that needs a
+        //     new outcome channel through the executor and worker, and is tracked
+        //     as a follow-up rather than smuggled into this slice.
+        //
+        //     Freezing is also what makes replay and deploy-canary contexts safe
+        //     by construction: they carry empty shared state by design, and
+        //     `side_effect`'s matched arm never invokes the closure, so the
+        //     snapshot is never consulted on replay at all.
+        //
+        //     The name carries a per-invocation sequence number so a loop that
+        //     reuses one timer id freezes each iteration under its own name,
+        //     keeping drift diagnostics readable and preventing a different call
+        //     site that reuses the id from matching silently.
         let freeze_name = format!(
             "{BUSINESS_DAY_SIDE_EFFECT_PREFIX}{}:{id}",
             self.next_business_day_seq()
         );
-        let already_frozen = {
-            let matcher = self
-                .matcher
-                .lock()
-                .expect("history matcher lock poisoned in freeze_business_day");
-            matcher.history_contains_custom_side_effect(&freeze_name)
-        };
         let snapshot = self.state::<crate::calendar::BusinessCalendars>();
-        if !already_frozen {
-            let Some(cals) = snapshot else {
-                return Err(HarvestError::Config(format!(
-                    "timer_business_days('{calendar}'): no BusinessCalendars snapshot is \
-                     registered on this worker — add `.state(BusinessCalendars::builtin())` \
-                     (or a snapshot loaded from the database) to the HarvestBuilder"
-                )));
-            };
-            // A calendar NAME that is not in the snapshot is the same class of
-            // deployment misconfiguration as no snapshot at all (a typo, or a
-            // worker built from a partial registration), so it gets the same
-            // retryable treatment: record nothing, fix the name, redeploy. The
-            // alternative — freezing it — would durably poison every in-flight
-            // execution and force a per-execution workflow reset even after the
-            // operator corrects the registration.
-            if cals.get(calendar).is_none() {
-                let mut known: Vec<&str> = cals.names().collect();
-                known.sort_unstable();
-                return Err(HarvestError::NotFound(format!(
-                    "business calendar '{calendar}' is not in the registered BusinessCalendars \
-                     snapshot (registered: {known:?}) — fix the calendar name (or register it) \
-                     and redeploy; nothing was recorded, so the call retries cleanly"
-                )));
-            }
-        }
-        // (4) Freeze. The anchor is captured INSIDE the closure so no separate
-        //     `Now` event can be orphaned by a later failure, and the closure is
-        //     never invoked on replay — which is what makes an operator calendar
-        //     edit structurally unable to move an armed deadline.
+        // The registered names are WORKER-LOCAL, so they are a diagnostic only —
+        // they are logged on the live path and deliberately never enter the frozen
+        // record or its replayed message, which must be identical on every worker.
+        let registered: Option<Vec<String>> = snapshot.map(|c| {
+            let mut names: Vec<String> = c.names().map(ToString::to_string).collect();
+            names.sort();
+            names
+        });
+        // The anchor is captured INSIDE the closure so no separate `Now` event can
+        // be orphaned by a later failure, and the closure is never invoked on
+        // replay — which is what makes an operator calendar edit structurally
+        // unable to move an armed deadline.
         let holidays = snapshot.and_then(|c| c.get(calendar).cloned());
         let coverage_end = snapshot.and_then(|c| c.coverage_end(calendar));
         let calendar_owned = calendar.to_string();
         let frozen: FrozenBusinessDay = self.side_effect(&freeze_name, move || {
             let anchor = self.business_day_anchor();
             let Some(holidays) = holidays else {
+                tracing::warn!(
+                    calendar = %calendar_owned,
+                    registered = ?registered,
+                    "business calendar is unavailable on this worker; freezing an \
+                     UnknownCalendar outcome. Register the calendar via \
+                     `HarvestBuilder::state(BusinessCalendars::..)` before deploying \
+                     workflows that name it — executions that already froze this \
+                     outcome need a workflow reset, a redeploy alone will not move them"
+                );
                 return FrozenBusinessDay::unknown_calendar(anchor, calendar_owned);
             };
             match crate::calendar::add_business_days_bounded(anchor, n, &holidays, coverage_end) {
@@ -18520,13 +18545,13 @@ mod tests {
     }
 
     #[cfg(test)]
-    fn bd_poll_pending(fut: impl std::future::Future<Output = HarvestResult<DateTime<Utc>>>) {
+    fn bd_poll_pending<T>(fut: impl std::future::Future<Output = HarvestResult<T>>) {
         let mut fut = Box::pin(fut);
         let waker = std::task::Waker::noop();
         let mut poll_cx = std::task::Context::from_waker(waker);
         assert!(
             std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
-            "a live business-day timer must suspend on the durable timer"
+            "the call must suspend on its durable timer"
         );
     }
 
@@ -18606,20 +18631,29 @@ mod tests {
             .await
             .expect("iteration 1 must replay from its frozen record");
 
-        // Iteration 2 is a FRESH dispatch. It must be a retryable PROLOGUE
-        // error recording ZERO commands -- never a durable frozen rejection.
+        // Iteration 2 is a FRESH dispatch on a worker without the snapshot. It
+        // must FREEZE an UnknownCalendar outcome, because "is this calendar
+        // available here?" is worker-local deployment state: returning early
+        // would make the recording worker and a corrected worker take different
+        // branches, which is the divergence Codex's P1 identified.
         let err = ctx
             .timer_business_days("poll", 1, "biz")
             .await
             .expect_err("iteration 2 is a fresh dispatch with no snapshot");
         assert!(
-            matches!(&err, HarvestError::Config(m) if m.contains("no BusinessCalendars snapshot")),
-            "a fresh dispatch without a snapshot must be the RETRYABLE prologue \
-             Config error, not a frozen rejection; got {err:?}"
+            matches!(&err, HarvestError::NotFound(m) if m.contains("biz")),
+            "an unavailable calendar must surface as the frozen NotFound naming \
+             the calendar; got {err:?}"
         );
+        let cmds = ctx.drain_commands();
         assert!(
-            ctx.drain_commands().is_empty(),
-            "a prologue rejection must record ZERO commands"
+            cmds.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::RecordSideEffect { name: Some(n), .. }
+                    if n == "__harvest_business_day:2:poll"
+            )),
+            "iteration 2 must FREEZE under its OWN sequence number (2) so the \
+             replayed outcome is stable on every worker; got {cmds:?}"
         );
     }
 
@@ -18704,28 +18738,99 @@ mod tests {
         ));
     }
 
-    // ── Prologue records NOTHING (issue #806 C1/C2) ───────────────────────
+    // ── Deployment-dependent outcomes are FROZEN (issue #806, Codex P1) ───
 
     #[tokio::test]
-    async fn business_day_missing_calendars_records_no_command() {
-        // No BusinessCalendars in shared state: the primitive is unavailable on
-        // this worker. This must be a PROLOGUE error -- zero commands -- so a
-        // redeploy that registers the snapshot lets the call succeed. A freeze
-        // here would poison the run forever over a deployment slip.
+    async fn business_day_missing_calendars_freezes_unknown_calendar() {
+        // No BusinessCalendars in shared state. "Is this calendar available on
+        // this worker?" is worker-local deployment state, so the outcome MUST be
+        // frozen: an early return would let the recording worker and a corrected
+        // worker take different branches, diverging on replay.
         let ctx = WorkflowContext::new_test();
         let err = ctx
             .timer_business_days("t1", 2, "biz")
             .await
             .expect_err("must reject");
         assert!(
-            matches!(&err, HarvestError::Config(m) if m.contains("BusinessCalendars")),
-            "expected a Config error naming the missing snapshot, got {err:?}"
+            matches!(&err, HarvestError::NotFound(m) if m.contains("biz")),
+            "expected the frozen NotFound naming the calendar, got {err:?}"
+        );
+        let cmds = ctx.drain_commands();
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::RecordSideEffect {
+                    kind: SideEffectKind::Custom,
+                    name: Some(n),
+                    ..
+                } if n == "__harvest_business_day:1:t1"
+            )),
+            "a deployment-dependent outcome must be FROZEN so every later replay \
+             reproduces it verbatim; got {cmds:?}"
+        );
+    }
+
+    /// The Codex P1 regression (issue #806): a workflow that CATCHES the
+    /// unavailable-calendar error and records something afterwards must still
+    /// replay cleanly once the operator registers the calendar.
+    ///
+    /// Falsifiable by construction. Deploy A records
+    /// `[WorkflowStarted, <freeze>, TimerStarted(fallback)]`. Deploy B replays
+    /// with the calendar now registered; if the outcome were NOT frozen, the
+    /// freeze would be emitted where history holds `TimerStarted` and this call
+    /// would return `NonDeterministic` instead of the caught error.
+    #[tokio::test]
+    async fn business_day_caught_unavailable_calendar_replays_after_the_fix() {
+        let anchor = bd_utc("2026-07-02T09:00:00Z");
+
+        // ── Deploy A: the calendar is not registered. ──
+        let deploy_a = WorkflowContext::new_test();
+        let err = deploy_a
+            .timer_business_days("t1", 2, "biz")
+            .await
+            .expect_err("deploy A has no calendar");
+        assert!(matches!(&err, HarvestError::NotFound(_)));
+        // The workflow catches it and arms a fallback timer instead.
+        let mut recorded: Vec<WorkflowEvent> = deploy_a
+            .drain_commands()
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                    Some(WorkflowEvent::SideEffectRecorded {
+                        kind: *kind,
+                        name: name.clone(),
+                        value: value.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recorded.len(), 1, "deploy A must have frozen the outcome");
+        recorded.push(WorkflowEvent::TimerStarted {
+            timer_id: crate::types::TimerId::new("fallback"),
+            duration_secs: 3600,
+        });
+
+        // ── Deploy B: the operator registered the calendar. ──
+        let deploy_b = bd_ctx_with_events(
+            anchor,
+            crate::calendar::BusinessCalendars::new().with_calendar("biz", []),
+            recorded,
+        );
+        let replayed = deploy_b
+            .timer_business_days("t1", 2, "biz")
+            .await
+            .expect_err("the frozen outcome must replay verbatim");
+        assert!(
+            matches!(&replayed, HarvestError::NotFound(m) if m.contains("biz")),
+            "replay must reproduce the CAUGHT error, not diverge; got {replayed:?}"
         );
         assert!(
-            ctx.drain_commands().is_empty(),
-            "a prologue rejection must record NOTHING -- an orphaned freeze would \
-             have no consumer on the next replay cycle"
+            !matches!(&replayed, HarvestError::NonDeterministic { .. }),
+            "the whole point: a corrected deployment must not nd-block this run"
         );
+        // And the fallback timer still matches at its recorded position.
+        bd_poll_pending(deploy_b.timer("fallback", 3600));
     }
 
     #[tokio::test]
@@ -18850,7 +18955,7 @@ mod tests {
     /// force a per-execution workflow reset even after the operator corrected
     /// the registration (issue #806 review).
     #[tokio::test]
-    async fn business_day_unknown_calendar_is_a_retryable_prologue_error() {
+    async fn business_day_unknown_calendar_is_frozen_not_returned_early() {
         let anchor = bd_utc("2026-07-02T09:00:00Z");
         let ctx = bd_ctx(
             anchor,
@@ -18861,16 +18966,30 @@ mod tests {
             .await
             .expect_err("an unknown calendar must reject");
         assert!(
-            matches!(&err, HarvestError::NotFound(m) if m.contains("typo") && m.contains("biz")),
-            "unknown calendar must be a typed NotFound naming the requested and \
-             registered names, got {err:?}"
+            matches!(&err, HarvestError::NotFound(m) if m.contains("typo")),
+            "unknown calendar must be a typed NotFound naming the requested \
+             calendar, got {err:?}"
         );
+        // The message must NOT enumerate the worker's registered calendars: that
+        // set is worker-local, so baking it into a FROZEN outcome would make the
+        // replayed message differ between workers.
         assert!(
-            ctx.drain_commands().is_empty(),
-            "a PROLOGUE error must record ZERO commands — nothing may be frozen"
+            !format!("{err}").contains("biz"),
+            "the frozen message must not carry worker-local registered names: {err}"
+        );
+        let cmds = ctx.drain_commands();
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::RecordSideEffect { name: Some(n), .. }
+                    if n == "__harvest_business_day:1:t1"
+            )),
+            "a typo'd calendar name is worker-local deployment state, so it must \
+             be FROZEN rather than returned early; got {cmds:?}"
         );
 
-        // Fix the registration: the very same call now succeeds, with no reset.
+        // A NEW execution started after the registration is fixed resolves
+        // normally — only runs that already froze the outcome need a reset.
         let fixed = bd_ctx(
             anchor,
             crate::calendar::BusinessCalendars::new().with_calendar("typo", []),
@@ -18879,7 +18998,7 @@ mod tests {
         let cmds = fixed.drain_commands();
         assert!(
             matches!(cmds.first(), Some(WorkflowCommand::RecordSideEffect { .. })),
-            "after the redeploy the call must freeze a real resolution, got {cmds:?}"
+            "a fresh execution must freeze a real resolution, got {cmds:?}"
         );
     }
 
@@ -18912,35 +19031,51 @@ mod tests {
     #[tokio::test]
     async fn distinct_error_variants_for_prologue_vs_frozen() {
         // A future consolidation that collapsed these onto one variant would
-        // silently change which failures are retryable-after-redeploy.
+        // silently change which failures are frozen vs returned early.
 
-        // Prologue: no snapshot at all -> Config, zero commands.
-        let ctx = WorkflowContext::new_test();
+        // Prologue: `n` over the cap is a pure function of the ARGUMENT, so it
+        // fires identically everywhere -> Config, zero commands.
+        let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
+        let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
         let prologue = ctx
-            .timer_business_days("t1", 2, "biz")
+            .timer_business_days("t1", crate::calendar::MAX_BUSINESS_DAYS + 1, "biz")
             .await
             .expect_err("prologue");
         assert!(
             matches!(prologue, HarvestError::Config(_)),
-            "prologue (snapshot absent, retryable) => Config"
+            "prologue (n over cap, deterministic) => Config"
         );
         assert!(ctx.drain_commands().is_empty(), "prologue records nothing");
 
-        // Prologue: snapshot present but the NAME is absent -> NotFound, zero
-        // commands. Same deployment-misconfiguration class as the above.
+        // Frozen: no snapshot at all is WORKER-LOCAL state -> NotFound, recorded.
+        let ctx = WorkflowContext::new_test();
+        let absent = ctx
+            .timer_business_days("t2", 2, "biz")
+            .await
+            .expect_err("snapshot absent");
+        assert!(
+            matches!(absent, HarvestError::NotFound(_)),
+            "frozen (calendar unavailable) => NotFound"
+        );
+        assert!(
+            !ctx.drain_commands().is_empty(),
+            "an unavailable calendar MUST be frozen, not returned early"
+        );
+
+        // Frozen: snapshot present but the NAME is absent -> same class.
         let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
         let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
         let unknown = ctx
-            .timer_business_days("t2", 2, "nope")
+            .timer_business_days("t3", 2, "nope")
             .await
             .expect_err("unknown calendar name");
         assert!(
             matches!(unknown, HarvestError::NotFound(_)),
-            "prologue (unknown calendar NAME, retryable) => NotFound"
+            "frozen (unknown calendar NAME) => NotFound"
         );
         assert!(
-            ctx.drain_commands().is_empty(),
-            "an unknown calendar name must NOT be frozen"
+            !ctx.drain_commands().is_empty(),
+            "an unknown calendar name is worker-local state, so it MUST be frozen"
         );
 
         // Frozen: coverage exhausted -> Config, and it IS recorded.

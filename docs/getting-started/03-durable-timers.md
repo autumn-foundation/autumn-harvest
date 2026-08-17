@@ -229,13 +229,26 @@ Errors split into two classes on purpose:
 
 | Class | Examples | Recorded? | Recovery |
 |---|---|---|---|
-| **Prologue** | no `BusinessCalendars` registered; the calendar **name** is not in the registered snapshot; `n` over `MAX_BUSINESS_DAYS`; the timer id collides with a **live cancellable `ctx.start_timer` handle** | No — zero commands | Fix config and redeploy; the call then succeeds |
-| **Frozen** | coverage exhausted (the calendar cannot reach the resolved date) | Yes — replays identically forever | Workflow reset |
+| **Prologue** | `n` over `MAX_BUSINESS_DAYS`; the timer id collides with a **live cancellable `ctx.start_timer` handle** | No — zero commands | Fix the call and redeploy |
+| **Frozen** | the calendar is **unavailable on this worker** (no `BusinessCalendars` registered, or the name is not in the snapshot); coverage exhausted | Yes — replays identically forever | Workflow reset |
 
-Every *deployment* misconfiguration is a prologue error, so correcting it and
-redeploying is enough — no per-execution reset. Only the coverage rejection is
-frozen, because it is a function of the captured anchor and a workflow that
-catches it has already committed to a fallback branch.
+The split follows one rule: a check that is a pure function of *(code, history,
+arguments)* may return early, because it fires identically on every worker and
+every replay. A check that depends on **worker-local deployment state** must be
+frozen.
+
+Calendar availability is worker-local, so it is frozen. Returning early looks
+retryable but is not: a workflow that *propagates* the error is sealed
+**terminally**, and one that *catches* it and records anything afterwards
+**diverges** on replay once you register the calendar — a non-terminal block
+that clears only by rolling *back* the fix. Freezing keeps both shapes
+replay-stable, at the documented cost that a run which already froze the outcome
+needs a reset.
+
+> **Register calendars before deploying workflows that name them.** A workflow
+> deployed ahead of its calendar will freeze `NotFound` into every execution
+> that runs in the gap, and registering the calendar afterwards will not move
+> them.
 
 > **`BusinessCalendars::builtin()` has an expiry date.** Its arrays declare a
 > horizon (currently 2026-12-31), so once wall-clock time approaches it, every

@@ -3539,32 +3539,6 @@ impl HistoryMatcher {
         })
     }
 
-    /// Pure, read-only scan: does recorded history contain a custom
-    /// `SideEffectRecorded` named `name`?
-    ///
-    /// Used by `timer_business_days` (issue #806) to tell a **fresh dispatch**
-    /// from a **replay** *before* consuming anything, so that a validation which
-    /// is only meaningful on the live frontier (is a `BusinessCalendars`
-    /// snapshot registered on this worker?) is skipped on replay — where the
-    /// snapshot is legitimately absent because the frozen value answers instead.
-    ///
-    /// Deliberately **non-consuming**: the subsequent `side_effect(..)` call
-    /// still needs to match and consume the event itself. Does not touch the
-    /// cursor or any consumption state.
-    #[must_use]
-    pub fn history_contains_custom_side_effect(&self, name: &str) -> bool {
-        self.events.iter().any(|ev| {
-            matches!(
-                ev,
-                WorkflowEvent::SideEffectRecorded {
-                    kind: crate::event::SideEffectKind::Custom,
-                    name: Some(n),
-                    ..
-                } if n == name
-            )
-        })
-    }
-
     /// Match a timer command against history.
     ///
     /// Expects `TimerStarted { timer_id }` at cursor, then scans for
