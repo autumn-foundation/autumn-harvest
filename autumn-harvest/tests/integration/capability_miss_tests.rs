@@ -970,7 +970,35 @@ fn workflow_invalidates_peer_then_misses(
 /// row is no longer `RUNNING`), and able to fail outright, which panics the body
 /// and turns a precise assertion into a bare timeout. A pooled checkout reuses a
 /// warm connection and waits rather than failing.
+///
+/// The pool must be **pre-warmed** by the test before the worker starts — see
+/// [`prewarm_claim_theft_injection`]. `deadpool` builds lazily, so an unwarmed
+/// pool pays that same TCP+auth handshake on its *first* `get()`, and this test
+/// performs exactly one dispatch: without the pre-warm the handshake lands
+/// inside the very window the pool exists to protect. The whole body has only
+/// `executor::SUSPENSION_TIMEOUT` (100 ms) to reach a command-emitting
+/// suspension; blow that and the dispatch is failed with "workflow suspended
+/// without emitted commands", the theft never happens, and this test fails as a
+/// bare `wait_for_task_owner` timeout that names none of the above.
 static CLAIM_THEFT_INJECTION: std::sync::OnceLock<DbPool> = std::sync::OnceLock::new();
+
+/// Force [`CLAIM_THEFT_INJECTION`]'s lazy `deadpool` to establish a connection
+/// now, so the in-body theft pays only a warm checkout plus one `UPDATE`.
+///
+/// Round-trips rather than merely checking out: `deadpool` hands back a
+/// connection object before the first statement proves the TCP+auth handshake
+/// actually completed, and it is the handshake — not the checkout — that is
+/// slow under load.
+async fn prewarm_claim_theft_injection() {
+    let pool = CLAIM_THEFT_INJECTION
+        .get()
+        .expect("claim-theft injection is armed before it is pre-warmed");
+    let mut conn = pool.get().await.expect("claim-theft pre-warm connects");
+    diesel::sql_query("SELECT 1")
+        .execute(&mut conn)
+        .await
+        .expect("claim-theft pre-warm round-trips");
+}
 
 /// The deterministic injection point for the round-28 lost-claim P1: a workflow
 /// body that hands its own task row to another worker **while its dispatch is
@@ -2701,6 +2729,9 @@ async fn a_claim_lost_mid_dispatch_makes_no_terminal_decision() {
         CLAIM_THEFT_INJECTION.set(build_pool(&url)).is_ok(),
         "claim-theft injection is armed exactly once per process"
     );
+    // Pay the TCP+auth handshake HERE, not inside the dispatch window. See
+    // `CLAIM_THEFT_INJECTION`'s docs: the body has 100 ms total.
+    prewarm_claim_theft_injection().await;
 
     let metrics = Arc::new(CapabilityMetrics::default());
     let worker = build_worker(

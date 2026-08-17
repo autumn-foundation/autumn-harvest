@@ -5440,6 +5440,51 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// Register the [`BusinessCalendars`](crate::calendar::BusinessCalendars)
+    /// snapshot `ctx.timer_business_days` resolves against (issue #806).
+    ///
+    /// Sugar over [`with_state`](Self::with_state) — the production wiring is
+    /// the same one builder call, `HarvestBuilder::state(..)`.
+    ///
+    /// Pair with [`with_frozen_anchor`](Self::with_frozen_anchor) so the
+    /// resolution is hermetic across weekdays; otherwise the test resolves
+    /// against the real wall clock and gives different answers on different CI
+    /// days.
+    ///
+    /// [`TestRunOutcome::replay_check`] **does** forward this snapshot into its
+    /// replay (via `with_shared_state`), exactly as a real worker holding the
+    /// same registration would. That makes `replay_check` a check that the
+    /// history replays cleanly — it is **not** a proof that the deadline is
+    /// frozen rather than recomputed, since a recompute under the same calendar
+    /// yields the same answer. For that proof, replay under a *withheld* or
+    /// *mutated* calendar with [`WorkflowReplayer`] directly (see
+    /// `tests/integration/business_day_replay_tests.rs`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `Arc` has been cloned before this is called —
+    /// unreachable in normal builder usage.
+    #[must_use]
+    pub fn with_business_calendars(self, calendars: crate::calendar::BusinessCalendars) -> Self {
+        self.with_state(calendars)
+    }
+
+    /// Freeze the environment's simulated wall clock at `anchor`.
+    ///
+    /// `anchor` becomes the seed `WorkflowStarted` timestamp, so `ctx.now()`
+    /// starts there and every date-sensitive primitive — notably
+    /// `ctx.timer_business_days` (issue #806), whose resolution is anchored on
+    /// the workflow's current time — resolves identically on every run,
+    /// regardless of which weekday CI happens to execute on.
+    ///
+    /// The clock still *advances* from `anchor` as durable timers fire
+    /// (issue #526); this pins only its starting point.
+    #[must_use]
+    pub const fn with_frozen_anchor(mut self, anchor: DateTime<Utc>) -> Self {
+        self.simulated_now = anchor;
+        self
+    }
+
     /// Seed the test environment with a prior successful run's result, as if the
     /// same schedule had previously completed with `value` as its output.
     ///

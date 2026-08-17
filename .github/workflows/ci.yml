@@ -316,6 +316,9 @@ jobs:
       - name: Run fanout_batch example tests (issue #750)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example fanout_batch
+      - name: Run business_day_escalation example tests (issue #806)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example business_day_escalation
       # The WASM example is a `main()` that self-asserts the sandbox contract
       # (echo round-trip, a granted capability, and an ungranted import denied as
       # SandboxDenied), so RUN it rather than only building it. It needs no

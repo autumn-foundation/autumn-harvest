@@ -3993,3 +3993,143 @@ async fn test_default_env_build_id_in_activity_input_replays_clean() {
         "the default (unset) build id must be used consistently on both sides:\n{report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Business-day timers (issue #806)
+// ---------------------------------------------------------------------------
+
+/// Arms one business-day timer and returns the resolved deadline.
+fn business_day_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let deadline = ctx
+            .timer_business_days("sla", 2, "biz")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!(deadline.to_rfc3339()))
+    })
+}
+
+fn biz_calendars() -> autumn_harvest::calendar::BusinessCalendars {
+    autumn_harvest::calendar::BusinessCalendars::new().with_calendar("biz", [])
+}
+
+/// `WorkflowTestEnv` fires a business-day timer deterministically, with **no
+/// real sleeping** — the harness auto-fires the durable timer.
+#[tokio::test]
+async fn test_business_day_timer_fires_without_real_sleeping() {
+    let start = std::time::Instant::now();
+    // Thursday 2026-07-02T09:00Z + 2 business days = Monday 2026-07-06T09:00Z
+    // (a 4-calendar-day wait that the harness must NOT actually sleep through).
+    let outcome = WorkflowTestEnv::new()
+        .with_frozen_anchor("2026-07-02T09:00:00Z".parse().expect("valid instant"))
+        .with_business_calendars(biz_calendars())
+        .run(business_day_workflow, json!(null))
+        .await;
+    let elapsed = start.elapsed();
+
+    let result = outcome.result.expect("workflow should complete");
+    assert_eq!(
+        result.as_str().expect("rfc3339 string"),
+        "2026-07-06T09:00:00+00:00",
+        "Sat 07-04 and Sun 07-05 must be stepped over"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "a 4-day business timer must fire virtually, not by sleeping: took {elapsed:?}"
+    );
+}
+
+/// `replay_check` forwards the env's shared state (so this is a *round-trip*
+/// check, not a freeze proof), and separately: replaying the harness-produced
+/// history under a **hostile** calendar that excludes the frozen deadline's own
+/// date still yields the identical deadline.
+///
+/// The hostile-calendar half is the falsifiable one — if the deadline were
+/// recomputed on replay instead of read back from the frozen record, the
+/// excluded Monday would push it to Tuesday and the assertion fails.
+#[tokio::test]
+async fn test_business_day_run_replays_frozen_under_a_hostile_calendar() {
+    let outcome = WorkflowTestEnv::new()
+        .with_frozen_anchor("2026-07-02T09:00:00Z".parse().expect("valid instant"))
+        .with_business_calendars(biz_calendars())
+        .run(business_day_workflow, json!(null))
+        .await;
+    let live = outcome
+        .result
+        .clone()
+        .expect("workflow should complete")
+        .as_str()
+        .expect("rfc3339 string")
+        .to_owned();
+    assert_eq!(live, "2026-07-06T09:00:00+00:00");
+
+    // (a) Round-trip: the harness's own self-check forwards the same snapshot a
+    //     real worker would hold, so this asserts the history replays cleanly.
+    let report = outcome.replay_check(business_day_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the recorded history must replay cleanly:\n{report}"
+    );
+
+    // (b) The freeze proof: replay under a calendar that excludes 2026-07-06.
+    //     A recompute would land on Tue 07-07; the frozen record must win.
+    let hostile = autumn_harvest::calendar::BusinessCalendars::new().with_calendar(
+        "biz",
+        [chrono::NaiveDate::from_ymd_opt(2026, 7, 6).expect("valid date")],
+    );
+    let hostile_report = autumn_harvest::testing::WorkflowReplayer::new()
+        .with_state(hostile)
+        .register_fn("business_day_workflow", business_day_workflow as _)
+        .replay_from_events(outcome.events().to_vec())
+        .await;
+    assert!(
+        matches!(hostile_report.status, ReplayStatus::ReplaySucceeded),
+        "a calendar edit after arming must not move the frozen deadline:\n{hostile_report}"
+    );
+}
+
+/// Hermeticity: the resolution depends only on the frozen anchor, never on the
+/// weekday CI happens to run. Without `with_frozen_anchor` this test would give
+/// a different answer on five of seven days.
+#[tokio::test]
+async fn test_business_day_env_is_hermetic_across_all_seven_weekdays() {
+    // 2026-06-29 is a Monday, so this walks Mon..Sun.
+    let expected = [
+        // anchor            -> +2 business days
+        ("2026-06-29", "2026-07-01"), // Mon -> Wed
+        ("2026-06-30", "2026-07-02"), // Tue -> Thu
+        ("2026-07-01", "2026-07-03"), // Wed -> Fri
+        ("2026-07-02", "2026-07-06"), // Thu -> Mon (weekend stepped over)
+        ("2026-07-03", "2026-07-07"), // Fri -> Tue (weekend stepped over)
+        // A weekend anchor first rolls forward to Monday (the n = 0 position),
+        // then counts 2 more business days from there -> Wednesday.
+        ("2026-07-04", "2026-07-08"), // Sat -> Wed
+        ("2026-07-05", "2026-07-08"), // Sun -> Wed
+    ];
+    for (anchor, want) in expected {
+        let outcome = WorkflowTestEnv::new()
+            .with_frozen_anchor(
+                format!("{anchor}T09:00:00Z")
+                    .parse()
+                    .expect("valid instant"),
+            )
+            .with_business_calendars(biz_calendars())
+            .run(business_day_workflow, json!(null))
+            .await;
+        let got = outcome
+            .result
+            .clone()
+            .expect("workflow should complete")
+            .as_str()
+            .expect("rfc3339 string")
+            .to_string();
+        assert_eq!(
+            got,
+            format!("{want}T09:00:00+00:00"),
+            "anchor {anchor} must resolve identically on every CI weekday"
+        );
+    }
+}

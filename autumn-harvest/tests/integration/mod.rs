@@ -17,6 +17,10 @@ mod auto_heartbeat_tests;
 mod awaitables_tests;
 #[cfg(feature = "db")]
 mod build_routing_tests;
+#[cfg(feature = "testing")]
+mod business_day_replay_tests;
+#[cfg(feature = "db")]
+mod business_day_timer_tests;
 mod cache_delta_load_tests;
 #[cfg(feature = "db")]
 mod canary_tests;
