@@ -204,6 +204,20 @@ fn plain_activity() -> ActivityInfo {
     }
 }
 
+/// An activity whose capability requirements live ONLY in the registry — the
+/// legacy/manual-enqueue shape, where the queue row carries no
+/// `required_capabilities` snapshot but `claim_task`'s ineligible-activities
+/// gate still enforces the registered `requires`.
+fn registry_gated_activity() -> ActivityInfo {
+    ActivityInfo {
+        name: "registry_gated",
+        default_queue: Some("payments"),
+        circuit_breaker: None,
+        requires: Some("gpu=true"),
+        ..breaker_activity()
+    }
+}
+
 // ── Harness ────────────────────────────────────────────────────────────────
 
 /// With `HARVEST_TEST_DATABASE_URL` set, a fresh database is created and
@@ -282,7 +296,11 @@ fn build_api_state_with_registry(
             wf_info("child_wf", child_parent_workflow),
             wf_info("completes_wf", completes_workflow),
         ],
-        vec![breaker_activity(), plain_activity()],
+        vec![
+            breaker_activity(),
+            plain_activity(),
+            registry_gated_activity(),
+        ],
     ));
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(admin_boundary);
@@ -2264,6 +2282,32 @@ async fn seed_task_requiring(
     .expect("seed gated task");
 }
 
+/// Seed a PENDING activity row with NO `required_capabilities` snapshot — the
+/// legacy / manual-enqueue shape.
+async fn seed_unsnapshotted_task(
+    pool: &DbPool,
+    exec_id: ExecutionId,
+    queue: &str,
+    activity_name: &str,
+) {
+    let mut conn = pool.get().await.expect("pooled conn");
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, activity_name, activity_id, \
+          input, state, priority, attempt, max_attempts, scheduled_at) \
+         VALUES ($1, $2, 'activity', $3, $4, $5, '{}'::jsonb, 'PENDING', 0, 0, 3, \
+                 NOW() - INTERVAL '1 minute')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(activity_name)
+    .bind::<diesel::sql_types::Uuid, _>(ActivityExecId::new().as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("seed unsnapshotted task");
+}
+
 /// Seed a worker in an explicit fleet status.
 async fn seed_worker_with_status(pool: &DbPool, worker_id: &str, queue: &str, status: &str) {
     let mut conn = pool.get().await.expect("pooled conn");
@@ -2448,6 +2492,65 @@ async fn task_requiring_an_unsatisfied_capability_reports_no_worker() {
         "a capability-gated task no live worker satisfies must not read healthy: {body}"
     );
     assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// A legacy or manually enqueued row carries NO `required_capabilities`
+/// snapshot, but `claim_task`'s ineligible-activities gate ($6) still enforces
+/// the REGISTERED handler's `requires` — so reading the absent snapshot as
+/// "no requirements" would report healthy progress for a task no live worker
+/// can claim (an AC3 false negative).
+#[tokio::test]
+async fn unsnapshotted_task_is_gated_by_the_registered_requirements() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    // NULL required_capabilities; `registry_gated` declares `requires = gpu=true`.
+    seed_unsnapshotted_task(&pool, exec_id, "payments", "registry_gated").await;
+    seed_live_worker_with(&pool, "w-cpu", "payments", "", json!({"gpu": "false"})).await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "activity_no_worker",
+        "the registered requirements must gate an un-snapshotted row: {body}"
+    );
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// The control: the same un-snapshotted row IS claimable by a worker that
+/// advertises the registered label, so it must read healthy.
+#[tokio::test]
+async fn unsnapshotted_task_with_a_satisfying_worker_is_healthy() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    seed_unsnapshotted_task(&pool, exec_id, "payments", "registry_gated").await;
+    seed_live_worker_with(&pool, "w-gpu", "payments", "", json!({"gpu": "true"})).await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
+}
+
+/// The second control: an un-snapshotted row whose activity declares NO
+/// `requires` is ungated, exactly as before — the backfill must not invent a
+/// requirement for an activity that has none.
+#[tokio::test]
+async fn unsnapshotted_task_for_an_ungated_activity_is_unaffected() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    // `send_email` is registered with no `requires`.
+    seed_unsnapshotted_task(&pool, exec_id, "email", "send_email").await;
+    seed_live_worker_with(&pool, "w-plain", "email", "", json!({})).await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
 }
 
 /// The control: a worker advertising the required label IS coverage.

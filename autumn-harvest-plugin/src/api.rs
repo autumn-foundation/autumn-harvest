@@ -12634,6 +12634,33 @@ fn worker_can_claim_now(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> 
         && worker.worker.status == autumn_harvest::workers::WorkerStatus::Active.as_str()
 }
 
+/// The capability requirements `claim_task` will actually enforce for this row.
+///
+/// The row's own `required_capabilities` snapshot is authoritative when present
+/// -- `claim_task_query` short-circuits its ineligible-activities gate on
+/// `required_capabilities IS NOT NULL`, so the snapshot is what gates the claim
+/// and the registry must never override it (the registry may have changed since
+/// the row was enqueued).
+///
+/// When the snapshot is **absent** -- a legacy or manually enqueued row -- the
+/// gate is NOT skipped: `claim_task` rejects any worker whose
+/// `ineligible_activities` list contains this row's `activity_name`, and that
+/// list is computed on each worker from the **registered** `ActivityInfo`'s
+/// `requires` matched against its own labels (`Worker::new`). Reading an absent
+/// snapshot as "no requirements" would therefore report `healthy_in_progress`
+/// for a task no live worker can claim.
+///
+/// Mirrors `queue::apply_activity_requirements` (the shard-health coverage
+/// backfill) and the eligibility explainer's own resolution (issue #611), so
+/// all three surfaces answer the capability question identically.
+fn effective_required_capabilities<'a>(
+    row_capabilities: Option<&'a serde_json::Value>,
+    activity_name: Option<&str>,
+    registered: &'a std::collections::HashMap<String, serde_json::Value>,
+) -> Option<&'a serde_json::Value> {
+    row_capabilities.or_else(|| activity_name.and_then(|name| registered.get(name)))
+}
+
 /// Can ANY single live worker actually claim this task?
 ///
 /// Queue coverage alone is not the claim predicate. `queue::claim_task` also
@@ -12954,6 +12981,19 @@ pub(crate) async fn build_diagnosis_report(
         },
     );
 
+    // Registered capability requirements, keyed by activity name (issue #804).
+    // Needed because a legacy or manually enqueued row can carry NULL
+    // `required_capabilities` while `claim_task`'s ineligible-activities gate
+    // still enforces the registered handler's `requires` -- see
+    // `effective_required_capabilities`. Empty when no runtime is installed,
+    // which degrades to today's snapshot-only answer rather than fabricating a
+    // stall.
+    let activity_requirements: std::collections::HashMap<String, serde_json::Value> = api_state
+        .runtime()
+        .ok()
+        .map(|runtime| runtime.registry().activity_requirements_json())
+        .unwrap_or_default();
+
     // Rate-limit saturation. A circuit-breaker-tracked activity enforces its
     // rate limit at DISPATCH rather than at claim (issue #369), so its bucket is
     // never a claim-time impediment and is deliberately not consulted — the
@@ -13094,7 +13134,11 @@ pub(crate) async fn build_diagnosis_report(
                     TaskClaimRequirements {
                         queue_name: &t.queue_name,
                         required_build_id: t.required_build_id.as_deref(),
-                        required_capabilities: t.required_capabilities.as_ref(),
+                        required_capabilities: effective_required_capabilities(
+                            t.required_capabilities.as_ref(),
+                            t.activity_name.as_deref(),
+                            &activity_requirements,
+                        ),
                         is_session_member: t.session_id.is_some(),
                         sticky_worker_id: t.sticky_worker_id.as_deref(),
                     },
@@ -13201,6 +13245,11 @@ pub(crate) async fn build_diagnosis_report(
                     TaskClaimRequirements {
                         queue_name: &queue_name,
                         required_build_id: required_build_id.as_deref(),
+                        // Deliberately NOT backfilled from the registry, unlike
+                        // the activity site: `claim_task`'s
+                        // ineligible-activities gate is guarded by
+                        // `task_type != 'activity'`, so a workflow task is only
+                        // ever gated by its own snapshot.
                         required_capabilities: required_capabilities.as_ref(),
                         is_session_member: session_id.is_some(),
                         sticky_worker_id: sticky_worker_id.as_deref(),
@@ -49213,5 +49262,111 @@ mod tests {
             "an orphan held by a dead claimant must surface no_live_worker even \
              when a live Active peer covers the queue"
         );
+    }
+
+    #[test]
+    fn effective_capabilities_backfill_registered_requirements_for_an_unsnapshotted_row() {
+        // A legacy or manually enqueued activity row carries NULL
+        // `required_capabilities`, but `claim_task`'s ineligible-activities
+        // gate ($6) still enforces the REGISTERED handler's `requires`. The
+        // row's absent snapshot must not be read as "no requirements".
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::from([(
+                "gated".to_string(),
+                serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+            )]);
+
+        let resolved = effective_required_capabilities(None, Some("gated"), &registered);
+        assert_eq!(
+            resolved,
+            registered.get("gated"),
+            "a NULL snapshot must resolve to the registered requirements"
+        );
+    }
+
+    #[test]
+    fn effective_capabilities_prefer_the_rows_own_snapshot() {
+        // A snapshot is what the row was enqueued with; the registry may have
+        // changed since. `claim_task` gates on the snapshot when present
+        // (`required_capabilities IS NOT NULL` short-circuits $6), so the
+        // snapshot must win and the registry must never override it.
+        let snapshot = serde_json::json!([{"Exact": {"key": "region", "value": "eu"}}]);
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::from([(
+                "gated".to_string(),
+                serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+            )]);
+
+        assert_eq!(
+            effective_required_capabilities(Some(&snapshot), Some("gated"), &registered),
+            Some(&snapshot)
+        );
+    }
+
+    #[test]
+    fn effective_capabilities_are_none_when_neither_source_has_any() {
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        assert!(effective_required_capabilities(None, Some("ungated"), &registered).is_none());
+        assert!(effective_required_capabilities(None, None, &registered).is_none());
+    }
+
+    #[test]
+    fn unsnapshotted_row_with_registered_requirements_has_no_eligible_worker() {
+        // The behavioural composition: an unsnapshotted row whose registered
+        // activity demands `gpu=true` is NOT claimable by a live poller that
+        // advertises `gpu=false`, so the endpoint must not read it as healthy.
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::from([(
+                "gated".to_string(),
+                serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+            )]);
+        let workers = vec![eligibility_worker(
+            "w-cpu",
+            &["payments"],
+            "",
+            serde_json::json!({"gpu": "false"}),
+        )];
+        let compat = autumn_harvest::build_routing::BuildCompatibilitySet::new();
+
+        assert!(
+            !task_has_eligible_worker(
+                &workers,
+                0,
+                TaskClaimRequirements {
+                    queue_name: "payments",
+                    required_capabilities: effective_required_capabilities(
+                        None,
+                        Some("gated"),
+                        &registered
+                    ),
+                    ..TaskClaimRequirements::default()
+                },
+                &compat,
+            ),
+            "an unsnapshotted row must still be gated by the registered requirements"
+        );
+
+        // The control: a worker that DOES advertise the label is coverage.
+        let workers = vec![eligibility_worker(
+            "w-gpu",
+            &["payments"],
+            "",
+            serde_json::json!({"gpu": "true"}),
+        )];
+        assert!(task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                queue_name: "payments",
+                required_capabilities: effective_required_capabilities(
+                    None,
+                    Some("gated"),
+                    &registered
+                ),
+                ..TaskClaimRequirements::default()
+            },
+            &compat,
+        ));
     }
 }
