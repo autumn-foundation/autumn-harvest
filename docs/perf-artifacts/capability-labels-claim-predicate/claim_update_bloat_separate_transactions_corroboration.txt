@@ -1,0 +1,68 @@
+Timing is off.
+CREATE PROCEDURE
+TRUNCATE TABLE
+INSERT 0 10000
+VACUUM
+               label                | heap_pages
+------------------------------------+------------
+ no-caps-before-claim-separate-txns |        213
+(1 row)
+
+CALL
+               label               | heap_pages
+-----------------------------------+------------
+ no-caps-after-claim-separate-txns |        264
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 10000
+VACUUM
+              label              | heap_pages
+---------------------------------+------------
+ caps-before-claim-separate-txns |        304
+(1 row)
+
+CALL
+             label              | heap_pages
+--------------------------------+------------
+ caps-after-claim-separate-txns |        363
+(1 row)
+
+TRUNCATE TABLE
+DROP PROCEDURE
+
+-- Derived (not printed by the script -- computed here for the doc):
+--   no-caps claim-loop delta:  264 - 213 = 51 heap pages
+--   caps claim-loop delta:     363 - 304 = 59 heap pages
+--   extra growth attributable to carrying required_capabilities forward
+--   on a claim UPDATE that never touches that column:
+--     59 - 51 = 8 pages, i.e. (59-51)/51 = +15.7% more heap growth from
+--     the identical claim-shaped update sequence, purely because the rows
+--     are wider -- run against the exact same seeding as
+--     claim_update_bloat_corroboration.sql, with the sole difference being
+--     that each of the 10,000 claims commits in its own transaction here
+--     (matching claim_task()'s real, one-call-per-commit production
+--     pattern) instead of all 10,000 sharing one uncommitted transaction.
+--
+--   Run-to-run range across five executions of this script: no-caps delta
+--   50-55 pages, caps delta 57-60 pages, extra-from-capability-labels
+--   +9.1% to +15.7% (mean ~+14% across the five runs) -- small-number
+--   noise from autovacuum/opportunistic-pruning timing varying slightly
+--   run to run, an artifact of the separate-transaction pattern itself
+--   (the single bulk-UPDATE script has no such variance, because it never
+--   gives autovacuum/pruning a commit boundary to act on).
+--
+--   Compare to the single-bulk-transaction corroboration
+--   (claim_update_bloat_corroboration.txt): 213->463 (delta 250, a 117%
+--   increase) for no-caps and 304->648 (delta 344, a 113% increase) for
+--   caps, i.e. roughly 4.5-5.8x MORE total heap growth than the
+--   separate-transaction pattern measures here, and a +37.6% claimed
+--   capability-labels effect vs. +9-16% (~+14% mean) measured here -- see
+--   the review-response note in docs/performance-capability-labels.md's
+--   "Write-side cost" section for why: within one uncommitted transaction,
+--   a tuple killed earlier in that same transaction cannot be reclaimed by
+--   a later row processed in it (xmax belongs to a not-yet-committed
+--   transaction, so it is unprunable by definition), whereas a loop of
+--   separately-committed claims opens a reclaim window between each commit
+--   that opportunistic HOT pruning (and, over a long enough run,
+--   autovacuum) can use.

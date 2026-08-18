@@ -236,37 +236,64 @@ MVCC tuple version that carries the full, unchanged column value forward,
 whether or not that particular `UPDATE` ever touches `required_capabilities`
 itself.
 
-This was measured directly: a claim-shaped `UPDATE` (setting `state`,
-`worker_id`, `started_at` -- never `required_capabilities`) applied to a
-freshly seeded, freshly `VACUUM`ed 10,000-row table costs 250 heap pages of
-growth when the rows carry no capability requirements, and 344 pages when
-they do (artifacts:
+This was measured directly, in two shapes -- the second added after a
+review round on PR #1192 caught a confound in the first (see below). Both
+apply a claim-shaped `UPDATE` (setting `state`, `worker_id`, `started_at` --
+never `required_capabilities`) 10,000 times to a freshly seeded, freshly
+`VACUUM`ed 10,000-row table, and differ only in how those 10,000 claims are
+committed.
+
+The **production-representative** shape commits each claim in its own
+transaction, matching `claim_task()`'s real one-call-per-commit pattern.
+Across five runs it costs 50-55 heap pages of growth when the rows carry no
+capability requirements, and 57-60 pages when they do (artifacts:
+`docs/perf-artifacts/capability-labels-claim-predicate/claim_update_bloat_separate_transactions_corroboration.{sql,txt}`)
+-- **roughly +9% to +16% more heap growth from the identical claim
+operation** (mean ~+14% across the five runs), purely from carrying the
+wider payload forward into the new tuple version.
+
+A second, deliberately **non**-representative shape applies all 10,000
+claims as a single set-based `UPDATE` inside one transaction (artifacts:
 `docs/perf-artifacts/capability-labels-claim-predicate/claim_update_bloat_corroboration.{sql,txt}`)
--- **+37.6% more heap growth from the identical claim operation**, purely
-from carrying the wider payload forward into the new tuple version. That
-figure lands within the ~30-47% band spanned by every other measurement on
-this page (from the +30.2% `EXPLAIN` delta at backlog=1,000 to the +46.57%
-`pg_stat_statements` aggregate delta above), which is expected: the claim
-`UPDATE`'s new tuple version is subject to the same per-row-width effect as
-the original scan.
+and costs 250 and 344 pages respectively -- **+37.6%**. Review correctly
+flagged this bulk-transaction figure as a confound with the production
+mechanism: within one uncommitted transaction, a tuple version killed
+earlier in that same transaction cannot be reclaimed by a later row
+processed in it -- its `xmax` belongs to a transaction that has not yet
+committed, so it is categorically unprunable, by either opportunistic HOT
+pruning or autovacuum, until that transaction commits -- whereas a loop of
+separately-committed claims (the real production pattern) opens a reclaim
+window between every commit that opportunistic pruning can use. The
+bulk-transaction figure still measures something real -- it is the worst
+case a batch operation touching many rows inside one explicit transaction
+(a mass backfill, a migration script, an admin tool) would see -- but it is
+not representative of the per-claim production path this design actually
+adds cost to, roughly overstating that cost by 2.4-4.1x (37.6% divided by
+the 9.1-15.7% range measured above). The
+separate-transaction measurement above is this section's headline figure;
+the bulk-transaction one is included only as an explicitly-scoped upper
+bound.
 
 This bloat is **not fully transient**: `VACUUM` (autovacuum, in production)
 marks the superseded tuple versions' space as reusable for future writes to
 this same table, but it does not compact live rows together or shrink the
 relation's on-disk size -- ordinary `VACUUM` only truncates pages that are
 entirely empty at the table's physical tail, which a continuously-churning
-task queue essentially never has. The heap-page growth measured above
-therefore persists past any number of ordinary vacuum cycles, not just in a
-window before the next vacuum runs: it recurs on every state transition a
-task row goes through (claim, then completion or failure, and again on
-every retry), and the resulting extra pages stay part of the table's
-physical footprint -- inflating every *future* `Seq Scan`'s buffer cost too,
-not just the write path that created them -- until either later writes
-happen to land in and reuse that specific freed space, or a full table
-rewrite (`VACUUM FULL`, `CLUSTER`, `pg_repack`) runs. Deployments that never
-populate `required_capabilities` pay none of this -- the `no-capabilities`
-baseline in this doc *is* every existing claim-path benchmark in this
-crate.
+task queue essentially never has. Some of the heap-page growth measured
+above is reclaimed the moment a later write happens to land on a page
+holding one of these now-dead tuples -- exactly the mechanism that makes
+the separate-transaction figure smaller than the bulk-transaction one -- but
+growth that is *not* reclaimed that way persists past any number of
+ordinary vacuum cycles, not just in a window before the next vacuum runs:
+it recurs on every state transition a task row goes through (claim, then
+completion or failure, and again on every retry), and the resulting extra
+pages stay part of the table's physical footprint -- inflating every
+*future* `Seq Scan`'s buffer cost too, not just the write path that created
+them -- until either later writes happen to land in and reuse that specific
+freed space, or a full table rewrite (`VACUUM FULL`, `CLUSTER`,
+`pg_repack`) runs. Deployments that never populate `required_capabilities`
+pay none of this -- the `no-capabilities` baseline in this doc *is* every
+existing claim-path benchmark in this crate.
 
 ## Why no fix is proposed
 
@@ -429,31 +456,38 @@ or, with only a reachable Docker daemon and no external Postgres:
 Both regenerate the `EXPLAIN` captures, `pg_stat_statements` snapshots, and
 `fixture-summary.txt` under
 `docs/perf-artifacts/capability-labels-claim-predicate/` from scratch.
-**They do NOT regenerate the two standalone SQL corroboration outputs**
-(`pg_relation_size_corroboration.txt` and
-`claim_update_bloat_corroboration.txt`) -- those scripts are independent of
-the Rust harness and are never invoked by either repro command above. After
-any schema, index, or storage-layout change to `harvest_task_queue` or
-`harvest_workers`, re-run these two commands explicitly as well, or the
-committed corroboration `.txt` outputs will silently go stale (reflecting
-the old layout) even though the primary `EXPLAIN`/`pg_stat_statements`
-captures are fresh.
+**They do NOT regenerate the three standalone SQL corroboration outputs**
+(`pg_relation_size_corroboration.txt`,
+`claim_update_bloat_corroboration.txt`, and
+`claim_update_bloat_separate_transactions_corroboration.txt`) -- those
+scripts are independent of the Rust harness and are never invoked by either
+repro command above. After any schema, index, or storage-layout change to
+`harvest_task_queue` or `harvest_workers`, re-run these three commands
+explicitly as well, or the committed corroboration `.txt` outputs will
+silently go stale (reflecting the old layout) even though the primary
+`EXPLAIN`/`pg_stat_statements` captures are fresh. Note that
+`claim_update_bloat_separate_transactions_corroboration.sql` commits 10,000
+separate transactions and its own dead-tuple reclamation therefore depends
+on autovacuum/opportunistic-pruning timing, so its exact page counts vary
+slightly run to run (see the range noted in its `.txt` artifact and in the
+[Write-side cost](#write-side-cost) section) -- this is expected, not a
+reproduction failure.
 
 **`$DATABASE_URL` below MUST point at a disposable scratch database --
-never a real development, staging, or production database.** Both SQL
+never a real development, staging, or production database.** All three SQL
 scripts repeatedly run `TRUNCATE harvest_task_queue RESTART IDENTITY`, and
-`psql` executes each statement in its own autocommit transaction, so if a
-later statement in the script fails, the `TRUNCATE`s that already ran are
-**not** rolled back. Pointed at a shared application database, these
+`psql` executes each top-level statement in its own autocommit transaction,
+so if a later statement in a script fails, the `TRUNCATE`s that already ran
+are **not** rolled back. Pointed at a shared application database, these
 commands irreversibly delete its queued tasks. The Rust harness above never
 has this risk -- it creates and tears down its own dedicated, pid-scoped
 scratch database (`harvest_claim_bench_<pid>_<token>_<seq>`, see
 `claim_bench_support.rs`) for every run. Do the equivalent by hand before
-invoking either script directly:
+invoking any of the three scripts directly:
 
 ```bash
 # 1. Create a throwaway database and apply migrations to it -- do this
-#    ONCE, then reuse the same scratch database for both scripts below.
+#    ONCE, then reuse the same scratch database for all three scripts below.
 createdb -h localhost -U postgres harvest_perf_scratch
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/harvest_perf_scratch
 (cd autumn-harvest && diesel migration run)
@@ -466,6 +500,10 @@ psql "$DATABASE_URL" \
 psql "$DATABASE_URL" \
   -f docs/perf-artifacts/capability-labels-claim-predicate/claim_update_bloat_corroboration.sql \
   > docs/perf-artifacts/capability-labels-claim-predicate/claim_update_bloat_corroboration.txt
+
+psql "$DATABASE_URL" \
+  -f docs/perf-artifacts/capability-labels-claim-predicate/claim_update_bloat_separate_transactions_corroboration.sql \
+  > docs/perf-artifacts/capability-labels-claim-predicate/claim_update_bloat_separate_transactions_corroboration.txt
 
 # 3. Tear the scratch database down when done.
 dropdb -h localhost -U postgres harvest_perf_scratch
