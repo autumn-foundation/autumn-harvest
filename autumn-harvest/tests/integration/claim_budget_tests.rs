@@ -2276,16 +2276,49 @@ async fn zz_capture_capability_labels_claim_evidence() {
 
         for label in ["no-capabilities", "capability-labels"] {
             if label == "capability-labels" {
-                // Mutate the just-seeded (still-PENDING, since the prior
-                // label's EXPLAIN ANALYZE below rolls its claim back) rows
-                // in place, then re-ANALYZE: a fresh JSONB column changes
-                // row width and therefore planner statistics.
+                // Re-seed FRESH with `required_capabilities` populated at
+                // INSERT time, rather than UPDATE-ing the already-seeded
+                // no-capabilities rows in place.
+                //
+                // The first cut of this capture did the latter, and it
+                // measured a confounded number: Postgres MVCC gives an
+                // UPDATE a brand-new tuple version, so mutating 10,000
+                // freshly-inserted rows left their *old*, now-dead NULL-caps
+                // versions physically resident in the heap alongside the new
+                // ones (nothing here runs a VACUUM) -- inflating the page
+                // count with bloat that has nothing to do with the
+                // predicate's real cost, and that never happens in
+                // production, where `required_capabilities` is set once at
+                // schedule time and never retroactively mutated. Verified
+                // directly: TRUNCATE+re-INSERT-with-capabilities measured
+                // 334 heap pages for this exact 10k-row/4-queue shape
+                // (+36.9% over the 244-page no-capabilities baseline);
+                // seed-then-UPDATE measured 578 pages on the identical rows
+                // (+136.9%) -- a ~3.7x inflation from the UPDATE artifact
+                // alone. This capture uses the honest, isolated number.
+                diesel::sql_query("TRUNCATE harvest_task_queue")
+                    .execute(&mut conn)
+                    .await
+                    .expect("truncate before the capability-labels re-seed");
                 diesel::sql_query(format!(
-                    "UPDATE harvest_task_queue SET required_capabilities = '{REQUIRED_CAPABILITIES_JSON}'::jsonb"
+                    "INSERT INTO harvest_task_queue \
+                       (queue_name, task_type, activity_name, activity_id, input, \
+                        state, priority, max_attempts, scheduled_at, \
+                        required_build_id, concurrency_key, concurrency_cap, \
+                        rate_limit_key, required_capabilities) \
+                     SELECT '{}-q-' || (i % {}), 'activity', '{}', \
+                            gen_random_uuid(), '{{}}'::jsonb, 'PENDING', 0, 3, \
+                            NOW() - INTERVAL '1 second', NULL, NULL, NULL, NULL, \
+                            '{REQUIRED_CAPABILITIES_JSON}'::jsonb \
+                     FROM generate_series(0, {}) AS s(i)",
+                    db::BENCH_PREFIX,
+                    scenario.queues,
+                    db::BENCH_ACTIVITY,
+                    backlog - 1,
                 ))
                 .execute(&mut conn)
                 .await
-                .expect("mutate seeded rows to carry required_capabilities");
+                .expect("re-seed rows carrying required_capabilities from birth");
                 diesel::sql_query(format!(
                     "UPDATE harvest_workers SET labels = '{WORKER_LABELS_JSON}'::jsonb WHERE worker_id = {worker_literal}"
                 ))
@@ -2295,7 +2328,7 @@ async fn zz_capture_capability_labels_claim_evidence() {
                 diesel::sql_query("ANALYZE harvest_task_queue")
                     .execute(&mut conn)
                     .await
-                    .expect("re-analyze after widening required_capabilities");
+                    .expect("re-analyze after the capability-labels re-seed");
                 diesel::sql_query("ANALYZE harvest_workers")
                     .execute(&mut conn)
                     .await
@@ -2382,12 +2415,34 @@ async fn zz_capture_capability_labels_claim_evidence() {
         let worker_literal = format!("'{}-worker-0'", db::BENCH_PREFIX);
 
         if label == "capability-labels" {
+            // Same fix as the backlog-sweep loop above: re-seed fresh with
+            // `required_capabilities` populated at INSERT time instead of
+            // UPDATE-ing the just-seeded rows, so the drain below starts
+            // from an unbloated table rather than one carrying dead NULL-caps
+            // tuple versions from an UPDATE that never happens in production.
+            diesel::sql_query("TRUNCATE harvest_task_queue")
+                .execute(&mut stats_conn)
+                .await
+                .expect("truncate before the capability-labels re-seed");
             diesel::sql_query(format!(
-                "UPDATE harvest_task_queue SET required_capabilities = '{REQUIRED_CAPABILITIES_JSON}'::jsonb"
+                "INSERT INTO harvest_task_queue \
+                   (queue_name, task_type, activity_name, activity_id, input, \
+                    state, priority, max_attempts, scheduled_at, \
+                    required_build_id, concurrency_key, concurrency_cap, \
+                    rate_limit_key, required_capabilities) \
+                 SELECT '{}-q-' || (i % {}), 'activity', '{}', \
+                        gen_random_uuid(), '{{}}'::jsonb, 'PENDING', 0, 3, \
+                        NOW() - INTERVAL '1 second', NULL, NULL, NULL, NULL, \
+                        '{REQUIRED_CAPABILITIES_JSON}'::jsonb \
+                 FROM generate_series(0, {}) AS s(i)",
+                db::BENCH_PREFIX,
+                headline.queues,
+                db::BENCH_ACTIVITY,
+                headline.backlog - 1,
             ))
             .execute(&mut stats_conn)
             .await
-            .expect("mutate headline backlog to carry required_capabilities");
+            .expect("re-seed headline backlog carrying required_capabilities from birth");
             diesel::sql_query(format!(
                 "UPDATE harvest_workers SET labels = '{WORKER_LABELS_JSON}'::jsonb WHERE worker_id = {worker_literal}"
             ))
