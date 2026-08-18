@@ -12701,26 +12701,79 @@ fn task_has_eligible_worker(
     reqs: TaskClaimRequirements<'_>,
     compat_set: &autumn_harvest::build_routing::BuildCompatibilitySet,
 ) -> bool {
+    !eligible_worker_ids(workers, shard_id, reqs, compat_set).is_empty()
+}
+
+/// WHICH workers could claim this task — the identities behind
+/// [`task_has_eligible_worker`]'s boolean.
+///
+/// Needed because the in-process circuit registry describes exactly one
+/// worker's breaker, so the endpoint must know whether that worker is the only
+/// one that could pick this row up before it treats the local phase as the
+/// answer (see [`local_circuit_snapshot_is_authoritative`]).
+fn eligible_worker_ids<'a>(
+    workers: &'a [WorkerRow],
+    shard_id: i32,
+    reqs: TaskClaimRequirements<'_>,
+    compat_set: &autumn_harvest::build_routing::BuildCompatibilitySet,
+) -> Vec<&'a str> {
     let requirements = reqs.required_capabilities.and_then(|caps| {
         serde_json::from_value::<Vec<autumn_harvest::eligibility::Requirement>>(caps.clone()).ok()
     });
 
-    workers.iter().any(|w| {
-        if !reqs.session_admits(&w.worker.worker_id) {
-            return false;
-        }
-        if !worker_can_claim_now(w, reqs.queue_name, shard_id) {
-            return false;
-        }
-        if !compat_set.is_eligible(&w.worker.build_id, reqs.required_build_id) {
-            return false;
-        }
-        requirements.as_ref().is_none_or(|parsed| {
-            let labels: std::collections::HashMap<String, String> =
-                serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
-            autumn_harvest::eligibility::matches_requirements(parsed, &labels)
+    workers
+        .iter()
+        .filter(|w| {
+            if !reqs.session_admits(&w.worker.worker_id) {
+                return false;
+            }
+            if !worker_can_claim_now(w, reqs.queue_name, shard_id) {
+                return false;
+            }
+            if !compat_set.is_eligible(&w.worker.build_id, reqs.required_build_id) {
+                return false;
+            }
+            requirements.as_ref().is_none_or(|parsed| {
+                let labels: std::collections::HashMap<String, String> =
+                    serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                autumn_harvest::eligibility::matches_requirements(parsed, &labels)
+            })
         })
-    })
+        .map(|w| w.worker.worker_id.as_str())
+        .collect()
+}
+
+/// May this process's circuit-breaker snapshot be reported as THE answer for a
+/// task whose eligible workers are `eligible_ids`?
+///
+/// The registry is deliberately **in-process and per-shard**
+/// (`circuit_breaker.rs`): every worker process constructs its own via
+/// `HandlerRegistry::new`, there is no table backing it, and the breaker that
+/// actually gates a dispatch is the one belonging to whichever worker ends up
+/// claiming the task (`process_activity_task`). A multi-replica fleet therefore
+/// has N independent breakers for one activity, and this API replica can only
+/// see its own.
+///
+/// So the local phase is authoritative only when the local worker is the
+/// **sole** worker that could claim the row. Otherwise a peer whose breaker is
+/// closed can still dispatch it, and reporting `activity_circuit_open` /
+/// `stalled` would be a false positive on the flagship stall verdict — the
+/// worst outcome for a triage tool, and the same principle that keeps a
+/// self-healing sticky lease out of `task_has_eligible_worker`.
+///
+/// The cost is a deliberate false *negative*: a genuinely fleet-wide outage
+/// (every replica open) is not reported as `activity_circuit_open`, and the run
+/// degrades to the next-ranked verdict instead. That is the safe direction for
+/// a stall verdict, and `GET /admin/circuits` remains the per-replica surface
+/// that shows each breaker's real phase.
+fn local_circuit_snapshot_is_authoritative(
+    eligible_ids: &[&str],
+    local_worker_id: Option<&str>,
+) -> bool {
+    match (eligible_ids, local_worker_id) {
+        ([only], Some(local)) => *only == local,
+        _ => false,
+    }
 }
 
 /// Decode the one activity error this response actually surfaces (issue #608).
@@ -12981,6 +13034,16 @@ pub(crate) async fn build_diagnosis_report(
         },
     );
 
+    // This process's own worker, when one is co-located. The breaker registry
+    // above belongs to exactly this worker, so its phase is only ever the
+    // answer for a task nothing else could claim -- see
+    // `local_circuit_snapshot_is_authoritative`. `None` on an API-only replica:
+    // nothing drives that registry, so it describes no dispatcher at all.
+    let local_worker_id: Option<String> = api_state
+        .runtime()
+        .ok()
+        .and_then(|runtime| runtime.worker_id);
+
     // Registered capability requirements, keyed by activity name (issue #804).
     // Needed because a legacy or manually enqueued row can carry NULL
     // `required_capabilities` while `claim_task`'s ineligible-activities gate
@@ -13088,7 +13151,38 @@ pub(crate) async fn build_diagnosis_report(
                 .activity_name
                 .as_ref()
                 .is_some_and(|name| cb_tracked.contains(name));
-            let snapshot = t.activity_name.as_ref().and_then(|name| cb_phase.get(name));
+            // WHICH workers could claim this row. Computed once: it answers
+            // both "is anything alive for this task?" and "is our own
+            // in-process breaker the one that will actually gate its dispatch?".
+            let eligible_ids = eligible_worker_ids(
+                &live_workers,
+                shard_id,
+                TaskClaimRequirements {
+                    queue_name: &t.queue_name,
+                    required_build_id: t.required_build_id.as_deref(),
+                    required_capabilities: effective_required_capabilities(
+                        t.required_capabilities.as_ref(),
+                        t.activity_name.as_deref(),
+                        &activity_requirements,
+                    ),
+                    is_session_member: t.session_id.is_some(),
+                    sticky_worker_id: t.sticky_worker_id.as_deref(),
+                },
+                &compat_set,
+            );
+            // The breaker registry is in-process, so its phase describes only
+            // THIS replica. Treat it as the verdict only when our own worker is
+            // the sole worker that could claim the row -- otherwise a peer whose
+            // breaker is closed can still dispatch it and a fleet-wide
+            // `activity_circuit_open`/`stalled` would be a false positive.
+            let snapshot = if local_circuit_snapshot_is_authoritative(
+                &eligible_ids,
+                local_worker_id.as_deref(),
+            ) {
+                t.activity_name.as_ref().and_then(|name| cb_phase.get(name))
+            } else {
+                None
+            };
             let (circuit_phase, circuit_cooldown_until) = match snapshot.map(|s| s.state) {
                 Some("open") => (
                     Some(BlockingCircuitPhase::Open),
@@ -13128,22 +13222,7 @@ pub(crate) async fn build_diagnosis_report(
                 rate_limit_key: t.rate_limit_key.clone(),
                 concurrency_key: t.concurrency_key.clone(),
                 queue_paused,
-                has_live_worker: task_has_eligible_worker(
-                    &live_workers,
-                    shard_id,
-                    TaskClaimRequirements {
-                        queue_name: &t.queue_name,
-                        required_build_id: t.required_build_id.as_deref(),
-                        required_capabilities: effective_required_capabilities(
-                            t.required_capabilities.as_ref(),
-                            t.activity_name.as_deref(),
-                            &activity_requirements,
-                        ),
-                        is_session_member: t.session_id.is_some(),
-                        sticky_worker_id: t.sticky_worker_id.as_deref(),
-                    },
-                    &compat_set,
-                ),
+                has_live_worker: !eligible_ids.is_empty(),
                 claimant_is_live: claimant_is_live(
                     &live_workers,
                     t.worker_id.as_deref(),
@@ -13397,7 +13476,7 @@ pub(crate) async fn build_diagnosis_report(
         decode_outcome.merged(decode_surfaced_activity_error(&mut blocked_on, decoder));
     let health = blocked_on.health();
     let summary = summarize(&blocked_on);
-    let contributing_reason_codes = contributing_reasons_for(&inputs.activities, &cb_phase);
+    let contributing_reason_codes = contributing_reasons_for(&inputs.activities);
 
     Ok(WorkflowDiagnoseResponse {
         execution_id: exec_id.to_string(),
@@ -13432,11 +13511,24 @@ pub(crate) async fn build_diagnosis_report(
 /// `blocked_on` can never drift apart in how an impediment is named.
 fn contributing_reasons_for(
     activities: &[autumn_harvest::stall_diagnosis::PendingActivityFacts],
-    cb_phase: &std::collections::HashMap<String, autumn_harvest::circuit_breaker::CircuitSnapshot>,
 ) -> Vec<String> {
-    let phases: std::collections::HashMap<String, &'static str> = cb_phase
+    // Derived from the FACTS, never from the raw in-process snapshot: a phase
+    // reaches a fact only when the local breaker is authoritative for that row
+    // (`local_circuit_snapshot_is_authoritative`). Reading the raw map here
+    // would put `circuit_open` next to a `healthy` headline whenever a peer
+    // replica could still dispatch the task -- the same two-surfaces-disagree
+    // bug the held-row liveness split fixed below.
+    let phases: std::collections::HashMap<String, &'static str> = activities
         .iter()
-        .map(|(name, snap)| (name.clone(), snap.state))
+        .filter_map(|f| {
+            let name = f.activity_name.clone()?;
+            let phase = match f.circuit_phase? {
+                autumn_harvest::stall_diagnosis::BlockingCircuitPhase::Open => "open",
+                autumn_harvest::stall_diagnosis::BlockingCircuitPhase::HalfOpen => "half_open",
+                _ => return None,
+            };
+            Some((name, phase))
+        })
         .collect();
     let mut reasons: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for facts in activities {
@@ -49131,7 +49223,7 @@ mod tests {
         let mut b = base("dead-q");
         b.has_live_worker = false;
 
-        let reasons = contributing_reasons_for(&[a, b], &std::collections::HashMap::new());
+        let reasons = contributing_reasons_for(&[a, b]);
         assert!(
             reasons.iter().any(|r| r == "queue_paused"),
             "expected queue_paused in {reasons:?}"
@@ -49164,7 +49256,7 @@ mod tests {
             rate_limit_saturated: false,
             concurrency_saturated: false,
         };
-        assert!(contributing_reasons_for(&[facts], &std::collections::HashMap::new()).is_empty());
+        assert!(contributing_reasons_for(&[facts]).is_empty());
     }
 
     #[test]
@@ -49191,7 +49283,7 @@ mod tests {
             concurrency_saturated: false,
         };
         assert_eq!(
-            contributing_reasons_for(&[facts], &std::collections::HashMap::new()),
+            contributing_reasons_for(&[facts]),
             vec!["no_live_worker".to_string()]
         );
     }
@@ -49225,7 +49317,7 @@ mod tests {
             concurrency_saturated: false,
         };
         assert!(
-            contributing_reasons_for(&[facts], &std::collections::HashMap::new()).is_empty(),
+            contributing_reasons_for(&[facts]).is_empty(),
             "a held row whose own claimant is alive is progressing; \
              reporting no_live_worker would contradict `healthy_in_progress`"
         );
@@ -49257,7 +49349,7 @@ mod tests {
             concurrency_saturated: false,
         };
         assert_eq!(
-            contributing_reasons_for(&[facts], &std::collections::HashMap::new()),
+            contributing_reasons_for(&[facts]),
             vec!["no_live_worker".to_string()],
             "an orphan held by a dead claimant must surface no_live_worker even \
              when a live Active peer covers the queue"
@@ -49309,6 +49401,73 @@ mod tests {
             std::collections::HashMap::new();
         assert!(effective_required_capabilities(None, Some("ungated"), &registered).is_none());
         assert!(effective_required_capabilities(None, None, &registered).is_none());
+    }
+
+    /// The circuit registry is **in-process** (`circuit_breaker.rs`) and each
+    /// worker process builds its own (`HandlerRegistry::new`), so a local
+    /// snapshot only describes the local worker's breaker. It may be treated as
+    /// the answer for a task ONLY when the local worker is the sole worker that
+    /// could claim that task — otherwise a peer replica whose breaker is closed
+    /// can still dispatch it, and reporting a fleet-wide stall would be a false
+    /// positive on the flagship verdict.
+    #[test]
+    fn local_circuit_snapshot_is_authoritative_only_for_a_sole_local_eligible_worker() {
+        // Sole eligible worker, and it is us: our breaker IS the one that will
+        // be consulted at dispatch.
+        assert!(local_circuit_snapshot_is_authoritative(
+            &["w-local"],
+            Some("w-local")
+        ));
+
+        // A peer is also eligible: its breaker may be closed, so our local
+        // snapshot cannot support a fleet-wide verdict.
+        assert!(!local_circuit_snapshot_is_authoritative(
+            &["w-local", "w-peer"],
+            Some("w-local")
+        ));
+
+        // The sole eligible worker is someone else entirely — our breaker is
+        // irrelevant to this task.
+        assert!(!local_circuit_snapshot_is_authoritative(
+            &["w-peer"],
+            Some("w-local")
+        ));
+
+        // No co-located worker in this process (an API-only replica): nothing
+        // drives our registry, so it describes no dispatcher at all.
+        assert!(!local_circuit_snapshot_is_authoritative(&["w-peer"], None));
+
+        // No eligible worker at all -- `activity_no_worker` outranks the
+        // breaker anyway, but the predicate must not claim authority.
+        assert!(!local_circuit_snapshot_is_authoritative(
+            &[],
+            Some("w-local")
+        ));
+    }
+
+    #[test]
+    fn eligible_worker_ids_lists_every_worker_that_can_claim() {
+        // Two pollers cover the queue; a third covers a different queue.
+        let workers = vec![
+            eligibility_worker("w-a", &["payments"], "", serde_json::json!({})),
+            eligibility_worker("w-b", &["payments"], "", serde_json::json!({})),
+            eligibility_worker("w-other", &["reports"], "", serde_json::json!({})),
+        ];
+        let compat = autumn_harvest::build_routing::BuildCompatibilitySet::new();
+        let reqs = TaskClaimRequirements {
+            queue_name: "payments",
+            ..TaskClaimRequirements::default()
+        };
+
+        let ids = eligible_worker_ids(&workers, 0, reqs, &compat);
+        assert_eq!(ids, vec!["w-a", "w-b"]);
+
+        // The boolean helper stays exactly "the set is non-empty", so every
+        // existing eligibility guarantee is preserved by construction.
+        assert_eq!(
+            task_has_eligible_worker(&workers, 0, reqs, &compat),
+            !ids.is_empty()
+        );
     }
 
     #[test]

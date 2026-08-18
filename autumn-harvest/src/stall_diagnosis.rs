@@ -345,13 +345,25 @@ impl BlockedOn {
     pub const fn health(&self) -> ExecutionHealth {
         match self {
             // Progressing, or self-healing without intervention.
+            //
+            // A HALF-OPEN breaker belongs here: a probe is admissible right now
+            // and success closes it, so it "clears without intervention" --
+            // `Healthy`'s documented contract, and what this verdict's own
+            // summary already tells the operator. Only an OPEN breaker actually
+            // fast-fails every dispatch, so it falls through to the stalled arm
+            // below. This arm must stay ABOVE the catch-all
+            // `ActivityCircuitOpen { .. }` for the phase split to bind.
             Self::HealthyInProgress
             | Self::SleepingTimer { .. }
             | Self::PendingChild { .. }
             | Self::ActivityRetrying { .. }
             | Self::ActivityDeferred { .. }
             | Self::ActivityRateLimited { .. }
-            | Self::ActivityConcurrencyDeferred { .. } => ExecutionHealth::Healthy,
+            | Self::ActivityConcurrencyDeferred { .. }
+            | Self::ActivityCircuitOpen {
+                phase: BlockingCircuitPhase::HalfOpen,
+                ..
+            } => ExecutionHealth::Healthy,
             // Waiting on a party outside the engine.
             Self::AwaitingSignal { .. }
             | Self::AwaitingExternalHandoff { .. }
@@ -1516,6 +1528,45 @@ mod tests {
             cooldown_until: None,
         };
         assert!(summarize(&forced).contains("force-close"));
+    }
+
+    /// `health()` must agree with the phase the verdict carries and with the
+    /// summary it renders.
+    ///
+    /// `ExecutionHealth::Healthy` is documented as "progressing, **or blocked on
+    /// something that clears without intervention**" -- which is precisely a
+    /// half-open breaker: a probe is admissible right now and success closes it.
+    /// Reporting `stalled` ("needs a human: nothing will move this run forward
+    /// on its own") contradicts both that contract and this verdict's own
+    /// summary, which explicitly says no operator action is required.
+    #[test]
+    fn half_open_circuit_health_is_healthy_not_stalled() {
+        let half_open = BlockedOn::ActivityCircuitOpen {
+            activity_name: "charge_card".to_string(),
+            phase: BlockingCircuitPhase::HalfOpen,
+            cooldown_until: None,
+        };
+        assert_eq!(
+            half_open.health(),
+            ExecutionHealth::Healthy,
+            "a half-open breaker recovers without a human, so it is not a stall"
+        );
+
+        // An OPEN breaker still fast-fails every dispatch, so it stays a stall
+        // -- whether it is operator-forced (no cooldown) or organically tripped.
+        let forced_open = BlockedOn::ActivityCircuitOpen {
+            activity_name: "charge_card".to_string(),
+            phase: BlockingCircuitPhase::Open,
+            cooldown_until: None,
+        };
+        assert_eq!(forced_open.health(), ExecutionHealth::Stalled);
+
+        let organic_open = BlockedOn::ActivityCircuitOpen {
+            activity_name: "charge_card".to_string(),
+            phase: BlockingCircuitPhase::Open,
+            cooldown_until: Some(chrono::Utc::now()),
+        };
+        assert_eq!(organic_open.health(), ExecutionHealth::Stalled);
     }
 
     /// The classifier preserves the observed phase, so the two shapes above are

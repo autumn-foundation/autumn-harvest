@@ -284,6 +284,44 @@ fn build_pool(url: &str) -> DbPool {
 /// Build the API state, also handing back the registry so a test can reach the
 /// SAME shared circuit-breaker registry the endpoint reads (`runtime()` is
 /// crate-private, so the handle is threaded out here instead).
+/// The worker id this test process's API runtime advertises as its own
+/// co-located worker.
+///
+/// The in-process circuit registry belongs to exactly this worker, so a test
+/// that expects an `activity_circuit_open` verdict must seed THIS id as the
+/// live poller -- that is what a real single-replica deployment looks like
+/// (the API and its worker share one process and one breaker registry). Seeding
+/// some other id models a *peer replica*, whose breaker this process cannot see.
+const LOCAL_WORKER_ID: &str = "diagnose-test";
+
+/// Like [`build_api_state_with_registry`], but the runtime advertises NO
+/// co-located worker -- an API-only replica. Its in-process breaker registry is
+/// driven by nothing, so it must never decide a dispatch verdict.
+fn build_api_state_without_local_worker(pool: &DbPool) -> (HarvestApiState, Arc<HandlerRegistry>) {
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![wf_info("activity_wf", activity_workflow)],
+        vec![
+            breaker_activity(),
+            plain_activity(),
+            registry_gated_activity(),
+        ],
+    ));
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::default(),
+    ));
+    (api_state, registry)
+}
+
 fn build_api_state_with_registry(
     pool: &DbPool,
     admin_boundary: bool,
@@ -309,7 +347,7 @@ fn build_api_state_with_registry(
         Arc::clone(&registry),
         Arc::new(DagCatalog::default()),
         Arc::new(Vec::new()),
-        Some("diagnose-test".to_string()),
+        Some(LOCAL_WORKER_ID.to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
@@ -742,7 +780,10 @@ async fn ac5_forced_open_circuit_reports_circuit_open_without_a_cooldown() {
     )
     .await;
     // A live worker, so `activity_no_worker` cannot be what we are observing.
-    seed_live_worker(&pool, "worker-payments", "payments").await;
+    // It is THIS process's own worker (`LOCAL_WORKER_ID`), i.e. the single-
+    // replica shape: the breaker we forced open is the very one that would gate
+    // this task's dispatch, so the local snapshot is authoritative.
+    seed_live_worker(&pool, LOCAL_WORKER_ID, "payments").await;
 
     let body = diagnose(&app, exec_id).await;
     assert_eq!(kind(&body), "activity_circuit_open", "body: {body}");
@@ -800,7 +841,9 @@ async fn ac5_organically_tripped_circuit_reports_a_derived_cooldown_until() {
         "NOW() - INTERVAL '1 minute'",
     )
     .await;
-    seed_live_worker(&pool, "worker-payments", "payments").await;
+    // The co-located worker (see `LOCAL_WORKER_ID`) -- the single-replica shape
+    // in which this process's breaker is the one that gates dispatch.
+    seed_live_worker(&pool, LOCAL_WORKER_ID, "payments").await;
 
     let before = Utc::now();
     let body = diagnose(&app, exec_id).await;
@@ -2769,6 +2812,110 @@ async fn held_workflow_task_with_a_draining_claimant_is_progressing() {
     assert_eq!(body["health"], "healthy", "body: {body}");
 }
 
+/// A tripped breaker on THIS replica is not a fleet-wide block.
+///
+/// The registry is in-process (`circuit_breaker.rs`) and every worker process
+/// builds its own, so when a peer replica also polls the queue its breaker may
+/// be closed and it can still dispatch the task. Reporting
+/// `activity_circuit_open`/`stalled` from one local snapshot would be a false
+/// positive on the flagship stall verdict.
+#[tokio::test]
+async fn open_circuit_is_not_reported_when_a_peer_replica_could_also_dispatch() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let (api_state, registry) = build_api_state_with_registry(&pool, true);
+    registry
+        .circuit_breakers()
+        .force_open("charge_card", std::time::Instant::now());
+    let app = build_api_app(api_state);
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_activity_task(
+        &pool,
+        exec_id,
+        "charge_card",
+        "payments",
+        "PENDING",
+        1,
+        Some("gateway 503"),
+        "NOW() - INTERVAL '1 minute'",
+    )
+    .await;
+    // Our own worker AND a peer replica both poll `payments`. We cannot see the
+    // peer's breaker, so our open one cannot decide the verdict.
+    seed_live_worker(&pool, LOCAL_WORKER_ID, "payments").await;
+    seed_live_worker(&pool, "worker-peer-replica", "payments").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_ne!(
+        kind(&body),
+        "activity_circuit_open",
+        "a peer replica could still dispatch this task, so one replica's open \
+         breaker must not be reported as a fleet-wide block: {body}"
+    );
+    assert_ne!(
+        body["health"], "stalled",
+        "and it must not be escalated to a stall: {body}"
+    );
+    // The advisory reason codes must agree with the headline -- reporting
+    // `circuit_open` there while the verdict says otherwise is the same
+    // two-surfaces-disagree bug the held-row liveness split fixed.
+    assert!(
+        !body["contributing_reason_codes"]
+            .as_array()
+            .expect("reason codes")
+            .iter()
+            .any(|r| r == "circuit_open"),
+        "reason codes must not claim a circuit block the verdict declined: {body}"
+    );
+}
+
+/// An API-only replica (no co-located worker) drives no breaker at all, so its
+/// registry describes no dispatcher and must never decide the verdict.
+#[tokio::test]
+async fn open_circuit_is_not_reported_by_an_api_replica_with_no_local_worker() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let (api_state, registry) = build_api_state_without_local_worker(&pool);
+    registry
+        .circuit_breakers()
+        .force_open("charge_card", std::time::Instant::now());
+    let app = build_api_app(api_state);
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_activity_task(
+        &pool,
+        exec_id,
+        "charge_card",
+        "payments",
+        "PENDING",
+        1,
+        Some("gateway 503"),
+        "NOW() - INTERVAL '1 minute'",
+    )
+    .await;
+    seed_live_worker(&pool, "worker-payments", "payments").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_ne!(
+        kind(&body),
+        "activity_circuit_open",
+        "an API-only replica's registry gates no dispatch: {body}"
+    );
+}
+
 /// A HALF-OPEN breaker is self-recovering: a probe is admitted right now and it
 /// closes on success. It must not be described like a force-opened breaker,
 /// whose only recovery is an explicit `force-close`.
@@ -2812,7 +2959,9 @@ async fn half_open_circuit_is_not_reported_as_operator_forced() {
         "NOW() - INTERVAL '1 minute'",
     )
     .await;
-    seed_live_worker(&pool, "worker-payments", "payments").await;
+    // The co-located worker (see `LOCAL_WORKER_ID`) -- the single-replica shape
+    // in which this process's breaker is the one that gates dispatch.
+    seed_live_worker(&pool, LOCAL_WORKER_ID, "payments").await;
 
     let body = diagnose(&app, exec_id).await;
     assert_eq!(kind(&body), "activity_circuit_open", "body: {body}");
