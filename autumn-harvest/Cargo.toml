@@ -281,5 +281,18 @@ harness = false
 name = "det_check_profile"
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `dlq::group_dead_letter_rows` -- the in-memory grouping core behind
+# `GET /admin/dead-letters/aggregate` (issue #385 / #613). `dlq.rs` uses
+# `diesel_async` unconditionally (no per-item `cfg(feature = "db")` gates), so
+# the whole file -- and this bench -- requires `db`; `required-features`
+# makes `cargo bench --no-default-features` skip it cleanly instead of
+# failing to compile, mirroring `claim_bench` above. See
+# `benches/dlq_aggregate_profile.rs` and `docs/performance-dlq-aggregate.md`.
+[[bench]]
+name = "dlq_aggregate_profile"
+required-features = ["db"]
+harness = false
+
 [lints]
 workspace = true
