@@ -2592,6 +2592,16 @@ async fn held_activity_on_a_draining_claimant_is_still_progressing() {
     let body = diagnose(&app, exec_id).await;
     assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
     assert_eq!(body["health"], "healthy", "body: {body}");
+    // The reason codes must agree with the verdict: a queue-coverage answer
+    // would report `no_live_worker` beside `health: healthy`.
+    assert!(
+        !body["contributing_reason_codes"]
+            .as_array()
+            .expect("reason codes")
+            .iter()
+            .any(|r| r == "no_live_worker"),
+        "a row held by its own live claimant must not report no_live_worker: {body}"
+    );
 }
 
 /// The complement: a `RUNNING` row whose claimant is GONE is still the flagship
@@ -2618,6 +2628,17 @@ async fn held_activity_whose_claimant_is_gone_reports_no_worker() {
     let body = diagnose(&app, exec_id).await;
     assert_eq!(kind(&body), "activity_no_worker", "body: {body}");
     assert_eq!(body["health"], "stalled", "body: {body}");
+    // The mirror image: claim eligibility is TRUE here (the Active peer covers
+    // the queue), so a coverage-only answer would omit the one reason that
+    // actually holds.
+    assert!(
+        body["contributing_reason_codes"]
+            .as_array()
+            .expect("reason codes")
+            .iter()
+            .any(|r| r == "no_live_worker"),
+        "an orphan held by a dead claimant must report no_live_worker: {body}"
+    );
 }
 
 /// The same distinction for the run's OWN workflow task: a decision cycle

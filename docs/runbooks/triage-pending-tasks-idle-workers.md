@@ -43,7 +43,15 @@ Use this runbook when an alert fires indicating that tasks are sitting in `PENDI
 > diagnosed activity, not just the highest-precedence one — so a task that is
 > both rate-limited *and* on a paused queue shows both. In a fan-out the
 > **worst** slot wins, so one wedged slot among nineteen healthy ones is never
-> masked.
+> masked. `no_live_worker` is the one code that is not a claim-time gate, so it
+> also appears for a row a worker already **holds** — but it asks the same
+> question the verdict does: an in-flight row is judged on whether its own
+> recorded claimant is alive (a gracefully-draining worker still counts, since
+> it is finishing exactly that row), not on whether some *other* worker could
+> claim new work. So the codes never contradict `health`: a row held by a live
+> draining claimant reads `healthy` with no `no_live_worker`, and an orphan
+> whose claimant is gone reads `stalled` **with** it even when a healthy Active
+> peer covers the queue.
 >
 > The endpoint is read-only: it appends no events, mutates no task-queue row,
 > and never advances a circuit breaker's phase, so it is safe to poll. Reach for

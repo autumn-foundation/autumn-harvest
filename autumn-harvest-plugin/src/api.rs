@@ -13395,14 +13395,32 @@ fn contributing_reasons_for(
         // gate, so the shared helper does not model it — but it is the one cause
         // that never self-heals, and it is equally real for a claimed row whose
         // fleet has gone (a poison-pill orphan, issue #367).
-        if !facts.has_live_worker {
+        //
+        // WHICH liveness question applies depends on the row's state, and must
+        // match `classify_pending_activity` exactly or the reason codes
+        // contradict the headline verdict:
+        //   * a PENDING row asks "can any worker CLAIM this?" (Active only), and
+        //   * a HELD row asks "is its own recorded CLAIMANT alive?" (Active OR
+        //     Draining — a gracefully-shutting-down worker claims nothing new
+        //     but IS finishing exactly this row).
+        // Without the split, a row held by a live draining claimant reports
+        // `healthy` yet carries `no_live_worker`, and an orphan held by a dead
+        // claimant OMITS it whenever a live Active peer happens to cover the
+        // queue — the one case the reason exists to surface.
+        let held = facts.task_state != "PENDING";
+        let worker_alive = if held {
+            facts.claimant_is_live.unwrap_or(facts.has_live_worker)
+        } else {
+            facts.has_live_worker
+        };
+        if !worker_alive {
             reasons.insert("no_live_worker".to_string());
         }
         // Every remaining reason is a CLAIM-time gate, so none of them applies
         // to a row a worker already holds. Reporting them for a claimed row
         // would put `queue_paused` next to `health: healthy` for work that is
         // actively running.
-        if facts.task_state != "PENDING" {
+        if held {
             continue;
         }
         // The classifier already resolved which impediments hold, so the
@@ -49126,6 +49144,74 @@ mod tests {
         assert_eq!(
             contributing_reasons_for(&[facts], &std::collections::HashMap::new()),
             vec!["no_live_worker".to_string()]
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_use_claimant_liveness_for_a_held_row() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // A row held by its own claimant, which has begun graceful shutdown
+        // (`Draining`, so it claims nothing new but IS finishing exactly this
+        // row). Queue-level claim eligibility is therefore false, but the
+        // claimant is alive and the classifier reports `healthy_in_progress` —
+        // so `no_live_worker` must NOT appear, or the reason codes would
+        // contradict the headline verdict.
+        let facts = PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: "email".to_string(),
+            task_state: "RUNNING".to_string(),
+            claimant_is_live: Some(true),
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            // Nothing *Active* covers the queue, so a PENDING row here would
+            // genuinely be `no_live_worker`.
+            has_live_worker: false,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            concurrency_saturated: false,
+        };
+        assert!(
+            contributing_reasons_for(&[facts], &std::collections::HashMap::new()).is_empty(),
+            "a held row whose own claimant is alive is progressing; \
+             reporting no_live_worker would contradict `healthy_in_progress`"
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_report_an_orphan_even_when_an_active_peer_covers_the_queue() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // The mirror image: the recorded claimant is gone (a poison-pill orphan,
+        // issue #367) while a healthy Active peer still covers the queue. A peer
+        // cannot pick up an already-claimed row, so the classifier reports
+        // `activity_no_worker` and the reason code must be present.
+        let facts = PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: "email".to_string(),
+            task_state: "RUNNING".to_string(),
+            claimant_is_live: Some(false),
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            // An Active peer covers the queue, so claim eligibility is true.
+            has_live_worker: true,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            concurrency_saturated: false,
+        };
+        assert_eq!(
+            contributing_reasons_for(&[facts], &std::collections::HashMap::new()),
+            vec!["no_live_worker".to_string()],
+            "an orphan held by a dead claimant must surface no_live_worker even \
+             when a live Active peer covers the queue"
         );
     }
 }
