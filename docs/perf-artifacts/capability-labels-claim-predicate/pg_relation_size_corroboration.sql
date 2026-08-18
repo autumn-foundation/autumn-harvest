@@ -3,12 +3,19 @@
 -- via pg_relation_size/pg_column_size, independent of the EXPLAIN-based
 -- measurement in the .explain.txt files alongside this artifact.
 --
--- Run against ANY database that already has autumn-harvest's Diesel
--- migrations applied (any dev DB, or a fresh bench DB produced by
--- claim_bench_support::setup_bench_db()). It TRUNCATEs and reseeds
--- harvest_task_queue three times in place -- do not run this against a
--- database whose harvest_task_queue contents you want to keep.
+-- Run ONLY against a disposable scratch database that already has
+-- autumn-harvest's Diesel migrations applied (a fresh throwaway DB you just
+-- created and migrated, or a fresh bench DB produced by
+-- claim_bench_support::setup_bench_db()) -- NEVER a real development,
+-- staging, or production database. It TRUNCATEs and reseeds
+-- harvest_task_queue three times in place. `psql` runs each statement in
+-- its own autocommit transaction, so if a later statement fails, the
+-- TRUNCATEs that already ran are NOT rolled back: pointed at a shared
+-- database, this irreversibly deletes its queued tasks.
 --
+--   createdb -h localhost -U postgres harvest_perf_scratch
+--   DATABASE_URL=postgres://postgres:postgres@localhost:5432/harvest_perf_scratch
+--   (cd autumn-harvest && diesel migration run)
 --   psql "$DATABASE_URL" -f docs/perf-artifacts/capability-labels-claim-predicate/pg_relation_size_corroboration.sql
 --
 -- pg_relation_size and pg_column_size are pure catalog/storage reads, not

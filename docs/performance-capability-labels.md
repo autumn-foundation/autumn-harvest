@@ -396,9 +396,28 @@ any schema, index, or storage-layout change to `harvest_task_queue` or
 `harvest_workers`, re-run these two commands explicitly as well, or the
 committed corroboration `.txt` outputs will silently go stale (reflecting
 the old layout) even though the primary `EXPLAIN`/`pg_stat_statements`
-captures are fresh:
+captures are fresh.
+
+**`$DATABASE_URL` below MUST point at a disposable scratch database --
+never a real development, staging, or production database.** Both SQL
+scripts repeatedly run `TRUNCATE harvest_task_queue RESTART IDENTITY`, and
+`psql` executes each statement in its own autocommit transaction, so if a
+later statement in the script fails, the `TRUNCATE`s that already ran are
+**not** rolled back. Pointed at a shared application database, these
+commands irreversibly delete its queued tasks. The Rust harness above never
+has this risk -- it creates and tears down its own dedicated, pid-scoped
+scratch database (`harvest_claim_bench_<pid>_<token>_<seq>`, see
+`claim_bench_support.rs`) for every run. Do the equivalent by hand before
+invoking either script directly:
 
 ```bash
+# 1. Create a throwaway database and apply migrations to it -- do this
+#    ONCE, then reuse the same scratch database for both scripts below.
+createdb -h localhost -U postgres harvest_perf_scratch
+export DATABASE_URL=postgres://postgres:postgres@localhost:5432/harvest_perf_scratch
+(cd autumn-harvest && diesel migration run)
+
+# 2. Run the corroboration scripts against the scratch database only.
 psql "$DATABASE_URL" \
   -f docs/perf-artifacts/capability-labels-claim-predicate/pg_relation_size_corroboration.sql \
   > docs/perf-artifacts/capability-labels-claim-predicate/pg_relation_size_corroboration.txt
@@ -406,4 +425,7 @@ psql "$DATABASE_URL" \
 psql "$DATABASE_URL" \
   -f docs/perf-artifacts/capability-labels-claim-predicate/claim_update_bloat_corroboration.sql \
   > docs/perf-artifacts/capability-labels-claim-predicate/claim_update_bloat_corroboration.txt
+
+# 3. Tear the scratch database down when done.
+dropdb -h localhost -U postgres harvest_perf_scratch
 ```

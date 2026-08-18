@@ -10,11 +10,17 @@
 -- claimed_at -- never required_capabilities) applied to an otherwise-clean,
 -- freshly-INSERTed 10,000-row table in each data state.
 --
--- Run against ANY database with autumn-harvest's Diesel migrations applied.
--- It TRUNCATEs and reseeds harvest_task_queue twice in place -- do not run
--- this against a database whose harvest_task_queue contents you want to
--- keep.
+-- Run ONLY against a disposable scratch database with autumn-harvest's
+-- Diesel migrations applied -- NEVER a real development, staging, or
+-- production database. It TRUNCATEs and reseeds harvest_task_queue twice
+-- in place. `psql` runs each statement in its own autocommit transaction,
+-- so if a later statement fails, the TRUNCATEs that already ran are NOT
+-- rolled back: pointed at a shared database, this irreversibly deletes its
+-- queued tasks.
 --
+--   createdb -h localhost -U postgres harvest_perf_scratch
+--   DATABASE_URL=postgres://postgres:postgres@localhost:5432/harvest_perf_scratch
+--   (cd autumn-harvest && diesel migration run)
 --   psql "$DATABASE_URL" -f docs/perf-artifacts/capability-labels-claim-predicate/claim_update_bloat_corroboration.sql
 --
 -- pg_relation_size is a pure catalog/storage read, not an EXPLAIN estimate --
