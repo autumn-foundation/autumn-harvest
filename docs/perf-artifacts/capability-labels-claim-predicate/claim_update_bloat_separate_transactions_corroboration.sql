@@ -185,14 +185,19 @@ END;
 $body$ LANGUAGE plpgsql;
 
 -- autovacuum_count on harvest_task_queue immediately BEFORE the five-run
--- loop below. This and the matching "after" query following the CALL are
+-- loop below. This is the baseline for the comparison the matching
+-- "after" query (following the CALL, below) performs -- together they are
 -- the direct, regenerable evidence for the opportunistic-pruning-only
 -- condition described in docs/performance-capability-labels.md (which
 -- draws no stronger conclusion than that condition -- see that doc's
--- Write-side cost section) -- if autovacuum has fired against this table
--- at all (even once, for any reason, at any point up to this line),
--- autovacuum_count_before will already be > 0 and this run no longer
--- reflects that condition.
+-- Write-side cost section). A nonzero value here is not itself a problem:
+-- the counter is cumulative, and a scratch database reused across
+-- multiple runs of this script (or any other prior activity) can leave
+-- this baseline above zero without any autovacuum having fired *during*
+-- the measured loop that follows. What determines whether the
+-- opportunistic-pruning-only condition holds for this run is whether this
+-- value differs from autovacuum_count_after below, not whether this
+-- baseline itself is zero.
 SELECT 'autovacuum_count_before' AS label, autovacuum_count
 FROM pg_stat_user_tables
 WHERE relname = 'harvest_task_queue';

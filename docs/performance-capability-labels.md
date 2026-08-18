@@ -8,8 +8,10 @@ to add. The seed leaves `required_capabilities` null." This page is that
 measurement.
 
 The result is a **negative finding, not an optimization**: the predicate has a
-real, non-trivial buffer cost on the claim query (roughly +30-37% across the
-tested backlog depths, corroborated three independent ways below), driven by
+real, non-trivial buffer cost on the claim query (+24.5% to +36.0% across the
+tested backlog depths -- see [Buffer deltas across backlog
+depth](#buffer-deltas-across-backlog-depth) below, corroborated three
+independent ways), driven by
 heap-page growth from a wider stored column, not a plan inefficiency -- there
 is no query rewrite, index, or `MATERIALIZED` hint that removes it without
 changing what issue #382 stores. That cost also recurs on the write side: it
