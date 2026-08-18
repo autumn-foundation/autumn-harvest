@@ -50,8 +50,10 @@
 use std::collections::HashMap;
 
 use autumn_harvest::dlq::{
-    AggregateRow, DeadLetterReason, DlqAggregateParams, DlqGroupDimension, group_dead_letter_rows,
+    AggregateRow, DeadLetterReason, DlqAggregateParams, DlqGroupDimension, error_class,
+    group_dead_letter_rows,
 };
+use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use uuid::Uuid;
 
@@ -62,10 +64,22 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Number of distinct error *shapes* [`error_text_for_group`] cycles through.
+/// Every shape's `group_index`-derived content is dynamic (a UUID, hex, or
+/// decimal run) and therefore collapses to the same normalized
+/// `failure_signature` regardless of the specific `group_index` -- see the
+/// injectivity note on [`build_rows`].
+const SHAPE_COUNT: usize = 6;
+
 /// One of the failure "shapes" real DLQ rows carry (see the module docs on
 /// `failure_signature`/`dlq_reason`/`error_class`).
-fn error_text_for_group(group_index: usize) -> String {
-    match group_index % 6 {
+///
+/// `shape` selects which of the `SHAPE_COUNT` structural forms to emit;
+/// `group_index` is embedded as dynamic (normalized-away) content within it,
+/// exactly like a real fleet's error text (a worker id, a UUID, a byte
+/// offset) -- see `build_rows` for why the two are threaded separately.
+fn error_text_for_group(shape: usize, group_index: usize) -> String {
+    match shape {
         0 => DeadLetterReason::PoisonPill {
             crash_strikes: 3,
             last_worker_id: Some(format!("worker-{group_index}")),
@@ -82,10 +96,18 @@ fn error_text_for_group(group_index: usize) -> String {
             timeout_secs: 30,
         }
         .to_string(),
-        3 => format!(
-            "activity failed: {{\"error_type\":\"CircuitOpen\",\"message\":\"downstream-{group_index} \
-             unavailable\",\"non_retryable\":true}}"
-        ),
+        // Constructed through the *production* wire-format encoder
+        // (`ActivityFailure::into_error_payload`), not a hand-rolled JSON
+        // fragment -- `error_class`'s typed-failure branch
+        // (`failure::parse_typed_payload`) only recognizes the tagged
+        // `harvest_activity_failure_v1` envelope `IntoActivityErrorString`
+        // emits, so a row meant to exercise "typed activity failure ->
+        // error_type" must actually be one.
+        3 => ActivityFailure::non_retryable(
+            "CircuitOpen",
+            format!("downstream-{group_index} unavailable"),
+        )
+        .into_error_payload(),
         4 => format!(
             "order {} not found for tenant {}",
             Uuid::from_u128(0x5040_0000_0000_0000_0000_0000_0000_0000 + group_index as u128),
@@ -98,10 +120,24 @@ fn error_text_for_group(group_index: usize) -> String {
     }
 }
 
+/// Build `n` rows collapsing into `group_count` distinct
+/// `(workflow_name, failure_signature)` groups.
+///
+/// `workflow_name` is bucketed by `group_index / SHAPE_COUNT` rather than a
+/// small fixed modulus: because every `error_text_for_group` shape's
+/// `group_index`-derived content is dynamic and therefore normalized away by
+/// `failure_signature` (see `SHAPE_COUNT`'s doc), `failure_signature` alone
+/// only ever distinguishes `SHAPE_COUNT` values, however large `group_count`
+/// is. Pairing it with `group_index / SHAPE_COUNT` is the standard
+/// base-`SHAPE_COUNT` positional decomposition of `group_index` --
+/// `group_index = (group_index / SHAPE_COUNT) * SHAPE_COUNT + (group_index %
+/// SHAPE_COUNT)` -- so the composite key is injective in `group_index` for
+/// *any* `group_count`, not just one that happens to be below
+/// `lcm(previous_fixed_modulus, SHAPE_COUNT)`.
 fn build_rows(n: usize, group_count: usize) -> (Vec<AggregateRow>, HashMap<Uuid, String>) {
     let base_time = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
     let workflow_names: Vec<String> = (0..group_count)
-        .map(|g| format!("order_flow_{}", g % 5))
+        .map(|g| format!("order_flow_{}", g / SHAPE_COUNT))
         .collect();
 
     let mut rows = Vec::with_capacity(n);
@@ -121,8 +157,8 @@ fn build_rows(n: usize, group_count: usize) -> (Vec<AggregateRow>, HashMap<Uuid,
             Some(format!("charge_card_{}", group % 3)),
             "default".to_string(),
             "activity".to_string(),
-            base_time + ChronoDuration::seconds(i as i64),
-            error_text_for_group(group),
+            base_time + ChronoDuration::seconds(i64::try_from(i).unwrap_or(i64::MAX)),
+            error_text_for_group(group % SHAPE_COUNT, group),
         ));
     }
     (rows, exec_names)
@@ -141,10 +177,48 @@ fn main() {
         ..DlqAggregateParams::default()
     };
 
+    // `group_count.min(n)` -- with fewer rows than requested groups, only
+    // `n` distinct group indices (0..n) ever get produced regardless of
+    // `group_count`; that isn't a fidelity bug, just arithmetic.
+    let expected_groups = group_count.min(n);
+
+    // Self-check (once, outside the measured loop -- constant O(1) cost
+    // regardless of `n`/`reps`) that the shape-3 row is actually a *typed*
+    // activity-failure envelope, not a JSON-shaped string that only looks
+    // like one: `error_class` must resolve it via `parse_typed_payload`'s
+    // typed-failure branch to the real `error_type`, not fall through to
+    // the legacy leading-token classifier.
+    let circuit_open_class = error_class(&error_text_for_group(3, 0));
+    assert_eq!(
+        circuit_open_class, "CircuitOpen",
+        "error_text_for_group(3, _) should classify as the typed activity-failure \
+         error_type \"CircuitOpen\" via error_class's parse_typed_payload branch, got \
+         {circuit_open_class:?} -- it no longer round-trips through the production \
+         ActivityFailure::into_error_payload wire envelope"
+    );
+
     let mut total_groups = 0usize;
     for _ in 0..reps {
         let (rows, workflow_names) = build_rows(n, group_count);
         let groups = group_dead_letter_rows(rows, &params, &workflow_names);
+        // `harness = false` means this binary's own `main()` -- not
+        // `#[test]`/libtest -- is what every invocation (including the
+        // `Reproduce` instructions in `docs/performance-dlq-aggregate.md`
+        // and any profiler run) actually executes, so the harness's own
+        // fidelity to its documented `DLQ_PROFILE_GROUPS` knob is
+        // self-checked here rather than in a separate `#[cfg(test)]` module
+        // that `cargo test` would never discover for a `harness = false`
+        // bench target. This is the O(1) `HashMap::len()` read the loop
+        // already needs for `total_groups`, so it adds no measurable cost
+        // to the profiled workload.
+        assert_eq!(
+            groups.len(),
+            expected_groups,
+            "DLQ_PROFILE_GROUPS={group_count} (n={n}) should produce {expected_groups} distinct \
+             (workflow_name, failure_signature) groups, got {} -- build_rows's group encoding no \
+             longer guarantees the composite key is injective in group_index",
+            groups.len(),
+        );
         total_groups += groups.len();
         // Keep the result alive across the black_box so a sufficiently smart
         // optimizer cannot prove it is dead and elide the call it came from.

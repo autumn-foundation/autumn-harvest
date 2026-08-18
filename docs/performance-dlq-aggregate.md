@@ -196,13 +196,101 @@ lib suite (2,749 tests). `cargo fmt --check` and `cargo clippy -p
 autumn-harvest --all-features --tests -- -D warnings` are clean at every
 step.
 
+## Post-revert harness hardening
+
+A further review pass (Codex) on the revert commit found two real fidelity
+bugs in `benches/dlq_aggregate_profile.rs` itself (the kept artifact) —
+neither touches `dlq.rs`, which was already back to its untouched, original
+`entry(key.clone())` form:
+
+1. **`DLQ_PROFILE_GROUPS` silently capped at 30.** `workflow_name` cycled
+   through only 5 values (`g % 5`) and `error_text_for_group`'s
+   `group_index`-derived content is *always* normalized away by
+   `failure_signature` (that's the function's whole purpose), so its
+   structural *shape* alone carried the distinguishing signal — only 6
+   values (`group_index % 6`). The composite `(workflow_name,
+   failure_signature)` key was therefore never injective in `group_index`
+   for `group_count > lcm(5, 6) = 30`: `DLQ_PROFILE_GROUPS=100` silently
+   returned only 30 distinct groups, invalidating any future cardinality
+   experiment using the documented knob. (The **default** `DLQ_PROFILE_GROUPS
+   =25` used for every number in this document was unaffected — `25 < 30`,
+   and `(g % 5, g % 6)` is injective over `g ∈ [0, 25)` by the Chinese
+   Remainder Theorem, confirmed empirically via `total_groups_returned=25`
+   in every run — so no measurement above changes.) Fixed by bucketing
+   `workflow_name` on `group_index / SHAPE_COUNT` instead of a fixed
+   modulus: `group_index = (group_index / SHAPE_COUNT) * SHAPE_COUNT +
+   (group_index % SHAPE_COUNT)` is the standard base-6 positional
+   decomposition, injective for *any* `group_count`. Verified directly:
+   `DLQ_PROFILE_GROUPS=100`/`1000` now return exactly 100/1000 distinct
+   groups. The invariant is now self-checked inside `main()` on every
+   invocation (`harness = false` means `cargo test` never discovers
+   `#[test]` functions in this target — confirmed empirically, a
+   `#[cfg(test)] mod` with `#[test] fn`s compiled clean but the compiler's
+   own `dead_code` warning showed they were never called — so the check has
+   to live in the binary's own execution path to actually run).
+2. **The `CircuitOpen` row wasn't a real typed-failure envelope.** Branch 3
+   of `error_text_for_group` built a hand-rolled `"activity failed:
+   {...}"` JSON fragment; `error_class`'s typed-failure branch
+   (`failure::parse_typed_payload`) only recognizes the tagged
+   `harvest_activity_failure_v1` wire envelope `IntoActivityErrorString`
+   emits, so this row was misclassified via the legacy leading-token
+   fallback (`"activity"`) rather than `"CircuitOpen"` — contradicting the
+   module doc's claim that error text mixes "a typed `ActivityFailure`
+   envelope." Fixed by constructing it through the real production encoder,
+   `ActivityFailure::non_retryable("CircuitOpen",
+   ...).into_error_payload()`; also self-checked once in `main()`
+   (`error_class(&error_text_for_group(3, 0)) == "CircuitOpen"`). Neither
+   of this document's cited measurements groups by `ErrorClass` (the
+   default groups by `FailureSignature`; the adversarial run groups by
+   `ActivityName`), so this bug did not affect any number above either.
+3. **Incidental**: `cargo clippy -p autumn-harvest --all-features --tests
+   -- -D warnings` — the project's real CI gate for this crate — does not
+   compile bench targets at all (`--tests` excludes `[[bench]]`), so this
+   harness had never actually been clippy-checked despite passing every
+   "clean" claim in this document; scoping clippy to just this target
+   (`--bench dlq_aggregate_profile`) surfaced a pre-existing,
+   unrelated-to-this-investigation `cast_possible_wrap` on the `i as i64`
+   row-timestamp cast (present since the harness's first commit). Fixed
+   with `i64::try_from(i).unwrap_or(i64::MAX)` while in the area, since it
+   cost one line and touches no measured logic.
+
+None of the three changes touch `dlq.rs` or the grouping algorithm being
+profiled — they only affect how the harness constructs its synthetic rows.
+Re-running the **default** (hit-heavy) workload against the hardened
+harness, with `dlq.rs` still in its current, unchanged `entry()` form:
+
+| | Whole process (Ir) |
+|---|---|
+| Original harness (as measured above) | 268,401,099 |
+| Hardened harness (post-revert) | 282,474,254 |
+| **Delta** | **+14,073,155 (+5.24%)** |
+
+This shift is entirely attributable to point 2 above — the `CircuitOpen`
+row now pays real `serde_json` serialization (`into_error_payload`) instead
+of a cheap `format!` string, once per iteration of the outer loop — not to
+any change in the `HashMap` lookup strategy the "Hypothesis"/"Change"
+sections above investigate. Because the shift lands in row *construction*
+(identical cost for whichever grouping implementation is under test) rather
+than in the grouping loop itself, it does not call the mechanism-level
+conclusion above into question and the get_mut-vs-entry comparison was not
+re-run against the hardened harness: the argument that `entry()` pays
+exactly one hash+probe pass per row while `get_mut`-then-`insert` pays two
+on a miss is a pure property of `std::collections::HashMap`'s API, not of
+this harness's row-construction cost. The historical numbers above are left
+as originally measured and are the ones that motivated the actual
+optimize → review → revert decision; `Reproduce` below now yields the
+hardened-harness number for the default config.
+
 ## What shipped
 
 - `AggregateRow` made `pub`; `group_dead_letter_rows` extracted from
   `aggregate_dead_letters` as a pure, DB-free `pub fn` — no behavior
   change, callers see byte-identical output.
 - `benches/dlq_aggregate_profile.rs`, a deterministic profiling harness for
-  the extracted function.
+  the extracted function, hardened per "Post-revert harness hardening"
+  above (guaranteed `DLQ_PROFILE_GROUPS` cardinality for any group count; a
+  real typed-failure envelope for the `CircuitOpen` row; both self-checked
+  inside `main()` on every run).
 - This documented negative result, so the `get_mut`-first idea (and its
   adversarial-workload cost) is not silently re-attempted later.
 - **No algorithmic change to `group_dead_letter_rows`'s grouping loop** —
