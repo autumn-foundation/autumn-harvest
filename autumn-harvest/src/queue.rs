@@ -2704,6 +2704,21 @@ pub async fn claim_still_held_for_update(
 /// next dispatcher's capability-miss decision undercount the live,
 /// unaccounted fleet by one, based on a peer this exact release just proved
 /// wrong.
+///
+/// Also resets `crash_strikes = 0` (Codex review round 4 of #1182): the
+/// `WHERE ... AND crash_strikes = $3` guard above still pins the update to
+/// the exact claim-time snapshot (so a concurrent poison-pill reclaim that
+/// bumped the strike count in the meantime is correctly treated as "the
+/// claim moved" rather than silently overwritten), but the value the row is
+/// set *to* must not carry that snapshot forward. This dispatch attempt ran
+/// the handler to a conclusion on this worker -- it just couldn't confirm
+/// ownership afterward, not that the process crashed -- so the issue #367
+/// crash streak this row was accumulating is genuinely broken, exactly the
+/// same "the body reached a conclusion on this worker" justification
+/// [`release_task_for_capability_miss_query`]'s `AfterHandler` phase already
+/// uses to reset the same column for the same reason. Leaving a stale count
+/// in place would let an unrelated, already-resolved crash history count
+/// against a task that just proved itself dispatchable.
 const fn release_suspended_workflow_claim_query() -> &'static str {
     "UPDATE harvest_task_queue \
      SET state = 'PENDING', \
@@ -2716,6 +2731,7 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
          activity_name = NULL, \
          capability_misses = 0, \
          capability_miss_workers = '{}', \
+         crash_strikes = 0, \
          sticky_until = CASE \
              WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
              THEN NOW() + sticky_timeout \
@@ -4365,6 +4381,15 @@ mod tests {
              except the pre-handler-lookup ingest one -- and must reset stale \
              evidence from a prior incapable worker, matching \
              park_workflow_task_sticky_query(true)'s established precedent",
+        );
+        assert!(
+            sql.contains("crash_strikes = 0"),
+            "the handler ran to a conclusion on this worker (it made no \
+             replay-significant progress, but the process did not crash), so the \
+             issue #367 crash streak is genuinely broken -- matching \
+             release_task_for_capability_miss_query's AfterHandler phase, which \
+             resets crash_strikes for the identical 'the body reached a conclusion \
+             on this worker' reason (Codex review round 4 of #1182)",
         );
     }
 
