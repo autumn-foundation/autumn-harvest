@@ -2249,6 +2249,30 @@ async fn zz_capture_capability_labels_claim_evidence() {
         let mut conn = db::connect(&bench.url).await;
         let seeded = db::seed(&mut conn, scenario).await;
 
+        // `db::seed()` analyzes `harvest_task_queue`/`harvest_workflow_executions`
+        // only (see its own doc comment) -- `harvest_workers` is left with
+        // whatever stats survived from the previous backlog depth's iteration,
+        // or none at all on the first. The `worker_info` CTE's
+        // `SELECT labels FROM harvest_workers WHERE worker_id = $1` lookup is a
+        // single-row equality match on a ~64-row table, small enough that the
+        // planner's choice between an index scan and a sequential scan is
+        // genuinely stats-sensitive rather than obviously index-scan-favored
+        // (confirmed: the committed backlog=10000 artifacts before this fix
+        // showed an Index Scan for no-capabilities and a Seq Scan for
+        // capability-labels on this exact node). Left asymmetric, the
+        // `no-capabilities` capture below would run against whatever
+        // stale/absent stats this connection happens to carry while
+        // `capability-labels` re-analyzes `harvest_workers` itself (it must,
+        // having just mutated `labels`) -- letting an access-path choice on an
+        // unrelated table leak into what is meant to be a pure
+        // `required_capabilities`-population comparison. Analyze it here, once
+        // per depth, before either label's capture, so both start from
+        // identical `harvest_workers` statistics.
+        diesel::sql_query("ANALYZE harvest_workers")
+            .execute(&mut conn)
+            .await
+            .expect("analyze harvest_workers before either label's capture");
+
         let queues = db::queue_names(scenario);
         let worker_literal = format!("'{}-worker-0'", db::BENCH_PREFIX);
         let queue_list = queues
@@ -2411,6 +2435,20 @@ async fn zz_capture_capability_labels_claim_evidence() {
 
         let headline = headline_scenario();
         let seeded = db::seed(&mut stats_conn, headline).await;
+        // Same fix as the backlog-sweep loop above: `db::seed()` never
+        // analyzes `harvest_workers`, and this loop's capability-labels
+        // branch is the only one that mutates it (`UPDATE harvest_workers
+        // SET labels = ...` below) -- so without this call the
+        // `no-capabilities` drain would run against whatever stale/absent
+        // `harvest_workers` stats this fresh connection happens to carry,
+        // while `capability-labels` re-analyzes the table itself after its
+        // mutation. Analyze it here, once per label, before either drain, so
+        // the `worker_info` CTE's single-row lookup on `harvest_workers`
+        // starts from identical statistics regardless of label.
+        diesel::sql_query("ANALYZE harvest_workers")
+            .execute(&mut stats_conn)
+            .await
+            .expect("analyze harvest_workers before either label's stat-snapshot drain");
         let queues = db::queue_names(headline);
         let worker_literal = format!("'{}-worker-0'", db::BENCH_PREFIX);
 
@@ -2453,6 +2491,15 @@ async fn zz_capture_capability_labels_claim_evidence() {
                 .execute(&mut stats_conn)
                 .await
                 .expect("re-analyze before the stat-snapshot drain");
+            // Mirrors the backlog-sweep loop's post-mutation re-analyze
+            // above: cheap, and keeps both loops' `harvest_workers`
+            // statistics symmetric even though this UPDATE only touches one
+            // row (row count is unaffected, but ANALYZE also refreshes
+            // per-column value statistics the planner may consult).
+            diesel::sql_query("ANALYZE harvest_workers")
+                .execute(&mut stats_conn)
+                .await
+                .expect("re-analyze after mutating worker labels");
         }
 
         // Drive the real claim path repeatedly so pg_stat_statements
