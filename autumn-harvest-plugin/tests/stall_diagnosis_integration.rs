@@ -2534,3 +2534,176 @@ async fn split_fleet_satisfying_each_dimension_separately_is_not_coverage() {
         "neither worker can claim the task on its own: {body}"
     );
 }
+
+// ── Codex round 9: held rows follow the CLAIMANT, not claim eligibility ─────
+
+/// Seed a HELD (`RUNNING`) activity row whose claim is owned by `claimant`.
+async fn seed_held_activity_task(
+    pool: &DbPool,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    queue: &str,
+    claimant: &str,
+) {
+    let mut conn = pool.get().await.expect("pooled conn");
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, activity_name, activity_id, \
+          input, state, priority, attempt, max_attempts, scheduled_at, worker_id, started_at) \
+         VALUES ($1, $2, 'activity', $3, $4, $5, '{}'::jsonb, 'RUNNING', 0, 1, 3, \
+                 NOW() - INTERVAL '1 minute', $6, NOW() - INTERVAL '30 seconds')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(activity_name)
+    .bind::<diesel::sql_types::Uuid, _>(ActivityExecId::new().as_uuid())
+    .bind::<diesel::sql_types::Text, _>(claimant)
+    .execute(&mut conn)
+    .await
+    .expect("seed held task");
+}
+
+/// A `RUNNING` activity whose claimant has begun a graceful shutdown is still
+/// legitimately progressing: `Worker::run` marks the worker `Draining` BEFORE
+/// awaiting `drain_in_flight`, so held work runs to completion.
+///
+/// Pre-fix this reported `activity_no_worker`/`stalled` for the entire drain
+/// window, because round 8's Active-only claim eligibility was applied to held
+/// rows too.
+#[tokio::test]
+async fn held_activity_on_a_draining_claimant_is_still_progressing() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_held_activity_task(&pool, exec_id, "charge_card", "payments", "w-draining").await;
+    // The ONLY worker on the queue is draining, so nothing new can be claimed —
+    // but this row is already held by it.
+    seed_worker_with_status(&pool, "w-draining", "payments", "Draining").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
+    assert_eq!(body["health"], "healthy", "body: {body}");
+}
+
+/// The complement: a `RUNNING` row whose claimant is GONE is still the flagship
+/// orphan stall, even when the queue itself has a live Active poller (a peer
+/// cannot pick up an already-claimed row; only the reclaimer heals it).
+#[tokio::test]
+async fn held_activity_whose_claimant_is_gone_reports_no_worker() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_held_activity_task(&pool, exec_id, "charge_card", "payments", "w-crashed").await;
+    // `w-crashed` was never registered. A healthy Active peer covers the queue,
+    // so a queue-coverage-only answer would wrongly report healthy progress.
+    seed_live_worker(&pool, "w-peer", "payments").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "activity_no_worker", "body: {body}");
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// The same distinction for the run's OWN workflow task: a decision cycle
+/// executing on a draining worker is progressing, not wedged.
+#[tokio::test]
+async fn held_workflow_task_with_a_draining_claimant_is_progressing() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "completes_wf", "RUNNING", vec![started_event()]).await;
+    seed_workflow_task(
+        &pool,
+        exec_id,
+        "default",
+        "RUNNING",
+        Some("w-wf-draining"),
+        "NOW() - INTERVAL '1 minute'",
+    )
+    .await;
+    seed_worker_with_status(&pool, "w-wf-draining", "default", "Draining").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
+    assert_eq!(body["health"], "healthy", "body: {body}");
+}
+
+/// A HALF-OPEN breaker is self-recovering: a probe is admitted right now and it
+/// closes on success. It must not be described like a force-opened breaker,
+/// whose only recovery is an explicit `force-close`.
+///
+/// Both phases report `cooldown_until: null`, so the phase itself is the only
+/// discriminator — which is why it is now surfaced on the wire.
+#[tokio::test]
+async fn half_open_circuit_is_not_reported_as_operator_forced() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let (api_state, registry) = build_api_state_with_registry(&pool, true);
+    // Trip organically (3 failures inside the 60s window), then drive a
+    // dispatch past the 30s cooldown so the registry transitions to half-open.
+    let now = std::time::Instant::now();
+    for _ in 0..3 {
+        registry
+            .circuit_breakers()
+            .on_external_failure("charge_card", now);
+    }
+    let after_cooldown = now + std::time::Duration::from_secs(31);
+    let _probe = registry
+        .circuit_breakers()
+        .on_dispatch("charge_card", after_cooldown);
+    let app = build_api_app(api_state);
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_activity_task(
+        &pool,
+        exec_id,
+        "charge_card",
+        "payments",
+        "PENDING",
+        1,
+        Some("gateway 503"),
+        "NOW() - INTERVAL '1 minute'",
+    )
+    .await;
+    seed_live_worker(&pool, "worker-payments", "payments").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "activity_circuit_open", "body: {body}");
+    assert_eq!(
+        body["blocked_on"]["phase"], "half_open",
+        "the observed breaker phase must reach the wire: {body}"
+    );
+    let summary = body["summary"].as_str().unwrap_or_default();
+    assert!(
+        !summary.contains("force-close"),
+        "a self-recovering half-open breaker must not instruct a manual \
+         force-close: {summary}"
+    );
+    assert!(
+        summary.contains("half-open"),
+        "the summary must name the recovering phase: {summary}"
+    );
+}

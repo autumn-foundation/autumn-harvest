@@ -12510,6 +12510,7 @@ type DiagnoseTaskRow = (
     Option<serde_json::Value>,     // required_capabilities
     Option<uuid::Uuid>,            // session_id
     Option<String>,                // sticky_worker_id
+    Option<String>,                // worker_id
 );
 
 /// The run's own workflow-task row, with the claim requirements its liveness
@@ -12552,6 +12553,10 @@ struct DiagnoseTask {
     session_id: Option<uuid::Uuid>,
     /// The pinned host recorded on the row.
     sticky_worker_id: Option<String>,
+    /// The worker currently holding this row's claim, when it is held. Used to
+    /// answer the CLAIMANT's own liveness for a `RUNNING` row -- a distinct
+    /// question from whether the queue is claim-eligible right now.
+    worker_id: Option<String>,
 }
 
 /// The claim-time requirements of one task row.
@@ -12598,6 +12603,32 @@ impl TaskClaimRequirements<'_> {
 /// Queue/shard coverage itself still goes through the canonical #774 predicate
 /// so this surface and `GET /admin/queue-coverage` can never disagree about
 /// what a worker is attached to; only the liveness half is narrowed.
+/// Whether the worker currently HOLDING a task row is still alive.
+///
+/// A held row's progress question is not "can this queue be claimed right now?"
+/// but "is the claimant still running it?" -- and `Worker::run` transitions a
+/// worker to `Draining` BEFORE awaiting `drain_in_flight`, so an activity on a
+/// gracefully-shutting-down worker is still legitimately progressing.
+///
+/// This therefore reuses the canonical #774 predicate verbatim (which admits
+/// `Active` OR `Draining`), deliberately NOT the Active-only
+/// [`worker_can_claim_now`] that answers claim eligibility for PENDING rows.
+///
+/// Returns `None` when the row records no claimant, so the classifier can fall
+/// back to queue coverage rather than infer a stall from missing data.
+fn claimant_is_live(
+    workers: &[WorkerRow],
+    claimant: Option<&str>,
+    queue_name: &str,
+    shard_id: i32,
+) -> Option<bool> {
+    let claimant = claimant?;
+    Some(workers.iter().any(|w| {
+        w.worker.worker_id == claimant
+            && crate::queue_coverage::worker_covers_queue(w, queue_name, shard_id)
+    }))
+}
+
 fn worker_can_claim_now(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
     crate::queue_coverage::worker_covers_queue(worker, queue_name, shard_id)
         && worker.worker.status == autumn_harvest::workers::WorkerStatus::Active.as_str()
@@ -12813,6 +12844,11 @@ pub(crate) async fn build_diagnosis_report(
             // a session whose host is gone is a permanent stall.
             harvest_task_queue::session_id,
             harvest_task_queue::sticky_worker_id,
+            // The CLAIMANT of a held row. A worker that has begun a graceful
+            // shutdown claims nothing new but is still finishing held work, so
+            // a `RUNNING` row's liveness must be answered from its own
+            // claimant, not from queue-level claim eligibility.
+            harvest_task_queue::worker_id,
         ))
         .load::<DiagnoseTaskRow>(&mut conn)
         .await
@@ -12835,6 +12871,7 @@ pub(crate) async fn build_diagnosis_report(
                 required_capabilities,
                 session_id,
                 sticky_worker_id,
+                worker_id,
             )| DiagnoseTask {
                 state,
                 activity_name,
@@ -12850,6 +12887,7 @@ pub(crate) async fn build_diagnosis_report(
                 required_capabilities,
                 session_id,
                 sticky_worker_id,
+                worker_id,
             },
         )
         .collect();
@@ -13062,6 +13100,12 @@ pub(crate) async fn build_diagnosis_report(
                     },
                     &compat_set,
                 ),
+                claimant_is_live: claimant_is_live(
+                    &live_workers,
+                    t.worker_id.as_deref(),
+                    &t.queue_name,
+                    shard_id,
+                ),
                 circuit_phase,
                 circuit_cooldown_until,
                 rate_limit_saturated: !has_cb
@@ -13162,6 +13206,12 @@ pub(crate) async fn build_diagnosis_report(
                         sticky_worker_id: sticky_worker_id.as_deref(),
                     },
                     &compat_set,
+                ),
+                claimant_is_live: claimant_is_live(
+                    &live_workers,
+                    worker_id.as_deref(),
+                    &queue_name,
+                    shard_id,
                 ),
                 state,
                 queue_name,
@@ -48996,6 +49046,7 @@ mod tests {
             activity_name: Some("send_email".to_string()),
             queue: queue.to_string(),
             task_state: "PENDING".to_string(),
+            claimant_is_live: None,
             attempt: 1,
             last_error: None,
             scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
@@ -49033,6 +49084,7 @@ mod tests {
             activity_name: Some("send_email".to_string()),
             queue: "email".to_string(),
             task_state: "RUNNING".to_string(),
+            claimant_is_live: None,
             attempt: 1,
             last_error: None,
             scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
@@ -49058,6 +49110,7 @@ mod tests {
             activity_name: Some("send_email".to_string()),
             queue: "email".to_string(),
             task_state: "RUNNING".to_string(),
+            claimant_is_live: None,
             attempt: 1,
             last_error: None,
             scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),

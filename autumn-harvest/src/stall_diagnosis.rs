@@ -181,9 +181,18 @@ pub enum BlockedOn {
     ActivityCircuitOpen {
         /// The activity whose breaker is tripped.
         activity_name: String,
-        /// When a half-open probe becomes admissible. `None` when the breaker is
+        /// The observed phase. Load-bearing for triage: a `half_open` breaker is
+        /// already recovering (a probe is admitted, or one is in flight) and
+        /// closes on success with no operator action, whereas an `open` breaker
+        /// with no cooldown is operator-forced and needs a manual `force-close`.
+        /// Without this the two collapse to the same `cooldown_until: None`
+        /// shape and a self-recovering breaker is misreported as needing manual
+        /// intervention.
+        phase: BlockingCircuitPhase,
+        /// When a half-open probe becomes admissible. `None` for a `half_open`
+        /// breaker (a probe is admissible *now*) and for one that is
         /// operator-forced open — no probe is admitted on any timer, so recovery
-        /// requires an explicit `force-close`.
+        /// requires an explicit `force-close`. Read it together with `phase`.
         #[serde(skip_serializing_if = "Option::is_none")]
         cooldown_until: Option<DateTime<Utc>>,
     },
@@ -366,7 +375,8 @@ impl BlockedOn {
 ///
 /// Only the two dispatch-blocking phases are represented; a closed (or absent)
 /// breaker contributes nothing and is modelled as `None` at the call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BlockingCircuitPhase {
     /// Tripped: dispatch fast-fails until the cooldown elapses.
@@ -409,8 +419,25 @@ pub struct PendingActivityFacts {
     pub concurrency_key: Option<String>,
     /// `true` when an operator has paused this task's queue (issue #619).
     pub queue_paused: bool,
-    /// `true` when at least one live worker polls this queue on this shard.
+    /// `true` when at least one worker could *claim* this row right now.
+    ///
+    /// The claim question, so it is the right one for a `PENDING` row and the
+    /// wrong one for a held row -- see [`Self::claimant_is_live`].
     pub has_live_worker: bool,
+    /// For a *held* row: is the worker that already claimed it still alive?
+    ///
+    /// Claim eligibility is deliberately **not** the right question here.
+    /// `Worker::run` marks a worker `Draining` *before* awaiting
+    /// `drain_in_flight`, so a draining worker claims nothing new while still
+    /// finishing the work it holds -- a held row on such a worker is genuinely
+    /// progressing for the whole drain window. Liveness here therefore means
+    /// `Active` **or** `Draining` with a fresh heartbeat, identified by the
+    /// row's own recorded claimant rather than by queue coverage.
+    ///
+    /// `None` when no claimant can be identified (an unheld row, or a held row
+    /// with no recorded `worker_id`); the classifier then falls back to
+    /// [`Self::has_live_worker`], preserving the pre-distinction behaviour.
+    pub claimant_is_live: Option<bool>,
     /// The activity's breaker phase, when it is blocking dispatch.
     pub circuit_phase: Option<BlockingCircuitPhase>,
     /// When a half-open probe becomes admissible, if that is knowable.
@@ -491,8 +518,15 @@ pub struct WorkflowTaskFacts {
     pub scheduled_at: DateTime<Utc>,
     /// `true` when an operator has paused `queue_name` (issue #619).
     pub queue_paused: bool,
-    /// `true` when at least one live worker polls `queue_name`.
+    /// `true` when at least one worker could *claim* this row right now.
     pub has_live_worker: bool,
+    /// For a *claimed* row: is the worker holding it still alive?
+    ///
+    /// Same distinction as [`PendingActivityFacts::claimant_is_live`]: a
+    /// decision cycle executing on a worker that has begun graceful shutdown is
+    /// progressing, even though that worker claims nothing new. `None` falls
+    /// back to [`Self::has_live_worker`].
+    pub claimant_is_live: Option<bool>,
 }
 
 /// A durable wait that replay named but no side table this endpoint reads can
@@ -583,7 +617,12 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
     // `activity_no_worker` case. Reporting it healthy would let the endpoint
     // answer "fine" forever for a run that can never move.
     if facts.task_state != "PENDING" {
-        if facts.has_live_worker {
+        // The claimant's own liveness, NOT queue-level claim eligibility: a
+        // worker that has begun graceful shutdown is `Draining` (so it claims
+        // nothing new) while it finishes exactly this row, so asking the claim
+        // question here would report a legitimately-progressing activity as
+        // stalled for the whole drain window.
+        if facts.claimant_is_live.unwrap_or(facts.has_live_worker) {
             // Every impediment below is a *claim-time* gate; none of them
             // applies to work that has already been claimed.
             return BlockedOn::HealthyInProgress;
@@ -618,8 +657,13 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
     if let (Some(phase), Some(name)) = (facts.circuit_phase, facts.activity_name.as_ref()) {
         return BlockedOn::ActivityCircuitOpen {
             activity_name: name.clone(),
-            // A forced-open breaker admits no probe on any timer, so it has no
-            // meaningful cooldown to advertise; the caller passes `None`.
+            // Preserved so a half-open breaker (recovering on its own) is
+            // distinguishable from an operator-forced-open one; both carry no
+            // cooldown, for opposite reasons.
+            phase,
+            // A forced-open breaker admits no probe on any timer, and a
+            // half-open one admits its probe immediately: neither has a
+            // meaningful future cooldown to advertise.
             cooldown_until: match phase {
                 BlockingCircuitPhase::Open => facts.circuit_cooldown_until,
                 BlockingCircuitPhase::HalfOpen => None,
@@ -715,8 +759,12 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
 #[must_use]
 pub fn workflow_task_hard_impediment(facts: &WorkflowTaskFacts) -> Option<BlockedOn> {
     if facts.has_worker {
-        // A stored claim only means progress while that worker is alive.
-        return (!facts.has_live_worker).then(|| BlockedOn::WorkflowNoWorker {
+        // A stored claim only means progress while that worker is alive -- but
+        // "alive" here is the *claimant's* own liveness (`Active` OR
+        // `Draining`), never claim eligibility: a decision cycle executing on a
+        // worker that is winding down is still progressing.
+        let claimant_live = facts.claimant_is_live.unwrap_or(facts.has_live_worker);
+        return (!claimant_live).then(|| BlockedOn::WorkflowNoWorker {
             queue: facts.queue_name.clone(),
         });
     }
@@ -1091,7 +1139,16 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
         ),
         BlockedOn::ActivityCircuitOpen {
             activity_name,
+            phase: BlockingCircuitPhase::HalfOpen,
+            ..
+        } => format!(
+            "the circuit breaker for activity '{activity_name}' is half-open; a probe is \
+                 admitted now and it closes on success, with no operator action"
+        ),
+        BlockedOn::ActivityCircuitOpen {
+            activity_name,
             cooldown_until,
+            ..
         } => cooldown_until.map_or_else(
             || {
                 format!(
@@ -1297,6 +1354,7 @@ mod tests {
             activity_name: Some("send_email".to_string()),
             queue: "email".to_string(),
             task_state: "PENDING".to_string(),
+            claimant_is_live: None,
             attempt: 1,
             last_error: None,
             scheduled_at: t(-10),
@@ -1309,6 +1367,174 @@ mod tests {
             rate_limit_saturated: false,
             concurrency_saturated: false,
         }
+    }
+
+    /// A row a worker already holds, claimed by a worker that is winding down.
+    fn held_by_draining_claimant() -> PendingActivityFacts {
+        PendingActivityFacts {
+            task_state: "RUNNING".to_string(),
+            // The queue has no *claimable* poller: the only worker on it has
+            // begun graceful shutdown, so it claims nothing new.
+            has_live_worker: false,
+            // ...but that same worker is still draining its in-flight work, and
+            // this row is part of it.
+            claimant_is_live: Some(true),
+            ..healthy_activity()
+        }
+    }
+
+    /// A draining claimant is still finishing the work it already holds.
+    ///
+    /// `Worker::run` marks a worker `Draining` **before** awaiting
+    /// `drain_in_flight`, so for the whole drain window a held row is genuinely
+    /// progressing even though that worker can claim nothing new. Claim
+    /// eligibility is the wrong question for held work.
+    #[test]
+    fn held_row_with_a_draining_claimant_is_still_progressing() {
+        assert_eq!(
+            classify_pending_activity(&held_by_draining_claimant(), t(0)),
+            BlockedOn::HealthyInProgress
+        );
+    }
+
+    /// The orphan case is unchanged: the claimant itself is gone.
+    #[test]
+    fn held_row_whose_claimant_is_gone_is_still_an_orphan() {
+        let facts = PendingActivityFacts {
+            claimant_is_live: Some(false),
+            ..held_by_draining_claimant()
+        };
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)),
+            BlockedOn::ActivityNoWorker {
+                queue: "email".to_string(),
+                activity_name: Some("send_email".to_string()),
+            }
+        );
+    }
+
+    /// An unidentifiable claimant falls back to queue-level coverage, exactly
+    /// as before this distinction existed.
+    #[test]
+    fn held_row_without_an_identifiable_claimant_falls_back_to_coverage() {
+        let orphaned = PendingActivityFacts {
+            claimant_is_live: None,
+            ..held_by_draining_claimant()
+        };
+        assert_eq!(
+            classify_pending_activity(&orphaned, t(0)),
+            BlockedOn::ActivityNoWorker {
+                queue: "email".to_string(),
+                activity_name: Some("send_email".to_string()),
+            }
+        );
+        let covered = PendingActivityFacts {
+            has_live_worker: true,
+            ..orphaned
+        };
+        assert_eq!(
+            classify_pending_activity(&covered, t(0)),
+            BlockedOn::HealthyInProgress
+        );
+    }
+
+    /// A PENDING row is unaffected: nothing holds it, so the claim question is
+    /// the only one that matters and a draining fleet cannot claim it.
+    #[test]
+    fn pending_row_still_uses_claim_eligibility_not_the_claimant() {
+        let facts = PendingActivityFacts {
+            task_state: "PENDING".to_string(),
+            has_live_worker: false,
+            // Meaningless for an unheld row, and must not rescue it.
+            claimant_is_live: Some(true),
+            ..healthy_activity()
+        };
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)),
+            BlockedOn::ActivityNoWorker {
+                queue: "email".to_string(),
+                activity_name: Some("send_email".to_string()),
+            }
+        );
+    }
+
+    /// The same distinction for the run's OWN workflow task row: a decision
+    /// cycle executing on a draining worker is progressing, not wedged.
+    #[test]
+    fn claimed_workflow_task_with_a_draining_claimant_is_progressing() {
+        let facts = WorkflowTaskFacts {
+            state: "RUNNING".to_string(),
+            has_worker: true,
+            has_live_worker: false,
+            claimant_is_live: Some(true),
+            ..wf_task()
+        };
+        assert_eq!(workflow_task_hard_impediment(&facts), None);
+        assert_eq!(
+            classify_workflow_task(&facts),
+            Some(BlockedOn::HealthyInProgress)
+        );
+
+        // The genuine orphan is unchanged.
+        let orphan = WorkflowTaskFacts {
+            claimant_is_live: Some(false),
+            ..facts
+        };
+        assert_eq!(
+            workflow_task_hard_impediment(&orphan),
+            Some(BlockedOn::WorkflowNoWorker {
+                queue: "default".to_string()
+            })
+        );
+    }
+
+    /// A half-open breaker is recovering on its own -- a probe is admitted (or
+    /// already in flight) and it closes on success. It must NOT be described
+    /// like an operator-forced-open breaker, which admits no probe on any timer
+    /// and genuinely needs a manual `force-close`.
+    #[test]
+    fn half_open_circuit_is_not_described_as_operator_forced() {
+        let half_open = BlockedOn::ActivityCircuitOpen {
+            activity_name: "charge_card".to_string(),
+            phase: BlockingCircuitPhase::HalfOpen,
+            cooldown_until: None,
+        };
+        let text = summarize(&half_open);
+        assert!(
+            !text.contains("force-close"),
+            "a self-recovering half-open breaker must not instruct a manual force-close: {text}"
+        );
+        assert!(
+            text.contains("probe"),
+            "the summary should say a probe is admitted: {text}"
+        );
+
+        // The forced-open shape keeps its manual-recovery instruction.
+        let forced = BlockedOn::ActivityCircuitOpen {
+            activity_name: "charge_card".to_string(),
+            phase: BlockingCircuitPhase::Open,
+            cooldown_until: None,
+        };
+        assert!(summarize(&forced).contains("force-close"));
+    }
+
+    /// The classifier preserves the observed phase, so the two shapes above are
+    /// distinguishable at all.
+    #[test]
+    fn classifier_preserves_the_observed_circuit_phase() {
+        let facts = PendingActivityFacts {
+            circuit_phase: Some(BlockingCircuitPhase::HalfOpen),
+            circuit_cooldown_until: None,
+            ..healthy_activity()
+        };
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)),
+            BlockedOn::ActivityCircuitOpen {
+                activity_name: "send_email".to_string(),
+                phase: BlockingCircuitPhase::HalfOpen,
+                cooldown_until: None,
+            }
+        );
     }
 
     fn inputs_with(activities: Vec<PendingActivityFacts>) -> DiagnosisInputs {
@@ -1398,6 +1624,7 @@ mod tests {
             BlockedOn::ActivityCircuitOpen {
                 activity_name: "send_email".to_string(),
                 cooldown_until: Some(t(30)),
+                phase: BlockingCircuitPhase::Open,
             }
         );
         assert_eq!(verdict.health(), ExecutionHealth::Stalled);
@@ -1412,6 +1639,7 @@ mod tests {
             BlockedOn::ActivityCircuitOpen {
                 activity_name: "send_email".to_string(),
                 cooldown_until: None,
+                phase: BlockingCircuitPhase::HalfOpen,
             }
         );
     }
@@ -1428,6 +1656,7 @@ mod tests {
             BlockedOn::ActivityCircuitOpen {
                 activity_name: "send_email".to_string(),
                 cooldown_until: None,
+                phase: BlockingCircuitPhase::Open,
             }
         );
     }
@@ -2234,6 +2463,7 @@ mod tests {
             BlockedOn::ActivityCircuitOpen {
                 activity_name: "a".into(),
                 cooldown_until: None,
+                phase: BlockingCircuitPhase::Open,
             },
             BlockedOn::ActivityConcurrencyDeferred {
                 key: "k".into(),
@@ -2579,6 +2809,7 @@ mod tests {
             BlockedOn::ActivityCircuitOpen {
                 activity_name: "a".into(),
                 cooldown_until: Some(t(4)),
+                phase: BlockingCircuitPhase::Open,
             },
             BlockedOn::ActivityRateLimited {
                 key: "k".into(),
@@ -2690,6 +2921,7 @@ mod tests {
             BlockedOn::ActivityCircuitOpen {
                 activity_name: "a".into(),
                 cooldown_until: None,
+                phase: BlockingCircuitPhase::Open,
             },
             BlockedOn::ActivityRateLimited {
                 key: "k".into(),
@@ -2981,6 +3213,7 @@ mod tests {
     fn wf_task() -> WorkflowTaskFacts {
         WorkflowTaskFacts {
             state: "PENDING".to_string(),
+            claimant_is_live: None,
             has_worker: false,
             queue_name: "default".to_string(),
             scheduled_at: t(-10),
