@@ -43,10 +43,18 @@ identical in every other column:
   measures).
 - **`capability-labels`** -- every row seeded with
   `required_capabilities = '[{"Exact":{"key":"region","value":"us-east"}}]'::jsonb`,
-  and all 64 seeded workers given `labels = '{"region":"us-east"}'::jsonb` so
-  every row is claimable (a worst case for wasted claim work would be
-  *unsatisfiable* requirements; this measures the predicate's cost when it is
-  doing useful, matching work, which is the common case).
+  and the single claiming worker (`{bench-prefix}-worker-0`, the worker id
+  the harness actually drives `claim_task()` as) given
+  `labels = '{"region":"us-east"}'::jsonb` so every row is claimable (a
+  worst case for wasted claim work would be *unsatisfiable* requirements;
+  this measures the predicate's cost when it is doing useful, matching
+  work, which is the common case). Only that one worker's labels matter
+  here: `claim_task_query()`'s `worker_info` CTE resolves labels via
+  `SELECT labels FROM harvest_workers WHERE worker_id = $1` -- a
+  single-row, worker-id-keyed lookup on the claiming worker's own id, not a
+  scan or join over the other 63 seeded (but never-claiming, and here
+  unlabeled) workers -- so what labels those other workers carry has no
+  effect on this query's plan or measured buffer cost.
 
 Both states are captured for `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS,
 TIMING OFF)` on `claim_task_query()` at each depth, and for a full
@@ -98,8 +106,18 @@ inefficiency: a wider `required_capabilities` JSONB payload means fewer rows
 fit per heap page, so the same 10,000-row/4-queue scan touches more pages.
 Nothing about the join, the CTE structure, or the InitPlan caching behavior
 changes between the two states -- and the whole label-matching machinery
-(`SubPlan 10` plus its two executed `InitPlan`s) accounts for only 8 of the
-94-buffer total delta at this depth, under 9% of it.
+accounts for only 4 of the 94-buffer total delta at this depth, under 5% of
+it. `SubPlan 10`'s own reported `Buffers: shared hit=4` is *already*
+cumulative over its subtree -- Postgres reports buffer usage inclusively at
+every ancestor node in an `EXPLAIN` tree, the same convention it uses for
+"Actual Total Time" -- so that figure already counts `InitPlan 6`/`7`'s
+`shared hit=2` each; it is not 4 *in addition to* their 2+2. Subtracting
+`SubPlan 10`'s total (4) from the `Seq Scan`'s own total (338) leaves 334 --
+exactly matching the 334-heap-page figure independently derived via a
+`TRUNCATE`+re-INSERT `pg_relation_size` measurement on this identical
+10,000-row/4-queue shape (see the code comment on the seeding helper in
+`claim_budget_tests.rs`), which corroborates that the label-matching
+machinery contributes only 4 buffers here, not 8.
 
 ## Measurement
 
@@ -175,15 +193,15 @@ each data state and snapshots `pg_stat_statements` afterward (artifacts:
 
 | state | calls | `shared_blks_hit` | avg per call |
 |---|---:|---:|---:|
-| no-capabilities | 10,001 | 4,722,036 | 472.16 |
-| capability-labels | 10,001 | 6,485,642 | 648.50 |
+| no-capabilities | 10,001 | 5,092,628 | 509.21 |
+| capability-labels | 10,001 | 7,464,424 | 746.37 |
 
-Aggregate delta: **+37.35%**, in the same range as the single-call `EXPLAIN`
+Aggregate delta: **+46.57%**, in the same range as the single-call `EXPLAIN`
 delta (+34.3%) at the same depth and the isolated-table `pg_relation_size`
 delta (+42.7%) above. Three independent measurement methods -- a single-call
 EXPLAIN, a direct heap-page-count comparison on the isolated table, and an
 aggregate `pg_stat_statements` snapshot over a 10,001-call production-code
-drain -- all land in the same ~34-43% band and none contradicts the others in
+drain -- all land in the same ~34-47% band and none contradicts the others in
 direction or order of magnitude. That consistency, not exact numeric
 agreement across methods measuring different things, is the evidence bar this
 finding clears.
@@ -240,11 +258,16 @@ by a `Seq Scan` that already reads every candidate row regardless of
 around:
 
 - The correlated `jsonb_array_elements` `SubPlan 10` itself measures
-  `Buffers: shared hit=4` at backlog=10,000, and its two executed
-  `InitPlan`s (6 and 7) measure `shared hit=2` each -- together 8 of the
-  94-buffer total delta at this depth, under 9% of it. Rewriting the
-  `SubPlan` would not touch the dominant *I/O* cost, which is the `Seq
-  Scan`'s own page count.
+  `Buffers: shared hit=4` at backlog=10,000 -- and that figure is already
+  cumulative over its subtree (Postgres reports buffer usage inclusively at
+  every ancestor `EXPLAIN` node, not per-node-exclusively), so it already
+  counts its two executed `InitPlan`s (6 and 7, `shared hit=2` each) rather
+  than adding to them. The whole label-matching machinery therefore
+  accounts for only 4 of the 94-buffer total delta at this depth, under 5%
+  of it -- corroborated by `338 - 4 = 334`, matching an independently
+  measured 334-heap-page `pg_relation_size` figure for this identical
+  10,000-row/4-queue shape. Rewriting the `SubPlan` would not touch the
+  dominant *I/O* cost, which is the `Seq Scan`'s own page count.
 - The nested worker-label `InitPlan`s are already resolved as cheaply as
   they can be in each state: `InitPlan 6`/`7` are `(never executed)` under
   `no-capabilities` (the whole `SubPlan` never runs) and cached at
