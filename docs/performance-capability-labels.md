@@ -241,14 +241,23 @@ figure lands in the same ~30-37% band as every other measurement on this
 page, which is expected: the claim `UPDATE`'s new tuple version is subject
 to the same per-row-width effect as the original scan.
 
-This bloat is transient in the same sense any `UPDATE`-driven dead-tuple
-growth is -- `VACUUM` (autovacuum, in production) reclaims the superseded
-tuple versions -- but it recurs on every state transition a task row goes
-through (claim, then completion or failure, and again on every retry), not
-once at schedule time, and it inflates heap and WAL write volume in the
-window before vacuum runs. Deployments that never populate
-`required_capabilities` pay none of this -- the `no-capabilities` baseline
-in this doc *is* every existing claim-path benchmark in this crate.
+This bloat is **not fully transient**: `VACUUM` (autovacuum, in production)
+marks the superseded tuple versions' space as reusable for future writes to
+this same table, but it does not compact live rows together or shrink the
+relation's on-disk size -- ordinary `VACUUM` only truncates pages that are
+entirely empty at the table's physical tail, which a continuously-churning
+task queue essentially never has. The heap-page growth measured above
+therefore persists past any number of ordinary vacuum cycles, not just in a
+window before the next vacuum runs: it recurs on every state transition a
+task row goes through (claim, then completion or failure, and again on
+every retry), and the resulting extra pages stay part of the table's
+physical footprint -- inflating every *future* `Seq Scan`'s buffer cost too,
+not just the write path that created them -- until either later writes
+happen to land in and reuse that specific freed space, or a full table
+rewrite (`VACUUM FULL`, `CLUSTER`, `pg_repack`) runs. Deployments that never
+populate `required_capabilities` pay none of this -- the `no-capabilities`
+baseline in this doc *is* every existing claim-path benchmark in this
+crate.
 
 ## Why no fix is proposed
 
