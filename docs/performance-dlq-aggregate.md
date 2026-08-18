@@ -287,7 +287,41 @@ valid configuration exercised in this document (the default, and the
 ever panic *before* or *instead of* running the profiled workload, never
 *during* one, so neither affects any Ir/dhat number above or below.
 
-None of the five changes touch `dlq.rs` or the grouping algorithm being
+A **fourth** review pass found two more robustness gaps, still harness-only:
+
+6. **Setup metadata was sized to the requested `DLQ_PROFILE_GROUPS`, not
+   the reachable subset of it.** `i % group_count` for `i in 0..n` only
+   ever produces the residues `0..group_count.min(n)` — if `n` is small
+   and `group_count` is large, most requested group indices are never
+   referenced. `build_rows` nonetheless eagerly built a `Vec<String>` and
+   sized a `HashMap` to the *full*, unreduced `group_count`: a small-`n`
+   profile paired with a very large `DLQ_PROFILE_GROUPS` could exhaust
+   memory constructing metadata for groups that would never be emitted,
+   before the profiled function ever ran. Fixed by sizing both to
+   `group_count.min(n)` — the same reachable-set arithmetic `main`'s
+   `expected_groups` already uses. Verified:
+   `DLQ_PROFILE_N=10 DLQ_PROFILE_GROUPS=100000000` (10 rows, 100 million
+   requested groups) now completes instantly with
+   `total_groups_returned=10`, instead of attempting to allocate on the
+   order of 100 million heap-backed `String`s up front.
+7. **`DLQ_PROFILE_REPS=0` silently produced a "successful" run that
+   measured nothing.** The measured loop is `for _ in 0..reps { ... }`; at
+   `reps=0` it never runs, so `group_dead_letter_rows` is never called,
+   yet the harness still printed a plausible-looking summary line
+   (`total_groups_returned=0`) and exited `0` — a profiler pointed at the
+   resulting process would measure only startup/arg-parsing cost and could
+   be mistaken for a genuine (implausibly fast) measurement of the target
+   function. Fixed with `assert!(reps > 0, ...)` alongside the existing
+   `group_count > 0` check. Verified: `DLQ_PROFILE_REPS=0` now panics with
+   `DLQ_PROFILE_REPS must be at least 1, got 0`.
+
+Like findings 4–5, both are pure guardrails/allocation-sizing fixes that
+change nothing for every valid configuration already measured in this
+document — the metadata-sizing fix only reduces *unreachable* allocation,
+and the `reps` guard only rejects a configuration that would have measured
+nothing at all.
+
+None of the seven changes touch `dlq.rs` or the grouping algorithm being
 profiled — they only affect how the harness constructs its synthetic rows.
 Re-running the **default** (hit-heavy) workload against the hardened
 harness, with `dlq.rs` still in its current, unchanged `entry()` form:
@@ -321,12 +355,14 @@ hardened-harness number for the default config.
   change, callers see byte-identical output.
 - `benches/dlq_aggregate_profile.rs`, a deterministic profiling harness for
   the extracted function, hardened per "Post-revert harness hardening"
-  above (guaranteed `DLQ_PROFILE_GROUPS` cardinality for any group count; a
-  real typed-failure envelope for the `CircuitOpen` row; a malformed or
-  non-Unicode env value rejected as a configuration error instead of
-  silently substituting the default; `DLQ_PROFILE_GROUPS=0` rejected with
-  a clear message instead of an opaque division-by-zero panic; the first
-  two self-checked inside `main()` on every run).
+  above across four review passes (guaranteed `DLQ_PROFILE_GROUPS`
+  cardinality for any group count; a real typed-failure envelope for the
+  `CircuitOpen` row; a malformed or non-Unicode env value rejected as a
+  configuration error instead of silently substituting the default;
+  `DLQ_PROFILE_GROUPS=0` and `DLQ_PROFILE_REPS=0` both rejected with a
+  clear message instead of an opaque panic or a silently-empty
+  "successful" run; setup metadata sized to the reachable group set
+  instead of the raw, possibly-enormous requested `DLQ_PROFILE_GROUPS`).
 - This documented negative result, so the `get_mut`-first idea (and its
   adversarial-workload cost) is not silently re-attempted later.
 - **No algorithmic change to `group_dead_letter_rows`'s grouping loop** —

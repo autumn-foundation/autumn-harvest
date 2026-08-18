@@ -150,12 +150,22 @@ fn error_text_for_group(shape: usize, group_index: usize) -> String {
 /// `lcm(previous_fixed_modulus, SHAPE_COUNT)`.
 fn build_rows(n: usize, group_count: usize) -> (Vec<AggregateRow>, HashMap<Uuid, String>) {
     let base_time = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let workflow_names: Vec<String> = (0..group_count)
+    // `i % group_count` for `i in 0..n` only ever produces the residues
+    // `0..group_count.min(n)` -- if `n < group_count` the modulus never
+    // wraps, so indices `n..group_count` are simply never referenced (this
+    // is the same arithmetic `expected_groups` in `main` already relies
+    // on). Size metadata to that reachable set, not the full (possibly
+    // enormous, for a small-`n` / huge-`group_count` config) `group_count`
+    // a caller might request -- eagerly allocating one `String` per
+    // requested-but-unreachable group could otherwise exhaust memory
+    // before the profiled function is even called.
+    let usable_groups = group_count.min(n);
+    let workflow_names: Vec<String> = (0..usable_groups)
         .map(|g| format!("order_flow_{}", g / SHAPE_COUNT))
         .collect();
 
     let mut rows = Vec::with_capacity(n);
-    let mut exec_names = HashMap::with_capacity(group_count);
+    let mut exec_names = HashMap::with_capacity(usable_groups);
     for i in 0..n {
         let group = i % group_count;
         let id = Uuid::from_u128(i as u128 + 1);
@@ -191,6 +201,12 @@ fn main() {
         group_count > 0,
         "DLQ_PROFILE_GROUPS must be at least 1 (0 groups cannot host any rows), got 0"
     );
+    // reps=0 skips the loop below entirely -- the harness would exit 0 and
+    // print a plausible-looking summary line without ever calling
+    // group_dead_letter_rows, so a profiler pointed at the resulting
+    // process would measure nothing but startup/arg-parsing cost and could
+    // easily be mistaken for a valid (implausibly fast) measurement.
+    assert!(reps > 0, "DLQ_PROFILE_REPS must be at least 1, got 0");
 
     let params = DlqAggregateParams {
         group_by: vec![
