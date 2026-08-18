@@ -19,7 +19,7 @@
 -- queued tasks.
 --
 --   createdb -h localhost -U postgres harvest_perf_scratch
---   DATABASE_URL=postgres://postgres:postgres@localhost:5432/harvest_perf_scratch
+--   export DATABASE_URL=postgres://postgres:postgres@localhost:5432/harvest_perf_scratch
 --   (cd autumn-harvest && diesel migration run)
 --   psql "$DATABASE_URL" -f docs/perf-artifacts/capability-labels-claim-predicate/claim_update_bloat_corroboration.sql
 --
@@ -43,6 +43,7 @@ FROM generate_series(0, 9999) AS s(i);
 VACUUM ANALYZE harvest_task_queue;
 SELECT 'no-caps-before-claim' AS label,
        pg_relation_size('harvest_task_queue') / 8192 AS heap_pages;
+SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages \gset no_caps_before_
 
 UPDATE harvest_task_queue
 SET state = 'RUNNING',
@@ -51,6 +52,7 @@ SET state = 'RUNNING',
 WHERE state = 'PENDING';
 SELECT 'no-caps-after-claim' AS label,
        pg_relation_size('harvest_task_queue') / 8192 AS heap_pages;
+SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages \gset no_caps_after_
 
 -- State B: capability-labels. Fresh INSERT with required_capabilities
 -- populated at birth, then the identical claim-shaped UPDATE -- still never
@@ -67,6 +69,7 @@ FROM generate_series(0, 9999) AS s(i);
 VACUUM ANALYZE harvest_task_queue;
 SELECT 'caps-before-claim' AS label,
        pg_relation_size('harvest_task_queue') / 8192 AS heap_pages;
+SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages \gset caps_before_
 
 UPDATE harvest_task_queue
 SET state = 'RUNNING',
@@ -75,6 +78,22 @@ SET state = 'RUNNING',
 WHERE state = 'PENDING';
 SELECT 'caps-after-claim' AS label,
        pg_relation_size('harvest_task_queue') / 8192 AS heap_pages;
+SELECT pg_relation_size('harvest_task_queue') / 8192 AS heap_pages \gset caps_after_
+
+-- Derived summary -- computed and printed by the script itself, so
+-- redirecting this script's output to the committed .txt artifact captures
+-- the analysis, not just the four raw before/after measurements above.
+SELECT
+  (:no_caps_after_heap_pages - :no_caps_before_heap_pages) AS no_caps_delta_pages,
+  (:caps_after_heap_pages - :caps_before_heap_pages) AS caps_delta_pages,
+  ((:caps_after_heap_pages - :caps_before_heap_pages)
+     - (:no_caps_after_heap_pages - :no_caps_before_heap_pages)) AS extra_pages,
+  round(
+    100.0 * ((:caps_after_heap_pages - :caps_before_heap_pages)
+              - (:no_caps_after_heap_pages - :no_caps_before_heap_pages))
+    / (:no_caps_after_heap_pages - :no_caps_before_heap_pages),
+    1
+  ) AS extra_pct_more_growth_from_capability_labels;
 
 -- cleanup: leave the scratch DB empty again.
 TRUNCATE harvest_task_queue RESTART IDENTITY;

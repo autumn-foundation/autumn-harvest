@@ -239,18 +239,61 @@ itself.
 This was measured directly, in two shapes -- the second added after a
 review round on PR #1192 caught a confound in the first (see below). Both
 apply a claim-shaped `UPDATE` (setting `state`, `worker_id`, `started_at` --
-never `required_capabilities`) 10,000 times to a freshly seeded, freshly
-`VACUUM`ed 10,000-row table, and differ only in how those 10,000 claims are
-committed.
+never `required_capabilities`) 10,000 times to a freshly seeded 10,000-row
+table, and differ in how those 10,000 claims are committed. (The
+separately-committed script also cannot run a pre-loop `VACUUM ANALYZE` the
+way the bulk-transaction script does, since PostgreSQL disallows `VACUUM`
+inside any function or procedure body under any circumstances -- checked
+separately to make no difference to the measurement, since a
+freshly-inserted table has no dead tuples yet for `VACUUM` to reclaim or
+truncate.)
 
 The **production-representative** shape commits each claim in its own
 transaction, matching `claim_task()`'s real one-call-per-commit pattern.
-Across five runs it costs 50-55 heap pages of growth when the rows carry no
-capability requirements, and 57-60 pages when they do (artifacts:
-`docs/perf-artifacts/capability-labels-claim-predicate/claim_update_bloat_separate_transactions_corroboration.{sql,txt}`)
--- **roughly +9% to +16% more heap growth from the identical claim
-operation** (mean ~+14% across the five runs), purely from carrying the
-wider payload forward into the new tuple version.
+It is scripted as a single, self-contained `psql -f` invocation that seeds
+and claims both variants five times in a row inside one PL/pgSQL procedure
+call and computes its own min/max/mean summary at the end (artifacts:
+`docs/perf-artifacts/capability-labels-claim-predicate/claim_update_bloat_separate_transactions_corroboration.{sql,txt}`
+-- a review finding on PR #1192 caught that an earlier version of this
+script measured one run per invocation, with the five-run range in this
+artifact computed by hand from five separate invocations that the
+documented single-command reproduction procedure could not itself
+regenerate; it is now fully self-contained). Run this way -- five claim
+passes back to back inside one long-lived session, with no gap between
+them -- it costs 48-49 heap pages of growth when the rows carry no
+capability requirements and 51-52 pages when they do, **+6.1% to +8.3%
+more heap growth from the identical claim operation** (mean ~+7.5% across
+the five runs), purely from carrying the wider payload forward into the
+new tuple version.
+
+That figure is a **floor**, not a ceiling, on the effect: `pg_stat_user_tables.autovacuum_count`
+was checked immediately before and immediately after a full run of this
+script and never incremented, confirming that PostgreSQL's background
+autovacuum worker gets no opportunity to run at all during this tight,
+uninterrupted execution -- every byte of space reclaimed here comes solely
+from *opportunistic* HOT pruning triggered in-line by the claim loop's own
+commits, the minimum reclaim mechanism any separately-committed claim
+sequence gets for free with zero background assistance. An earlier
+measurement of this same separately-committed pattern, taken across five
+manually-repeated shell invocations of an earlier, non-self-contained
+draft of this script (leaving real wall-clock gaps between runs for
+autovacuum's background worker to act in, closer to how a continuously
+polled production queue actually behaves over time), measured a
+consistently *larger* effect: 50-55 pages of growth for no-capabilities
+rows, 57-60 pages for capability-labels rows, +9.1% to +15.7% (mean
+~+14%). This is the expected direction, not noise: reclaimed space from a
+pruned dead tuple can only be reused by a new tuple version that fits
+inside it, so the *narrower* no-capabilities row is more likely to fit
+into a given freed slot than the wider capability-labels row -- meaning
+more aggressive reclaim (background autovacuum on top of opportunistic
+pruning) disproportionately shrinks the narrow variant's growth relative
+to the wide one, which *widens* the relative percentage gap between them,
+not narrows it. That earlier figure is no longer independently
+reproducible by the current single-invocation script (which completes too
+quickly in one continuous session for autovacuum's naptime-gated launcher
+to intervene), so it is retained here only as directional evidence, not as
+a currently-verifiable number -- the reproducible headline for this
+section is the +6.1% to +8.3% (mean ~+7.5%) figure above.
 
 A second, deliberately **non**-representative shape applies all 10,000
 claims as a single set-based `UPDATE` inside one transaction (artifacts:
@@ -263,16 +306,18 @@ processed in it -- its `xmax` belongs to a transaction that has not yet
 committed, so it is categorically unprunable, by either opportunistic HOT
 pruning or autovacuum, until that transaction commits -- whereas a loop of
 separately-committed claims (the real production pattern) opens a reclaim
-window between every commit that opportunistic pruning can use. The
-bulk-transaction figure still measures something real -- it is the worst
-case a batch operation touching many rows inside one explicit transaction
-(a mass backfill, a migration script, an admin tool) would see -- but it is
-not representative of the per-claim production path this design actually
-adds cost to, roughly overstating that cost by 2.4-4.1x (37.6% divided by
-the 9.1-15.7% range measured above). The
-separate-transaction measurement above is this section's headline figure;
-the bulk-transaction one is included only as an explicitly-scoped upper
-bound.
+window between every commit that opportunistic pruning, and sometimes
+autovacuum, can use. The bulk-transaction figure still measures something
+real -- it is the worst case a batch operation touching many rows inside
+one explicit transaction (a mass backfill, a migration script, an admin
+tool) would see -- but it is not representative of the per-claim
+production path this design actually adds cost to, overstating that cost
+by roughly 2.4x-6.2x (37.6% divided by the combined 6.1-15.7% range
+measured above, spanning opportunistic-pruning-only reclaim at one end to
+opportunistic-pruning-plus-background-autovacuum reclaim at the other).
+The separate-transaction measurement above is this section's headline
+figure; the bulk-transaction one is included only as an explicitly-scoped
+upper bound.
 
 This bloat is **not fully transient**: `VACUUM` (autovacuum, in production)
 marks the superseded tuple versions' space as reusable for future writes to
@@ -465,13 +510,17 @@ repro command above. After any schema, index, or storage-layout change to
 `harvest_task_queue` or `harvest_workers`, re-run these three commands
 explicitly as well, or the committed corroboration `.txt` outputs will
 silently go stale (reflecting the old layout) even though the primary
-`EXPLAIN`/`pg_stat_statements` captures are fresh. Note that
-`claim_update_bloat_separate_transactions_corroboration.sql` commits 10,000
-separate transactions and its own dead-tuple reclamation therefore depends
-on autovacuum/opportunistic-pruning timing, so its exact page counts vary
-slightly run to run (see the range noted in its `.txt` artifact and in the
+`EXPLAIN`/`pg_stat_statements` captures are fresh. Note that `claim_update_bloat_separate_transactions_corroboration.sql`
+commits 10,000 separate transactions per variant per internal run (five
+runs per variant, per invocation) and its own dead-tuple reclamation
+therefore depends on opportunistic HOT-pruning micro-timing, so its exact
+page counts can vary by a page or two between its five internal runs (see
+the per-run table and the derived min/max/mean it prints, and the
 [Write-side cost](#write-side-cost) section) -- this is expected, not a
-reproduction failure.
+reproduction failure. One `psql -f` invocation of this script now
+regenerates all five internal runs and their aggregate summary in a single
+command; it no longer needs to be manually re-invoked to build up a
+multi-run range.
 
 **`$DATABASE_URL` below MUST point at a disposable scratch database --
 never a real development, staging, or production database.** All three SQL

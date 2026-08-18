@@ -14,7 +14,7 @@
 -- database, this irreversibly deletes its queued tasks.
 --
 --   createdb -h localhost -U postgres harvest_perf_scratch
---   DATABASE_URL=postgres://postgres:postgres@localhost:5432/harvest_perf_scratch
+--   export DATABASE_URL=postgres://postgres:postgres@localhost:5432/harvest_perf_scratch
 --   (cd autumn-harvest && diesel migration run)
 --   psql "$DATABASE_URL" -f docs/perf-artifacts/capability-labels-claim-predicate/pg_relation_size_corroboration.sql
 --
