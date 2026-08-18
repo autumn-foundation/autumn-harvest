@@ -862,10 +862,15 @@ from the benchmark are directly comparable.
   query on every claim but are never given anything to match, so their subplans
   run against empty or null input and this page reports nothing about their
   cost. Ranked by how much that omission is likely to matter:
-  * **Capability labels (#382)** — a `NOT EXISTS` + `jsonb_array_elements`
-    subplan, so the one whose real cost is least predictable from the query
-    text, and the most defensible next scenario to add. The seed leaves
-    `required_capabilities` null.
+  * **Capability labels (#382)** — measured directly:
+    `docs/performance-capability-labels.md` seeds `required_capabilities`
+    (rather than leaving it null) and finds a real, +24–37% buffer cost on the
+    claim query across the same backlog-depth sweep used everywhere else on
+    this page, corroborated three independent ways (`EXPLAIN` buffers,
+    `pg_relation_size` row-width growth, and an aggregate `pg_stat_statements`
+    drain). The mechanism is heap-page growth from the wider stored JSONB
+    payload, not a plan inefficiency — no query-shape fix applies; see that
+    page for the full measurement and why.
   * **Queue pauses (#619)** — the attribution-table sweep above still only ever
     `TRUNCATE`s `harvest_queue_pauses`, so it still says nothing about this
     predicate's cost on its own. A dedicated harness variant that actively
@@ -900,3 +905,9 @@ from the benchmark are directly comparable.
   [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
 * `autumn-harvest/scripts/queue_pause_claim_perf_repro.sh` — regenerates that
   evidence from a clean checkout.
+* `docs/performance-capability-labels.md` — the capability-labels claim
+  predicate (#382) measurement referenced above.
+* `docs/perf-artifacts/capability-labels-claim-predicate/` — committed
+  `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
+* `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh` — regenerates
+  that evidence from a clean checkout.
