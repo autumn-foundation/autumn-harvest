@@ -1324,12 +1324,16 @@ async fn ac2_saturated_rate_limit_bucket_reports_activity_rate_limited() {
     );
 }
 
-/// A rate-limit key with NO bucket row at all must be treated as saturated:
-/// `claim_task`'s gate is `EXISTS(bucket >= 1.0)`, so a missing row makes the
-/// task permanently unclaimable. Reporting it healthy would be the exact
-/// false-negative this endpoint exists to prevent.
+/// A rate-limit key with NO bucket row at all is a PERMANENT block, distinct
+/// from a drained-but-refilling bucket.
+///
+/// `claim_task`'s gate is `EXISTS(bucket >= 1.0)`, so a missing row is refused
+/// forever — nothing refills a row that does not exist. Reporting it healthy
+/// would be the exact false-negative this endpoint exists to prevent, and
+/// reporting it as ordinary saturation would put a permanent condition behind
+/// a `healthy` verdict whose summary promises automatic refill.
 #[tokio::test]
-async fn ac2_missing_rate_limit_bucket_is_treated_as_saturated_not_healthy() {
+async fn ac2_missing_rate_limit_bucket_is_a_stall_not_a_refilling_saturation() {
     let (url, _guard) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_api_app(build_api_state(&pool));
@@ -1357,8 +1361,21 @@ async fn ac2_missing_rate_limit_bucket_is_treated_as_saturated_not_healthy() {
     let body = diagnose(&app, exec_id).await;
     assert_eq!(
         kind(&body),
-        "activity_rate_limited",
+        "activity_rate_limit_bucket_missing",
         "a key with no bucket row can never be claimed: {body}"
+    );
+    assert_eq!(body["blocked_on"]["key"], "tenant:ghost");
+    assert_eq!(
+        body["health"], "stalled",
+        "a missing bucket row never refills: {body}"
+    );
+    assert!(
+        body["contributing_reason_codes"]
+            .as_array()
+            .expect("reasons")
+            .iter()
+            .any(|r| r == "rate_limit_exhausted"),
+        "the rate-limit gate is still the gate that refuses it: {body}"
     );
 }
 

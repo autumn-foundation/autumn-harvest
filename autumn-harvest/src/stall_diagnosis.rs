@@ -204,6 +204,23 @@ pub enum BlockedOn {
         #[serde(skip_serializing_if = "Option::is_none")]
         activity_name: Option<String>,
     },
+    /// **The activity's rate-limit bucket row does not exist.** Distinct from
+    /// [`Self::ActivityRateLimited`], and the reason it is: `claim_task`'s gate
+    /// is `EXISTS(bucket WHERE ... >= 1.0)`, so a key with no row at all is
+    /// refused *forever* — nothing refills a row that does not exist. Folding
+    /// it into saturation would put a permanent condition behind a `healthy`
+    /// verdict whose summary promises automatic refill.
+    ///
+    /// Reachable when the bucket's auto-registration failed, the row was
+    /// deleted, or startup skipped it as an invalid config. Fix the bucket
+    /// (or remove the activity's rate limit) — no amount of waiting clears it.
+    ActivityRateLimitBucketMissing {
+        /// The bucket key with no row.
+        key: String,
+        /// The activity waiting on it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        activity_name: Option<String>,
+    },
     /// The activity's per-key concurrency cap is saturated.
     ActivityConcurrencyDeferred {
         /// The saturated concurrency key.
@@ -323,6 +340,7 @@ impl BlockedOn {
             Self::ActivityNoWorker { .. } => "activity_no_worker",
             Self::ActivityCircuitOpen { .. } => "activity_circuit_open",
             Self::ActivityRateLimited { .. } => "activity_rate_limited",
+            Self::ActivityRateLimitBucketMissing { .. } => "activity_rate_limit_bucket_missing",
             Self::ActivityConcurrencyDeferred { .. } => "activity_concurrency_deferred",
             Self::ActivityQueuePaused { .. } => "activity_queue_paused",
             Self::TimerOverdue { .. } => "timer_overdue",
@@ -373,6 +391,7 @@ impl BlockedOn {
             | Self::WorkflowQueuePaused { .. } => ExecutionHealth::BlockedExternal,
             // Nothing will move this forward without a human.
             Self::ActivityNoWorker { .. }
+            | Self::ActivityRateLimitBucketMissing { .. }
             | Self::WorkflowNoWorker { .. }
             | Self::TimerOverdue { .. }
             | Self::NonDeterminismBlocked { .. }
@@ -455,7 +474,15 @@ pub struct PendingActivityFacts {
     /// When a half-open probe becomes admissible, if that is knowable.
     pub circuit_cooldown_until: Option<DateTime<Utc>>,
     /// `true` when the rate-limit bucket has fewer than one token.
+    ///
+    /// Transient: the bucket refills. Distinct from
+    /// [`Self::rate_limit_bucket_missing`], which never does.
     pub rate_limit_saturated: bool,
+    /// `true` when the rate-limit bucket row does not exist at all.
+    ///
+    /// `claim_task`'s gate is `EXISTS(bucket WHERE ... >= 1.0)`, so this is a
+    /// permanent refusal rather than a transient one.
+    pub rate_limit_bucket_missing: bool,
     /// `true` when the per-key concurrency cap is fully in use.
     pub concurrency_saturated: bool,
 }
@@ -597,8 +624,11 @@ pub struct DiagnosisInputs {
 #[must_use]
 pub const fn activity_precedence(blocked: &BlockedOn) -> u8 {
     match blocked {
-        BlockedOn::ActivityQueuePaused { .. } => 7,
-        BlockedOn::ActivityNoWorker { .. } => 6,
+        BlockedOn::ActivityQueuePaused { .. } => 8,
+        BlockedOn::ActivityNoWorker { .. } => 7,
+        // Permanent, like the two above it: a bucket row that does not exist
+        // never refills, so this outranks every self-healing gate below.
+        BlockedOn::ActivityRateLimitBucketMissing { .. } => 6,
         BlockedOn::ActivityCircuitOpen { .. } => 5,
         BlockedOn::ActivityConcurrencyDeferred { .. } => 4,
         BlockedOn::ActivityRateLimited { .. } => 3,
@@ -664,7 +694,23 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
         };
     }
 
-    // 3. The breaker fast-fails dispatch. Only an activity the task row actually
+    // 3. The rate-limit bucket row does not exist. Permanent: `claim_task`'s
+    //    `EXISTS` gate refuses it forever and nothing refills a row that is not
+    //    there. Placed above the not-due check for the same reason
+    //    `activity_no_worker` is — a backing-off task whose bucket is missing
+    //    will not be claimable when it becomes due, so reporting `retrying`
+    //    would promise a retry that cannot happen — and above the transient
+    //    gates below because none of them self-heal into this one.
+    if facts.rate_limit_bucket_missing
+        && let Some(key) = facts.rate_limit_key.as_ref()
+    {
+        return BlockedOn::ActivityRateLimitBucketMissing {
+            key: key.clone(),
+            activity_name: facts.activity_name.clone(),
+        };
+    }
+
+    // 4. The breaker fast-fails dispatch. Only an activity the task row actually
     //    names can carry one, so an unnamed row can never reach here.
     if let (Some(phase), Some(name)) = (facts.circuit_phase, facts.activity_name.as_ref()) {
         return BlockedOn::ActivityCircuitOpen {
@@ -683,7 +729,7 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
         };
     }
 
-    // 4. Not due yet. The task has not reached the claim gates at all, so a
+    // 5. Not due yet. The task has not reached the claim gates at all, so a
     //    momentarily-saturated bucket or concurrency key says nothing about
     //    whether it will be free at `scheduled_at`; reporting one of those
     //    instead would drop `attempt`, `last_error` and `next_attempt_at`, the
@@ -719,7 +765,7 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
         };
     }
 
-    // 5. Per-key concurrency (issue #247): self-heals as siblings finish.
+    // 6. Per-key concurrency (issue #247): self-heals as siblings finish.
     if facts.concurrency_saturated
         && let Some(key) = facts.concurrency_key.as_ref()
     {
@@ -729,7 +775,7 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
         };
     }
 
-    // 6. Rate limit (issue #332/#699): self-heals on refill.
+    // 7. Rate limit (issue #332/#699): self-heals on refill.
     if facts.rate_limit_saturated
         && let Some(key) = facts.rate_limit_key.as_ref()
     {
@@ -1179,6 +1225,12 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
             "rate-limit bucket '{key}' is exhausted, deferring {}",
             activity_phrase(activity_name.as_ref())
         ),
+        BlockedOn::ActivityRateLimitBucketMissing { key, activity_name } => format!(
+            "rate-limit bucket '{key}' has no row, so {} can never be claimed; \
+                 the claim gate requires the bucket to exist and nothing refills a \
+                 missing row -- re-register the bucket or remove the rate limit",
+            activity_phrase(activity_name.as_ref())
+        ),
         BlockedOn::ActivityConcurrencyDeferred { key, activity_name } => format!(
             "concurrency key '{key}' is at its cap, deferring {}",
             activity_phrase(activity_name.as_ref())
@@ -1377,6 +1429,7 @@ mod tests {
             circuit_phase: None,
             circuit_cooldown_until: None,
             rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
             concurrency_saturated: false,
         }
     }
@@ -1830,6 +1883,98 @@ mod tests {
         assert_eq!(
             classify_pending_activity(&facts, t(0)).kind(),
             "activity_circuit_open"
+        );
+    }
+
+    #[test]
+    fn missing_rate_limit_bucket_is_a_stall_not_a_refilling_saturation() {
+        // `claim_task`'s gate is `EXISTS(bucket WHERE tokens >= 1.0)`. A key
+        // with NO bucket row at all fails that `EXISTS` forever: nothing
+        // refills a row that does not exist, so the task is permanently
+        // unclaimable. Reporting it as `activity_rate_limited` would put a
+        // permanent condition behind a `healthy` verdict whose summary
+        // promises automatic refill.
+        let mut facts = healthy_activity();
+        facts.rate_limit_key = Some("r".to_string());
+        facts.rate_limit_bucket_missing = true;
+        let verdict = classify_pending_activity(&facts, t(0));
+        assert_eq!(verdict.kind(), "activity_rate_limit_bucket_missing");
+        assert_eq!(verdict.health(), ExecutionHealth::Stalled);
+    }
+
+    #[test]
+    fn missing_rate_limit_bucket_outranks_a_saturated_one() {
+        // Both flags set is the shape a caller produces when it cannot tell
+        // them apart; the permanent condition is the actionable one.
+        let mut facts = healthy_activity();
+        facts.rate_limit_key = Some("r".to_string());
+        facts.rate_limit_saturated = true;
+        facts.rate_limit_bucket_missing = true;
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)).kind(),
+            "activity_rate_limit_bucket_missing"
+        );
+    }
+
+    #[test]
+    fn missing_rate_limit_bucket_outranks_retry_backoff_and_transient_gates() {
+        // Same reasoning `activity_no_worker` uses to outrank retry backoff: a
+        // backing-off task whose bucket row does not exist will never be
+        // claimable when it becomes due, so reporting `activity_retrying`
+        // would promise a retry that cannot happen. It likewise outranks the
+        // self-healing concurrency and rate-limit gates.
+        let mut facts = healthy_activity();
+        facts.rate_limit_key = Some("r".to_string());
+        facts.rate_limit_bucket_missing = true;
+        facts.scheduled_at = t(45);
+        facts.last_error = Some("connection reset".to_string());
+        facts.concurrency_key = Some("k".to_string());
+        facts.concurrency_saturated = true;
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)).kind(),
+            "activity_rate_limit_bucket_missing"
+        );
+    }
+
+    #[test]
+    fn no_worker_still_outranks_a_missing_rate_limit_bucket() {
+        // Both are permanent, but a pollerless queue is the broader failure:
+        // fixing the bucket alone would still leave nothing to claim it.
+        let mut facts = healthy_activity();
+        facts.has_live_worker = false;
+        facts.rate_limit_key = Some("r".to_string());
+        facts.rate_limit_bucket_missing = true;
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)).kind(),
+            "activity_no_worker"
+        );
+    }
+
+    #[test]
+    fn missing_bucket_without_a_key_cannot_be_reported() {
+        // The verdict names the key, so a row with no rate-limit key at all
+        // can never produce it however the flag is set.
+        let mut facts = healthy_activity();
+        facts.rate_limit_key = None;
+        facts.rate_limit_bucket_missing = true;
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)),
+            BlockedOn::HealthyInProgress
+        );
+    }
+
+    #[test]
+    fn held_row_ignores_a_missing_rate_limit_bucket() {
+        // Every rate-limit gate is a CLAIM-time gate; a row a live worker
+        // already holds has passed it.
+        let mut facts = healthy_activity();
+        facts.task_state = "RUNNING".to_string();
+        facts.claimant_is_live = Some(true);
+        facts.rate_limit_key = Some("r".to_string());
+        facts.rate_limit_bucket_missing = true;
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)),
+            BlockedOn::HealthyInProgress
         );
     }
 

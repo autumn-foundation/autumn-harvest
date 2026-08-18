@@ -13162,7 +13162,7 @@ pub(crate) async fn build_diagnosis_report(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    let saturated_rate_limits = saturated_rate_limit_keys(&mut conn, &rate_limit_keys).await?;
+    let rate_limit_gate = rate_limit_gate_status(&mut conn, &rate_limit_keys).await?;
 
     // Per-key concurrency, counted exactly as `claim_task` counts it: scoped by
     // (concurrency_key, task_type) over RUNNING rows with a worker.
@@ -13331,7 +13331,13 @@ pub(crate) async fn build_diagnosis_report(
                 rate_limit_saturated: !has_cb
                     && t.rate_limit_key
                         .as_ref()
-                        .is_some_and(|k| saturated_rate_limits.contains(k)),
+                        .is_some_and(|k| rate_limit_gate.saturated.contains(k)),
+                // A key with NO bucket row is refused by the gate's `EXISTS`
+                // forever, so it is a stall rather than a refilling deferral.
+                rate_limit_bucket_missing: !has_cb
+                    && t.rate_limit_key
+                        .as_ref()
+                        .is_some_and(|k| rate_limit_gate.missing.contains(k)),
                 concurrency_saturated,
             }
         })
@@ -13666,8 +13672,13 @@ fn contributing_reasons_for(
         // The classifier already resolved which impediments hold, so the
         // saturation sets handed to the shared helper are this row's own
         // answers.
+        // A MISSING bucket row is folded in here on purpose: the headline
+        // verdict distinguishes permanence, but the reason code names *which
+        // gate* refuses the row, and that gate is the rate-limit gate either
+        // way. Omitting it would leave a task blocked solely by a missing
+        // bucket with an empty reason set.
         let mut saturated_rate_limits = std::collections::HashSet::new();
-        if facts.rate_limit_saturated
+        if (facts.rate_limit_saturated || facts.rate_limit_bucket_missing)
             && let Some(key) = facts.rate_limit_key.as_ref()
         {
             saturated_rate_limits.insert(key.clone());
@@ -13713,45 +13724,75 @@ fn circuit_cooldown_until(
     now.checked_add_signed(delta)
 }
 
-/// `claim_task`'s rate-limit gate, inverted, so a key this reports as saturated
-/// is exactly a key the claim query would refuse — INCLUDING a key with no
-/// bucket row at all, which the gate's `EXISTS` also refuses.
-async fn saturated_rate_limit_keys(
+/// The two distinct ways `claim_task`'s rate-limit gate can refuse a key.
+///
+/// The gate is `EXISTS(bucket WHERE ... >= 1.0)`, which refuses a drained
+/// bucket **and** a key with no bucket row at all. Those look identical to the
+/// gate but are opposites to an operator: a drained bucket refills on its own,
+/// a missing row never does. Collapsing them would put a permanent condition
+/// behind a verdict whose summary promises automatic refill.
+#[derive(Debug, Default)]
+struct RateLimitGateStatus {
+    /// Keys whose bucket row exists but is currently below one token.
+    /// Transient — it refills.
+    saturated: std::collections::HashSet<String>,
+    /// Keys with **no bucket row at all**: auto-registration failed, the row
+    /// was deleted, or startup skipped it as an invalid config. Permanent —
+    /// the gate's `EXISTS` refuses it forever.
+    missing: std::collections::HashSet<String>,
+}
+
+/// `claim_task`'s rate-limit gate, decomposed, so a key this reports as
+/// refused is exactly a key the claim query would refuse — and the *reason*
+/// is preserved rather than flattened.
+///
+/// One query: it asks which rows exist and, for each, whether the canonical
+/// refill expression currently admits it. A key absent from the result has no
+/// row (`missing`); a key present but not admissible is drained (`saturated`).
+async fn rate_limit_gate_status(
     conn: &mut diesel_async::AsyncPgConnection,
     keys: &[String],
-) -> Result<std::collections::HashSet<String>, AutumnError> {
+) -> Result<RateLimitGateStatus, AutumnError> {
     #[derive(diesel::QueryableByName)]
     struct KeyRow {
         #[diesel(sql_type = diesel::sql_types::Text)]
         key: String,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        admissible: bool,
     }
 
     if keys.is_empty() {
-        return Ok(std::collections::HashSet::new());
+        return Ok(RateLimitGateStatus::default());
     }
-    // Asked as the ADMISSIBLE set and then inverted, because `claim_task`'s gate
-    // is `EXISTS(bucket WHERE ... >= 1.0)` — fail-CLOSED on a missing row. Asking
-    // the positive "which keys are saturated?" question would answer "not
-    // saturated" for a key with no bucket row at all (auto-registration failed,
-    // the row was deleted, or startup skipped it as an invalid config), and the
-    // classifier would then report `healthy` for a task the claim query can
-    // never admit. This mirrors the gate's own refill expression exactly.
-    let admissible: Vec<KeyRow> = diesel::sql_query(
-        "SELECT key FROM harvest_rate_limit_buckets \
-         WHERE key = ANY($1) \
-           AND LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) >= 1.0",
+    // Mirrors the gate's own refill expression exactly, so the two can never
+    // disagree about whether a present bucket admits a claim.
+    let rows: Vec<KeyRow> = diesel::sql_query(
+        "SELECT key, \
+                (LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) >= 1.0) AS admissible \
+         FROM harvest_rate_limit_buckets \
+         WHERE key = ANY($1)",
     )
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(keys)
     .load(conn)
     .await
     .map_err(database_error)?;
-    let admissible: std::collections::HashSet<String> =
-        admissible.into_iter().map(|r| r.key).collect();
-    Ok(keys
-        .iter()
-        .filter(|k| !admissible.contains(*k))
-        .cloned()
-        .collect())
+
+    let mut status = RateLimitGateStatus::default();
+    let present: std::collections::HashMap<String, bool> =
+        rows.into_iter().map(|r| (r.key, r.admissible)).collect();
+    for key in keys {
+        match present.get(key) {
+            // Present and admissible: not an impediment at all.
+            Some(true) => {}
+            Some(false) => {
+                status.saturated.insert(key.clone());
+            }
+            None => {
+                status.missing.insert(key.clone());
+            }
+        }
+    }
+    Ok(status)
 }
 
 /// `RUNNING` task counts per `(concurrency_key, task_type)`.
@@ -49333,6 +49374,7 @@ mod tests {
             circuit_phase: None,
             circuit_cooldown_until: None,
             rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
             concurrency_saturated: false,
         };
         let mut a = base("paused-q");
@@ -49371,6 +49413,7 @@ mod tests {
             circuit_phase: None,
             circuit_cooldown_until: None,
             rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
             concurrency_saturated: false,
         };
         assert!(contributing_reasons_for(&[facts]).is_empty());
@@ -49397,6 +49440,7 @@ mod tests {
             circuit_phase: None,
             circuit_cooldown_until: None,
             rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
             concurrency_saturated: false,
         };
         assert_eq!(
@@ -49431,6 +49475,7 @@ mod tests {
             circuit_phase: None,
             circuit_cooldown_until: None,
             rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
             concurrency_saturated: false,
         };
         assert!(
@@ -49463,6 +49508,7 @@ mod tests {
             circuit_phase: None,
             circuit_cooldown_until: None,
             rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
             concurrency_saturated: false,
         };
         assert_eq!(
