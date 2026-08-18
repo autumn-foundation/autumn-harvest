@@ -2264,6 +2264,125 @@ async fn seed_task_requiring(
     .expect("seed gated task");
 }
 
+/// Seed a worker in an explicit fleet status.
+async fn seed_worker_with_status(pool: &DbPool, worker_id: &str, queue: &str, status: &str) {
+    let mut conn = pool.get().await.expect("pooled conn");
+    diesel::sql_query(
+        "INSERT INTO harvest_workers \
+         (worker_id, last_heartbeat_at, status, queues, shard_assignments, max_concurrency, host) \
+         VALUES ($1, NOW(), $2, $3, '[0]'::jsonb, 10, 'test-host') \
+         ON CONFLICT (worker_id) DO NOTHING",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .bind::<diesel::sql_types::Text, _>(status)
+    .bind::<diesel::sql_types::Jsonb, _>(json!([queue]))
+    .execute(&mut conn)
+    .await
+    .expect("seed worker");
+}
+
+/// Seed a pending activity task pinned to a worker session (issue #606).
+async fn seed_session_pinned_task(
+    pool: &DbPool,
+    exec_id: ExecutionId,
+    queue: &str,
+    pinned_worker_id: &str,
+) {
+    let mut conn = pool.get().await.expect("pooled conn");
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, activity_name, activity_id, \
+          input, state, priority, attempt, max_attempts, scheduled_at, \
+          session_id, sticky_worker_id, sticky_until) \
+         VALUES ($1, $2, 'activity', $3, 'session_activity', $4, '{}'::jsonb, 'PENDING', 0, 0, 3, \
+                 NOW() - INTERVAL '1 minute', $5, $6, NOW() + INTERVAL '1 hour')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(ActivityExecId::new().as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<diesel::sql_types::Text, _>(pinned_worker_id)
+    .execute(&mut conn)
+    .await
+    .expect("seed session task");
+}
+
+/// A session member (issue #606) is claimable ONLY by its pinned host, with no
+/// expiry. A live peer covering the same queue can never stand in for a dead
+/// host, so this is a permanent stall -- not healthy progress.
+#[tokio::test]
+async fn session_pinned_task_whose_host_is_gone_reports_no_worker() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    seed_session_pinned_task(&pool, exec_id, "gpu", "w-host").await;
+    // A peer polls the queue, but it is NOT the session's pinned host.
+    seed_live_worker(&pool, "w-peer", "gpu").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        body["blocked_on"]["type"], "activity_no_worker",
+        "a session member whose pinned host is gone can never be claimed: {body}"
+    );
+    assert_eq!(body["health"], "stalled", "{body}");
+}
+
+/// The control: the session's own pinned host is live, so the row is claimable.
+#[tokio::test]
+async fn session_pinned_task_whose_host_is_live_is_healthy() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    seed_session_pinned_task(&pool, exec_id, "gpu", "w-host").await;
+    seed_live_worker(&pool, "w-host", "gpu").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(body["blocked_on"]["type"], "healthy_in_progress", "{body}");
+    assert_eq!(body["health"], "healthy", "{body}");
+}
+
+/// A `Draining` worker has already left its poll loop (`Worker::run` transitions
+/// only after `run_poll_loop` returns), so it claims no new task for the whole
+/// drain window even though queue coverage still counts it.
+#[tokio::test]
+async fn draining_only_fleet_reports_no_worker() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    seed_task_requiring(&pool, exec_id, "payments", None, None).await;
+    seed_worker_with_status(&pool, "w-draining", "payments", "Draining").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        body["blocked_on"]["type"], "activity_no_worker",
+        "a draining worker claims nothing new, so the queue has no live claimant: {body}"
+    );
+    assert_eq!(body["health"], "stalled", "{body}");
+}
+
+/// The control: the same fleet while still `Active` IS coverage.
+#[tokio::test]
+async fn active_fleet_on_the_same_queue_is_healthy() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    seed_task_requiring(&pool, exec_id, "payments", None, None).await;
+    seed_worker_with_status(&pool, "w-active", "payments", "Active").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(body["blocked_on"]["type"], "healthy_in_progress", "{body}");
+    assert_eq!(body["health"], "healthy", "{body}");
+}
+
 /// A task pinned to a build NO live worker runs is unclaimable, even though its
 /// queue has a live poller. Queue coverage alone would report healthy progress
 /// for a task that can sit `PENDING` forever.

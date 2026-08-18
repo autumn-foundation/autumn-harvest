@@ -12508,6 +12508,8 @@ type DiagnoseTaskRow = (
     String,                        // task_type
     Option<String>,                // required_build_id
     Option<serde_json::Value>,     // required_capabilities
+    Option<uuid::Uuid>,            // session_id
+    Option<String>,                // sticky_worker_id
 );
 
 /// The run's own workflow-task row, with the claim requirements its liveness
@@ -12519,6 +12521,8 @@ type WorkflowTaskRow = (
     chrono::DateTime<chrono::Utc>, // scheduled_at
     Option<String>,                // required_build_id
     Option<serde_json::Value>,     // required_capabilities
+    Option<uuid::Uuid>,            // session_id
+    Option<String>,                // sticky_worker_id
 );
 
 /// The narrow task-queue projection [`build_diagnosis_report`] reads.
@@ -12543,52 +12547,120 @@ struct DiagnoseTask {
     required_build_id: Option<String>,
     /// Capability requirements (issue #804) -- likewise claim-time enforced.
     required_capabilities: Option<serde_json::Value>,
+    /// Worker session membership (issue #606). A session member is claimable
+    /// ONLY by `sticky_worker_id`, and that pin never expires.
+    session_id: Option<uuid::Uuid>,
+    /// The pinned host recorded on the row.
+    sticky_worker_id: Option<String>,
+}
+
+/// The claim-time requirements of one task row.
+///
+/// Bundled so [`task_has_eligible_worker`] can mirror `claim_task`'s predicate
+/// dimension-for-dimension without an unreadable positional argument list.
+#[derive(Default, Clone, Copy)]
+struct TaskClaimRequirements<'a> {
+    queue_name: &'a str,
+    /// Build routing (issue #171/#604).
+    required_build_id: Option<&'a str>,
+    /// Capability requirements (issue #804).
+    required_capabilities: Option<&'a serde_json::Value>,
+    /// Worker sessions (issue #606): the row belongs to a session, so it is
+    /// claimable ONLY by the host in `sticky_worker_id`, with no expiry.
+    is_session_member: bool,
+    /// The recorded pinned host. Load-bearing here only for a session member;
+    /// an ordinary sticky lease is deliberately not modelled (see below).
+    sticky_worker_id: Option<&'a str>,
+}
+
+impl TaskClaimRequirements<'_> {
+    /// The session clause of `claim_task_query`, verbatim:
+    /// `session_id IS NULL OR sticky_worker_id = $1`.
+    ///
+    /// A session member whose row carries no `sticky_worker_id` matches no
+    /// worker at all -- `sticky_worker_id = $1` can never hold against NULL.
+    fn session_admits(&self, worker_id: &str) -> bool {
+        !self.is_session_member || self.sticky_worker_id == Some(worker_id)
+    }
+}
+
+/// Can this worker claim a NEW task right now?
+///
+/// Deliberately stricter than [`crate::queue_coverage::worker_covers_queue`]:
+/// that predicate (issue #774) counts `Active` **or** `Draining`, which is the
+/// right, broader answer to the deploy-oriented "is anything still attached to
+/// this queue?" but the wrong answer to "can anything claim this row?".
+/// `Worker::run` leaves `run_poll_loop` **before** it transitions to
+/// `Draining` and then only waits for in-flight work, so a draining worker
+/// claims no new task for the whole drain window -- and a long drain would
+/// otherwise read as healthy progress on a queue nothing can pick up.
+///
+/// Queue/shard coverage itself still goes through the canonical #774 predicate
+/// so this surface and `GET /admin/queue-coverage` can never disagree about
+/// what a worker is attached to; only the liveness half is narrowed.
+fn worker_can_claim_now(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
+    crate::queue_coverage::worker_covers_queue(worker, queue_name, shard_id)
+        && worker.worker.status == autumn_harvest::workers::WorkerStatus::Active.as_str()
 }
 
 /// Can ANY single live worker actually claim this task?
 ///
 /// Queue coverage alone is not the claim predicate. `queue::claim_task` also
 /// enforces the task's `required_build_id` (exact, `harvest_build_compat`
-/// declared, or legacy empty-build worker) and its `required_capabilities`
-/// (the same Exact/In label match), so a task sitting on a well-covered queue
-/// can still be permanently unclaimable because no poller runs the right build
-/// or advertises the right labels -- which this endpoint must report as a
-/// stall, not as healthy progress.
+/// declared, or legacy empty-build worker), its `required_capabilities` (the
+/// same Exact/In label match), and its **session pin** -- so a task sitting on
+/// a well-covered queue can still be permanently unclaimable because no poller
+/// runs the right build, advertises the right labels, or *is* the session's
+/// pinned host. This endpoint must report that as a stall, not healthy
+/// progress.
 ///
 /// Every dimension is checked against the **same** worker, exactly as the
 /// stranded-work sampler does (`worker.rs`): a task needing both a build and a
-/// label is not covered by two workers that each satisfy only one of them.
+/// label is not covered by two workers that each satisfy only one of them, and
+/// a session member is not covered by a peer that satisfies everything except
+/// being the pinned host.
+///
+/// # What is deliberately NOT modelled
+///
+/// An **ordinary sticky lease** (issue #235). Its claim clause is
+/// `sticky_worker_id IS NULL OR sticky_worker_id = $1 OR sticky_until IS NULL
+/// OR sticky_until <= NOW()`, so it releases to the whole fleet the moment
+/// `sticky_until` passes: a dead owner makes the row unclaimable only until
+/// that instant. Reporting a self-healing, seconds-long condition as
+/// `activity_no_worker`/`stalled` would be a false positive on the flagship
+/// verdict, which is the worst outcome for a triage tool -- so an unexpired
+/// lease is ignored and the transient over-optimism is accepted. A **session**
+/// pin has no such expiry, which is exactly why it IS modelled.
+/// `GET /admin/queues/{queue}/eligibility` (issue #611) remains the per-worker
+/// surface that reports `sticky_owned_by_other_worker`.
 ///
 /// Unparseable `required_capabilities` fall back to the other dimensions rather
 /// than reporting a stall, so a value this endpoint cannot read can never
 /// fabricate a false `no_worker` verdict.
-///
-/// Queue coverage itself still goes through the canonical
-/// [`crate::queue_coverage::worker_covers_queue`] predicate (issue #774) so
-/// this surface and `GET /admin/queue-coverage` can never disagree.
 fn task_has_eligible_worker(
     workers: &[WorkerRow],
     shard_id: i32,
-    queue_name: &str,
-    required_build_id: Option<&str>,
-    required_capabilities: Option<&serde_json::Value>,
+    reqs: TaskClaimRequirements<'_>,
     compat_set: &autumn_harvest::build_routing::BuildCompatibilitySet,
 ) -> bool {
-    let requirements = required_capabilities.and_then(|caps| {
+    let requirements = reqs.required_capabilities.and_then(|caps| {
         serde_json::from_value::<Vec<autumn_harvest::eligibility::Requirement>>(caps.clone()).ok()
     });
 
     workers.iter().any(|w| {
-        if !crate::queue_coverage::worker_covers_queue(w, queue_name, shard_id) {
+        if !reqs.session_admits(&w.worker.worker_id) {
             return false;
         }
-        if !compat_set.is_eligible(&w.worker.build_id, required_build_id) {
+        if !worker_can_claim_now(w, reqs.queue_name, shard_id) {
             return false;
         }
-        requirements.as_ref().is_none_or(|reqs| {
+        if !compat_set.is_eligible(&w.worker.build_id, reqs.required_build_id) {
+            return false;
+        }
+        requirements.as_ref().is_none_or(|parsed| {
             let labels: std::collections::HashMap<String, String> =
                 serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
-            autumn_harvest::eligibility::matches_requirements(reqs, &labels)
+            autumn_harvest::eligibility::matches_requirements(parsed, &labels)
         })
     })
 }
@@ -12736,6 +12808,11 @@ pub(crate) async fn build_diagnosis_report(
             harvest_task_queue::task_type,
             harvest_task_queue::required_build_id,
             harvest_task_queue::required_capabilities,
+            // Worker sessions (issue #606): the claim predicate admits a
+            // session member ONLY from `sticky_worker_id`, with no expiry, so
+            // a session whose host is gone is a permanent stall.
+            harvest_task_queue::session_id,
+            harvest_task_queue::sticky_worker_id,
         ))
         .load::<DiagnoseTaskRow>(&mut conn)
         .await
@@ -12756,6 +12833,8 @@ pub(crate) async fn build_diagnosis_report(
                 task_type,
                 required_build_id,
                 required_capabilities,
+                session_id,
+                sticky_worker_id,
             )| DiagnoseTask {
                 state,
                 activity_name,
@@ -12769,6 +12848,8 @@ pub(crate) async fn build_diagnosis_report(
                 task_type,
                 required_build_id,
                 required_capabilities,
+                session_id,
+                sticky_worker_id,
             },
         )
         .collect();
@@ -12802,6 +12883,8 @@ pub(crate) async fn build_diagnosis_report(
             // activity row gets.
             harvest_task_queue::required_build_id,
             harvest_task_queue::required_capabilities,
+            harvest_task_queue::session_id,
+            harvest_task_queue::sticky_worker_id,
         ))
         .first::<WorkflowTaskRow>(&mut conn)
         .await
@@ -12970,9 +13053,13 @@ pub(crate) async fn build_diagnosis_report(
                 has_live_worker: task_has_eligible_worker(
                     &live_workers,
                     shard_id,
-                    &t.queue_name,
-                    t.required_build_id.as_deref(),
-                    t.required_capabilities.as_ref(),
+                    TaskClaimRequirements {
+                        queue_name: &t.queue_name,
+                        required_build_id: t.required_build_id.as_deref(),
+                        required_capabilities: t.required_capabilities.as_ref(),
+                        is_session_member: t.session_id.is_some(),
+                        sticky_worker_id: t.sticky_worker_id.as_deref(),
+                    },
                     &compat_set,
                 ),
                 circuit_phase,
@@ -13051,16 +13138,29 @@ pub(crate) async fn build_diagnosis_report(
         .collect();
 
     let workflow_task = workflow_task_row.map(
-        |(state, worker_id, queue_name, scheduled_at, required_build_id, required_capabilities)| {
+        |(
+            state,
+            worker_id,
+            queue_name,
+            scheduled_at,
+            required_build_id,
+            required_capabilities,
+            session_id,
+            sticky_worker_id,
+        )| {
             WorkflowTaskFacts {
                 has_worker: worker_id.is_some(),
                 queue_paused: paused_queues.contains(&queue_name),
                 has_live_worker: task_has_eligible_worker(
                     &live_workers,
                     shard_id,
-                    &queue_name,
-                    required_build_id.as_deref(),
-                    required_capabilities.as_ref(),
+                    TaskClaimRequirements {
+                        queue_name: &queue_name,
+                        required_build_id: required_build_id.as_deref(),
+                        required_capabilities: required_capabilities.as_ref(),
+                        is_session_member: session_id.is_some(),
+                        sticky_worker_id: sticky_worker_id.as_deref(),
+                    },
                     &compat_set,
                 ),
                 state,
@@ -47137,6 +47237,17 @@ mod tests {
         build_id: &str,
         labels: serde_json::Value,
     ) -> WorkerRow {
+        eligibility_worker_with_status(worker_id, queues, build_id, labels, "Active")
+    }
+
+    /// The same, with an explicit fleet status so the drain case is testable.
+    fn eligibility_worker_with_status(
+        worker_id: &str,
+        queues: &[&str],
+        build_id: &str,
+        labels: serde_json::Value,
+        status: &str,
+    ) -> WorkerRow {
         use autumn_harvest::models::HarvestWorker;
         use autumn_harvest::workers::WorkerHealth;
 
@@ -47152,7 +47263,7 @@ mod tests {
                 in_flight_count: 0,
                 host: "localhost".to_string(),
                 version: None,
-                status: "Active".to_string(),
+                status: status.to_string(),
                 drain_deadline_at: None,
                 build_id: build_id.to_string(),
                 deployment_name: None,
@@ -47162,6 +47273,14 @@ mod tests {
             },
             health: WorkerHealth::Healthy,
             active_task_ids: vec![],
+        }
+    }
+
+    /// The common case: a queue name and no other claim requirement.
+    fn claim_reqs(queue: &str) -> TaskClaimRequirements<'_> {
+        TaskClaimRequirements {
+            queue_name: queue,
+            ..TaskClaimRequirements::default()
         }
     }
 
@@ -47179,15 +47298,19 @@ mod tests {
 
         // No build requirement -> the queue poller is enough.
         assert!(task_has_eligible_worker(
-            &workers, 0, "default", None, None, &compat
+            &workers,
+            0,
+            claim_reqs("default"),
+            &compat
         ));
         // Same build -> eligible.
         assert!(task_has_eligible_worker(
             &workers,
             0,
-            "default",
-            Some("build-1"),
-            None,
+            TaskClaimRequirements {
+                required_build_id: Some("build-1"),
+                ..claim_reqs("default")
+            },
             &compat
         ));
         // A build the only queue poller does NOT run and is not declared
@@ -47196,9 +47319,10 @@ mod tests {
         assert!(!task_has_eligible_worker(
             &workers,
             0,
-            "default",
-            Some("build-2"),
-            None,
+            TaskClaimRequirements {
+                required_build_id: Some("build-2"),
+                ..claim_reqs("default")
+            },
             &compat
         ));
     }
@@ -47220,9 +47344,10 @@ mod tests {
         assert!(task_has_eligible_worker(
             &workers,
             0,
-            "default",
-            Some("build-1"),
-            None,
+            TaskClaimRequirements {
+                required_build_id: Some("build-1"),
+                ..claim_reqs("default")
+            },
             &compat
         ));
         // A legacy worker (empty build_id) may claim anything.
@@ -47235,9 +47360,10 @@ mod tests {
         assert!(task_has_eligible_worker(
             &legacy,
             0,
-            "default",
-            Some("build-9"),
-            None,
+            TaskClaimRequirements {
+                required_build_id: Some("build-9"),
+                ..claim_reqs("default")
+            },
             &compat
         ));
     }
@@ -47264,17 +47390,19 @@ mod tests {
         assert!(!task_has_eligible_worker(
             &cpu_only,
             0,
-            "default",
-            None,
-            Some(&gpu_req),
+            TaskClaimRequirements {
+                required_capabilities: Some(&gpu_req),
+                ..claim_reqs("default")
+            },
             &compat
         ));
         assert!(task_has_eligible_worker(
             &gpu,
             0,
-            "default",
-            None,
-            Some(&gpu_req),
+            TaskClaimRequirements {
+                required_capabilities: Some(&gpu_req),
+                ..claim_reqs("default")
+            },
             &compat
         ));
     }
@@ -47299,9 +47427,11 @@ mod tests {
         assert!(!task_has_eligible_worker(
             &split,
             0,
-            "default",
-            Some("build-2"),
-            Some(&gpu_req),
+            TaskClaimRequirements {
+                required_build_id: Some("build-2"),
+                required_capabilities: Some(&gpu_req),
+                ..claim_reqs("default")
+            },
             &compat
         ));
 
@@ -47315,9 +47445,11 @@ mod tests {
         assert!(task_has_eligible_worker(
             &both,
             0,
-            "default",
-            Some("build-2"),
-            Some(&gpu_req),
+            TaskClaimRequirements {
+                required_build_id: Some("build-2"),
+                required_capabilities: Some(&gpu_req),
+                ..claim_reqs("default")
+            },
             &compat
         ));
     }
@@ -47340,17 +47472,169 @@ mod tests {
         assert!(task_has_eligible_worker(
             &workers,
             0,
-            "default",
-            None,
-            Some(&garbage),
+            TaskClaimRequirements {
+                required_capabilities: Some(&garbage),
+                ..claim_reqs("default")
+            },
             &compat
         ));
         assert!(!task_has_eligible_worker(
             &workers,
             0,
-            "other-queue",
-            None,
-            Some(&garbage),
+            TaskClaimRequirements {
+                required_capabilities: Some(&garbage),
+                ..claim_reqs("other-queue")
+            },
+            &compat
+        ));
+    }
+
+    #[test]
+    fn eligibility_session_member_requires_its_pinned_host() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        // A peer covers the queue, but the session's pinned host is gone.
+        let peer_only = vec![eligibility_worker(
+            "w-peer",
+            &["gpu"],
+            "",
+            serde_json::json!({}),
+        )];
+        assert!(
+            !task_has_eligible_worker(
+                &peer_only,
+                0,
+                TaskClaimRequirements {
+                    is_session_member: true,
+                    sticky_worker_id: Some("w-host"),
+                    ..claim_reqs("gpu")
+                },
+                &compat
+            ),
+            "a session member is claimable ONLY by its pinned host; a peer that \
+             covers the queue can never claim it, so this is a genuine stall"
+        );
+
+        // The pinned host itself is live -> claimable.
+        let with_host = vec![
+            eligibility_worker("w-peer", &["gpu"], "", serde_json::json!({})),
+            eligibility_worker("w-host", &["gpu"], "", serde_json::json!({})),
+        ];
+        assert!(task_has_eligible_worker(
+            &with_host,
+            0,
+            TaskClaimRequirements {
+                is_session_member: true,
+                sticky_worker_id: Some("w-host"),
+                ..claim_reqs("gpu")
+            },
+            &compat
+        ));
+    }
+
+    #[test]
+    fn eligibility_session_member_without_a_recorded_host_is_unclaimable() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let workers = vec![eligibility_worker("w", &["gpu"], "", serde_json::json!({}))];
+
+        // `sticky_worker_id = $1` can never hold against a NULL column.
+        assert!(!task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                is_session_member: true,
+                sticky_worker_id: None,
+                ..claim_reqs("gpu")
+            },
+            &compat
+        ));
+    }
+
+    #[test]
+    fn eligibility_session_pin_still_applies_build_and_capabilities() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        // The pinned host is live and polls the queue but runs the wrong build:
+        // no OTHER worker may stand in for it, so the task is unclaimable.
+        let workers = vec![
+            eligibility_worker("w-host", &["gpu"], "build-1", serde_json::json!({})),
+            eligibility_worker("w-peer", &["gpu"], "build-2", serde_json::json!({})),
+        ];
+        assert!(!task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-2"),
+                is_session_member: true,
+                sticky_worker_id: Some("w-host"),
+                ..claim_reqs("gpu")
+            },
+            &compat
+        ));
+    }
+
+    #[test]
+    fn eligibility_ignores_an_ordinary_sticky_lease() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        // Sticky owner recorded but NOT a session member: the lease self-heals
+        // at `sticky_until`, so any eligible poller counts and this is not a
+        // stall (see `task_has_eligible_worker`'s doc comment).
+        let peer_only = vec![eligibility_worker(
+            "w-peer",
+            &["default"],
+            "",
+            serde_json::json!({}),
+        )];
+        assert!(task_has_eligible_worker(
+            &peer_only,
+            0,
+            TaskClaimRequirements {
+                sticky_worker_id: Some("w-gone"),
+                ..claim_reqs("default")
+            },
+            &compat
+        ));
+    }
+
+    #[test]
+    fn eligibility_excludes_draining_workers() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        // `Worker::run` leaves its poll loop BEFORE transitioning to
+        // `Draining`, so a draining worker claims no new task for the whole
+        // drain window even though queue coverage still counts it.
+        let draining = vec![eligibility_worker_with_status(
+            "w-draining",
+            &["default"],
+            "",
+            serde_json::json!({}),
+            "Draining",
+        )];
+        assert!(!task_has_eligible_worker(
+            &draining,
+            0,
+            claim_reqs("default"),
+            &compat
+        ));
+
+        // The same worker while still `Active` IS coverage.
+        let active = vec![eligibility_worker(
+            "w-active",
+            &["default"],
+            "",
+            serde_json::json!({}),
+        )];
+        assert!(task_has_eligible_worker(
+            &active,
+            0,
+            claim_reqs("default"),
             &compat
         ));
     }
