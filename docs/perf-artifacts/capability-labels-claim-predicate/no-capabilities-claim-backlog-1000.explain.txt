@@ -116,8 +116,8 @@ CTE Scan on claimed  (cost=28603.34..28603.36 rows=1 width=817) (actual rows=1 l
                       Output: harvest_task_queue_1.attempt, harvest_task_queue_1.ctid, harvest_task_queue_1.id
                       Index Cond: (harvest_task_queue_1.id = candidate_1.id)
                       Buffers: shared hit=3
-Query Identifier: 1085906847310474491
+Query Identifier: 7233977270330023665
 Planning:
   Buffers: shared hit=677 read=39
-Planning Time: 4.859 ms
-Execution Time: 2.479 ms
+Planning Time: 3.966 ms
+Execution Time: 2.201 ms

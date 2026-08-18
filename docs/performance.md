@@ -864,7 +864,7 @@ from the benchmark are directly comparable.
   cost. Ranked by how much that omission is likely to matter:
   * **Capability labels (#382)** — measured directly:
     `docs/performance-capability-labels.md` seeds `required_capabilities`
-    (rather than leaving it null) and finds a real, +24–37% buffer cost on the
+    (rather than leaving it null) and finds a real, +24–36% buffer cost on the
     claim query across the same backlog-depth sweep used everywhere else on
     this page, corroborated three independent ways (`EXPLAIN` buffers,
     `pg_relation_size` row-width growth, and an aggregate `pg_stat_statements`

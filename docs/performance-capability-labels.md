@@ -136,11 +136,11 @@ buffers here, not 8.
 
 | backlog | no-capabilities buffers | capability-labels buffers | delta | delta % |
 |---:|---:|---:|---:|---:|
-| 1,000 | 53 | 69 | +16 | +30.2% |
+| 1,000 | 53 | 66 | +13 | +24.5% |
 | 10,000 | 274 | 368 | +94 | +34.3% |
-| 100,000 | 2,473 | 3,371 | +898 | +36.3% |
+| 100,000 | 2,478 | 3,371 | +893 | +36.0% |
 
-The delta *percentage* grows with backlog size (+30.2% -> +34.3% -> +36.3%)
+The delta *percentage* grows with backlog size (+24.5% -> +34.3% -> +36.0%)
 rather than shrinking, which is consistent with a per-row storage-width
 effect rather than a fixed per-query overhead that would amortize away at
 scale.
@@ -200,15 +200,15 @@ each data state and snapshots `pg_stat_statements` afterward (artifacts:
 
 | state | calls | `shared_blks_hit` | avg per call |
 |---|---:|---:|---:|
-| no-capabilities | 10,001 | 5,092,628 | 509.21 |
-| capability-labels | 10,001 | 7,464,424 | 746.37 |
+| no-capabilities | 10,001 | 5,124,942 | 512.44 |
+| capability-labels | 10,001 | 7,014,608 | 701.39 |
 
-Aggregate delta: **+46.57%**, in the same range as the single-call `EXPLAIN`
+Aggregate delta: **+36.87%**, in the same range as the single-call `EXPLAIN`
 delta (+34.3%) at the same depth and the isolated-table `pg_relation_size`
 delta (+42.7%) above. Three independent measurement methods -- a single-call
 EXPLAIN, a direct heap-page-count comparison on the isolated table, and an
 aggregate `pg_stat_statements` snapshot over a 10,001-call production-code
-drain -- all land in the same ~34-47% band and none contradicts the others in
+drain -- all land in the same ~34-43% band and none contradicts the others in
 direction or order of magnitude. That consistency, not exact numeric
 agreement across methods measuring different things, is the evidence bar this
 finding clears.
@@ -273,27 +273,48 @@ autovacuum worker gets no opportunity to run at all during this tight,
 uninterrupted execution -- every byte of space reclaimed here comes solely
 from *opportunistic* HOT pruning triggered in-line by the claim loop's own
 commits, the minimum reclaim mechanism any separately-committed claim
-sequence gets for free with zero background assistance. An earlier
-measurement of this same separately-committed pattern, taken across five
-manually-repeated shell invocations of an earlier, non-self-contained
-draft of this script (leaving real wall-clock gaps between runs for
-autovacuum's background worker to act in, closer to how a continuously
-polled production queue actually behaves over time), measured a
-consistently *larger* effect: 50-55 pages of growth for no-capabilities
-rows, 57-60 pages for capability-labels rows, +9.1% to +15.7% (mean
-~+14%). This is the expected direction, not noise: reclaimed space from a
-pruned dead tuple can only be reused by a new tuple version that fits
-inside it, so the *narrower* no-capabilities row is more likely to fit
-into a given freed slot than the wider capability-labels row -- meaning
-more aggressive reclaim (background autovacuum on top of opportunistic
-pruning) disproportionately shrinks the narrow variant's growth relative
-to the wide one, which *widens* the relative percentage gap between them,
-not narrows it. That earlier figure is no longer independently
-reproducible by the current single-invocation script (which completes too
-quickly in one continuous session for autovacuum's naptime-gated launcher
-to intervene), so it is retained here only as directional evidence, not as
-a currently-verifiable number -- the reproducible headline for this
-section is the +6.1% to +8.3% (mean ~+7.5%) figure above.
+sequence gets for free with zero background assistance.
+
+An earlier measurement of this same separately-committed pattern, taken
+across five manually-repeated shell invocations of an earlier,
+non-self-contained draft of this script, measured a consistently *larger*
+effect: 50-55 pages of growth for no-capabilities rows, 57-60 pages for
+capability-labels rows, +9.1% to +15.7% (mean ~+14%). An earlier revision
+of this page attributed that gap to autovacuum acting on the table between
+the five shell invocations -- **review on PR #1192 correctly caught that
+this cannot be the mechanism**: each of those five invocations both began
+and ended by `TRUNCATE`-ing `harvest_task_queue`, which physically
+discards the table's storage file rather than marking rows dead, so any
+autovacuum activity that might have run *between* invocations would have
+acted on an already-empty table and left nothing behind for the next
+invocation's fresh seed-and-claim cycle to inherit. Those older
+invocations also never instrumented `pg_stat_user_tables.autovacuum_count`
+during their own claim loops the way the current script does, so there is
+no verified explanation for the gap between the old and new figures --
+plausible remaining candidates include autovacuum firing *within* one of
+those older invocations' own (longer, separate-process) wall-clock
+runtime rather than in the gap between invocations, an unrecorded
+behavioral difference in that earlier non-self-contained draft, or
+something else entirely -- none of which has been confirmed. *If*
+additional reclaim did occur by some unverified mechanism, the direction
+would at least be consistent with a real effect rather than pure noise:
+reclaimed space from a pruned dead tuple can only be reused by a new
+tuple version that fits inside it, so the narrower no-capabilities row is
+more likely to fit into a given freed slot than the wider
+capability-labels row, meaning reclaim beyond opportunistic pruning alone
+would disproportionately shrink the narrow variant's growth relative to
+the wide one and widen, not narrow, the relative percentage gap -- but
+that reasoning is offered only as a plausibility check on the
+*direction* of the older figure, not as confirmation of *why* it differs.
+That older figure is no longer independently reproducible by the current
+single-invocation script (which completes far too quickly in one
+continuous session for any background process to plausibly intervene) and
+its cause is unverified, so it is retained here only as an unexplained
+historical data point -- it is **not** combined with the verified range
+below for any derived calculation on this page (see the corrected
+multiplier a few paragraphs down, which now uses the +6.1% to +8.3% range
+alone). The reproducible, evidence-backed headline for this section is the
++6.1% to +8.3% (mean ~+7.5%) figure above.
 
 A second, deliberately **non**-representative shape applies all 10,000
 claims as a single set-based `UPDATE` inside one transaction (artifacts:
@@ -312,9 +333,10 @@ real -- it is the worst case a batch operation touching many rows inside
 one explicit transaction (a mass backfill, a migration script, an admin
 tool) would see -- but it is not representative of the per-claim
 production path this design actually adds cost to, overstating that cost
-by roughly 2.4x-6.2x (37.6% divided by the combined 6.1-15.7% range
-measured above, spanning opportunistic-pruning-only reclaim at one end to
-opportunistic-pruning-plus-background-autovacuum reclaim at the other).
+by roughly 4.5x-6.2x (37.6% divided by the +6.1% to +8.3% verified
+separate-transaction range measured above -- the older, unverified +9.1%
+to +15.7% figure is deliberately excluded from this calculation, per the
+review finding discussed above).
 The separate-transaction measurement above is this section's headline
 figure; the bulk-transaction one is included only as an explicitly-scoped
 upper bound.
