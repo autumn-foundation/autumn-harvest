@@ -1047,14 +1047,18 @@ async fn enforce_activity_timeout(
             // snapshot, so a pause committing after the scan would otherwise let
             // this transaction schedule-to-start-fail a task the hold protects.
             //
-            // No advisory lock (unlike the queue path): this is authoritative as
-            // of its own snapshot rather than through commit, leaving a bounded
-            // residual that is documented in full on
-            // `activity_pause::is_activity_paused`. Placed *after* the queue
-            // re-check so the two are evaluated coarse-to-fine, and after the
-            // `schedule_to_start_still_expired_unlocked` re-read below would be
-            // wrong -- a held task must bail before paying for the execution row
-            // lock and history load.
+            // No advisory lock (unlike the queue path). This copy is an
+            // ADVISORY FAST PATH: it lets a held task bail before paying for the
+            // execution row lock and history load below. It is NOT the
+            // guarantee -- the very next statement,
+            // `lock_workflow_execution_row_and_load_history`, can block for an
+            // UNBOUNDED period behind any other holder of that row, and
+            // `pause_activity` shares no row with this transaction so it commits
+            // freely during that wait (round-17 review, P1). The authoritative
+            // re-check therefore runs AFTER the row locks; see it below.
+            // Placed after the queue re-check so the two read coarse-to-fine,
+            // and before `schedule_to_start_still_expired_unlocked` so a held
+            // task short-circuits on the cheaper condition.
             //
             // Scoped by `task_type = 'activity'` to match the scan predicate
             // exactly. A *workflow* task can carry a non-NULL `activity_name` —
@@ -1112,6 +1116,42 @@ async fn enforce_activity_timeout(
         // resume's own `scheduled_at` shift can serialize against it.
         if matches!(reason, TimeoutReason::ScheduleToStart)
             && !schedule_to_start_still_expired(conn, task.id).await?
+        {
+            return Ok(false);
+        }
+        // Authoritative ACTIVITY-pause re-check, AFTER the blocking row
+        // acquisitions above (issue #807, round-17 review, P1).
+        //
+        // The copy near the top of this transaction is a fast path only. Between
+        // it and here sits `lock_workflow_execution_row_and_load_history`, a
+        // `FOR UPDATE` that can block for an UNBOUNDED period behind any other
+        // transaction holding the execution row. `pause_activity` touches
+        // neither that row nor this task's, so an operator pause commits
+        // immediately during that wait and returns success -- and without this
+        // re-check the enforcer went on to append `ActivityTimedOut` and
+        // terminally fail the very task the acknowledged hold was placed to
+        // protect, seconds after the operator was told the brake had taken.
+        //
+        // Why this is not the queue path's problem: `lock_queue_for_timeout_recheck`
+        // takes a shared advisory lock at the TOP of this transaction and holds
+        // it through COMMIT, so `pause_queue` cannot interleave at all. The
+        // activity path deliberately takes no advisory lock -- a new keyspace
+        // would impose a fleet-wide queue-before-activity ordering rule and an
+        // ABBA hazard on two paths that today take none -- so the equivalent
+        // guarantee is bought by re-reading after the last blocking acquisition
+        // instead. That is what makes the documented residual genuinely
+        // "bounded by this transaction's own remaining work": every statement
+        // from here to COMMIT touches only rows this transaction already holds.
+        //
+        // Cheap by construction: one indexed `EXISTS` on `harvest_activity_pauses`,
+        // and only on the `ScheduleToStart` path (`activity_pause_suppresses_timeout`
+        // is false for every other reason), which is the rarest of the four.
+        if task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE
+            && let Some(activity_name) = task.activity_name.as_deref()
+            && crate::activity_pause::activity_pause_suppresses_timeout(
+                reason,
+                crate::activity_pause::is_activity_paused(conn, activity_name).await?,
+            )
         {
             return Ok(false);
         }

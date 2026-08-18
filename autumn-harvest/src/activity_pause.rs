@@ -526,7 +526,7 @@ pub const fn is_activity_paused_query() -> &'static str {
 
 /// Is this activity type currently held on **this shard's** database?
 ///
-/// The authoritative re-check for [`crate::timeout::enforce_timeouts_once`]'s
+/// The re-check for [`crate::timeout::enforce_timeouts_once`]'s
 /// `ScheduleToStart` path. The scan predicate that selected the task is a
 /// non-locking snapshot, so a pause committing after the scan is invisible to
 /// it and the enforcer would terminally fail the very task the hold exists to
@@ -534,13 +534,31 @@ pub const fn is_activity_paused_query() -> &'static str {
 /// to prevent. Running this inside the enforcement transaction closes all but a
 /// bounded residual, described below.
 ///
+/// # Called TWICE per enforcement, and why (round-17 review)
+///
+/// `enforce_activity_timeout` calls this once near the top of its transaction
+/// and again **after** it has taken the execution and task row locks. The first
+/// call is an advisory fast path — it lets a held task bail before paying for
+/// the row locks and the history load. It is emphatically **not** the
+/// guarantee, because the statement immediately after it,
+/// `lock_workflow_execution_row_and_load_history`, is a `FOR UPDATE` that can
+/// block for an **unbounded** period behind any other holder of that row.
+/// `pause_activity` shares no row with that transaction, so an operator pause
+/// commits freely during that wait and returns success — and with only the
+/// first call, the enforcer went on to fail the task anyway. The second call,
+/// after the last blocking acquisition, is the authoritative one.
+///
 /// # Residual window (deliberate)
 ///
-/// This is authoritative as of **its own snapshot**, not through commit: a
-/// pause that commits between this read and the enforcement transaction's
-/// `COMMIT` is not observed, so one already-scanned task can still be failed.
-/// The queue-pause sibling closes that window with a shared advisory lock, and
-/// this path deliberately does not, because:
+/// Even the authoritative call is authoritative as of **its own snapshot**, not
+/// through commit: a pause committing between it and the enforcement
+/// transaction's `COMMIT` is not observed, so one already-scanned task can
+/// still be failed. That remaining window is genuinely bounded by this
+/// transaction's own remaining work — every statement from the second call to
+/// `COMMIT` touches only rows the transaction already holds, so it waits on no
+/// foreign lock. The queue-pause sibling closes the window entirely with a
+/// shared advisory lock held through commit, and this path deliberately does
+/// not, because:
 ///
 /// 1. The lock would need a **new** two-argument advisory keyspace.
 ///    `queue_pause` owns that keyspace by a CI-enforced guard, and the

@@ -1548,3 +1548,172 @@ async fn resume_credits_a_late_arrival_under_a_repeatable_read_session_default()
         "the whole backlog is claimable again after the thaw"
     );
 }
+
+/// Hold the execution row's `FOR UPDATE` lock open on a dedicated connection.
+///
+/// The caller must `COMMIT` on the same connection to release it. Mirrors the
+/// helper the issue #609 pause suite uses for the same choreography.
+async fn hold_execution_row_lock(conn: &mut AsyncPgConnection, exec_id: Uuid) {
+    use diesel_async::RunQueryDsl;
+    conn.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id)
+        .execute(conn)
+        .await
+        .expect("lock execution row");
+}
+
+/// A pause that commits while enforcement is BLOCKED on the execution row lock
+/// must still suppress the timeout (issue #807 review, Codex round 17, P1).
+///
+/// `enforce_activity_timeout` re-checks the activity pause near the top of its
+/// transaction, and that re-check was documented as leaving only a residual
+/// "bounded by one statement's snapshot". It is not. The very next thing the
+/// transaction does is `lock_workflow_execution_row_and_load_history`, a
+/// `FOR UPDATE` that can block for an **unbounded** period behind any other
+/// transaction holding that row. `pause_activity` shares no row with this
+/// transaction, so it commits immediately during that wait and returns success
+/// to the operator — and with no further check after the lock is acquired, the
+/// enforcer went on to append `ActivityTimedOut` and terminally fail the very
+/// task the acknowledged hold was placed to protect. The operator sees a
+/// successful pause and then watches the task fail anyway, seconds later.
+///
+/// The queue-pause sibling is immune for a reason worth stating: it takes a
+/// shared advisory lock at the top of the same transaction and holds it
+/// **through commit**, so `pause_queue` cannot interleave at all. The activity
+/// path deliberately takes no advisory lock (a new keyspace would impose a
+/// fleet-wide queue-before-activity ordering rule and an ABBA hazard), so the
+/// fix is a second, authoritative re-check *after* the blocking acquisition —
+/// which is what restores the "bounded residual" the docs claim.
+///
+/// Choreography: hold the execution row lock, start the scanner (its scan
+/// snapshot picks the expired task up and its pre-lock pause check correctly
+/// sees NOT paused, because nothing is paused yet), then commit the pause while
+/// the enforcement transaction is queued on the lock, then release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_committed_while_enforcement_waits_on_the_row_lock_suppresses_the_timeout() {
+    use autumn_harvest::timeout::enforce_timeouts_once;
+    use diesel_async::RunQueryDsl;
+    use std::time::Duration;
+
+    let (url, _c, dbname) = setup_isolated_db_url().await;
+    let mut conn = connect(&url).await;
+    let mut conn_lock = connect(&url).await;
+    let mut conn_pause = connect(&url).await;
+    let mut conn_scan = connect(&url).await;
+
+    let activity = unique("lockrace");
+    let queue = unique("q");
+
+    // Seed an execution whose history carries the `ActivityScheduled` the
+    // enforcer needs to resolve an activity id — without it the transaction
+    // bails early for an unrelated reason and the test would pass vacuously.
+    let exec_id = insert_execution(&mut conn).await;
+    let activity_id = Uuid::new_v4();
+    autumn_harvest::store::append_single_event(
+        &mut conn,
+        autumn_harvest::types::ExecutionId::from_uuid(exec_id),
+        autumn_harvest::event::WorkflowEvent::ActivityScheduled {
+            activity_id: autumn_harvest::types::ActivityExecId::from_uuid(activity_id),
+            name: activity.clone(),
+            input: serde_json::json!({}),
+            queue: queue.clone(),
+        },
+    )
+    .await
+    .expect("append ActivityScheduled");
+
+    let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some(activity.clone());
+    params.activity_id = Some(activity_id);
+    params.schedule_to_start = Some(chrono::Duration::seconds(1));
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+    // Blow the schedule_to_start deadline so the scan selects it.
+    backdate_scheduled_at(&mut conn, task_id, 600).await;
+
+    let due = timeout::find_timed_out_tasks(&mut conn)
+        .await
+        .expect("scan should succeed");
+    assert!(
+        due.iter()
+            .any(|(t, r)| t.id == task_id && matches!(r, TimeoutReason::ScheduleToStart)),
+        "precondition: the task must be schedule-to-start expired and unpaused, \
+         or the race under test is never reached"
+    );
+
+    hold_execution_row_lock(&mut conn_lock, exec_id).await;
+
+    // The scan snapshot runs unblocked and the pre-lock activity-pause check
+    // correctly observes NOT paused; the transaction then queues on the row
+    // lock held above.
+    let scan_handle = tokio::spawn(async move {
+        enforce_timeouts_once(
+            &mut conn_scan,
+            &autumn_harvest::telemetry::NoOpMetrics,
+            Duration::from_secs(5),
+            &None,
+            &[],
+            None,
+            None,
+            60,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // The pause shares no row with the enforcement transaction, so it commits
+    // immediately and reports success to the operator while the enforcer is
+    // still blocked.
+    let paused = activity_pause::pause_activity(
+        &mut conn_pause,
+        &activity,
+        "downstream is down",
+        "oncall",
+        None,
+    )
+    .await
+    .expect("pause must not be blocked by the held execution row lock");
+    assert!(
+        paused.newly_paused,
+        "the pause must have genuinely taken while enforcement was blocked"
+    );
+
+    conn_lock
+        .batch_execute("COMMIT")
+        .await
+        .expect("release the held execution row lock");
+
+    scan_handle
+        .await
+        .expect("scanner task should not panic")
+        .expect("timeout enforcement should succeed");
+
+    assert_eq!(
+        task_state(&mut conn, task_id).await,
+        "PENDING",
+        "a pause acknowledged to the operator must suppress the timeout even when \
+         it commits during the enforcer's unbounded wait on the execution row lock; \
+         the task must stay held, not be terminally failed"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let timed_out: Cnt = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_events \
+         WHERE workflow_exec_id = $1 AND event_type = 'ActivityTimedOut'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .get_result(&mut conn)
+    .await
+    .expect("count ActivityTimedOut");
+    assert_eq!(
+        timed_out.n, 0,
+        "and no ActivityTimedOut may be appended against a held activity"
+    );
+
+    drop_isolated_db(dbname).await;
+}
