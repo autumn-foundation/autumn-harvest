@@ -1318,6 +1318,20 @@ enum WorkflowCommand {
         /// Workflow execution ID.
         execution_id: String,
     },
+    /// Diagnose why one execution is stuck: a one-word health verdict plus the
+    /// discriminated root cause (no live worker on the queue, circuit open,
+    /// retry backoff, rate-limited, concurrency-deferred, queue paused,
+    /// awaiting a signal, sleeping on a timer, ...), in a single call.
+    ///
+    /// For a determinism verdict on a code change instead, see
+    /// `workflow replay-diagnosis`.
+    Diagnose {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Print the raw JSON body instead of the rendered verdict.
+        #[arg(long)]
+        json: bool,
+    },
     /// Render the recursive descendant lineage tree for an execution across all
     /// shards — the spawn topology of a saga or fan-out, annotated with each
     /// descendant's state.
@@ -1350,8 +1364,10 @@ enum WorkflowCommand {
     /// Replay a single execution's recorded history against the currently
     /// registered workflow handler and report a structured determinism verdict
     /// (clean, diverged, failed, not-registered, or not-replayable).
+    ///
+    /// For a stall root cause instead, see `workflow diagnose`.
     ReplayDiagnosis {
-        /// Workflow execution ID to diagnose.
+        /// Workflow execution ID to replay.
         execution_id: String,
     },
     /// List child workflow executions for a parent execution.
@@ -4440,6 +4456,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if usage_wants_table(cli) {
         return Ok(format_usage_table(value));
     }
+    if diagnose_wants_table(cli) {
+        return Ok(format_diagnose_verdict(value));
+    }
 
     let output = if workflow_children_wants_raw_json(cli)
         || workflow_summaries_wants_raw_json(cli)
@@ -4453,6 +4472,7 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
         || queue_coverage_wants_raw_json(cli)
         || activity_list_wants_raw_json(cli)
         || usage_wants_raw_json(cli)
+        || diagnose_wants_raw_json(cli)
     {
         OutputFormat::Json
     } else {
@@ -4499,6 +4519,97 @@ fn fanout_partial_notice(value: &Value) -> Option<String> {
         unavailable.len(),
         detail.join(", ")
     ))
+}
+
+fn diagnose_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Diagnose { json: false, .. }
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+const fn diagnose_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Diagnose { json: true, .. }
+        }
+    )
+}
+
+/// Render `GET /workflows/{id}/diagnose` as a human-readable verdict
+/// (issue #809).
+///
+/// Leads with the two things an operator reads first — the one-word `health`
+/// and the one-sentence `summary` — then the discriminated `blocked_on`
+/// members, so the actionable field (the uncovered queue, the open circuit's
+/// cooldown, the awaited signal's name) is on screen without a `jq` pipeline.
+fn format_diagnose_verdict(value: &Value) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "execution: {}  workflow: {}  state: {}",
+        cell_str(value.get("execution_id")),
+        cell_str(value.get("workflow_name")),
+        cell_str(value.get("state")),
+    );
+    let _ = writeln!(out, "health:    {}", cell_str(value.get("health")));
+    let _ = writeln!(out, "summary:   {}", cell_str(value.get("summary")));
+
+    if let Some(blocked) = value.get("blocked_on").and_then(Value::as_object) {
+        let _ = writeln!(
+            out,
+            "blocked on: {}",
+            blocked
+                .get("type")
+                .map_or("-", |v| v.as_str().unwrap_or("-"))
+        );
+        // Every member except the discriminator, in the response's own order.
+        for (key, member) in blocked.iter().filter(|(k, _)| k.as_str() != "type") {
+            let _ = writeln!(out, "  {key}: {}", cell_str(Some(member)));
+        }
+    }
+
+    if let Some(outcome) = value.get("terminal_outcome").and_then(Value::as_object) {
+        let _ = writeln!(out, "terminal outcome:");
+        for (key, member) in outcome {
+            let _ = writeln!(out, "  {key}: {}", cell_str(Some(member)));
+        }
+    }
+
+    let reasons = value
+        .get("contributing_reason_codes")
+        .and_then(Value::as_array)
+        .map(|codes| {
+            codes
+                .iter()
+                .map(|c| cell_str(Some(c)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    if !reasons.is_empty() {
+        let _ = writeln!(out, "contributing reasons: {reasons}");
+    }
+
+    let _ = writeln!(
+        out,
+        "last event: {} ({}s ago)",
+        cell_str(value.get("last_event_at")),
+        format_f64(value.get("last_event_age_seconds")),
+    );
+    let wait_set = cell_str(value.get("wait_set"));
+    match value.get("wait_set_reason").and_then(Value::as_str) {
+        Some(reason) => {
+            let _ = writeln!(out, "wait set:   {wait_set} ({reason})");
+        }
+        None => {
+            let _ = writeln!(out, "wait set:   {wait_set}");
+        }
+    }
+    out
 }
 
 fn usage_wants_table(cli: &Cli) -> bool {
@@ -6887,6 +6998,13 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
         )),
         WorkflowCommand::Awaitables { execution_id } => Ok(ApiRequest::get(format!(
             "/workflows/{}/awaitables",
+            path_segment(execution_id)
+        ))),
+        WorkflowCommand::Diagnose {
+            execution_id,
+            json: _,
+        } => Ok(ApiRequest::get(format!(
+            "/workflows/{}/diagnose",
             path_segment(execution_id)
         ))),
         WorkflowCommand::Tree {
@@ -11868,6 +11986,39 @@ mod completion_delivery_cli_tests {
     }
 
     #[test]
+    fn render_response_renders_the_diagnose_verdict_as_a_table() {
+        // Pins the WIRING, not just the formatter: deleting the dispatch arm in
+        // `render_response` would leave the formatter and predicate tests green
+        // while `harvest workflow diagnose` silently reverted to raw JSON.
+        let cli = parse(&["workflow", "diagnose", "exec-1"]);
+        let value = json!({
+            "execution_id": "exec-1",
+            "health": "stalled",
+            "summary": "no live worker is polling queue 'email'",
+            "blocked_on": { "type": "activity_no_worker", "queue": "email" },
+            "contributing_reason_codes": ["no_live_worker"],
+        });
+        let rendered = render_response(&cli, &value).expect("should render");
+        assert!(
+            rendered.contains("stalled"),
+            "expected the rendered verdict, got: {rendered}"
+        );
+        assert!(
+            serde_json::from_str::<Value>(&rendered).is_err(),
+            "the table renderer must not emit raw JSON, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_response_diagnose_json_flag_emits_the_raw_body() {
+        let cli = parse(&["workflow", "diagnose", "exec-1", "--json"]);
+        let value = json!({ "execution_id": "exec-1", "health": "stalled" });
+        let rendered = render_response(&cli, &value).expect("should render");
+        let parsed: Value = serde_json::from_str(&rendered).expect("--json must emit valid JSON");
+        assert_eq!(parsed["health"], "stalled");
+    }
+
+    #[test]
     fn render_response_applies_state_filter_only_for_completion_delivery_list() {
         let cli = parse(&[
             "completion-delivery",
@@ -11987,6 +12138,120 @@ mod usage_cli_tests {
         let json_cli = parse(&["usage", "--from", "24h", "--to", "1h", "--json"]);
         assert!(!usage_wants_table(&json_cli));
         assert!(usage_wants_raw_json(&json_cli));
+    }
+
+    #[test]
+    fn diagnose_flag_selects_table_vs_raw_json() {
+        let table_cli = parse(&["workflow", "diagnose", "exec-1"]);
+        assert!(diagnose_wants_table(&table_cli));
+        assert!(!diagnose_wants_raw_json(&table_cli));
+
+        let json_cli = parse(&["workflow", "diagnose", "exec-1", "--json"]);
+        assert!(!diagnose_wants_table(&json_cli));
+        assert!(diagnose_wants_raw_json(&json_cli));
+    }
+
+    #[test]
+    fn format_diagnose_verdict_renders_the_replay_derived_wait_kinds() {
+        // The renderer walks `blocked_on`'s members generically, so a newly
+        // added variant must surface with no CLI change. This pins that: a
+        // mutex park has to name the contended key an operator needs to find
+        // the holder.
+        let value = serde_json::json!({
+            "execution_id": "00000000-0000-0000-0000-000000000001",
+            "health": "blocked_external",
+            "summary": "parked on a durable mutex wait (ledger:42)",
+            "blocked_on": {
+                "type": "awaiting_replay_wait",
+                "wait_kind": "mutex",
+                "name": "ledger:42"
+            },
+            "wait_set": "replayed",
+        });
+        let rendered = format_diagnose_verdict(&value);
+        assert!(
+            rendered.contains("awaiting_replay_wait"),
+            "expected the verdict type, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("mutex") && rendered.contains("ledger:42"),
+            "expected the wait kind and contended key, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_diagnose_verdict_renders_the_workflow_task_verdicts() {
+        let value = serde_json::json!({
+            "execution_id": "00000000-0000-0000-0000-000000000001",
+            "health": "stalled",
+            "summary": "no live worker is polling workflow task queue 'orphan'",
+            "blocked_on": { "type": "workflow_no_worker", "queue": "orphan" },
+        });
+        let rendered = format_diagnose_verdict(&value);
+        assert!(
+            rendered.contains("workflow_no_worker") && rendered.contains("orphan"),
+            "expected the uncovered workflow queue, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_diagnose_verdict_surfaces_the_actionable_root_cause() {
+        // The headline case (#809 AC3): the operator must read the uncovered
+        // queue name off the rendered verdict without a `jq` pipeline.
+        let value = serde_json::json!({
+            "execution_id": "00000000-0000-0000-0000-000000000001",
+            "workflow_id": "order-42",
+            "workflow_name": "order_flow",
+            "state": "RUNNING",
+            "health": "stalled",
+            "blocked_on": {
+                "type": "activity_no_worker",
+                "queue": "typo-queue",
+                "activity_name": "charge_card"
+            },
+            "summary": "no live worker is polling queue 'typo-queue', so activity 'charge_card' will never be claimed",
+            "last_event_age_seconds": 903.5,
+            "last_event_at": "2026-01-01T00:00:00Z",
+            "contributing_reason_codes": ["no_live_worker"],
+            "wait_set": "not_consulted"
+        });
+        let rendered = format_diagnose_verdict(&value);
+        assert!(rendered.contains("health:    stalled"), "{rendered}");
+        assert!(
+            rendered.contains("blocked on: activity_no_worker"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("queue: typo-queue"), "{rendered}");
+        assert!(
+            rendered.contains("activity_name: charge_card"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("no_live_worker"), "{rendered}");
+        assert!(rendered.contains("order_flow"), "{rendered}");
+    }
+
+    #[test]
+    fn format_diagnose_verdict_renders_a_terminal_outcome_without_blocked_on() {
+        let value = serde_json::json!({
+            "execution_id": "00000000-0000-0000-0000-000000000002",
+            "workflow_id": "order-43",
+            "workflow_name": "order_flow",
+            "state": "FAILED",
+            "health": "terminal",
+            "summary": "execution reached terminal state FAILED — nothing to diagnose",
+            "last_event_age_seconds": 12.0,
+            "terminal_outcome": {"state": "FAILED", "error": "boom"},
+            "contributing_reason_codes": [],
+            "wait_set": "not_consulted"
+        });
+        let rendered = format_diagnose_verdict(&value);
+        assert!(rendered.contains("health:    terminal"), "{rendered}");
+        assert!(rendered.contains("terminal outcome:"), "{rendered}");
+        assert!(rendered.contains("error: boom"), "{rendered}");
+        assert!(
+            !rendered.contains("blocked on:"),
+            "a terminal verdict has no blocked_on to render: {rendered}"
+        );
     }
 
     #[test]

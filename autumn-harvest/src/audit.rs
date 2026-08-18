@@ -345,6 +345,10 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // Open-awaitables diagnostic (issue #615): read-only replay projection of
     // what an execution is parked on; appends no events, performs no writes.
     ("GET /workflows/{id}/awaitables", RouteClass::ReadOnly),
+    // Per-execution stall diagnosis (issue #809): read-only root-cause verdict
+    // for a single stuck run. Reads only the owning shard; appends no events,
+    // performs no task-queue mutation.
+    ("GET /workflows/{id}/diagnose", RouteClass::ReadOnly),
     ("GET /workflows/{id}/run-chain", RouteClass::ReadOnly),
     // Single-execution replay diagnosis (issue #614): POST for the replay action
     // but read-only (appends no events, performs no writes, no audit trail).
@@ -806,6 +810,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /workflows/{id}/timeline",
     "GET /workflows/{id}/logs",
     "GET /workflows/{id}/awaitables",
+    "GET /workflows/{id}/diagnose",
     "GET /workflows/{id}/run-chain",
     "POST /workflows/{id}/replay-diagnosis",
     "GET /workflows/{id}/query/{query_name}",
@@ -941,6 +946,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workflows/{id}/logs", None),
     // Issue #615: read-only, no audit operation.
     ("GET /workflows/{id}/awaitables", None),
+    // Issue #809: read-only, no audit operation.
+    ("GET /workflows/{id}/diagnose", None),
     ("GET /workflows/{id}/run-chain", None),
     // Issue #614: read-only, no audit operation.
     ("POST /workflows/{id}/replay-diagnosis", None),
@@ -1822,6 +1829,35 @@ mod tests {
         assert!(
             EXCLUDED_ROUTES.contains(&route),
             "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #615)"
+        );
+    }
+
+    #[test]
+    fn diagnose_route_is_classified_read_only() {
+        // The per-execution stall diagnosis endpoint (issue #809) resolves the
+        // owning shard from the ExecutionId and reads only that shard: it
+        // appends no WorkflowEvent, performs no task-queue mutation, and adds
+        // no migration, so it is safe to call repeatedly. Pinned here (not only
+        // via the general exhaustiveness guards, which cross-check
+        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other rather
+        // than against the live router) so dropping it from BOTH lists at once
+        // is caught.
+        let route = "GET /workflows/{id}/diagnose";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+            "{route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #809)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && op.is_none()),
+            "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (issue #809)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&route),
+            "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #809)"
         );
     }
 

@@ -2,6 +2,64 @@
 
 Use this runbook when an alert fires indicating that tasks are sitting in `PENDING` state on a queue while connected workers appear idle.
 
+> **Start here for a single wedged run: `GET /workflows/{exec_id}/diagnose`.**
+> Issue #809 collapses the correlation this runbook otherwise walks you through
+> — the pending stack, per-queue worker liveness, the circuit registry,
+> rate-limit / concurrency saturation, queue pauses, and the task row's own
+> retry timing — into **one** admin-gated, read-only call that names the actual
+> root cause:
+>
+> ```bash
+> harvest workflow diagnose <exec-id>            # human-readable verdict
+> harvest workflow diagnose <exec-id> --json     # raw body
+> curl -s "$HARVEST/api/harvest/workflows/$EXEC/diagnose" | jq .
+> ```
+>
+> The response leads with a one-word `health` (`healthy` | `stalled` |
+> `blocked_external` | `terminal`) and a discriminated `blocked_on` object:
+>
+> | `blocked_on.type` | `health` | What to do |
+> |---|---|---|
+> | `activity_no_worker` | `stalled` | **No live worker can run this row.** For a *pending* row that means nothing `Active` can claim it — deploy/scale a worker for `queue`, or fix the queue name (a `Draining` worker claims nothing new, so a drain-only fleet reports this too). For an *already-held* row it means the recorded claimant itself is gone — a poison-pill orphan (#367) a peer cannot pick up. Coverage is not the whole claim predicate: the row's required build (#171/#604), required capabilities (#804) and session pin (#606) are each checked against the *same* worker, so a well-covered queue can still report this. If the row predates capability snapshotting (a legacy or manual enqueue with no `required_capabilities`), the **registered** activity's `requires` still gates it — compare the activity's `#[activity(requires = "...")]` against your workers' labels. Cross-check with `GET /admin/queue-coverage` (#774) and `GET /admin/queues/{queue}/eligibility` (#611). |
+> | `activity_circuit_open` | `stalled` when `phase` is `open`, `healthy` when `half_open` | The breaker for `activity_name` is open until `cooldown_until`. Read `phase` first: `half_open` means a probe is admitted **right now** and the breaker closes on success — no operator action, so the run is reported `healthy`. `open` with a `cooldown_until` self-heals at that instant; `open` with the field **absent** was operator-forced, admits no timed probe, and needs an explicit `force-close`. **Multi-replica caveat:** the breaker registry is in-process (one per worker process), so this verdict is only reported when the API replica's own co-located worker is the *sole* worker that could claim the task. In a multi-replica fleet a peer's breaker may be closed and still dispatch the work, so the endpoint deliberately declines to report a fleet-wide block — use `GET /admin/circuits` on each replica to see every breaker's real phase. See `docs/runbooks/activity-circuit-breaker.md`. |
+> | `workflow_no_worker` | `stalled` | **No live worker polls the queue the run's own decision cycle sits on.** Nothing individual is wedged — the workflow task itself can never be claimed. Also covers a claim left behind by a crashed worker (a poison-pill orphan, #367) and a task deferred to a future `scheduled_at` that nothing will claim when it arrives. Same remedy as `activity_no_worker`, applied to the workflow queue. |
+> | `no_pending_work` | `stalled` | A `RUNNING` run with nothing pending and a *parked* workflow task — executor loss / lost task. Consider a redrive. |
+> | `activity_retrying` | `healthy` | Backing off; `last_error` says why, `next_attempt_at` says when. |
+> | `activity_deferred` | `healthy` | Pushed forward by the dispatcher with **no failure recorded** — a dispatch-time rate-limit deferral (#699/#369), session capacity (#606), or a capability-miss redelivery (#804). Distinct from `activity_retrying`: nothing failed, so do not go hunting an error. |
+> | `activity_rate_limited` / `activity_concurrency_deferred` | `healthy` | Deliberately paced by `key`. Raise the limit or wait. |
+> | `activity_rate_limit_bucket_missing` | `stalled` | **The rate-limit bucket `key` has no row at all**, so the claim gate's `EXISTS(bucket >= 1.0)` refuses the task *forever* — nothing refills a row that does not exist. Distinct from `activity_rate_limited`, which self-heals. Reachable when the bucket's auto-registration failed, the row was deleted, or startup skipped it as an invalid config. Check `GET /admin/rate-limits` for `key`; re-register the bucket or remove the activity's rate limit. |
+> | `activity_queue_paused` | `blocked_external` | An operator paused `queue` (#619). Resume it. |
+> | `activity_paused` | `blocked_external` | An operator paused activity type `activity_name` (#807). It is held on every queue on this shard. Resume it. |
+> | `sleeping_timer` | `healthy` | A durable sleep until `fires_at` — **not** a stall, however old the last event is. Reported only when the run's own workflow task is actually claimable: a timer fires when a worker claims that task, so a paused or pollerless workflow queue reports `workflow_queue_paused` / `workflow_no_worker` instead. |
+> | `timer_overdue` | `stalled` | A timer was due at `fires_at` (`overdue_by_seconds` ago), nothing fired it, **and that timer owned the run's wake** (the workflow task is `PENDING` long past its own `scheduled_at`). Timers fire only when a worker claims the owning workflow task, so this is a lost-task wedge — same remedy as `no_pending_work`. A timer armed alongside another wait (an external handoff, a child, a signal) does *not* own the wake and is reported under that wait instead, so an overdue row there is expected, not a stall. |
+> | `pending_child` | `healthy` | Waiting on `child_exec_id`; diagnose *that* id next. |
+> | `awaiting_signal` / `awaiting_external_handoff` | `blocked_external` | Waiting on an external party. Nothing engine-side is wrong. |
+> | `workflow_queue_paused` | `blocked_external` | An operator paused the queue the run's own decision cycle sits on (#619). Resume it. Outranks every timer verdict, because a held queue stops the claim that would fire the timer. |
+> | `workflow_no_worker` | `stalled` | Nothing polls the queue the run's own decision cycle sits on. Start a worker for `queue`. Like the pause above, this outranks a timer verdict — an unclaimable task can never fire its timer. |
+> | `awaiting_replay_wait` | `blocked_external` | Parked on a durable wait that leaves no side-table row — `wait_kind` names which: `condition` (a `ctx.await_condition` park), `mutex` (#691 — `name` is the contended key; find the holder), `update`, or `external_workflow`. Only the replay-derived wait set can see these, so `wait_set` will read `replayed`. |
+> | `paused` | `blocked_external` | Operator-paused (#383); resume when ready. |
+> | `non_determinism_blocked` | `stalled` | **Replay diverged and the engine blocked the run (#603) rather than failing it.** `reason` is the recorded divergence, `since` when it was first blocked and `block_count` how many times it has re-fired. The run re-pends its workflow task on a capped-exponential backoff **indefinitely**, so by row shape alone it is identical to a healthy deferral. Roll the divergent build back (or forward-fix it) — see `docs/runbooks/nondeterminism-block.md`. Outranks every side-table cause, because the block re-fires on every decision cycle whatever those rows are doing; the activities' own impediments still appear in `contributing_reason_codes`. |
+> | `healthy_in_progress` | `healthy` | Genuinely running — an activity in flight, or the run's own decision cycle claimed by a live worker or awaiting dispatch on a covered queue. |
+>
+> `contributing_reason_codes` lists **every** claim-time impediment on the
+> diagnosed activity, not just the highest-precedence one — so a task that is
+> both rate-limited *and* on a paused queue shows both. In a fan-out the
+> **worst** slot wins, so one wedged slot among nineteen healthy ones is never
+> masked. `no_live_worker` is the one code that is not a claim-time gate, so it
+> also appears for a row a worker already **holds** — but it asks the same
+> question the verdict does: an in-flight row is judged on whether its own
+> recorded claimant is alive (a gracefully-draining worker still counts, since
+> it is finishing exactly that row), not on whether some *other* worker could
+> claim new work. So the codes never contradict `health`: a row held by a live
+> draining claimant reads `healthy` with no `no_live_worker`, and an orphan
+> whose claimant is gone reads `stalled` **with** it even when a healthy Active
+> peer covers the queue.
+>
+> The endpoint is read-only: it appends no events, mutates no task-queue row,
+> and never advances a circuit breaker's phase, so it is safe to poll. Reach for
+> the per-endpoint triage below when you need the raw underlying detail, or when
+> you are diagnosing a **queue** rather than a single execution.
+
 > **First check for a heartbeating activity.** Before assuming an activity is
 > stalled, confirm it is actually stuck rather than just slow. Call
 > `GET /workflows/{exec_id}/stack` and read the activity's
