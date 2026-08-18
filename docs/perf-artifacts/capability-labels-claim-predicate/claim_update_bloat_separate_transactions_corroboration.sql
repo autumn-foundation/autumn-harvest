@@ -55,6 +55,19 @@
 --   (cd autumn-harvest && diesel migration run)
 --   psql "$DATABASE_URL" -f docs/perf-artifacts/capability-labels-claim-predicate/claim_update_bloat_separate_transactions_corroboration.sql
 --
+-- A follow-up review finding on PR #1192 (against an earlier revision of
+-- this script) correctly caught that the "floor, not a ceiling" claim in
+-- the doc -- i.e. that this five-run, 100,000-claim reproduction reflects
+-- opportunistic HOT pruning alone, with zero background autovacuum
+-- reclamation -- was asserted in prose without this script itself ever
+-- sampling `pg_stat_user_tables.autovacuum_count`, so a regenerated
+-- artifact had no way to verify or falsify it. The two `SELECT`s
+-- immediately before and after the `CALL` below close that gap: they
+-- capture harvest_task_queue's own autovacuum_count directly in this
+-- script's output, so every regeneration of this artifact carries its own
+-- proof (or disproof) of the "opportunistic-pruning-only floor" claim
+-- inline, rather than relying on an out-of-band manual check.
+--
 -- pg_relation_size is a pure catalog/storage read, not an EXPLAIN estimate
 -- -- admissible evidence under this repo's performance-measurement
 -- discipline (docs/performance.md). No VACUUM runs between the pre- and
@@ -168,7 +181,34 @@ BEGIN
 END;
 $body$ LANGUAGE plpgsql;
 
+-- autovacuum_count on harvest_task_queue immediately BEFORE the five-run
+-- loop below. This and the matching "after" query following the CALL are
+-- the direct, regenerable evidence for the "opportunistic-pruning-only
+-- floor" claim in docs/performance-capability-labels.md -- if autovacuum
+-- has fired against this table at all (even once, for any reason, at any
+-- point up to this line), autovacuum_count_before will already be > 0 and
+-- the floor claim does not hold for this run.
+SELECT 'autovacuum_count_before' AS label, autovacuum_count
+FROM pg_stat_user_tables
+WHERE relname = 'harvest_task_queue';
+
 CALL run_separate_txn_claim_bloat(5, 10000);
+
+-- autovacuum_count on harvest_task_queue immediately AFTER the five-run
+-- loop. TRUNCATE does not reset this counter (it resets the table's
+-- storage/relfilenode, not the cumulative pg_stat_user_tables row for the
+-- relation's OID), so this value is directly comparable to the "before"
+-- value above and reflects every autovacuum run against this table across
+-- all ten TRUNCATE+seed+claim cycles (5 runs x 2 variants) inside the
+-- CALL. If it equals autovacuum_count_before, zero background autovacuum
+-- activity occurred during the measured loop and every byte of space
+-- reclaimed above came solely from opportunistic HOT pruning triggered
+-- in-line by the claim loop's own commits -- confirming the floor claim
+-- for this run. If it is greater, the floor claim does not hold and the
+-- measured range above may include background-autovacuum reclamation.
+SELECT 'autovacuum_count_after' AS label, autovacuum_count
+FROM pg_stat_user_tables
+WHERE relname = 'harvest_task_queue';
 
 -- Per-run detail, as captured.
 SELECT run_no, variant, before_pages, after_pages,

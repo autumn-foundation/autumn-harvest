@@ -260,18 +260,23 @@ artifact computed by hand from five separate invocations that the
 documented single-command reproduction procedure could not itself
 regenerate; it is now fully self-contained). Run this way -- five claim
 passes back to back inside one long-lived session, with no gap between
-them -- it costs 48-49 heap pages of growth when the rows carry no
-capability requirements and 51-52 pages when they do, **+6.1% to +8.3%
-more heap growth from the identical claim operation** (mean ~+7.5% across
-the five runs), purely from carrying the wider payload forward into the
-new tuple version.
+them -- it costs 48 heap pages of growth when the rows carry no
+capability requirements and 52 pages when they do, **identically across
+all five runs**, i.e. **+8.3% more heap growth from the identical claim
+operation**, purely from carrying the wider payload forward into the new
+tuple version.
 
-That figure is a **floor**, not a ceiling, on the effect: `pg_stat_user_tables.autovacuum_count`
-was checked immediately before and immediately after a full run of this
-script and never incremented, confirming that PostgreSQL's background
-autovacuum worker gets no opportunity to run at all during this tight,
-uninterrupted execution -- every byte of space reclaimed here comes solely
-from *opportunistic* HOT pruning triggered in-line by the claim loop's own
+That figure is a **floor**, not a ceiling, on the effect, and this script
+now captures the direct evidence for that claim in its own output rather
+than relying on an out-of-band manual check (a gap review on PR #1192
+correctly flagged in an earlier revision of this script): the two
+`SELECT`s bracketing the `CALL` sample `pg_stat_user_tables.autovacuum_count`
+for `harvest_task_queue` immediately before and immediately after the
+five-run, 100,000-claim loop, and both read **0** in the committed
+artifact -- confirming that PostgreSQL's background autovacuum worker got
+no opportunity to run at all during this tight, uninterrupted execution.
+Every byte of space reclaimed here therefore comes solely from
+*opportunistic* HOT pruning triggered in-line by the claim loop's own
 commits, the minimum reclaim mechanism any separately-committed claim
 sequence gets for free with zero background assistance.
 
@@ -310,11 +315,11 @@ That older figure is no longer independently reproducible by the current
 single-invocation script (which completes far too quickly in one
 continuous session for any background process to plausibly intervene) and
 its cause is unverified, so it is retained here only as an unexplained
-historical data point -- it is **not** combined with the verified range
-below for any derived calculation on this page (see the corrected
-multiplier a few paragraphs down, which now uses the +6.1% to +8.3% range
-alone). The reproducible, evidence-backed headline for this section is the
-+6.1% to +8.3% (mean ~+7.5%) figure above.
+historical data point -- it is **not** combined with the verified figure
+above for any derived calculation on this page (see the corrected
+multiplier a few paragraphs down, which now uses the +8.3% figure alone).
+The reproducible, evidence-backed headline for this section is the +8.3%
+figure above.
 
 A second, deliberately **non**-representative shape applies all 10,000
 claims as a single set-based `UPDATE` inside one transaction (artifacts:
@@ -333,10 +338,10 @@ real -- it is the worst case a batch operation touching many rows inside
 one explicit transaction (a mass backfill, a migration script, an admin
 tool) would see -- but it is not representative of the per-claim
 production path this design actually adds cost to, overstating that cost
-by roughly 4.5x-6.2x (37.6% divided by the +6.1% to +8.3% verified
-separate-transaction range measured above -- the older, unverified +9.1%
-to +15.7% figure is deliberately excluded from this calculation, per the
-review finding discussed above).
+by roughly 4.5x (37.6% divided by the +8.3% verified separate-transaction
+figure measured above -- the older, unverified +9.1% to +15.7% figure is
+deliberately excluded from this calculation, per the review finding
+discussed above).
 The separate-transaction measurement above is this section's headline
 figure; the bulk-transaction one is included only as an explicitly-scoped
 upper bound.

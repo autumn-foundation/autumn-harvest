@@ -1,12 +1,22 @@
 Timing is off.
 CREATE TABLE
 CREATE PROCEDURE
+          label          | autovacuum_count 
+-------------------------+------------------
+ autovacuum_count_before |                0
+(1 row)
+
 CALL
+         label          | autovacuum_count 
+------------------------+------------------
+ autovacuum_count_after |                0
+(1 row)
+
  run_no |      variant      | before_pages | after_pages | delta_pages 
 --------+-------------------+--------------+-------------+-------------
       1 | capability-labels |          304 |         356 |          52
-      1 | no-caps           |          213 |         262 |          49
-      2 | capability-labels |          304 |         355 |          51
+      1 | no-caps           |          213 |         261 |          48
+      2 | capability-labels |          304 |         356 |          52
       2 | no-caps           |          213 |         261 |          48
       3 | capability-labels |          304 |         356 |          52
       3 | no-caps           |          213 |         261 |          48
@@ -18,7 +28,7 @@ CALL
 
  runs | no_caps_delta_min | no_caps_delta_max | caps_delta_min | caps_delta_max | extra_pct_min | extra_pct_max | extra_pct_mean 
 ------+-------------------+-------------------+----------------+----------------+---------------+---------------+----------------
-    5 |                48 |                49 |             51 |             52 |           6.1 |           8.3 |            7.5
+    5 |                48 |                48 |             52 |             52 |           8.3 |           8.3 |            8.3
 (1 row)
 
 TRUNCATE TABLE
