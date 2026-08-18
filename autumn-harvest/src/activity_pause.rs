@@ -795,7 +795,7 @@ pub async fn pause_activity(
     paused_by: &str,
     scope_shard_id: Option<i32>,
 ) -> HarvestResult<ActivityPauseOutcome> {
-    use diesel_async::{AsyncConnection, RunQueryDsl};
+    use diesel_async::RunQueryDsl;
 
     let name = validate_activity_name(activity_name)?;
     let reason = reason.to_string();
@@ -808,8 +808,18 @@ pub async fn pause_activity(
     // fleet-wide, and the operator sees a 500 and concludes the hold did not
     // take. That is the worst possible failure mode for an incident brake, and
     // the count is the statement most likely to be slow on a large backlog.
+    // Pinned to READ COMMITTED for the same reason as `resume_activity`, and
+    // for one specific to this path: the held count below is read *before* the
+    // upsert, and under `REPEATABLE READ` it would be answered from a snapshot
+    // taken before this transaction waited on any concurrent resume -- reporting
+    // a backlog that no longer exists. Postgres can also abort the upsert
+    // outright with a serialization failure when `ON CONFLICT` lands on a row a
+    // concurrent resume touched after that snapshot, turning an idempotent
+    // re-pause into a 500. Both are invisible to this code when the level is
+    // inherited from the database or the role, so it is emitted on the `BEGIN`.
+    let mut tx = conn.build_transaction().read_committed();
     Box::pin(
-        conn.transaction::<ActivityPauseOutcome, HarvestError, _>(async |conn| {
+        tx.run::<ActivityPauseOutcome, HarvestError, _>(async |conn| {
             let (name, reason, paused_by) = (name, reason, paused_by);
 
             // The count runs FIRST, before the row that records the hold (issue
@@ -925,11 +935,33 @@ pub async fn resume_activity(
     conn: &mut AsyncPgConnection,
     activity_name: &str,
 ) -> HarvestResult<ActivityResumeOutcome> {
-    use diesel_async::{AsyncConnection, RunQueryDsl};
+    use diesel_async::RunQueryDsl;
 
     let name = validate_activity_name(activity_name)?;
+    // Pinned to READ COMMITTED rather than inheriting the session default.
+    //
+    // Every statement below depends on taking a FRESH snapshot. The primary
+    // shift, the doorbell and the late-arrivals credit exist precisely to catch
+    // rows that became visible after this transaction began: a task enqueued
+    // during the hold, or one enqueued before it whose insert only committed
+    // just now. Under `REPEATABLE READ` the whole transaction shares the
+    // snapshot taken at its first statement (the `DELETE` below), so such a row
+    // is invisible to *every* later statement and the late-arrivals pass is
+    // structurally inert. That task keeps its entire held wait, and the
+    // `schedule_to_start` scanner can terminally fail it the instant the hold
+    // lifts -- the exact outcome the credit exists to prevent.
+    //
+    // Inheriting the level would let a `default_transaction_isolation =
+    // repeatable read` set on the database or the role silently disable that
+    // guarantee from outside this code. `build_transaction().read_committed()`
+    // emits the level on the `BEGIN` itself, so it travels with the query. This
+    // mirrors `queue_pause::resume_queue`, `queue::claim_task`, the timeout
+    // enforcer and the scheduler, which all pin it for the same reason (issue
+    // #807 review, Codex P1). Pinned by
+    // `resume_credits_a_late_arrival_under_a_repeatable_read_session_default`.
+    let mut tx = conn.build_transaction().read_committed();
     Box::pin(
-        conn.transaction::<ActivityResumeOutcome, HarvestError, _>(async |conn| {
+        tx.run::<ActivityResumeOutcome, HarvestError, _>(async |conn| {
             let name = name;
             let deleted: Vec<DeletedPauseRow> = diesel::sql_query(delete_activity_pause_query())
                 .bind::<diesel::sql_types::Text, _>(&name)

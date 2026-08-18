@@ -1288,3 +1288,139 @@ async fn pause_stamps_paused_at_after_the_backlog_count_not_at_transaction_start
         BLOCK.as_secs_f64()
     );
 }
+
+// ── Isolation level ───────────────────────────────────────────────────────────
+
+/// Block until a backend is genuinely waiting on **`holder`'s** lock.
+///
+/// Scoped to the holder's pid *and* the current database on purpose: an
+/// unscoped `cardinality(pg_blocking_pids(pid)) > 0` is satisfied by any
+/// blocked backend anywhere on the cluster — including a concurrent suite on a
+/// shared test Postgres — which would let this test pass vacuously.
+async fn wait_until_blocked_on(conn: &mut AsyncPgConnection, holder: i32) {
+    use diesel_async::RunQueryDsl;
+    #[derive(diesel::QueryableByName)]
+    struct Blocked {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    for _ in 0..600 {
+        let blocked: Blocked = diesel::sql_query(
+            "SELECT count(*) AS n FROM pg_stat_activity \
+             WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind::<diesel::sql_types::Integer, _>(holder)
+        .get_result(conn)
+        .await
+        .expect("probe pg_stat_activity");
+        if blocked.n > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the resume never blocked on the held pause row");
+}
+
+/// The resume must run at `READ COMMITTED` even when the session default is
+/// `REPEATABLE READ`.
+///
+/// The resume's correctness rests on each statement taking a **fresh** snapshot:
+/// the primary shift and the late-arrivals credit exist precisely to catch rows
+/// that became visible after the transaction began. Under `REPEATABLE READ` the
+/// whole transaction shares the snapshot taken at its first statement, so a task
+/// committed after that point is invisible to *every* later statement — the
+/// late-arrivals pass becomes structurally inert. That task keeps its entire
+/// held wait, and the `schedule_to_start` scanner can terminally fail it the
+/// instant the hold lifts.
+///
+/// Inheriting the level would let a `default_transaction_isolation = repeatable
+/// read` set on the database or the role silently disable the guarantee from
+/// outside this code, so `resume_activity` pins it on the `BEGIN` itself. This
+/// mirrors `queue_pause::resume_queue`, `queue::claim_task`, the timeout
+/// enforcer and the scheduler, which all pin it for the same fresh-snapshot
+/// reason (issue #807 review, Codex P1).
+///
+/// The lock is what makes this deterministic rather than a sleep race: the
+/// resume's first statement is the pause-row `DELETE`, so holding that row
+/// blocks the resume *after* it has taken its snapshot, giving an exact window
+/// to commit the late arrival in.
+#[tokio::test]
+async fn resume_credits_a_late_arrival_under_a_repeatable_read_session_default() {
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    let mut resumer = connect(&url).await;
+    let mut locker = connect(&url).await;
+
+    let q = unique("q_rr");
+    let activity = unique("act_rr");
+
+    // A pre-existing held task, so the resume has real work to do either way.
+    let early = enqueue_activity(&mut conn, &q, &activity, None).await;
+    backdate_scheduled_at(&mut conn, early, 100).await;
+    assert!(pause(&mut conn, &activity).await);
+    backdate_paused_at(&mut conn, &activity, 100).await;
+
+    // The session default an operator can set on the database or the role.
+    resumer
+        .batch_execute("SET default_transaction_isolation = 'repeatable read'")
+        .await
+        .expect("set the session isolation default");
+
+    // Hold the pause row so the resume blocks on its very first statement.
+    locker
+        .batch_execute(&format!(
+            "BEGIN; SELECT 1 FROM harvest_activity_pauses \
+             WHERE activity_name = '{activity}' FOR UPDATE"
+        ))
+        .await
+        .expect("hold the pause row");
+    let holder_pid = {
+        use diesel_async::RunQueryDsl;
+        #[derive(diesel::QueryableByName)]
+        struct Pid {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            pid: i32,
+        }
+        let row: Pid = diesel::sql_query("SELECT pg_backend_pid() AS pid")
+            .get_result(&mut locker)
+            .await
+            .expect("read holder pid");
+        row.pid
+    };
+
+    let activity_for_resume = activity.clone();
+    let resume = tokio::spawn(async move {
+        activity_pause::resume_activity(&mut resumer, &activity_for_resume).await
+    });
+
+    // ── THE WINDOW ──────────────────────────────────────────────────────────
+    // The resume has taken its snapshot and is now blocked on the pause row.
+    wait_until_blocked_on(&mut conn, holder_pid).await;
+    let late = enqueue_activity(&mut conn, &q, &activity, None).await;
+    backdate_scheduled_at(&mut conn, late, 100).await;
+
+    locker.batch_execute("COMMIT").await.expect("release");
+
+    let outcome = resume
+        .await
+        .expect("join the resume")
+        .expect("resume succeeds");
+    assert!(outcome.newly_resumed, "the resume released a real hold");
+
+    // Both must be credited: a task that carries its held wait past the thaw is
+    // exactly what the schedule_to_start scanner terminally fails.
+    for (id, label) in [(early, "pre-existing"), (late, "late-arriving")] {
+        let wait = (chrono::Utc::now() - scheduled_at_of(&mut conn, id).await).num_seconds();
+        assert!(
+            wait <= 2,
+            "the {label} task must be credited for the held time even when the \
+             session default is REPEATABLE READ; apparent wait {wait}s"
+        );
+    }
+
+    assert_eq!(
+        claim_all(&mut conn, &q).await.len(),
+        2,
+        "the whole backlog is claimable again after the thaw"
+    );
+}
