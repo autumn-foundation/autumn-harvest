@@ -9,9 +9,19 @@ turned up a realistic adversarial input shape it regresses. The shipped
 outcome is the pure extraction (`group_dead_letter_rows` as a `pub`,
 DB-free function) plus this documented negative result — no algorithmic
 change landed. Wall-clock timing is not admissible evidence on this
-(shared-vCPU) machine — every number below is a deterministic instruction
-or allocation count from `valgrind --tool=callgrind` / `valgrind
---tool=dhat`, reproducible bit-for-bit on any machine.
+(shared-vCPU) machine — every number below is an instruction or
+allocation count from `valgrind --tool=callgrind` / `valgrind
+--tool=dhat`, chosen because it measures work actually done rather than
+scheduler noise. It is **not** bit-for-bit reproducible run-to-run: both
+this harness's own row-construction map and `group_dead_letter_rows`'s
+internal grouping `HashMap` use `std::collections::HashMap`'s
+randomly-seeded `RandomState`, so bucket layout differs across process
+invocations even with byte-identical inputs, code, and binary. Ten
+repeated runs of the identical binary measured Ir in a
+`282,474,199..=282,531,788` band (~0.02% spread) — see "Post-revert
+harness hardening" below for the full measurement. Every delta reported
+in this document is ~250x that noise floor, so it does not change any
+conclusion here.
 
 ## Workload
 
@@ -321,8 +331,42 @@ document — the metadata-sizing fix only reduces *unreachable* allocation,
 and the `reps` guard only rejects a configuration that would have measured
 nothing at all.
 
-None of the seven changes touch `dlq.rs` or the grouping algorithm being
-profiled — they only affect how the harness constructs its synthetic rows.
+A **fifth** review pass questioned the "reproducible bit-for-bit on any
+machine" framing in the opening paragraph itself:
+
+8. **Callgrind Ir counts are not bit-for-bit reproducible.** Both this
+   harness's own `exec_names`/`workflow_names` lookup map (built in
+   `build_rows`) and `group_dead_letter_rows`'s internal `groups: HashMap`
+   use `std::collections::HashMap`'s default, randomly-seeded
+   `RandomState` — a fresh seed per process, so bucket placement and
+   probe-chain length for the same keys differ across invocations even
+   with byte-identical inputs, code, and binary. Verified empirically: 10
+   repeated runs of the identical compiled binary under `valgrind
+   --tool=callgrind --branch-sim=no --cache-sim=no` (default config,
+   `DLQ_PROFILE_N=20000 DLQ_PROFILE_GROUPS=25`) measured `I refs:` in a
+   `282,474,199..=282,531,788` band — a ~57,600-instruction, ~0.02%
+   spread around the 282,474,254 figure reported above. This is real, but
+   it does not call any conclusion in this document into question: it is
+   ~250x below the process's 5% impact floor and ~250–300x below every
+   delta actually reported here (4.49%–6.34%, and the +5.24%
+   harness-hardening shift two sections above) — none of those deltas
+   could plausibly be an artifact of this noise. No code changed for this
+   finding. `dlq.rs`'s hasher choice is production API surface — an
+   architectural change out of scope for a PR whose entire point is a
+   clean revert — and seeding only this harness's own map would not have
+   eliminated the variance anyway: roughly half of it originates inside
+   `group_dead_letter_rows` itself, the function under test, which this
+   document deliberately profiles unmodified. Instead the opening
+   paragraph and the "Reproduce" section are corrected to describe
+   *stable within measurement noise* rather than *bit-for-bit
+   reproducible* — the reason the process treats Callgrind Ir as
+   admissible-but-not-exact evidence and requires a percentage floor on
+   the delta, rather than treating any two individual run outputs as
+   comparable to the last digit.
+
+None of the eight findings changed `dlq.rs` or the grouping algorithm
+being profiled — findings 1–7 only affect how the harness constructs its
+synthetic rows, and finding 8 changed only this document's language.
 Re-running the **default** (hit-heavy) workload against the hardened
 harness, with `dlq.rs` still in its current, unchanged `entry()` form:
 
@@ -345,24 +389,30 @@ exactly one hash+probe pass per row while `get_mut`-then-`insert` pays two
 on a miss is a pure property of `std::collections::HashMap`'s API, not of
 this harness's row-construction cost. The historical numbers above are left
 as originally measured and are the ones that motivated the actual
-optimize → review → revert decision; `Reproduce` below now yields the
-hardened-harness number for the default config.
+optimize → review → revert decision; `Reproduce` below now yields an Ir
+count within run-to-run noise (see "Post-revert harness hardening",
+point 8) of the hardened-harness number for the default config.
 
 ## What shipped
 
 - `AggregateRow` made `pub`; `group_dead_letter_rows` extracted from
   `aggregate_dead_letters` as a pure, DB-free `pub fn` — no behavior
   change, callers see byte-identical output.
-- `benches/dlq_aggregate_profile.rs`, a deterministic profiling harness for
-  the extracted function, hardened per "Post-revert harness hardening"
-  above across four review passes (guaranteed `DLQ_PROFILE_GROUPS`
-  cardinality for any group count; a real typed-failure envelope for the
-  `CircuitOpen` row; a malformed or non-Unicode env value rejected as a
-  configuration error instead of silently substituting the default;
-  `DLQ_PROFILE_GROUPS=0` and `DLQ_PROFILE_REPS=0` both rejected with a
-  clear message instead of an opaque panic or a silently-empty
-  "successful" run; setup metadata sized to the reachable group set
-  instead of the raw, possibly-enormous requested `DLQ_PROFILE_GROUPS`).
+- `benches/dlq_aggregate_profile.rs`, a profiling harness for the
+  extracted function (Ir counts stable to within ~0.02% run-to-run noise,
+  not bit-for-bit deterministic — see "Post-revert harness hardening",
+  point 8), hardened per that section above across five review passes
+  (guaranteed `DLQ_PROFILE_GROUPS` cardinality for any group count; a
+  real typed-failure envelope for the `CircuitOpen` row; a malformed or
+  non-Unicode env value rejected as a configuration error instead of
+  silently substituting the default; `DLQ_PROFILE_GROUPS=0` and
+  `DLQ_PROFILE_REPS=0` both rejected with a clear message instead of an
+  opaque panic or a silently-empty "successful" run; setup metadata sized
+  to the reachable group set instead of the raw, possibly-enormous
+  requested `DLQ_PROFILE_GROUPS`; the "reproducible bit-for-bit"
+  framing itself corrected after measuring genuine `HashMap`-seed-driven
+  run-to-run Ir variance and confirming it is ~250x below the impact
+  floor).
 - This documented negative result, so the `get_mut`-first idea (and its
   adversarial-workload cost) is not silently re-attempted later.
 - **No algorithmic change to `group_dead_letter_rows`'s grouping loop** —

@@ -1,14 +1,20 @@
-//! Deterministic (non-criterion) instruction/allocation-count profiling
-//! harness for `dlq::group_dead_letter_rows` -- the in-memory grouping core
-//! behind `GET /api/harvest/dead-letters/aggregate` (issue #385) and its
+//! Non-criterion instruction/allocation-count profiling harness for
+//! `dlq::group_dead_letter_rows` -- the in-memory grouping core behind
+//! `GET /api/harvest/dead-letters/aggregate` (issue #385) and its
 //! cause-targeted follow-up (issue #613).
 //!
 //! Wall-clock timing is unreliable on this (shared-vCPU) machine, so this
 //! binary is not measured with `cargo bench` / criterion timing. It is
 //! driven directly under `valgrind --tool=callgrind` (instruction counts)
-//! and `valgrind --tool=dhat` (allocation counts/bytes), which are
-//! deterministic across runs. See `docs/performance-dlq-aggregate.md` for
-//! the numbers this produces and how to reproduce them.
+//! and `valgrind --tool=dhat` (allocation counts/bytes) instead -- a
+//! direct single-process measurement rather than a statistical sample, but
+//! **not** bit-for-bit reproducible run-to-run: this file's own lookup map
+//! and `group_dead_letter_rows`'s internal grouping map both use
+//! `std::collections::HashMap`'s randomly-seeded `RandomState`, so
+//! instruction counts vary by roughly 0.02% between runs (measured; see
+//! `docs/performance-dlq-aggregate.md`'s "Post-revert harness hardening",
+//! point 8). See that document for the numbers this produces and how to
+//! reproduce them.
 //!
 //! `harness = false`, own `main()` -- same shape as `replay_profile.rs` /
 //! `verify_profile.rs` / `schema_validate_profile.rs` / `det_check_profile.rs`
