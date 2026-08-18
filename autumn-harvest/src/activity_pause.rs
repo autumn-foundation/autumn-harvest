@@ -339,6 +339,46 @@ pub async fn release_claim_if_activity_paused(
 /// the *safe* direction — over-crediting past commit time would push
 /// `scheduled_at` into the future and make the task **un**claimable.
 ///
+/// # Overlapping queue and activity holds over-credit, deliberately
+///
+/// A task can be held by BOTH its queue (#619) and its activity type at once,
+/// and each resume path applies this same *relative* shift with no knowledge of
+/// the other, so the overlap is credited twice. A task scheduled at `t=0` held
+/// by both from `t=100`, resumed at `t=200` and then `t=300`, ends with
+/// `scheduled_at = 300` where the union-correct value is `200` — erasing 100 s
+/// of genuine pre-pause wait and handing it a fresh `schedule_to_start` budget.
+///
+/// That is bounded, and it is the **safe** direction. The formula's result is
+/// always `<= clock_timestamp()`: when `scheduled_at <= paused_at` it is
+/// `scheduled_at + now - paused_at <= now`, and otherwise it collapses to
+/// exactly `now`. So no combination of holds can push a task into the future or
+/// make it un-claimable, and none can credit *less* than the task earned. The
+/// cost is delayed starvation detection — never a spurious terminal failure,
+/// which is the precise outcome both pause features exist to prevent.
+///
+/// The two obvious coordinations are worse, because each trades this safe
+/// over-credit for an **unsafe** under-credit:
+///
+/// - *Skip a row while the other mechanism still holds it.* Correct when the
+///   holds begin together, but on staggered starts (queue from `t=100`,
+///   activity from `t=150`, resumed at `200` then `300`) only the surviving
+///   resume credits, and from `t=150` — landing on `150` against a
+///   union-correct `200`.
+/// - *A per-row `credited_through` watermark.* Correct on that ordering, and
+///   symmetrically wrong on its reverse (activity from `t=150` resumed first,
+///   queue from `t=100` resumed second) — also `150` against `200`.
+///
+/// Crediting the union exactly needs the *earliest* `paused_at` among the
+/// overlapping holds to survive until the last resume, and both pause tables
+/// key on the name and hard-delete on resume, so by then that value is gone.
+/// Recovering it means new persistent state: a `held_since` watermark on
+/// `harvest_task_queue` — the hottest table in the schema — plus an anti-join
+/// against the other mechanism and a matching change to #619's shipped resume
+/// path. That is a migration-bearing cross-feature change, tracked as follow-up
+/// rather than taken here. `overlapping_queue_and_activity_holds_over_credit_but_never_starve`
+/// pins both halves of the contract so a future coordination cannot land the
+/// unsafe direction unnoticed.
+///
 /// # Why one statement, where queue pause needs two
 ///
 /// Queue pause splits this into a primary pass plus a late-arrivals pass

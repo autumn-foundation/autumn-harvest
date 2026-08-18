@@ -31,6 +31,7 @@
 
 use autumn_harvest::activity_pause;
 use autumn_harvest::queue::{self, EnqueueParams, TaskType, claim_task};
+use autumn_harvest::queue_pause;
 use autumn_harvest::timeout::{self, TimeoutReason};
 use diesel_async::AsyncPgConnection;
 use diesel_async::SimpleAsyncConnection;
@@ -999,6 +1000,129 @@ async fn resume_credits_a_task_that_arrives_between_the_two_passes() {
         claim_all(&mut conn, &q).await.len(),
         2,
         "both tasks are claimable once the resume commits"
+    );
+}
+
+/// Backdate a QUEUE pause's `paused_at`, the queue-side twin of
+/// [`backdate_paused_at`], so a resume computes a non-trivial held span.
+async fn backdate_queue_paused_at(conn: &mut AsyncPgConnection, queue: &str, secs: i64) {
+    use diesel_async::RunQueryDsl;
+    diesel::sql_query(
+        "UPDATE harvest_queue_pauses SET paused_at = NOW() - ($2 || ' seconds')::interval \
+         WHERE queue_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Text, _>(secs.to_string())
+    .execute(conn)
+    .await
+    .expect("backdate queue pause");
+}
+
+/// A task held by BOTH its queue (#619) and its activity type at once is
+/// over-credited — and that is the deliberate, bounded, *safe* direction.
+///
+/// Issue #807 review, Codex round 15. Each resume path applies the same
+/// relative `scheduled_at` shift with no knowledge of the other, so the
+/// overlapping interval is credited twice and the task's genuine pre-pause wait
+/// is erased. `resume_shift_scheduled_at_query`'s "Overlapping queue and
+/// activity holds over-credit, deliberately" section carries the full argument,
+/// including why both obvious coordinations swap this for an *unsafe*
+/// under-credit and why the exact fix needs a migration.
+///
+/// This pins BOTH halves of that contract, so neither can move silently:
+///
+/// 1. **The safety invariant** (load-bearing, must never regress) — no
+///    combination of holds may push `scheduled_at` past the thaw instant or
+///    leave the task un-claimable, and none may credit *less* than the task
+///    earned.
+/// 2. **The accepted cost** (documented, expected to change together with the
+///    doc) — the doubly-credited task escapes a `schedule_to_start` failure it
+///    would have taken under a single hold, so detection is delayed rather than
+///    made spurious.
+///
+/// The control is the single-hold twin `resume_credits_the_held_time_only_not_
+/// the_whole_wait`, whose identically-shaped `already_blown` task DOES time out.
+/// Same budget, same wait, same held span — the only difference is the second
+/// overlapping hold, so the assertion cannot pass vacuously.
+///
+/// A future PR that credits the union exactly will flip assertion 2 and must
+/// update the doc section with it. That is the intended coupling.
+#[tokio::test]
+async fn overlapping_queue_and_activity_holds_over_credit_but_never_starve() {
+    let (mut conn, _c) = setup_db().await;
+    let q = unique("apq");
+    let act = unique("slow");
+
+    // Identical shape to the single-hold control: 600s of wall-clock wait, 595s
+    // of it held, so 5s of genuine wait against a 2s budget — union-correct
+    // behaviour is to time out.
+    let doubly_held =
+        enqueue_activity(&mut conn, &q, &act, Some(chrono::Duration::seconds(2))).await;
+
+    queue_pause::pause_queue(&mut conn, &q, "downstream outage", "oncall", None)
+        .await
+        .expect("pause queue");
+    pause(&mut conn, &act).await;
+
+    backdate_scheduled_at(&mut conn, doubly_held, 600).await;
+    backdate_queue_paused_at(&mut conn, &q, 595).await;
+    backdate_paused_at(&mut conn, &act, 595).await;
+
+    let held_from = scheduled_at_of(&mut conn, doubly_held).await;
+
+    // Resume order is the interesting axis; the queue first, then the activity.
+    queue_pause::resume_queue(&mut conn, &q, "oncall")
+        .await
+        .expect("resume queue");
+    let after_first = scheduled_at_of(&mut conn, doubly_held).await;
+    activity_pause::resume_activity(&mut conn, &act)
+        .await
+        .expect("resume activity");
+    let after_both = scheduled_at_of(&mut conn, doubly_held).await;
+
+    let now = chrono::Utc::now();
+
+    // ── 1. the safety invariant ───────────────────────────────────────────────
+    assert!(
+        after_both <= now,
+        "a doubly-credited task must never be pushed past the thaw instant: \
+         scheduled_at={after_both} > now={now}. Above `now` the claim gate's \
+         `scheduled_at <= clock_timestamp()` predicate stops matching and the \
+         hold silently becomes permanent."
+    );
+    assert!(
+        after_both >= after_first && after_first >= held_from,
+        "each resume may only move scheduled_at forward: {held_from} -> \
+         {after_first} -> {after_both}. A backwards step would credit less than \
+         the task earned and re-expose it to the schedule_to_start failure the \
+         hold exists to prevent."
+    );
+
+    // ── 2. the accepted cost, made explicit ──────────────────────────────────
+    //
+    // The scan MUST run before the claim: `find_timed_out_tasks` only considers
+    // `PENDING` rows, so claiming first would make this assertion vacuous — it
+    // would pass on a single hold too, which is exactly what the control test
+    // proves must NOT happen.
+    let due = timeout::find_timed_out_tasks(&mut conn)
+        .await
+        .expect("scan after both resumes");
+    assert!(
+        !due.iter()
+            .any(|(t, r)| t.id == doubly_held && matches!(r, TimeoutReason::ScheduleToStart)),
+        "ACCEPTED COST: the overlap is credited twice, so this task escapes the \
+         schedule_to_start failure its single-hold twin \
+         (`resume_credits_the_held_time_only_not_the_whole_wait`) takes on the \
+         same budget, wait and held span. Detection is delayed, never spurious. \
+         If you are here because you implemented exact union crediting, flip \
+         this assertion and update `resume_shift_scheduled_at_query`'s \
+         \"Overlapping queue and activity holds\" doc section with it."
+    );
+
+    assert_eq!(
+        claim_one(&mut conn, &q).await,
+        Some(doubly_held),
+        "and the doubly-held task is claimable the moment both holds lift"
     );
 }
 
