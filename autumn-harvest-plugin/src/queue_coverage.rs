@@ -446,7 +446,7 @@ fn merge_excluded_paused_queues(sets: Vec<BTreeSet<String>>) -> Vec<String> {
 /// function's own bug while implementing #774) -- factoring the predicate
 /// into one shared function means the two consumers cannot drift apart
 /// again.
-fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
+pub(crate) fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
     let is_live = worker.health == WorkerHealth::Healthy
         && (worker.worker.status == WorkerStatus::Active.as_str()
             || worker.worker.status == WorkerStatus::Draining.as_str());
@@ -490,7 +490,7 @@ fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> b
 /// to classify as `Healthy` a moment later -- the trailing `WorkerHealth::classify`
 /// call below is therefore a cheap, defense-in-depth confirmation of an
 /// already-SQL-filtered set, not a second unbounded pass over stale rows.
-async fn fetch_potentially_live_workers(
+pub(crate) async fn fetch_potentially_live_workers(
     conn: &mut AsyncPgConnection,
     worker_stale_threshold: Duration,
 ) -> HarvestResult<Vec<WorkerRow>> {

@@ -3141,3 +3141,35 @@ fn token_rotate_maps_to_post_create_replacement() {
     assert_eq!(request.method, ApiMethod::Post);
     assert_eq!(request.path, "/admin/tokens");
 }
+
+/// Issue #809: `workflow diagnose` maps onto the read-only diagnose route, and
+/// `--json` is a render-only flag that must not alter the wire request.
+#[test]
+fn workflow_diagnose_maps_to_the_diagnose_route() {
+    for args in [
+        vec![
+            "harvest",
+            "workflow",
+            "diagnose",
+            "00000000-0000-0000-0000-000000000001",
+        ],
+        vec![
+            "harvest",
+            "workflow",
+            "diagnose",
+            "00000000-0000-0000-0000-000000000001",
+            "--json",
+        ],
+    ] {
+        let diagnose = Cli::try_parse_from(args).expect("workflow diagnose args should parse");
+        let diagnose_request = diagnose
+            .api_request()
+            .expect("diagnose request should build");
+        assert_eq!(diagnose_request.method, ApiMethod::Get);
+        assert_eq!(
+            diagnose_request.path,
+            "/workflows/00000000-0000-0000-0000-000000000001/diagnose"
+        );
+        assert_eq!(diagnose_request.body, None);
+    }
+}

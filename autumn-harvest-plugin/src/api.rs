@@ -4746,6 +4746,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/workflows/{id}/awaitables",
             get(get_workflow_awaitables).route_layer(require_admin.clone()),
         )
+        // Per-execution stall diagnosis (issue #809): admin-gated, same posture
+        // as the eligibility and awaitables triage endpoints — the response
+        // names queue / rate-limit / concurrency keys and fleet coverage state.
+        .route(
+            "/workflows/{id}/diagnose",
+            get(get_workflow_diagnose).route_layer(require_admin.clone()),
+        )
         .route("/workflows/{id}/run-chain", get(get_run_chain))
         // Single-execution replay diagnosis (issue #614): admin-gated, read-only.
         // POST (not GET) because it drives a replay of the workflow handler, but
@@ -5928,6 +5935,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         // read-only. See docs/api-contract.json.
         ("GET", "/workflows/{id}/logs"),
         ("GET", "/workflows/{id}/awaitables"),
+        // Per-execution stall diagnosis (issue #809): admin-gated, read-only.
+        // See docs/api-contract.json.
+        ("GET", "/workflows/{id}/diagnose"),
         ("GET", "/workflows/{id}/run-chain"),
         // Single-execution replay diagnosis (issue #614): admin-gated, read-only
         // POST (post_for_body_only). See docs/api-contract.json.
@@ -6694,6 +6704,32 @@ pub const fn management_api_response_fields()
                 "next_cursor",
                 "total_lines",
                 "truncated",
+            ]),
+        ),
+        (
+            "GET",
+            "/workflows/{id}/diagnose",
+            // Issue #809. `blocked_on` is an internally-tagged, snake_case
+            // discriminated object whose per-variant fields are documented in
+            // the route's contract description (the `/stack` precedent for
+            // nested shapes). `blocked_on`, `last_event_at`, `terminal_outcome`
+            // and `wait_set_reason` are omitted when absent
+            // (skip_serializing_if) but declared here so the registry <->
+            // contract cross-check covers them.
+            Some(&[
+                "execution_id",
+                "workflow_id",
+                "workflow_name",
+                "state",
+                "health",
+                "blocked_on",
+                "summary",
+                "last_event_age_seconds",
+                "last_event_at",
+                "terminal_outcome",
+                "contributing_reason_codes",
+                "wait_set",
+                "wait_set_reason",
             ]),
         ),
         (
@@ -12346,6 +12382,817 @@ async fn get_workflow_awaitables(
 ) -> Result<Json<WorkflowAwaitablesResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     let report = build_awaitables_report(&api_state, exec_id).await?;
+    Ok(Json(report))
+}
+
+// ── Per-execution stall diagnosis (issue #809) ────────────────────────────
+
+/// The terminal outcome echoed for an already-finished execution.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct TerminalOutcomeResponse {
+    /// The terminal state (`COMPLETED`, `FAILED`, …).
+    pub state: String,
+    /// The recorded failure text, where the run failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// When the run reached its terminal state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Response of `GET /workflows/{id}/diagnose`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct WorkflowDiagnoseResponse {
+    /// The execution's id (echoed).
+    pub execution_id: String,
+    /// The business workflow id.
+    pub workflow_id: String,
+    /// The workflow type name.
+    pub workflow_name: String,
+    /// The execution's current state.
+    pub state: String,
+    /// The one-word triage verdict.
+    pub health: autumn_harvest::stall_diagnosis::ExecutionHealth,
+    /// The discriminated root cause. Absent for a terminal execution — there is
+    /// nothing to diagnose, and `terminal_outcome` carries the answer instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_on: Option<autumn_harvest::stall_diagnosis::BlockedOn>,
+    /// A one-sentence, human-readable rendering of the verdict.
+    pub summary: String,
+    /// Age of the most recent recorded event, in seconds. Informational only —
+    /// `health` is never derived from it, so a long durable sleep is never
+    /// reported as a stall (AC4). `null` when the execution has no events.
+    pub last_event_age_seconds: Option<f64>,
+    /// Timestamp of the most recent recorded event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Present only for a terminal execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_outcome: Option<TerminalOutcomeResponse>,
+    /// Every claim-time impediment that applies to the diagnosed activity, not
+    /// just the single highest-precedence one carried by `blocked_on`.
+    ///
+    /// Sourced verbatim from the eligibility explainer's own pure
+    /// [`task_intrinsic_impediment_reasons`] (issue #611), so the single-verdict
+    /// and multi-reason surfaces can never drift apart. Empty for every
+    /// non-activity verdict.
+    pub contributing_reason_codes: Vec<String>,
+    /// How the awaited-signal set was derived: `"replayed"`, `"history_only"`,
+    /// or `"not_consulted"` when the verdict was already decided by a
+    /// higher-precedence category and the replay drive was deliberately skipped.
+    pub wait_set: String,
+    /// Why the wait-set degraded to `history_only`, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_set_reason: Option<String>,
+}
+
+/// Sentinel `wait_set` value for the fast path: the verdict was fully decided by
+/// a category that outranks an awaited signal, so the replay drive was skipped.
+const WAIT_SET_NOT_CONSULTED: &str = "not_consulted";
+
+/// Builds the stall-diagnosis report for one execution (issue #809).
+///
+/// Correlates, in a single shard-local read, the five signals an operator would
+/// otherwise gather from four separate endpoints: the pending work itself
+/// (`/stack`), per-queue worker liveness (`/workers/health`, `/admin/queue-coverage`),
+/// the in-process circuit registry (`/admin/circuits`), rate-limit and per-key
+/// concurrency saturation (`/admin/rate-limits`, `/admin/concurrency`), plus the
+/// operator queue-pause table and the task row's own retry timing. The pure
+/// [`autumn_harvest::stall_diagnosis::classify_execution`] collapses them into
+/// one verdict.
+///
+/// ## Read-only by construction
+///
+/// No events are appended, no task-queue row is touched, no state is
+/// recomputed, and no migration is involved. The circuit registry is consulted
+/// through `list()` only — never `on_dispatch` / `on_result` / `force_*` — so
+/// diagnosing cannot itself advance a breaker's phase. Safe to call repeatedly.
+///
+/// ## Shard-local
+///
+/// A single execution lives on a single shard, so the read routes O(1) from the
+/// `ExecutionId` via `db_conn_for_execution`. There is no cross-shard fan-out.
+///
+/// ## Replay is consulted only when it can change the answer
+///
+/// An awaited-but-unsent signal exists solely as a parked command inside the
+/// coroutine — no side table can see it — so observing one requires the #615
+/// replay drive. That drive is comparatively expensive, and an awaited signal
+/// ranks *below* pending activities, external handoffs and pending children in
+/// the category ladder. So the drive runs **only** when the database-observable
+/// categories could not already decide the verdict (i.e. the run would otherwise
+/// report `sleeping_timer` or `no_pending_work`, the two verdicts an awaited
+/// signal outranks). The final verdict is identical either way; the common
+/// triage path — a wedged pending activity — never pays for a replay.
+///
+/// ## Payload-free
+///
+/// Names, ids, timestamps, queue/bucket keys and the task row's own error text
+/// only — never an activity input, signal payload or activity output. The one
+/// exception is the task row's `error` text surfaced as
+/// `ActivityRetrying.last_error`, which IS routed through read-path payload
+/// decoding (issue #608) exactly as `/stack` routes the same column for its own
+/// `last_failure`; otherwise an admin would read plaintext there and a
+/// ciphertext envelope here for the same column of the same row.
+/// The column tuple [`build_diagnosis_report`]'s narrow task projection loads.
+type DiagnoseTaskRow = (
+    String,                        // state
+    Option<String>,                // activity_name
+    String,                        // queue_name
+    i32,                           // attempt
+    Option<String>,                // error
+    chrono::DateTime<chrono::Utc>, // scheduled_at
+    Option<String>,                // rate_limit_key
+    Option<String>,                // concurrency_key
+    Option<i32>,                   // concurrency_cap
+    String,                        // task_type
+);
+
+/// The narrow task-queue projection [`build_diagnosis_report`] reads.
+///
+/// Deliberately not `TaskQueueItem`: that model carries five jsonb payload
+/// columns this report never touches, and loading them on a wide fan-out of
+/// large activity inputs would move hundreds of megabytes to answer a triage
+/// question.
+struct DiagnoseTask {
+    state: String,
+    activity_name: Option<String>,
+    queue_name: String,
+    attempt: i32,
+    error: Option<String>,
+    scheduled_at: chrono::DateTime<chrono::Utc>,
+    rate_limit_key: Option<String>,
+    concurrency_key: Option<String>,
+    concurrency_cap: Option<i32>,
+    task_type: String,
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn build_diagnosis_report(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+    decoder: Option<&PayloadCodecs>,
+    decode_outcome: &mut LossyDecodeOutcome,
+) -> Result<WorkflowDiagnoseResponse, AutumnError> {
+    use autumn_harvest::stall_diagnosis::{
+        AwaitedSignalFacts, BlockedOn, BlockingCircuitPhase, DiagnosisInputs, ExecutionHealth,
+        ExternalHandoffFacts, PendingActivityFacts, PendingChildFacts, PendingTimerFacts,
+        classify_execution, summarize,
+    };
+
+    let exec_uuid = exec_id.as_uuid();
+    let mut conn = db_conn_for_execution(api_state, exec_id).await?;
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(execution) => execution,
+        Err(HarvestError::NotFound(_)) => {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found \
+                 (classic DAG runs are not on the execution path)"
+            )));
+        }
+        Err(err) => return Err(map_error(err)),
+    };
+
+    // Snapshot `now` once so every deadline, age and backoff comparison in this
+    // response is judged against one consistent instant.
+    let now = chrono::Utc::now();
+
+    let last_event_at: Option<chrono::DateTime<chrono::Utc>> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
+        .select(diesel::dsl::max(harvest_events::timestamp))
+        .first::<Option<chrono::DateTime<chrono::Utc>>>(&mut conn)
+        .await
+        .map_err(database_error)?;
+    let last_event_age_seconds =
+        last_event_at.map(|ts| (now - ts).to_std().map_or(0.0, |d| d.as_secs_f64()));
+
+    let is_terminal = is_terminal_state(&execution.state);
+    if is_terminal {
+        return Ok(WorkflowDiagnoseResponse {
+            execution_id: exec_id.to_string(),
+            workflow_id: execution.workflow_id.clone(),
+            workflow_name: execution.workflow_name.clone(),
+            state: execution.state.clone(),
+            health: ExecutionHealth::Terminal,
+            blocked_on: None,
+            summary: format!(
+                "execution reached terminal state {} — nothing to diagnose",
+                execution.state
+            ),
+            last_event_age_seconds,
+            last_event_at,
+            terminal_outcome: Some(TerminalOutcomeResponse {
+                state: execution.state,
+                error: execution.error,
+                completed_at: execution.completed_at,
+            }),
+            contributing_reason_codes: Vec::new(),
+            wait_set: WAIT_SET_NOT_CONSULTED.to_string(),
+            wait_set_reason: None,
+        });
+    }
+
+    // ── Pending activity task rows ─────────────────────────────────────────
+    // Mirrors `/stack`'s own pending-task predicate and deterministic ordering,
+    // so the two surfaces always talk about the same rows in the same order
+    // (equal-precedence ties therefore resolve identically call to call).
+    // A NARROW projection on purpose. `TaskQueueItem::as_select()` would drag in
+    // five jsonb columns (`input`, `output`, `heartbeat_details`, `retry_policy`,
+    // `trace_context`) that this report never reads — on a wide fan-out of large
+    // activity inputs, exactly the stalled shape this endpoint exists to
+    // diagnose, that is hundreds of megabytes moved to answer a triage question.
+    // The ten scalars below are everything the classifier consumes.
+    //
+    // Deliberately UNBOUNDED: the worst-of fold must see every row or it can
+    // miss the one wedged slot behind a healthy majority, so a `LIMIT` would
+    // trade a correctness guarantee for a cost the narrow projection has
+    // already removed.
+    let task_rows: Vec<DiagnoseTaskRow> = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
+        .filter(harvest_task_queue::task_type.eq("activity"))
+        .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
+        .order((
+            harvest_task_queue::scheduled_at.asc(),
+            harvest_task_queue::id.asc(),
+        ))
+        .select((
+            harvest_task_queue::state,
+            harvest_task_queue::activity_name,
+            harvest_task_queue::queue_name,
+            harvest_task_queue::attempt,
+            harvest_task_queue::error,
+            harvest_task_queue::scheduled_at,
+            harvest_task_queue::rate_limit_key,
+            harvest_task_queue::concurrency_key,
+            harvest_task_queue::concurrency_cap,
+            harvest_task_queue::task_type,
+        ))
+        .load::<DiagnoseTaskRow>(&mut conn)
+        .await
+        .map_err(database_error)?;
+    let tasks: Vec<DiagnoseTask> = task_rows
+        .into_iter()
+        .map(
+            |(
+                state,
+                activity_name,
+                queue_name,
+                attempt,
+                error,
+                scheduled_at,
+                rate_limit_key,
+                concurrency_key,
+                concurrency_cap,
+                task_type,
+            )| DiagnoseTask {
+                state,
+                activity_name,
+                queue_name,
+                attempt,
+                error,
+                scheduled_at,
+                rate_limit_key,
+                concurrency_key,
+                concurrency_cap,
+                task_type,
+            },
+        )
+        .collect();
+
+    // ── Infra state for those rows (only what they actually reference) ──────
+    let pending_tasks: Vec<&DiagnoseTask> = tasks.iter().filter(|t| t.state == "PENDING").collect();
+
+    // Circuit-breaker phases. `list()` prunes each breaker's rolling window and
+    // reads its phase but NEVER transitions it (Open→HalfOpen is driven solely
+    // by dispatch), so consulting it here cannot perturb enforcement. A
+    // cooled-down breaker therefore still reads "open" until a real probe is
+    // admitted — a deliberate, documented read-only conservatism.
+    let (cb_phase, cb_tracked): (
+        std::collections::HashMap<String, autumn_harvest::circuit_breaker::CircuitSnapshot>,
+        Vec<String>,
+    ) = api_state.runtime().ok().map_or_else(
+        || (std::collections::HashMap::new(), Vec::new()),
+        |runtime| {
+            let breakers = runtime.registry().circuit_breakers();
+            let tracked = breakers.tracked_activity_names().to_vec();
+            let phases = breakers
+                .list(std::time::Instant::now())
+                .into_iter()
+                .map(|snap| (snap.activity_name.clone(), snap))
+                .collect();
+            (phases, tracked)
+        },
+    );
+
+    // Rate-limit saturation. A circuit-breaker-tracked activity enforces its
+    // rate limit at DISPATCH rather than at claim (issue #369), so its bucket is
+    // never a claim-time impediment and is deliberately not consulted — the
+    // breaker verdict is the accurate one. Matches the eligibility explainer.
+    let rate_limit_keys: Vec<String> = pending_tasks
+        .iter()
+        .filter(|t| {
+            !t.activity_name
+                .as_ref()
+                .is_some_and(|name| cb_tracked.contains(name))
+        })
+        .filter_map(|t| t.rate_limit_key.clone())
+        // Deduped so a wide fan-out sharing one key binds a 1-element array
+        // rather than one entry per task row.
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let saturated_rate_limits = saturated_rate_limit_keys(&mut conn, &rate_limit_keys).await?;
+
+    // Per-key concurrency, counted exactly as `claim_task` counts it: scoped by
+    // (concurrency_key, task_type) over RUNNING rows with a worker.
+    let concurrency_keys: Vec<String> = pending_tasks
+        .iter()
+        .filter_map(|t| t.concurrency_key.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let running_by_key = running_counts_for_concurrency_keys(&mut conn, &concurrency_keys).await?;
+
+    // Operator queue pauses (issue #619). Propagates on failure rather than
+    // defaulting to "nothing is held": this endpoint exists to answer "why is
+    // nothing happening?", and swallowing the read would answer it with a
+    // confident, wrong "nothing is holding this queue".
+    let paused_queues: std::collections::HashSet<String> =
+        autumn_harvest::queue_pause::paused_queue_names(&mut conn)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .collect();
+
+    // Per-queue worker liveness, via the SAME predicate `GET /admin/queue-coverage`
+    // uses (issue #774) so the two surfaces can never disagree about whether a
+    // queue has a live poller — the exact drift that bit `shard_health` in #1150.
+    // Built from EVERY loaded row, not just the PENDING ones: a claimed
+    // (`RUNNING`) row also needs a truthful liveness answer, because a claimed
+    // row whose fleet is gone is an orphan rather than healthy work. Deriving
+    // it from PENDING rows alone would leave `has_live_worker: false` on a
+    // claimed row merely because coverage was never CHECKED for its queue.
+    let queues_in_play: std::collections::BTreeSet<String> =
+        tasks.iter().map(|t| t.queue_name.clone()).collect();
+    let mut covered_queues: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if !queues_in_play.is_empty() {
+        let stale_threshold = api_state.worker_stale_threshold();
+        let workers =
+            crate::queue_coverage::fetch_potentially_live_workers(&mut conn, stale_threshold)
+                .await
+                .map_err(map_error)?;
+        // The row's OWN recorded shard, not `exec_id.shard()`. A pre-sharding
+        // (or `ExecutionId::new()`) id carries the `ShardId::UNENCODED`
+        // sentinel (0xFFFF), which the router resolves to the default shard —
+        // but a worker registers `shard_assignments` with its real shard
+        // number, so comparing against the raw sentinel would match no worker
+        // and report a false `activity_no_worker` for a perfectly covered
+        // queue. `harvest_workflow_executions.shard_id` is the same value the
+        // worker itself is registered against, so the two always agree.
+        let shard_id = execution.shard_id;
+        for queue in &queues_in_play {
+            if workers
+                .iter()
+                .any(|w| crate::queue_coverage::worker_covers_queue(w, queue, shard_id))
+            {
+                covered_queues.insert(queue.clone());
+            }
+        }
+    }
+
+    let activities: Vec<PendingActivityFacts> = tasks
+        .iter()
+        .map(|t| {
+            let queue_paused = paused_queues.contains(&t.queue_name);
+            let has_cb = t
+                .activity_name
+                .as_ref()
+                .is_some_and(|name| cb_tracked.contains(name));
+            let snapshot = t.activity_name.as_ref().and_then(|name| cb_phase.get(name));
+            let (circuit_phase, circuit_cooldown_until) = match snapshot.map(|s| s.state) {
+                Some("open") => (
+                    Some(BlockingCircuitPhase::Open),
+                    snapshot
+                        .and_then(|s| s.time_until_probe_secs)
+                        .and_then(|secs| circuit_cooldown_until(now, secs)),
+                ),
+                Some("half_open") => (Some(BlockingCircuitPhase::HalfOpen), None),
+                _ => (None, None),
+            };
+            let concurrency_saturated = match (t.concurrency_key.as_ref(), t.concurrency_cap) {
+                (Some(key), Some(cap)) => {
+                    running_by_key
+                        .get(&(key.clone(), t.task_type.clone()))
+                        .copied()
+                        .unwrap_or(0)
+                        >= i64::from(cap)
+                }
+                _ => false,
+            };
+            PendingActivityFacts {
+                activity_name: t.activity_name.clone(),
+                queue: t.queue_name.clone(),
+                task_state: t.state.clone(),
+                attempt: t.attempt,
+                last_error: t.error.clone().map(|mut error| {
+                    if let Some(codecs) = decoder {
+                        *decode_outcome =
+                            decode_outcome.merged(decode_error_field(codecs, &mut error));
+                    }
+                    error
+                }),
+                scheduled_at: t.scheduled_at,
+                rate_limit_key: t.rate_limit_key.clone(),
+                concurrency_key: t.concurrency_key.clone(),
+                queue_paused,
+                has_live_worker: covered_queues.contains(&t.queue_name),
+                circuit_phase,
+                circuit_cooldown_until,
+                rate_limit_saturated: !has_cb
+                    && t.rate_limit_key
+                        .as_ref()
+                        .is_some_and(|k| saturated_rate_limits.contains(k)),
+                concurrency_saturated,
+            }
+        })
+        .collect();
+
+    // ── The remaining database-observable categories ───────────────────────
+    let handoff_filters = external_task::ExternalHandoffFilters {
+        states: vec!["PENDING".to_string()],
+        execution_id: Some(exec_id),
+        limit: MAX_EXTERNAL_HANDOFF_LIMIT,
+        ..external_task::ExternalHandoffFilters::default()
+    };
+    let external_handoffs: Vec<ExternalHandoffFacts> =
+        external_task::list_external_handoffs(&mut conn, &handoff_filters)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .map(|row| ExternalHandoffFacts {
+                token: row.token.to_string(),
+                activity_name: Some(row.activity_name),
+            })
+            .collect();
+
+    let children: Vec<PendingChildFacts> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::parent_id.eq(Some(exec_uuid)))
+        .filter(harvest_workflow_executions::state.ne_all([
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "CONTINUED_AS_NEW",
+            "TERMINATED",
+        ]))
+        .order(harvest_workflow_executions::id.asc())
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::state,
+        ))
+        .load::<(uuid::Uuid, String)>(&mut conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|(child_exec_id, child_state)| PendingChildFacts {
+            child_exec_id: child_exec_id.to_string(),
+            child_state,
+        })
+        .collect();
+
+    let timers: Vec<PendingTimerFacts> = harvest_timers::table
+        .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
+        .filter(harvest_timers::fired.eq(false))
+        .select(harvest_timers::fires_at)
+        .load::<chrono::DateTime<chrono::Utc>>(&mut conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|fires_at| PendingTimerFacts { fires_at })
+        .collect();
+
+    // The connection is released before any replay drive: user workflow code is
+    // never driven while a pool slot is held (the #612 discipline).
+    drop(conn);
+
+    let mut inputs = DiagnosisInputs {
+        is_terminal: false,
+        is_paused: execution.state == "PAUSED",
+        pause_actor: execution.pause_actor.clone(),
+        paused_since: execution.paused_at,
+        activities,
+        external_handoffs,
+        children,
+        awaited_signals: Vec::new(),
+        timers,
+    };
+
+    // ── Awaited-but-unsent signals, only when they could change the answer ──
+    let mut wait_set = WAIT_SET_NOT_CONSULTED.to_string();
+    let mut wait_set_reason = None;
+    let db_verdict = classify_execution(&inputs, now);
+    let signals_could_win = matches!(
+        db_verdict.as_ref().map(BlockedOn::kind),
+        Some("sleeping_timer" | "no_pending_work")
+    );
+    if signals_could_win {
+        // Deadline the whole replay. `build_awaitables_report` inflates offloaded
+        // payloads per event (issue #524) OUTSIDE the query timeout, so on a long
+        // history with a remote `PayloadStore` it can run for minutes. The
+        // degrade path below is exactly the right answer when it does.
+        let replay = tokio::time::timeout(
+            api_state.query_timeout(),
+            build_awaitables_report(api_state, exec_id),
+        )
+        .await;
+        match replay {
+            Ok(Ok(report)) => {
+                // `build_awaitables_report` can answer `terminal` if the run
+                // reached a terminal state between our own load and this replay.
+                // That is a real TOCTOU, but this response has already committed
+                // to a non-terminal verdict, so surface it as an unavailable
+                // wait set rather than leaking a fourth vocabulary value the
+                // contract does not document.
+                if report.wait_set == "terminal" {
+                    wait_set = "history_only".to_string();
+                    wait_set_reason = Some("execution_went_terminal".to_string());
+                } else {
+                    wait_set = report.wait_set;
+                    wait_set_reason = report.wait_set_reason;
+                }
+                inputs.awaited_signals = report
+                    .awaitables
+                    .iter()
+                    .filter(|a| a.kind == autumn_harvest::awaitables::AwaitableKind::Signal)
+                    .filter_map(|a| {
+                        a.name.clone().map(|signal_name| AwaitedSignalFacts {
+                            signal_name,
+                            since: a.since,
+                        })
+                    })
+                    .collect();
+            }
+            Ok(Err(error)) => {
+                // Degrade, never fail: this is a triage endpoint. Without the
+                // replay the verdict simply falls back to what the side tables
+                // can see, and the caller is told the wait set is unavailable.
+                tracing::warn!(
+                    %exec_id,
+                    ?error,
+                    "diagnose: awaited-signal replay unavailable; \
+                     serving the database-only verdict"
+                );
+                wait_set = "history_only".to_string();
+                wait_set_reason = Some("wait_set_unavailable".to_string());
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    %exec_id,
+                    "diagnose: awaited-signal replay exceeded the query timeout; \
+                     serving the database-only verdict"
+                );
+                wait_set = "history_only".to_string();
+                wait_set_reason = Some("wait_set_timed_out".to_string());
+            }
+        }
+    }
+
+    let blocked_on = classify_execution(&inputs, now).unwrap_or(BlockedOn::NoPendingWork);
+    let health = blocked_on.health();
+    let summary = summarize(&blocked_on);
+    let contributing_reason_codes = contributing_reasons_for(&inputs.activities, &cb_phase);
+
+    Ok(WorkflowDiagnoseResponse {
+        execution_id: exec_id.to_string(),
+        workflow_id: execution.workflow_id,
+        workflow_name: execution.workflow_name,
+        state: execution.state,
+        health,
+        blocked_on: Some(blocked_on),
+        summary,
+        last_event_age_seconds,
+        last_event_at,
+        terminal_outcome: None,
+        contributing_reason_codes,
+        wait_set,
+        wait_set_reason,
+    })
+}
+
+/// Every claim-time impediment holding ANY of this execution's activity rows.
+///
+/// Deliberately a UNION across all rows rather than the single row `blocked_on`
+/// names. `blocked_on` is one triage verdict chosen by precedence, so a
+/// higher-ranked sibling would otherwise HIDE a lower-ranked one — in a fan-out
+/// where slot A sits on a paused queue (rank 6) and slot B has no live poller
+/// (rank 5), the `no_live_worker` condition holds but would appear nowhere in
+/// the response. Unioning is what makes the endpoint's "surfaced 100% of the
+/// time it holds" guarantee true, and what makes the runbook's promise that a
+/// task both rate-limited AND on a paused queue "shows both" literally correct.
+///
+/// Delegates to the eligibility explainer's own pure
+/// [`task_intrinsic_impediment_reasons`] (issue #611) so this list and
+/// `blocked_on` can never drift apart in how an impediment is named.
+fn contributing_reasons_for(
+    activities: &[autumn_harvest::stall_diagnosis::PendingActivityFacts],
+    cb_phase: &std::collections::HashMap<String, autumn_harvest::circuit_breaker::CircuitSnapshot>,
+) -> Vec<String> {
+    let phases: std::collections::HashMap<String, &'static str> = cb_phase
+        .iter()
+        .map(|(name, snap)| (name.clone(), snap.state))
+        .collect();
+    let mut reasons: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for facts in activities {
+        // Worker liveness is a property of the fleet, not a claim-time *task*
+        // gate, so the shared helper does not model it — but it is the one cause
+        // that never self-heals, and it is equally real for a claimed row whose
+        // fleet has gone (a poison-pill orphan, issue #367).
+        if !facts.has_live_worker {
+            reasons.insert("no_live_worker".to_string());
+        }
+        // Every remaining reason is a CLAIM-time gate, so none of them applies
+        // to a row a worker already holds. Reporting them for a claimed row
+        // would put `queue_paused` next to `health: healthy` for work that is
+        // actively running.
+        if facts.task_state != "PENDING" {
+            continue;
+        }
+        // The classifier already resolved which impediments hold, so the
+        // saturation sets handed to the shared helper are this row's own
+        // answers.
+        let mut saturated_rate_limits = std::collections::HashSet::new();
+        if facts.rate_limit_saturated
+            && let Some(key) = facts.rate_limit_key.as_ref()
+        {
+            saturated_rate_limits.insert(key.clone());
+        }
+        reasons.extend(task_intrinsic_impediment_reasons(
+            facts.activity_name.as_deref(),
+            facts.rate_limit_key.as_deref(),
+            // `rate_limit_saturated` is already false for a breaker-tracked
+            // activity (dispatch-time enforcement, issue #369), so the
+            // suppression flag is redundant here and passing `false` keeps the
+            // two paths consistent.
+            false,
+            &saturated_rate_limits,
+            facts.concurrency_saturated,
+            &phases,
+            facts.queue_paused,
+        ));
+    }
+    let mut reasons: Vec<String> = reasons.into_iter().collect();
+    sort_reason_codes(&mut reasons);
+    reasons
+}
+
+/// Which of `keys` currently have fewer than one token available.
+///
+/// Uses the canonical refill expression Postgres itself evaluates in
+/// Absolute `cooldown_until` instant for an open circuit breaker.
+///
+/// [`autumn_harvest::circuit_breaker::CircuitSnapshot`] reports the remaining
+/// cooldown as *fractional seconds* (`time_until_probe_secs`), not an absolute
+/// timestamp, so the endpoint derives one. Every failure mode resolves to
+/// `None` rather than a panic or a wrapped instant: a NaN / negative / absurdly
+/// large value (`try_from_secs_f64`), a duration outside `chrono`'s range
+/// (`from_std`), or an instant that would overflow (`checked_add_signed`). A
+/// missing `cooldown_until` is already the documented shape for a
+/// force-opened breaker, so degrading to `None` is never a lie.
+fn circuit_cooldown_until(
+    now: chrono::DateTime<chrono::Utc>,
+    secs: f64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let std_dur = std::time::Duration::try_from_secs_f64(secs).ok()?;
+    let delta = chrono::Duration::from_std(std_dur).ok()?;
+    now.checked_add_signed(delta)
+}
+
+/// `claim_task`'s rate-limit gate, inverted, so a key this reports as saturated
+/// is exactly a key the claim query would refuse — INCLUDING a key with no
+/// bucket row at all, which the gate's `EXISTS` also refuses.
+async fn saturated_rate_limit_keys(
+    conn: &mut diesel_async::AsyncPgConnection,
+    keys: &[String],
+) -> Result<std::collections::HashSet<String>, AutumnError> {
+    #[derive(diesel::QueryableByName)]
+    struct KeyRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        key: String,
+    }
+
+    if keys.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    // Asked as the ADMISSIBLE set and then inverted, because `claim_task`'s gate
+    // is `EXISTS(bucket WHERE ... >= 1.0)` — fail-CLOSED on a missing row. Asking
+    // the positive "which keys are saturated?" question would answer "not
+    // saturated" for a key with no bucket row at all (auto-registration failed,
+    // the row was deleted, or startup skipped it as an invalid config), and the
+    // classifier would then report `healthy` for a task the claim query can
+    // never admit. This mirrors the gate's own refill expression exactly.
+    let admissible: Vec<KeyRow> = diesel::sql_query(
+        "SELECT key FROM harvest_rate_limit_buckets \
+         WHERE key = ANY($1) \
+           AND LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) >= 1.0",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(keys)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+    let admissible: std::collections::HashSet<String> =
+        admissible.into_iter().map(|r| r.key).collect();
+    Ok(keys
+        .iter()
+        .filter(|k| !admissible.contains(*k))
+        .cloned()
+        .collect())
+}
+
+/// `RUNNING` task counts per `(concurrency_key, task_type)`.
+///
+/// Shaped exactly like `claim_task`'s own cap subquery — `state = 'RUNNING'` and
+/// `worker_id IS NOT NULL`, grouped by key *and* task type — so a key this
+/// reports as at-cap is exactly a key the claim query would defer.
+async fn running_counts_for_concurrency_keys(
+    conn: &mut diesel_async::AsyncPgConnection,
+    keys: &[String],
+) -> Result<std::collections::HashMap<(String, String), i64>, AutumnError> {
+    #[derive(diesel::QueryableByName)]
+    struct ConcurrencyRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        key: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        task_type: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        running_count: i64,
+    }
+
+    if keys.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<ConcurrencyRow> = diesel::sql_query(
+        "SELECT concurrency_key AS key, task_type, COUNT(*) AS running_count \
+         FROM harvest_task_queue \
+         WHERE state = 'RUNNING' \
+           AND concurrency_key = ANY($1) \
+           AND worker_id IS NOT NULL \
+         GROUP BY concurrency_key, task_type",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(keys)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ((r.key, r.task_type), r.running_count))
+        .collect())
+}
+
+/// `GET /workflows/{id}/diagnose` — why is this execution not progressing?
+///
+/// Per-execution stall diagnosis (issue #809): the root-cause complement to
+/// issue #486's fleet-wide "which runs look stalled?" discovery. Returns one
+/// triage `health` verdict plus a discriminated `blocked_on` cause, correlating
+/// pending work with per-queue worker liveness, circuit-breaker phase,
+/// rate-limit and concurrency saturation, operator queue pauses, and task-queue
+/// retry timing — the four-endpoint correlation an operator does by hand today.
+///
+/// Admin-gated, matching the eligibility and `/awaitables` triage endpoints:
+/// the response names queue, bucket and concurrency keys (which can embed tenant
+/// identifiers) and the fleet's worker-coverage state.
+///
+/// Read-only: appends no events, mutates no task-queue row, adds no migration.
+async fn get_workflow_diagnose(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> Result<Json<WorkflowDiagnoseResponse>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    // Read-path payload decoding (issue #608). This report is payload-free
+    // EXCEPT for the task row's `error` text, which `/stack` already decodes for
+    // its own `last_failure` — without this an admin would see plaintext there
+    // and a ciphertext envelope here, for the same column of the same row.
+    let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
+    let mut outcome = LossyDecodeOutcome::default();
+    let report =
+        build_diagnosis_report(&api_state, exec_id, decoder.as_ref(), &mut outcome).await?;
+    if decoder.is_some() {
+        // No live connection is held here — `build_diagnosis_report` drops its
+        // own before returning — so the pool-acquiring branch is safe.
+        audit_decoded_read(
+            &api_state,
+            None,
+            &headers,
+            TARGET_WORKFLOW,
+            Some(&exec_id.to_string()),
+            "GET /workflows/{id}/diagnose",
+            Some(exec_id.shard()),
+            outcome,
+            None,
+        )
+        .await;
+    }
     Ok(Json(report))
 }
 
@@ -47248,5 +48095,121 @@ mod tests {
              WorkflowInfo, registered under the DAG's own name"
         );
         assert_eq!(entry.sla_secs, Some(10_800));
+    }
+
+    // ── Stall diagnosis (issue #809) — derivation helpers ──────────────────
+
+    #[test]
+    fn circuit_cooldown_until_derives_an_absolute_deadline() {
+        let now = chrono::Utc::now();
+        let at = circuit_cooldown_until(now, 30.0).expect("30s is representable");
+        assert_eq!((at - now).num_seconds(), 30);
+    }
+
+    #[test]
+    fn circuit_cooldown_until_degrades_on_unrepresentable_input() {
+        // A missing `cooldown_until` is already the documented shape for a
+        // force-opened breaker, so degrading is never a lie — but it must never
+        // panic or wrap either.
+        let now = chrono::Utc::now();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 1e30] {
+            assert!(
+                circuit_cooldown_until(now, bad).is_none(),
+                "{bad} must not yield a cooldown"
+            );
+        }
+        // Zero is representable and simply means "probe now".
+        assert_eq!(circuit_cooldown_until(now, 0.0), Some(now));
+    }
+
+    #[test]
+    fn contributing_reasons_union_across_rows_not_just_the_winner() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // Slot A: paused queue (the highest-ranked verdict, so `blocked_on`
+        // names it). Slot B: no live poller. The `no_live_worker` condition
+        // holds and MUST still be surfaced — that is the endpoint's whole
+        // "100% of the time it holds" guarantee.
+        let base = |queue: &str| PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: queue.to_string(),
+            task_state: "PENDING".to_string(),
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            has_live_worker: true,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            concurrency_saturated: false,
+        };
+        let mut a = base("paused-q");
+        a.queue_paused = true;
+        let mut b = base("dead-q");
+        b.has_live_worker = false;
+
+        let reasons = contributing_reasons_for(&[a, b], &std::collections::HashMap::new());
+        assert!(
+            reasons.iter().any(|r| r == "queue_paused"),
+            "expected queue_paused in {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r == "no_live_worker"),
+            "a lower-ranked sibling's cause must not be hidden behind the winner: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_skip_claim_gates_for_a_claimed_row() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // A row a live worker already holds is running; reporting `queue_paused`
+        // next to `health: healthy` would be self-contradictory.
+        let facts = PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: "email".to_string(),
+            task_state: "RUNNING".to_string(),
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: true,
+            has_live_worker: true,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            concurrency_saturated: false,
+        };
+        assert!(contributing_reasons_for(&[facts], &std::collections::HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn contributing_reasons_report_an_orphaned_claimed_row() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // The converse: a claimed row whose fleet is gone (issue #367) is an
+        // orphan, and worker liveness is not a claim-time gate — it holds for a
+        // claimed row too.
+        let facts = PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: "email".to_string(),
+            task_state: "RUNNING".to_string(),
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            has_live_worker: false,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            concurrency_saturated: false,
+        };
+        assert_eq!(
+            contributing_reasons_for(&[facts], &std::collections::HashMap::new()),
+            vec!["no_live_worker".to_string()]
+        );
     }
 }

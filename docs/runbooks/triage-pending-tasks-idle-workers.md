@@ -2,6 +2,48 @@
 
 Use this runbook when an alert fires indicating that tasks are sitting in `PENDING` state on a queue while connected workers appear idle.
 
+> **Start here for a single wedged run: `GET /workflows/{exec_id}/diagnose`.**
+> Issue #809 collapses the correlation this runbook otherwise walks you through
+> — the pending stack, per-queue worker liveness, the circuit registry,
+> rate-limit / concurrency saturation, queue pauses, and the task row's own
+> retry timing — into **one** admin-gated, read-only call that names the actual
+> root cause:
+>
+> ```bash
+> harvest workflow diagnose <exec-id>            # human-readable verdict
+> harvest workflow diagnose <exec-id> --json     # raw body
+> curl -s "$HARVEST/api/harvest/workflows/$EXEC/diagnose" | jq .
+> ```
+>
+> The response leads with a one-word `health` (`healthy` | `stalled` |
+> `blocked_external` | `terminal`) and a discriminated `blocked_on` object:
+>
+> | `blocked_on.type` | `health` | What to do |
+> |---|---|---|
+> | `activity_no_worker` | `stalled` | **No live worker polls `queue`.** Deploy/scale a worker for it, or fix the queue name. Cross-check with `GET /admin/queue-coverage` (#774). |
+> | `activity_circuit_open` | `stalled` | The breaker for `activity_name` is open until `cooldown_until`. That field is **absent** when the breaker was operator-forced open — no probe is admitted on any timer, so recovery needs an explicit `force-close`. See `docs/runbooks/activity-circuit-breaker.md`. |
+> | `no_pending_work` | `stalled` | A `RUNNING` run with nothing pending — executor loss / lost task. Consider a redrive. |
+> | `activity_retrying` | `healthy` | Backing off; `last_error` says why, `next_attempt_at` says when. |
+> | `activity_rate_limited` / `activity_concurrency_deferred` | `healthy` | Deliberately paced by `key`. Raise the limit or wait. |
+> | `activity_queue_paused` | `blocked_external` | An operator paused `queue` (#619). Resume it. |
+> | `sleeping_timer` | `healthy` | A durable sleep until `fires_at` — **not** a stall, however old the last event is. |
+> | `timer_overdue` | `stalled` | A timer was due at `fires_at` (`overdue_by_seconds` ago) and nothing fired it. Timers fire only when a worker claims the owning workflow task, so this is a lost-task wedge — same remedy as `no_pending_work`. |
+> | `pending_child` | `healthy` | Waiting on `child_exec_id`; diagnose *that* id next. |
+> | `awaiting_signal` / `awaiting_external_handoff` | `blocked_external` | Waiting on an external party. Nothing engine-side is wrong. |
+> | `paused` | `blocked_external` | Operator-paused (#383); resume when ready. |
+> | `healthy_in_progress` | `healthy` | Genuinely running. |
+>
+> `contributing_reason_codes` lists **every** claim-time impediment on the
+> diagnosed activity, not just the highest-precedence one — so a task that is
+> both rate-limited *and* on a paused queue shows both. In a fan-out the
+> **worst** slot wins, so one wedged slot among nineteen healthy ones is never
+> masked.
+>
+> The endpoint is read-only: it appends no events, mutates no task-queue row,
+> and never advances a circuit breaker's phase, so it is safe to poll. Reach for
+> the per-endpoint triage below when you need the raw underlying detail, or when
+> you are diagnosing a **queue** rather than a single execution.
+
 > **First check for a heartbeating activity.** Before assuming an activity is
 > stalled, confirm it is actually stuck rather than just slow. Call
 > `GET /workflows/{exec_id}/stack` and read the activity's
