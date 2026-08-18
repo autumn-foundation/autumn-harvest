@@ -811,6 +811,56 @@ async fn ac5_backing_off_task_reports_retrying_with_attempt_error_and_next_attem
     assert_eq!(body["health"], "healthy", "body: {body}");
 }
 
+/// A not-yet-due task with NO recorded error is a dispatcher deferral, not a
+/// retry. `queue::defer_rate_limited_task` pushes `scheduled_at` forward and
+/// decrements the claim-time attempt back down without recording a failure
+/// ("a rate-limit deferral is not an attempt"); the session-capacity (#606) and
+/// capability-miss (#804) paths reuse the same clean continuation. Reporting
+/// those as `activity_retrying` would send an operator hunting a failure that
+/// never happened.
+#[tokio::test]
+async fn ac2_not_due_task_without_an_error_reports_deferred_not_retrying() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_activity_task(
+        &pool,
+        exec_id,
+        "charge_card",
+        "payments",
+        "PENDING",
+        // The deferral restored the attempt, and no error was ever recorded.
+        1,
+        None,
+        "NOW() + INTERVAL '5 minutes'",
+    )
+    .await;
+    seed_live_worker(&pool, "worker-payments", "payments").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "activity_deferred", "body: {body}");
+    assert_eq!(body["blocked_on"]["activity_name"], "charge_card");
+    assert!(
+        body["blocked_on"]["next_attempt_at"].is_string(),
+        "activity_deferred must carry next_attempt_at from the task row: {body}"
+    );
+    // A clean deferral self-heals, so it is not a stall.
+    assert_eq!(body["health"], "healthy", "body: {body}");
+    // And it must NOT fabricate retry facts.
+    assert!(
+        body["blocked_on"]["last_error"].is_null(),
+        "a deferral has no failure to report: {body}"
+    );
+}
+
 // ── AC6: no pending work of any kind ───────────────────────────────────────
 
 /// A RUNNING execution with no task rows, no timers, no children and no

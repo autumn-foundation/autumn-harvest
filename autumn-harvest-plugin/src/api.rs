@@ -12583,7 +12583,18 @@ pub(crate) async fn build_diagnosis_report(
             last_event_at,
             terminal_outcome: Some(TerminalOutcomeResponse {
                 state: execution.state,
-                error: execution.error,
+                // Decode the TEXT `error` exactly as the pending-activity path
+                // below decodes a task row's `error` (issue #608): on a
+                // codec-encrypting deployment a failed execution's error is a
+                // serialized envelope, and returning it verbatim would hand an
+                // admin ciphertext while the decode audit recorded nothing.
+                error: execution.error.map(|mut error| {
+                    if let Some(codecs) = decoder {
+                        *decode_outcome =
+                            decode_outcome.merged(decode_error_field(codecs, &mut error));
+                    }
+                    error
+                }),
                 completed_at: execution.completed_at,
             }),
             contributing_reason_codes: Vec::new(),

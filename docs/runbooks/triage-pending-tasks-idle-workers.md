@@ -24,6 +24,7 @@ Use this runbook when an alert fires indicating that tasks are sitting in `PENDI
 > | `activity_circuit_open` | `stalled` | The breaker for `activity_name` is open until `cooldown_until`. That field is **absent** when the breaker was operator-forced open — no probe is admitted on any timer, so recovery needs an explicit `force-close`. See `docs/runbooks/activity-circuit-breaker.md`. |
 > | `no_pending_work` | `stalled` | A `RUNNING` run with nothing pending — executor loss / lost task. Consider a redrive. |
 > | `activity_retrying` | `healthy` | Backing off; `last_error` says why, `next_attempt_at` says when. |
+> | `activity_deferred` | `healthy` | Pushed forward by the dispatcher with **no failure recorded** — a dispatch-time rate-limit deferral (#699/#369), session capacity (#606), or a capability-miss redelivery (#804). Distinct from `activity_retrying`: nothing failed, so do not go hunting an error. |
 > | `activity_rate_limited` / `activity_concurrency_deferred` | `healthy` | Deliberately paced by `key`. Raise the limit or wait. |
 > | `activity_queue_paused` | `blocked_external` | An operator paused `queue` (#619). Resume it. |
 > | `sleeping_timer` | `healthy` | A durable sleep until `fires_at` — **not** a stall, however old the last event is. |

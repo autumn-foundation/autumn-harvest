@@ -154,6 +154,18 @@ pub enum BlockedOn {
         #[serde(skip_serializing_if = "Option::is_none")]
         next_attempt_at: Option<DateTime<Utc>>,
     },
+    /// An activity was pushed into the future by the dispatcher with no failure
+    /// recorded against it — a dispatch-time rate-limit deferral (issue #699 /
+    /// #369), a session-capacity deferral (#606), or a capability-miss
+    /// redelivery (#804). Distinct from [`Self::ActivityRetrying`], which
+    /// requires evidence that an attempt actually failed.
+    ActivityDeferred {
+        /// The deferred activity, where the task row names one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        activity_name: Option<String>,
+        /// When the task becomes claimable again (the task's `scheduled_at`).
+        next_attempt_at: DateTime<Utc>,
+    },
     /// **No live worker is polling this activity's task queue.** The condition
     /// issue #486's coarse `pending_activity` bucket cannot express, and the one
     /// that never self-heals.
@@ -245,6 +257,7 @@ impl BlockedOn {
             Self::SleepingTimer { .. } => "sleeping_timer",
             Self::PendingChild { .. } => "pending_child",
             Self::ActivityRetrying { .. } => "activity_retrying",
+            Self::ActivityDeferred { .. } => "activity_deferred",
             Self::ActivityNoWorker { .. } => "activity_no_worker",
             Self::ActivityCircuitOpen { .. } => "activity_circuit_open",
             Self::ActivityRateLimited { .. } => "activity_rate_limited",
@@ -270,6 +283,7 @@ impl BlockedOn {
             | Self::SleepingTimer { .. }
             | Self::PendingChild { .. }
             | Self::ActivityRetrying { .. }
+            | Self::ActivityDeferred { .. }
             | Self::ActivityRateLimited { .. }
             | Self::ActivityConcurrencyDeferred { .. } => ExecutionHealth::Healthy,
             // Waiting on a party outside the engine.
@@ -413,12 +427,15 @@ pub struct DiagnosisInputs {
 #[must_use]
 pub const fn activity_precedence(blocked: &BlockedOn) -> u8 {
     match blocked {
-        BlockedOn::ActivityQueuePaused { .. } => 6,
-        BlockedOn::ActivityNoWorker { .. } => 5,
-        BlockedOn::ActivityCircuitOpen { .. } => 4,
-        BlockedOn::ActivityConcurrencyDeferred { .. } => 3,
-        BlockedOn::ActivityRateLimited { .. } => 2,
-        BlockedOn::ActivityRetrying { .. } => 1,
+        BlockedOn::ActivityQueuePaused { .. } => 7,
+        BlockedOn::ActivityNoWorker { .. } => 6,
+        BlockedOn::ActivityCircuitOpen { .. } => 5,
+        BlockedOn::ActivityConcurrencyDeferred { .. } => 4,
+        BlockedOn::ActivityRateLimited { .. } => 3,
+        // A row with recorded failure evidence outranks a clean dispatcher
+        // deferral: the failure is the more actionable of the two.
+        BlockedOn::ActivityRetrying { .. } => 2,
+        BlockedOn::ActivityDeferred { .. } => 1,
         _ => 0,
     }
 }
@@ -486,19 +503,39 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
         };
     }
 
-    // 4. Retry backoff: the task is not due, so it has not reached the claim
-    //    gates at all — a momentarily-saturated bucket or concurrency key says
-    //    nothing about whether it will be free at `scheduled_at`. Reporting one
-    //    of those instead would drop `attempt`, `last_error` and
-    //    `next_attempt_at`, the three fields an operator actually wants. The
-    //    three non-self-healing gates above still outrank it, because a task
-    //    backing off toward a queue nothing polls will never run at all.
+    // 4. Not due yet. The task has not reached the claim gates at all, so a
+    //    momentarily-saturated bucket or concurrency key says nothing about
+    //    whether it will be free at `scheduled_at`; reporting one of those
+    //    instead would drop `attempt`, `last_error` and `next_attempt_at`, the
+    //    three fields an operator actually wants. The three non-self-healing
+    //    gates above still outrank it, because a task waiting toward a queue
+    //    nothing polls will never run at all.
+    //
+    //    A future `scheduled_at` alone does NOT mean "failed and retrying".
+    //    The dispatcher also pushes a task forward with no failure at all:
+    //    `queue::defer_rate_limited_task` (dispatch-time rate limiting, issue
+    //    #699 / #369) even decrements the claim-time attempt back down because
+    //    "a rate-limit deferral is not an attempt", and the session-capacity
+    //    (#606) and capability-miss (#804) paths reuse the same clean
+    //    continuation. Calling those `activity_retrying` would send an operator
+    //    hunting a failure that never happened. So the verdict turns on
+    //    *failure evidence* — a recorded `error` — not on timing alone. The
+    //    error column survives a later deferral (`CleanContinuationChangeset`
+    //    does not clear it), so its presence is durable proof an attempt really
+    //    did fail, and its absence proof that none ever did.
     if facts.scheduled_at > now {
-        return BlockedOn::ActivityRetrying {
-            activity_name: facts.activity_name.clone(),
-            attempt: facts.attempt,
-            last_error: facts.last_error.clone(),
-            next_attempt_at: Some(facts.scheduled_at),
+        return if facts.last_error.is_some() {
+            BlockedOn::ActivityRetrying {
+                activity_name: facts.activity_name.clone(),
+                attempt: facts.attempt,
+                last_error: facts.last_error.clone(),
+                next_attempt_at: Some(facts.scheduled_at),
+            }
+        } else {
+            BlockedOn::ActivityDeferred {
+                activity_name: facts.activity_name.clone(),
+                next_attempt_at: facts.scheduled_at,
+            }
         };
     }
 
@@ -575,8 +612,30 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
     // `StallReason` ordering so the discovery and root-cause surfaces agree
     // about which category wins; external handoffs sit directly under regular
     // activities because they *are* the activity work, just executed elsewhere.
-    // An unfired timer well past its deadline is checked BEFORE the remaining
-    // categories. Timers fire only when a worker claims the owning workflow task
+    //
+    // The overdue-timer check below deliberately sits UNDER the activity bucket
+    // and must NOT be hoisted above it. Whether an overdue unfired timer is a
+    // wedge depends entirely on whether the owning workflow task was scheduled
+    // to wake at that deadline:
+    //   * A timer-only suspension (and the `receive_signal_timeout` deadline
+    //     race, which routes to the same persist path) calls
+    //     `queue::reschedule_task(task_id, fires_at)` — the task IS due to wake
+    //     at the deadline, so an unfired timer past it proves the wake never
+    //     happened. Those shapes leave no pending activity row, so they reach
+    //     the check below.
+    //   * `persist_scheduled_activities` parks the task on the ACTIVITY and
+    //     explicitly discards the armed deadline (`_min_fires_at`, commented
+    //     "armed timers observed on next wake; deadline unused here"). A
+    //     cancellable timer (issue #768) armed alongside an activity — e.g.
+    //     `join!(handle.await_fire(), ctx.execute_activity(..))` — therefore
+    //     goes overdue as a matter of course while the activity runs, and fires
+    //     on the activity's completion wake. Reporting that healthy run as
+    //     `timer_overdue`/`stalled` would be a false positive, which is the one
+    //     failure mode this endpoint must never have: it sends an operator
+    //     chasing a non-problem. Pinned by
+    //     `healthy_activity_alongside_an_overdue_timer_is_not_a_stall`.
+    // So the activity verdict wins first BY DESIGN — and when the activity is
+    // itself wedged, that verdict is the actionable root cause anyway. Timers fire only when a worker claims the owning workflow task
     // (`worker::ingest_due_timers_and_signals`); there is no independent timer
     // scanner. So a long-elapsed deadline is a hard fact that the engine failed
     // to act, not an inference — and it must outrank the legitimate-looking
@@ -637,29 +696,21 @@ pub const TIMER_OVERDUE_GRACE_SECONDS: i64 = 60;
 /// A one-sentence, human-readable rendering of a verdict, for CLI output and
 /// the response's `summary` field.
 #[must_use]
-pub fn summarize(blocked: &BlockedOn) -> String {
-    /// Render `activity 'name' ` when the row names one, else a bare noun.
-    fn activity_phrase(activity_name: Option<&String>) -> String {
-        activity_name.map_or_else(
-            || "a pending activity".to_string(),
-            |name| format!("activity '{name}'"),
-        )
-    }
+/// Render an activity row's name for a human summary, or a neutral phrase
+/// when `harvest_task_queue.activity_name` is NULL.
+fn activity_phrase(activity_name: Option<&String>) -> String {
+    activity_name.map_or_else(
+        || "a pending activity".to_string(),
+        |name| format!("activity '{name}'"),
+    )
+}
 
+/// Summarize the activity-row causes of [`summarize`].
+///
+/// Split out purely so [`summarize`] stays within the function-length lint
+/// budget; the two together are exhaustive over [`BlockedOn`].
+fn summarize_activity_cause(blocked: &BlockedOn) -> String {
     match blocked {
-        BlockedOn::HealthyInProgress => {
-            "work is in progress; nothing is blocking this execution".to_string()
-        }
-        BlockedOn::AwaitingSignal { signal_name, .. } => {
-            format!("waiting for signal '{signal_name}' to be sent")
-        }
-        BlockedOn::SleepingTimer { fires_at } => {
-            format!("sleeping on a durable timer until {fires_at}")
-        }
-        BlockedOn::PendingChild {
-            child_exec_id,
-            child_state,
-        } => format!("waiting on child workflow {child_exec_id} (state {child_state})"),
         BlockedOn::ActivityRetrying {
             activity_name,
             attempt,
@@ -676,13 +727,17 @@ pub fn summarize(blocked: &BlockedOn) -> String {
                 },
             )
         }
-        BlockedOn::TimerOverdue {
-            fires_at,
-            overdue_by_seconds,
-        } => format!(
-            "a durable timer was due at {fires_at} ({overdue_by_seconds}s ago) but nothing fired \
-             it — the owning workflow task was never claimed"
-        ),
+        BlockedOn::ActivityDeferred {
+            activity_name,
+            next_attempt_at,
+        } => {
+            let who = activity_phrase(activity_name.as_ref());
+            format!(
+                "{who} was deferred by the dispatcher with no failure recorded \
+                     (rate limit, session capacity, or capability miss); \
+                     next attempt at {next_attempt_at}"
+            )
+        }
         BlockedOn::ActivityNoWorker {
             queue,
             activity_name,
@@ -697,13 +752,13 @@ pub fn summarize(blocked: &BlockedOn) -> String {
             || {
                 format!(
                     "the circuit breaker for activity '{activity_name}' is open and \
-                     operator-forced; it needs an explicit force-close"
+                         operator-forced; it needs an explicit force-close"
                 )
             },
             |until| {
                 format!(
                     "the circuit breaker for activity '{activity_name}' is open; a probe is \
-                     admitted at {until}"
+                         admitted at {until}"
                 )
             },
         ),
@@ -722,6 +777,36 @@ pub fn summarize(blocked: &BlockedOn) -> String {
             "queue '{queue}' is paused by an operator, holding {}",
             activity_phrase(activity_name.as_ref())
         ),
+        // Every non-activity cause is handled by `summarize` itself.
+        other => summarize(other),
+    }
+}
+
+/// A one-sentence, human-readable rendering of a verdict, for CLI output and
+/// the response's `summary` field.
+#[must_use]
+pub fn summarize(blocked: &BlockedOn) -> String {
+    match blocked {
+        BlockedOn::HealthyInProgress => {
+            "work is in progress; nothing is blocking this execution".to_string()
+        }
+        BlockedOn::AwaitingSignal { signal_name, .. } => {
+            format!("waiting for signal '{signal_name}' to be sent")
+        }
+        BlockedOn::SleepingTimer { fires_at } => {
+            format!("sleeping on a durable timer until {fires_at}")
+        }
+        BlockedOn::PendingChild {
+            child_exec_id,
+            child_state,
+        } => format!("waiting on child workflow {child_exec_id} (state {child_state})"),
+        BlockedOn::TimerOverdue {
+            fires_at,
+            overdue_by_seconds,
+        } => format!(
+            "a durable timer was due at {fires_at} ({overdue_by_seconds}s ago) but nothing fired \
+             it — the owning workflow task was never claimed"
+        ),
         BlockedOn::AwaitingExternalHandoff {
             token,
             activity_name,
@@ -736,6 +821,9 @@ pub fn summarize(blocked: &BlockedOn) -> String {
         BlockedOn::NoPendingWork => "this execution has no pending work of any kind; its \
              workflow task may have been lost"
             .to_string(),
+        // Activity-row causes are summarized by a dedicated helper so this
+        // function stays within the line-length lint budget as variants grow.
+        activity_cause => summarize_activity_cause(activity_cause),
     }
 }
 
@@ -1032,10 +1120,153 @@ mod tests {
         facts.rate_limit_key = Some("r".to_string());
         facts.rate_limit_saturated = true;
         facts.scheduled_at = t(45);
+        facts.last_error = Some("connection reset".to_string());
         assert_eq!(
             classify_pending_activity(&facts, t(0)).kind(),
             "activity_retrying"
         );
+    }
+
+    #[test]
+    fn not_yet_due_task_without_failure_evidence_is_deferred_not_retrying() {
+        // `queue::defer_rate_limited_task` pushes `scheduled_at` forward AND
+        // decrements the claim-time attempt back down, recording no error —
+        // "a rate-limit deferral is not an attempt". Reporting that as
+        // `activity_retrying` would send an operator hunting a failure that
+        // never happened, so the verdict turns on failure evidence, not timing.
+        let mut facts = healthy_activity();
+        facts.scheduled_at = t(45);
+        facts.last_error = None;
+        let verdict = classify_pending_activity(&facts, t(0));
+        assert_eq!(verdict.kind(), "activity_deferred");
+        assert!(
+            matches!(
+                &verdict,
+                BlockedOn::ActivityDeferred { next_attempt_at, .. } if *next_attempt_at == t(45)
+            ),
+            "must carry the deferral deadline: {verdict:?}"
+        );
+        // A clean deferral self-heals, so it is not a stall.
+        assert_eq!(verdict.health(), ExecutionHealth::Healthy);
+    }
+
+    #[test]
+    fn not_yet_due_task_with_failure_evidence_is_retrying() {
+        // The mirror control: a recorded error is durable proof an attempt
+        // really did fail (`CleanContinuationChangeset` never clears it), so
+        // the retry facts are reported.
+        let mut facts = healthy_activity();
+        facts.scheduled_at = t(45);
+        facts.attempt = 3;
+        facts.last_error = Some("upstream 503".to_string());
+        let verdict = classify_pending_activity(&facts, t(0));
+        assert_eq!(verdict.kind(), "activity_retrying");
+        assert!(
+            matches!(
+                &verdict,
+                BlockedOn::ActivityRetrying {
+                    attempt: 3,
+                    last_error: Some(err),
+                    next_attempt_at: Some(at),
+                    ..
+                } if err == "upstream 503" && *at == t(45)
+            ),
+            "must carry attempt/last_error/next_attempt_at: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn non_self_healing_gates_still_outrank_a_clean_deferral() {
+        // A task deferred toward a queue nothing polls will never run at all,
+        // so the no-worker verdict must still win over the deferral.
+        let mut facts = healthy_activity();
+        facts.scheduled_at = t(45);
+        facts.last_error = None;
+        facts.has_live_worker = false;
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)).kind(),
+            "activity_no_worker"
+        );
+    }
+
+    #[test]
+    fn healthy_activity_alongside_an_overdue_timer_is_not_a_stall() {
+        // REGRESSION PIN. Hoisting the overdue-timer check above the activity
+        // bucket looks like a fix ("an overdue timer is a lost-task wedge") but
+        // is a false positive for a shape the engine produces routinely:
+        // `join!(cancellable_timer.await_fire(), ctx.execute_activity(..))`
+        // routes to `persist_scheduled_activities`, which parks the task on the
+        // ACTIVITY and discards the armed deadline (`_min_fires_at`). The timer
+        // then goes overdue as a matter of course while the activity runs, and
+        // fires on the activity's completion wake — nothing is wrong. A false
+        // "stalled" is the one verdict this endpoint must never emit, so the
+        // activity verdict wins.
+        let inputs = DiagnosisInputs {
+            activities: vec![healthy_activity()],
+            timers: vec![PendingTimerFacts {
+                fires_at: t(-600), // ten minutes past due
+            }],
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(
+            verdict.kind(),
+            "healthy_in_progress",
+            "an overdue timer alongside a healthy activity is not a stall: {verdict:?}"
+        );
+        assert_eq!(verdict.health(), ExecutionHealth::Healthy);
+    }
+
+    #[test]
+    fn overdue_timer_still_wins_when_no_activity_is_pending() {
+        // The complement: with no activity parking the task, the task WAS
+        // rescheduled to the deadline, so an unfired timer past it proves the
+        // wake never happened — and it must outrank the healthy-looking waits
+        // below (a signal-or-deadline race whose deadline the engine missed).
+        let inputs = DiagnosisInputs {
+            awaited_signals: vec![AwaitedSignalFacts {
+                signal_name: "approval".to_string(),
+                since: None,
+            }],
+            timers: vec![PendingTimerFacts { fires_at: t(-600) }],
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "timer_overdue", "{verdict:?}");
+        assert_eq!(verdict.health(), ExecutionHealth::Stalled);
+    }
+
+    #[test]
+    fn wedged_activity_alongside_an_overdue_timer_reports_the_activity() {
+        // When the activity IS the problem, its verdict is the actionable root
+        // cause and the overdue timer is downstream of it.
+        let mut facts = healthy_activity();
+        facts.has_live_worker = false;
+        let inputs = DiagnosisInputs {
+            activities: vec![facts],
+            timers: vec![PendingTimerFacts { fires_at: t(-600) }],
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "activity_no_worker", "{verdict:?}");
+        assert_eq!(verdict.health(), ExecutionHealth::Stalled);
+    }
+
+    #[test]
+    fn retrying_outranks_a_clean_deferral_across_rows() {
+        // Cross-task worst-of: recorded failure evidence is the more
+        // actionable of the two, so it wins the fold.
+        let mut deferred = healthy_activity();
+        deferred.scheduled_at = t(45);
+        let mut retrying = healthy_activity();
+        retrying.scheduled_at = t(45);
+        retrying.last_error = Some("boom".to_string());
+        let verdict = classify_execution(&inputs_with(vec![deferred, retrying]), t(0))
+            .expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "activity_retrying");
     }
 
     #[test]
@@ -1764,6 +1995,22 @@ mod tests {
         let mut facts = healthy_activity();
         facts.activity_name = None;
         facts.scheduled_at = t(600);
+
+        // Without failure evidence the row is a clean dispatcher deferral.
+        match classify_pending_activity(&facts, now) {
+            BlockedOn::ActivityDeferred {
+                activity_name,
+                next_attempt_at,
+            } => {
+                assert!(activity_name.is_none());
+                assert_eq!(next_attempt_at, t(600));
+            }
+            other => panic!("expected a nameless deferral verdict, got {other:?}"),
+        }
+
+        // With failure evidence it is a genuine retry backoff — still nameless,
+        // still never "nothing is blocking this".
+        facts.last_error = Some("boom".to_string());
         match classify_pending_activity(&facts, now) {
             BlockedOn::ActivityRetrying {
                 activity_name,
