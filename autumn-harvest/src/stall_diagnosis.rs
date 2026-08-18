@@ -660,9 +660,12 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
 /// every real cause. It exists to separate three states the row makes plain
 /// but no other table does:
 ///   * **claimed** (`worker_id IS NOT NULL`) — the handler is executing right
-///     now. A decision cycle that runs a long local activity (issue #98, up to
-///     a minute by default) schedules no queue row of any kind, so without this
-///     check a perfectly healthy in-flight run reports `no_pending_work`.
+///     now, *provided the claimant's queue still has a live poller*. A decision
+///     cycle that runs a long local activity (issue #98, up to a minute by
+///     default) schedules no queue row of any kind, so without this check a
+///     perfectly healthy in-flight run reports `no_pending_work`. A claim left
+///     behind by a crashed worker on a queue nothing polls is an orphan
+///     (issue #367), not progress, and reports [`BlockedOn::WorkflowNoWorker`].
 ///   * **awaiting dispatch** (`PENDING`) — about to be claimed. Healthy when a
 ///     live worker polls the queue; the workflow-task analogue of AC3's
 ///     flagship "no live worker" stall when one does not, and the operator-held
@@ -672,29 +675,55 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
 ///     exactly the lost-task shape, and its verdict is deliberately unchanged.
 #[must_use]
 pub fn classify_workflow_task(facts: &WorkflowTaskFacts, now: DateTime<Utc>) -> Option<BlockedOn> {
-    // A held claim is unambiguous: a worker is running the handler this instant.
+    // A worker holds the claim — but a *stored* claim only means progress while
+    // that worker is alive. A crashed worker leaves the row RUNNING with a
+    // non-null `worker_id` until the poison-pill reclaimer processes it (issue
+    // #367); if nothing polls the queue at all, that stale claim never advances
+    // and reporting it healthy would answer "fine" forever for a wedged run.
+    // Same rule, and the same fleet-coverage proxy, as a claimed activity row.
     if facts.has_worker {
-        return Some(BlockedOn::HealthyInProgress);
+        if facts.has_live_worker {
+            // Every impediment below is a *claim-time* gate — an operator pause
+            // included. None of them stops a handler that is already executing.
+            return Some(BlockedOn::HealthyInProgress);
+        }
+        return Some(BlockedOn::WorkflowNoWorker {
+            queue: facts.queue_name.clone(),
+        });
     }
-    // Only a PENDING row is awaiting a claim. See the parked case above.
+    // Only a PENDING row is awaiting a claim. A RUNNING row with a NULL worker
+    // is *parked*: it advances on a wake, not a claim, so a live poller proves
+    // nothing about it. Yield to the replay-wait / lost-task verdicts instead.
     if facts.state != "PENDING" {
         return None;
     }
+
+    // 1. An operator holds the whole queue (issue #619) — deliberate, and the
+    //    cause a triaging operator should see before anything else.
     if facts.queue_paused {
         return Some(BlockedOn::WorkflowQueuePaused {
             queue: facts.queue_name.clone(),
         });
     }
-    // Deliberately deferred by the dispatcher (retry backoff, a rate-limit or
-    // capability-miss redelivery): self-healing, so healthy.
-    if facts.scheduled_at > now {
-        return Some(BlockedOn::HealthyInProgress);
-    }
+
+    // 2. Nothing polls this queue. This never self-heals, and it outranks the
+    //    deferral below on purpose: unlike a timed sleep, a dispatcher deferral
+    //    only resolves when something claims the row at `scheduled_at`, so a
+    //    deferred row on a pollerless queue will never run at all. Reporting it
+    //    healthy would promise a claim that cannot happen.
     if !facts.has_live_worker {
         return Some(BlockedOn::WorkflowNoWorker {
             queue: facts.queue_name.clone(),
         });
     }
+
+    // 3. Deliberately deferred by the dispatcher (retry backoff, a rate-limit
+    //    or capability-miss redelivery). With coverage established above, this
+    //    genuinely self-heals when the timestamp arrives.
+    if facts.scheduled_at > now {
+        return Some(BlockedOn::HealthyInProgress);
+    }
+
     // Due, unimpeded, and covered by a live poller: ordinary dispatch latency.
     Some(BlockedOn::HealthyInProgress)
 }
@@ -2285,12 +2314,75 @@ mod tests {
     }
 
     #[test]
-    fn not_yet_due_pending_workflow_task_is_healthy() {
-        // Deliberately deferred by the dispatcher; self-healing, and a dead
-        // queue is not yet the operative fact.
+    fn not_yet_due_pending_workflow_task_with_a_live_worker_is_healthy() {
+        // Deliberately deferred by the dispatcher (retry backoff, a rate-limit
+        // or capability-miss redelivery). With a live poller on the queue this
+        // genuinely self-heals when `scheduled_at` arrives.
+        let task = WorkflowTaskFacts {
+            scheduled_at: t(30),
+            ..wf_task()
+        };
+        assert_eq!(
+            classify_workflow_task(&task, t(0)),
+            Some(BlockedOn::HealthyInProgress)
+        );
+    }
+
+    #[test]
+    fn not_yet_due_pending_workflow_task_on_a_dead_queue_reports_no_worker() {
+        // A deferral only self-heals if something will claim the row when the
+        // timestamp arrives. With no poller on the queue nobody ever will, so
+        // the coverage gap is the operative fact and must outrank the deferral
+        // — the same hard-impediment ordering `classify_pending_activity` uses.
         let task = WorkflowTaskFacts {
             scheduled_at: t(30),
             has_live_worker: false,
+            ..wf_task()
+        };
+        let verdict = classify_execution(&inputs_with_wf_task(task), t(0));
+        match verdict {
+            Some(BlockedOn::WorkflowNoWorker { ref queue }) => assert_eq!(queue, "default"),
+            other => panic!(
+                "expected workflow_no_worker for a deferral nobody will claim, got {other:?}"
+            ),
+        }
+        assert_eq!(verdict.map(|v| v.health()), Some(ExecutionHealth::Stalled));
+    }
+
+    #[test]
+    fn claimed_workflow_task_on_a_dead_queue_is_an_orphan_not_healthy() {
+        // A crashed worker leaves its workflow task RUNNING with a non-null
+        // worker_id until the poison-pill reclaimer processes it (issue #367).
+        // If nothing polls the queue, that stale claim never advances, so
+        // reporting "the handler is executing right now" would answer "fine"
+        // forever for a run that cannot move.
+        let task = WorkflowTaskFacts {
+            state: "RUNNING".to_string(),
+            has_worker: true,
+            has_live_worker: false,
+            ..wf_task()
+        };
+        let verdict = classify_execution(&inputs_with_wf_task(task), t(0));
+        match verdict {
+            Some(BlockedOn::WorkflowNoWorker { ref queue }) => assert_eq!(queue, "default"),
+            other => panic!("expected workflow_no_worker for a stale claim, got {other:?}"),
+        }
+        assert_eq!(
+            verdict.map(|v| v.health()),
+            Some(ExecutionHealth::Stalled),
+            "an orphaned claim on a dead queue is a stall, not progress",
+        );
+    }
+
+    #[test]
+    fn claimed_workflow_task_on_a_paused_queue_still_reports_healthy() {
+        // A pause is a *claim-time* gate: it stops new claims, it does not stop
+        // a handler already executing. A held claim on a covered queue is
+        // therefore progressing regardless of the operator hold.
+        let task = WorkflowTaskFacts {
+            state: "RUNNING".to_string(),
+            has_worker: true,
+            queue_paused: true,
             ..wf_task()
         };
         assert_eq!(

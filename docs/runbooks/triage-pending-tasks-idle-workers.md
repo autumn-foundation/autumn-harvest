@@ -22,7 +22,7 @@ Use this runbook when an alert fires indicating that tasks are sitting in `PENDI
 > |---|---|---|
 > | `activity_no_worker` | `stalled` | **No live worker polls `queue`.** Deploy/scale a worker for it, or fix the queue name. Cross-check with `GET /admin/queue-coverage` (#774). |
 > | `activity_circuit_open` | `stalled` | The breaker for `activity_name` is open until `cooldown_until`. That field is **absent** when the breaker was operator-forced open — no probe is admitted on any timer, so recovery needs an explicit `force-close`. See `docs/runbooks/activity-circuit-breaker.md`. |
-> | `workflow_no_worker` | `stalled` | **No live worker polls the queue the run's own decision cycle sits on.** Nothing individual is wedged — the workflow task itself can never be claimed. Same remedy as `activity_no_worker`, applied to the workflow queue. |
+> | `workflow_no_worker` | `stalled` | **No live worker polls the queue the run's own decision cycle sits on.** Nothing individual is wedged — the workflow task itself can never be claimed. Also covers a claim left behind by a crashed worker (a poison-pill orphan, #367) and a task deferred to a future `scheduled_at` that nothing will claim when it arrives. Same remedy as `activity_no_worker`, applied to the workflow queue. |
 > | `no_pending_work` | `stalled` | A `RUNNING` run with nothing pending and a *parked* workflow task — executor loss / lost task. Consider a redrive. |
 > | `activity_retrying` | `healthy` | Backing off; `last_error` says why, `next_attempt_at` says when. |
 > | `activity_deferred` | `healthy` | Pushed forward by the dispatcher with **no failure recorded** — a dispatch-time rate-limit deferral (#699/#369), session capacity (#606), or a capability-miss redelivery (#804). Distinct from `activity_retrying`: nothing failed, so do not go hunting an error. |
@@ -35,7 +35,7 @@ Use this runbook when an alert fires indicating that tasks are sitting in `PENDI
 > | `workflow_queue_paused` | `blocked_external` | An operator paused the queue the run's own decision cycle sits on (#619). Resume it. |
 > | `awaiting_replay_wait` | `blocked_external` | Parked on a durable wait that leaves no side-table row — `wait_kind` names which: `condition` (a `ctx.await_condition` park), `mutex` (#691 — `name` is the contended key; find the holder), `update`, or `external_workflow`. Only the replay-derived wait set can see these, so `wait_set` will read `replayed`. |
 > | `paused` | `blocked_external` | Operator-paused (#383); resume when ready. |
-> | `healthy_in_progress` | `healthy` | Genuinely running — an activity in flight, or the run's own decision cycle claimed by a worker or awaiting dispatch on a covered queue. |
+> | `healthy_in_progress` | `healthy` | Genuinely running — an activity in flight, or the run's own decision cycle claimed by a live worker or awaiting dispatch on a covered queue. |
 >
 > `contributing_reason_codes` lists **every** claim-time impediment on the
 > diagnosed activity, not just the highest-precedence one — so a task that is

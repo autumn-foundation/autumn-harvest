@@ -1597,6 +1597,94 @@ async fn claimed_workflow_task_reports_healthy_not_a_lost_task() {
         "NOW()",
     )
     .await;
+    seed_live_worker(&pool, "w-live", "default").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
+    assert_eq!(body["health"], "healthy", "body: {body}");
+}
+
+// ── PR #1188 review round 3: hard impediments outrank a stored claim ───────
+
+/// A crashed worker leaves its workflow task RUNNING with a non-null `worker_id`
+/// until the poison-pill reclaimer processes it (issue #367). With nothing
+/// polling the queue that stale claim never advances, so reporting "the handler
+/// is executing" would answer "fine" forever for a run that cannot move.
+#[tokio::test]
+async fn claimed_workflow_task_on_a_dead_queue_reports_workflow_no_worker() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "completes_wf", "RUNNING", vec![started_event()]).await;
+    // Claimed by a worker that is NOT registered as live: the orphan shape.
+    seed_workflow_task(
+        &pool,
+        exec_id,
+        "orphaned-wf-queue",
+        "RUNNING",
+        Some("w-crashed"),
+        "NOW()",
+    )
+    .await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "workflow_no_worker", "body: {body}");
+    assert_eq!(
+        body["blocked_on"]["queue"], "orphaned-wf-queue",
+        "body: {body}"
+    );
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// A dispatcher deferral (`scheduled_at` in the future) only self-heals when
+/// something claims the row once the timestamp arrives. On a queue nothing
+/// polls, nobody ever will — so the coverage gap outranks the deferral.
+#[tokio::test]
+async fn not_yet_due_workflow_task_on_a_dead_queue_reports_workflow_no_worker() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "completes_wf", "RUNNING", vec![started_event()]).await;
+    seed_workflow_task(
+        &pool,
+        exec_id,
+        "deferred-dead-queue",
+        "PENDING",
+        None,
+        "NOW() + INTERVAL '1 hour'",
+    )
+    .await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "workflow_no_worker", "body: {body}");
+    assert_eq!(
+        body["blocked_on"]["queue"], "deferred-dead-queue",
+        "body: {body}"
+    );
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// The control for the test above: with a live poller the same deferral is
+/// ordinary, self-healing dispatch scheduling.
+#[tokio::test]
+async fn not_yet_due_workflow_task_with_a_live_worker_is_healthy() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "completes_wf", "RUNNING", vec![started_event()]).await;
+    seed_workflow_task(
+        &pool,
+        exec_id,
+        "deferred-live-queue",
+        "PENDING",
+        None,
+        "NOW() + INTERVAL '1 hour'",
+    )
+    .await;
+    seed_live_worker(&pool, "w-deferred", "deferred-live-queue").await;
 
     let body = diagnose(&app, exec_id).await;
     assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
