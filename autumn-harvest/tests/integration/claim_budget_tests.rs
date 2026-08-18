@@ -2535,6 +2535,21 @@ async fn zz_capture_capability_labels_claim_evidence() {
             "label={label} stat-snapshot claim loop: claimed={claimed} of {} claimable",
             seeded.claimable_rows
         );
+        // Guard against a shared seeding/eligibility regression that makes
+        // BOTH labels claim the same wrong (e.g. partial, or zero) count --
+        // the equality check below this loop only compares the two labels
+        // against each other, which such a regression would still pass,
+        // letting an incomplete drain be published as an "equivalent
+        // 10,000-row measurement" (flagged by review on PR #1192).
+        assert_eq!(
+            claimed, seeded.claimable_rows,
+            "label={label} claimed {claimed} of {} seeded-claimable rows -- \
+             an incomplete or over-claiming drain invalidates every \
+             pg_stat_statements/pg_relation_size figure derived from this \
+             capture, so this must exactly match the ground-truth seeded \
+             count, not just match the other label",
+            seeded.claimable_rows,
+        );
         claimed_by_label.insert(label, claimed);
 
         let stats_rows: Vec<StatRow> = diesel::sql_query(

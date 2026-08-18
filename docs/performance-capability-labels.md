@@ -385,10 +385,18 @@ or, with only a reachable Docker daemon and no external Postgres:
 ./autumn-harvest/scripts/capability_labels_claim_perf_repro.sh
 ```
 
-Both regenerate every artifact under
-`docs/perf-artifacts/capability-labels-claim-predicate/` from scratch, except
-the two standalone SQL corroboration scripts, which are independent of the
-Rust harness -- regenerate them against any migrated database with:
+Both regenerate the `EXPLAIN` captures, `pg_stat_statements` snapshots, and
+`fixture-summary.txt` under
+`docs/perf-artifacts/capability-labels-claim-predicate/` from scratch.
+**They do NOT regenerate the two standalone SQL corroboration outputs**
+(`pg_relation_size_corroboration.txt` and
+`claim_update_bloat_corroboration.txt`) -- those scripts are independent of
+the Rust harness and are never invoked by either repro command above. After
+any schema, index, or storage-layout change to `harvest_task_queue` or
+`harvest_workers`, re-run these two commands explicitly as well, or the
+committed corroboration `.txt` outputs will silently go stale (reflecting
+the old layout) even though the primary `EXPLAIN`/`pg_stat_statements`
+captures are fresh:
 
 ```bash
 psql "$DATABASE_URL" \
