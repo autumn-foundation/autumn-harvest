@@ -311,27 +311,38 @@ all five runs**, i.e. **+8.3% more heap growth from the identical claim
 operation**, purely from carrying the wider payload forward into the new
 tuple version.
 
-This measurement reflects a specific, confirmed condition: this script now
-captures the direct evidence for that condition in its own output rather
-than relying on an out-of-band manual check (a gap review on PR #1192
-correctly flagged in an earlier revision of this script). The two
-`SELECT`s bracketing the `CALL` sample `pg_stat_user_tables.autovacuum_count`
-for `harvest_task_queue` immediately before and immediately after the
-five-run, 100,000-claim loop, and both read **0** in the committed
-artifact -- confirming that PostgreSQL's background autovacuum worker got
-no opportunity to run at all during this tight, uninterrupted execution.
-Every byte of space reclaimed here therefore comes solely from
+This measurement reflects a specific, confirmed condition, now closed by
+**construction** rather than by observation alone. The script disables
+autovacuum on `harvest_task_queue` for the duration of the loop
+(`ALTER TABLE ... SET (autovacuum_enabled = false)`), so no autovacuum run
+against it -- completed, in progress, or not yet started -- can occur
+while the five-run, 100,000-claim loop executes, regardless of timing.
+This closes a gap a plain before/after counter comparison cannot: a
+review finding on PR #1192 correctly caught that
+`pg_stat_user_tables.autovacuum_count` only increments when an autovacuum
+run on that relation *completes*, while VACUUM reclaims space into the
+free space map incrementally as it scans -- so a worker that started
+mid-loop and had not yet finished (hence not yet incremented the counter)
+by the time an "after" sample is taken could have already contributed
+reclaimed pages without a counter-based check alone ever detecting it.
+The two `SELECT`s bracketing the `CALL` still sample
+`pg_stat_user_tables.autovacuum_count` for `harvest_task_queue`
+immediately before and after the five-run, 100,000-claim loop and both
+read **0** in the committed artifact, but now only as a secondary sanity
+check (e.g. against a manual `VACUUM` run by some other session sharing
+the scratch database) -- the primary guarantee is the table-level disable
+itself. Every byte of space reclaimed here therefore comes solely from
 *opportunistic* HOT pruning triggered in-line by the claim loop's own
 commits, the reclaim mechanism any separately-committed claim sequence
 gets for free with zero background assistance. This page does **not**
 claim +8.3% is a guaranteed floor on the true effect under every possible
 reclaim condition -- whether *additional* reclaim (autovacuum firing
 mid-sequence, as could happen on a longer-running or busier production
-table) would widen or narrow the percentage gap is a directional question
-this measurement does not answer on its own. A plausibility argument for
-one direction is offered, and explicitly treated as unconfirmed rather
-than proven, in the discussion of the older historical figure immediately
-below.
+table where autovacuum is not disabled) would widen or narrow the
+percentage gap is a directional question this measurement does not answer
+on its own. A plausibility argument for one direction is offered, and
+explicitly treated as unconfirmed rather than proven, in the discussion of
+the older historical figure immediately below.
 
 An earlier measurement of this same separately-committed pattern, taken
 across five manually-repeated shell invocations of an earlier,

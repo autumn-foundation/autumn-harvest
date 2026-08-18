@@ -64,12 +64,42 @@
 -- review round further caught that "reflects this condition" is not the
 -- same claim as "is therefore a guaranteed floor on the true effect" --
 -- see the doc's Write-side cost section for how that distinction is now
--- drawn.) The two `SELECT`s immediately before and after the `CALL` below
--- close the verification gap: they capture harvest_task_queue's own
--- autovacuum_count directly in this script's output, so every
--- regeneration of this artifact carries its own proof (or disproof) of
--- the opportunistic-pruning-only condition inline, rather than relying on
--- an out-of-band manual check.
+-- drawn.)
+--
+-- A THIRD review round on PR #1192 correctly caught a race the
+-- before/after autovacuum_count comparison alone cannot close:
+-- pg_stat_user_tables.autovacuum_count is only incremented when an
+-- autovacuum RUN on this relation COMPLETES, but VACUUM reclaims space
+-- into the free space map (FSM) incrementally, page by page, as it scans
+-- -- well before that completion. A worker that STARTED vacuuming
+-- harvest_task_queue mid-loop and had not yet finished (hence not yet
+-- incremented the counter) by the time the "after" SELECT runs could
+-- therefore have already contributed reclaimed pages to the measured
+-- after_pages figure while autovacuum_count_before still equals
+-- autovacuum_count_after -- silently invalidating the opportunistic-
+-- pruning-only classification the equal-counter check alone was being
+-- used to prove.
+--
+-- Rather than try to detect that race after the fact (e.g. polling
+-- pg_stat_progress_vacuum, itself timing-fragile -- a worker that starts
+-- AND finishes between two polls is invisible to it), this script now
+-- closes it by construction: the `ALTER TABLE harvest_task_queue SET
+-- (autovacuum_enabled = false)` below disables autovacuum for this one
+-- table for the duration of the measurement, so no autovacuum run against
+-- it -- completed, in progress, or not yet started -- can occur at all
+-- while the loop runs, regardless of timing. (A prior-run autovacuum
+-- worker already mid-scan on this table at the instant that ALTER TABLE
+-- executes is not itself a further gap: the very next statement inside
+-- the loop's PROCEDURE is a TRUNCATE, which requires an
+-- AccessExclusiveLock that conflicts with autovacuum's lock --
+-- PostgreSQL autovacuum workers self-cancel rather than block a
+-- conflicting lock request, so any such worker is force-terminated
+-- before the first claim UPDATE in the loop ever runs.) The two
+-- `SELECT`s immediately before and after the `CALL` below are retained as
+-- a secondary sanity check only (e.g. against a manual `VACUUM` issued by
+-- some other session sharing this scratch database), not as the primary
+-- proof: with autovacuum disabled on the table, they are expected -- and
+-- required -- to always read equal.
 --
 -- pg_relation_size is a pure catalog/storage read, not an EXPLAIN estimate
 -- -- admissible evidence under this repo's performance-measurement
@@ -81,12 +111,21 @@
 -- measurement: running VACUUM ANALYZE immediately after an equivalent
 -- fresh bulk INSERT (before any claims) leaves pg_relation_size unchanged,
 -- because a freshly-inserted table has no dead tuples for VACUUM to act
--- on. Its absence also deliberately lets ordinary autovacuum activity (if
--- it fires during the loop's real wall-clock runtime) participate exactly
--- as it would in production, which is the whole point of testing the
--- separate-transaction pattern.
+-- on. Its absence, combined with the autovacuum-disable above, keeps this
+-- measurement scoped to opportunistic pruning alone: with no VACUUM of
+-- any kind able to touch this table while the loop runs, every byte of
+-- space reclaimed here comes solely from the opportunistic HOT pruning
+-- triggered in-line by the claim loop's own commits.
 \set ON_ERROR_STOP on
 \timing off
+
+-- Disable autovacuum on this one table for the duration of the
+-- measurement below (reset at cleanup, near the end of this script). This
+-- is what makes the opportunistic-pruning-only condition hold by
+-- construction rather than by observation of the autovacuum_count SELECTs
+-- further down -- see the header comment above for the review finding
+-- this closes.
+ALTER TABLE harvest_task_queue SET (autovacuum_enabled = false);
 
 CREATE TEMP TABLE claim_bloat_runs (
   run_no INT,
@@ -185,19 +224,21 @@ END;
 $body$ LANGUAGE plpgsql;
 
 -- autovacuum_count on harvest_task_queue immediately BEFORE the five-run
--- loop below. This is the baseline for the comparison the matching
--- "after" query (following the CALL, below) performs -- together they are
--- the direct, regenerable evidence for the opportunistic-pruning-only
--- condition described in docs/performance-capability-labels.md (which
--- draws no stronger conclusion than that condition -- see that doc's
--- Write-side cost section). A nonzero value here is not itself a problem:
--- the counter is cumulative, and a scratch database reused across
--- multiple runs of this script (or any other prior activity) can leave
--- this baseline above zero without any autovacuum having fired *during*
--- the measured loop that follows. What determines whether the
--- opportunistic-pruning-only condition holds for this run is whether this
--- value differs from autovacuum_count_after below, not whether this
--- baseline itself is zero.
+-- loop below. With autovacuum disabled on this table (the ALTER TABLE ...
+-- SET (autovacuum_enabled = false) above), the opportunistic-pruning-only
+-- condition described in docs/performance-capability-labels.md's
+-- Write-side cost section holds by construction, regardless of what this
+-- counter reads -- no autovacuum run against this table, completed or
+-- still in progress, can occur while autovacuum is disabled on it. This
+-- SELECT and the matching "after" query (following the CALL, below) are
+-- retained only as a secondary sanity check (e.g. against a manual
+-- VACUUM issued by some other session sharing this scratch database, or
+-- against a bug in the isolation itself), not as the primary proof. A
+-- nonzero value here is not itself a problem: the counter is cumulative,
+-- and a scratch database reused across multiple runs of this script (or
+-- any other prior activity) can leave this baseline above zero. With
+-- autovacuum disabled, this and the "after" value are expected -- and
+-- required -- to read equal.
 SELECT 'autovacuum_count_before' AS label, autovacuum_count
 FROM pg_stat_user_tables
 WHERE relname = 'harvest_task_queue';
@@ -208,15 +249,17 @@ CALL run_separate_txn_claim_bloat(5, 10000);
 -- loop. TRUNCATE does not reset this counter (it resets the table's
 -- storage/relfilenode, not the cumulative pg_stat_user_tables row for the
 -- relation's OID), so this value is directly comparable to the "before"
--- value above and reflects every autovacuum run against this table across
--- all ten TRUNCATE+seed+claim cycles (5 runs x 2 variants) inside the
--- CALL. If it equals autovacuum_count_before, zero background autovacuum
--- activity occurred during the measured loop and every byte of space
--- reclaimed above came solely from opportunistic HOT pruning triggered
--- in-line by the claim loop's own commits -- confirming the
--- opportunistic-pruning-only condition held for this run. If it is
--- greater, that condition does not hold and the measured range above may
--- include background-autovacuum reclamation.
+-- value above. With autovacuum disabled on this table for the duration of
+-- the loop (see the ALTER TABLE above), this is expected -- and required
+-- -- to equal autovacuum_count_before: every byte of space reclaimed
+-- above comes solely from opportunistic HOT pruning triggered in-line by
+-- the claim loop's own commits, by construction, not merely by
+-- observation. If this value is instead GREATER than
+-- autovacuum_count_before, autovacuum somehow ran against this table
+-- despite being disabled on it -- an unexpected condition worth
+-- investigating on its own, since it means the isolation this script
+-- relies on failed for this run, not that the +8.3% figure includes
+-- background reclamation as a valid alternate measurement.
 SELECT 'autovacuum_count_after' AS label, autovacuum_count
 FROM pg_stat_user_tables
 WHERE relname = 'harvest_task_queue';
@@ -257,7 +300,12 @@ SELECT
   round(AVG(extra_pct), 1) AS extra_pct_mean
 FROM per_run_pct;
 
--- cleanup: leave the scratch DB empty again and drop the throwaway helpers.
+-- cleanup: leave the scratch DB empty again, drop the throwaway helpers,
+-- and re-enable autovacuum on harvest_task_queue so any other script run
+-- against this same scratch database afterward (e.g.
+-- claim_update_bloat_corroboration.sql, or another run of this script)
+-- is not left with autovacuum silently disabled on the table.
 TRUNCATE harvest_task_queue RESTART IDENTITY;
+ALTER TABLE harvest_task_queue RESET (autovacuum_enabled);
 DROP PROCEDURE run_separate_txn_claim_bloat(INT, INT);
 DROP TABLE claim_bloat_runs;
