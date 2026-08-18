@@ -12570,6 +12570,10 @@ struct TaskClaimRequirements<'a> {
     required_build_id: Option<&'a str>,
     /// Capability requirements (issue #804).
     required_capabilities: Option<&'a serde_json::Value>,
+    /// `true` when `required_capabilities` came from **this process's** registry
+    /// rather than the row's own snapshot, so it describes only workers running
+    /// this build. See [`registry_fallback_binds`].
+    capabilities_from_registry_fallback: bool,
     /// Worker sessions (issue #606): the row belongs to a session, so it is
     /// claimable ONLY by the host in `sticky_worker_id`, with no expiry.
     is_session_member: bool,
@@ -12634,31 +12638,104 @@ fn worker_can_claim_now(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> 
         && worker.worker.status == autumn_harvest::workers::WorkerStatus::Active.as_str()
 }
 
-/// The capability requirements `claim_task` will actually enforce for this row.
+/// The capability requirements `claim_task` will enforce for this row, plus
+/// where they came from.
 ///
 /// The row's own `required_capabilities` snapshot is authoritative when present
 /// -- `claim_task_query` short-circuits its ineligible-activities gate on
 /// `required_capabilities IS NOT NULL`, so the snapshot is what gates the claim
 /// and the registry must never override it (the registry may have changed since
-/// the row was enqueued).
+/// the row was enqueued). A snapshotted requirement is enforced **row-side**, so
+/// it applies to every worker regardless of build.
 ///
-/// When the snapshot is **absent** -- a legacy or manually enqueued row -- the
-/// gate is NOT skipped: `claim_task` rejects any worker whose
-/// `ineligible_activities` list contains this row's `activity_name`, and that
-/// list is computed on each worker from the **registered** `ActivityInfo`'s
-/// `requires` matched against its own labels (`Worker::new`). Reading an absent
-/// snapshot as "no requirements" would therefore report `healthy_in_progress`
-/// for a task no live worker can claim.
+/// When the snapshot is **absent** the gate is NOT skipped: `claim_task` rejects
+/// any worker whose `ineligible_activities` list contains this row's
+/// `activity_name`, and that list is computed **on each worker** from **that
+/// worker's own** registry (`Worker::new`). Reading an absent snapshot as "no
+/// requirements" would report `healthy_in_progress` for a task no live worker
+/// can claim (issue #809, round 11) -- but the local registry describes only
+/// *this* process's build, so the fallback is per-worker evidence and callers
+/// must consult [`registry_fallback_binds`] before rejecting anyone on it.
 ///
 /// Mirrors `queue::apply_activity_requirements` (the shard-health coverage
 /// backfill) and the eligibility explainer's own resolution (issue #611), so
 /// all three surfaces answer the capability question identically.
-fn effective_required_capabilities<'a>(
+fn resolve_required_capabilities<'a>(
     row_capabilities: Option<&'a serde_json::Value>,
     activity_name: Option<&str>,
     registered: &'a std::collections::HashMap<String, serde_json::Value>,
-) -> Option<&'a serde_json::Value> {
-    row_capabilities.or_else(|| activity_name.and_then(|name| registered.get(name)))
+) -> ResolvedCapabilities<'a> {
+    row_capabilities.map_or_else(
+        || ResolvedCapabilities {
+            requirements: activity_name.and_then(|name| registered.get(name)),
+            from_registry_fallback: activity_name.is_some_and(|name| registered.contains_key(name)),
+        },
+        |snapshot| ResolvedCapabilities {
+            requirements: Some(snapshot),
+            from_registry_fallback: false,
+        },
+    )
+}
+
+/// The outcome of [`resolve_required_capabilities`].
+#[derive(Debug, Clone, Copy)]
+struct ResolvedCapabilities<'a> {
+    /// The requirements to enforce, if any.
+    requirements: Option<&'a serde_json::Value>,
+    /// `true` when they came from **this process's** registry rather than the
+    /// row's own snapshot, so they describe only workers running this build.
+    from_registry_fallback: bool,
+}
+
+/// May a registry-derived capability requirement be used to REJECT this worker?
+///
+/// Only when the worker runs the same build this process does. `claim_task`'s
+/// NULL-snapshot gate is `NOT (activity_name = ANY($6))`, and `$6` is the
+/// claiming worker's **own** `ineligible_activities`, built in `Worker::new`
+/// from **its own** registry's `ActivityInfo::requires`. During a rolling
+/// deployment those requirements differ by build: an old-build worker whose
+/// handler declares nothing has an empty ineligible list and IS admitted, even
+/// though this replica's newer handler demands a label that worker lacks.
+/// Rejecting it on our requirement would produce a false `activity_no_worker`
+/// -- the flagship stall verdict, and the worst error a triage tool can make.
+///
+/// Build identity is the only fleet-visible evidence of a shared build, so
+/// equality of the advertised `build_id` is the discriminator. Two consequences
+/// are deliberate:
+///
+/// - A deployment that configures **no** build ids (the default -- build
+///   routing is opt-in, issue #171) has `""` everywhere, so every worker
+///   compares equal and the fallback binds exactly as it did before. Such a
+///   deployment has no build signal at all, which is a pre-existing consequence
+///   of not configuring one.
+/// - Where the local build is **unknown** (an API-only replica, or a co-located
+///   worker that has not registered its row yet) it resolves to `""`, so the
+///   fallback binds for workers that also advertise no build -- the
+///   no-build-routing case above -- and not for any worker that does. A
+///   deployment that advertises builds therefore never has an unidentified
+///   replica reject a worker on a requirement it cannot attribute.
+///
+/// The residual: a rolling deploy in a deployment that configures **no** build
+/// ids is invisible here, so the false positive this guards against can still
+/// occur there. Configuring `WorkerConfig::build_id` (issue #171) is what makes
+/// a build skew observable at all.
+fn registry_fallback_binds(worker_build_id: &str, local_build_id: &str) -> bool {
+    worker_build_id == local_build_id
+}
+
+/// This process's build identity, read from the co-located worker's own
+/// advertised row.
+///
+/// The local worker registered with `WorkerConfig::build_id`, i.e. the build
+/// running in this very process -- the same build whose registry backs
+/// [`resolve_required_capabilities`]'s fallback. Empty when there is no
+/// co-located worker (an API-only replica) or it has not registered yet, which
+/// [`registry_fallback_binds`] treats as "no build identity configured".
+fn local_build_id_from_workers(workers: &[WorkerRow], local_worker_id: Option<&str>) -> String {
+    local_worker_id
+        .and_then(|local| workers.iter().find(|w| w.worker.worker_id == local))
+        .map(|w| w.worker.build_id.clone())
+        .unwrap_or_default()
 }
 
 /// Can ANY single live worker actually claim this task?
@@ -12700,8 +12777,9 @@ fn task_has_eligible_worker(
     shard_id: i32,
     reqs: TaskClaimRequirements<'_>,
     compat_set: &autumn_harvest::build_routing::BuildCompatibilitySet,
+    local_build_id: &str,
 ) -> bool {
-    !eligible_worker_ids(workers, shard_id, reqs, compat_set).is_empty()
+    !eligible_worker_ids(workers, shard_id, reqs, compat_set, local_build_id).is_empty()
 }
 
 /// WHICH workers could claim this task — the identities behind
@@ -12716,6 +12794,7 @@ fn eligible_worker_ids<'a>(
     shard_id: i32,
     reqs: TaskClaimRequirements<'_>,
     compat_set: &autumn_harvest::build_routing::BuildCompatibilitySet,
+    local_build_id: &str,
 ) -> Vec<&'a str> {
     let requirements = reqs.required_capabilities.and_then(|caps| {
         serde_json::from_value::<Vec<autumn_harvest::eligibility::Requirement>>(caps.clone()).ok()
@@ -12732,6 +12811,15 @@ fn eligible_worker_ids<'a>(
             }
             if !compat_set.is_eligible(&w.worker.build_id, reqs.required_build_id) {
                 return false;
+            }
+            // A requirement recovered from THIS process's registry describes
+            // only workers running THIS build; `claim_task` asks each worker's
+            // own registry instead. Rejecting a different-build worker on it
+            // would fabricate `activity_no_worker` for a row that claim admits.
+            if reqs.capabilities_from_registry_fallback
+                && !registry_fallback_binds(&w.worker.build_id, local_build_id)
+            {
+                return true;
             }
             requirements.as_ref().is_none_or(|parsed| {
                 let labels: std::collections::HashMap<String, String> =
@@ -13133,6 +13221,12 @@ pub(crate) async fn build_diagnosis_report(
             .unwrap_or_default();
         (workers, compat)
     };
+    // This process's build identity, read from the co-located worker's own
+    // advertised row. It scopes the registry capability fallback: a requirement
+    // recovered from THIS registry describes only workers running THIS build,
+    // and `claim_task` asks each worker's own registry instead (see
+    // [`registry_fallback_binds`]). `None` for an API-only replica.
+    let local_build_id = local_build_id_from_workers(&live_workers, local_worker_id.as_deref());
     // The row's OWN recorded shard, not `exec_id.shard()`. A pre-sharding (or
     // `ExecutionId::new()`) id carries the `ShardId::UNENCODED` sentinel
     // (0xFFFF), which the router resolves to the default shard — but a worker
@@ -13154,21 +13248,24 @@ pub(crate) async fn build_diagnosis_report(
             // WHICH workers could claim this row. Computed once: it answers
             // both "is anything alive for this task?" and "is our own
             // in-process breaker the one that will actually gate its dispatch?".
+            let capabilities = resolve_required_capabilities(
+                t.required_capabilities.as_ref(),
+                t.activity_name.as_deref(),
+                &activity_requirements,
+            );
             let eligible_ids = eligible_worker_ids(
                 &live_workers,
                 shard_id,
                 TaskClaimRequirements {
                     queue_name: &t.queue_name,
                     required_build_id: t.required_build_id.as_deref(),
-                    required_capabilities: effective_required_capabilities(
-                        t.required_capabilities.as_ref(),
-                        t.activity_name.as_deref(),
-                        &activity_requirements,
-                    ),
+                    required_capabilities: capabilities.requirements,
+                    capabilities_from_registry_fallback: capabilities.from_registry_fallback,
                     is_session_member: t.session_id.is_some(),
                     sticky_worker_id: t.sticky_worker_id.as_deref(),
                 },
                 &compat_set,
+                &local_build_id,
             );
             // The breaker registry is in-process, so its phase describes only
             // THIS replica. Treat it as the verdict only when our own worker is
@@ -13330,10 +13427,12 @@ pub(crate) async fn build_diagnosis_report(
                         // `task_type != 'activity'`, so a workflow task is only
                         // ever gated by its own snapshot.
                         required_capabilities: required_capabilities.as_ref(),
+                        capabilities_from_registry_fallback: false,
                         is_session_member: session_id.is_some(),
                         sticky_worker_id: sticky_worker_id.as_deref(),
                     },
                     &compat_set,
+                    &local_build_id,
                 ),
                 claimant_is_live: claimant_is_live(
                     &live_workers,
@@ -47510,7 +47609,8 @@ mod tests {
             &workers,
             0,
             claim_reqs("default"),
-            &compat
+            &compat,
+            ""
         ));
         // Same build -> eligible.
         assert!(task_has_eligible_worker(
@@ -47520,7 +47620,8 @@ mod tests {
                 required_build_id: Some("build-1"),
                 ..claim_reqs("default")
             },
-            &compat
+            &compat,
+            ""
         ));
         // A build the only queue poller does NOT run and is not declared
         // compatible with: the task is unclaimable even though the queue is
@@ -47532,7 +47633,8 @@ mod tests {
                 required_build_id: Some("build-2"),
                 ..claim_reqs("default")
             },
-            &compat
+            &compat,
+            ""
         ));
     }
 
@@ -47557,7 +47659,8 @@ mod tests {
                 required_build_id: Some("build-1"),
                 ..claim_reqs("default")
             },
-            &compat
+            &compat,
+            ""
         ));
         // A legacy worker (empty build_id) may claim anything.
         let legacy = vec![eligibility_worker(
@@ -47573,7 +47676,8 @@ mod tests {
                 required_build_id: Some("build-9"),
                 ..claim_reqs("default")
             },
-            &compat
+            &compat,
+            ""
         ));
     }
 
@@ -47603,7 +47707,8 @@ mod tests {
                 required_capabilities: Some(&gpu_req),
                 ..claim_reqs("default")
             },
-            &compat
+            &compat,
+            ""
         ));
         assert!(task_has_eligible_worker(
             &gpu,
@@ -47612,7 +47717,8 @@ mod tests {
                 required_capabilities: Some(&gpu_req),
                 ..claim_reqs("default")
             },
-            &compat
+            &compat,
+            ""
         ));
     }
 
@@ -47641,7 +47747,8 @@ mod tests {
                 required_capabilities: Some(&gpu_req),
                 ..claim_reqs("default")
             },
-            &compat
+            &compat,
+            ""
         ));
 
         // The same worker satisfying both IS coverage.
@@ -47659,7 +47766,8 @@ mod tests {
                 required_capabilities: Some(&gpu_req),
                 ..claim_reqs("default")
             },
-            &compat
+            &compat,
+            ""
         ));
     }
 
@@ -47685,7 +47793,8 @@ mod tests {
                 required_capabilities: Some(&garbage),
                 ..claim_reqs("default")
             },
-            &compat
+            &compat,
+            ""
         ));
         assert!(!task_has_eligible_worker(
             &workers,
@@ -47694,7 +47803,8 @@ mod tests {
                 required_capabilities: Some(&garbage),
                 ..claim_reqs("other-queue")
             },
-            &compat
+            &compat,
+            ""
         ));
     }
 
@@ -47719,7 +47829,8 @@ mod tests {
                     sticky_worker_id: Some("w-host"),
                     ..claim_reqs("gpu")
                 },
-                &compat
+                &compat,
+                ""
             ),
             "a session member is claimable ONLY by its pinned host; a peer that \
              covers the queue can never claim it, so this is a genuine stall"
@@ -47738,7 +47849,8 @@ mod tests {
                 sticky_worker_id: Some("w-host"),
                 ..claim_reqs("gpu")
             },
-            &compat
+            &compat,
+            ""
         ));
     }
 
@@ -47758,7 +47870,8 @@ mod tests {
                 sticky_worker_id: None,
                 ..claim_reqs("gpu")
             },
-            &compat
+            &compat,
+            ""
         ));
     }
 
@@ -47782,7 +47895,8 @@ mod tests {
                 sticky_worker_id: Some("w-host"),
                 ..claim_reqs("gpu")
             },
-            &compat
+            &compat,
+            ""
         ));
     }
 
@@ -47807,7 +47921,8 @@ mod tests {
                 sticky_worker_id: Some("w-gone"),
                 ..claim_reqs("default")
             },
-            &compat
+            &compat,
+            ""
         ));
     }
 
@@ -47830,7 +47945,8 @@ mod tests {
             &draining,
             0,
             claim_reqs("default"),
-            &compat
+            &compat,
+            ""
         ));
 
         // The same worker while still `Active` IS coverage.
@@ -47844,7 +47960,8 @@ mod tests {
             &active,
             0,
             claim_reqs("default"),
-            &compat
+            &compat,
+            ""
         ));
     }
 
@@ -49368,11 +49485,15 @@ mod tests {
                 serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
             )]);
 
-        let resolved = effective_required_capabilities(None, Some("gated"), &registered);
+        let resolved = resolve_required_capabilities(None, Some("gated"), &registered);
         assert_eq!(
-            resolved,
+            resolved.requirements,
             registered.get("gated"),
             "a NULL snapshot must resolve to the registered requirements"
+        );
+        assert!(
+            resolved.from_registry_fallback,
+            "and must report that they came from THIS process's registry"
         );
     }
 
@@ -49389,9 +49510,11 @@ mod tests {
                 serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
             )]);
 
-        assert_eq!(
-            effective_required_capabilities(Some(&snapshot), Some("gated"), &registered),
-            Some(&snapshot)
+        let resolved = resolve_required_capabilities(Some(&snapshot), Some("gated"), &registered);
+        assert_eq!(resolved.requirements, Some(&snapshot));
+        assert!(
+            !resolved.from_registry_fallback,
+            "a snapshotted requirement is row-side, so it gates every build"
         );
     }
 
@@ -49399,8 +49522,13 @@ mod tests {
     fn effective_capabilities_are_none_when_neither_source_has_any() {
         let registered: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
-        assert!(effective_required_capabilities(None, Some("ungated"), &registered).is_none());
-        assert!(effective_required_capabilities(None, None, &registered).is_none());
+        for resolved in [
+            resolve_required_capabilities(None, Some("ungated"), &registered),
+            resolve_required_capabilities(None, None, &registered),
+        ] {
+            assert!(resolved.requirements.is_none());
+            assert!(!resolved.from_registry_fallback);
+        }
     }
 
     /// The circuit registry is **in-process** (`circuit_breaker.rs`) and each
@@ -49459,13 +49587,13 @@ mod tests {
             ..TaskClaimRequirements::default()
         };
 
-        let ids = eligible_worker_ids(&workers, 0, reqs, &compat);
+        let ids = eligible_worker_ids(&workers, 0, reqs, &compat, "");
         assert_eq!(ids, vec!["w-a", "w-b"]);
 
         // The boolean helper stays exactly "the set is non-empty", so every
         // existing eligibility guarantee is preserved by construction.
         assert_eq!(
-            task_has_eligible_worker(&workers, 0, reqs, &compat),
+            task_has_eligible_worker(&workers, 0, reqs, &compat, ""),
             !ids.is_empty()
         );
     }
@@ -49487,6 +49615,7 @@ mod tests {
             serde_json::json!({"gpu": "false"}),
         )];
         let compat = autumn_harvest::build_routing::BuildCompatibilitySet::new();
+        let resolved = resolve_required_capabilities(None, Some("gated"), &registered);
 
         assert!(
             !task_has_eligible_worker(
@@ -49494,14 +49623,12 @@ mod tests {
                 0,
                 TaskClaimRequirements {
                     queue_name: "payments",
-                    required_capabilities: effective_required_capabilities(
-                        None,
-                        Some("gated"),
-                        &registered
-                    ),
+                    required_capabilities: resolved.requirements,
+                    capabilities_from_registry_fallback: resolved.from_registry_fallback,
                     ..TaskClaimRequirements::default()
                 },
                 &compat,
+                "",
             ),
             "an unsnapshotted row must still be gated by the registered requirements"
         );
@@ -49518,14 +49645,145 @@ mod tests {
             0,
             TaskClaimRequirements {
                 queue_name: "payments",
-                required_capabilities: effective_required_capabilities(
-                    None,
-                    Some("gated"),
-                    &registered
-                ),
+                required_capabilities: resolved.requirements,
+                capabilities_from_registry_fallback: resolved.from_registry_fallback,
                 ..TaskClaimRequirements::default()
             },
             &compat,
+            "",
         ));
+    }
+    #[test]
+    fn registry_fallback_binds_only_to_a_worker_on_the_local_build() {
+        // Same build -- the local registry genuinely describes that worker's
+        // handler, so its `requires` is what `claim_task` will enforce.
+        assert!(registry_fallback_binds("build-x", "build-x"));
+
+        // The default, no-build-routing deployment: every worker (and this
+        // process) advertises no build identity, so they are treated as one
+        // build and the fallback binds exactly as it did before.
+        assert!(registry_fallback_binds("", ""));
+
+        // Rolling deploy: the worker runs a DIFFERENT build, whose handler may
+        // declare no requirement at all. We have no evidence about it, so the
+        // fallback must not be used to reject it.
+        assert!(!registry_fallback_binds("build-old", "build-new"));
+
+        // One side unidentified is still not evidence of a shared build.
+        assert!(!registry_fallback_binds("build-old", ""));
+        assert!(!registry_fallback_binds("", "build-new"));
+    }
+
+    #[test]
+    fn local_build_id_reads_the_local_workers_advertised_build() {
+        let workers = vec![
+            eligibility_worker("w-peer", &["payments"], "build-old", serde_json::json!({})),
+            eligibility_worker("w-local", &["payments"], "build-new", serde_json::json!({})),
+        ];
+
+        assert_eq!(
+            local_build_id_from_workers(&workers, Some("w-local")),
+            "build-new",
+        );
+
+        // A co-located worker that has not registered a row yet, and an
+        // API-only replica, both leave the local build unidentified -- which
+        // `registry_fallback_binds` reads as "no build identity configured".
+        assert!(local_build_id_from_workers(&workers, Some("w-missing")).is_empty());
+        assert!(local_build_id_from_workers(&workers, None).is_empty());
+    }
+
+    #[test]
+    fn registry_fallback_does_not_gate_a_worker_on_a_different_build() {
+        // Rolling deploy. THIS replica runs `build-new`, whose `gated` handler
+        // declares `requires = gpu=true`. The row was enqueued by `build-old`,
+        // whose handler declared nothing, so its snapshot is NULL -- and
+        // `claim_task` admits the old worker, because that worker builds its
+        // own `ineligible_activities` from its OWN registry, which has no
+        // requirement for `gated`. Diagnosis must not reject it on our
+        // requirement and report a false `activity_no_worker`.
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::from([(
+                "gated".to_string(),
+                serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+            )]);
+        let compat = autumn_harvest::build_routing::BuildCompatibilitySet::new();
+        let resolved = resolve_required_capabilities(None, Some("gated"), &registered);
+        assert!(
+            resolved.from_registry_fallback,
+            "a NULL snapshot resolved from the registry IS a fallback"
+        );
+
+        let old_build = vec![eligibility_worker(
+            "w-old",
+            &["payments"],
+            "build-old",
+            serde_json::json!({}),
+        )];
+        assert_eq!(
+            eligible_worker_ids(
+                &old_build,
+                0,
+                TaskClaimRequirements {
+                    queue_name: "payments",
+                    required_capabilities: resolved.requirements,
+                    capabilities_from_registry_fallback: resolved.from_registry_fallback,
+                    ..TaskClaimRequirements::default()
+                },
+                &compat,
+                "build-new",
+            ),
+            vec!["w-old"],
+            "a worker on another build must not be rejected on OUR registry's requirement"
+        );
+
+        // Control 1 -- round 11 preserved. A worker on the SAME build is still
+        // gated by the fallback, because our registry does describe its handler.
+        let same_build = vec![eligibility_worker(
+            "w-new",
+            &["payments"],
+            "build-new",
+            serde_json::json!({"gpu": "false"}),
+        )];
+        assert!(
+            eligible_worker_ids(
+                &same_build,
+                0,
+                TaskClaimRequirements {
+                    queue_name: "payments",
+                    required_capabilities: resolved.requirements,
+                    capabilities_from_registry_fallback: resolved.from_registry_fallback,
+                    ..TaskClaimRequirements::default()
+                },
+                &compat,
+                "build-new",
+            )
+            .is_empty(),
+            "the fallback must still gate a worker running the build it came from"
+        );
+
+        // Control 2 -- a requirement carried on the ROW's own snapshot is what
+        // `claim_task` enforces server-side, independent of any worker's build,
+        // so it gates every build.
+        let snapshot = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+        let snapshotted =
+            resolve_required_capabilities(Some(&snapshot), Some("gated"), &registered);
+        assert!(!snapshotted.from_registry_fallback);
+        assert!(
+            eligible_worker_ids(
+                &old_build,
+                0,
+                TaskClaimRequirements {
+                    queue_name: "payments",
+                    required_capabilities: snapshotted.requirements,
+                    capabilities_from_registry_fallback: snapshotted.from_registry_fallback,
+                    ..TaskClaimRequirements::default()
+                },
+                &compat,
+                "build-new",
+            )
+            .is_empty(),
+            "a snapshotted requirement is row-side and gates every build"
+        );
     }
 }

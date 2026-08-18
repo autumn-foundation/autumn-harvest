@@ -2980,3 +2980,94 @@ async fn half_open_circuit_is_not_reported_as_operator_forced() {
         "the summary must name the recovering phase: {summary}"
     );
 }
+
+/// **Rolling deploy.** The row was enqueued by an older build whose handler
+/// declared no `requires`, so its `required_capabilities` snapshot is NULL. This
+/// API replica runs the NEWER build, whose `registry_gated` handler demands
+/// `gpu=true`.
+///
+/// `claim_task`'s NULL-snapshot gate is `NOT (activity_name = ANY($6))`, and
+/// `$6` is the CLAIMING worker's own `ineligible_activities`, built in
+/// `Worker::new` from **its own** registry. The old-build worker's list is
+/// empty, so it is admitted and the task will run. Diagnosis must not reject it
+/// on this replica's requirement and report a false `activity_no_worker`.
+#[tokio::test]
+async fn rolling_deploy_old_build_worker_is_not_rejected_on_the_new_builds_requirement() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    seed_unsnapshotted_task(&pool, exec_id, "payments", "registry_gated").await;
+    // This process's co-located worker advertises the NEW build.
+    seed_live_worker_with(
+        &pool,
+        LOCAL_WORKER_ID,
+        "payments",
+        "build-new",
+        json!({"gpu": "false"}),
+    )
+    .await;
+    // A worker still running the OLD build, whose handler has no requirement.
+    seed_live_worker_with(
+        &pool,
+        "w-old-build",
+        "payments",
+        "build-old",
+        json!({"gpu": "false"}),
+    )
+    .await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_ne!(
+        kind(&body),
+        "activity_no_worker",
+        "an old-build worker that claim_task admits must not be reported as no coverage: {body}"
+    );
+    assert_ne!(body["health"], "stalled", "body: {body}");
+    assert!(
+        !body["contributing_reason_codes"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|c| c == "no_live_worker"),
+        "the reason codes must agree with the verdict: {body}"
+    );
+}
+
+/// The control -- round 11 preserved. When every live worker runs the SAME build
+/// as this replica, our registry genuinely describes their handlers, so the
+/// fallback still gates them and an unsatisfied label is a real stall.
+#[tokio::test]
+async fn same_build_workers_are_still_gated_by_the_registry_fallback() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    seed_unsnapshotted_task(&pool, exec_id, "payments", "registry_gated").await;
+    seed_live_worker_with(
+        &pool,
+        LOCAL_WORKER_ID,
+        "payments",
+        "build-new",
+        json!({"gpu": "false"}),
+    )
+    .await;
+    seed_live_worker_with(
+        &pool,
+        "w-peer-same-build",
+        "payments",
+        "build-new",
+        json!({"gpu": "false"}),
+    )
+    .await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "activity_no_worker",
+        "the registered requirements must still gate workers on our own build: {body}"
+    );
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
