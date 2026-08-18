@@ -70,11 +70,16 @@ note](#review-note-an-analyze-asymmetry-the-harness-carried-caught-by-review)
 below -- the same `Seq Scan on harvest_workers` access path for all four
 aliased `worker_info`-CTE lookups) and differ only in per-node buffer counts:
 
-- The `Seq Scan on harvest_task_queue` node itself grows from 244 to 338
-  buffers (delta 94) -- almost exactly the query's whole top-level delta at
-  this depth (94 of 94; see Measurement below). This is the scan reading the
-  wider `required_capabilities`-bearing tuples off the heap, not any
-  correlated subplan doing extra I/O.
+- The `Seq Scan on harvest_task_queue` node reports 244 -> 338 total buffers
+  (delta 94) -- almost exactly the query's whole top-level delta at this
+  depth (94 of 94; see Measurement below). That 338 is a **cumulative**
+  subtree total, not the scan's own exclusive read cost: it already includes
+  the nested `SubPlan 10`/`InitPlan`s discussed next, since Postgres reports
+  `EXPLAIN` buffer usage inclusively at every ancestor node. Of the 94-buffer
+  delta, 90 buffers are the scan reading the wider
+  `required_capabilities`-bearing tuples directly off the heap, and 4 are
+  `SubPlan 10`'s own cumulative contribution -- the exact split is derived
+  below, once `SubPlan 10`'s buffer figure has been introduced.
 - `SubPlan 10` (the correlated `jsonb_array_elements(t.required_capabilities)`
   requirement check) reports `(never executed)` under `no-capabilities` --
   the planner short-circuits it entirely when the column is `NULL` -- and
@@ -113,11 +118,13 @@ every ancestor node in an `EXPLAIN` tree, the same convention it uses for
 "Actual Total Time" -- so that figure already counts `InitPlan 6`/`7`'s
 `shared hit=2` each; it is not 4 *in addition to* their 2+2. Subtracting
 `SubPlan 10`'s total (4) from the `Seq Scan`'s own total (338) leaves 334 --
-exactly matching the 334-heap-page figure independently derived via a
-`TRUNCATE`+re-INSERT `pg_relation_size` measurement on this identical
-10,000-row/4-queue shape (see the code comment on the seeding helper in
-`claim_budget_tests.rs`), which corroborates that the label-matching
-machinery contributes only 4 buffers here, not 8.
+i.e. the scan's own, exclusive heap-read cost grows 244 -> 334 (delta 90),
+not 244 -> 338 (delta 94). That isolated 334-page figure exactly matches the
+334-heap-page figure independently derived via a `TRUNCATE`+re-INSERT
+`pg_relation_size` measurement on this identical 10,000-row/4-queue shape
+(see the code comment on the seeding helper in `claim_budget_tests.rs`),
+which corroborates that the label-matching machinery contributes only 4
+buffers here, not 8.
 
 ## Measurement
 
@@ -237,9 +244,11 @@ they do (artifacts:
 `docs/perf-artifacts/capability-labels-claim-predicate/claim_update_bloat_corroboration.{sql,txt}`)
 -- **+37.6% more heap growth from the identical claim operation**, purely
 from carrying the wider payload forward into the new tuple version. That
-figure lands in the same ~30-37% band as every other measurement on this
-page, which is expected: the claim `UPDATE`'s new tuple version is subject
-to the same per-row-width effect as the original scan.
+figure lands within the ~30-47% band spanned by every other measurement on
+this page (from the +30.2% `EXPLAIN` delta at backlog=1,000 to the +46.57%
+`pg_stat_statements` aggregate delta above), which is expected: the claim
+`UPDATE`'s new tuple version is subject to the same per-row-width effect as
+the original scan.
 
 This bloat is **not fully transient**: `VACUUM` (autovacuum, in production)
 marks the superseded tuple versions' space as reusable for future writes to
