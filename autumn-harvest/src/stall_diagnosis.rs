@@ -650,6 +650,52 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
     BlockedOn::HealthyInProgress
 }
 
+/// The **hard** impediments on a workflow task row — the ones that stop it
+/// being claimed at all.
+///
+/// Returns only [`BlockedOn::WorkflowQueuePaused`] and
+/// [`BlockedOn::WorkflowNoWorker`]; a claimable row yields `None`. The ordinary
+/// healthy-dispatch verdict is deliberately withheld so callers can consult
+/// this *above* a side-table cause without masking it.
+///
+/// This matters because durable side-table waits do not advance on their own:
+/// a timer fires only when a worker claims the owning workflow task and
+/// `worker::ingest_due_timers_and_signals` runs. So a run sleeping on a timer
+/// whose workflow queue is operator-held (issue #619) or has no live poller is
+/// not sleeping — it can never wake — and the queue is the actionable cause.
+///
+/// Three row shapes, matching [`classify_workflow_task`]:
+///   * **claimed** (`worker_id IS NOT NULL`) — a handler is executing, so no
+///     *claim-time* gate applies; a pause cannot stop it. A claim left behind
+///     by a crashed worker on a queue nothing polls is an orphan (issue #367),
+///     not progress, and reports [`BlockedOn::WorkflowNoWorker`].
+///   * **parked** (`RUNNING` with a NULL worker) — advances on a *wake*, not a
+///     claim, so no claim-time gate applies and this returns `None`. That is
+///     what keeps a parked run's side-table cause (a handoff, a child, a
+///     signal, a sleeping timer) the answer.
+///   * **`PENDING`** — awaiting a claim, so both gates apply. A pause outranks
+///     missing coverage: it is deliberate, and lifting it is the fix.
+#[must_use]
+pub fn workflow_task_hard_impediment(facts: &WorkflowTaskFacts) -> Option<BlockedOn> {
+    if facts.has_worker {
+        // A stored claim only means progress while that worker is alive.
+        return (!facts.has_live_worker).then(|| BlockedOn::WorkflowNoWorker {
+            queue: facts.queue_name.clone(),
+        });
+    }
+    if facts.state != "PENDING" {
+        return None;
+    }
+    if facts.queue_paused {
+        return Some(BlockedOn::WorkflowQueuePaused {
+            queue: facts.queue_name.clone(),
+        });
+    }
+    (!facts.has_live_worker).then(|| BlockedOn::WorkflowNoWorker {
+        queue: facts.queue_name.clone(),
+    })
+}
+
 /// Classify the run's OWN workflow task row.
 ///
 /// Returns `None` when the row cannot explain the run's state, leaving the
@@ -670,61 +716,31 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
 ///     live worker polls the queue; the workflow-task analogue of AC3's
 ///     flagship "no live worker" stall when one does not, and the operator-held
 ///     [`BlockedOn::WorkflowQueuePaused`] when the queue is paused (issue #619).
+///     A row deliberately deferred by the dispatcher (retry backoff, a
+///     rate-limit or capability-miss redelivery) is healthy once coverage is
+///     established: it self-heals when its timestamp arrives.
 ///   * **parked** (`RUNNING` with a NULL worker) — advances on a *wake*, not a
 ///     claim, so a live worker proves nothing and this returns `None`. That is
 ///     exactly the lost-task shape, and its verdict is deliberately unchanged.
+///
+/// The hard impediments are shared with [`workflow_task_hard_impediment`], so
+/// the fallback verdict and the timer-gating check can never disagree about
+/// whether a row is claimable.
 #[must_use]
-pub fn classify_workflow_task(facts: &WorkflowTaskFacts, now: DateTime<Utc>) -> Option<BlockedOn> {
-    // A worker holds the claim — but a *stored* claim only means progress while
-    // that worker is alive. A crashed worker leaves the row RUNNING with a
-    // non-null `worker_id` until the poison-pill reclaimer processes it (issue
-    // #367); if nothing polls the queue at all, that stale claim never advances
-    // and reporting it healthy would answer "fine" forever for a wedged run.
-    // Same rule, and the same fleet-coverage proxy, as a claimed activity row.
-    if facts.has_worker {
-        if facts.has_live_worker {
-            // Every impediment below is a *claim-time* gate — an operator pause
-            // included. None of them stops a handler that is already executing.
-            return Some(BlockedOn::HealthyInProgress);
-        }
-        return Some(BlockedOn::WorkflowNoWorker {
-            queue: facts.queue_name.clone(),
-        });
+pub fn classify_workflow_task(facts: &WorkflowTaskFacts) -> Option<BlockedOn> {
+    if let Some(hard) = workflow_task_hard_impediment(facts) {
+        return Some(hard);
     }
-    // Only a PENDING row is awaiting a claim. A RUNNING row with a NULL worker
-    // is *parked*: it advances on a wake, not a claim, so a live poller proves
-    // nothing about it. Yield to the replay-wait / lost-task verdicts instead.
+    // Claimed, on a covered queue: a handler is executing right now.
+    if facts.has_worker {
+        return Some(BlockedOn::HealthyInProgress);
+    }
+    // Parked: yield to the replay-wait / lost-task verdicts.
     if facts.state != "PENDING" {
         return None;
     }
-
-    // 1. An operator holds the whole queue (issue #619) — deliberate, and the
-    //    cause a triaging operator should see before anything else.
-    if facts.queue_paused {
-        return Some(BlockedOn::WorkflowQueuePaused {
-            queue: facts.queue_name.clone(),
-        });
-    }
-
-    // 2. Nothing polls this queue. This never self-heals, and it outranks the
-    //    deferral below on purpose: unlike a timed sleep, a dispatcher deferral
-    //    only resolves when something claims the row at `scheduled_at`, so a
-    //    deferred row on a pollerless queue will never run at all. Reporting it
-    //    healthy would promise a claim that cannot happen.
-    if !facts.has_live_worker {
-        return Some(BlockedOn::WorkflowNoWorker {
-            queue: facts.queue_name.clone(),
-        });
-    }
-
-    // 3. Deliberately deferred by the dispatcher (retry backoff, a rate-limit
-    //    or capability-miss redelivery). With coverage established above, this
-    //    genuinely self-heals when the timestamp arrives.
-    if facts.scheduled_at > now {
-        return Some(BlockedOn::HealthyInProgress);
-    }
-
-    // Due, unimpeded, and covered by a live poller: ordinary dispatch latency.
+    // PENDING, unheld and covered — either due (ordinary dispatch latency) or
+    // deliberately deferred by the dispatcher. Both self-heal.
     Some(BlockedOn::HealthyInProgress)
 }
 
@@ -856,6 +872,29 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
     // `overdue_timer_wins_when_the_workflow_wake_was_genuinely_missed`). This is
     // NOT the event-age heuristic AC4 forbids: a future deadline still reports
     // `sleeping_timer` however old the run is.
+    // A durable side-table wait does not advance on its own: a timer fires only
+    // when a worker claims the owning workflow task. So a HARD impediment on
+    // that task — an operator queue pause (issue #619) or no live poller —
+    // means the run cannot wake at all, whatever the side tables say, and names
+    // the queue an operator must actually fix. Only the hard impediments are
+    // hoisted here; the ordinary healthy-dispatch verdict stays in the fallback
+    // below, or it would mask the more specific `sleeping_timer`.
+    //
+    // Ranked BELOW the activity bucket on purpose: a wedged activity names the
+    // specific thing to fix, and hoisting this above it would mask that
+    // (pinned by `wedged_activity_still_outranks_a_workflow_queue_impediment`).
+    // Ranked ABOVE the handoff/child/signal categories is harmless by
+    // construction — every one of those parks the workflow task, and a parked
+    // row yields `None` from [`workflow_task_hard_impediment`] (pinned by
+    // `parked_workflow_task_never_masks_a_sleeping_timer`).
+    if let Some(hard) = inputs
+        .workflow_task
+        .as_ref()
+        .and_then(workflow_task_hard_impediment)
+    {
+        return Some(hard);
+    }
+
     if workflow_wake_was_missed(inputs.workflow_task.as_ref(), now)
         && let Some(overdue) = inputs
             .timers
@@ -903,10 +942,15 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
     // fact there is (the handler is executing this instant, so any replay wait
     // is from the previous suspension). The two never actually compete: a
     // parked row — the shape a replay wait explains — yields `None` here.
+    //
+    // Its HARD impediments were already consulted above the timer categories;
+    // reaching this point means the row is claimable, so what is left is the
+    // ordinary healthy-dispatch verdict. Both go through
+    // [`workflow_task_hard_impediment`], so the two sites cannot disagree.
     if let Some(verdict) = inputs
         .workflow_task
         .as_ref()
-        .and_then(|facts| classify_workflow_task(facts, now))
+        .and_then(classify_workflow_task)
     {
         return Some(verdict);
     }
@@ -1505,6 +1549,211 @@ mod tests {
             classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
         assert_eq!(verdict.kind(), "activity_no_worker", "{verdict:?}");
         assert_eq!(verdict.health(), ExecutionHealth::Stalled);
+    }
+
+    // ── A timer cannot fire if its own workflow task can never be claimed ──
+    // (PR #1188 review round 5). A durable timer fires only when a worker
+    // claims the owning workflow task, so a hard impediment on THAT task —
+    // an operator queue pause (#619) or no live poller — outranks every timer
+    // verdict below. Its *ordinary* healthy-dispatch result must NOT be hoisted
+    // though, or it would mask the more specific `sleeping_timer`.
+
+    #[test]
+    fn sleeping_timer_on_a_paused_workflow_queue_reports_queue_paused() {
+        let inputs = DiagnosisInputs {
+            timers: vec![PendingTimerFacts { fires_at: t(3600) }],
+            workflow_task: Some(WorkflowTaskFacts {
+                scheduled_at: t(3600),
+                queue_paused: true,
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(
+            verdict.kind(),
+            "workflow_queue_paused",
+            "a held queue means nothing will claim the task that fires this timer: {verdict:?}"
+        );
+        assert_eq!(verdict.health(), ExecutionHealth::BlockedExternal);
+    }
+
+    #[test]
+    fn sleeping_timer_on_a_dead_workflow_queue_reports_no_worker() {
+        let inputs = DiagnosisInputs {
+            timers: vec![PendingTimerFacts { fires_at: t(3600) }],
+            workflow_task: Some(WorkflowTaskFacts {
+                scheduled_at: t(3600),
+                has_live_worker: false,
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(
+            verdict.kind(),
+            "workflow_no_worker",
+            "a timer whose owning task nobody polls will never fire: {verdict:?}"
+        );
+        assert_eq!(verdict.health(), ExecutionHealth::Stalled);
+    }
+
+    #[test]
+    fn sleeping_timer_with_a_healthy_workflow_queue_is_still_a_sleeping_timer() {
+        let inputs = DiagnosisInputs {
+            timers: vec![PendingTimerFacts { fires_at: t(3600) }],
+            workflow_task: Some(WorkflowTaskFacts {
+                scheduled_at: t(3600),
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(
+            verdict.kind(),
+            "sleeping_timer",
+            "the ordinary healthy-dispatch result must not mask the timer: {verdict:?}"
+        );
+        assert_eq!(verdict.health(), ExecutionHealth::Healthy);
+    }
+
+    #[test]
+    fn overdue_timer_on_a_dead_workflow_queue_reports_no_worker() {
+        // Both are `stalled`, but `workflow_no_worker` names the queue an
+        // operator must fix; `timer_overdue` only says a deadline elapsed.
+        let inputs = DiagnosisInputs {
+            timers: vec![PendingTimerFacts { fires_at: t(-600) }],
+            workflow_task: Some(WorkflowTaskFacts {
+                scheduled_at: t(-600),
+                has_live_worker: false,
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(
+            verdict.kind(),
+            "workflow_no_worker",
+            "the hard impediment is the actionable cause, not the elapsed deadline: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn claimed_workflow_task_on_a_dead_queue_outranks_a_sleeping_timer() {
+        // A stale claim left by a crashed worker (issue #367) is an orphan, and
+        // no timer it owns will ever fire.
+        let inputs = DiagnosisInputs {
+            timers: vec![PendingTimerFacts { fires_at: t(3600) }],
+            workflow_task: Some(WorkflowTaskFacts {
+                state: "RUNNING".to_string(),
+                has_worker: true,
+                has_live_worker: false,
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "workflow_no_worker", "{verdict:?}");
+    }
+
+    #[test]
+    fn parked_workflow_task_never_masks_a_sleeping_timer() {
+        // A parked row advances on a *wake*, not a claim, so no claim-time gate
+        // applies to it and the side-table cause stays the answer.
+        let inputs = DiagnosisInputs {
+            timers: vec![PendingTimerFacts { fires_at: t(3600) }],
+            workflow_task: Some(WorkflowTaskFacts {
+                has_live_worker: false,
+                queue_paused: true,
+                ..parked_wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "sleeping_timer", "{verdict:?}");
+    }
+
+    #[test]
+    fn wedged_activity_still_outranks_a_workflow_queue_impediment() {
+        // Deliberate scoping: the activity verdict names the specific thing an
+        // operator must fix, so the workflow-task hard impediment is checked
+        // BELOW the activity bucket, not above it.
+        let inputs = DiagnosisInputs {
+            activities: vec![PendingActivityFacts {
+                has_live_worker: false,
+                ..healthy_activity()
+            }],
+            timers: vec![PendingTimerFacts { fires_at: t(3600) }],
+            workflow_task: Some(WorkflowTaskFacts {
+                has_live_worker: false,
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "activity_no_worker", "{verdict:?}");
+    }
+
+    #[test]
+    fn workflow_task_hard_impediment_truth_table() {
+        // Claimed + live poller: executing, no claim-time gate applies.
+        assert!(
+            workflow_task_hard_impediment(&WorkflowTaskFacts {
+                state: "RUNNING".to_string(),
+                has_worker: true,
+                queue_paused: true,
+                ..wf_task()
+            })
+            .is_none()
+        );
+        // Claimed + dead queue: an orphaned claim.
+        assert_eq!(
+            workflow_task_hard_impediment(&WorkflowTaskFacts {
+                state: "RUNNING".to_string(),
+                has_worker: true,
+                has_live_worker: false,
+                ..wf_task()
+            })
+            .map(|v| v.kind()),
+            Some("workflow_no_worker")
+        );
+        // Parked: advances on a wake, so no claim-time gate applies.
+        assert!(
+            workflow_task_hard_impediment(&WorkflowTaskFacts {
+                queue_paused: true,
+                has_live_worker: false,
+                ..parked_wf_task()
+            })
+            .is_none()
+        );
+        // PENDING: a pause outranks missing coverage.
+        assert_eq!(
+            workflow_task_hard_impediment(&WorkflowTaskFacts {
+                queue_paused: true,
+                has_live_worker: false,
+                ..wf_task()
+            })
+            .map(|v| v.kind()),
+            Some("workflow_queue_paused")
+        );
+        assert_eq!(
+            workflow_task_hard_impediment(&WorkflowTaskFacts {
+                has_live_worker: false,
+                ..wf_task()
+            })
+            .map(|v| v.kind()),
+            Some("workflow_no_worker")
+        );
+        // PENDING, covered and unheld: no HARD impediment (the ordinary
+        // dispatch verdict is deliberately not returned here).
+        assert!(workflow_task_hard_impediment(&wf_task()).is_none());
     }
 
     // ── Overdue timers must own the workflow wake (PR #1188 review round 4) ──
@@ -2501,7 +2750,7 @@ mod tests {
             ..wf_task()
         };
         assert_eq!(
-            classify_workflow_task(&task, t(0)),
+            classify_workflow_task(&task),
             Some(BlockedOn::HealthyInProgress)
         );
         let verdict = classify_execution(&inputs_with_wf_task(task), t(0));
@@ -2565,7 +2814,7 @@ mod tests {
             ..wf_task()
         };
         assert_eq!(
-            classify_workflow_task(&task, t(0)),
+            classify_workflow_task(&task),
             Some(BlockedOn::HealthyInProgress)
         );
     }
@@ -2628,7 +2877,7 @@ mod tests {
             ..wf_task()
         };
         assert_eq!(
-            classify_workflow_task(&task, t(0)),
+            classify_workflow_task(&task),
             Some(BlockedOn::HealthyInProgress)
         );
     }
@@ -2643,7 +2892,7 @@ mod tests {
             has_worker: false,
             ..wf_task()
         };
-        assert_eq!(classify_workflow_task(&task, t(0)), None);
+        assert_eq!(classify_workflow_task(&task), None);
         assert_eq!(
             classify_execution(&inputs_with_wf_task(task), t(0)),
             Some(BlockedOn::NoPendingWork)

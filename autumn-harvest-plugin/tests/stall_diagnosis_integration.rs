@@ -1585,6 +1585,134 @@ async fn overdue_timer_still_wins_when_the_task_own_wake_was_missed() {
     assert_eq!(body["health"], "stalled", "body: {body}");
 }
 
+/// A durable timer fires only when a worker claims the owning workflow task, so
+/// a run "sleeping" on a timer whose workflow queue nobody polls is not
+/// sleeping — it can never wake. The queue is the actionable cause, not the
+/// future deadline (PR #1188 review round 5).
+#[tokio::test]
+async fn sleeping_timer_on_a_dead_workflow_queue_reports_no_worker() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "timer_wf", "RUNNING", vec![started_event()]).await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'long_sleep', NOW() + INTERVAL '1 hour', false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed future timer");
+    }
+    // `persist_started_timer` reschedules the task TO the deadline: PENDING and
+    // not yet due. No worker is registered for `default`, so nothing will claim
+    // it when the deadline arrives.
+    seed_workflow_task(
+        &pool,
+        exec_id,
+        "default",
+        "PENDING",
+        None,
+        "NOW() + INTERVAL '1 hour'",
+    )
+    .await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "workflow_no_worker", "body: {body}");
+    assert_eq!(body["blocked_on"]["queue"], "default", "body: {body}");
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// The control: with a live poller on the workflow queue, the same shape is a
+/// genuine healthy sleep and the ordinary dispatch verdict must NOT mask the
+/// more specific timer answer.
+#[tokio::test]
+async fn sleeping_timer_with_a_live_workflow_queue_is_still_a_sleeping_timer() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "timer_wf", "RUNNING", vec![started_event()]).await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'long_sleep', NOW() + INTERVAL '1 hour', false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed future timer");
+    }
+    seed_workflow_task(
+        &pool,
+        exec_id,
+        "default",
+        "PENDING",
+        None,
+        "NOW() + INTERVAL '1 hour'",
+    )
+    .await;
+    seed_live_worker(&pool, "w-live", "default").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "sleeping_timer", "body: {body}");
+    assert_eq!(body["health"], "healthy", "body: {body}");
+}
+
+/// An operator queue hold (issue #619) on the WORKFLOW queue stops the claim
+/// that would fire the timer, so it outranks the sleep too.
+#[tokio::test]
+async fn sleeping_timer_on_a_paused_workflow_queue_reports_queue_paused() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "timer_wf", "RUNNING", vec![started_event()]).await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'long_sleep', NOW() + INTERVAL '1 hour', false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed future timer");
+    }
+    seed_workflow_task(
+        &pool,
+        exec_id,
+        "default",
+        "PENDING",
+        None,
+        "NOW() + INTERVAL '1 hour'",
+    )
+    .await;
+    seed_live_worker(&pool, "w-live", "default").await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_queue_pauses (queue_name, reason, paused_by) \
+             VALUES ('default', 'incident-99', 'oncall')",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("pause queue");
+    }
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "workflow_queue_paused", "body: {body}");
+    assert_eq!(body["blocked_on"]["queue"], "default", "body: {body}");
+    assert_eq!(body["health"], "blocked_external", "body: {body}");
+}
+
 /// The multi-reason list is a UNION across rows, not the winner's reasons: a
 /// lower-ranked sibling's cause must not vanish behind a higher-ranked one.
 #[tokio::test]

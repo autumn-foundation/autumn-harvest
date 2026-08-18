@@ -463,7 +463,7 @@ pub use stall_diagnosis::{
     ExternalHandoffFacts, PendingActivityFacts, PendingChildFacts, PendingTimerFacts,
     ReplayWaitFacts, TIMER_OVERDUE_GRACE_SECONDS, WorkflowTaskFacts, activity_precedence,
     classify_execution, classify_pending_activity, classify_workflow_task, summarize,
-    workflow_wake_was_missed,
+    workflow_task_hard_impediment, workflow_wake_was_missed,
 };
 #[cfg(feature = "db")]
 pub use store::AwaitMode;
