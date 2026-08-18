@@ -37,7 +37,7 @@ current for the audited revision, not as prose.
 | Is harvest's determinism core backend-portable? | **Yes, already.** It consumes plain values (`ExecutionId`, `Vec<WorkflowEvent>`, a handler `fn`, JSON) — no connection, no trait object. |
 | Is harvest's *coordination* layer backend-portable? | **No.** Multi-worker claim, push notification, and cross-connection locking are the three load-bearing Postgres features, and SQLite substitutes them only by dropping capability. |
 | Did the prototype work? | **Yes — 4/4 durability scenarios**, plus cross-backend replay. Now productized. |
-| Should core grow a `StorageBackend` trait? | **No.** Buildable, but costed below at a scale the benefit does not justify — 18 of 43 coupled modules are portable only by dropping a capability or reimplementing wholesale, for a use case that does not share the Postgres concurrency model. |
+| Should core grow a `StorageBackend` trait? | **No.** Buildable, but costed below at a scale the benefit does not justify — 19 of 43 coupled modules are portable only by dropping a capability or reimplementing wholesale, for a use case that does not share the Postgres concurrency model. |
 | What shipped instead? | `autumn-harvest-sqlite` — reuses the determinism core wholesale, reimplements persistence only. |
 
 The one-sentence version: **the valuable half of harvest is already portable
@@ -55,7 +55,7 @@ module counts at the audited revision, recomputed by CI:
 | Mechanism | Reach | Portable? |
 |---|---|---|
 | `diesel` query layer | 42 modules | Query construction is mechanical; the *type* layer is not. |
-| `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 13 modules | Only by dropping multi-worker concurrency. |
+| `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 15 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 15 modules | Subsumed by the single write lock. |
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 9 modules | Yes — integer epoch milliseconds. |
 | `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 26 modules | Case by case — the SQL must be read, not inferred from the ORM. |
@@ -129,6 +129,13 @@ else does*. `concurrency`'s per-key limit is enforced "across the whole fleet"
 precisely because the claim query serialises it, and `store` skips a TOCTOU
 guard because "tasks are serialised per-execution by SKIP LOCKED".
 
+(A third comment-only consumer, `error`'s `SuspendedClaimAmbiguous`, joined
+this list after the audited revision above — issue #1182 — for the identical
+reason: the variant exists only to represent an ambiguity a `SKIP LOCKED`
+probe can produce, and would have no reason to exist under a single-writer
+engine that produces no such ambiguity. See the inventory row below; the
+count in *Coupling mechanisms* above is kept current by CI, not this prose.)
+
 This is the single most important structural result in the audit. A
 `StorageBackend` trait derived mechanically from SQL call sites would have
 abstracted the *writers* of that invariant and silently orphaned its
@@ -163,7 +170,7 @@ Classification rule:
 | `debounce` | diesel, skip-locked, to_regclass, raw-pg-sql, raw-sql | (c) | Scanner claim; `sqlite_master` probe for the table check. |
 | `dlq` | diesel, row-lock, raw-sql | (b) | Row lock on replay/redrive; subsumed by the single write lock. |
 | `erase` | diesel, row-lock | (b) | Scrub holds a row lock; subsumed by the single write lock. |
-| `error` | diesel | (a) | `From<diesel::result::Error>` only — swap the error type. |
+| `error` | diesel, skip-locked | (c) | **Comment-only consumer, like `concurrency` above and `store` below.** `SuspendedClaimAmbiguous` (issue #1182) represents the ambiguity a `SKIP LOCKED` claim probe can produce; a single-writer engine has no such ambiguity to represent, so the variant itself would not exist there. |
 | `event_batch` | diesel, skip-locked, to_regclass, raw-pg-sql, raw-sql | (c) | Scanner claim. |
 | `execution` | diesel, skip-locked, row-lock, interval-sql, raw-pg-sql, raw-sql | (c) | Start/reuse matrix under `FOR UPDATE`; row-lock ordering is load-bearing. |
 | `external_task` | diesel, row-lock | (b) | `find_by_token_locked` serialises completion/failure; subsumed. |
@@ -192,10 +199,10 @@ Classification rule:
 | `version_gate_retirement` | diesel, raw-pg-sql, raw-sql | (b) | Marker scan over JSONB `#>>` with a `~ '^[0-9]{1,19}$'` guard. SQLite has no regex — substitute `GLOB`/`CAST`. |
 | `version_usage` | diesel, raw-pg-sql, raw-sql | (b) | Same JSONB-path + POSIX-regex shape as `version_gate_retirement`. |
 | `wasm_store` | diesel, advisory-lock, raw-pg-sql, raw-sql | (b) | Content-hash upsert; advisory lock subsumed. |
-| `worker` | diesel, row-lock, advisory-lock, listen/notify, raw-pg-sql, raw-sql | (c) | The dispatch loop; wakeups and persistence are interleaved. |
+| `worker` | diesel, skip-locked, row-lock, advisory-lock, listen/notify, raw-pg-sql, raw-sql | (c) | The dispatch loop; wakeups and persistence are interleaved. |
 | `workers` | diesel, interval-sql, raw-pg-sql, raw-sql | (b) | Fleet registry rows, but the sticky-lease filter embeds `NOW()` and the capability-miss fleet lookup adds an `INTERVAL` liveness window plus a `queues @> to_jsonb($2::text)` containment test. SQLite: `CURRENT_TIMESTAMP`/epoch ms; JSON1 `EXISTS (SELECT 1 FROM json_each(queues) …)` for the containment. |
 
-**Totals: (a) 8 · (b) 17 · (c) 18.**
+**Totals: (a) 7 · (b) 17 · (c) 19.**
 
 The shape matters more than the totals. The (a) column is genuinely
 mechanical CRUD. The (b) column is dominated by **pessimistic row locking**:
@@ -342,8 +349,8 @@ shape*. The structural fix is to stop resting a recommendation on one limb. It
 rests instead on the audit's measurements, none of which any review round has
 disputed:
 
-- **18 modules are class (c)** — portable only by dropping a capability or
-  reimplementing wholesale — against 8 that are trivially trait-able.
+- **19 modules are class (c)** — portable only by dropping a capability or
+  reimplementing wholesale — against 7 that are trivially trait-able.
 - **26 modules reach for raw SQL**, so their portability cannot be read off
   their Diesel usage at all.
 - The **capability losses are documented and unavoidable** on the single-writer

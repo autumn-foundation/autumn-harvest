@@ -16172,41 +16172,35 @@ async fn process_workflow_task(
             .await;
         }
         Err(error) => {
-            // Issue #1182 (Codex review round 2): the suspended-dispatch
-            // claim guard could not confirm ownership, and `?` inside the
-            // transaction closure has already rolled the *whole* persistence
-            // transaction back -- releasing the execution row's lock and
-            // discarding any bookkeeping write made earlier in this cycle
-            // (see `fail_suspended_workflow_if_still_claimed`'s doc comment
-            // for why the release cannot happen from inside that
-            // transaction). Only now, standalone and holding no other lock,
-            // is the actual claim release attempted; it is never a terminal
-            // decision, so this always returns `Ok(())` regardless of
-            // `is_terminal_with_commands`.
-            if let Some(task_id) = error.suspended_claim_ambiguous() {
-                let released = queue::release_suspended_workflow_claim(
-                    conn,
-                    task_id,
-                    worker_id,
-                    task.crash_strikes,
-                )
-                .await?;
-                tracing::info!(
-                    task_id = %task_id,
-                    queue = %task.queue_name,
-                    released,
-                    "a suspended workflow dispatch made no replay-significant progress; the \
-                     claim guard could not confirm ownership (a genuine transfer, or a \
-                     concurrent, unrelated lock holder), so the enclosing transaction was \
-                     rolled back and no terminal decision was made; the task was released \
-                     back to the queue if it was still ours"
-                );
-                return Ok(());
-            }
-            // Preserve per-path error handling: a terminal-with-commands persist
-            // failure durably fails the task + execution (matching the prior
-            // `fail_execution_on_error` wrapping); a suspended/simple-terminal
-            // persist failure propagates so the task is retried.
+            // Issue #1182 (Codex review round 3): an ambiguous suspended-
+            // dispatch claim is deliberately NOT intercepted here, unlike
+            // round 2's first cut. `?` inside the transaction closure has
+            // already rolled the *whole* persistence transaction back --
+            // releasing the execution row's lock and discarding any
+            // bookkeeping write made earlier in this cycle (see
+            // `fail_suspended_workflow_if_still_claimed`'s doc comment for
+            // why the release cannot happen from inside that transaction) --
+            // but the release itself is a deliberately *blocking* (not
+            // `SKIP LOCKED`) wait for a transient lock holder to clear, and
+            // this whole function's future is wrapped in the issue #494
+            // `workflow_task_timeout` budget by `run_under_workflow_body_
+            // budget`. Performing the release here risked that wait alone
+            // consuming the remaining budget and being cancelled mid-flight
+            // -- reporting `BodyTimedOut` and banking a timeout strike
+            // against a workflow whose handler had in fact completed fine;
+            // only the *cleanup* waited on unrelated row contention (Codex
+            // review round 3). So this error, like a capability miss, is
+            // simply propagated here: the caller (`process_task`) performs
+            // the release *after* the budgeted cycle has already returned,
+            // exactly mirroring how it already handles
+            // `handler_not_registered()`.
+            //
+            // Preserve per-path error handling otherwise: a
+            // terminal-with-commands persist failure durably fails the task
+            // + execution (matching the prior `fail_execution_on_error`
+            // wrapping, which itself passes an ambiguous-claim error through
+            // un-failed); a suspended/simple-terminal persist failure
+            // (including this one) propagates so the caller can act on it.
             if is_terminal_with_commands {
                 return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(error)).await;
             }
@@ -16305,6 +16299,57 @@ async fn run_under_workflow_body_budget<F: std::future::Future>(
         Some(budget) => tokio::time::timeout(budget, body).await.ok(),
         None => Some(body.await),
     }
+}
+
+/// Issue #1182 (Codex review round 3): performs the release for an ambiguous
+/// suspended-dispatch claim -- if `error` names one -- and returns `None`
+/// (a no-op) for every other error, so the caller falls through to the
+/// capability-miss check unchanged.
+///
+/// Deliberately called from `process_task` *after*
+/// [`run_under_workflow_body_budget`] has already returned, rather than from
+/// inside `process_workflow_task`'s own timeout-wrapped decision cycle: the
+/// release is intentionally blocking (see
+/// `fail_suspended_workflow_if_still_claimed`'s doc comment on why it must
+/// wait for the row lock rather than skip ownership verification), so
+/// performing it *inside* the budget risked the wait alone consuming the
+/// remaining issue #494 `workflow_task_timeout` and being cancelled --
+/// reporting a false [`TaskDispatchOutcome::BodyTimedOut`] and banking a
+/// timeout strike against a workflow whose handler had in fact already
+/// completed within its budget; only the *cleanup* waited on unrelated row
+/// contention.
+async fn handle_ambiguous_suspended_claim(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    error: &HarvestError,
+) -> Option<HarvestResult<TaskDispatchOutcome>> {
+    let task_id = error.suspended_claim_ambiguous()?;
+    let released =
+        match queue::release_suspended_workflow_claim(conn, task_id, worker_id, task.crash_strikes)
+            .await
+        {
+            Ok(released) => released,
+            Err(err) => return Some(Err(err)),
+        };
+    tracing::info!(
+        task_id = %task_id,
+        queue = %task.queue_name,
+        released,
+        "a suspended workflow dispatch made no replay-significant progress; the claim guard \
+         could not confirm ownership (a genuine transfer, or a concurrent, unrelated lock \
+         holder), so the enclosing transaction was rolled back and no terminal decision was \
+         made; the task was released back to the queue if it was still ours"
+    );
+    // The handler ran to a conclusion -- this is the "suspended, empty-
+    // handed" persist path, reached only after the workflow body returned --
+    // and only the final claim recheck found ambiguity, so this dispatch is
+    // genuine evidence of health: clear the issue #494 timeout strike,
+    // mirroring the `AfterHandler` capability-miss rule
+    // (`TaskDispatchOutcome::Released`'s doc comment).
+    Some(Ok(TaskDispatchOutcome::Released {
+        clears_timeout_strike: true,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16422,6 +16467,14 @@ async fn process_task(
     let Err(error) = &outcome else {
         return outcome.map(|()| TaskDispatchOutcome::Completed);
     };
+    // Issue #1182 (Codex review round 3): an ambiguous suspended-dispatch
+    // claim is intercepted HERE -- after `run_under_workflow_body_budget`
+    // has already returned -- rather than inside `process_workflow_task`.
+    // See `handle_ambiguous_suspended_claim`'s doc comment for why.
+    if let Some(result) = handle_ambiguous_suspended_claim(&mut conn, &task, worker_id, error).await
+    {
+        return result;
+    }
     let Some((kind, name)) = error.handler_not_registered() else {
         return outcome.map(|()| TaskDispatchOutcome::Completed);
     };

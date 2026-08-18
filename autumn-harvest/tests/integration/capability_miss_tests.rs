@@ -2960,9 +2960,13 @@ async fn a_stale_dispatcher_with_zero_emitted_commands_makes_no_terminal_decisio
 /// `SKIP LOCKED`, so it can never be the thing waiting inside a transaction
 /// that also holds another lock -- and the blocking, ownership-guarded
 /// release is a **separate**, standalone call
-/// ([`queue::release_suspended_workflow_claim`]) made only afterward, exactly
-/// mirroring what `process_workflow_task`'s post-transaction `match` arm now
-/// does. This test drives both calls in that order and asserts the fast
+/// ([`queue::release_suspended_workflow_claim`]) made only afterward. Codex
+/// review round 3 relocated that standalone call from `process_workflow_
+/// task`'s own post-transaction `match` arm out to `process_task` -- one
+/// layer further out, after the issue #494 `workflow_task_timeout` budget
+/// has already been unwound -- but the two-call shape this test drives is
+/// unchanged by that move. This test drives both calls in that order and
+/// asserts the fast
 /// return is genuinely fast (bounded well under the lock-hold window) before
 /// asserting the release itself blocks and then succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3013,10 +3017,13 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
             .expect("must be the ambiguous-claim sentinel");
             let probe_elapsed = probe_started.elapsed();
 
-            // The standalone release, exactly as `process_workflow_task`'s
-            // post-transaction match arm performs it -- this is the call
-            // that actually blocks on `conn_lock`'s held lock, never the
-            // probe above.
+            // The standalone release, exactly as `process_task` performs it
+            // after `process_workflow_task`'s own transaction has already
+            // ended (Codex review round 3 moved it one layer further out,
+            // past the issue #494 timeout budget too -- see
+            // `run_under_workflow_body_budget`'s doc comment) -- this is the
+            // call that actually blocks on `conn_lock`'s held lock, never
+            // the probe above.
             let released = queue::release_suspended_workflow_claim(
                 &mut conn,
                 ambiguous_task_id,
