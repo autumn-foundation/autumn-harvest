@@ -728,6 +728,48 @@ pub fn classify_workflow_task(facts: &WorkflowTaskFacts, now: DateTime<Utc>) -> 
     Some(BlockedOn::HealthyInProgress)
 }
 
+/// Did the workflow task's *own* wake go missing?
+///
+/// A durable timer never fires on its own: it fires when a worker claims the
+/// owning workflow task and `worker::ingest_due_timers_and_signals` runs. So an
+/// unfired row past its deadline only proves a *wedge* when that timer is what
+/// the workflow task is actually scheduled to wake for.
+///
+/// It usually is not. Every `*_park` persist path in `worker.rs` —
+/// `persist_signal_wait_park`, `persist_mutex_acquire_park`,
+/// `persist_activity_wait_park`, `persist_scheduled_activities`,
+/// `persist_all_started_child_workflows` and `persist_scheduled_external_activity`
+/// — discards the armed deadline (`_min_fires_at`) and parks the task on the
+/// thing being awaited. Only `persist_started_timer` calls
+/// [`crate::queue::reschedule_task`] with the deadline, handing the timer
+/// ownership of the wake. A timer armed alongside any of those other waits
+/// therefore goes overdue *as a matter of course* while the wait runs, and fires
+/// on that wait's completion wake — a healthy run, not a stall.
+///
+/// The distinguishing fact is the workflow task row itself:
+///   * **claimed** — the handler is executing right now, so nothing was missed.
+///   * **parked** (`RUNNING`, NULL worker) — some other wake owns this run; the
+///     timer is a passenger and its overdue row is expected.
+///   * **`PENDING`** — the row is due to be claimed at `scheduled_at`. Only
+///     `persist_started_timer` sets that to a deadline, so a `PENDING` row whose
+///     own `scheduled_at` is past the grace window is a genuinely missed wake.
+///
+/// Absent facts (`None`) resolve to `true`, preserving the pre-gate behaviour
+/// for callers that do not supply a workflow task row.
+#[must_use]
+pub fn workflow_wake_was_missed(task: Option<&WorkflowTaskFacts>, now: DateTime<Utc>) -> bool {
+    let Some(task) = task else {
+        return true;
+    };
+    if task.has_worker {
+        return false;
+    }
+    if task.state != "PENDING" {
+        return false;
+    }
+    (now - task.scheduled_at).num_seconds() >= TIMER_OVERDUE_GRACE_SECONDS
+}
+
 /// Collapse an execution's whole fact set into one root-cause verdict.
 ///
 /// Returns `None` for a terminal execution — there is nothing to diagnose, and
@@ -778,41 +820,48 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
     // about which category wins; external handoffs sit directly under regular
     // activities because they *are* the activity work, just executed elsewhere.
     //
-    // The overdue-timer check below deliberately sits UNDER the activity bucket
-    // and must NOT be hoisted above it. Whether an overdue unfired timer is a
-    // wedge depends entirely on whether the owning workflow task was scheduled
-    // to wake at that deadline:
-    //   * A timer-only suspension (and the `receive_signal_timeout` deadline
-    //     race, which routes to the same persist path) calls
-    //     `queue::reschedule_task(task_id, fires_at)` — the task IS due to wake
-    //     at the deadline, so an unfired timer past it proves the wake never
-    //     happened. Those shapes leave no pending activity row, so they reach
-    //     the check below.
-    //   * `persist_scheduled_activities` parks the task on the ACTIVITY and
-    //     explicitly discards the armed deadline (`_min_fires_at`, commented
-    //     "armed timers observed on next wake; deadline unused here"). A
-    //     cancellable timer (issue #768) armed alongside an activity — e.g.
-    //     `join!(handle.await_fire(), ctx.execute_activity(..))` — therefore
-    //     goes overdue as a matter of course while the activity runs, and fires
-    //     on the activity's completion wake. Reporting that healthy run as
-    //     `timer_overdue`/`stalled` would be a false positive, which is the one
-    //     failure mode this endpoint must never have: it sends an operator
-    //     chasing a non-problem. Pinned by
-    //     `healthy_activity_alongside_an_overdue_timer_is_not_a_stall`.
-    // So the activity verdict wins first BY DESIGN — and when the activity is
-    // itself wedged, that verdict is the actionable root cause anyway. Timers fire only when a worker claims the owning workflow task
-    // (`worker::ingest_due_timers_and_signals`); there is no independent timer
-    // scanner. So a long-elapsed deadline is a hard fact that the engine failed
-    // to act, not an inference — and it must outrank the legitimate-looking
-    // waits below, or a signal-or-deadline race (issue #476) whose deadline the
-    // engine missed would report the healthy-looking `awaiting_signal` instead
-    // of the wedge. This is NOT the event-age heuristic AC4 forbids: a future
-    // deadline still reports `sleeping_timer` however old the run is.
-    if let Some(overdue) = inputs
-        .timers
-        .iter()
-        .filter(|timer| (now - timer.fires_at).num_seconds() >= TIMER_OVERDUE_GRACE_SECONDS)
-        .min_by_key(|timer| timer.fires_at)
+    // The overdue-timer check below sits UNDER the activity bucket and is gated
+    // on [`workflow_wake_was_missed`]. Both guards exist for the same reason:
+    // an unfired timer past its deadline is only a wedge when that timer is what
+    // the workflow task is actually scheduled to wake for.
+    //
+    // Only `persist_started_timer` hands a timer that ownership, by calling
+    // `queue::reschedule_task(task_id, fires_at)`. Every other persist path —
+    // `persist_signal_wait_park`, `persist_mutex_acquire_park`,
+    // `persist_activity_wait_park`, `persist_scheduled_activities`,
+    // `persist_all_started_child_workflows`, `persist_scheduled_external_activity`
+    // — discards the armed deadline (`_min_fires_at`) and parks the task on the
+    // thing being awaited, so a timer armed alongside that wait goes overdue as a
+    // matter of course and fires on the wait's completion wake. Reporting such a
+    // healthy run as `timer_overdue`/`stalled` would be a false positive, the one
+    // failure mode this endpoint must never have: it sends an operator chasing a
+    // non-problem.
+    //
+    // The gate keys on the workflow task's OWN wake, so it covers every one of
+    // those paths at once (pinned by the `overdue_timer_with_a_parked_task_*`
+    // tests). The ordering guard is kept as well because it is load-bearing for
+    // the activity case specifically: `persist_scheduled_activities` leaves the
+    // row PENDING at a *retry* `scheduled_at`, which the gate cannot distinguish
+    // from a missed timer wake. Pinned by
+    // `healthy_activity_alongside_an_overdue_timer_is_not_a_stall`.
+    //
+    // What survives both guards is a hard fact, not an inference: timers fire
+    // only when a worker claims the owning workflow task
+    // (`worker::ingest_due_timers_and_signals`), and there is no independent
+    // timer scanner — so a PENDING task long past its own `scheduled_at` with an
+    // overdue timer means the engine failed to act. That must outrank the
+    // legitimate-looking waits below, or a signal-or-deadline race (issue #476)
+    // whose deadline the engine missed would report the healthy-looking
+    // `awaiting_signal` instead of the wedge (pinned by
+    // `overdue_timer_wins_when_the_workflow_wake_was_genuinely_missed`). This is
+    // NOT the event-age heuristic AC4 forbids: a future deadline still reports
+    // `sleeping_timer` however old the run is.
+    if workflow_wake_was_missed(inputs.workflow_task.as_ref(), now)
+        && let Some(overdue) = inputs
+            .timers
+            .iter()
+            .filter(|timer| (now - timer.fires_at).num_seconds() >= TIMER_OVERDUE_GRACE_SECONDS)
+            .min_by_key(|timer| timer.fires_at)
     {
         return Some(BlockedOn::TimerOverdue {
             fires_at: overdue.fires_at,
@@ -1456,6 +1505,188 @@ mod tests {
             classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
         assert_eq!(verdict.kind(), "activity_no_worker", "{verdict:?}");
         assert_eq!(verdict.health(), ExecutionHealth::Stalled);
+    }
+
+    // ── Overdue timers must own the workflow wake (PR #1188 review round 4) ──
+
+    /// Codex's exact counterexample. `persist_scheduled_external_activity`
+    /// parks the workflow task and discards the armed deadline, so a
+    /// cancellable timer awaited alongside an external activity goes overdue as
+    /// a matter of course while the callback is outstanding. Unlike the
+    /// activity case, the handoff is ranked BELOW the overdue check, so the
+    /// ordering cannot protect it — the check itself must.
+    #[test]
+    fn overdue_timer_with_a_parked_task_reports_the_external_handoff() {
+        let inputs = DiagnosisInputs {
+            external_handoffs: vec![ExternalHandoffFacts {
+                token: "cb-token".to_string(),
+                activity_name: Some("call_partner".to_string()),
+            }],
+            timers: vec![PendingTimerFacts { fires_at: t(-600) }],
+            workflow_task: Some(parked_wf_task()),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(
+            verdict.kind(),
+            "awaiting_external_handoff",
+            "a parked task means the callback owns the wake, not the timer: {verdict:?}"
+        );
+        assert_eq!(verdict.health(), ExecutionHealth::BlockedExternal);
+    }
+
+    /// The same defect for `persist_all_started_child_workflows`, which parks
+    /// and discards the deadline identically.
+    #[test]
+    fn overdue_timer_with_a_parked_task_reports_the_pending_child() {
+        let inputs = DiagnosisInputs {
+            children: vec![PendingChildFacts {
+                child_exec_id: "child-1".to_string(),
+                child_state: "RUNNING".to_string(),
+            }],
+            timers: vec![PendingTimerFacts { fires_at: t(-600) }],
+            workflow_task: Some(parked_wf_task()),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "pending_child", "{verdict:?}");
+    }
+
+    /// And for `persist_signal_wait_park`: a PURE `wait_for_signal` parks
+    /// without rescheduling, so an unrelated armed timer going overdue beside
+    /// it is expected, not a missed wake.
+    #[test]
+    fn overdue_timer_with_a_parked_task_reports_the_awaited_signal() {
+        let inputs = DiagnosisInputs {
+            awaited_signals: vec![AwaitedSignalFacts {
+                signal_name: "approval".to_string(),
+                since: None,
+            }],
+            timers: vec![PendingTimerFacts { fires_at: t(-600) }],
+            workflow_task: Some(parked_wf_task()),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "awaiting_signal", "{verdict:?}");
+    }
+
+    /// The complement that must NOT regress: a `receive_signal_timeout`
+    /// deadline race (issue #476) routes to `persist_started_timer`, which
+    /// calls `reschedule_task(task_id, fires_at)` — the task IS due to wake at
+    /// the deadline. An unfired timer past it with the task still PENDING and
+    /// unclaimed proves the wake never happened, and must still outrank the
+    /// healthy-looking `awaiting_signal` beneath it.
+    #[test]
+    fn overdue_timer_wins_when_the_workflow_wake_was_genuinely_missed() {
+        let inputs = DiagnosisInputs {
+            awaited_signals: vec![AwaitedSignalFacts {
+                signal_name: "approval".to_string(),
+                since: None,
+            }],
+            timers: vec![PendingTimerFacts { fires_at: t(-600) }],
+            workflow_task: Some(WorkflowTaskFacts {
+                // reschedule_task set scheduled_at = fires_at, and nothing
+                // claimed it.
+                scheduled_at: t(-600),
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "timer_overdue", "{verdict:?}");
+        assert_eq!(verdict.health(), ExecutionHealth::Stalled);
+    }
+
+    #[test]
+    fn overdue_timer_suppressed_while_a_worker_holds_the_claim() {
+        // A worker is on the decision cycle right now; it ingests due timers
+        // when it claims. Nothing was missed.
+        let inputs = DiagnosisInputs {
+            awaited_signals: vec![AwaitedSignalFacts {
+                signal_name: "approval".to_string(),
+                since: None,
+            }],
+            timers: vec![PendingTimerFacts { fires_at: t(-600) }],
+            workflow_task: Some(WorkflowTaskFacts {
+                state: "RUNNING".to_string(),
+                has_worker: true,
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "awaiting_signal", "{verdict:?}");
+    }
+
+    #[test]
+    fn overdue_timer_suppressed_when_the_next_wake_is_still_ahead() {
+        // Two armed timers: the earliest is overdue, but the task is scheduled
+        // to wake at the LATER one, which will observe it. Not a missed wake.
+        let inputs = DiagnosisInputs {
+            awaited_signals: vec![AwaitedSignalFacts {
+                signal_name: "approval".to_string(),
+                since: None,
+            }],
+            timers: vec![
+                PendingTimerFacts { fires_at: t(-600) },
+                PendingTimerFacts { fires_at: t(900) },
+            ],
+            workflow_task: Some(WorkflowTaskFacts {
+                scheduled_at: t(900),
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "awaiting_signal", "{verdict:?}");
+    }
+
+    #[test]
+    fn workflow_wake_was_missed_truth_table() {
+        // No evidence supplied: preserve the pre-round-4 unconditional verdict.
+        assert!(workflow_wake_was_missed(None, t(0)));
+        // Claimed right now.
+        assert!(!workflow_wake_was_missed(
+            Some(&WorkflowTaskFacts {
+                state: "RUNNING".to_string(),
+                has_worker: true,
+                scheduled_at: t(-600),
+                ..wf_task()
+            }),
+            t(0)
+        ));
+        // Parked: another wake source owns it.
+        assert!(!workflow_wake_was_missed(Some(&parked_wf_task()), t(0)));
+        // PENDING and overdue past the grace window: the wake was missed.
+        assert!(workflow_wake_was_missed(
+            Some(&WorkflowTaskFacts {
+                scheduled_at: t(-TIMER_OVERDUE_GRACE_SECONDS),
+                ..wf_task()
+            }),
+            t(0)
+        ));
+        // PENDING but only just due: ordinary dispatch latency.
+        assert!(!workflow_wake_was_missed(
+            Some(&WorkflowTaskFacts {
+                scheduled_at: t(-TIMER_OVERDUE_GRACE_SECONDS + 1),
+                ..wf_task()
+            }),
+            t(0)
+        ));
+        // PENDING with the wake still ahead.
+        assert!(!workflow_wake_was_missed(
+            Some(&WorkflowTaskFacts {
+                scheduled_at: t(300),
+                ..wf_task()
+            }),
+            t(0)
+        ));
     }
 
     #[test]
@@ -2238,6 +2469,17 @@ mod tests {
             scheduled_at: t(-10),
             queue_paused: false,
             has_live_worker: true,
+        }
+    }
+
+    /// A *parked* workflow task: `RUNNING` with a NULL worker. Produced by
+    /// every `*_park` persist path, none of which reschedules the task to an
+    /// armed timer's deadline.
+    fn parked_wf_task() -> WorkflowTaskFacts {
+        WorkflowTaskFacts {
+            state: "RUNNING".to_string(),
+            has_worker: false,
+            ..wf_task()
         }
     }
 

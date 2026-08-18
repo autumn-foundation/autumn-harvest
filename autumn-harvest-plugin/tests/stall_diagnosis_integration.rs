@@ -1485,6 +1485,106 @@ async fn ac2_overdue_unfired_timer_reports_timer_overdue() {
     );
 }
 
+/// A timer armed alongside an external handoff goes overdue as a matter of
+/// course, and that is NOT a stall.
+///
+/// `persist_scheduled_external_activity` parks the workflow task on the handoff
+/// and deliberately discards the armed deadline (`_min_fires_at`), so the timer
+/// is only observed when the external completion wakes the run. A callback that
+/// takes longer than the grace window leaves a legitimately-overdue row behind;
+/// reporting it `timer_overdue`/`stalled` would send an operator chasing a
+/// non-problem. The parked task row is what proves the timer does not own the
+/// wake — see `stall_diagnosis::workflow_wake_was_missed`.
+#[tokio::test]
+async fn overdue_timer_alongside_a_parked_external_handoff_is_not_a_stall() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    let token = Uuid::new_v4();
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        // The handoff the run is actually parked on.
+        diesel::sql_query(
+            "INSERT INTO harvest_external_tasks \
+             (id, token, workflow_exec_id, activity_id, name, queue, state, \
+              schedule_to_close_at, schedule_to_close_secs) \
+             VALUES ($1, $2, $3, $4, 'await_partner', 'default', 'PENDING', \
+                     NOW() + INTERVAL '1 hour', 3600)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(token)
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Uuid, _>(ActivityExecId::new().as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed handoff");
+        // A cancellable timer (issue #768) armed alongside it, long overdue.
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'partner_deadline', NOW() - INTERVAL '2 hours', false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed overdue timer");
+    }
+    // Parked: RUNNING with a NULL worker — the shape every `*_park` path leaves.
+    seed_workflow_task(&pool, exec_id, "default", "RUNNING", None, "NOW()").await;
+    seed_live_worker(&pool, "w-live", "default").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "awaiting_external_handoff",
+        "a timer that does not own the wake must not mask the handoff: {body}"
+    );
+    assert_eq!(body["blocked_on"]["token"], token.to_string());
+    assert_eq!(body["health"], "blocked_external", "body: {body}");
+}
+
+/// The converse: when the workflow task's OWN wake was missed, the overdue
+/// timer is still the verdict, so the gate above does not blind the endpoint to
+/// a genuine wedge (the issue #476 signal-or-deadline rationale).
+#[tokio::test]
+async fn overdue_timer_still_wins_when_the_task_own_wake_was_missed() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "timer_wf", "RUNNING", vec![started_event()]).await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'long_sleep', NOW() - INTERVAL '2 hours', false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed overdue timer");
+    }
+    // `persist_started_timer` reschedules the task TO the deadline, so a PENDING
+    // row long past its own `scheduled_at` is a genuinely missed timer wake.
+    seed_workflow_task(
+        &pool,
+        exec_id,
+        "default",
+        "PENDING",
+        None,
+        "NOW() - INTERVAL '2 hours'",
+    )
+    .await;
+    seed_live_worker(&pool, "w-live", "default").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "timer_overdue", "body: {body}");
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
 /// The multi-reason list is a UNION across rows, not the winner's reasons: a
 /// lower-ranked sibling's cause must not vanish behind a higher-ranked one.
 #[tokio::test]

@@ -29,7 +29,7 @@ Use this runbook when an alert fires indicating that tasks are sitting in `PENDI
 > | `activity_rate_limited` / `activity_concurrency_deferred` | `healthy` | Deliberately paced by `key`. Raise the limit or wait. |
 > | `activity_queue_paused` | `blocked_external` | An operator paused `queue` (#619). Resume it. |
 > | `sleeping_timer` | `healthy` | A durable sleep until `fires_at` — **not** a stall, however old the last event is. |
-> | `timer_overdue` | `stalled` | A timer was due at `fires_at` (`overdue_by_seconds` ago) and nothing fired it. Timers fire only when a worker claims the owning workflow task, so this is a lost-task wedge — same remedy as `no_pending_work`. |
+> | `timer_overdue` | `stalled` | A timer was due at `fires_at` (`overdue_by_seconds` ago), nothing fired it, **and that timer owned the run's wake** (the workflow task is `PENDING` long past its own `scheduled_at`). Timers fire only when a worker claims the owning workflow task, so this is a lost-task wedge — same remedy as `no_pending_work`. A timer armed alongside another wait (an external handoff, a child, a signal) does *not* own the wake and is reported under that wait instead, so an overdue row there is expected, not a stall. |
 > | `pending_child` | `healthy` | Waiting on `child_exec_id`; diagnose *that* id next. |
 > | `awaiting_signal` / `awaiting_external_handoff` | `blocked_external` | Waiting on an external party. Nothing engine-side is wrong. |
 > | `workflow_queue_paused` | `blocked_external` | An operator paused the queue the run's own decision cycle sits on (#619). Resume it. |
