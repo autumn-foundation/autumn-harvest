@@ -2154,3 +2154,373 @@ async fn zz_capture_queue_pause_claim_evidence() {
         out_dir.display()
     );
 }
+
+/// Generates the committed evidence for the capability-labels claim-path
+/// predicate (issue #382 / Ledger perf pass), documented in
+/// `docs/performance.md` and `docs/performance-capability-labels.md`.
+///
+/// Unlike [`zz_capture_queue_pause_claim_evidence`], this capture does not
+/// toggle a code fix: `queue::claim_task_query()` is unmodified end to end,
+/// because measurement found no query-shape fix that helps (see the
+/// dedicated doc page). It toggles *data* instead — every EXPLAIN /
+/// `pg_stat_statements` pair below is captured from the exact same query
+/// text at two seeded states of `harvest_task_queue.required_capabilities`:
+///
+/// * `no-capabilities` — every row's column is `NULL` (today's default seed
+///   shape, and every other `ClaimGate` scenario's shape too).
+/// * `capability-labels` — every row carries one `Exact` requirement that
+///   the claiming worker's `labels` satisfy. Deliberately made to match
+///   (not to exclude) so the claimable row count is **identical** between
+///   the two labels — that isolates the predicate's *evaluation* cost from
+///   any change in which rows are eligible, and lets the same-run drain
+///   loop assert equal claimed counts as a correctness sanity check.
+///
+/// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
+/// repeatable CI assertion. See
+/// `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh`, which runs
+/// this test once (no git/tree toggling needed, since no code changes) to
+/// produce the `docs/perf-artifacts/capability-labels-claim-predicate/`
+/// files the doc cites.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[ignore = "evidence generator, not a CI assertion -- run via \
+            autumn-harvest/scripts/capability_labels_claim_perf_repro.sh"]
+#[allow(clippy::too_many_lines)] // one-shot evidence capture, not a CI assertion
+async fn zz_capture_capability_labels_claim_evidence() {
+    use diesel::QueryableByName;
+    use diesel_async::RunQueryDsl;
+
+    #[derive(QueryableByName)]
+    struct ExplainRow {
+        #[diesel(sql_type = diesel::sql_types::Text, column_name = "QUERY PLAN")]
+        query_plan: String,
+    }
+
+    #[derive(QueryableByName, Debug)]
+    struct StatRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        query: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        calls: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        shared_blks_hit: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        shared_blks_read: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        total_buffers: i64,
+    }
+
+    /// One `Exact` capability requirement the seeded worker's `labels` are
+    /// made to satisfy exactly -- so the predicate always evaluates `TRUE`
+    /// and every capability-labels row stays claimable, matching the
+    /// no-capabilities claimable count.
+    const REQUIRED_CAPABILITIES_JSON: &str = r#"[{"Exact":{"key":"region","value":"us-east"}}]"#;
+    const WORKER_LABELS_JSON: &str = r#"{"region":"us-east"}"#;
+
+    let Some(bench) = bench_db_or_skip().await else {
+        eprintln!("no database reachable; nothing captured");
+        return;
+    };
+
+    let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("autumn-harvest/ has a workspace-root parent")
+        .join("docs")
+        .join("perf-artifacts")
+        .join("capability-labels-claim-predicate");
+    std::fs::create_dir_all(&out_dir).expect("create artifact output directory");
+
+    let mut summary_lines: Vec<String> = Vec::new();
+    let raw = autumn_harvest::queue::claim_task_query();
+
+    // One EXPLAIN capture per published backlog depth, at both labels, from
+    // the SAME seeded backlog (the no-capabilities capture's EXPLAIN ANALYZE
+    // runs inside a rolled-back transaction, so the seeded rows survive
+    // unclaimed for the capability-labels mutation that follows) -- shows
+    // whether the added cost is a fixed per-call overhead or scales with
+    // candidate rows scanned.
+    for backlog in super::claim_bench_support::BACKLOG_SWEEP {
+        let scenario = Scenario {
+            backlog,
+            claimers: 1,
+            queues: 4,
+            gate: ClaimGate::Baseline,
+        };
+
+        let mut conn = db::connect(&bench.url).await;
+        let seeded = db::seed(&mut conn, scenario).await;
+
+        let queues = db::queue_names(scenario);
+        let worker_literal = format!("'{}-worker-0'", db::BENCH_PREFIX);
+        let queue_list = queues
+            .iter()
+            .map(|q| format!("'{q}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let literals = [
+            worker_literal.clone(),
+            format!("ARRAY[{queue_list}]::text[]"),
+            format!("'{}'", db::worker_build_id(scenario.gate)),
+            "NULL".to_string(),
+            "ARRAY[]::text[]".to_string(),
+            "ARRAY[]::text[]".to_string(),
+        ];
+        assert!(
+            !raw.contains(&format!("${}", literals.len() + 1)),
+            "claim_task_query() grew a seventh bind; extend `literals` before \
+             this capture can be trusted",
+        );
+        let mut sql = raw.to_string();
+        for (i, literal) in literals.iter().enumerate().rev() {
+            sql = sql.replace(&format!("${}", i + 1), literal);
+        }
+
+        for label in ["no-capabilities", "capability-labels"] {
+            if label == "capability-labels" {
+                // Mutate the just-seeded (still-PENDING, since the prior
+                // label's EXPLAIN ANALYZE below rolls its claim back) rows
+                // in place, then re-ANALYZE: a fresh JSONB column changes
+                // row width and therefore planner statistics.
+                diesel::sql_query(format!(
+                    "UPDATE harvest_task_queue SET required_capabilities = '{REQUIRED_CAPABILITIES_JSON}'::jsonb"
+                ))
+                .execute(&mut conn)
+                .await
+                .expect("mutate seeded rows to carry required_capabilities");
+                diesel::sql_query(format!(
+                    "UPDATE harvest_workers SET labels = '{WORKER_LABELS_JSON}'::jsonb WHERE worker_id = {worker_literal}"
+                ))
+                .execute(&mut conn)
+                .await
+                .expect("mutate claiming worker's labels to satisfy the requirement");
+                diesel::sql_query("ANALYZE harvest_task_queue")
+                    .execute(&mut conn)
+                    .await
+                    .expect("re-analyze after widening required_capabilities");
+                diesel::sql_query("ANALYZE harvest_workers")
+                    .execute(&mut conn)
+                    .await
+                    .expect("re-analyze after mutating worker labels");
+            }
+
+            // `EXPLAIN ANALYZE` really executes the statement -- including
+            // the UPDATE CTEs -- so it runs inside a transaction that is
+            // rolled back; otherwise producing the plan would itself consume
+            // a task and shrink the backlog the other label measures against.
+            diesel::sql_query("BEGIN")
+                .execute(&mut conn)
+                .await
+                .expect("begin");
+            let loaded: Result<Vec<ExplainRow>, _> = diesel::sql_query(format!(
+                "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF) {sql}"
+            ))
+            .load(&mut conn)
+            .await;
+            diesel::sql_query("ROLLBACK")
+                .execute(&mut conn)
+                .await
+                .expect("rollback");
+
+            let plan_text = loaded
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF) \
+                         failed for label={label} backlog={backlog}: {e} -- the \
+                         literal substitution of claim_task_query() above is \
+                         likely stale against a query shape change; see the \
+                         `literals` array"
+                    )
+                })
+                .into_iter()
+                .map(|r| r.query_plan)
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let file_name = format!("{label}-claim-backlog-{backlog}.explain.txt");
+            std::fs::write(
+                out_dir.join(&file_name),
+                format!(
+                    "-- {label}: claim_task_query() @ backlog={backlog}, 4 queues --\n{plan_text}\n"
+                ),
+            )
+            .expect("write explain artifact");
+            eprintln!("wrote {file_name}");
+        }
+
+        summary_lines.push(format!(
+            "backlog={backlog} queues={} seeded_rows={} claimable_rows={}",
+            scenario.queues, seeded.seeded_rows, seeded.claimable_rows,
+        ));
+    }
+
+    // A `pg_stat_statements` snapshot from the *real* `claim_task()` production
+    // function (not the literal-substituted EXPLAIN text above), at both
+    // labels, so the committed snapshot reflects exactly the code path a live
+    // worker takes -- and so the drain loop's claimed count is a correctness
+    // sanity check that the capability-labels mutation above did not change
+    // *which* rows are eligible, only the cost of deciding so.
+    let mut claimed_by_label: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for label in ["no-capabilities", "capability-labels"] {
+        let mut stats_conn = db::connect(&bench.url).await;
+        let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+            .execute(&mut stats_conn)
+            .await;
+        diesel::sql_query(
+            "SELECT pg_stat_statements_reset(0, \
+                    (SELECT oid FROM pg_database WHERE datname = current_database()), 0)",
+        )
+        .execute(&mut stats_conn)
+        .await
+        .expect(
+            "pg_stat_statements_reset(...) failed -- see \
+             zz_capture_queue_pause_claim_evidence for the full rationale",
+        );
+
+        let headline = headline_scenario();
+        let seeded = db::seed(&mut stats_conn, headline).await;
+        let queues = db::queue_names(headline);
+        let worker_literal = format!("'{}-worker-0'", db::BENCH_PREFIX);
+
+        if label == "capability-labels" {
+            diesel::sql_query(format!(
+                "UPDATE harvest_task_queue SET required_capabilities = '{REQUIRED_CAPABILITIES_JSON}'::jsonb"
+            ))
+            .execute(&mut stats_conn)
+            .await
+            .expect("mutate headline backlog to carry required_capabilities");
+            diesel::sql_query(format!(
+                "UPDATE harvest_workers SET labels = '{WORKER_LABELS_JSON}'::jsonb WHERE worker_id = {worker_literal}"
+            ))
+            .execute(&mut stats_conn)
+            .await
+            .expect("mutate claiming worker's labels for the stat-snapshot drain");
+            diesel::sql_query("ANALYZE harvest_task_queue")
+                .execute(&mut stats_conn)
+                .await
+                .expect("re-analyze before the stat-snapshot drain");
+        }
+
+        // Drive the real claim path repeatedly so pg_stat_statements
+        // accumulates real, attributed `calls`/buffer counters for the
+        // production query text -- not just the single literal-substituted
+        // EXPLAIN above.
+        let mut claimed = 0usize;
+        let ceiling = seeded.claimable_rows + 10;
+        loop {
+            let result = autumn_harvest::queue::claim_task(
+                &mut stats_conn,
+                &queues,
+                &format!("{}-worker-0", db::BENCH_PREFIX),
+                "",
+                None,
+                &[],
+                &[],
+            )
+            .await
+            .expect("claim_task must not error");
+            match result {
+                Some(_) => {
+                    claimed += 1;
+                    assert!(
+                        claimed <= ceiling,
+                        "claimed more rows than were seeded -- bug in the capture loop"
+                    );
+                }
+                None => break,
+            }
+        }
+        eprintln!(
+            "label={label} stat-snapshot claim loop: claimed={claimed} of {} claimable",
+            seeded.claimable_rows
+        );
+        claimed_by_label.insert(label, claimed);
+
+        let stats_rows: Vec<StatRow> = diesel::sql_query(
+            "SELECT query, calls, shared_blks_hit, shared_blks_read, \
+                    (shared_blks_hit + shared_blks_read) AS total_buffers \
+             FROM pg_stat_statements \
+             WHERE query ILIKE '%harvest_task_queue%' \
+               AND dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+             ORDER BY total_buffers DESC LIMIT 10",
+        )
+        .load(&mut stats_conn)
+        .await
+        .expect(
+            "pg_stat_statements query failed -- see \
+             zz_capture_queue_pause_claim_evidence for the full rationale",
+        );
+
+        assert!(
+            !stats_rows.is_empty(),
+            "pg_stat_statements returned zero rows matching '%harvest_task_queue%' \
+             for label={label}, even though {claimed} real claim_task() calls \
+             (plus one terminal None) were just driven above",
+        );
+
+        let expected_calls =
+            i64::try_from(claimed + 1).expect("claimed count fits in i64 at this test's scale");
+        let claim_row = stats_rows
+            .iter()
+            .find(|r| r.query.contains("rate_limit_debit"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no pg_stat_statements row matched the production \
+                     claim_task_query() shape for label={label}; got: {stats_rows:?}"
+                )
+            });
+        assert_eq!(
+            claim_row.calls, expected_calls,
+            "pg_stat_statements reports {} calls for label={label}, expected \
+             {expected_calls} ({claimed} successful claims + 1 terminal None)",
+            claim_row.calls,
+        );
+
+        let stats_text = stats_rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "calls={} shared_blks_hit={} shared_blks_read={} total_buffers={}\nquery={}\n",
+                    r.calls, r.shared_blks_hit, r.shared_blks_read, r.total_buffers, r.query,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            out_dir.join(format!("{label}-pg_stat_statements.txt")),
+            format!(
+                "-- {label}: pg_stat_statements @ headline scenario ({} backlog, real claim_task() calls) --\n{stats_text}\n",
+                headline.backlog
+            ),
+        )
+        .expect("write pg_stat_statements artifact");
+
+        summary_lines.push(format!(
+            "stat_snapshot label={label}: backlog={} claimed={claimed}",
+            headline.backlog,
+        ));
+    }
+
+    // Correctness sanity check: the capability-labels mutation was built to
+    // MATCH the claiming worker, not exclude it, so both labels must claim
+    // the identical number of rows -- proving the added predicate cost is
+    // isolated from any change in which rows are eligible.
+    assert_eq!(
+        claimed_by_label.get("no-capabilities"),
+        claimed_by_label.get("capability-labels"),
+        "capability-labels mutation changed the claimable row count relative \
+         to no-capabilities ({claimed_by_label:?}) -- the labels/requirement \
+         seeded above no longer match, so this capture would be comparing \
+         different populations rather than isolating predicate cost",
+    );
+
+    std::fs::write(
+        out_dir.join("fixture-summary.txt"),
+        summary_lines.join("\n") + "\n",
+    )
+    .expect("write fixture summary");
+
+    eprintln!(
+        "== capture complete: capability-labels evidence, artifacts in {} ==",
+        out_dir.display()
+    );
+}
