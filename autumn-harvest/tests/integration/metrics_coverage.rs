@@ -11,16 +11,17 @@
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::telemetry::{
-    ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_LABEL_SCANNER,
-    METRIC_LABEL_SHARD, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_PAUSED,
-    METRIC_RETENTION_DELETED, METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED,
-    METRIC_SCANNER_TICK, METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS,
-    METRIC_SCHEDULE_SKIPPED, METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED,
-    METRIC_TASK_CAPABILITY_MISS, METRIC_TIMER_STARTED, METRIC_UPDATE_ADMITTED,
-    METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION, METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED,
-    METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION,
-    METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
-    MetricsRecorder, NoOpMetrics, WorkflowStatus,
+    ActivityPauseAction, ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_PAUSE_ACTIONS,
+    METRIC_DLQ_ENTRIES, METRIC_LABEL_SCANNER, METRIC_LABEL_SHARD, METRIC_QUEUE_DEPTH,
+    METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_PAUSED, METRIC_RETENTION_DELETED,
+    METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED, METRIC_SCANNER_TICK,
+    METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
+    METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED, METRIC_TASK_CAPABILITY_MISS,
+    METRIC_TIMER_STARTED, METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION,
+    METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED, METRIC_WORKFLOW_ACTIVE,
+    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
+    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, MetricsRecorder, NoOpMetrics,
+    WorkflowStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -142,6 +143,16 @@ impl MetricsRecorder for RecordingMetrics {
             labels: vec![
                 ("queue", queue.to_owned()),
                 ("paused", u8::from(paused).to_string()),
+            ],
+        });
+    }
+
+    fn record_activity_pause_action(&self, activity_name: &str, action: ActivityPauseAction) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_ACTIVITY_PAUSE_ACTIONS,
+            labels: vec![
+                ("activity", activity_name.to_owned()),
+                ("action", action.as_str().to_owned()),
             ],
         });
     }
@@ -372,6 +383,7 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
     rec.record_queue_depth("default", 5);
     rec.record_dlq_entries(0, 2);
     rec.record_queue_paused("email-workers", true);
+    rec.record_activity_pause_action("charge_card", ActivityPauseAction::Pause);
     rec.record_schedule_run("workflow", "nightly");
     rec.record_schedule_skipped("workflow", "nightly", "paused");
     rec.record_schedule_decision_write_failed();
@@ -492,6 +504,7 @@ fn cardinality_no_execution_id_label_on_any_metric() {
     rec.record_queue_depth("default", 0);
     rec.record_dlq_entries(0, 0);
     rec.record_queue_paused("email-workers", false);
+    rec.record_activity_pause_action("charge_card", ActivityPauseAction::Resume);
     rec.record_workflow_active("wf", "running", 0);
     rec.record_schedule_run("dag", "my_dag");
     rec.record_schedule_skipped("dag", "my_dag", "max_active_runs_reached");
@@ -742,6 +755,7 @@ fn noop_metrics_implements_all_catalogue_methods() {
     rec.record_queue_depth("q", 0);
     rec.record_dlq_entries(0, 0);
     rec.record_queue_paused("email-workers", false);
+    rec.record_activity_pause_action("charge_card", ActivityPauseAction::Pause);
     rec.record_schedule_run("workflow", "wf");
     rec.record_schedule_skipped("workflow", "wf", "paused");
     rec.record_schedule_decision_write_failed();
@@ -789,4 +803,45 @@ fn capability_miss_counter_reachable_with_bounded_labels() {
         })
         .collect();
     assert_eq!(outcomes, vec!["released", "escalated"]);
+}
+
+#[test]
+fn activity_pause_actions_counter_reachable_with_bounded_labels() {
+    // Issue #807: the pause/resume counter must be reachable via the trait with
+    // exactly the bounded label set activity/action — execution.id is forbidden
+    // by construction (ADR-0001 §7). Scope note (mirrors the capability-miss /
+    // saga / signal / update tests above): the asserted keys belong to the
+    // RecordingMetrics test double, so this pins the trait's reachable surface;
+    // production label content is pinned by the metrics_rs_adapter bridge test.
+    let rec = RecordingMetrics::default();
+    rec.record_activity_pause_action("charge_card", ActivityPauseAction::Pause);
+    rec.record_activity_pause_action("charge_card", ActivityPauseAction::Resume);
+
+    let samples = rec.drain();
+    assert_eq!(samples.len(), 2, "both bounded actions must be reachable");
+
+    for sample in &samples {
+        assert_eq!(sample.name, METRIC_ACTIVITY_PAUSE_ACTIONS);
+        let keys: Vec<&str> = sample.labels.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            vec!["activity", "action"],
+            "activity-pause labels must be exactly activity/action"
+        );
+    }
+
+    // A hold and a release must be separable on the counter: an operator
+    // graphing "how often is this lever pulled" needs to tell the two apart,
+    // and `increase(...)` over a merged series would be meaningless.
+    let actions: Vec<&str> = samples
+        .iter()
+        .map(|s| {
+            s.labels
+                .iter()
+                .find(|(k, _)| *k == "action")
+                .map(|(_, v)| v.as_str())
+                .expect("action label present")
+        })
+        .collect();
+    assert_eq!(actions, vec!["pause", "resume"]);
 }

@@ -417,6 +417,31 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     ("harvest_workers", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_batch_jobs", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_audit_log", &["SELECT", "INSERT", "DELETE"]),
+    // Claim-path gate tables. The claim CTE reads all four unconditionally on
+    // every poll, so a storage role missing `SELECT` on any one of them makes
+    // `claim_task` error and the worker claim *nothing* -- a missing grant
+    // becomes a total dispatch outage, not a degraded feature. No migration
+    // issues `GRANT`s, so this probe is the only thing that catches it before
+    // production. `INSERT` + `UPDATE` are paired because each pause table's
+    // and `harvest_build_compat`'s writer is `INSERT ... ON CONFLICT DO
+    // UPDATE`, which Postgres checks against *both* privileges.
+    // Pinned by `every_table_the_claim_path_reads_is_covered_by_the_privilege_probe`.
+    (
+        "harvest_activity_pauses",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
+    (
+        "harvest_queue_pauses",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
+    (
+        "harvest_build_compat",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
+    (
+        "harvest_rate_limit_buckets",
+        &["SELECT", "INSERT", "UPDATE"],
+    ),
 ];
 
 const HARVEST_SEQUENCE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] =
@@ -2122,6 +2147,8 @@ mod tests {
         assert!(sql.contains("harvest_task_queue"));
         assert!(sql.contains("harvest_dead_letters"));
         assert!(sql.contains("harvest_workers"));
+        assert!(sql.contains("harvest_activity_pauses"));
+        assert!(sql.contains("harvest_queue_pauses"));
         assert!(sql.contains("INSERT"));
         assert!(sql.contains("UPDATE"));
         assert!(sql.contains("DELETE"));
@@ -2133,6 +2160,50 @@ mod tests {
             assert!(
                 privileges.contains(&"SELECT"),
                 "{table} must require SELECT so readable/writable preflight matches runtime access"
+            );
+        }
+    }
+
+    /// Every table the hot claim path reads must be covered by the write
+    /// privilege probe.
+    ///
+    /// The claim CTE reads its gate tables **unconditionally on every poll**,
+    /// so a storage role missing `SELECT` on any one of them does not merely
+    /// degrade that feature -- `claim_task` errors and the worker claims
+    /// *nothing*, converting a missing grant into a total dispatch outage.
+    /// Preflight exists to catch exactly that before it reaches production,
+    /// and no migration issues `GRANT`s, so this list is the only thing
+    /// standing between a separately-granted storage role and that outage.
+    ///
+    /// Derived from `claim_task_query()` rather than hardcoded so that adding
+    /// a new gate table to the claim path *cannot* silently skip the probe:
+    /// this test fails until the table is registered here (issue #807 review,
+    /// Codex P1).
+    #[test]
+    fn every_table_the_claim_path_reads_is_covered_by_the_privilege_probe() {
+        let sql = autumn_harvest::queue::claim_task_query();
+
+        let mut referenced: Vec<&str> = sql
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|token| token.starts_with("harvest_"))
+            .collect();
+        referenced.sort_unstable();
+        referenced.dedup();
+
+        assert!(
+            !referenced.is_empty(),
+            "the extractor found no harvest_* tables -- the claim query shape changed"
+        );
+
+        for table in referenced {
+            let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
+                .iter()
+                .any(|(name, privileges)| *name == table && privileges.contains(&"SELECT"));
+            assert!(
+                covered,
+                "{table} is read by claim_task_query() but is not in \
+                 HARVEST_WRITE_PRIVILEGE_REQUIREMENTS with SELECT; a storage role \
+                 missing that grant would fail every claim while preflight passed"
             );
         }
     }

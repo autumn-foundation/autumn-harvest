@@ -8,6 +8,8 @@ mod activity_failure_tests;
 mod activity_info_tests;
 mod activity_interceptor_tests;
 mod activity_outcome_metrics_tests;
+#[cfg(feature = "db")]
+mod activity_pause_tests;
 mod admission_gate_authoritative_tests;
 mod admission_gate_tests;
 mod alert_pack_docs;

@@ -1321,6 +1321,110 @@ fn workflow_child_row_from_parts(
     }
 }
 
+/// Load the direct children of every id in `parent_ids` from one shard, in
+/// one `parent_id = ANY($1)` query.
+///
+/// This is the batched sibling of `load_workflow_children`: a caller walking
+/// a traversal *frontier* (the accumulated set of parents discovered at one
+/// depth level) should call this once per shard per depth level rather than
+/// calling `load_workflow_children` once per *parent* per shard per depth
+/// level — the latter costs `O(nodes × shards)` round trips for a depth-`D`
+/// tree, this costs `O(D × shards)`. See the "Cross-shard lineage tree
+/// loaders" doc comment below for the same argument as applied to
+/// `load_workflow_children_batch`, which this mirrors exactly except for
+/// returning `WorkflowChildRow` (this endpoint's flat, non-parent-tagged
+/// projection) instead of `LineageChildRow` (the nested `/tree` endpoint's
+/// parent-tagged one) — the caller here doesn't need to know *which* parent
+/// in the frontier produced a given child, only the whole next frontier and
+/// the whole set of matching rows.
+///
+/// Returns an empty vec without querying when `parent_ids` is empty.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn load_workflow_children_multi(
+    conn: &mut AsyncPgConnection,
+    parent_ids: &[uuid::Uuid],
+    filters: &WorkflowChildFilters,
+    depth: u8,
+) -> HarvestResult<Vec<WorkflowChildRow>> {
+    if parent_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parents: Vec<uuid::Uuid> = parent_ids.to_vec();
+    let mut query = harvest_workflow_executions::table
+        .into_boxed()
+        .filter(harvest_workflow_executions::parent_id.eq_any(parents))
+        .order((
+            harvest_workflow_executions::started_at.desc(),
+            harvest_workflow_executions::id.desc(),
+        ));
+
+    if !filters.statuses.is_empty() {
+        query = query.filter(harvest_workflow_executions::state.eq_any(filters.statuses.clone()));
+    }
+    if let Some(name) = &filters.workflow_name {
+        query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
+    }
+    if let Some(cursor) = &filters.cursor {
+        query = query.filter(
+            harvest_workflow_executions::started_at
+                .lt(cursor.started_at)
+                .or(harvest_workflow_executions::started_at
+                    .eq(cursor.started_at)
+                    .and(harvest_workflow_executions::id.lt(cursor.exec_id))),
+        );
+    }
+    if let Some(limit) = filters.limit {
+        query = query.limit(limit);
+    }
+
+    query
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_name,
+            harvest_workflow_executions::state,
+            harvest_workflow_executions::started_at,
+            harvest_workflow_executions::completed_at,
+            harvest_workflow_executions::error,
+            harvest_workflow_executions::shard_id,
+            harvest_workflow_executions::parent_close_policy,
+        ))
+        .load::<WorkflowChildProjection>(conn)
+        .await
+        .map_err(crate::error::database_error)
+        .map(|rows| {
+            rows.into_iter()
+                .map(
+                    |(
+                        id,
+                        workflow_name,
+                        state,
+                        started_at,
+                        completed_at,
+                        error,
+                        shard_id,
+                        parent_close_policy,
+                    )| {
+                        workflow_child_row_from_parts(
+                            id,
+                            workflow_name,
+                            state,
+                            started_at,
+                            completed_at,
+                            error,
+                            shard_id,
+                            depth,
+                            parent_close_policy.as_deref(),
+                        )
+                    },
+                )
+                .collect()
+        })
+}
+
 // ── Cross-shard lineage tree loaders (issue #621) ────────────────────────────
 //
 // The recursive lineage walk expands a whole *frontier* of parents per level,

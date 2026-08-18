@@ -320,6 +320,7 @@ metric is emitted in the source code.
 | `harvest.activity.failed` | Counter | `worker.rs` — `dispatch_activity_handler`, on each failed attempt; richer labels than `harvest.activity.attempts` (`workflow.type`, `error.type`, `non_retryable`) |
 | `harvest.activity.attempts` | Counter | `worker.rs` — `dispatch_activity_handler`, once per attempt for **both** outcomes; use for success-rate SLOs: `rate(attempts{outcome="completed"}[5m]) / rate(attempts[5m])` (issue #528) |
 | `harvest.activity.retries` | Counter | `worker.rs` — `handle_activity_result`, once per retry actually scheduled (after the `schedule_to_close` deadline check); use for retry-storm detection (issue #528) |
+| `harvest.activity.pause_actions` | Counter | `activity_pause.rs` — the `pause_activity` / `resume_activity` write path, once per operator action on a whole activity type (issue #807). **Gated on the action having genuinely changed state** (`ActivityPauseOutcome::newly_paused` / `ActivityResumeOutcome::newly_resumed`) so an idempotent retry after a lost response does not read as a second hold — the same gating `harvest.workflow.paused` uses (issue #383). Deliberately a counter, not a gauge: it records *actions*, so a flat line says nothing about whether a hold is currently in effect — `GET /api/harvest/activities` is the read model for the state. Contrast its sibling `harvest.queue.paused` (issue #619), a gauge, because there the alertable thing is the *duration* of the hold |
 | `harvest.timer.started` | Counter | `worker.rs` — `persist_timer_command`, when a durable timer is written |
 | `harvest.queue.depth` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, periodic (5 s default). Aggregated **across all shards** of the worker's `ShardedDbPool` (summed per queue) so multi-shard backlog is fleet-wide, not default-shard-only (issue #522) |
 | `harvest.queue.schedule_to_start` | Histogram | `worker.rs` — `dispatch_task`, recorded after the concurrency permit is acquired so it captures worker-local backpressure; skew-discounted (issue #501) |
@@ -376,6 +377,7 @@ metric is emitted in the source code.
 | `harvest.activity.failed` | `activity`, `workflow.type`, `error.type`, `non_retryable` |
 | `harvest.activity.attempts` | `activity`, `queue`, `outcome` (`completed\|failed`) |
 | `harvest.activity.retries` | `activity`, `queue` |
+| `harvest.activity.pause_actions` | `activity` (bounded **by bucketing**: the pause routes accept an unregistered name on purpose, so the raw value is caller-controlled free text — the emitter resolves it against the registered activity catalogue and substitutes `__unregistered__` when absent, exactly as the #684 update-name label does), `action` (`pause\|resume`, bounded by `ActivityPauseAction`) |
 | `harvest.timer.started` | _(none)_ |
 | `harvest.queue.depth` | `queue` |
 | `harvest.queue.schedule_to_start` | `queue` |

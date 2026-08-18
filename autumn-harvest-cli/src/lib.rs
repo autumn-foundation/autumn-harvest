@@ -327,6 +327,13 @@ pub enum CliError {
         detail: String,
     },
 
+    /// An activity pause/resume was only partially applied across the fleet.
+    #[error("activity mutation was only partially applied: {detail}")]
+    ActivityPartialMutation {
+        /// Per-shard failure summary reported by the API.
+        detail: String,
+    },
+
     /// A queue name would be normalized away as a URL dot-segment.
     #[error(
         "invalid queue name '{value}': '.' and '..' are removed as dot-segments \
@@ -334,6 +341,17 @@ pub enum CliError {
          request at a different route"
     )]
     QueueNameDotSegment {
+        /// Original CLI argument value.
+        value: String,
+    },
+
+    /// An activity name would be normalized away as a URL dot-segment.
+    #[error(
+        "invalid activity name '{value}': '.' and '..' are removed as \
+         dot-segments when the request URL is parsed, which would silently \
+         retarget the request at a different route"
+    )]
+    ActivityNameDotSegment {
         /// Original CLI argument value.
         value: String,
     },
@@ -546,6 +564,12 @@ enum Commands {
     Queue {
         #[command(subcommand)]
         command: QueueCommand,
+    },
+    /// Hold or release dispatch for a single activity type (issue #807).
+    #[command(alias = "activities")]
+    Activity {
+        #[command(subcommand)]
+        command: ActivityCommand,
     },
     /// Inspect cluster-wide per-activity concurrency caps.
     Concurrency {
@@ -2056,6 +2080,64 @@ enum QueueCommand {
     },
 }
 
+/// Per-activity-type pause/resume (issue #807): the surgical sibling of the
+/// queue pause above.
+///
+/// Hold dispatch for ONE activity type while a scoped downstream dependency is
+/// down, leaving every other activity type on the same queue flowing. Held
+/// tasks stay `PENDING` — never failed, retried, or dead-lettered — and an
+/// already-running attempt finishes naturally. On resume the time each task
+/// spent held is credited back to its `scheduled_at`, so the thaw does not
+/// retroactively schedule-to-start-time-out the backlog.
+///
+/// Reach for `harvest queue pause` instead when the WHOLE queue must stop; for
+/// many affected activity types on one queue, one queue hold is easier to
+/// remember to release than N activity holds.
+#[derive(Debug, Subcommand)]
+enum ActivityCommand {
+    /// Hold dispatch for one activity type, fleet-wide.
+    Pause {
+        /// Activity type name, matched exactly (no trimming).
+        activity_name: String,
+        /// Why the activity is being held. Recorded on the pause row, surfaced
+        /// by `harvest activity list`, and carried into the audit trail — which
+        /// is the reason's only permanent home, since resume deletes the row.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Operator identity to record as `paused_by`. A LABEL for attribution,
+        /// not authentication: the audit row always carries the authenticated
+        /// actor, so this can never rewrite the security trail.
+        #[arg(long)]
+        actor: Option<String>,
+    },
+    /// Release a held activity type; held tasks become immediately claimable.
+    Resume {
+        /// Activity type name, matched exactly (no trimming).
+        activity_name: String,
+    },
+    /// List registered activity types with their pause state and held backlog.
+    ///
+    /// Driven by the registered catalogue, not the pause table, so a healthy
+    /// activity is listed with `paused: false` — this is the surface used to
+    /// answer "is `charge_card` held?" during an incident. A paused-but-
+    /// unregistered activity is listed too, flagged `registered: false`, so a
+    /// mistyped hold can never become invisible here.
+    #[command(alias = "list-paused", alias = "status")]
+    List {
+        /// Print the raw JSON body instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one activity type's pause state.
+    ///
+    /// Exits non-zero when the name is neither registered nor paused anywhere
+    /// the read could reach (HTTP 404).
+    Get {
+        /// Activity type name, matched exactly (no trimming).
+        activity_name: String,
+    },
+}
+
 /// Per-execution legal hold (issue #747): exempt an execution's history from
 /// retention deletion and PII erasure until released or auto-expired.
 #[derive(Debug, Subcommand)]
@@ -2455,6 +2537,7 @@ impl Cli {
             Commands::CompletionDelivery { command } => Ok(completion_delivery_request(command)),
             Commands::Retention { command } => Ok(retention_request(command)),
             Commands::Queue { command } => queue_request(command),
+            Commands::Activity { command } => activity_request(command),
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
             Commands::RateLimit { command } => Ok(rate_limit_request(command)),
             Commands::Batch { command } => batch_request(command),
@@ -2786,6 +2869,17 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
             .unwrap_or("see response body")
             .to_string();
         return Err(CliError::QueuePartialMutation { detail });
+    }
+    // Same 207-is-2xx hazard as the queue mutation above, and the response
+    // carries the identical `ok`/`status` contract, so the same body-level gate
+    // applies: a hold that missed a shard must never look like success.
+    if activity_mutation_should_gate(&cli) && queue_mutation_exit_code(&response) != 0 {
+        let detail = response
+            .get("partial_failures")
+            .and_then(Value::as_str)
+            .unwrap_or("see response body")
+            .to_string();
+        return Err(CliError::ActivityPartialMutation { detail });
     }
     if canary_should_gate(&cli) && canary_exit_code(&response) != 0 {
         let verdict = response
@@ -4350,6 +4444,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if queue_coverage_wants_table(cli) {
         return Ok(format_queue_coverage_table(value));
     }
+    if activity_list_wants_table(cli) {
+        return Ok(format_activity_list_table(value));
+    }
     if backfill_wants_table(cli) {
         return Ok(format_backfill_table(value));
     }
@@ -4373,6 +4470,7 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
         || canary_wants_raw_json(cli)
         || workflow_reachability_wants_raw_json(cli)
         || queue_coverage_wants_raw_json(cli)
+        || activity_list_wants_raw_json(cli)
         || usage_wants_raw_json(cli)
         || diagnose_wants_raw_json(cli)
     {
@@ -5616,6 +5714,116 @@ fn format_workflow_reachability_table(value: &Value) -> String {
     };
 
     format!("status: {status}\nobserved_at: {observed_at}\n\n{table}{footer}")
+}
+
+// ─── Per-activity-type pause helpers (issue #807) ─────────────────────────────
+
+/// `harvest activity list` renders the table by default; `--json` opts out.
+///
+/// Mirrors the `--json`-flag idiom the other list reads use (dlq aggregate,
+/// workflow-types reachability, queue coverage) rather than the queue-pause
+/// sibling, which ships no renderer at all: `queue list-paused` returns only
+/// held queues, whereas this read returns the whole registered catalogue and is
+/// long enough that raw JSON is unreadable mid-incident.
+fn activity_list_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Activity {
+            command: ActivityCommand::List { json: false }
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+const fn activity_list_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Activity {
+            command: ActivityCommand::List { json: true }
+        }
+    )
+}
+
+/// Render `GET /activities` (issue #807) as an operator-readable table.
+///
+/// `status` is a header line rather than a column because it qualifies every
+/// row at once: on a partial read `PAUSED: no` means only "not held on the
+/// shards that answered", so an operator reading a negative during an incident
+/// has to see the degradation before trusting it. The per-shard detail is not
+/// repeated here — `run_cli` already emits it on STDERR via
+/// `fanout_partial_notice`, keeping STDOUT a single clean table.
+///
+/// `LOCAL` earns a column despite being niche: a local activity runs inline on
+/// the workflow worker and never takes a task-queue row, so a hold on one holds
+/// nothing. A `PAUSED: yes` / `LOCAL: yes` row is a no-op hold, and that is
+/// invisible without the column. `REGISTERED` is the mistyped-hold signal — a
+/// held name this process has no catalogue entry for is still listed, flagged
+/// `no`.
+///
+/// `SCOPE` earns one for the same reason (issue #807 review): it is the second
+/// way `PAUSED: yes` can be a lie. A fleet-wide pause that only reached some
+/// shards writes rows byte-identical to a complete hold and *no* row on the
+/// shards it missed, so `partial_fleet` is the only signal that part of the
+/// fleet is still dispatching. Leaving it to `--json` would put the one field
+/// that contradicts the headline answer behind a flag nobody reaches for
+/// mid-incident. The remaining fields (`scope_shard_id`, `provenance_uniform`,
+/// the per-shard `shards` array) stay `--json` territory: they matter when
+/// reconciling a disagreeing hold, not when answering "is this held?".
+fn format_activity_list_table(value: &Value) -> String {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let Some(items) = value.get("activities").and_then(Value::as_array) else {
+        return format!("status: {status}\nNo activities returned.");
+    };
+    if items.is_empty() {
+        return format!("status: {status}\nNo activities found.");
+    }
+
+    let mut rows = Vec::with_capacity(items.len() + 1);
+    rows.push(vec![
+        "ACTIVITY".to_string(),
+        "QUEUE".to_string(),
+        "REGISTERED".to_string(),
+        "LOCAL".to_string(),
+        "PAUSED".to_string(),
+        "SCOPE".to_string(),
+        "HELD".to_string(),
+        "REASON".to_string(),
+        "PAUSED_BY".to_string(),
+    ]);
+    for item in items {
+        rows.push(vec![
+            cell_str(item.get("activity_name")),
+            cell_str(item.get("queue_name")),
+            bool_cell(item.get("registered")),
+            bool_cell(item.get("is_local")),
+            bool_cell(item.get("paused")),
+            cell_str(item.get("effective_scope")),
+            cell_number(item.get("held_task_count")),
+            cell_str(item.get("paused_reason")),
+            cell_str(item.get("paused_actor")),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("status: {status}\n\n{table}")
 }
 
 // ─── Queue coverage helpers (issue #774) ───────────────────────────────────
@@ -7858,6 +8066,79 @@ fn queue_request(command: &QueueCommand) -> Result<ApiRequest, CliError> {
     }
 }
 
+/// True when the command is an activity pause/resume, whose response carries
+/// the same partial-application contract as the queue mutations.
+///
+/// `list`/`get` are reads with no such contract, so they are excluded — the
+/// same split `queue_mutation_should_gate` makes for `list-paused`.
+const fn activity_mutation_should_gate(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Activity {
+            command: ActivityCommand::Pause { .. } | ActivityCommand::Resume { .. }
+        }
+    )
+}
+
+/// Map `harvest activity …` onto the four management routes (issue #807).
+///
+/// The activity name is checked for URL dot-segments for exactly the reason
+/// `checked_queue_segment` documents: the WHATWG URL parser strips `.` and `..`
+/// segments AFTER `ApiRequest.path` is assembled, so an activity literally named
+/// `.` would silently retarget `/activities/./pause` at `/activities/pause`.
+///
+/// `--reason`/`--actor` are omitted from the body entirely when unset, so the
+/// server applies its own defaults rather than receiving an empty string — and
+/// a bare `harvest activity pause charge_card` is a valid, complete containment
+/// action. Containment must not wait on paperwork.
+fn activity_request(command: &ActivityCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        ActivityCommand::Pause {
+            activity_name,
+            reason,
+            actor,
+        } => {
+            let segment = checked_activity_segment(activity_name)?;
+            let mut body = Map::new();
+            if let Some(value) = reason {
+                body.insert("reason".to_string(), Value::String(value.clone()));
+            }
+            if let Some(value) = actor {
+                body.insert("actor".to_string(), Value::String(value.clone()));
+            }
+            Ok(ApiRequest::post(
+                format!("/activities/{segment}/pause"),
+                Some(Value::Object(body)),
+            ))
+        }
+        ActivityCommand::Resume { activity_name } => {
+            let segment = checked_activity_segment(activity_name)?;
+            Ok(ApiRequest::post(
+                format!("/activities/{segment}/resume"),
+                Some(Value::Object(Map::new())),
+            ))
+        }
+        ActivityCommand::List { .. } => Ok(ApiRequest::get("/activities")),
+        ActivityCommand::Get { activity_name } => {
+            let segment = checked_activity_segment(activity_name)?;
+            Ok(ApiRequest::get(format!("/activities/{segment}")))
+        }
+    }
+}
+
+/// Reject an activity name that cannot survive URL path parsing intact.
+///
+/// Shares `is_url_dot_segment` with the queue path — the hazard is a property
+/// of URL parsing, not of what the segment names.
+fn checked_activity_segment(activity_name: &str) -> Result<String, CliError> {
+    if is_url_dot_segment(activity_name) {
+        return Err(CliError::ActivityNameDotSegment {
+            value: activity_name.to_string(),
+        });
+    }
+    Ok(path_segment(activity_name))
+}
+
 fn rate_limit_request(command: &RateLimitCommand) -> ApiRequest {
     match command {
         RateLimitCommand::Status => ApiRequest::get("/admin/rate-limits"),
@@ -10076,6 +10357,258 @@ mod reuse_policy_tests {
             .exit_code(),
             1
         );
+    }
+
+    // ─── Per-activity-type pause/resume (issue #807) ─────────────────────────
+
+    #[test]
+    fn activity_mutation_gate_applies_only_to_the_mutating_subcommands() {
+        assert!(activity_mutation_should_gate(&parse(&[
+            "activity",
+            "pause",
+            "charge_card"
+        ])));
+        assert!(activity_mutation_should_gate(&parse(&[
+            "activity",
+            "resume",
+            "charge_card"
+        ])));
+        assert!(
+            !activity_mutation_should_gate(&parse(&["activity", "list"])),
+            "the read route has no partial-application contract to gate on"
+        );
+        assert!(!activity_mutation_should_gate(&parse(&[
+            "activity",
+            "get",
+            "charge_card"
+        ])));
+        assert!(!activity_mutation_should_gate(&parse(&["health"])));
+        assert!(
+            !activity_mutation_should_gate(&parse(&["queue", "pause", "q", "--reason", "x"])),
+            "the queue gate and the activity gate must not fire for each other"
+        );
+    }
+
+    #[test]
+    fn activity_partial_mutation_error_uses_exit_code_one() {
+        assert_eq!(
+            CliError::ActivityPartialMutation {
+                detail: "shard 1 unreachable".to_string()
+            }
+            .exit_code(),
+            1
+        );
+    }
+
+    #[test]
+    fn activity_name_dot_segment_error_uses_exit_code_one() {
+        assert_eq!(
+            CliError::ActivityNameDotSegment {
+                value: "..".to_string()
+            }
+            .exit_code(),
+            1
+        );
+    }
+
+    #[test]
+    fn activity_list_renders_a_table_by_default_and_raw_json_on_demand() {
+        assert!(
+            activity_list_wants_table(&parse(&["activity", "list"])),
+            "the table is the default rendering, not an opt-in"
+        );
+        assert!(!activity_list_wants_raw_json(&parse(&["activity", "list"])));
+
+        assert!(!activity_list_wants_table(&parse(&[
+            "activity", "list", "--json"
+        ])));
+        assert!(activity_list_wants_raw_json(&parse(&[
+            "activity", "list", "--json"
+        ])));
+
+        // `--output json` is the global format flag and must keep suppressing
+        // the table on its own, exactly as it does for every other list read.
+        assert!(!activity_list_wants_table(&parse(&[
+            "--output", "json", "activity", "list"
+        ])));
+
+        // The table gate is scoped to `list`: the mutations and the single-name
+        // read still fall through to the shared JSON rendering.
+        assert!(!activity_list_wants_table(&parse(&[
+            "activity",
+            "get",
+            "charge_card"
+        ])));
+        assert!(!activity_list_wants_table(&parse(&[
+            "activity",
+            "pause",
+            "charge_card"
+        ])));
+    }
+
+    #[test]
+    fn activity_list_table_gate_survives_the_documented_aliases() {
+        // The aliases are the muscle-memory spellings an operator reaches for
+        // mid-incident; they must land on the table, not raw JSON.
+        for alias in ["list", "list-paused", "status"] {
+            assert!(
+                activity_list_wants_table(&parse(&["activity", alias])),
+                "`activity {alias}` should render the table"
+            );
+        }
+    }
+
+    #[test]
+    fn activity_list_table_surfaces_the_hold_and_its_provenance() {
+        let value = json!({
+            "status": "complete",
+            "activities": [
+                {
+                    "activity_name": "charge_card",
+                    "registered": true,
+                    "queue_name": "payments",
+                    "is_local": false,
+                    "paused": true,
+                    "paused_reason": "stripe outage",
+                    "paused_actor": "alice",
+                    "paused_at": "2026-08-17T00:00:00Z",
+                    "scope_shard_id": null,
+                    "held_task_count": 42,
+                    "provenance_uniform": true,
+                    "shards": []
+                },
+                {
+                    "activity_name": "send_email",
+                    "registered": true,
+                    "queue_name": "email",
+                    "is_local": false,
+                    "paused": false,
+                    "paused_reason": null,
+                    "paused_actor": null,
+                    "paused_at": null,
+                    "scope_shard_id": null,
+                    "held_task_count": 0,
+                    "provenance_uniform": true,
+                    "shards": []
+                }
+            ],
+            "unavailable_shards": []
+        });
+        let rendered = format_activity_list_table(&value);
+
+        assert!(rendered.starts_with("status: complete"));
+        assert!(rendered.contains("ACTIVITY"));
+        assert!(rendered.contains("charge_card"));
+        assert!(rendered.contains("payments"));
+        assert!(rendered.contains("42"), "held backlog must be visible");
+        assert!(rendered.contains("stripe outage"), "why it is held");
+        assert!(rendered.contains("alice"), "who held it");
+        // The healthy row is listed too — this read answers "is it held?", so a
+        // flowing activity has to appear rather than be absent-by-omission.
+        assert!(rendered.contains("send_email"));
+    }
+
+    #[test]
+    fn activity_list_table_flags_a_no_op_hold_on_a_local_activity() {
+        // A local activity runs inline and never takes a task-queue row, so a
+        // hold on one holds nothing. Without the LOCAL column that row reads as
+        // a successful containment action when it did nothing at all.
+        let value = json!({
+            "status": "complete",
+            "activities": [{
+                "activity_name": "compute_checksum",
+                "registered": true,
+                "queue_name": null,
+                "is_local": true,
+                "paused": true,
+                "paused_reason": "held by mistake",
+                "paused_actor": "bob",
+                "held_task_count": 0
+            }],
+            "unavailable_shards": []
+        });
+        let rendered = format_activity_list_table(&value);
+        assert!(rendered.contains("LOCAL"));
+        assert!(rendered.contains("compute_checksum"));
+    }
+
+    /// Issue #807 review: a partially-applied fleet-wide hold must not render
+    /// as a clean containment action.
+    ///
+    /// `PAUSED: yes` on its own is exactly the misleading signal: the shards a
+    /// fleet-wide pause reached hold rows byte-identical to a complete hold, and
+    /// the ones it missed hold no row at all, so an operator reading the table
+    /// during an incident would believe `charge_card` is stopped while part of
+    /// the fleet keeps dispatching it. `SCOPE` is the column that says otherwise.
+    #[test]
+    fn activity_list_table_flags_a_partially_applied_fleet_hold() {
+        let value = json!({
+            "status": "complete",
+            "activities": [{
+                "activity_name": "charge_card",
+                "registered": true,
+                "queue_name": "payments",
+                "is_local": false,
+                "paused": true,
+                "effective_scope": "partial_fleet",
+                "paused_reason": "stripe outage",
+                "paused_actor": "alice",
+                "scope_shard_id": null,
+                "held_task_count": 4,
+                "provenance_uniform": true,
+                "shards": []
+            }],
+            "unavailable_shards": []
+        });
+        let rendered = format_activity_list_table(&value);
+        assert!(rendered.contains("SCOPE"), "the coverage column must exist");
+        assert!(
+            rendered.contains("partial_fleet"),
+            "an incomplete hold must say so on the surface an operator reads \
+             during the incident, not only in --json: {rendered}"
+        );
+    }
+
+    #[test]
+    fn activity_list_table_keeps_status_visible_on_a_partial_read() {
+        // The contract warns that on a partial read `paused: false` means only
+        // "not held on the shards that answered". The status line is what stops
+        // an operator trusting that negative, so it must render even though the
+        // per-shard detail goes to STDERR via `fanout_partial_notice`.
+        let value = json!({
+            "status": "partial",
+            "activities": [{
+                "activity_name": "charge_card",
+                "registered": true,
+                "queue_name": "payments",
+                "is_local": false,
+                "paused": false,
+                "held_task_count": 0
+            }],
+            "unavailable_shards": [{ "shard_id": 1, "reason": "connect timeout" }]
+        });
+        let rendered = format_activity_list_table(&value);
+        assert!(
+            rendered.starts_with("status: partial"),
+            "a degraded read must not present a clean negative: {rendered}"
+        );
+    }
+
+    #[test]
+    fn activity_list_table_handles_empty_and_malformed_bodies() {
+        let empty = format_activity_list_table(&json!({
+            "status": "complete",
+            "activities": [],
+            "unavailable_shards": []
+        }));
+        assert!(empty.contains("status: complete"));
+        assert!(empty.contains("No activities found."));
+
+        // Defensive: never panic on a body missing the list entirely, and still
+        // report the status the operator needs.
+        let malformed = format_activity_list_table(&json!({ "status": "unavailable" }));
+        assert!(malformed.contains("status: unavailable"));
+        assert!(malformed.contains("No activities returned."));
     }
 
     #[test]

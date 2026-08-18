@@ -369,6 +369,55 @@ async fn eris_unauthenticated_queue_resume_is_blocked() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// Issue #807: pausing dispatch for an activity TYPE is a fleet-wide kill
+/// switch for that downstream — the most surgical, and therefore the most
+/// reachable-for, of the hold controls. It must be admin-gated and audited,
+/// never reachable unauthenticated.
+///
+/// The body is deliberately optional on this route (containment must not wait
+/// on paperwork), which makes it the easiest of the mutations to fire
+/// accidentally — a bare POST is a valid hold — so the gate matters more here,
+/// not less. Both cases below send a body-free POST for exactly that reason.
+#[tokio::test]
+async fn eris_unauthenticated_activity_pause_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json("/activities/charge_card/pause", ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_activity_resume_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json("/activities/charge_card/resume", ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Issue #807: unlike the queue-pause sibling, whose paused-queue list is an
+/// ungated read, BOTH activity reads are admin-gated — they surface
+/// operator-authored hold reasons (free text written mid-incident) and the full
+/// shape of the registered activity catalogue, which is a map of the fleet's
+/// downstream dependencies. Pinned so the gate cannot be dropped by someone
+/// pattern-matching on the queue sibling.
+#[tokio::test]
+async fn eris_unauthenticated_activity_list_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app.oneshot(get("/activities")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_activity_get_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app.oneshot(get("/activities/charge_card")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn eris_unauthenticated_workflow_logs_is_blocked() {
     // Durable per-execution author log lines (issue #790): admin-only read —

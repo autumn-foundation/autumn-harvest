@@ -1,0 +1,9 @@
+-- before: pg_stat_statements @ one real GET /workflows/{id}/children?depth=2 request, 300 gen1 x 4 gen2 x 2 gen3, 2 shards --
+TOTAL across matching statement shapes: calls=3002 buffers=9276
+
+calls=1501 shared_blks_hit=4758 shared_blks_read=0 total_buffers=4758
+query=SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."state", "harvest_workflow_executions"."started_at", "harvest_workflow_executions"."completed_at", "harvest_workflow_executions"."error", "harvest_workflow_executions"."shard_id", "harvest_workflow_executions"."parent_close_policy" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."parent_id" = $1) ORDER BY "harvest_workflow_executions"."started_at" DESC, "harvest_workflow_executions"."id" DESC
+
+calls=1501 shared_blks_hit=4518 shared_blks_read=0 total_buffers=4518
+query=SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."state", "harvest_workflow_executions"."started_at", "harvest_workflow_executions"."completed_at", "harvest_workflow_executions"."error", "harvest_workflow_executions"."shard_id", "harvest_workflow_executions"."parent_close_policy" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."parent_id" = $1) ORDER BY "harvest_workflow_executions"."started_at" DESC, "harvest_workflow_executions"."id" DESC
+

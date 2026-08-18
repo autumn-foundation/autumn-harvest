@@ -260,12 +260,17 @@ struct AuditRow {
     status: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     route_or_command: String,
+    /// `harvest_audit_log` has no metadata column, so the hold's reason (plus
+    /// any on-behalf-of label and partial-failure text) is carried here.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    error_summary: Option<String>,
 }
 
 async fn audit_rows(pool: &DbPool, operation: &str) -> Vec<AuditRow> {
     let mut conn = pool.get().await.expect("pooled conn");
     diesel::sql_query(
-        "SELECT operation, actor, target_type, target_id, status, route_or_command \
+        "SELECT operation, actor, target_type, target_id, status, route_or_command, \
+                error_summary \
          FROM harvest_audit_log WHERE operation = $1 ORDER BY occurred_at",
     )
     .bind::<diesel::sql_types::Text, _>(operation)
@@ -393,6 +398,71 @@ async fn pause_list_resume_round_trip_with_audit() {
     assert_eq!(
         resumes[0].route_or_command,
         "POST /admin/queues/{queue_name}/resume"
+    );
+}
+
+/// An idempotent re-pause must audit the hold actually IN EFFECT, not the
+/// reason the retry happened to carry (issue #807 review).
+///
+/// `pause_queue` preserves the ORIGINAL row on a re-pause — that is the whole
+/// point of the idempotence — so a second pause carrying a different reason (or
+/// omitting one entirely, which resolves to the default) leaves every shard
+/// still held for the *first* incident. The response body already reports the
+/// effective provenance; the durable audit row is what survives the resume's
+/// `DELETE`, so a row echoing the request would be the only permanent record of
+/// the hold and would name a reason that was in effect nowhere.
+///
+/// This is the wiring-level assertion for that contract: it drives the real
+/// route and reads the real `harvest_audit_log` row, so it fails if the handler
+/// is ever pointed back at the request's reason. The per-activity sibling
+/// shares the same `held_holds_audit_reason` helper and call-site shape, and is
+/// unit-covered alongside this one.
+#[tokio::test]
+async fn a_re_pause_audits_the_effective_hold_not_the_new_request() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let (status, _) = post_json(
+        &app,
+        "/admin/queues/email-workers/pause",
+        json!({"reason": "SMTP provider outage"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The retry a real operator makes: same hold, different words.
+    let (status, body) = post_json(
+        &app,
+        "/admin/queues/email-workers/pause",
+        json!({"reason": "retry: unrelated wording"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "re-pause body: {body}");
+    assert_eq!(
+        body["newly_paused"], false,
+        "the hold was already in effect"
+    );
+    assert_eq!(
+        body["reason"], "SMTP provider outage",
+        "the RESPONSE already reports the effective hold: {body}"
+    );
+
+    let pauses = audit_rows(&pool, "queue.pause").await;
+    assert_eq!(pauses.len(), 2, "both attempts are audited");
+    let repeat = pauses[1]
+        .error_summary
+        .as_deref()
+        .expect("a successful pause still records its reason");
+    assert!(
+        repeat.contains("SMTP provider outage"),
+        "the durable row must name the hold actually in effect -- it outlives \
+         the response and the pause row; got {repeat}"
+    );
+    assert!(
+        !repeat.contains("retry: unrelated wording"),
+        "the request's reason is in effect on no shard and must not be recorded \
+         as though it were; got {repeat}"
     );
 }
 

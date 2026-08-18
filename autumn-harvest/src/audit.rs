@@ -134,6 +134,15 @@ pub const OP_WORKFLOW_REPLAY_CANARY: &str = "workflow.replay_canary";
 pub const OP_ACTIVITY_RETRY_NOW: &str = "activity.retry_now";
 /// Audit operation: Force-failed a hung in-flight activity task (issue #765).
 pub const OP_ACTIVITY_FAIL_NOW: &str = "activity.fail_now";
+/// Audit operation: an operator held dispatch for one activity **type**
+/// (issue #807).
+///
+/// Distinct from [`OP_ACTIVITY_RETRY_NOW`] / [`OP_ACTIVITY_FAIL_NOW`], which
+/// act on a single in-flight *task*: this is the type-wide, fleet-wide hold an
+/// operator reaches for when one downstream dependency is in a known outage.
+pub const OP_ACTIVITY_PAUSE: &str = "activity.pause";
+/// Audit operation: an operator released a per-activity-type hold (issue #807).
+pub const OP_ACTIVITY_RESUME: &str = "activity.resume";
 /// Audit operation: Batch-reset workflow executions to a semantic point (issue #538).
 pub const OP_BATCH_RESET: &str = "batch.reset";
 /// Audit operation: Set (or updated) a queue's percentage build ramp (issue #604).
@@ -497,6 +506,20 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "POST /activities/external/{token}/heartbeat",
         RouteClass::Mutating,
     ),
+    // Per-activity-type pause/resume (issue #807): the operator's hand on one
+    // activity's dispatch valve during a scoped downstream outage. The two
+    // reads are admin-gated but audit-excluded (a diagnostic read, like every
+    // other read model); the two mutations are the fleet-wide hold control.
+    ("GET /activities", RouteClass::ReadOnly),
+    ("GET /activities/{activity_name}", RouteClass::ReadOnly),
+    (
+        "POST /activities/{activity_name}/pause",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /activities/{activity_name}/resume",
+        RouteClass::Mutating,
+    ),
     ("POST /workers/{worker_id}/drain", RouteClass::Mutating),
     ("POST /admin/rate-limits/{key}", RouteClass::Mutating),
     ("POST /batch-operations", RouteClass::Mutating),
@@ -737,6 +760,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_ACTIVITY_RETRY_NOW,
     // Force-fail hung in-flight activity (issue #765)
     OP_ACTIVITY_FAIL_NOW,
+    // Per-activity-type pause/resume (issue #807)
+    OP_ACTIVITY_PAUSE,
+    OP_ACTIVITY_RESUME,
     // Batch reset by semantic point (issue #538)
     OP_BATCH_RESET,
     // Percentage build ramp (issue #604)
@@ -823,6 +849,9 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/rate-limits",
     // Heartbeats are high-volume liveness pings, not operator mutations.
     "POST /activities/external/{token}/heartbeat",
+    // Activity-pause catalogue reads (issue #807) — diagnostic, no audit trail.
+    "GET /activities",
+    "GET /activities/{activity_name}",
     "GET /workers",
     "GET /workers/health",
     "GET /workers/{worker_id}",
@@ -1020,6 +1049,17 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         Some(OP_EXTERNAL_ACTIVITY_FAIL),
     ),
     ("POST /activities/external/{token}/heartbeat", None),
+    // Per-activity-type pause/resume (issue #807)
+    ("GET /activities", None),
+    ("GET /activities/{activity_name}", None),
+    (
+        "POST /activities/{activity_name}/pause",
+        Some(OP_ACTIVITY_PAUSE),
+    ),
+    (
+        "POST /activities/{activity_name}/resume",
+        Some(OP_ACTIVITY_RESUME),
+    ),
     // Worker fleet
     ("GET /workers/health", None),
     ("GET /workers", None),
@@ -1482,6 +1522,63 @@ mod tests {
         );
         assert!(AUDITED_OPERATIONS.contains(&OP_LEGAL_HOLD_SET));
         assert!(AUDITED_OPERATIONS.contains(&OP_LEGAL_HOLD_RELEASE));
+    }
+
+    #[test]
+    fn activity_pause_routes_are_classified_and_audited() {
+        // Per-activity-type pause/resume (issue #807). This dedicated test --
+        // not just the general exhaustiveness guards, which only cross-check
+        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each OTHER -- is
+        // what catches a route dropped from BOTH lists at once.
+        //
+        // The mutations are a fleet-wide dispatch kill switch for one activity
+        // type, so they must be classified Mutating (which is what makes the
+        // read-only-operator role, issue #776, deny them) and audited.
+        for (route, op) in [
+            ("POST /activities/{activity_name}/pause", OP_ACTIVITY_PAUSE),
+            (
+                "POST /activities/{activity_name}/resume",
+                OP_ACTIVITY_RESUME,
+            ),
+        ] {
+            assert!(
+                CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, c)| *r == route && *c == RouteClass::Mutating),
+                "{route} must be classified RouteClass::Mutating in CLASSIFIED_ROUTES (issue #807)"
+            );
+            assert!(
+                ALL_MUTATION_ROUTES
+                    .iter()
+                    .any(|(r, mapped)| *r == route && *mapped == Some(op)),
+                "{route} must map to {op} in ALL_MUTATION_ROUTES (issue #807)"
+            );
+            assert!(
+                AUDITED_OPERATIONS.contains(&op),
+                "{op} must be registered in AUDITED_OPERATIONS (issue #807)"
+            );
+        }
+
+        // The two catalogue reads are diagnostics: classified ReadOnly, mapped
+        // to no operation, and explicitly audit-excluded.
+        for route in ["GET /activities", "GET /activities/{activity_name}"] {
+            assert!(
+                CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+                "{route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #807)"
+            );
+            assert!(
+                ALL_MUTATION_ROUTES
+                    .iter()
+                    .any(|(r, op)| *r == route && op.is_none()),
+                "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (issue #807)"
+            );
+            assert!(
+                EXCLUDED_ROUTES.contains(&route),
+                "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #807)"
+            );
+        }
     }
 
     #[test]

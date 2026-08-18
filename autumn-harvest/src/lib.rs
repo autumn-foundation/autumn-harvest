@@ -62,6 +62,8 @@ pub const fn full_migrations_sql() -> &'static str {
     include_str!(concat!(env!("OUT_DIR"), "/all_migrations_bundle.sql"))
 }
 
+/// Per-activity-type pause/resume for surgical outage containment (issue #807).
+pub mod activity_pause;
 /// Admission gate primitive for incident-response operators (issue #377).
 pub mod admission_gate;
 /// History analyzer and linter.

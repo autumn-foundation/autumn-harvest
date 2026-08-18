@@ -54,6 +54,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          activity_default_floor_tests
 linux        autumn-harvest         integration                      -                          activity_info_tests
 linux        autumn-harvest         integration                      -                          activity_interceptor_tests
+linux        autumn-harvest         integration                      -                          activity_pause_tests
 linux        autumn-harvest         integration                      -                          admission_gate_authoritative
 linux        autumn-harvest         integration                      -                          auto_heartbeat_tests
 linux        autumn-harvest         integration                      -                          business_day_timer_tests
@@ -140,6 +141,7 @@ linux        autumn-harvest-plugin  token_auth_integration           -          
 linux        autumn-harvest-plugin  triage_integration               -                          -
 linux        autumn-harvest-plugin  ui_integration                   -                          -
 linux        autumn-harvest-plugin  webhook_receiver_integration     webhooks                   -
+linux        autumn-harvest-plugin  workflow_children_traversal_perf -                          -
 linux        autumn-harvest-plugin  workflow_logs_integration        -                          -
 linux        autumn-harvest-plugin  workflow_reachability_integration  -                          -
 linux        autumn-harvest-plugin  workflow_rerun_integration       -                          -
