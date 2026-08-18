@@ -44,7 +44,8 @@
 //! is to clear**, so the verdict names the thing an operator must act on rather
 //! than the thing that happens to self-heal soonest:
 //!
-//! `queue_paused` > `no_worker` > `circuit_open` > `concurrency_deferred` >
+//! `queue_paused` > `activity_paused` > `no_worker` >
+//! `rate_limit_bucket_missing` > `circuit_open` > `concurrency_deferred` >
 //! `rate_limited` > `retrying` > healthy.
 //!
 //! In particular `no_worker` deliberately outranks `retrying`: a task in retry
@@ -238,6 +239,18 @@ pub enum BlockedOn {
         #[serde(skip_serializing_if = "Option::is_none")]
         activity_name: Option<String>,
     },
+    /// An operator has paused this **activity type** (issue #807), so
+    /// `claim_task`'s `paused_activities` anti-join rejects the row on every
+    /// queue on the shard until the pause is lifted.
+    ///
+    /// Distinct from [`Self::ActivityQueuePaused`]: that holds a whole queue,
+    /// this holds one activity type wherever it runs. A row can be held by
+    /// both, and the lever an operator must pull differs.
+    ActivityPaused {
+        /// The held activity type. Never optional: a pause is keyed by name, so
+        /// a row with no activity name cannot be held by one.
+        activity_name: String,
+    },
     /// **A durable timer's deadline has passed but nothing fired it.** Timers
     /// fire only when a worker claims the owning workflow task
     /// (`worker::ingest_due_timers_and_signals`) — there is no independent timer
@@ -343,6 +356,7 @@ impl BlockedOn {
             Self::ActivityRateLimitBucketMissing { .. } => "activity_rate_limit_bucket_missing",
             Self::ActivityConcurrencyDeferred { .. } => "activity_concurrency_deferred",
             Self::ActivityQueuePaused { .. } => "activity_queue_paused",
+            Self::ActivityPaused { .. } => "activity_paused",
             Self::TimerOverdue { .. } => "timer_overdue",
             Self::AwaitingExternalHandoff { .. } => "awaiting_external_handoff",
             Self::Paused { .. } => "paused",
@@ -388,6 +402,7 @@ impl BlockedOn {
             | Self::AwaitingReplayWait { .. }
             | Self::Paused { .. }
             | Self::ActivityQueuePaused { .. }
+            | Self::ActivityPaused { .. }
             | Self::WorkflowQueuePaused { .. } => ExecutionHealth::BlockedExternal,
             // Nothing will move this forward without a human.
             Self::ActivityNoWorker { .. }
@@ -450,6 +465,10 @@ pub struct PendingActivityFacts {
     pub concurrency_key: Option<String>,
     /// `true` when an operator has paused this task's queue (issue #619).
     pub queue_paused: bool,
+    /// `true` when an operator has paused this task's **activity type**
+    /// (issue #807). Independent of [`Self::queue_paused`]: either holds the
+    /// row on its own, and both can hold it at once.
+    pub activity_paused: bool,
     /// `true` when at least one worker could *claim* this row right now.
     ///
     /// The claim question, so it is the right one for a `PENDING` row and the
@@ -624,7 +643,12 @@ pub struct DiagnosisInputs {
 #[must_use]
 pub const fn activity_precedence(blocked: &BlockedOn) -> u8 {
     match blocked {
-        BlockedOn::ActivityQueuePaused { .. } => 8,
+        BlockedOn::ActivityQueuePaused { .. } => 9,
+        // The narrower operator hold. Ranked just under the queue pause because
+        // that is the broader lever -- lifting this one alone still leaves a
+        // queue-held row blocked -- and above everything below because an
+        // operator's deliberate hold is what a triaging operator must see first.
+        BlockedOn::ActivityPaused { .. } => 8,
         BlockedOn::ActivityNoWorker { .. } => 7,
         // Permanent, like the two above it: a bucket row that does not exist
         // never refills, so this outranks every self-healing gate below.
@@ -684,7 +708,21 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
         };
     }
 
-    // 2. Nothing polls this queue. This never self-heals, and it outranks retry
+    // 2. An operator holds this activity TYPE (issue #807). The narrower
+    //    sibling of the queue pause above, and equally permanent: the
+    //    `paused_activities` anti-join in `claim_task` rejects the row on every
+    //    queue on the shard until the pause is lifted. Guarded on the name
+    //    because a pause is keyed by it -- a row with no activity name cannot
+    //    be held by one, so the fact is never reportable without it.
+    if facts.activity_paused
+        && let Some(name) = facts.activity_name.as_ref()
+    {
+        return BlockedOn::ActivityPaused {
+            activity_name: name.clone(),
+        };
+    }
+
+    // 3. Nothing polls this queue. This never self-heals, and it outranks retry
     //    backoff on purpose: a backing-off task on a pollerless queue will never
     //    run, so reporting "retrying" would promise a retry that cannot happen.
     if !facts.has_live_worker {
@@ -694,7 +732,7 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
         };
     }
 
-    // 3. The rate-limit bucket row does not exist. Permanent: `claim_task`'s
+    // 4. The rate-limit bucket row does not exist. Permanent: `claim_task`'s
     //    `EXISTS` gate refuses it forever and nothing refills a row that is not
     //    there. Placed above the not-due check for the same reason
     //    `activity_no_worker` is — a backing-off task whose bucket is missing
@@ -710,7 +748,7 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
         };
     }
 
-    // 4. The breaker fast-fails dispatch. Only an activity the task row actually
+    // 5. The breaker fast-fails dispatch. Only an activity the task row actually
     //    names can carry one, so an unnamed row can never reach here.
     if let (Some(phase), Some(name)) = (facts.circuit_phase, facts.activity_name.as_ref()) {
         return BlockedOn::ActivityCircuitOpen {
@@ -729,7 +767,7 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
         };
     }
 
-    // 5. Not due yet. The task has not reached the claim gates at all, so a
+    // 6. Not due yet. The task has not reached the claim gates at all, so a
     //    momentarily-saturated bucket or concurrency key says nothing about
     //    whether it will be free at `scheduled_at`; reporting one of those
     //    instead would drop `attempt`, `last_error` and `next_attempt_at`, the
@@ -765,7 +803,7 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
         };
     }
 
-    // 6. Per-key concurrency (issue #247): self-heals as siblings finish.
+    // 7. Per-key concurrency (issue #247): self-heals as siblings finish.
     if facts.concurrency_saturated
         && let Some(key) = facts.concurrency_key.as_ref()
     {
@@ -775,7 +813,7 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
         };
     }
 
-    // 7. Rate limit (issue #332/#699): self-heals on refill.
+    // 8. Rate limit (issue #332/#699): self-heals on refill.
     if facts.rate_limit_saturated
         && let Some(key) = facts.rate_limit_key.as_ref()
     {
@@ -1256,6 +1294,10 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
 #[must_use]
 pub fn summarize(blocked: &BlockedOn) -> String {
     match blocked {
+        BlockedOn::ActivityPaused { activity_name } => format!(
+            "an operator has paused activity type '{activity_name}', so it is \
+                 held on every queue on this shard until the pause is lifted"
+        ),
         BlockedOn::HealthyInProgress => {
             "work is in progress; nothing is blocking this execution".to_string()
         }
@@ -1425,6 +1467,7 @@ mod tests {
             rate_limit_key: None,
             concurrency_key: None,
             queue_paused: false,
+            activity_paused: false,
             has_live_worker: true,
             circuit_phase: None,
             circuit_cooldown_until: None,
@@ -1847,6 +1890,80 @@ mod tests {
         assert_eq!(
             classify_pending_activity(&facts, t(0)).kind(),
             "activity_no_worker"
+        );
+    }
+
+    /// Issue #807: an operator paused the activity TYPE while its queue still
+    /// has an eligible active worker. `claim_task`'s `paused_activities`
+    /// anti-join rejects the row for as long as the pause stands, so reporting
+    /// `healthy_in_progress` would be flat-out wrong during exactly the triage
+    /// this endpoint exists for.
+    #[test]
+    fn paused_activity_type_is_activity_paused() {
+        let mut facts = healthy_activity();
+        facts.activity_paused = true;
+        let verdict = classify_pending_activity(&facts, t(0));
+        assert_eq!(
+            verdict,
+            BlockedOn::ActivityPaused {
+                activity_name: "send_email".to_string(),
+            }
+        );
+        assert_eq!(verdict.health(), ExecutionHealth::BlockedExternal);
+    }
+
+    /// A pause is keyed by activity name, so a row with no name can never be
+    /// held by one. Defensive: never fabricate a verdict from a fact whose
+    /// subject is missing.
+    #[test]
+    fn activity_paused_without_a_name_cannot_be_reported() {
+        let mut facts = healthy_activity();
+        facts.activity_name = None;
+        facts.activity_paused = true;
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)),
+            BlockedOn::HealthyInProgress
+        );
+    }
+
+    /// An activity pause is a claim-time gate; a row a live worker already
+    /// holds has passed it.
+    #[test]
+    fn held_row_ignores_an_activity_pause() {
+        let mut facts = healthy_activity();
+        facts.task_state = "RUNNING".to_string();
+        facts.claimant_is_live = Some(true);
+        facts.activity_paused = true;
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)),
+            BlockedOn::HealthyInProgress
+        );
+    }
+
+    /// Both operator holds stand: the queue pause is the broader lever (lifting
+    /// the activity pause alone still leaves the row held), so it leads. No
+    /// information is lost -- `contributing_reason_codes` carries both.
+    #[test]
+    fn queue_paused_outranks_activity_paused() {
+        let mut facts = healthy_activity();
+        facts.queue_paused = true;
+        facts.activity_paused = true;
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)).kind(),
+            "activity_queue_paused"
+        );
+    }
+
+    /// A deliberate operator hold outranks fleet state, exactly as
+    /// `queue_paused_outranks_no_worker` does: the pause is the thing to lift.
+    #[test]
+    fn activity_paused_outranks_no_worker() {
+        let mut facts = healthy_activity();
+        facts.activity_paused = true;
+        facts.has_live_worker = false;
+        assert_eq!(
+            classify_pending_activity(&facts, t(0)).kind(),
+            "activity_paused"
         );
     }
 

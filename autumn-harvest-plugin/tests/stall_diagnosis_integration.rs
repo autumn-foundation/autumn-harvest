@@ -1413,6 +1413,62 @@ async fn ac2_saturated_concurrency_key_reports_activity_concurrency_deferred() {
     assert_eq!(body["health"], "healthy", "siblings finish: {body}");
 }
 
+/// Issue #807: an operator paused the ACTIVITY TYPE while its queue still has
+/// an eligible active worker. `claim_task`'s `paused_activities` anti-join
+/// rejects the row for as long as the pause stands, so without threading the
+/// pause into the facts this reads as `healthy_in_progress` — a confident wrong
+/// answer during exactly the triage this endpoint exists for.
+#[tokio::test]
+async fn ac2_paused_activity_type_reports_activity_paused() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_activity_task(
+        &pool,
+        exec_id,
+        "send_email",
+        "email",
+        "PENDING",
+        1,
+        None,
+        "NOW() - INTERVAL '1 minute'",
+    )
+    .await;
+    // The queue is NOT paused and IS covered by a live active worker, so every
+    // other impediment is absent: only the activity pause can explain a stall.
+    seed_live_worker(&pool, "worker-email", "email").await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_activity_pauses (activity_name, reason, paused_by) \
+             VALUES ('send_email', 'incident-99', 'oncall')",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("pause activity");
+    }
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "activity_paused", "body: {body}");
+    assert_eq!(body["blocked_on"]["activity_name"], "send_email");
+    assert_eq!(body["health"], "blocked_external", "body: {body}");
+    let reasons = body["contributing_reason_codes"]
+        .as_array()
+        .expect("reason codes");
+    assert!(
+        reasons.iter().any(|r| r == "activity_paused"),
+        "the multi-reason surface must name the hold too; body: {body}"
+    );
+}
+
 /// An operator-paused queue resolves to `activity_queue_paused` — the highest
 /// rank in the ladder, and the variant that keeps a paused queue from reading
 /// as `healthy_in_progress`.

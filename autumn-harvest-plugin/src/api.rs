@@ -13280,6 +13280,19 @@ pub(crate) async fn build_diagnosis_report(
             .into_iter()
             .collect();
 
+    // Operator ACTIVITY pauses (issue #807), the per-activity-type sibling of
+    // the read above. Load-bearing for the same reason: `claim_task`'s
+    // `paused_activities` anti-join rejects a held activity type on EVERY queue
+    // on the shard, so without this a paused activity on a well-covered queue
+    // would fall through to `healthy_in_progress` — a confident wrong answer.
+    // Deliberately unfiltered by queue, matching that CTE.
+    let paused_activities: std::collections::HashSet<String> =
+        autumn_harvest::activity_pause::paused_activity_names(&mut conn)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .collect();
+
     // Worker eligibility inputs. Queue coverage goes through the SAME predicate
     // `GET /admin/queue-coverage` uses (issue #774) so the two surfaces can
     // never disagree about whether a queue has a live poller — the exact drift
@@ -13336,6 +13349,13 @@ pub(crate) async fn build_diagnosis_report(
         .iter()
         .map(|t| {
             let queue_paused = paused_queues.contains(&t.queue_name);
+            // Shares the eligibility explainer's own predicate (issue #807), so
+            // the two surfaces cannot drift on what "held" means.
+            let activity_paused = task_is_activity_paused(
+                &t.task_type,
+                t.activity_name.as_deref(),
+                &paused_activities,
+            );
             let has_cb = t
                 .activity_name
                 .as_ref()
@@ -13414,6 +13434,7 @@ pub(crate) async fn build_diagnosis_report(
                 rate_limit_key: t.rate_limit_key.clone(),
                 concurrency_key: t.concurrency_key.clone(),
                 queue_paused,
+                activity_paused,
                 has_live_worker: !eligible_ids.is_empty(),
                 claimant_is_live: claimant_is_live(
                     &live_workers,
@@ -13789,7 +13810,10 @@ fn contributing_reasons_for(
             &saturated_rate_limits,
             facts.concurrency_saturated,
             &phases,
-            facts.queue_paused,
+            OperatorPauseHolds {
+                queue: facts.queue_paused,
+                activity: facts.activity_paused,
+            },
         ));
     }
     let mut reasons: Vec<String> = reasons.into_iter().collect();
@@ -51685,6 +51709,7 @@ mod tests {
             rate_limit_key: None,
             concurrency_key: None,
             queue_paused: false,
+            activity_paused: false,
             has_live_worker: true,
             circuit_phase: None,
             circuit_cooldown_until: None,
@@ -51724,6 +51749,7 @@ mod tests {
             rate_limit_key: None,
             concurrency_key: None,
             queue_paused: true,
+            activity_paused: false,
             has_live_worker: true,
             circuit_phase: None,
             circuit_cooldown_until: None,
@@ -51751,6 +51777,7 @@ mod tests {
             rate_limit_key: None,
             concurrency_key: None,
             queue_paused: false,
+            activity_paused: false,
             has_live_worker: false,
             circuit_phase: None,
             circuit_cooldown_until: None,
@@ -51784,6 +51811,7 @@ mod tests {
             rate_limit_key: None,
             concurrency_key: None,
             queue_paused: false,
+            activity_paused: false,
             // Nothing *Active* covers the queue, so a PENDING row here would
             // genuinely be `no_live_worker`.
             has_live_worker: false,
@@ -51818,6 +51846,7 @@ mod tests {
             rate_limit_key: None,
             concurrency_key: None,
             queue_paused: false,
+            activity_paused: false,
             // An Active peer covers the queue, so claim eligibility is true.
             has_live_worker: true,
             circuit_phase: None,
