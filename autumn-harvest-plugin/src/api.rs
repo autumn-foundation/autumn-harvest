@@ -32647,18 +32647,14 @@ async fn pause_activity_handler(
     };
     let reason = resolve_activity_pause_reason(request.reason.as_deref());
 
-    let (canonical_activity, targets, mut failures) = match prepare_activity_pause_targets(
-        &api_state,
-        &audit,
-        &activity_name,
-        OP_ACTIVITY_PAUSE,
-        ROUTE,
-    )
-    .await
-    {
-        Ok(prepared) => prepared,
-        Err(response) => return response,
-    };
+    let (canonical_activity, targets, mut failures) =
+        match prepare_activity_pause_targets_checked(&api_state, &audit, &activity_name, ROUTE)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
+
     let (actor, source, request_id) = audit;
 
     let (paused_by, on_behalf_of) = resolve_pause_operator_label(request.actor.as_deref(), &actor);
@@ -33044,6 +33040,107 @@ fn registered_activity_catalog(
             )
         })
         .collect()
+}
+
+/// The operator-facing refusal when a pause could not possibly hold the named
+/// activity, or `None` when the pause may proceed.
+///
+/// # Why a pause on a local activity must be refused, not recorded
+///
+/// A `local = true` activity (issue #98) runs **inline on the workflow worker**
+/// inside the workflow task. It never takes a `harvest_task_queue` row, so the
+/// claim-path gate this whole feature is built on has nothing to skip: the
+/// pause row is written, the read model dutifully reports a hold, and every new
+/// invocation keeps running. Answering `ok: true` / `newly_paused: true` there
+/// is worse than answering nothing — during an incident it is the single call
+/// an operator makes to stop a broken dependency, and nobody re-reads a
+/// mutation that said it worked.
+///
+/// This is the same reasoning [`::autumn_harvest::activity_pause::validate_activity_name`]
+/// gives for rejecting a whitespace-padded name rather than trimming it: only
+/// rejecting cannot lie, and during an outage a `400` naming the problem beats
+/// a false green.
+///
+/// # Why an unregistered name still passes
+///
+/// These routes deliberately accept names this management node does not
+/// register — a management node need not register every activity the fleet
+/// runs, which is the same remote/unregistered case the read endpoints' 404-vs-
+/// 503 rule preserves. Refusing an unknown name would break pausing a genuinely
+/// remote activity, i.e. the feature's primary use. Only a name the node
+/// registers **and** knows to be local is refused.
+fn local_activity_pause_refusal(
+    catalog: &std::collections::BTreeMap<String, ActivityCatalogEntry>,
+    activity_name: &str,
+) -> Option<String> {
+    catalog
+        .get(activity_name)
+        .filter(|entry| entry.is_local)
+        .map(|_| {
+            format!(
+                "activity '{activity_name}' is registered as a local activity \
+                 (#[activity(local = true)]): it runs inline on the workflow worker and never \
+                 takes a task-queue row, so a pause cannot hold it. Refusing rather than \
+                 reporting a hold that would hold nothing. To contain it, pause the queue the \
+                 calling workflows are dispatched on (POST /queues/{{queue_name}}/pause, issue \
+                 #619), or rely on the activity's circuit breaker if one is declared (issue #369)."
+            )
+        })
+}
+
+/// [`prepare_activity_pause_targets`] plus the pause-only refusal of an
+/// activity a hold could not possibly reach (issue #807 review).
+///
+/// The refusal runs AFTER name validation, so a malformed name still reports
+/// the malformation rather than this, and BEFORE any pause row is written, so a
+/// refusal leaves no phantom hold behind. The decision itself lives in the pure
+/// [`local_activity_pause_refusal`] so it is testable without a runtime.
+///
+/// Resume deliberately does **not** get this check: a local pause row written
+/// by an older build must stay removable.
+///
+/// Deliberately fails **open** when the runtime is not installed yet: without
+/// it we cannot tell local from remote, and treating an unknowable activity as
+/// remote matches how an unregistered name is already handled. Failing closed
+/// would refuse EVERY pause during the boot window — including the ordinary
+/// remote ones an operator needs most mid-incident — to guard a case that is
+/// merely today's behaviour.
+async fn prepare_activity_pause_targets_checked(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    activity_name: &str,
+    route: &'static str,
+) -> Result<
+    (
+        String,
+        Vec<(i32, ::autumn_harvest::worker::DbPool)>,
+        Vec<String>,
+    ),
+    axum::response::Response,
+> {
+    let prepared =
+        prepare_activity_pause_targets(api_state, audit, activity_name, OP_ACTIVITY_PAUSE, route)
+            .await?;
+    let canonical = &prepared.0;
+    let Ok(runtime) = api_state.runtime() else {
+        return Ok(prepared);
+    };
+    let catalog = registered_activity_catalog(&runtime);
+    let Some(summary) = local_activity_pause_refusal(&catalog, canonical) else {
+        return Ok(prepared);
+    };
+    Err(reject_activity_pause(
+        api_state,
+        audit,
+        OP_ACTIVITY_PAUSE,
+        route,
+        canonical,
+        map_error(::autumn_harvest::error::HarvestError::Config(
+            summary.clone(),
+        )),
+        &summary,
+    )
+    .await)
 }
 
 /// Write one activity entry's pause block: the paused arm and the not-paused
@@ -42565,6 +42662,64 @@ mod tests {
                  knows where to re-check: {err:?}"
             );
         }
+    }
+
+    /// A pause must be REFUSED for an activity registered `local = true`, and
+    /// still ALLOWED for an unregistered name.
+    ///
+    /// Issue #807 review, Codex round 16. A local activity runs inline on the
+    /// workflow worker and never takes a `harvest_task_queue` row, so the
+    /// claim-path gate this feature is built on can never hold one. The pause
+    /// route nevertheless wrote its rows and answered `ok: true` /
+    /// `newly_paused: true` — during an incident, the one call an operator
+    /// makes to stop a broken dependency reported containment while every new
+    /// invocation kept running. The read model already labelled it a no-op, but
+    /// nobody re-reads a mutation that said it worked.
+    ///
+    /// The unregistered arm is the load-bearing half of the fix: these routes
+    /// deliberately accept names this management node does not register (the
+    /// same remote/unregistered case the 404-vs-503 read fix preserves), so a
+    /// blanket "must be registered" check would break pausing a genuinely
+    /// remote activity — the feature's primary use.
+    #[test]
+    fn a_pause_is_refused_for_a_registered_local_activity_but_not_a_remote_one() {
+        let catalog = std::collections::BTreeMap::from([
+            (
+                "compute_checksum".to_string(),
+                ActivityCatalogEntry {
+                    queue_name: "default",
+                    is_local: true,
+                },
+            ),
+            (
+                "charge_card".to_string(),
+                ActivityCatalogEntry {
+                    queue_name: "payments",
+                    is_local: false,
+                },
+            ),
+        ]);
+
+        let refusal = local_activity_pause_refusal(&catalog, "compute_checksum")
+            .expect("a registered local activity must be refused");
+        assert!(
+            refusal.contains("compute_checksum") && refusal.contains("local"),
+            "the refusal must name the activity and why it cannot be held: {refusal}"
+        );
+        assert!(
+            refusal.contains("queue"),
+            "and must point at the containment that does work: {refusal}"
+        );
+
+        assert!(
+            local_activity_pause_refusal(&catalog, "charge_card").is_none(),
+            "an ordinary dispatched activity is pausable"
+        );
+        assert!(
+            local_activity_pause_refusal(&catalog, "remote_unregistered").is_none(),
+            "an unregistered name may be a genuinely remote activity this node \
+             does not register -- refusing it would break the feature's main use"
+        );
     }
 
     /// Issue #807 review: the activity read model must report real coverage for

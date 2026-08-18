@@ -246,6 +246,20 @@ legitimately carry a non-NULL `activity_name` (the engine stamps the
 tasks. The explainer matches that scoping, so `activity_paused` never appears
 against a task the engine would happily dispatch.
 
+**A pause on a *local* activity is refused, not silently ineffective.** A
+`#[activity(local = true)]` activity (issue #98) runs **inline on the workflow
+worker** and never takes a `harvest_task_queue` row at all, so the claim-path
+gate a pause installs has nothing to hold — the invocations would keep running
+while the read endpoints reported a healthy-looking hold. `harvest activity
+pause` therefore rejects a name the management node has registered as local
+with a `400` naming the activity, rather than reporting containment it cannot
+deliver. To contain a local activity, hold the **queue** the calling workflows
+are dispatched on (§5, issue #619) — that stops the workflow tasks that would
+invoke it — or rely on the activity's circuit breaker if it declares one
+(issue #369). A name this node does *not* have registered is still accepted:
+a management node need not register every activity the fleet runs, and
+refusing an unregistered name would break holding a genuinely remote one.
+
 **Distinguish it from `circuit_open`.** Both name one activity type, but they
 answer different questions: `circuit_open` is the engine's *automatic, reactive*
 breaker fast-failing after failures accumulated (issue #369), while
