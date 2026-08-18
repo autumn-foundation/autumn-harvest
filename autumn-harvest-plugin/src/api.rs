@@ -30974,6 +30974,13 @@ struct PauseProvenance<'a> {
     uniform: bool,
     /// Per-shard detail, so a divergent hold loses nothing.
     shards: Vec<Value>,
+    /// Every hold in effect, deduplicated by `(reason, operator)` and ordered
+    /// earliest first.
+    ///
+    /// [`Self::shards`] goes only to the transient HTTP response; this is what
+    /// the durable audit row carries, so an idempotent re-pause records the
+    /// provenance actually holding the fleet rather than the request's.
+    held_groups: Vec<HeldHoldGroup>,
 }
 
 /// Summarise a fleet-wide pause without discarding any shard's provenance.
@@ -31012,10 +31019,19 @@ fn summarise_pause_provenance(
             })
         })
         .collect();
+    let held_groups = group_held_holds(per_shard.iter().map(|(shard_id, o)| {
+        (
+            *shard_id,
+            o.reason.as_str(),
+            o.paused_by.as_str(),
+            o.paused_at,
+        )
+    }));
     Some(PauseProvenance {
         effective,
         uniform,
         shards,
+        held_groups,
     })
 }
 
@@ -31186,6 +31202,169 @@ impl ReleasedHoldGroup {
             self.anchor_secs
         )
     }
+}
+
+/// A held `(reason, operator)` pair — the identity of one hold in effect.
+///
+/// The pause mirror of [`ReleasedHoldKey`]. `paused_by` is a plain `String`
+/// rather than an `Option`: a pause row always records an operator (the route
+/// falls back to the authenticated actor when the body supplies no label),
+/// whereas a *released* hold can come from a row written before that guarantee
+/// existed.
+type HeldHoldKey = (String, String);
+
+/// Cross-shard accumulator for one [`HeldHoldKey`].
+///
+/// The pause mirror of [`HoldGroupFold`], anchored on the EARLIEST stamp rather
+/// than the longest duration: at pause time nothing has been held for a
+/// measurable span yet, and the earliest hold is what the response's top-level
+/// provenance reports.
+struct HeldGroupFold {
+    shard_ids: Vec<i32>,
+    anchor_at: chrono::DateTime<chrono::Utc>,
+    anchor_shard_id: i32,
+}
+
+impl HeldGroupFold {
+    /// Seeded above the range of any real stamp so the first shard observed
+    /// always becomes the anchor.
+    const fn new() -> Self {
+        Self {
+            shard_ids: Vec::new(),
+            anchor_at: chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            anchor_shard_id: i32::MAX,
+        }
+    }
+
+    /// Fold in one shard's hold, keeping the group's EARLIEST stamp as the
+    /// anchor (lowest shard id on a tie, matching the `min_by_key` the
+    /// response's top-level provenance uses).
+    fn observe(&mut self, shard_id: i32, paused_at: chrono::DateTime<chrono::Utc>) {
+        self.shard_ids.push(shard_id);
+        if (paused_at, shard_id) < (self.anchor_at, self.anchor_shard_id) {
+            self.anchor_at = paused_at;
+            self.anchor_shard_id = shard_id;
+        }
+    }
+
+    fn finish(mut self, (reason, paused_by): HeldHoldKey) -> HeldHoldGroup {
+        self.shard_ids.sort_unstable();
+        HeldHoldGroup {
+            reason,
+            paused_by,
+            shard_ids: self.shard_ids,
+            anchor_at: self.anchor_at,
+            anchor_shard_id: self.anchor_shard_id,
+        }
+    }
+}
+
+/// One distinct hold in effect — a `(reason, operator)` pair — and the shards
+/// carrying it.
+///
+/// The pause mirror of [`ReleasedHoldGroup`]: shards holding for the *same*
+/// incident collapse into one entry, so the durable audit row grows with the
+/// number of genuinely distinct holds (a small, operator-authored quantity)
+/// rather than with the shard count, and the common fleet-wide case still
+/// renders as a single line.
+struct HeldHoldGroup {
+    reason: String,
+    paused_by: String,
+    /// Ascending.
+    shard_ids: Vec<i32>,
+    /// This group's earliest stamp, and the shard that carries it (lowest shard
+    /// id on an internal tie).
+    ///
+    /// Ordering groups by `(anchor_at, anchor_shard_id)` ascending reproduces
+    /// exactly the single-anchor `min_by_key` the response's top-level fields
+    /// use, so `held_groups[0]` is always the shard the response reports.
+    anchor_at: chrono::DateTime<chrono::Utc>,
+    anchor_shard_id: i32,
+}
+
+impl HeldHoldGroup {
+    /// `shards 0,2 by alice: stripe outage`
+    ///
+    /// No duration suffix (the resume sibling renders `(held Ns)`): at pause
+    /// time nothing has been held for a measurable span, and the response
+    /// already reports `paused_at`.
+    fn render(&self) -> String {
+        let ids = self
+            .shard_ids
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let label = if self.shard_ids.len() == 1 {
+            "shard"
+        } else {
+            "shards"
+        };
+        format!("{label} {ids} by {}: {}", self.paused_by, self.reason)
+    }
+}
+
+/// Group the shards carrying a hold by the `(reason, operator)` they actually
+/// hold it for, earliest hold first.
+///
+/// Feature-neutral (`&str`s and a timestamp) so the queue pause (#619) and the
+/// per-activity pause (#807) share one definition and can never drift on what
+/// their audit rows say about the same situation.
+fn group_held_holds<'a>(
+    per_shard: impl IntoIterator<Item = (i32, &'a str, &'a str, chrono::DateTime<chrono::Utc>)>,
+) -> Vec<HeldHoldGroup> {
+    // Keyed by the hold's identity so shards sharing one incident collapse;
+    // `BTreeMap` so groups that tie on the sort key below resolve
+    // deterministically.
+    let mut grouped: std::collections::BTreeMap<HeldHoldKey, HeldGroupFold> =
+        std::collections::BTreeMap::new();
+    for (shard_id, reason, paused_by, paused_at) in per_shard {
+        grouped
+            .entry((reason.to_string(), paused_by.to_string()))
+            .or_insert_with(HeldGroupFold::new)
+            .observe(shard_id, paused_at);
+    }
+    let mut groups: Vec<HeldHoldGroup> = grouped
+        .into_iter()
+        .map(|(key, fold)| fold.finish(key))
+        .collect();
+    groups.sort_by_key(|group| (group.anchor_at, group.anchor_shard_id));
+    groups
+}
+
+/// Render the holds actually IN EFFECT for the durable audit trail.
+///
+/// The pause mirror of [`released_holds_audit_reason`], and the reason a pause
+/// audit row does not simply echo the request: `pause_queue` / `pause_activity`
+/// preserve each shard's ORIGINAL provenance on an idempotent re-pause, so the
+/// request's reason can be in effect on no shard at all — most starkly when the
+/// re-pause omits a reason and resolves to the default while every shard is
+/// still held for the original incident. The response body already reports the
+/// effective provenance for exactly this reason (issue #619 review); this keeps
+/// the durable row — which outlives the response, since the resume `DELETE`s
+/// the pause rows — from telling a different story (issue #807 review).
+///
+/// A single hold — the overwhelmingly common case, including a fleet-wide hold
+/// placed by one operator for one incident — keeps the plain single-line form.
+/// Its shard list is deliberately omitted there, for the same reason the resume
+/// sibling omits it: with one `(reason, operator)` group there is nothing
+/// distinguishing to attribute, and the response already reports the counts.
+fn held_holds_audit_reason(groups: &[HeldHoldGroup]) -> Option<String> {
+    let (leading, rest) = groups.split_first()?;
+    if rest.is_empty() {
+        return Some(format!("hold by {}: {}", leading.paused_by, leading.reason));
+    }
+    let count = groups.len();
+    let detail = groups
+        .iter()
+        .map(HeldHoldGroup::render)
+        .collect::<Vec<_>>()
+        // `; ` and not ` | `: the latter separates this contribution from the
+        // partial-failure text in `queue_pause_audit_context`.
+        .join("; ");
+    Some(format!(
+        "{count} holds in effect (earliest first); {detail}"
+    ))
 }
 
 /// The cross-shard provenance summary of a resume, plus each shard's own row.
@@ -31515,9 +31694,15 @@ async fn pause_queue_handler(
     };
 
     let partial = (!failures.is_empty()).then(|| failures.join("; "));
-    // Carry the operator's reason into the audit row: the pause row that holds
-    // it is deleted on resume, so this is its only permanent home.
-    let audit_context = queue_pause_audit_context(Some(&reason), partial.as_deref());
+    // Carry the reason into the audit row: the pause row that holds it is
+    // deleted on resume, so this is its only permanent home. It is the
+    // EFFECTIVE provenance, not the request's — an idempotent re-pause
+    // preserves each shard's original row, so echoing the request would record
+    // a reason in effect on no shard at all (issue #807 review).
+    let audit_context = queue_pause_audit_context(
+        held_holds_audit_reason(&provenance.held_groups).as_deref(),
+        partial.as_deref(),
+    );
     write_queue_pause_audit(
         &targets,
         &actor,
@@ -32210,6 +32395,9 @@ struct ActivityPauseProvenance<'a> {
     uniform: bool,
     /// Per-shard detail, so a divergent hold loses nothing.
     shards: Vec<Value>,
+    /// Every hold in effect, deduplicated by `(reason, operator)` and ordered
+    /// earliest first — see [`PauseProvenance::held_groups`].
+    held_groups: Vec<HeldHoldGroup>,
 }
 
 /// Summarise a fleet-wide activity pause without discarding any shard's
@@ -32249,10 +32437,19 @@ fn summarise_activity_pause_provenance(
             })
         })
         .collect();
+    let held_groups = group_held_holds(per_shard.iter().map(|(shard_id, o)| {
+        (
+            *shard_id,
+            o.reason.as_str(),
+            o.paused_by.as_str(),
+            o.paused_at,
+        )
+    }));
     Some(ActivityPauseProvenance {
         effective,
         uniform,
         shards,
+        held_groups,
     })
 }
 
@@ -32404,6 +32601,22 @@ fn summarise_activity_resume_provenance(
     }
 }
 
+/// Resolve the operator LABEL stored on the pause row, and the audit note that
+/// records an on-behalf-of relationship.
+///
+/// The label is body-supplied when present; the audit row always carries the
+/// AUTHENTICATED actor, and names the relationship when the two differ, so a
+/// body field can never rewrite the security trail. A blank or whitespace-only
+/// label falls back to the actor rather than storing `""`.
+fn resolve_pause_operator_label(requested: Option<&str>, actor: &str) -> (String, Option<String>) {
+    let paused_by = requested
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map_or_else(|| actor.to_string(), truncate_operator_reason);
+    let on_behalf_of = (paused_by != actor).then(|| format!("on behalf of: {paused_by}"));
+    (paused_by, on_behalf_of)
+}
+
 /// `POST /activities/{activity_name}/pause` — hold dispatch for one activity
 /// type, fleet-wide (issue #807).
 ///
@@ -32448,17 +32661,7 @@ async fn pause_activity_handler(
     };
     let (actor, source, request_id) = audit;
 
-    // `paused_by` is the operator LABEL (body-supplied when present); the audit
-    // row below always carries the AUTHENTICATED actor, and names the
-    // on-behalf-of relationship when the two differ, so a body field can never
-    // rewrite the security trail.
-    let paused_by = request
-        .actor
-        .as_deref()
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-        .map_or_else(|| actor.clone(), truncate_operator_reason);
-    let on_behalf_of = (paused_by != actor).then(|| format!("on behalf of: {paused_by}"));
+    let (paused_by, on_behalf_of) = resolve_pause_operator_label(request.actor.as_deref(), &actor);
 
     let ActivityPauseApplication {
         newly_paused,
@@ -32495,10 +32698,19 @@ async fn pause_activity_handler(
     };
 
     let partial = (!failures.is_empty()).then(|| failures.join("; "));
-    // Carry the operator's reason into the audit row: the pause row that holds
-    // it is deleted on resume, so this is its only permanent home.
-    let audit_context =
-        activity_pause_audit_context(Some(&reason), on_behalf_of.as_deref(), partial.as_deref());
+    // Carry the reason into the audit row: the pause row that holds it is
+    // deleted on resume, so this is its only permanent home. It is the
+    // EFFECTIVE provenance, not the request's — `pause_activity` preserves each
+    // shard's original row on an idempotent re-pause, so echoing the request
+    // would record a reason in effect on no shard at all (issue #807 review).
+    // `on_behalf_of` stays request-scoped by contrast: it records what THIS
+    // caller claimed, which is a security fact about the request rather than a
+    // description of the hold.
+    let audit_context = activity_pause_audit_context(
+        held_holds_audit_reason(&provenance.held_groups).as_deref(),
+        on_behalf_of.as_deref(),
+        partial.as_deref(),
+    );
     write_activity_pause_audit(
         &targets,
         &actor,
@@ -42571,6 +42783,110 @@ mod tests {
         assert!(
             rendered.contains("unknown"),
             "an absent operator renders as 'unknown', not an empty gap; got {rendered}"
+        );
+    }
+
+    fn activity_pause_outcome(
+        reason: &str,
+        actor: &str,
+        secs_ago: i64,
+        held: i64,
+    ) -> ::autumn_harvest::activity_pause::ActivityPauseOutcome {
+        ::autumn_harvest::activity_pause::ActivityPauseOutcome {
+            activity_name: "charge_card".to_string(),
+            newly_paused: false,
+            reason: reason.to_string(),
+            paused_by: actor.to_string(),
+            paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            scope_shard_id: None,
+            held_task_count: held,
+        }
+    }
+
+    /// The pause audit row must record the hold that is actually IN EFFECT, not
+    /// the reason the request happened to carry (issue #807 review).
+    ///
+    /// `pause_activity` / `pause_queue` preserve each shard's ORIGINAL
+    /// provenance on an idempotent re-pause, so a second pause -- most starkly
+    /// one that omits the reason entirely and resolves to the default -- would
+    /// otherwise write an audit row claiming a reason that is in effect on no
+    /// shard at all. The response body already reports the effective provenance
+    /// for exactly this reason; the durable row must not tell a different story
+    /// than the response the operator just read.
+    #[test]
+    fn pause_audit_reason_records_the_effective_hold_not_the_request() {
+        // Both features, because the bug and the fix are identical and the two
+        // audit trails must never drift on the same question.
+        let queue_shards = [(0, pause_outcome("stripe outage", "alice", 900, None, 4))];
+        let queue = summarise_pause_provenance(&queue_shards).expect("a shard applied the hold");
+        assert_eq!(
+            held_holds_audit_reason(&queue.held_groups).as_deref(),
+            Some("hold by alice: stripe outage"),
+            "a uniform fleet-wide hold keeps the plain single-line form"
+        );
+
+        let activity_shards = [(0, activity_pause_outcome("stripe outage", "alice", 900, 4))];
+        let activity = summarise_activity_pause_provenance(&activity_shards)
+            .expect("a shard applied the hold");
+        assert_eq!(
+            held_holds_audit_reason(&activity.held_groups).as_deref(),
+            Some("hold by alice: stripe outage"),
+            "the per-activity hold must render byte-identically to the queue \
+             sibling for a byte-identical situation"
+        );
+    }
+
+    /// EVERY reason actually holding some part of the fleet must survive in the
+    /// durable row, not just the earliest one (issue #807 review).
+    ///
+    /// This is the retry-a-partial-fleet case: the first attempt reached shard 0
+    /// and stamped its reason there; the retry reaches shard 1 and stamps a
+    /// different one, while shard 0 idempotently keeps the original. Recording
+    /// only the request's reason hides shard 0's; recording only the earliest
+    /// hides shard 1's. The resume `DELETE`s both rows, so whichever is dropped
+    /// here is unrecoverable.
+    #[test]
+    fn pause_audit_reason_preserves_every_divergent_shard_reason() {
+        let per_shard = [
+            (0, activity_pause_outcome("stripe outage", "alice", 900, 1)),
+            (
+                1,
+                activity_pause_outcome("retry: fleet freeze", "bob", 60, 2),
+            ),
+            (2, activity_pause_outcome("stripe outage", "alice", 300, 3)),
+        ];
+        let provenance =
+            summarise_activity_pause_provenance(&per_shard).expect("shards applied the hold");
+        let rendered =
+            held_holds_audit_reason(&provenance.held_groups).expect("a hold is in effect");
+
+        for fragment in ["stripe outage", "alice", "retry: fleet freeze", "bob"] {
+            assert!(
+                rendered.contains(fragment),
+                "'{fragment}' is unrecoverable once the pause row is deleted; got {rendered}"
+            );
+        }
+
+        // Shards sharing one story collapse, so the row grows with the number of
+        // distinct holds (operator-authored, small) not the shard count.
+        assert!(
+            rendered.contains("shards 0,2"),
+            "the two shards sharing one incident must collapse into one entry; got {rendered}"
+        );
+        assert!(rendered.contains("shard 1"), "got {rendered}");
+        assert_eq!(
+            rendered.matches("stripe outage").count(),
+            1,
+            "the shared reason must not be repeated per shard; got {rendered}"
+        );
+
+        // The EARLIEST hold leads, matching the response's top-level `reason`
+        // and `paused_at`, so the row and the response stay coherent.
+        let stripe = rendered.find("stripe outage").expect("present");
+        let freeze = rendered.find("retry: fleet freeze").expect("present");
+        assert!(
+            stripe < freeze,
+            "the earliest hold must lead, matching the response summary; got {rendered}"
         );
     }
 

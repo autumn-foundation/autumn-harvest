@@ -81,6 +81,71 @@ async fn setup_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
     (conn, container)
 }
 
+/// Swap the database name in a Postgres URL, preserving any query string.
+fn with_database(url: &str, database: &str) -> String {
+    let (base, query) = url
+        .split_once('?')
+        .map_or((url, None), |(b, q)| (b, Some(q)));
+    let (prefix, _) = base.rsplit_once('/').expect("a database URL has a path");
+    query.map_or_else(
+        || format!("{prefix}/{database}"),
+        |query| format!("{prefix}/{database}?{query}"),
+    )
+}
+
+/// A migrated database this test owns exclusively, and its drop guard.
+///
+/// One test here blocks the pause's backlog count with an `ACCESS EXCLUSIVE`
+/// lock on `harvest_task_queue`. That lock stalls **every** session touching
+/// the table, so against a shared `HARVEST_TEST_DATABASE_URL` it would be a
+/// sibling test's problem too. Giving the locking test its own database keeps
+/// that blast radius inside it. Without the env var each test already starts
+/// its own container, so that path is returned unchanged.
+///
+/// This contains the lock; it does **not** make the suite parallel-safe. These
+/// tests share one env-provided database and [`setup_db`] scrubs
+/// `harvest_activity_pauses` on entry (the table is keyed by activity name
+/// alone), so a parallel run can still have one test wipe another's hold. The
+/// suite is run serially — `.github/ci/integration-suites.txt` lists it under
+/// the `linux` class, which the runner drives with `--test-threads=1`.
+async fn setup_isolated_db_url() -> (String, Option<ContainerAsync<Postgres>>, Option<String>) {
+    let Ok(shared) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+        let (url, container) = setup_db_url().await;
+        return (url, container, None);
+    };
+    use diesel_async::RunQueryDsl;
+    let name = format!("harvest_ap_{}", Uuid::new_v4().simple());
+    let mut admin = connect(&shared).await;
+    diesel::sql_query(format!("CREATE DATABASE {name}"))
+        .execute(&mut admin)
+        .await
+        .expect("create the isolated database");
+    let url = with_database(&shared, &name);
+    let mut conn = connect(&url).await;
+    conn.batch_execute(autumn_harvest::full_migrations_sql())
+        .await
+        .expect("apply migrations");
+    (url, None, Some(name))
+}
+
+/// Best-effort teardown for [`setup_isolated_db_url`].
+///
+/// A panicking test leaks its database; the `harvest_ap_` prefix makes those
+/// identifiable, and they are cheap and empty.
+async fn drop_isolated_db(name: Option<String>) {
+    let (Some(name), Ok(shared)) = (name, std::env::var("HARVEST_TEST_DATABASE_URL")) else {
+        return;
+    };
+    use diesel_async::RunQueryDsl;
+    if let Ok(mut admin) =
+        <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&shared).await
+    {
+        let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .execute(&mut admin)
+            .await;
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn unique(prefix: &str) -> String {
@@ -1147,7 +1212,7 @@ async fn pause_stamps_paused_at_after_the_backlog_count_not_at_transaction_start
     /// (stamp after it) are separated by a 2x margin in both directions.
     const BLOCK: std::time::Duration = std::time::Duration::from_millis(1_500);
 
-    let (url, _c) = setup_db_url().await;
+    let (url, _c, isolated) = setup_isolated_db_url().await;
     let mut conn = connect(&url).await;
     let mut locker = connect(&url).await;
 
@@ -1208,6 +1273,12 @@ async fn pause_stamps_paused_at_after_the_backlog_count_not_at_transaction_start
     };
 
     let threshold = BLOCK.as_secs_f64() / 2.0;
+    // Drop the connections before the teardown so `DROP DATABASE` is not
+    // blocked by this test's own sessions, and tear down before asserting so a
+    // failure does not also leak the database.
+    drop(conn);
+    drop(locker);
+    drop_isolated_db(isolated).await;
     assert!(
         age < threshold,
         "paused_at must be stamped once the count has finished, not at \
