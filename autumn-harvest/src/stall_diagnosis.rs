@@ -242,6 +242,23 @@ pub enum BlockedOn {
         #[serde(skip_serializing_if = "Option::is_none")]
         since: Option<DateTime<Utc>>,
     },
+    /// Replay detected non-determinism and the engine blocked the run
+    /// (issue #603) rather than failing it terminally.
+    ///
+    /// The execution stays `RUNNING` and its workflow task is re-pended at a
+    /// capped-exponential backoff, **indefinitely**, until a build that replays
+    /// the recorded history cleanly is deployed. By row shape alone that is
+    /// indistinguishable from an ordinary dispatcher deferral, so this verdict
+    /// exists to name it: roll back (or forward-fix) the workflow code.
+    NonDeterminismBlocked {
+        /// When the engine first blocked this run.
+        since: DateTime<Utc>,
+        /// The recorded divergence, where one was stamped.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// How many times the block has re-fired — a rough age of the wedge.
+        block_count: i32,
+    },
     /// Replay found the run parked on a durable wait that leaves no row in any
     /// side table this endpoint reads — a `ctx.await_condition` park, a durable
     /// mutex acquire (issue #691), an admitted update awaiting its handler
@@ -302,6 +319,7 @@ impl BlockedOn {
             Self::TimerOverdue { .. } => "timer_overdue",
             Self::AwaitingExternalHandoff { .. } => "awaiting_external_handoff",
             Self::Paused { .. } => "paused",
+            Self::NonDeterminismBlocked { .. } => "non_determinism_blocked",
             Self::AwaitingReplayWait { .. } => "awaiting_replay_wait",
             Self::WorkflowNoWorker { .. } => "workflow_no_worker",
             Self::WorkflowQueuePaused { .. } => "workflow_queue_paused",
@@ -336,6 +354,7 @@ impl BlockedOn {
             Self::ActivityNoWorker { .. }
             | Self::WorkflowNoWorker { .. }
             | Self::TimerOverdue { .. }
+            | Self::NonDeterminismBlocked { .. }
             | Self::ActivityCircuitOpen { .. }
             | Self::NoPendingWork => ExecutionHealth::Stalled,
         }
@@ -429,6 +448,21 @@ pub struct AwaitedSignalFacts {
     pub since: Option<DateTime<Utc>>,
 }
 
+/// The engine's recorded nondeterminism block (issue #603).
+///
+/// Read straight off `harvest_workflow_executions` — this is a *recorded fact*,
+/// not an inference from row shape, which is why it outranks every side-table
+/// cause below it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NdBlockFacts {
+    /// `nd_blocked_at` — when the engine first blocked this run.
+    pub blocked_at: DateTime<Utc>,
+    /// `nd_block_reason` — the recorded divergence.
+    pub reason: Option<String>,
+    /// `nd_block_count` — how many times the block has re-fired.
+    pub block_count: i32,
+}
+
 /// An unfired durable timer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingTimerFacts {
@@ -502,6 +536,9 @@ pub struct DiagnosisInputs {
     /// The run's own workflow task row, where one was loaded. `None` leaves the
     /// classifier's pre-issue-#1188 behaviour exactly as it was.
     pub workflow_task: Option<WorkflowTaskFacts>,
+    /// The engine's recorded nondeterminism block (issue #603), where one is
+    /// stamped. `None` leaves the ladder byte-identical.
+    pub nd_block: Option<NdBlockFacts>,
 }
 
 /// Rank a pending-activity verdict by how hard its impediment is to clear.
@@ -807,6 +844,31 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
         });
     }
 
+    // Replay detected non-determinism and the engine blocked the run (#603).
+    // It re-pends the workflow task at a backoff `scheduled_at` and repeats
+    // INDEFINITELY until a compatible build is deployed, so by row shape alone
+    // it is indistinguishable from an ordinary dispatcher deferral — a
+    // permanently wedged run would otherwise report `healthy_in_progress`.
+    //
+    // Ranked here, directly under `paused`, because it is the same *class* of
+    // fact: an explicit state the engine stamped on the execution row, not an
+    // inference from a liveness proxy or a timestamp. It outranks every
+    // side-table cause because the block re-fires on EVERY decision cycle, so
+    // the run is wedged regardless of what those rows are doing — and nothing
+    // is lost, since a pending activity's own impediments still reach the
+    // operator through `contributing_reason_codes`, which is a union across
+    // rows rather than the winner's reasons.
+    //
+    // `paused` stays above it, mirroring the engine: an operator pause observed
+    // under the row lock supersedes the block and re-parks instead.
+    if let Some(nd) = inputs.nd_block.as_ref() {
+        return Some(BlockedOn::NonDeterminismBlocked {
+            since: nd.blocked_at,
+            reason: nd.reason.clone(),
+            block_count: nd.block_count,
+        });
+    }
+
     // The activity bucket: report the WORST verdict across every pending row so
     // one wedged slot in a fan-out is never masked by nineteen healthy ones.
     // `max_by_key` keeps the LAST maximum, so the scan is written explicitly to
@@ -991,8 +1053,8 @@ fn activity_phrase(activity_name: Option<&String>) -> String {
 ///
 /// Split out purely so [`summarize`] stays within the function-length lint
 /// budget; the two together are exhaustive over [`BlockedOn`].
-fn summarize_activity_cause(blocked: &BlockedOn) -> String {
-    match blocked {
+fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
+    Some(match blocked {
         BlockedOn::ActivityRetrying {
             activity_name,
             attempt,
@@ -1059,9 +1121,13 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> String {
             "queue '{queue}' is paused by an operator, holding {}",
             activity_phrase(activity_name.as_ref())
         ),
-        // Every non-activity cause is handled by `summarize` itself.
-        other => summarize(other),
-    }
+        // Not an activity-row cause -- `summarize` handles it itself. Returning
+        // `None` (rather than calling back into `summarize`) keeps the two
+        // functions non-mutually-recursive, so a variant that is new to BOTH
+        // catch-alls degrades to a readable fallback instead of overflowing
+        // the stack.
+        _ => return None,
+    })
 }
 
 /// A one-sentence, human-readable rendering of a verdict, for CLI output and
@@ -1117,9 +1183,25 @@ pub fn summarize(blocked: &BlockedOn) -> String {
         BlockedOn::NoPendingWork => "this execution has no pending work of any kind; its \
              workflow task may have been lost"
             .to_string(),
+        BlockedOn::NonDeterminismBlocked {
+            since,
+            reason,
+            block_count,
+        } => format!(
+            "replay detected non-determinism, so the engine blocked this run at {since} \
+             (block #{block_count}) rather than failing it; it stays blocked until the \
+             divergent build is rolled back{}",
+            reason
+                .as_ref()
+                .map_or_else(String::new, |r| format!(" -- recorded divergence: {r}"))
+        ),
         // Activity-row causes are summarized by a dedicated helper so this
         // function stays within the line-length lint budget as variants grow.
-        activity_cause => summarize_activity_cause(activity_cause),
+        // The helper returns `None` for anything it does not own, and the
+        // fallback keeps this function total: a variant added to neither match
+        // still yields a readable line instead of recursing forever.
+        activity_cause => summarize_activity_cause(activity_cause)
+            .unwrap_or_else(|| format!("blocked on {}", activity_cause.kind())),
     }
 }
 
@@ -1130,6 +1212,83 @@ mod tests {
 
     fn t(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_800_000_000 + secs, 0).unwrap()
+    }
+
+    /// `kind()` and the serialized `blocked_on.type` are two independent
+    /// spellings of one bounded vocabulary -- the CLI renderer and the runbook
+    /// key on the wire tag, internal callers key on `kind()`. A variant whose
+    /// hand-written `kind()` disagrees with serde's derived tag silently
+    /// splits that vocabulary in two, so pin them together for every variant.
+    #[test]
+    fn kind_matches_the_serialized_wire_tag_for_every_variant() {
+        for verdict in &all_verdicts() {
+            let wire = serde_json::to_value(verdict).expect("verdict serializes");
+            assert_eq!(
+                wire["type"].as_str().expect("tagged with `type`"),
+                verdict.kind(),
+                "kind() drifted from the wire tag for {verdict:?}"
+            );
+        }
+    }
+
+    /// `summarize` and `summarize_activity_cause` used to be MUTUALLY
+    /// recursive through their two catch-all arms, so a variant new to both
+    /// overflowed the stack instead of returning a string. Every variant must
+    /// now summarize in bounded time, including one that no explicit arm owns.
+    /// One instance of EVERY `BlockedOn` variant. `kind()` is exhaustively
+    /// matched (no catch-all), so a new variant is a compile error there --
+    /// this list is what makes the two pins below cover it too.
+    fn all_verdicts() -> Vec<BlockedOn> {
+        vec![
+            BlockedOn::HealthyInProgress,
+            BlockedOn::NoPendingWork,
+            BlockedOn::NonDeterminismBlocked {
+                since: t(-180),
+                reason: Some("activity mismatch at event 7".to_string()),
+                block_count: 4,
+            },
+            BlockedOn::NonDeterminismBlocked {
+                since: t(-180),
+                reason: None,
+                block_count: 1,
+            },
+            BlockedOn::ActivityNoWorker {
+                activity_name: Some("charge".to_string()),
+                queue: "payments".to_string(),
+            },
+            BlockedOn::WorkflowNoWorker {
+                queue: "default".to_string(),
+            },
+            BlockedOn::Paused {
+                actor: None,
+                since: Some(t(-60)),
+            },
+            BlockedOn::SleepingTimer { fires_at: t(60) },
+        ]
+    }
+
+    #[test]
+    fn every_verdict_summarizes_without_recursing() {
+        let verdicts = all_verdicts();
+        for verdict in &verdicts {
+            let summary = summarize(verdict);
+            assert!(
+                !summary.is_empty(),
+                "{} must summarize to a non-empty line",
+                verdict.kind()
+            );
+        }
+        // The nd-block summary is operator-actionable: it names the recorded
+        // divergence and the remediation.
+        let summary = summarize(&verdicts[2]);
+        assert!(
+            summary.contains("activity mismatch at event 7"),
+            "{summary}"
+        );
+        assert!(summary.contains("rolled back"), "{summary}");
+        // ... and stays coherent when the engine recorded no reason.
+        let bare = summarize(&verdicts[3]);
+        assert!(!bare.contains("recorded divergence"), "{bare}");
     }
 
     /// A due, unimpeded, single-attempt PENDING activity on a covered queue.
@@ -1549,6 +1708,115 @@ mod tests {
             classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
         assert_eq!(verdict.kind(), "activity_no_worker", "{verdict:?}");
         assert_eq!(verdict.health(), ExecutionHealth::Stalled);
+    }
+
+    // ── A nondeterminism block is an engine-declared stall (PR #1188 round 6) ──
+    // Issue #603 keeps an nd-blocked execution `RUNNING` and re-pends its
+    // workflow task `PENDING` at a backoff `scheduled_at`, indefinitely, until a
+    // compatible build is deployed. That is indistinguishable from an ordinary
+    // dispatcher deferral by row shape alone — so without the recorded
+    // `nd_blocked_at` fact the endpoint reports a permanently wedged run as
+    // `healthy_in_progress`.
+
+    #[test]
+    fn nd_blocked_execution_is_not_reported_healthy() {
+        // Exactly the #603 shape: RUNNING, task PENDING at the backoff instant,
+        // a live poller, and no side-table work.
+        let inputs = DiagnosisInputs {
+            nd_block: Some(NdBlockFacts {
+                blocked_at: t(-3600),
+                reason: Some("expected ActivityScheduled(charge), got TimerStarted".to_string()),
+                block_count: 12,
+            }),
+            workflow_task: Some(WorkflowTaskFacts {
+                scheduled_at: t(120),
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(
+            verdict,
+            BlockedOn::NonDeterminismBlocked {
+                since: t(-3600),
+                reason: Some("expected ActivityScheduled(charge), got TimerStarted".to_string()),
+                block_count: 12,
+            },
+            "a replay-blocked run is a stall, not dispatch latency: {verdict:?}"
+        );
+        assert_eq!(verdict.health(), ExecutionHealth::Stalled);
+    }
+
+    #[test]
+    fn nd_block_outranks_every_side_table_cause() {
+        // The block re-fires on EVERY decision cycle, so it wedges the run
+        // regardless of what the side tables are doing. The activity's own
+        // impediments still reach the operator via `contributing_reason_codes`.
+        let inputs = DiagnosisInputs {
+            nd_block: Some(NdBlockFacts {
+                blocked_at: t(-600),
+                reason: None,
+                block_count: 1,
+            }),
+            activities: vec![healthy_activity()],
+            timers: vec![PendingTimerFacts { fires_at: t(3600) }],
+            children: vec![PendingChildFacts {
+                child_exec_id: "child-1".to_string(),
+                child_state: "RUNNING".to_string(),
+            }],
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "non_determinism_blocked", "{verdict:?}");
+    }
+
+    #[test]
+    fn operator_pause_outranks_a_nondeterminism_block() {
+        // Mirrors the engine: `block_workflow_for_non_determinism` observes a
+        // pause under the row lock and re-parks instead of blocking, so a pause
+        // is the operative fact when both are recorded.
+        let inputs = DiagnosisInputs {
+            is_paused: true,
+            pause_actor: Some("oncall".to_string()),
+            paused_since: Some(t(-60)),
+            nd_block: Some(NdBlockFacts {
+                blocked_at: t(-600),
+                reason: None,
+                block_count: 3,
+            }),
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "paused", "{verdict:?}");
+    }
+
+    #[test]
+    fn terminal_outranks_a_nondeterminism_block() {
+        let inputs = DiagnosisInputs {
+            is_terminal: true,
+            nd_block: Some(NdBlockFacts {
+                blocked_at: t(-600),
+                reason: None,
+                block_count: 3,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(classify_execution(&inputs, t(0)), None);
+    }
+
+    #[test]
+    fn no_nd_block_leaves_the_ladder_untouched() {
+        // The default (`None`) must be byte-identical to the pre-round-6 ladder.
+        let inputs = DiagnosisInputs {
+            activities: vec![healthy_activity()],
+            ..Default::default()
+        };
+        let verdict =
+            classify_execution(&inputs, t(0)).expect("non-terminal execution must yield a verdict");
+        assert_eq!(verdict.kind(), "healthy_in_progress", "{verdict:?}");
     }
 
     // ── A timer cannot fire if its own workflow task can never be claimed ──

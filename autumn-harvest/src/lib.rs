@@ -460,7 +460,7 @@ pub use signal_handler::SignalHandlerRegistry;
 pub use simulator::{SimulatorResult, WorkflowSimulator};
 pub use stall_diagnosis::{
     AwaitedSignalFacts, BlockedOn, BlockingCircuitPhase, DiagnosisInputs, ExecutionHealth,
-    ExternalHandoffFacts, PendingActivityFacts, PendingChildFacts, PendingTimerFacts,
+    ExternalHandoffFacts, NdBlockFacts, PendingActivityFacts, PendingChildFacts, PendingTimerFacts,
     ReplayWaitFacts, TIMER_OVERDUE_GRACE_SECONDS, WorkflowTaskFacts, activity_precedence,
     classify_execution, classify_pending_activity, classify_workflow_task, summarize,
     workflow_task_hard_impediment, workflow_wake_was_missed,

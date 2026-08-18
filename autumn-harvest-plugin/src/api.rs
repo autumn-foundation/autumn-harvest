@@ -12527,6 +12527,37 @@ struct DiagnoseTask {
     task_type: String,
 }
 
+/// Decode the one activity error this response actually surfaces (issue #608).
+///
+/// `PendingActivityFacts::last_error` is carried RAW on purpose. The classifier
+/// only needs the error's *presence* — it is the failure-evidence discriminator
+/// that separates `activity_retrying` from `activity_deferred` — and at most one
+/// row's error ever reaches the caller, on the winning
+/// [`BlockedOn::ActivityRetrying`]. Decoding every row up front would decrypt a
+/// losing row's error and write a `payload.decode_read` audit record for data
+/// the caller never sees, breaking the #608 "decode exactly what is surfaced"
+/// contract.
+///
+/// Returns the outcome to merge into the request's decode accumulator; a
+/// non-retrying verdict, an absent error, or an inactive decoder all yield the
+/// empty outcome, leaving the audit row untouched.
+fn decode_surfaced_activity_error(
+    blocked_on: &mut autumn_harvest::stall_diagnosis::BlockedOn,
+    decoder: Option<&PayloadCodecs>,
+) -> LossyDecodeOutcome {
+    let (
+        Some(codecs),
+        autumn_harvest::stall_diagnosis::BlockedOn::ActivityRetrying {
+            last_error: Some(error),
+            ..
+        },
+    ) = (decoder, blocked_on)
+    else {
+        return LossyDecodeOutcome::default();
+    };
+    decode_error_field(codecs, error)
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn build_diagnosis_report(
     api_state: &HarvestApiState,
@@ -12536,8 +12567,8 @@ pub(crate) async fn build_diagnosis_report(
 ) -> Result<WorkflowDiagnoseResponse, AutumnError> {
     use autumn_harvest::stall_diagnosis::{
         AwaitedSignalFacts, BlockedOn, BlockingCircuitPhase, DiagnosisInputs, ExecutionHealth,
-        ExternalHandoffFacts, PendingActivityFacts, PendingChildFacts, PendingTimerFacts,
-        ReplayWaitFacts, WorkflowTaskFacts, classify_execution, summarize,
+        ExternalHandoffFacts, NdBlockFacts, PendingActivityFacts, PendingChildFacts,
+        PendingTimerFacts, ReplayWaitFacts, WorkflowTaskFacts, classify_execution, summarize,
     };
 
     let exec_uuid = exec_id.as_uuid();
@@ -12854,13 +12885,16 @@ pub(crate) async fn build_diagnosis_report(
                 queue: t.queue_name.clone(),
                 task_state: t.state.clone(),
                 attempt: t.attempt,
-                last_error: t.error.clone().map(|mut error| {
-                    if let Some(codecs) = decoder {
-                        *decode_outcome =
-                            decode_outcome.merged(decode_error_field(codecs, &mut error));
-                    }
-                    error
-                }),
+                // RAW on purpose (issue #608: decode exactly what is surfaced).
+                // Classification only needs the error's PRESENCE — it is the
+                // failure-evidence discriminator that separates
+                // `activity_retrying` from `activity_deferred` — and at most one
+                // row's error ever reaches the response, on the winning
+                // `ActivityRetrying`. Decoding here would decrypt every losing
+                // row's error and write a `payload.decode_read` audit row for
+                // data the caller never sees. The winner is decoded after
+                // `classify_execution` picks it.
+                last_error: t.error.clone(),
                 scheduled_at: t.scheduled_at,
                 rate_limit_key: t.rate_limit_key.clone(),
                 concurrency_key: t.concurrency_key.clone(),
@@ -12959,6 +12993,17 @@ pub(crate) async fn build_diagnosis_report(
         timers,
         replay_waits: Vec::new(),
         workflow_task,
+        // Issue #603: an nd-blocked run stays RUNNING with its workflow task
+        // re-pended at a backoff `scheduled_at`, indefinitely. That row shape is
+        // an ordinary deferral, so without this recorded fact a permanently
+        // wedged run reports `healthy_in_progress`. Terminal executions returned
+        // above, and a PAUSED one is answered by the higher-ranked `paused`
+        // verdict, so a stamped marker here is always a live block.
+        nd_block: execution.nd_blocked_at.map(|blocked_at| NdBlockFacts {
+            blocked_at,
+            reason: execution.nd_block_reason.clone(),
+            block_count: execution.nd_block_count,
+        }),
     };
 
     // ── Awaited-but-unsent signals, only when they could change the answer ──
@@ -13055,7 +13100,9 @@ pub(crate) async fn build_diagnosis_report(
         }
     }
 
-    let blocked_on = classify_execution(&inputs, now).unwrap_or(BlockedOn::NoPendingWork);
+    let mut blocked_on = classify_execution(&inputs, now).unwrap_or(BlockedOn::NoPendingWork);
+    *decode_outcome =
+        decode_outcome.merged(decode_surfaced_activity_error(&mut blocked_on, decoder));
     let health = blocked_on.health();
     let summary = summarize(&blocked_on);
     let contributing_reason_codes = contributing_reasons_for(&inputs.activities, &cb_phase);
@@ -46962,6 +47009,122 @@ mod tests {
             v.reverse();
             Ok(v)
         }
+    }
+
+    // ── issue #809 / PR #1188 round 6: decode exactly what is surfaced ─────
+    //
+    // The per-row activity facts carry `last_error` RAW so a LOSING row's
+    // encrypted error is never decrypted and never written to the
+    // `payload.decode_read` audit row. Only the winning verdict's error is
+    // decoded, and only when a decoder is active.
+
+    /// Wrap `plaintext` the way a codec-encrypting deployment stores an
+    /// encoded TEXT error: the serialized form of a codec envelope around a
+    /// JSON string. Built through the public `encode_event` seam (encoding a
+    /// string-valued payload field) so the fixture can never drift from the
+    /// engine's real envelope shape.
+    fn encoded_error_envelope(plaintext: &str) -> String {
+        let codecs = reversing_codecs();
+        let event = autumn_harvest::WorkflowEvent::WorkflowCompleted {
+            output: serde_json::Value::String(plaintext.to_string()),
+        };
+        let event_data = codecs.encode_event(&event).expect("encode event");
+        let envelope = &event_data["data"]["output"];
+        assert_eq!(
+            envelope["_harvest_codec_envelope"], 1,
+            "fixture sanity: the encoded field must carry a codec envelope"
+        );
+        serde_json::to_string(envelope).expect("serialize envelope")
+    }
+
+    #[test]
+    fn only_the_surfaced_activity_error_is_decoded() {
+        use autumn_harvest::stall_diagnosis::BlockedOn;
+
+        let codecs = reversing_codecs();
+        let encoded = encoded_error_envelope("card declined");
+
+        // The winning verdict's error IS decoded, and the outcome is non-empty
+        // so the caller's `payload.decode_read` audit row is written.
+        let mut winner = BlockedOn::ActivityRetrying {
+            activity_name: Some("charge_card".to_string()),
+            attempt: 3,
+            last_error: Some(encoded),
+            next_attempt_at: None,
+        };
+        let outcome = decode_surfaced_activity_error(&mut winner, Some(&codecs));
+        assert!(outcome.touched(), "a surfaced error must be audited");
+        let BlockedOn::ActivityRetrying {
+            last_error: Some(decoded),
+            ..
+        } = &winner
+        else {
+            panic!("verdict shape changed: {winner:?}");
+        };
+        assert_eq!(decoded, "card declined");
+        assert!(
+            !decoded.contains("_harvest_codec_envelope"),
+            "the surfaced error must not leak the envelope: {decoded}"
+        );
+    }
+
+    #[test]
+    fn a_losing_rows_error_is_never_decoded_or_audited() {
+        use autumn_harvest::stall_diagnosis::BlockedOn;
+
+        let codecs = reversing_codecs();
+        // The fan-out case Codex named: a retrying row loses precedence to a
+        // paused-queue row, so its error never reaches the caller.
+        let mut winner = BlockedOn::ActivityQueuePaused {
+            queue: "payments".to_string(),
+            activity_name: Some("charge_card".to_string()),
+        };
+        let outcome = decode_surfaced_activity_error(&mut winner, Some(&codecs));
+        assert!(
+            !outcome.touched(),
+            "an unsurfaced error must not write a decode audit row"
+        );
+    }
+
+    #[test]
+    fn decode_is_a_noop_without_an_active_decoder() {
+        use autumn_harvest::stall_diagnosis::BlockedOn;
+
+        let encoded = encoded_error_envelope("card declined");
+        let mut winner = BlockedOn::ActivityRetrying {
+            activity_name: None,
+            attempt: 1,
+            last_error: Some(encoded.clone()),
+            next_attempt_at: None,
+        };
+        let outcome = decode_surfaced_activity_error(&mut winner, None);
+        assert!(!outcome.touched());
+        let BlockedOn::ActivityRetrying {
+            last_error: Some(unchanged),
+            ..
+        } = &winner
+        else {
+            panic!("verdict shape changed: {winner:?}");
+        };
+        assert_eq!(
+            unchanged, &encoded,
+            "with no decoder the stored bytes must be returned verbatim"
+        );
+    }
+
+    #[test]
+    fn a_retrying_verdict_without_an_error_is_a_noop() {
+        use autumn_harvest::stall_diagnosis::BlockedOn;
+
+        let codecs = reversing_codecs();
+        let mut winner = BlockedOn::ActivityRetrying {
+            activity_name: None,
+            attempt: 1,
+            last_error: None,
+            next_attempt_at: None,
+        };
+        let outcome = decode_surfaced_activity_error(&mut winner, Some(&codecs));
+        assert!(!outcome.touched());
     }
 
     fn read_path_test_codecs() -> PayloadCodecs {

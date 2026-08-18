@@ -2008,3 +2008,136 @@ async fn workflow_task_fallback_never_masks_a_wedged_activity() {
         "the activity queue is the actionable one: {body}"
     );
 }
+
+// ── issue #809 / PR #1188 round 6: nd-blocked runs are not healthy ─────────
+
+/// Stamp the issue #603 non-determinism block columns on a RUNNING execution.
+async fn mark_nd_blocked(pool: &DbPool, exec_id: ExecutionId, reason: &str, count: i32) {
+    let mut conn = pool.get().await.expect("pooled conn");
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+         SET nd_blocked_at = NOW() - INTERVAL '3 minutes', \
+             nd_block_reason = $2, nd_block_count = $3 \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(reason)
+    .bind::<diesel::sql_types::Integer, _>(count)
+    .execute(&mut conn)
+    .await
+    .expect("stamp nd block");
+}
+
+/// The issue #603 nd-block leaves the execution `RUNNING` and re-pends its
+/// workflow task at a FUTURE `scheduled_at` (the capped-exponential backoff) --
+/// byte-identical to an ordinary deliberate deferral. Reading the task row
+/// alone therefore reports healthy dispatch for a run that is wedged until an
+/// operator rolls the divergent build back. The execution row's own
+/// `nd_blocked_at` is the authoritative signal and must win.
+#[tokio::test]
+async fn nd_blocked_execution_reports_the_block_not_healthy_dispatch() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "completes_wf", "RUNNING", vec![started_event()]).await;
+    // The exact shape `requeue_workflow_task_nd_blocked` leaves behind.
+    seed_workflow_task(
+        &pool,
+        exec_id,
+        "default",
+        "PENDING",
+        None,
+        "NOW() + INTERVAL '80 seconds'",
+    )
+    .await;
+    seed_live_worker(&pool, "w-nd-live", "default").await;
+    mark_nd_blocked(&pool, exec_id, "activity mismatch at event 7", 4).await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "non_determinism_blocked", "body: {body}");
+    assert_eq!(body["health"], "stalled", "body: {body}");
+    assert_eq!(
+        body["blocked_on"]["reason"], "activity mismatch at event 7",
+        "the recorded divergence must be surfaced: {body}"
+    );
+    assert_eq!(body["blocked_on"]["block_count"], 4, "body: {body}");
+    assert!(
+        body["blocked_on"]["since"].is_string(),
+        "the block instant must be surfaced: {body}"
+    );
+}
+
+/// An nd-blocked run cannot replay, so no activity of that run will ever make
+/// progress -- the block outranks every side-table cause. The activity's own
+/// impediment is still reported in `contributing_reason_codes`, so nothing is
+/// lost by ranking the block first.
+#[tokio::test]
+async fn nd_block_outranks_a_wedged_activity_but_keeps_its_reason_codes() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_activity_task(
+        &pool,
+        exec_id,
+        "noop_activity",
+        "dead-activity-queue",
+        "PENDING",
+        1,
+        None,
+        "NOW()",
+    )
+    .await;
+    mark_nd_blocked(&pool, exec_id, "timer mismatch at event 3", 1).await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "non_determinism_blocked", "body: {body}");
+    assert!(
+        body["contributing_reason_codes"]
+            .as_array()
+            .expect("reason codes")
+            .iter()
+            .any(|r| r == "no_live_worker"),
+        "the activity's own impediment must still be surfaced: {body}"
+    );
+}
+
+/// A run that was never nd-blocked must be unaffected: the block columns are
+/// NULL and the ordinary ladder applies. Guards against the branch firing on
+/// every execution.
+#[tokio::test]
+async fn a_run_that_was_never_nd_blocked_keeps_its_ordinary_verdict() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_activity_task(
+        &pool,
+        exec_id,
+        "noop_activity",
+        "dead-activity-queue",
+        "PENDING",
+        1,
+        None,
+        "NOW()",
+    )
+    .await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "activity_no_worker", "body: {body}");
+}
