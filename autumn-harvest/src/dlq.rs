@@ -1918,18 +1918,37 @@ pub fn group_dead_letter_rows(
             })
             .collect();
 
-        let entry = groups.entry(key.clone()).or_insert_with(|| DlqRawGroup {
-            key,
-            count: 0,
-            first_seen: None,
-            last_seen: None,
-            sample_ids: Vec::new(),
-        });
-        entry.count += 1;
-        entry.first_seen = min_instant(entry.first_seen, Some(failed_at));
-        entry.last_seen = max_instant(entry.last_seen, Some(failed_at));
-        if entry.sample_ids.len() < params.samples_per_group as usize {
-            entry.sample_ids.push(id.to_string());
+        // `HashMap::entry` always takes its key by value, so the obvious
+        // `groups.entry(key.clone())` clones `key` -- a `Vec<Option<String>>`,
+        // itself owning up to `group_by.len()` `String`s -- on *every* row,
+        // even though a real DLQ aggregate's whole point is that most rows
+        // land in an *already-seen* group (a "flood" is many rows, few root
+        // causes). `get_mut` looks the key up by reference on the hot
+        // (existing-group) path, so the clone below runs only once per
+        // *group*, not once per *row*.
+        if let Some(entry) = groups.get_mut(&key) {
+            entry.count += 1;
+            entry.first_seen = min_instant(entry.first_seen, Some(failed_at));
+            entry.last_seen = max_instant(entry.last_seen, Some(failed_at));
+            if entry.sample_ids.len() < params.samples_per_group as usize {
+                entry.sample_ids.push(id.to_string());
+            }
+        } else {
+            let sample_ids = if params.samples_per_group > 0 {
+                vec![id.to_string()]
+            } else {
+                Vec::new()
+            };
+            groups.insert(
+                key.clone(),
+                DlqRawGroup {
+                    key,
+                    count: 1,
+                    first_seen: Some(failed_at),
+                    last_seen: Some(failed_at),
+                    sample_ids,
+                },
+            );
         }
     }
     groups
