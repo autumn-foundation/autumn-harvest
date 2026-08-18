@@ -2141,3 +2141,277 @@ async fn a_run_that_was_never_nd_blocked_keeps_its_ordinary_verdict() {
     let body = diagnose(&app, exec_id).await;
     assert_eq!(kind(&body), "activity_no_worker", "body: {body}");
 }
+
+/// A DETACHED child (issue #347) keeps `parent_id` but carries a non-null
+/// `parent_close_policy` and NEVER wakes its parent — the engine's own
+/// discriminator (`worker.rs`'s `is_detached_child`). Counting it as a pending
+/// child would report a healthy `pending_child` wait for a parent that is not
+/// waiting on it at all, masking the awaited signal the parent is genuinely
+/// parked on for as long as the fire-and-forget child happens to run.
+#[tokio::test]
+async fn detached_child_does_not_mask_the_signal_the_parent_is_parked_on() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    // `signal_wait_wf` parks on an awaited-but-unsent signal — visible ONLY to
+    // the replay drive, which a `pending_child` verdict would skip entirely.
+    let parent = seed_execution(&pool, "signal_wait_wf", "RUNNING", vec![started_event()]).await;
+    let detached = seed_execution(&pool, "completes_wf", "RUNNING", vec![started_event()]).await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions \
+             SET parent_id = $1, parent_close_policy = 'Abandon' WHERE id = $2",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(parent.as_uuid())
+        .bind::<diesel::sql_types::Uuid, _>(detached.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("link detached child");
+    }
+
+    let body = diagnose(&app, parent).await;
+    assert_eq!(
+        kind(&body),
+        "awaiting_signal",
+        "a detached child must not be reported as a pending child: {body}"
+    );
+    assert_eq!(body["health"], "blocked_external", "body: {body}");
+    assert_eq!(
+        body["wait_set"], "replayed",
+        "the replay drive must still run: {body}"
+    );
+}
+
+/// The complement: an AWAITED child (`parent_close_policy IS NULL`) is still a
+/// pending child. Guards the fix from over-filtering into a false stall.
+#[tokio::test]
+async fn awaited_child_is_still_reported_as_pending() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let parent = seed_execution(&pool, "signal_wait_wf", "RUNNING", vec![started_event()]).await;
+    let awaited = seed_execution(&pool, "completes_wf", "RUNNING", vec![started_event()]).await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query("UPDATE harvest_workflow_executions SET parent_id = $1 WHERE id = $2")
+            .bind::<diesel::sql_types::Uuid, _>(parent.as_uuid())
+            .bind::<diesel::sql_types::Uuid, _>(awaited.as_uuid())
+            .execute(&mut conn)
+            .await
+            .expect("link awaited child");
+    }
+
+    let body = diagnose(&app, parent).await;
+    assert_eq!(kind(&body), "pending_child", "body: {body}");
+    assert_eq!(body["blocked_on"]["child_exec_id"], awaited.to_string());
+}
+
+// ── Per-task claim eligibility: build routing (#171) and capabilities (#804) ──
+
+/// Seed a live worker carrying a build id and capability labels.
+async fn seed_live_worker_with(
+    pool: &DbPool,
+    worker_id: &str,
+    queue: &str,
+    build_id: &str,
+    labels: serde_json::Value,
+) {
+    let mut conn = pool.get().await.expect("pooled conn");
+    diesel::sql_query(
+        "INSERT INTO harvest_workers \
+         (worker_id, last_heartbeat_at, status, queues, shard_assignments, max_concurrency, \
+          host, build_id, labels) \
+         VALUES ($1, NOW(), 'Active', $2, '[0]'::jsonb, 10, 'test-host', $3, $4) \
+         ON CONFLICT (worker_id) DO NOTHING",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .bind::<diesel::sql_types::Jsonb, _>(json!([queue]))
+    .bind::<diesel::sql_types::Text, _>(build_id)
+    .bind::<diesel::sql_types::Jsonb, _>(labels)
+    .execute(&mut conn)
+    .await
+    .expect("seed worker");
+}
+
+/// Seed a pending activity task carrying claim-time routing requirements.
+async fn seed_task_requiring(
+    pool: &DbPool,
+    exec_id: ExecutionId,
+    queue: &str,
+    required_build_id: Option<&str>,
+    required_capabilities: Option<serde_json::Value>,
+) {
+    let mut conn = pool.get().await.expect("pooled conn");
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, activity_name, activity_id, \
+          input, state, priority, attempt, max_attempts, scheduled_at, \
+          required_build_id, required_capabilities) \
+         VALUES ($1, $2, 'activity', $3, 'gated_activity', $4, '{}'::jsonb, 'PENDING', 0, 0, 3, \
+                 NOW() - INTERVAL '1 minute', $5, $6)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(ActivityExecId::new().as_uuid())
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(required_build_id)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Jsonb>, _>(required_capabilities)
+    .execute(&mut conn)
+    .await
+    .expect("seed gated task");
+}
+
+/// A task pinned to a build NO live worker runs is unclaimable, even though its
+/// queue has a live poller. Queue coverage alone would report healthy progress
+/// for a task that can sit `PENDING` forever.
+#[tokio::test]
+async fn task_requiring_an_absent_build_reports_no_worker_despite_queue_coverage() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    seed_task_requiring(&pool, exec_id, "payments", Some("build-2"), None).await;
+    // A live poller on the queue — but running the WRONG build.
+    seed_live_worker_with(&pool, "w-old-build", "payments", "build-1", json!({})).await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "activity_no_worker",
+        "a build-pinned task no live worker can claim must not read healthy: {body}"
+    );
+    assert_eq!(body["blocked_on"]["queue"], "payments", "body: {body}");
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// The control: a live poller running the REQUIRED build is genuine coverage.
+#[tokio::test]
+async fn task_requiring_a_present_build_is_healthy() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    seed_task_requiring(&pool, exec_id, "payments", Some("build-2"), None).await;
+    seed_live_worker_with(&pool, "w-new-build", "payments", "build-2", json!({})).await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
+}
+
+/// A task requiring a capability label no live worker advertises is likewise
+/// unclaimable — the second half of the claim predicate.
+#[tokio::test]
+async fn task_requiring_an_unsatisfied_capability_reports_no_worker() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    seed_task_requiring(
+        &pool,
+        exec_id,
+        "payments",
+        None,
+        Some(json!([{"Exact": {"key": "gpu", "value": "true"}}])),
+    )
+    .await;
+    seed_live_worker_with(&pool, "w-cpu", "payments", "", json!({"gpu": "false"})).await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "activity_no_worker",
+        "a capability-gated task no live worker satisfies must not read healthy: {body}"
+    );
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// The control: a worker advertising the required label IS coverage.
+#[tokio::test]
+async fn task_requiring_a_satisfied_capability_is_healthy() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    seed_task_requiring(
+        &pool,
+        exec_id,
+        "payments",
+        None,
+        Some(json!([{"Exact": {"key": "gpu", "value": "true"}}])),
+    )
+    .await;
+    seed_live_worker_with(&pool, "w-gpu", "payments", "", json!({"gpu": "true"})).await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
+}
+
+/// A declared `harvest_build_compat` row makes a newer build eligible for an
+/// older build's work — the same rule `claim_task` applies, so it must not
+/// report a false stall.
+#[tokio::test]
+async fn declared_build_compatibility_counts_as_coverage() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    seed_task_requiring(&pool, exec_id, "payments", Some("build-1"), None).await;
+    seed_live_worker_with(&pool, "w-new", "payments", "build-2", json!({})).await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_build_compat (id, build_id, compatible_with) \
+             VALUES ($1, 'build-2', 'build-1')",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .execute(&mut conn)
+        .await
+        .expect("declare compat");
+    }
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
+}
+
+/// Every dimension must hold for the SAME worker: a fleet where one worker has
+/// the build and a different one has the label covers nothing.
+#[tokio::test]
+async fn split_fleet_satisfying_each_dimension_separately_is_not_coverage() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "activity_wf", "RUNNING", vec![started_event()]).await;
+    seed_task_requiring(
+        &pool,
+        exec_id,
+        "payments",
+        Some("build-2"),
+        Some(json!([{"Exact": {"key": "gpu", "value": "true"}}])),
+    )
+    .await;
+    seed_live_worker_with(&pool, "w-build-only", "payments", "build-2", json!({})).await;
+    seed_live_worker_with(
+        &pool,
+        "w-gpu-only",
+        "payments",
+        "build-1",
+        json!({"gpu": "true"}),
+    )
+    .await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "activity_no_worker",
+        "neither worker can claim the task on its own: {body}"
+    );
+}

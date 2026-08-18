@@ -12506,6 +12506,19 @@ type DiagnoseTaskRow = (
     Option<String>,                // concurrency_key
     Option<i32>,                   // concurrency_cap
     String,                        // task_type
+    Option<String>,                // required_build_id
+    Option<serde_json::Value>,     // required_capabilities
+);
+
+/// The run's own workflow-task row, with the claim requirements its liveness
+/// answer depends on.
+type WorkflowTaskRow = (
+    String,                        // state
+    Option<String>,                // worker_id
+    String,                        // queue_name
+    chrono::DateTime<chrono::Utc>, // scheduled_at
+    Option<String>,                // required_build_id
+    Option<serde_json::Value>,     // required_capabilities
 );
 
 /// The narrow task-queue projection [`build_diagnosis_report`] reads.
@@ -12525,6 +12538,59 @@ struct DiagnoseTask {
     concurrency_key: Option<String>,
     concurrency_cap: Option<i32>,
     task_type: String,
+    /// Build routing (issue #171/#604) -- part of the claim predicate, so part
+    /// of whether any live worker can actually claim this row.
+    required_build_id: Option<String>,
+    /// Capability requirements (issue #804) -- likewise claim-time enforced.
+    required_capabilities: Option<serde_json::Value>,
+}
+
+/// Can ANY single live worker actually claim this task?
+///
+/// Queue coverage alone is not the claim predicate. `queue::claim_task` also
+/// enforces the task's `required_build_id` (exact, `harvest_build_compat`
+/// declared, or legacy empty-build worker) and its `required_capabilities`
+/// (the same Exact/In label match), so a task sitting on a well-covered queue
+/// can still be permanently unclaimable because no poller runs the right build
+/// or advertises the right labels -- which this endpoint must report as a
+/// stall, not as healthy progress.
+///
+/// Every dimension is checked against the **same** worker, exactly as the
+/// stranded-work sampler does (`worker.rs`): a task needing both a build and a
+/// label is not covered by two workers that each satisfy only one of them.
+///
+/// Unparseable `required_capabilities` fall back to the other dimensions rather
+/// than reporting a stall, so a value this endpoint cannot read can never
+/// fabricate a false `no_worker` verdict.
+///
+/// Queue coverage itself still goes through the canonical
+/// [`crate::queue_coverage::worker_covers_queue`] predicate (issue #774) so
+/// this surface and `GET /admin/queue-coverage` can never disagree.
+fn task_has_eligible_worker(
+    workers: &[WorkerRow],
+    shard_id: i32,
+    queue_name: &str,
+    required_build_id: Option<&str>,
+    required_capabilities: Option<&serde_json::Value>,
+    compat_set: &autumn_harvest::build_routing::BuildCompatibilitySet,
+) -> bool {
+    let requirements = required_capabilities.and_then(|caps| {
+        serde_json::from_value::<Vec<autumn_harvest::eligibility::Requirement>>(caps.clone()).ok()
+    });
+
+    workers.iter().any(|w| {
+        if !crate::queue_coverage::worker_covers_queue(w, queue_name, shard_id) {
+            return false;
+        }
+        if !compat_set.is_eligible(&w.worker.build_id, required_build_id) {
+            return false;
+        }
+        requirements.as_ref().is_none_or(|reqs| {
+            let labels: std::collections::HashMap<String, String> =
+                serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+            autumn_harvest::eligibility::matches_requirements(reqs, &labels)
+        })
+    })
 }
 
 /// Decode the one activity error this response actually surfaces (issue #608).
@@ -12668,6 +12734,8 @@ pub(crate) async fn build_diagnosis_report(
             harvest_task_queue::concurrency_key,
             harvest_task_queue::concurrency_cap,
             harvest_task_queue::task_type,
+            harvest_task_queue::required_build_id,
+            harvest_task_queue::required_capabilities,
         ))
         .load::<DiagnoseTaskRow>(&mut conn)
         .await
@@ -12686,6 +12754,8 @@ pub(crate) async fn build_diagnosis_report(
                 concurrency_key,
                 concurrency_cap,
                 task_type,
+                required_build_id,
+                required_capabilities,
             )| DiagnoseTask {
                 state,
                 activity_name,
@@ -12697,6 +12767,8 @@ pub(crate) async fn build_diagnosis_report(
                 concurrency_key,
                 concurrency_cap,
                 task_type,
+                required_build_id,
+                required_capabilities,
             },
         )
         .collect();
@@ -12714,12 +12786,7 @@ pub(crate) async fn build_diagnosis_report(
     // that query's projection, ordering, and PENDING/`queues_in_play`
     // partitioning are all activity-shaped, and one more cheap round trip is far
     // safer than threading a second task type through all of it.
-    let workflow_task_row: Option<(
-        String,
-        Option<String>,
-        String,
-        chrono::DateTime<chrono::Utc>,
-    )> = harvest_task_queue::table
+    let workflow_task_row: Option<WorkflowTaskRow> = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
         .filter(harvest_task_queue::task_type.eq("workflow"))
         .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
@@ -12729,13 +12796,14 @@ pub(crate) async fn build_diagnosis_report(
             harvest_task_queue::worker_id,
             harvest_task_queue::queue_name,
             harvest_task_queue::scheduled_at,
+            // Build routing applies to workflow tasks too (the claim
+            // predicate's `required_build_id` clause has no task-type guard),
+            // so its liveness answer needs the same eligibility check an
+            // activity row gets.
+            harvest_task_queue::required_build_id,
+            harvest_task_queue::required_capabilities,
         ))
-        .first::<(
-            String,
-            Option<String>,
-            String,
-            chrono::DateTime<chrono::Utc>,
-        )>(&mut conn)
+        .first::<WorkflowTaskRow>(&mut conn)
         .await
         .optional()
         .map_err(database_error)?;
@@ -12805,51 +12873,51 @@ pub(crate) async fn build_diagnosis_report(
             .into_iter()
             .collect();
 
-    // Per-queue worker liveness, via the SAME predicate `GET /admin/queue-coverage`
-    // uses (issue #774) so the two surfaces can never disagree about whether a
-    // queue has a live poller — the exact drift that bit `shard_health` in #1150.
-    // Built from EVERY loaded row, not just the PENDING ones: a claimed
+    // Worker eligibility inputs. Queue coverage goes through the SAME predicate
+    // `GET /admin/queue-coverage` uses (issue #774) so the two surfaces can
+    // never disagree about whether a queue has a live poller — the exact drift
+    // that bit `shard_health` in #1150 — but coverage alone is NOT the claim
+    // predicate: `task_has_eligible_worker` also applies each row's own
+    // `required_build_id` and `required_capabilities` against the SAME worker,
+    // so a task no live poller can actually claim is reported as a stall rather
+    // than as healthy progress.
+    //
+    // Evaluated for EVERY loaded row, not just the PENDING ones: a claimed
     // (`RUNNING`) row also needs a truthful liveness answer, because a claimed
-    // row whose fleet is gone is an orphan rather than healthy work. Deriving
-    // it from PENDING rows alone would leave `has_live_worker: false` on a
-    // claimed row merely because coverage was never CHECKED for its queue.
-    // Includes the workflow task's OWN queue: its liveness answer is what
-    // separates "about to be claimed" from the workflow-task analogue of AC3's
-    // flagship no-live-worker stall.
-    let queues_in_play: std::collections::BTreeSet<String> = tasks
-        .iter()
-        .map(|t| t.queue_name.clone())
-        .chain(
-            workflow_task_row
-                .iter()
-                .map(|(_, _, queue, _)| queue.clone()),
+    // row whose fleet is gone is an orphan rather than healthy work. Includes
+    // the workflow task's OWN row: its liveness answer is what separates "about
+    // to be claimed" from the workflow-task analogue of AC3's flagship
+    // no-live-worker stall.
+    let (live_workers, compat_set) = if tasks.is_empty() && workflow_task_row.is_none() {
+        (
+            Vec::new(),
+            autumn_harvest::build_routing::BuildCompatibilitySet::new(),
         )
-        .collect();
-    let mut covered_queues: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if !queues_in_play.is_empty() {
+    } else {
         let stale_threshold = api_state.worker_stale_threshold();
         let workers =
             crate::queue_coverage::fetch_potentially_live_workers(&mut conn, stale_threshold)
                 .await
                 .map_err(map_error)?;
-        // The row's OWN recorded shard, not `exec_id.shard()`. A pre-sharding
-        // (or `ExecutionId::new()`) id carries the `ShardId::UNENCODED`
-        // sentinel (0xFFFF), which the router resolves to the default shard —
-        // but a worker registers `shard_assignments` with its real shard
-        // number, so comparing against the raw sentinel would match no worker
-        // and report a false `activity_no_worker` for a perfectly covered
-        // queue. `harvest_workflow_executions.shard_id` is the same value the
-        // worker itself is registered against, so the two always agree.
-        let shard_id = execution.shard_id;
-        for queue in &queues_in_play {
-            if workers
-                .iter()
-                .any(|w| crate::queue_coverage::worker_covers_queue(w, queue, shard_id))
-            {
-                covered_queues.insert(queue.clone());
-            }
-        }
-    }
+        // Cross-build declarations, so a worker running a NEWER build that has
+        // declared itself compatible still counts as coverage for a task
+        // assigned an older build (issue #171). On load failure fall back to an
+        // empty set: exact-match and legacy-worker rules still apply, exactly
+        // as the stranded-work sampler degrades.
+        let compat = autumn_harvest::build_routing::load_compat_set(&mut conn)
+            .await
+            .unwrap_or_default();
+        (workers, compat)
+    };
+    // The row's OWN recorded shard, not `exec_id.shard()`. A pre-sharding (or
+    // `ExecutionId::new()`) id carries the `ShardId::UNENCODED` sentinel
+    // (0xFFFF), which the router resolves to the default shard — but a worker
+    // registers `shard_assignments` with its real shard number, so comparing
+    // against the raw sentinel would match no worker and report a false
+    // `activity_no_worker` for a perfectly covered queue.
+    // `harvest_workflow_executions.shard_id` is the same value the worker
+    // itself is registered against, so the two always agree.
+    let shard_id = execution.shard_id;
 
     let activities: Vec<PendingActivityFacts> = tasks
         .iter()
@@ -12899,7 +12967,14 @@ pub(crate) async fn build_diagnosis_report(
                 rate_limit_key: t.rate_limit_key.clone(),
                 concurrency_key: t.concurrency_key.clone(),
                 queue_paused,
-                has_live_worker: covered_queues.contains(&t.queue_name),
+                has_live_worker: task_has_eligible_worker(
+                    &live_workers,
+                    shard_id,
+                    &t.queue_name,
+                    t.required_build_id.as_deref(),
+                    t.required_capabilities.as_ref(),
+                    &compat_set,
+                ),
                 circuit_phase,
                 circuit_cooldown_until,
                 rate_limit_saturated: !has_cb
@@ -12929,8 +13004,18 @@ pub(crate) async fn build_diagnosis_report(
             })
             .collect();
 
+    // AWAITED children only. A DETACHED child (issue #347) keeps `parent_id`
+    // but carries a non-null `parent_close_policy`, and the engine uses exactly
+    // that discriminator (`worker.rs`'s `is_detached_child`) to decide a child
+    // does NOT wake its parent on completion or failure. A fire-and-forget child
+    // is therefore never something the parent is waiting on, so counting it
+    // would report a healthy `pending_child` for a parent that is genuinely
+    // parked elsewhere -- masking an awaited signal or condition (which only the
+    // replay drive, ranked BELOW children, can see) and even masking a lost
+    // workflow task as healthy for as long as the detached child runs.
     let children: Vec<PendingChildFacts> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::parent_id.eq(Some(exec_uuid)))
+        .filter(harvest_workflow_executions::parent_close_policy.is_null())
         .filter(harvest_workflow_executions::state.ne_all([
             "COMPLETED",
             "FAILED",
@@ -12965,17 +13050,25 @@ pub(crate) async fn build_diagnosis_report(
         .map(|fires_at| PendingTimerFacts { fires_at })
         .collect();
 
-    let workflow_task =
-        workflow_task_row.map(
-            |(state, worker_id, queue_name, scheduled_at)| WorkflowTaskFacts {
+    let workflow_task = workflow_task_row.map(
+        |(state, worker_id, queue_name, scheduled_at, required_build_id, required_capabilities)| {
+            WorkflowTaskFacts {
                 has_worker: worker_id.is_some(),
                 queue_paused: paused_queues.contains(&queue_name),
-                has_live_worker: covered_queues.contains(&queue_name),
+                has_live_worker: task_has_eligible_worker(
+                    &live_workers,
+                    shard_id,
+                    &queue_name,
+                    required_build_id.as_deref(),
+                    required_capabilities.as_ref(),
+                    &compat_set,
+                ),
                 state,
                 queue_name,
                 scheduled_at,
-            },
-        );
+            }
+        },
+    );
 
     // The connection is released before any replay drive: user workflow code is
     // never driven while a pool slot is held (the #612 discipline).
@@ -47035,6 +47128,231 @@ mod tests {
             "fixture sanity: the encoded field must carry a codec envelope"
         );
         serde_json::to_string(envelope).expect("serialize envelope")
+    }
+
+    /// Build a live `WorkerRow` for the eligibility tests below.
+    fn eligibility_worker(
+        worker_id: &str,
+        queues: &[&str],
+        build_id: &str,
+        labels: serde_json::Value,
+    ) -> WorkerRow {
+        use autumn_harvest::models::HarvestWorker;
+        use autumn_harvest::workers::WorkerHealth;
+
+        let now = chrono::Utc::now();
+        WorkerRow {
+            worker: HarvestWorker {
+                worker_id: worker_id.to_string(),
+                started_at: now,
+                last_heartbeat_at: now,
+                queues: serde_json::json!(queues),
+                shard_assignments: serde_json::json!([0]),
+                max_concurrency: 10,
+                in_flight_count: 0,
+                host: "localhost".to_string(),
+                version: None,
+                status: "Active".to_string(),
+                drain_deadline_at: None,
+                build_id: build_id.to_string(),
+                deployment_name: None,
+                labels,
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
+            },
+            health: WorkerHealth::Healthy,
+            active_task_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn eligibility_requires_the_task_build_not_just_the_queue() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let workers = vec![eligibility_worker(
+            "w-old",
+            &["default"],
+            "build-1",
+            serde_json::json!({}),
+        )];
+
+        // No build requirement -> the queue poller is enough.
+        assert!(task_has_eligible_worker(
+            &workers, 0, "default", None, None, &compat
+        ));
+        // Same build -> eligible.
+        assert!(task_has_eligible_worker(
+            &workers,
+            0,
+            "default",
+            Some("build-1"),
+            None,
+            &compat
+        ));
+        // A build the only queue poller does NOT run and is not declared
+        // compatible with: the task is unclaimable even though the queue is
+        // covered.
+        assert!(!task_has_eligible_worker(
+            &workers,
+            0,
+            "default",
+            Some("build-2"),
+            None,
+            &compat
+        ));
+    }
+
+    #[test]
+    fn eligibility_honours_declared_build_compatibility() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        // `build-2` is declared able to process work assigned `build-1`.
+        let mut compat = BuildCompatibilitySet::new();
+        compat.add_declaration("build-2", "build-1");
+        let workers = vec![eligibility_worker(
+            "w-new",
+            &["default"],
+            "build-2",
+            serde_json::json!({}),
+        )];
+
+        assert!(task_has_eligible_worker(
+            &workers,
+            0,
+            "default",
+            Some("build-1"),
+            None,
+            &compat
+        ));
+        // A legacy worker (empty build_id) may claim anything.
+        let legacy = vec![eligibility_worker(
+            "w-legacy",
+            &["default"],
+            "",
+            serde_json::json!({}),
+        )];
+        assert!(task_has_eligible_worker(
+            &legacy,
+            0,
+            "default",
+            Some("build-9"),
+            None,
+            &compat
+        ));
+    }
+
+    #[test]
+    fn eligibility_requires_the_task_capabilities() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let gpu_req = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+        let cpu_only = vec![eligibility_worker(
+            "w-cpu",
+            &["default"],
+            "",
+            serde_json::json!({"gpu": "false"}),
+        )];
+        let gpu = vec![eligibility_worker(
+            "w-gpu",
+            &["default"],
+            "",
+            serde_json::json!({"gpu": "true"}),
+        )];
+
+        assert!(!task_has_eligible_worker(
+            &cpu_only,
+            0,
+            "default",
+            None,
+            Some(&gpu_req),
+            &compat
+        ));
+        assert!(task_has_eligible_worker(
+            &gpu,
+            0,
+            "default",
+            None,
+            Some(&gpu_req),
+            &compat
+        ));
+    }
+
+    #[test]
+    fn eligibility_checks_every_dimension_against_the_same_worker() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let gpu_req = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+        // One worker satisfies the build, a DIFFERENT one satisfies the label.
+        // Neither can claim the task, so the split fleet is not coverage.
+        let split = vec![
+            eligibility_worker("w-build", &["default"], "build-2", serde_json::json!({})),
+            eligibility_worker(
+                "w-gpu",
+                &["default"],
+                "build-1",
+                serde_json::json!({"gpu": "true"}),
+            ),
+        ];
+        assert!(!task_has_eligible_worker(
+            &split,
+            0,
+            "default",
+            Some("build-2"),
+            Some(&gpu_req),
+            &compat
+        ));
+
+        // The same worker satisfying both IS coverage.
+        let both = vec![eligibility_worker(
+            "w-both",
+            &["default"],
+            "build-2",
+            serde_json::json!({"gpu": "true"}),
+        )];
+        assert!(task_has_eligible_worker(
+            &both,
+            0,
+            "default",
+            Some("build-2"),
+            Some(&gpu_req),
+            &compat
+        ));
+    }
+
+    #[test]
+    fn eligibility_falls_back_to_other_dimensions_on_unparseable_capabilities() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let garbage = serde_json::json!({"not": "a requirement list"});
+        let workers = vec![eligibility_worker(
+            "w",
+            &["default"],
+            "",
+            serde_json::json!({}),
+        )];
+
+        // Never fabricate a stall from a value this endpoint cannot read: the
+        // capability dimension is skipped, the others still apply.
+        assert!(task_has_eligible_worker(
+            &workers,
+            0,
+            "default",
+            None,
+            Some(&garbage),
+            &compat
+        ));
+        assert!(!task_has_eligible_worker(
+            &workers,
+            0,
+            "other-queue",
+            None,
+            Some(&garbage),
+            &compat
+        ));
     }
 
     #[test]
