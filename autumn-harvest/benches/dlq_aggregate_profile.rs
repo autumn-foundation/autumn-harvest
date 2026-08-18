@@ -57,11 +57,25 @@ use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use uuid::Uuid;
 
+/// Reads `key` as a `usize`, using `default` only when the variable is
+/// genuinely *absent*. A *present but malformed* value (a typo, e.g.
+/// `DLQ_PROFILE_N=2000O`, or non-Unicode content) is a configuration error,
+/// not silently substituted for the default -- a harness whose whole point
+/// is producing a specific, documented, reproducible number must not
+/// silently profile a *different* configuration than the one actually
+/// requested and report success as if nothing were wrong (its own
+/// cardinality self-check would still pass, since it's computed from the
+/// same substituted value).
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Ok(raw) => raw
+            .parse()
+            .unwrap_or_else(|e| panic!("{key}={raw:?} is not a valid usize: {e}")),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            panic!("{key}={} is not valid Unicode", raw.to_string_lossy())
+        }
+    }
 }
 
 /// Number of distinct error *shapes* [`error_text_for_group`] cycles through.
@@ -168,6 +182,15 @@ fn main() {
     let n = env_usize("DLQ_PROFILE_N", 20_000);
     let group_count = env_usize("DLQ_PROFILE_GROUPS", 25);
     let reps = env_usize("DLQ_PROFILE_REPS", 1);
+
+    // `build_rows` takes `i % group_count` on every row; a zero group count
+    // would panic on the very first row (or worse, only when n > 0) with an
+    // opaque "divisor of zero" message instead of a clear configuration
+    // error naming the offending knob.
+    assert!(
+        group_count > 0,
+        "DLQ_PROFILE_GROUPS must be at least 1 (0 groups cannot host any rows), got 0"
+    );
 
     let params = DlqAggregateParams {
         group_by: vec![

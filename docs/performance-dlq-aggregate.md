@@ -254,7 +254,40 @@ neither touches `dlq.rs`, which was already back to its untouched, original
    with `i64::try_from(i).unwrap_or(i64::MAX)` while in the area, since it
    cost one line and touches no measured logic.
 
-None of the three changes touch `dlq.rs` or the grouping algorithm being
+A **third** review pass found two more configuration-validation gaps — again
+in the harness only, not `dlq.rs`:
+
+4. **A malformed env value silently ran the default workload instead of
+   erroring.** `env_usize` converted *any* parse failure — a typo such as
+   `DLQ_PROFILE_N=2000O` — into `None` via `.ok()` and fell back to
+   `default`; the harness's own cardinality self-check is computed from
+   that same substituted default, so the run "succeeded" with a plausible
+   number while silently profiling a *different* configuration than the
+   one actually requested — exactly the kind of quiet substitution that
+   would make a `Reproduce` command misleading without anyone noticing.
+   Fixed by distinguishing "variable absent" (use `default`, unchanged)
+   from "variable present but malformed or non-Unicode" (panic naming the
+   key, the value, and why it was rejected). Verified: `DLQ_PROFILE_N=2000O`
+   now panics with `DLQ_PROFILE_N="2000O" is not a valid usize: invalid
+   digit found in string`; a genuinely non-Unicode value panics naming the
+   key and a lossy rendering of the bytes; the unset default case and
+   `DLQ_PROFILE_GROUPS=100` (point 1's fix) are both unaffected.
+5. **`DLQ_PROFILE_GROUPS=0` panicked with an opaque division-by-zero
+   message.** `build_rows` computes `i % group_count` on every row with no
+   upfront validation, so a zero group count crashed on the very first row
+   with Rust's generic "attempt to calculate the remainder with a divisor
+   of zero" instead of a message naming the actual misconfigured knob.
+   Fixed with `assert!(group_count > 0, ...)` in `main()`, before any row
+   is built. Verified: `DLQ_PROFILE_GROUPS=0` now panics with `DLQ_PROFILE_GROUPS
+   must be at least 1 (0 groups cannot host any rows), got 0`.
+
+Both of these are pure guardrails on invalid configurations — for every
+valid configuration exercised in this document (the default, and the
+`ActivityName`/high-cardinality variants), they change nothing: they only
+ever panic *before* or *instead of* running the profiled workload, never
+*during* one, so neither affects any Ir/dhat number above or below.
+
+None of the five changes touch `dlq.rs` or the grouping algorithm being
 profiled — they only affect how the harness constructs its synthetic rows.
 Re-running the **default** (hit-heavy) workload against the hardened
 harness, with `dlq.rs` still in its current, unchanged `entry()` form:
@@ -289,8 +322,11 @@ hardened-harness number for the default config.
 - `benches/dlq_aggregate_profile.rs`, a deterministic profiling harness for
   the extracted function, hardened per "Post-revert harness hardening"
   above (guaranteed `DLQ_PROFILE_GROUPS` cardinality for any group count; a
-  real typed-failure envelope for the `CircuitOpen` row; both self-checked
-  inside `main()` on every run).
+  real typed-failure envelope for the `CircuitOpen` row; a malformed or
+  non-Unicode env value rejected as a configuration error instead of
+  silently substituting the default; `DLQ_PROFILE_GROUPS=0` rejected with
+  a clear message instead of an opaque division-by-zero panic; the first
+  two self-checked inside `main()` on every run).
 - This documented negative result, so the `get_mut`-first idea (and its
   adversarial-workload cost) is not silently re-attempted later.
 - **No algorithmic change to `group_dead_letter_rows`'s grouping loop** —
