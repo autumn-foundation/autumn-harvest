@@ -1,0 +1,39 @@
+Timing is off.
+TRUNCATE TABLE
+INSERT 0 10000
+VACUUM
+        label         | heap_pages
+----------------------+------------
+ no-caps-before-claim |        213
+(1 row)
+
+UPDATE 10000
+        label        | heap_pages
+---------------------+------------
+ no-caps-after-claim |        463
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 10000
+VACUUM
+       label       | heap_pages
+-------------------+------------
+ caps-before-claim |        304
+(1 row)
+
+UPDATE 10000
+      label       | heap_pages
+------------------+------------
+ caps-after-claim |        648
+(1 row)
+
+TRUNCATE TABLE
+
+-- Derived (not printed by the script -- computed here for the doc):
+--   no-caps claim UPDATE delta:  463 - 213 = 250 heap pages
+--   caps claim UPDATE delta:     648 - 304 = 344 heap pages
+--   extra growth attributable to carrying required_capabilities forward
+--   on a claim UPDATE that never touches that column:
+--     344 - 250 = 94 pages, i.e. (344-250)/250 = +37.6% more heap growth
+--     from the identical claim-shaped UPDATE, purely because the rows are
+--     wider.
