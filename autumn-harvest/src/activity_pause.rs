@@ -723,14 +723,43 @@ struct UpsertedPauseRow {
 /// values, so an idempotent re-pause preserves the original reason, operator and
 /// instant while still returning the row (AC1: "pausing an already-paused type
 /// returns success, not an error"). `xmax = 0` distinguishes the insert from the
-/// no-op update.
+/// no-op update. The `clock_timestamp()` in `VALUES` is evaluated on a re-pause
+/// too, and discarded — only a fresh insert stamps it.
+///
+/// # Why `clock_timestamp()` and not `NOW()` (issue #807 review, Codex P2)
+///
+/// `NOW()` is `transaction_timestamp()`: fixed the moment the transaction
+/// **starts**, no matter which statement reads it. But a pause only takes effect
+/// for every other session when this transaction **commits**, so anything the
+/// transaction does after the upsert widens the gap between the recorded
+/// `paused_at` and the instant the hold actually began.
+///
+/// That gap is not cosmetic. `paused_at` is the `$2` the resume credit passes
+/// subtract from, so a `paused_at` earlier than the true hold start credits back
+/// wait the task spent **claimable and unheld** — laundering a
+/// `schedule_to_start` budget the task had already burned, which is precisely
+/// what the pause is not allowed to do. The statement most able to widen it is
+/// [`held_task_count_query`], whose cost scales with the backlog: largest during
+/// exactly the incident an operator is pausing for.
+///
+/// Two halves fix it: this volatile clock, read when the upsert actually
+/// executes, and running the count **before** the upsert (see
+/// [`pause_activity`]) so nothing slow sits between the stamp and the commit.
+///
+/// The residual is the mirror image of the resume side's, and is documented the
+/// same way: the true freeze instant is commit time, which no in-statement
+/// expression can know, so `paused_at` still precedes it by the upsert's own
+/// execution plus the commit. It therefore still errs toward over-crediting, but
+/// bounded by microseconds rather than by an unbounded backlog scan — and never
+/// the other way, since a stamp *later* than the effective hold would
+/// under-credit and could time out a task that was genuinely held.
 ///
 /// Binds: `$1` name, `$2` reason, `$3` operator, `$4` scope shard id.
 #[must_use]
 pub const fn pause_activity_upsert_query() -> &'static str {
     "INSERT INTO harvest_activity_pauses \
          (activity_name, reason, paused_by, paused_at, scope_shard_id) \
-     VALUES ($1, $2, $3, NOW(), $4) \
+     VALUES ($1, $2, $3, clock_timestamp(), $4) \
      ON CONFLICT (activity_name) DO UPDATE \
          SET reason = harvest_activity_pauses.reason, \
              paused_by = harvest_activity_pauses.paused_by, \
@@ -773,8 +802,8 @@ pub async fn pause_activity(
     let paused_by = paused_by.to_string();
 
     // ONE transaction, matching `resume_activity`. The upsert and the held count
-    // must commit or roll back together, or a failure of the *count* — a
-    // best-effort observability read — inverts the reported outcome of a live
+    // must commit or roll back together, or a failure of the *count* -- a
+    // best-effort observability read -- inverts the reported outcome of a live
     // mutation: the pause row commits, the claim gate starts holding tasks
     // fleet-wide, and the operator sees a 500 and concludes the hold did not
     // take. That is the worst possible failure mode for an incident brake, and
@@ -782,17 +811,39 @@ pub async fn pause_activity(
     Box::pin(
         conn.transaction::<ActivityPauseOutcome, HarvestError, _>(async |conn| {
             let (name, reason, paused_by) = (name, reason, paused_by);
+
+            // The count runs FIRST, before the row that records the hold (issue
+            // #807 review, Codex P2). It reads only `harvest_task_queue` and
+            // never the pause row, so its answer does not depend on the upsert
+            // having run -- and the hold is invisible to every other session
+            // until this transaction commits either way, so the number it
+            // reports is the same approximation in both orders.
+            //
+            // What the order buys is the accuracy of `paused_at`. The upsert
+            // stamps `clock_timestamp()` (see `pause_activity_upsert_query` for
+            // why not `NOW()`), so the recorded instant is only as close to the
+            // true hold start -- commit -- as the work that follows it is short.
+            // The count is the one statement here whose cost scales with the
+            // backlog, i.e. is largest during exactly the incident being paused
+            // for. Putting it ahead of the stamp keeps a slow count from
+            // back-dating the hold and letting the resume credit back wait the
+            // tasks spent claimable and unheld.
+            //
+            // It also shortens how long the pause row's lock is held: the upsert
+            // now locks it only across its own execution and the commit, instead
+            // of across an unbounded scan, so a concurrent pause or resume of
+            // the same activity queues behind it for less time.
+            let held: CountRow = diesel::sql_query(held_task_count_query())
+                .bind::<diesel::sql_types::Text, _>(&name)
+                .get_result(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+
             let row: UpsertedPauseRow = diesel::sql_query(pause_activity_upsert_query())
                 .bind::<diesel::sql_types::Text, _>(&name)
                 .bind::<diesel::sql_types::Text, _>(&reason)
                 .bind::<diesel::sql_types::Text, _>(&paused_by)
                 .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(scope_shard_id)
-                .get_result(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-
-            let held: CountRow = diesel::sql_query(held_task_count_query())
-                .bind::<diesel::sql_types::Text, _>(&name)
                 .get_result(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -907,28 +958,31 @@ pub async fn resume_activity(
             let released = shifted.len();
             let shifted_ids: Vec<uuid::Uuid> = shifted.into_iter().map(|r| r.id).collect();
 
-            // Second pass, before the doorbell so it sees the freshest snapshot:
-            // a task still held (our DELETE has not committed, so every other
-            // session still sees the pause row) may be invisible to the primary
-            // shift above -- whether it was created during the hold, or created
-            // before it by an enqueue that only committed just now. This pass
-            // covers every due row the primary pass did not report shifting, so
-            // the two are disjoint by construction and no row is credited twice.
-            // See `resume_shift_late_arrivals_query` for the irreducible
-            // residual this narrows but cannot close.
-            let late: usize = diesel::sql_query(resume_shift_late_arrivals_query())
-                .bind::<diesel::sql_types::Text, _>(&name)
-                .bind::<diesel::sql_types::Timestamptz, _>(pause.paused_at)
-                .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-
             // Ring the doorbell INSIDE the transaction: Postgres queues NOTIFY
             // and delivers it at COMMIT, so listeners wake exactly when the
-            // hold lifts — never earlier (an early wake would still see the
+            // hold lifts -- never earlier (an early wake would still see the
             // uncommitted pause row and skip the task) and never at all if this
             // rolls back.
+            //
+            // Ordered BEFORE the late-arrivals credit pass so that pass is the
+            // last statement this transaction runs (issue #807 review, Codex
+            // P1). The uncredited residual is bounded by whatever still runs
+            // after the final credit, and this notification pass is the
+            // expensive tail: one round-trip per queue holding backlog. Ringing
+            // first shrinks that residual from "the whole notification pass" to
+            // "one small UPDATE" -- which is what
+            // `resume_shift_late_arrivals_query` already documents, and did not
+            // hold with the reverse order.
+            //
+            // The trade is asymmetric, which is what settles the order. A row
+            // committing after this SELECT gets no doorbell of its own and waits
+            // one poll tick -- workers still poll, so that is a latency cost.
+            // The same row missing its *credit* keeps its whole held wait, and
+            // the `schedule_to_start` scanner can terminally fail it the instant
+            // the hold lifts. Latency is recoverable; a terminal failure is not.
+            // The doorbell also rarely misses anything: it is per-queue, so a
+            // late arrival is silent only when it is the sole due row on its
+            // queue.
             let notify: Vec<NotifyTaskRow> =
                 diesel::sql_query(resumed_activity_notify_task_query())
                     .bind::<diesel::sql_types::Text, _>(&name)
@@ -938,6 +992,23 @@ pub async fn resume_activity(
             for row in notify {
                 crate::notify::notify_task_enqueued(conn, &row.queue_name, row.id).await?;
             }
+
+            // Final statement of the transaction: a task still held (our DELETE
+            // has not committed, so every other session still sees the pause
+            // row) may be invisible to the primary shift above -- whether it was
+            // created during the hold, or created before it by an enqueue that
+            // only committed just now. This pass covers every due row the
+            // primary pass did not report shifting, so the two are disjoint by
+            // construction and no row is credited twice. See
+            // `resume_shift_late_arrivals_query` for the irreducible residual
+            // this narrows but cannot close.
+            let late: usize = diesel::sql_query(resume_shift_late_arrivals_query())
+                .bind::<diesel::sql_types::Text, _>(&name)
+                .bind::<diesel::sql_types::Timestamptz, _>(pause.paused_at)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
 
             let paused_duration_secs = (Utc::now() - pause.paused_at).num_seconds().max(0);
             Ok(ActivityResumeOutcome {
@@ -1225,6 +1296,21 @@ mod tests {
         assert!(sql.contains("paused_by = harvest_activity_pauses.paused_by"));
         assert!(sql.contains("paused_at = harvest_activity_pauses.paused_at"));
         assert!(sql.contains("(xmax = 0) AS newly_paused"));
+    }
+
+    /// `NOW()` is `transaction_timestamp()`, frozen at transaction start, so it
+    /// records a hold that began before the transaction did any of its work --
+    /// and the resume subtracts `paused_at`, so that gap is credited back as if
+    /// it were held time. See the query's own docs for the full argument.
+    #[test]
+    fn pause_upsert_stamps_the_volatile_clock_not_the_frozen_transaction_clock() {
+        let sql = pause_activity_upsert_query();
+        assert!(sql.contains("clock_timestamp()"));
+        assert!(
+            !sql.contains("NOW()"),
+            "a frozen NOW() back-dates the hold to transaction start, letting \
+             the resume credit back wait the tasks spent unheld; got:\n{sql}"
+        );
     }
 
     /// The read must not disappear a paused activity that happens to be holding

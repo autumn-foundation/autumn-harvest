@@ -953,3 +953,267 @@ async fn scheduled_at_of(conn: &mut AsyncPgConnection, id: Uuid) -> chrono::Date
             .expect("read scheduled_at");
     rows[0].scheduled_at
 }
+
+/// The credit pass must be the **last** statement of the resume transaction, so
+/// a task that commits while the doorbell is being rung is still credited.
+///
+/// Issue #807 review, Codex P1. The resume originally ran
+/// `primary shift -> late-arrivals credit -> notify SELECT -> one pg_notify per
+/// queue -> COMMIT`, which left the uncredited window bounded by the *whole
+/// notification pass* — one round-trip per queue holding backlog, i.e. widest
+/// during exactly the incident being resumed — rather than by the single small
+/// `UPDATE` that `resume_shift_late_arrivals_query` documents. A row landing in
+/// that window keeps its entire held wait, and the `schedule_to_start` scanner
+/// can terminally fail it the instant the hold lifts.
+///
+/// Hand-drives the statements on an explicit transaction (the idiom
+/// `resume_credits_a_task_that_arrives_between_the_two_passes` establishes) so
+/// the window is opened deterministically rather than raced: here it is opened
+/// *after* the doorbell and *before* the credit, which is the arrangement the
+/// fix produces. The pre-window assertion proves the row is genuinely
+/// uncredited at that point, so the post-commit assertion cannot pass vacuously.
+///
+/// Scope, stated plainly: because the statements are hand-driven, this pins the
+/// **ordering contract** — that a row arriving after the doorbell is still the
+/// credit pass's to claim — rather than `resume_activity`'s own wiring. The
+/// wiring is a three-statement arrangement verified by reading, exactly as the
+/// arrangement it replaces was. A test that falsified the wiring would have to
+/// land a concurrent commit *inside* the notification pass, and that window is
+/// not blockable: `pg_notify` takes no lock, and the notify `SELECT` blocks only
+/// on `ACCESS EXCLUSIVE`, which the resume's own transaction already holds
+/// conflicting rights against. The available alternative — flooding inserts and
+/// hoping one lands in the window — is probabilistic in the *passing*
+/// direction, so it would be a flaky guard rather than a real one.
+#[tokio::test]
+async fn resume_credits_a_task_that_arrives_during_the_notification_pass() {
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    let mut resumer = connect(&url).await;
+
+    let q = unique("q_notifywin");
+    let activity = unique("act_notifywin");
+
+    let early = enqueue_activity(&mut conn, &q, &activity, None).await;
+    backdate_scheduled_at(&mut conn, early, 100).await;
+    assert!(pause(&mut conn, &activity).await);
+    backdate_paused_at(&mut conn, &activity, 100).await;
+
+    #[derive(diesel::QueryableByName)]
+    struct PausedAtRow {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        paused_at: chrono::DateTime<chrono::Utc>,
+    }
+    let paused_at = {
+        use diesel_async::RunQueryDsl;
+        let rows: Vec<PausedAtRow> = diesel::sql_query(
+            "SELECT paused_at FROM harvest_activity_pauses WHERE activity_name = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(&activity)
+        .load(&mut conn)
+        .await
+        .expect("read paused_at");
+        rows[0].paused_at
+    };
+
+    // Release the hold, uncommitted: every other session still sees the pause
+    // row, so anything enqueued from here is genuinely held and owed a credit.
+    resumer
+        .batch_execute(&format!(
+            "BEGIN; DELETE FROM harvest_activity_pauses WHERE activity_name = '{activity}'"
+        ))
+        .await
+        .expect("begin and release the hold");
+
+    #[derive(diesel::QueryableByName)]
+    struct ShiftedTaskIdRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+    let shifted_ids: Vec<Uuid> = {
+        use diesel_async::RunQueryDsl;
+        let rows: Vec<ShiftedTaskIdRow> =
+            diesel::sql_query(activity_pause::resume_shift_scheduled_at_query())
+                .bind::<diesel::sql_types::Text, _>(&activity)
+                .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+                .load(&mut resumer)
+                .await
+                .expect("primary shift");
+        rows.into_iter().map(|r| r.id).collect()
+    };
+    assert_eq!(shifted_ids.len(), 1, "the pre-existing backlog is pass 1's");
+
+    // The notification pass, in the position the fix gives it: after the
+    // primary shift, before the credit.
+    #[derive(diesel::QueryableByName)]
+    struct NotifyTaskRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        queue_name: String,
+    }
+    let doorbells: Vec<NotifyTaskRow> = {
+        use diesel_async::RunQueryDsl;
+        diesel::sql_query(activity_pause::resumed_activity_notify_task_query())
+            .bind::<diesel::sql_types::Text, _>(&activity)
+            .load(&mut resumer)
+            .await
+            .expect("notify lookup")
+    };
+    assert_eq!(
+        doorbells.len(),
+        1,
+        "one doorbell for the activity's one queue"
+    );
+    for row in doorbells {
+        autumn_harvest::notify::notify_task_enqueued(&mut resumer, &row.queue_name, row.id)
+            .await
+            .expect("ring the doorbell");
+    }
+
+    // ── THE WINDOW: inside the notification pass ────────────────────────────
+    let late = enqueue_activity(&mut conn, &q, &activity, None).await;
+    backdate_scheduled_at(&mut conn, late, 100).await;
+    assert_eq!(
+        claim_one(&mut conn, &q).await,
+        None,
+        "the hold is still in force: the resume's DELETE has not committed, so a \
+         task enqueued during the notification pass is genuinely held"
+    );
+    let before_credit = (chrono::Utc::now() - scheduled_at_of(&mut conn, late).await).num_seconds();
+    assert!(
+        (99..=101).contains(&before_credit),
+        "neither the primary shift nor the doorbell credits this row, so the \
+         post-commit assertion below is not vacuous; apparent wait \
+         {before_credit}s"
+    );
+
+    // The credit pass, last.
+    let late_shifted = {
+        use diesel_async::RunQueryDsl;
+        diesel::sql_query(activity_pause::resume_shift_late_arrivals_query())
+            .bind::<diesel::sql_types::Text, _>(&activity)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
+            .execute(&mut resumer)
+            .await
+            .expect("late-arrivals shift")
+    };
+    resumer
+        .batch_execute("COMMIT")
+        .await
+        .expect("commit resume");
+
+    assert_eq!(
+        late_shifted, 1,
+        "a task arriving during the notification pass is still the credit \
+         pass's row -- with the notification pass running last it would have \
+         been missed entirely"
+    );
+    let wait = (chrono::Utc::now() - scheduled_at_of(&mut conn, late).await).num_seconds();
+    assert!(
+        wait <= 2,
+        "the task that arrived during the notification pass must be credited, \
+         else schedule_to_start can fail it the instant the hold lifts; \
+         apparent wait {wait}s"
+    );
+    assert_eq!(
+        claim_all(&mut conn, &q).await.len(),
+        2,
+        "the whole backlog is claimable once the resume commits"
+    );
+}
+
+/// `paused_at` must be stamped **after** the backlog count, not at transaction
+/// start, or a slow count back-dates the hold and the resume credits back wait
+/// the tasks spent claimable and unheld.
+///
+/// Issue #807 review, Codex P2. `pause_activity` originally ran
+/// `upsert (paused_at = NOW()) -> held_task_count -> COMMIT`, and `NOW()` is
+/// `transaction_timestamp()` — frozen at transaction start. The hold only takes
+/// effect for other sessions at COMMIT, so the recorded `paused_at` preceded the
+/// effective hold by the entire count, whose cost scales with the backlog. The
+/// resume subtracts `paused_at`, so the gap is credited as if it were held time:
+/// a `schedule_to_start` budget the task had already burned gets laundered.
+///
+/// Deterministic rather than raced: an `ACCESS EXCLUSIVE` lock on
+/// `harvest_task_queue` held from a second session blocks the count for a known
+/// duration. With the fix (count first, `clock_timestamp()` in the upsert) the
+/// stamp lands after the lock releases; without it the stamp predates the whole
+/// block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pause_stamps_paused_at_after_the_backlog_count_not_at_transaction_start() {
+    /// How long the count is blocked. The assertion threshold is half this, so
+    /// the pre-fix behaviour (stamp before the block) and the post-fix one
+    /// (stamp after it) are separated by a 2x margin in both directions.
+    const BLOCK: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    let mut locker = connect(&url).await;
+
+    let q = unique("q_stamp");
+    let activity = unique("act_stamp");
+    // Backlog for the count to walk; its size is irrelevant, the lock is what
+    // makes the count slow.
+    let _ = enqueue_activity(&mut conn, &q, &activity, None).await;
+    let _ = enqueue_activity(&mut conn, &q, &activity, None).await;
+
+    locker
+        .batch_execute("BEGIN; LOCK TABLE harvest_task_queue IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("take the table lock");
+
+    let pause_url = url.clone();
+    let pause_activity_name = activity.clone();
+    let pausing = tokio::spawn(async move {
+        let mut pauser = connect(&pause_url).await;
+        activity_pause::pause_activity(
+            &mut pauser,
+            &pause_activity_name,
+            "downstream outage",
+            "oncall",
+            None,
+        )
+        .await
+        .expect("pause")
+    });
+
+    tokio::time::sleep(BLOCK).await;
+    locker.batch_execute("COMMIT").await.expect("release lock");
+    let outcome = pausing.await.expect("pause task joined");
+    assert!(outcome.newly_paused);
+    assert_eq!(
+        outcome.held_task_count, 2,
+        "the count still sees the backlog"
+    );
+
+    // Measured entirely database-side, so no app/DB clock skew enters the
+    // comparison.
+    #[derive(diesel::QueryableByName)]
+    struct AgeRow {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        secs: f64,
+    }
+    let age = {
+        use diesel_async::RunQueryDsl;
+        let rows: Vec<AgeRow> = diesel::sql_query(
+            "SELECT EXTRACT(EPOCH FROM (clock_timestamp() - paused_at))::float8 AS secs \
+             FROM harvest_activity_pauses WHERE activity_name = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(&activity)
+        .load(&mut conn)
+        .await
+        .expect("read paused_at age");
+        rows[0].secs
+    };
+
+    let threshold = BLOCK.as_secs_f64() / 2.0;
+    assert!(
+        age < threshold,
+        "paused_at must be stamped once the count has finished, not at \
+         transaction start: a back-dated hold lets the resume credit back wait \
+         the tasks spent claimable and unheld. blocked the count for {}s, but \
+         paused_at is already {age:.3}s old",
+        BLOCK.as_secs_f64()
+    );
+}
