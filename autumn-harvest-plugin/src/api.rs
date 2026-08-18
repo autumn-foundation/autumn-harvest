@@ -31731,10 +31731,7 @@ async fn list_paused_queues_handler(
     // `scope_shard_id = NULL` on the shards it reached and no row on the ones it
     // missed, so real coverage is derived from the EXPECTED shard set rather
     // than the stored intent (issue #619 review).
-    let pools = shard_fanout::pools_by_shard(&api_state);
-    let expected: Vec<i32> = shard_fanout::expected_shards(&api_state, &pools)
-        .into_iter()
-        .collect();
+    let expected = expected_shard_ids(&api_state);
 
     Ok(Json(serde_json::json!({
         "paused_queues": merge_paused_queue_rows(collected.rows, &expected),
@@ -32837,6 +32834,100 @@ fn registered_activity_catalog(
         .collect()
 }
 
+/// Write one activity entry's pause block: the paused arm and the not-paused
+/// arm write the **same key set**, so a consumer never has to branch on which
+/// arm produced the entry.
+fn insert_activity_pause_fields(
+    map: &mut serde_json::Map<String, Value>,
+    shard_rows: &[(i32, ::autumn_harvest::activity_pause::PausedActivity)],
+    expected_shards: &[i32],
+) {
+    let Some((_, earliest)) = shard_rows
+        .iter()
+        .min_by_key(|(shard_id, row)| (row.paused_at, *shard_id))
+    else {
+        map.insert("paused".to_string(), Value::Bool(false));
+        map.insert("effective_scope".to_string(), Value::Null);
+        map.insert("paused_at".to_string(), Value::Null);
+        map.insert("paused_reason".to_string(), Value::Null);
+        map.insert("paused_actor".to_string(), Value::Null);
+        map.insert("scope_shard_id".to_string(), Value::Null);
+        map.insert("held_task_count".to_string(), serde_json::json!(0));
+        map.insert("provenance_uniform".to_string(), Value::Bool(true));
+        map.insert("shards".to_string(), serde_json::json!([]));
+        return;
+    };
+
+    let uniform = shard_rows.iter().all(|(_, row)| {
+        row.reason == earliest.reason
+            && row.paused_by == earliest.paused_by
+            && row.scope_shard_id == earliest.scope_shard_id
+    });
+    let held_total: i64 = shard_rows.iter().map(|(_, row)| row.held_task_count).sum();
+
+    // Real coverage, not stored intent. REUSES the queue-pause classifier
+    // rather than restating the rule, so the two read models can never
+    // disagree about what "fleet-wide" means.
+    let holding: Vec<i32> = shard_rows.iter().map(|(shard_id, _)| *shard_id).collect();
+    let scopes: Vec<Option<i32>> = shard_rows
+        .iter()
+        .map(|(_, row)| row.scope_shard_id)
+        .collect();
+    let coverage =
+        ::autumn_harvest::queue_pause::classify_pause_coverage(&holding, &scopes, expected_shards);
+
+    map.insert("paused".to_string(), Value::Bool(true));
+    map.insert("effective_scope".to_string(), serde_json::json!(coverage));
+    map.insert(
+        "paused_at".to_string(),
+        serde_json::json!(earliest.paused_at),
+    );
+    map.insert(
+        "paused_reason".to_string(),
+        Value::String(earliest.reason.clone()),
+    );
+    map.insert(
+        "paused_actor".to_string(),
+        Value::String(earliest.paused_by.clone()),
+    );
+    map.insert(
+        "scope_shard_id".to_string(),
+        serde_json::json!(earliest.scope_shard_id),
+    );
+    map.insert("held_task_count".to_string(), serde_json::json!(held_total));
+    map.insert("provenance_uniform".to_string(), Value::Bool(uniform));
+    map.insert(
+        "shards".to_string(),
+        serde_json::json!(
+            shard_rows
+                .iter()
+                .map(|(shard_id, row)| serde_json::json!({
+                    "shard_id": shard_id,
+                    "reason": row.reason,
+                    "paused_by": row.paused_by,
+                    "paused_at": row.paused_at,
+                    "scope_shard_id": row.scope_shard_id,
+                    "held_task_count": row.held_task_count,
+                }))
+                .collect::<Vec<_>>()
+        ),
+    );
+}
+
+/// The shard set a hold is expected to span, as a sorted `Vec`.
+///
+/// One definition shared by the queue-pause (#619) and activity-pause (#807)
+/// read models: both derive real coverage from the shards the fleet is
+/// *supposed* to have, and computing that two ways is exactly how the two
+/// surfaces would come to disagree about whether the same partially-applied
+/// hold is fleet-wide.
+fn expected_shard_ids(api_state: &HarvestApiState) -> Vec<i32> {
+    let pools = shard_fanout::pools_by_shard(api_state);
+    shard_fanout::expected_shards(api_state, &pools)
+        .into_iter()
+        .collect()
+}
+
 /// Merge the registered activity catalogue with the cross-shard pause rows into
 /// one entry per activity type.
 ///
@@ -32858,9 +32949,22 @@ fn registered_activity_catalog(
 /// shard's own row, and `provenance_uniform` compares
 /// `(reason, paused_by, scope_shard_id)` — deliberately not `paused_at`, since
 /// each shard stamps its own `NOW()`.
+///
+/// `effective_scope` reports how much of the fleet the hold is **actually** in
+/// effect on, derived from `expected_shards` rather than from the stored
+/// `scope_shard_id` (issue #807 review). The distinction is load-bearing: a
+/// fleet-wide pause that only reached some shards returns 207 at mutation time,
+/// but the rows it *did* write are byte-identical to a complete hold
+/// (`scope_shard_id = NULL`) and the shards it missed hold no row at all — so a
+/// later read that reaches every shard has a `complete` status and rows that
+/// agree, and reading intent alone would present a clean fleet-wide hold while
+/// part of the fleet keeps dispatching the very activity the operator believes
+/// they stopped. An activity that is not held reports `null`: there is no hold,
+/// so there is no coverage, mirroring the other null provenance fields.
 fn merge_activity_catalog_rows(
     catalog: &std::collections::BTreeMap<String, ActivityCatalogEntry>,
     rows: Vec<(i32, ::autumn_harvest::activity_pause::PausedActivity)>,
+    expected_shards: &[i32],
 ) -> Vec<Value> {
     let mut paused_by_activity: std::collections::BTreeMap<
         String,
@@ -32900,61 +33004,7 @@ fn merge_activity_catalog_rows(
             let map = entry
                 .as_object_mut()
                 .expect("json! object literal is an object");
-            if let Some((_, earliest)) = shard_rows
-                .iter()
-                .min_by_key(|(shard_id, row)| (row.paused_at, *shard_id))
-            {
-                let uniform = shard_rows.iter().all(|(_, row)| {
-                    row.reason == earliest.reason
-                        && row.paused_by == earliest.paused_by
-                        && row.scope_shard_id == earliest.scope_shard_id
-                });
-                let held_total: i64 = shard_rows.iter().map(|(_, row)| row.held_task_count).sum();
-                map.insert("paused".to_string(), Value::Bool(true));
-                map.insert(
-                    "paused_at".to_string(),
-                    serde_json::json!(earliest.paused_at),
-                );
-                map.insert(
-                    "paused_reason".to_string(),
-                    Value::String(earliest.reason.clone()),
-                );
-                map.insert(
-                    "paused_actor".to_string(),
-                    Value::String(earliest.paused_by.clone()),
-                );
-                map.insert(
-                    "scope_shard_id".to_string(),
-                    serde_json::json!(earliest.scope_shard_id),
-                );
-                map.insert("held_task_count".to_string(), serde_json::json!(held_total));
-                map.insert("provenance_uniform".to_string(), Value::Bool(uniform));
-                map.insert(
-                    "shards".to_string(),
-                    serde_json::json!(
-                        shard_rows
-                            .iter()
-                            .map(|(shard_id, row)| serde_json::json!({
-                                "shard_id": shard_id,
-                                "reason": row.reason,
-                                "paused_by": row.paused_by,
-                                "paused_at": row.paused_at,
-                                "scope_shard_id": row.scope_shard_id,
-                                "held_task_count": row.held_task_count,
-                            }))
-                            .collect::<Vec<_>>()
-                    ),
-                );
-            } else {
-                map.insert("paused".to_string(), Value::Bool(false));
-                map.insert("paused_at".to_string(), Value::Null);
-                map.insert("paused_reason".to_string(), Value::Null);
-                map.insert("paused_actor".to_string(), Value::Null);
-                map.insert("scope_shard_id".to_string(), Value::Null);
-                map.insert("held_task_count".to_string(), serde_json::json!(0));
-                map.insert("provenance_uniform".to_string(), Value::Bool(true));
-                map.insert("shards".to_string(), serde_json::json!([]));
-            }
+            insert_activity_pause_fields(map, &shard_rows, expected_shards);
             entry
         })
         .collect()
@@ -32991,9 +33041,10 @@ async fn list_activities_handler(
     let runtime = api_state.runtime()?;
     let catalog = registered_activity_catalog(&runtime);
     let collected = observe_activity_pause_rows(&api_state).await?;
+    let expected = expected_shard_ids(&api_state);
 
     Ok(Json(serde_json::json!({
-        "activities": merge_activity_catalog_rows(&catalog, collected.rows),
+        "activities": merge_activity_catalog_rows(&catalog, collected.rows, &expected),
         "status": collected.status,
         "unavailable_shards": collected.unavailable_shards,
     })))
@@ -33036,7 +33087,8 @@ async fn get_activity_handler(
         .map(|found| (activity_name.clone(), *found))
         .into_iter()
         .collect();
-    let mut merged = merge_activity_catalog_rows(&narrowed_catalog, rows);
+    let expected = expected_shard_ids(&api_state);
+    let mut merged = merge_activity_catalog_rows(&narrowed_catalog, rows, &expected);
 
     // `merge_activity_catalog_rows` emits one entry per name in the union of
     // (catalogue, pause rows); both are already narrowed to this name, so an
@@ -42198,6 +42250,102 @@ mod tests {
             &[0, 1],
         );
         assert_eq!(scoped[0]["effective_scope"], "shard");
+    }
+
+    fn paused_activity_row(
+        activity: &str,
+        reason: &str,
+        actor: &str,
+        secs_ago: i64,
+        scope: Option<i32>,
+        held: i64,
+    ) -> ::autumn_harvest::activity_pause::PausedActivity {
+        ::autumn_harvest::activity_pause::PausedActivity {
+            activity_name: activity.to_string(),
+            reason: reason.to_string(),
+            paused_by: actor.to_string(),
+            paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            scope_shard_id: scope,
+            held_task_count: held,
+        }
+    }
+
+    /// Issue #807 review: the activity read model must report real coverage for
+    /// exactly the reason its queue-level sibling does.
+    ///
+    /// A fleet-wide activity pause that only reached some shards returns 207 at
+    /// mutation time, but the pause rows it *did* write are byte-identical to a
+    /// complete hold (`scope_shard_id = NULL`), and the missed shards hold no
+    /// row at all. A later read that reaches every shard therefore has a
+    /// `complete` status and rows that agree — so without comparing the holding
+    /// shards against the expected set, `GET /activities` presents a clean
+    /// fleet-wide hold while part of the fleet is still dispatching the very
+    /// activity an operator believes they stopped.
+    #[test]
+    fn activity_effective_scope_reflects_real_coverage_not_stored_intent() {
+        let catalog = std::collections::BTreeMap::from([(
+            "charge_card".to_string(),
+            ActivityCatalogEntry {
+                queue_name: "payments",
+                is_local: false,
+            },
+        )]);
+
+        // One of two expected shards holds it: intent says fleet, reality does not.
+        let partial = merge_activity_catalog_rows(
+            &catalog,
+            vec![(
+                0,
+                paused_activity_row("charge_card", "stripe outage", "alice", 30, None, 4),
+            )],
+            &[0, 1],
+        );
+        assert_eq!(
+            partial[0]["effective_scope"], "partial_fleet",
+            "a partially-applied fleet-wide hold must be reported as such"
+        );
+        assert_eq!(
+            partial[0]["scope_shard_id"],
+            serde_json::Value::Null,
+            "the recorded intent is still reported verbatim"
+        );
+
+        // Both expected shards hold it: the same intent really is fleet-wide.
+        let complete = merge_activity_catalog_rows(
+            &catalog,
+            vec![
+                (
+                    0,
+                    paused_activity_row("charge_card", "stripe outage", "alice", 30, None, 4),
+                ),
+                (
+                    1,
+                    paused_activity_row("charge_card", "stripe outage", "alice", 29, None, 6),
+                ),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(complete[0]["effective_scope"], "fleet");
+
+        // A deliberately shard-scoped hold is not "partially applied".
+        let scoped = merge_activity_catalog_rows(
+            &catalog,
+            vec![(
+                0,
+                paused_activity_row("charge_card", "shard-0 only", "alice", 30, Some(0), 4),
+            )],
+            &[0, 1],
+        );
+        assert_eq!(scoped[0]["effective_scope"], "shard");
+
+        // An activity that is not held at all has no coverage to report.
+        let unheld = merge_activity_catalog_rows(&catalog, Vec::new(), &[0, 1]);
+        assert_eq!(unheld[0]["paused"], serde_json::json!(false));
+        assert_eq!(
+            unheld[0]["effective_scope"],
+            serde_json::Value::Null,
+            "no hold means no coverage, mirroring the other null provenance fields"
+        );
     }
 
     /// Issue #619 review: the operator's reason must reach the durable audit

@@ -5646,8 +5646,16 @@ const fn activity_list_wants_raw_json(cli: &Cli) -> bool {
 /// nothing. A `PAUSED: yes` / `LOCAL: yes` row is a no-op hold, and that is
 /// invisible without the column. `REGISTERED` is the mistyped-hold signal — a
 /// held name this process has no catalogue entry for is still listed, flagged
-/// `no`. The remaining fields (`scope_shard_id`, `provenance_uniform`, the
-/// per-shard `shards` array) are `--json` territory: they matter when
+/// `no`.
+///
+/// `SCOPE` earns one for the same reason (issue #807 review): it is the second
+/// way `PAUSED: yes` can be a lie. A fleet-wide pause that only reached some
+/// shards writes rows byte-identical to a complete hold and *no* row on the
+/// shards it missed, so `partial_fleet` is the only signal that part of the
+/// fleet is still dispatching. Leaving it to `--json` would put the one field
+/// that contradicts the headline answer behind a flag nobody reaches for
+/// mid-incident. The remaining fields (`scope_shard_id`, `provenance_uniform`,
+/// the per-shard `shards` array) stay `--json` territory: they matter when
 /// reconciling a disagreeing hold, not when answering "is this held?".
 fn format_activity_list_table(value: &Value) -> String {
     let status = value
@@ -5668,6 +5676,7 @@ fn format_activity_list_table(value: &Value) -> String {
         "REGISTERED".to_string(),
         "LOCAL".to_string(),
         "PAUSED".to_string(),
+        "SCOPE".to_string(),
         "HELD".to_string(),
         "REASON".to_string(),
         "PAUSED_BY".to_string(),
@@ -5679,6 +5688,7 @@ fn format_activity_list_table(value: &Value) -> String {
             bool_cell(item.get("registered")),
             bool_cell(item.get("is_local")),
             bool_cell(item.get("paused")),
+            cell_str(item.get("effective_scope")),
             cell_number(item.get("held_task_count")),
             cell_str(item.get("paused_reason")),
             cell_str(item.get("paused_actor")),
@@ -10402,6 +10412,43 @@ mod reuse_policy_tests {
         let rendered = format_activity_list_table(&value);
         assert!(rendered.contains("LOCAL"));
         assert!(rendered.contains("compute_checksum"));
+    }
+
+    /// Issue #807 review: a partially-applied fleet-wide hold must not render
+    /// as a clean containment action.
+    ///
+    /// `PAUSED: yes` on its own is exactly the misleading signal: the shards a
+    /// fleet-wide pause reached hold rows byte-identical to a complete hold, and
+    /// the ones it missed hold no row at all, so an operator reading the table
+    /// during an incident would believe `charge_card` is stopped while part of
+    /// the fleet keeps dispatching it. `SCOPE` is the column that says otherwise.
+    #[test]
+    fn activity_list_table_flags_a_partially_applied_fleet_hold() {
+        let value = json!({
+            "status": "complete",
+            "activities": [{
+                "activity_name": "charge_card",
+                "registered": true,
+                "queue_name": "payments",
+                "is_local": false,
+                "paused": true,
+                "effective_scope": "partial_fleet",
+                "paused_reason": "stripe outage",
+                "paused_actor": "alice",
+                "scope_shard_id": null,
+                "held_task_count": 4,
+                "provenance_uniform": true,
+                "shards": []
+            }],
+            "unavailable_shards": []
+        });
+        let rendered = format_activity_list_table(&value);
+        assert!(rendered.contains("SCOPE"), "the coverage column must exist");
+        assert!(
+            rendered.contains("partial_fleet"),
+            "an incomplete hold must say so on the surface an operator reads \
+             during the incident, not only in --json: {rendered}"
+        );
     }
 
     #[test]

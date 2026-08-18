@@ -268,8 +268,31 @@ things could not. A paused-but-**unregistered** activity is listed too, flagged
 page used to find it. Each entry carries `reason` (why), `paused_by` (who),
 `paused_at` (since when), and `held_task_count` (how much work is waiting).
 
+**Check the `SCOPE` column before trusting `PAUSED: yes`.** It reports what the
+hold *actually* covers, derived from the shards that hold the activity versus
+the expected shard set — not the `scope_shard_id` intent recorded when the row
+was written:
+
+- `fleet` — every expected shard holds it.
+- `partial_fleet` — **some shards are still dispatching this activity.** A
+  fleet-wide pause that only reached part of the fleet writes
+  `scope_shard_id: null` on the shards it reached and *no row* on the ones it
+  missed, so intent alone cannot tell this apart from a complete hold. The
+  original request returned `207`, but a later read that reaches every shard
+  looks `complete` and its rows agree — this column is what still says
+  otherwise. Re-issue the pause; it is idempotent and preserves the original
+  provenance.
+- `shard` — every row is deliberately shard-scoped and they do not span the
+  fleet. Expected for a scoped hold; suspicious if you asked for fleet-wide.
+
+An unreachable shard counts as expected-but-not-holding — the safe direction,
+since it may still be dispatching — so a `partial` read also reports
+`partial_fleet`.
+
 **Corrective Actions**:
 - Confirm the downstream named in `reason` has actually recovered.
+- If `SCOPE` reads `partial_fleet`, re-issue the pause **before** triaging
+  anything else: part of the fleet never stopped.
 - Release the hold:
   ```bash
   harvest activity resume charge_card

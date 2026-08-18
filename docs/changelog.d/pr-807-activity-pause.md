@@ -12,6 +12,25 @@
 
 **Resume credits late arrivals too — a second pass (PR review, Codex P1).** Under READ COMMITTED each statement takes its own snapshot, so a task enqueued *after* the primary shift began but *before* the resume's pause `DELETE` commits is invisible to that pass while still being genuinely held (every other session still sees the uncommitted pause row and still skips it). With a single pass such a row thawed carrying its whole held wait, and the `schedule_to_start` scanner could terminally fail it the instant the hold lifted — the exact failure the credit exists to prevent, and widest on a large backlog where the bulk `UPDATE` and the per-queue notification pass keep the transaction open longest. `resume_shift_scheduled_at_query` now `RETURNING id`s the rows it shifted and `resume_shift_late_arrivals_query` credits every other due `PENDING` row, excluded **by id rather than by predicate** — which makes coverage total for *any* commit order, since "which rows a statement saw" is a question about visibility, not about the row. Adopted wholesale from the queue-pause sibling's own two-pass design (issue #619 rounds 16/19), including the `NOT EXISTS (… unnest …)` spelling (a hash anti-join, O(rows + ids), rather than `<> ALL`'s per-row array scan). The residual it cannot close — a row committing after *this* statement's snapshot — is bounded by that one small statement, errs in the same safe direction, and is documented rather than eliminated: closing it would mean serializing **enqueue** behind an activity-scoped lock, putting a serialization point on the hot enqueue path for every task, paused or not.
 
+**The read model reports real coverage, not stored intent (PR review, Codex P1).**
+A fleet-wide pause that only reaches some shards returns `207` at mutation time,
+but the rows it *did* write are byte-identical to a complete hold
+(`scope_shard_id = NULL`) and the shards it missed hold no row at all. A later
+read that reaches every shard therefore has a `complete` status and rows that
+agree, so a read driven by "any shard has a row" would present a clean
+fleet-wide hold while part of the fleet keeps dispatching the very activity the
+operator believes they stopped. Both read endpoints now derive an
+`effective_scope` (`fleet` / `partial_fleet` / `shard`) from the shards that
+actually hold the activity versus `shard_fanout::expected_shards`, by **reusing**
+`queue_pause::classify_pause_coverage` rather than restating the rule — so the
+activity and queue read models can never disagree about what "fleet-wide" means.
+An unheld activity reports `null` (no hold, no coverage), mirroring the other
+null provenance fields. `harvest activity list` gains a `SCOPE` column for the
+same reason `LOCAL` has one: it is the second way `PAUSED: yes` can be a lie, and
+leaving it to `--json` would hide the one field that contradicts the headline
+answer behind a flag nobody reaches for mid-incident. The three read models that
+need an expected-shard set now share one `expected_shard_ids` helper.
+
 **The down migration drops the index too (PR review, Codex P2).** `idx_harvest_tq_activity_pause` lives on `harvest_task_queue`, which this migration does not own, so dropping `harvest_activity_pauses` alone left it behind. A rollback that leaves an index on a hot, high-write table has not restored the previous schema — the deployment keeps paying its storage and per-`INSERT` maintenance cost for a feature that is no longer there.
 
 **Multi-queue thaw.** A paused activity's held tasks can span multiple queues (a per-call `queue_override` sends the same activity type to different queues), so the resume doorbell selects `DISTINCT ON (queue_name)` and rings **every** queue the activity spans, not just the first. Pinned by `resume_releases_the_backlog_on_every_queue_the_activity_spans`.
