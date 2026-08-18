@@ -49,12 +49,26 @@ identical in every other column:
   worst case for wasted claim work would be *unsatisfiable* requirements;
   this measures the predicate's cost when it is doing useful, matching
   work, which is the common case). Only that one worker's labels matter
-  here: `claim_task_query()`'s `worker_info` CTE resolves labels via
-  `SELECT labels FROM harvest_workers WHERE worker_id = $1` -- a
-  single-row, worker-id-keyed lookup on the claiming worker's own id, not a
-  scan or join over the other 63 seeded (but never-claiming, and here
-  unlabeled) workers -- so what labels those other workers carry has no
-  effect on this query's plan or measured buffer cost.
+  *for correctness* here: `claim_task_query()`'s `worker_info` CTE resolves
+  labels via `SELECT labels FROM harvest_workers WHERE worker_id = $1`, and
+  only the row matching the claiming worker's id feeds the requirement
+  check. That lookup is **not**, however, an indexed point read that
+  bypasses the rest of the table: although `worker_id` is the table's
+  primary key, the planner consistently picks a `Seq Scan on
+  harvest_workers` at this table size (~64 rows, confirmed at every depth
+  captured here -- see [Plan](#plan) and [Review
+  note](#review-note-an-analyze-asymmetry-the-harness-carried-caught-by-review)
+  below), and the committed artifacts show it reading through every seeded
+  row to get there: `InitPlan 6`/`InitPlan 7` report `Rows Removed by
+  Filter: 63` on the `capability-labels` side. Its buffer cost is therefore
+  a function of the whole `harvest_workers` table, not just the matched
+  row -- the other 63 workers' `labels` content could, in principle, move
+  it. Here those 63 rows are unlabeled and the fleet is fixed at 64, so the
+  scan's measured contribution (`Buffers: shared hit=2` for each
+  `InitPlan`, folding into `SubPlan 10`'s reported 4-buffer total -- see
+  [Plan](#plan)) is small and dominated by the fixed table size, not by
+  other workers' label content; a larger or more heavily-labeled fleet was
+  not tested here and would grow it.
 
 Both states are captured for `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS,
 TIMING OFF)` on `claim_task_query()` at each depth, and for a full
@@ -68,7 +82,9 @@ At backlog=10,000, the two plans are identical in shape (same join order, same
 CTE structure, and -- since a harness fix described in [Review
 note](#review-note-an-analyze-asymmetry-the-harness-carried-caught-by-review)
 below -- the same `Seq Scan on harvest_workers` access path for all four
-aliased `worker_info`-CTE lookups) and differ only in per-node buffer counts:
+aliased `worker_info`-CTE lookups) and differ in per-node buffer counts, plus
+one planner row-count estimate discussed below that does not, in this query,
+change which plan is chosen:
 
 - The `Seq Scan on harvest_task_queue` node reports 244 -> 338 total buffers
   (delta 94) -- almost exactly the query's whole top-level delta at this
@@ -105,10 +121,36 @@ aliased `worker_info`-CTE lookups) and differ only in per-node buffer counts:
   `capability-labels` because the sole seeded `Exact` requirement resolves
   the requirement's `OR` first, short-circuiting evaluation of the `In`
   branch.
+- The `Seq Scan on harvest_task_queue` node's own **planner row-count
+  estimate** also differs between states, independent of the buffer-cost
+  mechanism below: under `no-capabilities` the planner estimates exactly the
+  actual row count at every depth measured (`rows=1000`/`10000`/`100000`
+  estimated vs. `actual rows=1000`/`10000`/`100000`), while under
+  `capability-labels` it estimates **exactly half** the actual count at
+  every depth (`rows=500`/`5000`/`50000` estimated vs. the same
+  `actual rows=1000`/`10000`/`100000`) -- confirmed directly in the
+  committed `.explain.txt` artifacts at all three backlog depths, not just
+  the 10,000-row one discussed above. This is consistent with Postgres
+  falling back to a default selectivity estimate for the correlated
+  `SubPlan 10` requirement check, which it cannot cost from column
+  statistics the way it can a plain equality or range predicate -- but that
+  specific mechanism was not independently verified against Postgres's
+  planner source or via a targeted test isolating it, so it is reported
+  here as an observed, reproducible fact (flagged by review on PR #1192),
+  not as a confirmed root cause. In this query the misestimate does not
+  change the plan shape: both states still choose a `Seq Scan` with
+  identical join structure, and the *actual* execution-time row/buffer
+  counts already reported above are unaffected by it (a planner estimate
+  drives plan *choice*, not the executed plan's own reported actuals). A
+  query where this scan's output feeds a join or `LIMIT` whose strategy is
+  cardinality-sensitive could see the estimate drive a materially different
+  plan under `capability-labels` than under `no-capabilities` -- that
+  scenario was not tested here.
 
-The mechanism is therefore **row-width growth**, not subplan or InitPlan
-inefficiency: a wider `required_capabilities` JSONB payload means fewer rows
-fit per heap page, so the same 10,000-row/4-queue scan touches more pages.
+The mechanism behind the buffer-cost delta is therefore **row-width
+growth**, not subplan or InitPlan inefficiency: a wider
+`required_capabilities` JSONB payload means fewer rows fit per heap page, so
+the same 10,000-row/4-queue scan touches more pages.
 Nothing about the join, the CTE structure, or the InitPlan caching behavior
 changes between the two states -- and the whole label-matching machinery
 accounts for only 4 of the 94-buffer total delta at this depth, under 5% of
@@ -179,7 +221,8 @@ heap growth, and the EXPLAIN-measured buffer delta at the same 10,000-row
 depth shows **+34.3%** -- both large, both positive, both consistent with the
 plan-node evidence in [Plan](#plan) that this is a row-width effect, not a
 plan-shape difference (the two plans are structurally identical; only the
-per-node buffer counts differ).
+per-node buffer counts, and one planner row-count estimate discussed under
+[Plan](#plan) above, differ).
 
 The per-row byte accounting confirms the mechanism further: average row size
 with capabilities populated is 237 bytes vs. 165 bytes without (delta 72
@@ -266,10 +309,10 @@ all five runs**, i.e. **+8.3% more heap growth from the identical claim
 operation**, purely from carrying the wider payload forward into the new
 tuple version.
 
-That figure is a **floor**, not a ceiling, on the effect, and this script
-now captures the direct evidence for that claim in its own output rather
+This measurement reflects a specific, confirmed condition: this script now
+captures the direct evidence for that condition in its own output rather
 than relying on an out-of-band manual check (a gap review on PR #1192
-correctly flagged in an earlier revision of this script): the two
+correctly flagged in an earlier revision of this script). The two
 `SELECT`s bracketing the `CALL` sample `pg_stat_user_tables.autovacuum_count`
 for `harvest_task_queue` immediately before and immediately after the
 five-run, 100,000-claim loop, and both read **0** in the committed
@@ -277,8 +320,16 @@ artifact -- confirming that PostgreSQL's background autovacuum worker got
 no opportunity to run at all during this tight, uninterrupted execution.
 Every byte of space reclaimed here therefore comes solely from
 *opportunistic* HOT pruning triggered in-line by the claim loop's own
-commits, the minimum reclaim mechanism any separately-committed claim
-sequence gets for free with zero background assistance.
+commits, the reclaim mechanism any separately-committed claim sequence
+gets for free with zero background assistance. This page does **not**
+claim +8.3% is a guaranteed floor on the true effect under every possible
+reclaim condition -- whether *additional* reclaim (autovacuum firing
+mid-sequence, as could happen on a longer-running or busier production
+table) would widen or narrow the percentage gap is a directional question
+this measurement does not answer on its own. A plausibility argument for
+one direction is offered, and explicitly treated as unconfirmed rather
+than proven, in the discussion of the older historical figure immediately
+below.
 
 An earlier measurement of this same separately-committed pattern, taken
 across five manually-repeated shell invocations of an earlier,
