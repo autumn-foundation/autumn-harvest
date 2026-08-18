@@ -11619,6 +11619,49 @@ mod usage_cli_tests {
     }
 
     #[test]
+    fn format_diagnose_verdict_renders_the_replay_derived_wait_kinds() {
+        // The renderer walks `blocked_on`'s members generically, so a newly
+        // added variant must surface with no CLI change. This pins that: a
+        // mutex park has to name the contended key an operator needs to find
+        // the holder.
+        let value = serde_json::json!({
+            "execution_id": "00000000-0000-0000-0000-000000000001",
+            "health": "blocked_external",
+            "summary": "parked on a durable mutex wait (ledger:42)",
+            "blocked_on": {
+                "type": "awaiting_replay_wait",
+                "wait_kind": "mutex",
+                "name": "ledger:42"
+            },
+            "wait_set": "replayed",
+        });
+        let rendered = format_diagnose_verdict(&value);
+        assert!(
+            rendered.contains("awaiting_replay_wait"),
+            "expected the verdict type, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("mutex") && rendered.contains("ledger:42"),
+            "expected the wait kind and contended key, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_diagnose_verdict_renders_the_workflow_task_verdicts() {
+        let value = serde_json::json!({
+            "execution_id": "00000000-0000-0000-0000-000000000001",
+            "health": "stalled",
+            "summary": "no live worker is polling workflow task queue 'orphan'",
+            "blocked_on": { "type": "workflow_no_worker", "queue": "orphan" },
+        });
+        let rendered = format_diagnose_verdict(&value);
+        assert!(
+            rendered.contains("workflow_no_worker") && rendered.contains("orphan"),
+            "expected the uncovered workflow queue, got: {rendered}"
+        );
+    }
+
+    #[test]
     fn format_diagnose_verdict_surfaces_the_actionable_root_cause() {
         // The headline case (#809 AC3): the operator must read the uncovered
         // queue name off the rendered verdict without a `jq` pipeline.

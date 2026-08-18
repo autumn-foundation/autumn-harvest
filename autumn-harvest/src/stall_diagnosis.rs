@@ -242,6 +242,42 @@ pub enum BlockedOn {
         #[serde(skip_serializing_if = "Option::is_none")]
         since: Option<DateTime<Utc>>,
     },
+    /// Replay found the run parked on a durable wait that leaves no row in any
+    /// side table this endpoint reads — a `ctx.await_condition` park, a durable
+    /// mutex acquire (issue #691), an admitted update awaiting its handler
+    /// result, or a parked external-workflow operation (#492/#757/#751).
+    ///
+    /// Named by the replay-derived wait set (issue #615) rather than inferred
+    /// from the database, and reported only when no side table produced a more
+    /// precise cause — so it upgrades what would otherwise be a false
+    /// [`Self::NoPendingWork`] and can never mask a specific verdict.
+    AwaitingReplayWait {
+        /// The awaitable kind replay reported (`condition`, `mutex`, `update`,
+        /// `external_workflow`, `activity`, `child_workflow`, `timer`).
+        wait_kind: String,
+        /// The awaitable's label, where replay names one. `None` for an
+        /// `await_condition` park (the API takes no site label).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// When the wait began, where recorded history can date it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<DateTime<Utc>>,
+    },
+    /// **No live worker is polling the queue the run's own workflow task sits
+    /// on.** The workflow-task analogue of [`Self::ActivityNoWorker`]: the
+    /// decision cycle itself can never be claimed, so the run cannot advance
+    /// even though nothing is individually wedged.
+    WorkflowNoWorker {
+        /// The workflow task queue with no live poller.
+        queue: String,
+    },
+    /// An operator has paused the queue the run's own workflow task sits on
+    /// (issue #619), so no worker will claim the decision cycle until the pause
+    /// is lifted.
+    WorkflowQueuePaused {
+        /// The held workflow task queue.
+        queue: String,
+    },
     /// A non-terminal execution with no pending work of any kind — the
     /// executor-loss / lost-task indicator.
     NoPendingWork,
@@ -266,6 +302,9 @@ impl BlockedOn {
             Self::TimerOverdue { .. } => "timer_overdue",
             Self::AwaitingExternalHandoff { .. } => "awaiting_external_handoff",
             Self::Paused { .. } => "paused",
+            Self::AwaitingReplayWait { .. } => "awaiting_replay_wait",
+            Self::WorkflowNoWorker { .. } => "workflow_no_worker",
+            Self::WorkflowQueuePaused { .. } => "workflow_queue_paused",
             Self::NoPendingWork => "no_pending_work",
         }
     }
@@ -289,10 +328,13 @@ impl BlockedOn {
             // Waiting on a party outside the engine.
             Self::AwaitingSignal { .. }
             | Self::AwaitingExternalHandoff { .. }
+            | Self::AwaitingReplayWait { .. }
             | Self::Paused { .. }
-            | Self::ActivityQueuePaused { .. } => ExecutionHealth::BlockedExternal,
+            | Self::ActivityQueuePaused { .. }
+            | Self::WorkflowQueuePaused { .. } => ExecutionHealth::BlockedExternal,
             // Nothing will move this forward without a human.
             Self::ActivityNoWorker { .. }
+            | Self::WorkflowNoWorker { .. }
             | Self::TimerOverdue { .. }
             | Self::ActivityCircuitOpen { .. }
             | Self::NoPendingWork => ExecutionHealth::Stalled,
@@ -394,6 +436,44 @@ pub struct PendingTimerFacts {
     pub fires_at: DateTime<Utc>,
 }
 
+/// The run's OWN workflow task row (`task_type = 'workflow'`).
+///
+/// Every non-terminal execution has exactly one. It is the decision cycle
+/// itself, so it is consulted only as a fallback — when no activity, timer,
+/// child, handoff, or awaited signal produced a cause — to distinguish a run
+/// that is *currently executing or awaiting dispatch* from the genuinely lost
+/// task [`BlockedOn::NoPendingWork`] reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowTaskFacts {
+    /// The row's `state` (`PENDING`, `RUNNING`, ...).
+    pub state: String,
+    /// `true` when `worker_id IS NOT NULL` — a worker holds the claim and the
+    /// handler is executing right now. A *parked* row is `RUNNING` with a NULL
+    /// worker, so this is what separates executing from parked.
+    pub has_worker: bool,
+    /// The task queue the decision cycle is dispatched on.
+    pub queue_name: String,
+    /// When the row becomes claimable.
+    pub scheduled_at: DateTime<Utc>,
+    /// `true` when an operator has paused `queue_name` (issue #619).
+    pub queue_paused: bool,
+    /// `true` when at least one live worker polls `queue_name`.
+    pub has_live_worker: bool,
+}
+
+/// A durable wait that replay named but no side table this endpoint reads can
+/// see — an `await_condition` park, a mutex acquire, an admitted update, or a
+/// parked external-workflow operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayWaitFacts {
+    /// The awaitable kind replay reported.
+    pub wait_kind: String,
+    /// The awaitable's label, where replay names one.
+    pub name: Option<String>,
+    /// When the wait began, where recorded history can date it.
+    pub since: Option<DateTime<Utc>>,
+}
+
 /// The complete, already-gathered fact set for one execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiagnosisInputs {
@@ -415,6 +495,13 @@ pub struct DiagnosisInputs {
     pub awaited_signals: Vec<AwaitedSignalFacts>,
     /// Every unfired durable timer.
     pub timers: Vec<PendingTimerFacts>,
+    /// Durable waits replay named that leave no side-table row. Consulted only
+    /// below every side-table cause, so it can only ever replace a false
+    /// [`BlockedOn::NoPendingWork`].
+    pub replay_waits: Vec<ReplayWaitFacts>,
+    /// The run's own workflow task row, where one was loaded. `None` leaves the
+    /// classifier's pre-issue-#1188 behaviour exactly as it was.
+    pub workflow_task: Option<WorkflowTaskFacts>,
 }
 
 /// Rank a pending-activity verdict by how hard its impediment is to clear.
@@ -563,6 +650,55 @@ pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc
     BlockedOn::HealthyInProgress
 }
 
+/// Classify the run's OWN workflow task row.
+///
+/// Returns `None` when the row cannot explain the run's state, leaving the
+/// caller's lost-task verdict ([`BlockedOn::NoPendingWork`]) standing.
+///
+/// This is a **fallback**, never a headline: a non-terminal run always has a
+/// workflow task row, so consulting it above the specific waits would mask
+/// every real cause. It exists to separate three states the row makes plain
+/// but no other table does:
+///   * **claimed** (`worker_id IS NOT NULL`) — the handler is executing right
+///     now. A decision cycle that runs a long local activity (issue #98, up to
+///     a minute by default) schedules no queue row of any kind, so without this
+///     check a perfectly healthy in-flight run reports `no_pending_work`.
+///   * **awaiting dispatch** (`PENDING`) — about to be claimed. Healthy when a
+///     live worker polls the queue; the workflow-task analogue of AC3's
+///     flagship "no live worker" stall when one does not, and the operator-held
+///     [`BlockedOn::WorkflowQueuePaused`] when the queue is paused (issue #619).
+///   * **parked** (`RUNNING` with a NULL worker) — advances on a *wake*, not a
+///     claim, so a live worker proves nothing and this returns `None`. That is
+///     exactly the lost-task shape, and its verdict is deliberately unchanged.
+#[must_use]
+pub fn classify_workflow_task(facts: &WorkflowTaskFacts, now: DateTime<Utc>) -> Option<BlockedOn> {
+    // A held claim is unambiguous: a worker is running the handler this instant.
+    if facts.has_worker {
+        return Some(BlockedOn::HealthyInProgress);
+    }
+    // Only a PENDING row is awaiting a claim. See the parked case above.
+    if facts.state != "PENDING" {
+        return None;
+    }
+    if facts.queue_paused {
+        return Some(BlockedOn::WorkflowQueuePaused {
+            queue: facts.queue_name.clone(),
+        });
+    }
+    // Deliberately deferred by the dispatcher (retry backoff, a rate-limit or
+    // capability-miss redelivery): self-healing, so healthy.
+    if facts.scheduled_at > now {
+        return Some(BlockedOn::HealthyInProgress);
+    }
+    if !facts.has_live_worker {
+        return Some(BlockedOn::WorkflowNoWorker {
+            queue: facts.queue_name.clone(),
+        });
+    }
+    // Due, unimpeded, and covered by a live poller: ordinary dispatch latency.
+    Some(BlockedOn::HealthyInProgress)
+}
+
 /// Collapse an execution's whole fact set into one root-cause verdict.
 ///
 /// Returns `None` for a terminal execution — there is nothing to diagnose, and
@@ -677,6 +813,30 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
     if let Some(timer) = inputs.timers.iter().min_by_key(|timer| timer.fires_at) {
         return Some(BlockedOn::SleepingTimer {
             fires_at: timer.fires_at,
+        });
+    }
+
+    // Below every side-table cause: the run's own workflow task row, then the
+    // durable waits replay named that leave no side-table row at all. Both sit
+    // here — not higher — so they can only ever replace what would otherwise be
+    // a false `NoPendingWork`, never mask a more precise verdict above.
+    //
+    // The workflow task goes first because a *claimed* row is the most current
+    // fact there is (the handler is executing this instant, so any replay wait
+    // is from the previous suspension). The two never actually compete: a
+    // parked row — the shape a replay wait explains — yields `None` here.
+    if let Some(verdict) = inputs
+        .workflow_task
+        .as_ref()
+        .and_then(|facts| classify_workflow_task(facts, now))
+    {
+        return Some(verdict);
+    }
+    if let Some(wait) = inputs.replay_waits.first() {
+        return Some(BlockedOn::AwaitingReplayWait {
+            wait_kind: wait.wait_kind.clone(),
+            name: wait.name.clone(),
+            since: wait.since,
         });
     }
 
@@ -817,6 +977,20 @@ pub fn summarize(blocked: &BlockedOn) -> String {
         BlockedOn::Paused { actor, .. } => actor.as_ref().map_or_else(
             || "this execution is paused by an operator".to_string(),
             |actor| format!("this execution is paused by an operator ({actor})"),
+        ),
+        BlockedOn::AwaitingReplayWait {
+            wait_kind, name, ..
+        } => name.as_ref().map_or_else(
+            || format!("parked on a durable {wait_kind} wait"),
+            |name| format!("parked on a durable {wait_kind} wait ({name})"),
+        ),
+        BlockedOn::WorkflowNoWorker { queue } => format!(
+            "no live worker is polling workflow task queue '{queue}', so this run's own decision \
+             cycle can never be claimed"
+        ),
+        BlockedOn::WorkflowQueuePaused { queue } => format!(
+            "an operator has paused workflow task queue '{queue}', so this run's own decision \
+             cycle will not be claimed until the pause is lifted"
         ),
         BlockedOn::NoPendingWork => "this execution has no pending work of any kind; its \
              workflow task may have been lost"
@@ -2021,6 +2195,344 @@ mod tests {
                 assert_eq!(next_attempt_at, Some(t(600)));
             }
             other => panic!("expected a nameless retry verdict, got {other:?}"),
+        }
+    }
+
+    // ── The run's own workflow task row (issue #809, PR #1188 review) ──────
+
+    /// A PENDING, due, unimpeded workflow task on a covered queue.
+    fn wf_task() -> WorkflowTaskFacts {
+        WorkflowTaskFacts {
+            state: "PENDING".to_string(),
+            has_worker: false,
+            queue_name: "default".to_string(),
+            scheduled_at: t(-10),
+            queue_paused: false,
+            has_live_worker: true,
+        }
+    }
+
+    fn inputs_with_wf_task(task: WorkflowTaskFacts) -> DiagnosisInputs {
+        DiagnosisInputs {
+            workflow_task: Some(task),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn claimed_workflow_task_is_healthy_not_a_lost_task() {
+        // The decision cycle is executing on a worker right now — the shape a
+        // long local activity (issue #98) holds for up to a minute while
+        // scheduling no queue row of any kind.
+        let task = WorkflowTaskFacts {
+            state: "RUNNING".to_string(),
+            has_worker: true,
+            ..wf_task()
+        };
+        assert_eq!(
+            classify_workflow_task(&task, t(0)),
+            Some(BlockedOn::HealthyInProgress)
+        );
+        let verdict = classify_execution(&inputs_with_wf_task(task), t(0));
+        assert_eq!(verdict, Some(BlockedOn::HealthyInProgress));
+        assert_eq!(
+            verdict.map(|v| v.health()),
+            Some(ExecutionHealth::Healthy),
+            "an executing decision cycle must never read as stalled",
+        );
+    }
+
+    #[test]
+    fn pending_workflow_task_on_a_dead_queue_reports_no_worker() {
+        let task = WorkflowTaskFacts {
+            has_live_worker: false,
+            ..wf_task()
+        };
+        let verdict = classify_execution(&inputs_with_wf_task(task), t(0));
+        match verdict {
+            Some(BlockedOn::WorkflowNoWorker { ref queue }) => assert_eq!(queue, "default"),
+            other => panic!("expected workflow_no_worker, got {other:?}"),
+        }
+        assert_eq!(verdict.map(|v| v.health()), Some(ExecutionHealth::Stalled));
+    }
+
+    #[test]
+    fn pending_workflow_task_on_a_paused_queue_reports_queue_paused() {
+        // A paused queue outranks the dead-queue check: the operator's hold is
+        // the actionable cause even when no worker happens to be polling.
+        let task = WorkflowTaskFacts {
+            queue_paused: true,
+            has_live_worker: false,
+            ..wf_task()
+        };
+        let verdict = classify_execution(&inputs_with_wf_task(task), t(0));
+        match verdict {
+            Some(BlockedOn::WorkflowQueuePaused { ref queue }) => assert_eq!(queue, "default"),
+            other => panic!("expected workflow_queue_paused, got {other:?}"),
+        }
+        assert_eq!(
+            verdict.map(|v| v.health()),
+            Some(ExecutionHealth::BlockedExternal)
+        );
+    }
+
+    #[test]
+    fn pending_workflow_task_with_a_live_worker_is_dispatch_latency_not_a_stall() {
+        assert_eq!(
+            classify_execution(&inputs_with_wf_task(wf_task()), t(0)),
+            Some(BlockedOn::HealthyInProgress)
+        );
+    }
+
+    #[test]
+    fn not_yet_due_pending_workflow_task_is_healthy() {
+        // Deliberately deferred by the dispatcher; self-healing, and a dead
+        // queue is not yet the operative fact.
+        let task = WorkflowTaskFacts {
+            scheduled_at: t(30),
+            has_live_worker: false,
+            ..wf_task()
+        };
+        assert_eq!(
+            classify_workflow_task(&task, t(0)),
+            Some(BlockedOn::HealthyInProgress)
+        );
+    }
+
+    #[test]
+    fn parked_workflow_task_with_nothing_pending_is_still_the_lost_task_verdict() {
+        // RUNNING with a NULL worker is *parked*: it advances on a wake, not a
+        // claim, so a live worker proves nothing. This is exactly the lost-task
+        // shape and its verdict must be unchanged.
+        let task = WorkflowTaskFacts {
+            state: "RUNNING".to_string(),
+            has_worker: false,
+            ..wf_task()
+        };
+        assert_eq!(classify_workflow_task(&task, t(0)), None);
+        assert_eq!(
+            classify_execution(&inputs_with_wf_task(task), t(0)),
+            Some(BlockedOn::NoPendingWork)
+        );
+    }
+
+    #[test]
+    fn workflow_task_fallback_never_masks_a_specific_activity_verdict() {
+        // A wedged activity AND a dead workflow queue: the activity is the
+        // actionable root cause and must win, or the fallback would flatten
+        // every specific verdict this endpoint exists to produce.
+        let inputs = DiagnosisInputs {
+            activities: vec![PendingActivityFacts {
+                has_live_worker: false,
+                ..healthy_activity()
+            }],
+            workflow_task: Some(WorkflowTaskFacts {
+                has_live_worker: false,
+                ..wf_task()
+            }),
+            ..Default::default()
+        };
+        match classify_execution(&inputs, t(0)) {
+            Some(BlockedOn::ActivityNoWorker { ref queue, .. }) => assert_eq!(queue, "email"),
+            other => panic!("expected the activity verdict to win, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_task_fallback_never_masks_an_awaited_signal() {
+        let inputs = DiagnosisInputs {
+            awaited_signals: vec![AwaitedSignalFacts {
+                signal_name: "approval".to_string(),
+                since: None,
+            }],
+            workflow_task: Some(wf_task()),
+            ..Default::default()
+        };
+        match classify_execution(&inputs, t(0)) {
+            Some(BlockedOn::AwaitingSignal {
+                ref signal_name, ..
+            }) => {
+                assert_eq!(signal_name, "approval");
+            }
+            other => panic!("expected awaiting_signal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn absent_workflow_task_leaves_the_lost_task_verdict_unchanged() {
+        // The `None` default keeps every pre-existing caller byte-identical.
+        assert_eq!(
+            classify_execution(&DiagnosisInputs::default(), t(0)),
+            Some(BlockedOn::NoPendingWork)
+        );
+    }
+
+    // ── Replay-derived waits with no side-table row ────────────────────────
+
+    fn inputs_with_replay_wait(wait: ReplayWaitFacts) -> DiagnosisInputs {
+        DiagnosisInputs {
+            replay_waits: vec![wait],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn replay_condition_park_is_reported_not_a_lost_task() {
+        // `ctx.await_condition` is command-less: it leaves no row in any side
+        // table, so without this replay is the ONLY source that can see it.
+        let verdict = classify_execution(
+            &inputs_with_replay_wait(ReplayWaitFacts {
+                wait_kind: "condition".to_string(),
+                name: None,
+                since: Some(t(-60)),
+            }),
+            t(0),
+        );
+        match verdict {
+            Some(BlockedOn::AwaitingReplayWait {
+                ref wait_kind,
+                ref name,
+                since,
+            }) => {
+                assert_eq!(wait_kind, "condition");
+                assert_eq!(name.as_ref(), None);
+                assert_eq!(since, Some(t(-60)));
+            }
+            other => panic!("expected awaiting_replay_wait, got {other:?}"),
+        }
+        assert_eq!(
+            verdict.map(|v| v.health()),
+            Some(ExecutionHealth::BlockedExternal),
+        );
+    }
+
+    #[test]
+    fn replay_mutex_park_names_the_held_key() {
+        match classify_execution(
+            &inputs_with_replay_wait(ReplayWaitFacts {
+                wait_kind: "mutex".to_string(),
+                name: Some("ledger:42".to_string()),
+                since: None,
+            }),
+            t(0),
+        ) {
+            Some(BlockedOn::AwaitingReplayWait {
+                ref wait_kind,
+                ref name,
+                ..
+            }) => {
+                assert_eq!(wait_kind, "mutex");
+                assert_eq!(name.as_deref(), Some("ledger:42"));
+            }
+            other => panic!("expected awaiting_replay_wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_wait_never_masks_a_sleeping_timer() {
+        // The side tables are authoritative and more precise: a DB timer says
+        // exactly when the run wakes, which a generic replay wait cannot.
+        let inputs = DiagnosisInputs {
+            timers: vec![PendingTimerFacts { fires_at: t(600) }],
+            replay_waits: vec![ReplayWaitFacts {
+                wait_kind: "condition".to_string(),
+                name: None,
+                since: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_execution(&inputs, t(0)),
+            Some(BlockedOn::SleepingTimer { fires_at: t(600) })
+        );
+    }
+
+    #[test]
+    fn awaited_signal_still_outranks_the_generic_replay_wait() {
+        let inputs = DiagnosisInputs {
+            awaited_signals: vec![AwaitedSignalFacts {
+                signal_name: "approval".to_string(),
+                since: None,
+            }],
+            replay_waits: vec![ReplayWaitFacts {
+                wait_kind: "condition".to_string(),
+                name: None,
+                since: None,
+            }],
+            ..Default::default()
+        };
+        match classify_execution(&inputs, t(0)) {
+            Some(BlockedOn::AwaitingSignal { .. }) => {}
+            other => panic!("expected the dedicated signal verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_blocked_on_kind_is_unique_and_snake_case() {
+        // The three new variants must not collide with an existing wire label.
+        let kinds = [
+            BlockedOn::AwaitingReplayWait {
+                wait_kind: "condition".to_string(),
+                name: None,
+                since: None,
+            }
+            .kind(),
+            BlockedOn::WorkflowNoWorker {
+                queue: "q".to_string(),
+            }
+            .kind(),
+            BlockedOn::WorkflowQueuePaused {
+                queue: "q".to_string(),
+            }
+            .kind(),
+            BlockedOn::NoPendingWork.kind(),
+            BlockedOn::ActivityNoWorker {
+                queue: "q".to_string(),
+                activity_name: None,
+            }
+            .kind(),
+            BlockedOn::ActivityQueuePaused {
+                queue: "q".to_string(),
+                activity_name: None,
+            }
+            .kind(),
+        ];
+        let unique: std::collections::BTreeSet<_> = kinds.iter().copied().collect();
+        assert_eq!(unique.len(), kinds.len(), "duplicate kind label: {kinds:?}");
+        for kind in kinds {
+            assert!(
+                kind.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "kind {kind} is not snake_case",
+            );
+        }
+    }
+
+    #[test]
+    fn new_verdicts_all_summarize_to_actionable_prose() {
+        for verdict in [
+            BlockedOn::WorkflowNoWorker {
+                queue: "default".to_string(),
+            },
+            BlockedOn::WorkflowQueuePaused {
+                queue: "default".to_string(),
+            },
+            BlockedOn::AwaitingReplayWait {
+                wait_kind: "mutex".to_string(),
+                name: Some("ledger:42".to_string()),
+                since: None,
+            },
+            BlockedOn::AwaitingReplayWait {
+                wait_kind: "condition".to_string(),
+                name: None,
+                since: None,
+            },
+        ] {
+            let summary = summarize(&verdict);
+            assert!(!summary.is_empty(), "{verdict:?} summarized to nothing");
+            assert!(
+                !summary.contains("  "),
+                "{verdict:?} summary has a doubled space: {summary}",
+            );
         }
     }
 }

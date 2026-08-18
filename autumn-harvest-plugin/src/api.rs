@@ -12537,7 +12537,7 @@ pub(crate) async fn build_diagnosis_report(
     use autumn_harvest::stall_diagnosis::{
         AwaitedSignalFacts, BlockedOn, BlockingCircuitPhase, DiagnosisInputs, ExecutionHealth,
         ExternalHandoffFacts, PendingActivityFacts, PendingChildFacts, PendingTimerFacts,
-        classify_execution, summarize,
+        ReplayWaitFacts, WorkflowTaskFacts, classify_execution, summarize,
     };
 
     let exec_uuid = exec_id.as_uuid();
@@ -12670,6 +12670,45 @@ pub(crate) async fn build_diagnosis_report(
         )
         .collect();
 
+    // ── The run's OWN workflow task row ────────────────────────────────────
+    // A non-terminal run always has exactly one, and it is the only place three
+    // states are visible: the handler EXECUTING right now (`worker_id` held),
+    // the decision cycle AWAITING DISPATCH (`PENDING`), and the genuinely
+    // PARKED row that is the lost-task shape. Without it, a run whose handler is
+    // mid-flight — canonically one running a long local activity (issue #98),
+    // which schedules no queue row at all — falls through every category below
+    // and reports the alarming `no_pending_work`/`stalled`.
+    //
+    // A separate single-row indexed lookup rather than widening the query above:
+    // that query's projection, ordering, and PENDING/`queues_in_play`
+    // partitioning are all activity-shaped, and one more cheap round trip is far
+    // safer than threading a second task type through all of it.
+    let workflow_task_row: Option<(
+        String,
+        Option<String>,
+        String,
+        chrono::DateTime<chrono::Utc>,
+    )> = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
+        .filter(harvest_task_queue::task_type.eq("workflow"))
+        .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
+        .order(harvest_task_queue::id.asc())
+        .select((
+            harvest_task_queue::state,
+            harvest_task_queue::worker_id,
+            harvest_task_queue::queue_name,
+            harvest_task_queue::scheduled_at,
+        ))
+        .first::<(
+            String,
+            Option<String>,
+            String,
+            chrono::DateTime<chrono::Utc>,
+        )>(&mut conn)
+        .await
+        .optional()
+        .map_err(database_error)?;
+
     // ── Infra state for those rows (only what they actually reference) ──────
     let pending_tasks: Vec<&DiagnoseTask> = tasks.iter().filter(|t| t.state == "PENDING").collect();
 
@@ -12743,8 +12782,18 @@ pub(crate) async fn build_diagnosis_report(
     // row whose fleet is gone is an orphan rather than healthy work. Deriving
     // it from PENDING rows alone would leave `has_live_worker: false` on a
     // claimed row merely because coverage was never CHECKED for its queue.
-    let queues_in_play: std::collections::BTreeSet<String> =
-        tasks.iter().map(|t| t.queue_name.clone()).collect();
+    // Includes the workflow task's OWN queue: its liveness answer is what
+    // separates "about to be claimed" from the workflow-task analogue of AC3's
+    // flagship no-live-worker stall.
+    let queues_in_play: std::collections::BTreeSet<String> = tasks
+        .iter()
+        .map(|t| t.queue_name.clone())
+        .chain(
+            workflow_task_row
+                .iter()
+                .map(|(_, _, queue, _)| queue.clone()),
+        )
+        .collect();
     let mut covered_queues: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !queues_in_play.is_empty() {
         let stale_threshold = api_state.worker_stale_threshold();
@@ -12882,6 +12931,18 @@ pub(crate) async fn build_diagnosis_report(
         .map(|fires_at| PendingTimerFacts { fires_at })
         .collect();
 
+    let workflow_task =
+        workflow_task_row.map(
+            |(state, worker_id, queue_name, scheduled_at)| WorkflowTaskFacts {
+                has_worker: worker_id.is_some(),
+                queue_paused: paused_queues.contains(&queue_name),
+                has_live_worker: covered_queues.contains(&queue_name),
+                state,
+                queue_name,
+                scheduled_at,
+            },
+        );
+
     // The connection is released before any replay drive: user workflow code is
     // never driven while a pool slot is held (the #612 discipline).
     drop(conn);
@@ -12896,17 +12957,19 @@ pub(crate) async fn build_diagnosis_report(
         children,
         awaited_signals: Vec::new(),
         timers,
+        replay_waits: Vec::new(),
+        workflow_task,
     };
 
     // ── Awaited-but-unsent signals, only when they could change the answer ──
     let mut wait_set = WAIT_SET_NOT_CONSULTED.to_string();
     let mut wait_set_reason = None;
     let db_verdict = classify_execution(&inputs, now);
-    let signals_could_win = matches!(
+    let replay_could_win = matches!(
         db_verdict.as_ref().map(BlockedOn::kind),
         Some("sleeping_timer" | "no_pending_work")
     );
-    if signals_could_win {
+    if replay_could_win {
         // Deadline the whole replay. `build_awaitables_report` inflates offloaded
         // payloads per event (issue #524) OUTSIDE the query timeout, so on a long
         // history with a remote `PayloadStore` it can run for minutes. The
@@ -12940,6 +13003,30 @@ pub(crate) async fn build_diagnosis_report(
                             signal_name,
                             since: a.since,
                         })
+                    })
+                    .collect();
+                // Every OTHER kind replay can name. Signals have their own,
+                // more specific verdict above; the rest — a command-less
+                // `ctx.await_condition` park, a durable mutex acquire (#691),
+                // an admitted update awaiting its handler, a parked
+                // external-workflow operation (#492/#757/#751) — leave no row in
+                // any side table this endpoint reads, so replay is the ONLY
+                // source that can see them. Dropping them (as this filter once
+                // did) meant a run legitimately parked on any of them reported
+                // the alarming `no_pending_work`/`stalled`.
+                //
+                // Recorded/command order is deterministic, so taking them in
+                // order keeps the verdict stable call to call. The classifier
+                // consults them BELOW every side-table cause, so they can only
+                // ever replace a false lost-task verdict.
+                inputs.replay_waits = report
+                    .awaitables
+                    .iter()
+                    .filter(|a| a.kind != autumn_harvest::awaitables::AwaitableKind::Signal)
+                    .map(|a| ReplayWaitFacts {
+                        wait_kind: a.kind.as_str().to_string(),
+                        name: a.name.clone(),
+                        since: a.since,
                     })
                     .collect();
             }

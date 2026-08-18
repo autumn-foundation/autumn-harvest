@@ -413,6 +413,36 @@ async fn seed_activity_task(
         .expect("seed task");
 }
 
+/// Seed the run's OWN workflow task row (`task_type = 'workflow'`).
+///
+/// `worker_id` non-`None` means a worker holds the claim (the handler is
+/// executing); `RUNNING` with `None` is the *parked* shape.
+async fn seed_workflow_task(
+    pool: &DbPool,
+    exec_id: ExecutionId,
+    queue: &str,
+    state: &str,
+    worker_id: Option<&str>,
+    scheduled_at_sql: &str,
+) {
+    let mut conn = pool.get().await.expect("pooled conn");
+    let sql = format!(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, input, state, priority, attempt, \
+          max_attempts, scheduled_at, worker_id) \
+         VALUES ($1, $2, 'workflow', $3, '{{}}'::jsonb, $4, 0, 1, 3, {scheduled_at_sql}, $5)"
+    );
+    diesel::sql_query(sql)
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Text, _>(state)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(worker_id)
+        .execute(&mut conn)
+        .await
+        .expect("seed workflow task");
+}
+
 /// Register a live worker covering `queue` on shard 0.
 async fn seed_live_worker(pool: &DbPool, worker_id: &str, queue: &str) {
     let mut conn = pool.get().await.expect("pooled conn");
@@ -1542,5 +1572,123 @@ async fn ac2_replay_failure_degrades_to_history_only_and_still_serves_200() {
     assert_eq!(
         body["wait_set_reason"], "handler_not_registered",
         "the upstream reason must be passed through, not flattened: {body}"
+    );
+}
+
+// ── PR #1188 review round 2: the run's own workflow task row ───────────────
+
+/// A workflow task held by a worker means the handler is executing RIGHT NOW.
+/// Canonically a long local activity (issue #98), which schedules no queue row
+/// at all — so before this the run fell through every category and reported the
+/// alarming `no_pending_work`/`stalled`.
+#[tokio::test]
+async fn claimed_workflow_task_reports_healthy_not_a_lost_task() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "completes_wf", "RUNNING", vec![started_event()]).await;
+    seed_workflow_task(
+        &pool,
+        exec_id,
+        "default",
+        "RUNNING",
+        Some("w-live"),
+        "NOW()",
+    )
+    .await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
+    assert_eq!(body["health"], "healthy", "body: {body}");
+}
+
+/// A PENDING workflow task on a queue nothing polls: the decision cycle can
+/// never be claimed, so the run cannot advance even though nothing individual
+/// is wedged. The workflow-task analogue of AC3's flagship condition.
+#[tokio::test]
+async fn pending_workflow_task_with_no_live_worker_reports_workflow_no_worker() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "completes_wf", "RUNNING", vec![started_event()]).await;
+    seed_workflow_task(&pool, exec_id, "orphan-queue", "PENDING", None, "NOW()").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "workflow_no_worker", "body: {body}");
+    assert_eq!(body["blocked_on"]["queue"], "orphan-queue", "body: {body}");
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// The control for the test above: register a live poller and the verdict
+/// becomes ordinary dispatch latency, proving the stall verdict is driven by
+/// coverage rather than by the mere presence of a PENDING row.
+#[tokio::test]
+async fn pending_workflow_task_with_a_live_worker_is_healthy() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "completes_wf", "RUNNING", vec![started_event()]).await;
+    seed_workflow_task(&pool, exec_id, "covered-queue", "PENDING", None, "NOW()").await;
+    seed_live_worker(&pool, "w-covers", "covered-queue").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
+    assert_eq!(body["health"], "healthy", "body: {body}");
+}
+
+/// A parked workflow task (`RUNNING` with a NULL worker) advances on a *wake*,
+/// not a claim, so a live worker proves nothing: this is exactly the lost-task
+/// shape and its verdict must be unchanged.
+#[tokio::test]
+async fn parked_workflow_task_is_still_the_lost_task_verdict() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "completes_wf", "RUNNING", vec![started_event()]).await;
+    seed_workflow_task(&pool, exec_id, "default", "RUNNING", None, "NOW()").await;
+    seed_live_worker(&pool, "w-parked", "default").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "no_pending_work", "body: {body}");
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// The fallback must never flatten a specific verdict: a wedged activity AND a
+/// dead workflow queue reports the ACTIVITY, which is the actionable cause.
+#[tokio::test]
+async fn workflow_task_fallback_never_masks_a_wedged_activity() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_activity_task(
+        &pool,
+        exec_id,
+        "noop_activity",
+        "dead-activity-queue",
+        "PENDING",
+        1,
+        None,
+        "NOW()",
+    )
+    .await;
+    seed_workflow_task(&pool, exec_id, "dead-wf-queue", "PENDING", None, "NOW()").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(kind(&body), "activity_no_worker", "body: {body}");
+    assert_eq!(
+        body["blocked_on"]["queue"], "dead-activity-queue",
+        "the activity queue is the actionable one: {body}"
     );
 }
