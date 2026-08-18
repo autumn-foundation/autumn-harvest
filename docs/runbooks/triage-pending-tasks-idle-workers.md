@@ -218,7 +218,143 @@ designed — not a shortage of workers.
 
 ---
 
-### 6. `healthy`
+### 6. `activity_paused` — an operator is deliberately holding one activity type
+
+**What it means**: An operator has paused dispatch for a single **activity
+type**, fleet-wide (issue #807) — the surgical sibling of the queue pause above.
+It is the right tool when one downstream dependency is broken but the healthy
+work sharing its queue should keep flowing. **This is not an incident.** Held
+tasks stay `PENDING`, already-`RUNNING` tasks finish naturally, and the
+`schedule_to_start` timer is suspended for the duration of the hold.
+
+> **A pause does not stop the `schedule_to_close` clock.** Exactly as for the
+> queue pause above, only the *relative* `schedule_to_start` timer is suspended;
+> an activity declaring an **absolute** `schedule_to_close` deadline (issue #378)
+> will still be timed out during a long hold. Check what the held activity
+> declares before freezing it for longer than that deadline.
+
+Like `queue_paused`, it is listed **first** in the eligibility explainer's reason
+set because it is the operator's own deliberate action — check it before chasing
+a capacity or routing cause. A task can be held by **both** pauses at once; both
+codes are reported, so resuming the one you see first does not silently leave the
+task stuck behind the other.
+
+**Reported only for `task_type='activity'` rows.** A *workflow* task can
+legitimately carry a non-NULL `activity_name` (the engine stamps the
+`'mixed_signal_suspension'` sentinel there), and the claim gate is scoped by
+`task_type` so pausing an activity of that name cannot hold those workflow
+tasks. The explainer matches that scoping, so `activity_paused` never appears
+against a task the engine would happily dispatch.
+
+**A pause on a *local* activity is refused, not silently ineffective.** A
+`#[activity(local = true)]` activity (issue #98) runs **inline on the workflow
+worker** and never takes a `harvest_task_queue` row at all, so the claim-path
+gate a pause installs has nothing to hold — the invocations would keep running
+while the read endpoints reported a healthy-looking hold. `harvest activity
+pause` therefore rejects a name the management node has registered as local
+with a `400` naming the activity, rather than reporting containment it cannot
+deliver. To contain a local activity, hold the **queue** the calling workflows
+are dispatched on (§5, issue #619) — that stops the workflow tasks that would
+invoke it — or rely on the activity's circuit breaker if it declares one
+(issue #369). A name this node does *not* have registered is still accepted:
+a management node need not register every activity the fleet runs, and
+refusing an unregistered name would break holding a genuinely remote one.
+
+**Distinguish it from `circuit_open`.** Both name one activity type, but they
+answer different questions: `circuit_open` is the engine's *automatic, reactive*
+breaker fast-failing after failures accumulated (issue #369), while
+`activity_paused` is a human's *manual, proactive* hold that fails nothing. If
+you see `circuit_open`, something broke on its own; if you see
+`activity_paused`, someone decided.
+
+**How to verify**:
+
+```bash
+harvest activity list             # every registered type + its pause state
+harvest activity get charge_card  # just this one
+```
+
+`list` is driven by the registered **catalogue**, not the pause table, so a
+healthy activity is listed with `paused: false` — this is the surface that
+answers "is `charge_card` held?", and one that listed only the already-broken
+things could not. A paused-but-**unregistered** activity is listed too, flagged
+`registered: false`, so a mistyped hold can never become invisible on the one
+page used to find it. Each entry carries `reason` (why), `paused_by` (who),
+`paused_at` (since when), and `held_task_count` (how much work is waiting).
+
+**Check the `SCOPE` column before trusting `PAUSED: yes`.** It reports what the
+hold *actually* covers, derived from the shards that hold the activity versus
+the expected shard set — not the `scope_shard_id` intent recorded when the row
+was written:
+
+- `fleet` — every expected shard holds it.
+- `partial_fleet` — **some shards are still dispatching this activity.** A
+  fleet-wide pause that only reached part of the fleet writes
+  `scope_shard_id: null` on the shards it reached and *no row* on the ones it
+  missed, so intent alone cannot tell this apart from a complete hold. The
+  original request returned `207`, but a later read that reaches every shard
+  looks `complete` and its rows agree — this column is what still says
+  otherwise. Re-issue the pause; it is idempotent and preserves the original
+  provenance.
+- `shard` — every row is deliberately shard-scoped and they do not span the
+  fleet. Expected for a scoped hold; suspicious if you asked for fleet-wide.
+
+An unreachable shard counts as expected-but-not-holding — the safe direction,
+since it may still be dispatching — so a `partial` read also reports
+`partial_fleet`.
+
+**Corrective Actions**:
+- Confirm the downstream named in `reason` has actually recovered.
+- If `SCOPE` reads `partial_fleet`, re-issue the pause **before** triaging
+  anything else: part of the fleet never stopped.
+- Release the hold:
+  ```bash
+  harvest activity resume charge_card
+  ```
+  Held tasks become claimable immediately, and the time they spent held is
+  credited back to their `scheduled_at`, so a thaw does **not** retroactively
+  schedule-to-start-time-out the backlog. The command exits non-zero if the
+  release only partially applied (a shard was unreachable) — a `207` must never
+  look like success, because the shards it missed are still holding.
+- If the outage is still ongoing, leave the hold in place.
+- If the *whole* queue needs holding rather than one activity, prefer the queue
+  pause in §5; if many activity types on one queue are affected, holding the
+  queue once is easier to remember to release than N activity holds.
+
+**The full loop** — pause → triage → resume:
+
+```bash
+# 1. CONTAIN. Reason and actor are optional: containment must not wait on
+#    paperwork. Effective on every shard and worker within one poll interval.
+harvest activity pause charge_card --reason "payments provider 5xx" --actor alice
+
+# 2. TRIAGE. The backlog is visible and bounded, and it is not decaying:
+#    nothing is being failed, retried, or dead-lettered while held.
+harvest activity get charge_card       # held_task_count, reason, paused_by
+harvest workflow list --state RUNNING  # in-flight attempts finish naturally
+
+# 3. RELEASE, once the downstream is actually healthy.
+harvest activity resume charge_card
+```
+
+**Choosing between the three holds.** All three stop work; they differ in blast
+radius and in who decides:
+
+| | `harvest activity pause` (#807) | `harvest queue pause` (#619) | Circuit breaker (#369) |
+|---|---|---|---|
+| Scope | One **activity type**, fleet-wide | One **queue**, and everything on it | One activity type |
+| Who decides | A human, proactively | A human, proactively | The engine, reactively |
+| Effect on work | Held `PENDING`; nothing fails | Held `PENDING`; nothing fails | Fast-**fails** with `CircuitOpen` |
+| Reach for it when | One downstream is broken and healthy types share its queue | The whole queue's dependency is down, or many types on it are affected | You want automatic protection, configured ahead of time |
+
+An operator pause **wins over** a tripped breaker: the task is held before
+dispatch, so the breaker never gets to fast-fail it. Resuming the pause does
+**not** auto-close a tripped breaker — the breaker's own half-open probe still
+governs recovery, so a resume cannot accidentally re-arm a broken dependency.
+
+---
+
+### 7. `healthy`
 
 **What it means**: Eligible workers with available capacity are connected and polling.
 

@@ -144,6 +144,55 @@ pub const METRIC_ACTIVITY_ATTEMPTS: &str = "harvest.activity.attempts";
 /// never appear as labels here.
 pub const METRIC_ACTIVITY_RETRIES: &str = "harvest.activity.retries";
 
+/// Counter: incremented once per **effective** operator pause/resume action on
+/// an activity type (issue #807).
+///
+/// Labels:
+/// - `activity` (= [`METRIC_LABEL_ACTIVITY`]): the registered activity name (bounded)
+/// - `action` (= [`METRIC_LABEL_ACTION`]): [`ActivityPauseAction::as_str`] —
+///   exactly `pause` or `resume`
+///
+/// **Why a counter, not a gauge.** Its closest sibling `harvest.queue.paused`
+/// (issue #619) is a *gauge*, because a queue hold is a binary state whose
+/// *duration* is the thing an operator pages on. This one answers the
+/// different question issue #807 asks — how often the fleet is reaching for
+/// this lever, and on what — so it counts point-in-time actions. The current
+/// *state* is deliberately not derivable from it; `GET /activities`
+/// is the read model for that.
+///
+/// **Why not the `paused` noun.** `harvest_queue_paused` (gauge, issue #619)
+/// and `harvest_workflow_paused_total` (counter, issue #383) already disagree
+/// on instrument type under that noun. A third spelling would leave an
+/// operator guessing which shape they are graphing, so this one is named for
+/// what it actually counts.
+///
+/// **Emission contract.** Counted only when the action genuinely changed
+/// state — gate on `ActivityPauseOutcome::newly_paused` /
+/// `ActivityResumeOutcome::newly_resumed`, mirroring how
+/// [`MetricsRecorder::record_workflow_paused`] is gated on `newly_paused`
+/// (issue #383). Both mutations are idempotent by design, so an operator
+/// retry after a lost response must not read as a second hold.
+///
+/// **Cardinality (ADR-0001 §7).** `activity` is bounded **by bucketing**, not by
+/// validation. `activity_pause::validate_activity_name` bounds the name's
+/// *length*, not its *cardinality*, and the pause routes deliberately accept an
+/// **unregistered** name (so an operator can pre-pause an activity before its
+/// fleet rolls out, and a paused-but-unregistered hold stays inspectable) — so
+/// the raw name is caller-controlled free text. The emitter therefore resolves
+/// it against the registered activity catalogue and substitutes
+/// [`UNREGISTERED_ACTIVITY_NAME`] when it is absent, keeping the label bounded
+/// to the app's real activity set plus one sentinel series. Same fix, and same
+/// reason, as the #684 update-name label. `action` is bounded to two values by
+/// construction ([`ActivityPauseAction`]). `execution.id` is span-only and MUST
+/// NOT appear here.
+///
+/// The plain `activity` label (not the dotted `activity.name`) is the right
+/// one: the dotted variant exists solely so the circuit-breaker counters
+/// (issue #369) can match the ADR-0001 `activity.name` *span* attribute, while
+/// every other activity counter — `attempts`, `retries`, `panic`,
+/// `rate_limit.throttled` — uses [`METRIC_LABEL_ACTIVITY`].
+pub const METRIC_ACTIVITY_PAUSE_ACTIONS: &str = "harvest.activity.pause_actions";
+
 /// Counter: incremented when a durable timer is persisted.
 pub const METRIC_TIMER_STARTED: &str = "harvest.timer.started";
 
@@ -1135,6 +1184,26 @@ pub const METRIC_UPDATE_DURATION: &str = "harvest.update.duration";
 /// mislabeling any legitimately-registered (declarative or imperative) handler.
 pub const UNREGISTERED_UPDATE_NAME: &str = "__unregistered__";
 
+/// Sentinel `activity` label for [`METRIC_ACTIVITY_PAUSE_ACTIONS`] when the
+/// paused name is not in this process's registered activity catalogue
+/// (issue #807).
+///
+/// The pause routes deliberately accept an **unregistered** name: an operator
+/// must be able to pre-pause an activity type before its worker fleet rolls
+/// out, and a paused-but-unregistered activity is a real hold that must remain
+/// inspectable. That makes the raw name caller-controlled free text (bounded in
+/// *length* by `activity_pause::MAX_ACTIVITY_NAME_LEN`, but not in
+/// *cardinality*), which ADR-0001 §7 forbids as a metric label — a buggy
+/// remediation loop templating a tenant id into the name would mint unbounded
+/// permanent series.
+///
+/// Bucketing exactly that case here keeps the label bounded to the app's real
+/// activity set plus this one extra series, without mislabeling any legitimately
+/// registered activity. The durable `harvest_activity_pauses` row and the read
+/// API keep the raw name; only the metric label is bucketed. Same shape and
+/// same reasoning as [`UNREGISTERED_UPDATE_NAME`].
+pub const UNREGISTERED_ACTIVITY_NAME: &str = "__unregistered__";
+
 /// Bounded outcome classification for a worker-session acquisition attempt
 /// (issue #606).
 ///
@@ -1378,6 +1447,13 @@ pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
 /// Metric label: adaptive slot-tuner decision (`"grow"` / `"shrink"` / `"hold"`,
 /// issue #548).
 pub const METRIC_LABEL_DECISION: &str = "decision";
+/// Metric label: the operator action taken on an activity-type pause
+/// (`"pause"` / `"resume"`, issue #807).
+///
+/// Bounded by construction to the [`ActivityPauseAction`] variants — a call
+/// site passes the enum's `as_str()`, never a free string (same discipline as
+/// [`METRIC_LABEL_SCANNER`] and [`METRIC_LABEL_DECISION`]).
+pub const METRIC_LABEL_ACTION: &str = "action";
 /// Metric label: background control loop identity (issue #797).
 ///
 /// Bounded by construction to the [`Scanner`](crate::scanner_health::Scanner)
@@ -1797,6 +1873,32 @@ impl TunerDecision {
             Self::Grow => "grow",
             Self::Shrink => "shrink",
             Self::Hold => "hold",
+        }
+    }
+}
+
+/// The operator action taken on an activity-type pause (issue #807), used as
+/// the bounded `action` label on [`METRIC_ACTIVITY_PAUSE_ACTIONS`].
+///
+/// Exists so the label can never be a free string: the two values are the only
+/// two mutations `activity_pause` exposes, so cardinality is bounded by the
+/// type system rather than by convention (same reason [`TunerDecision`] and
+/// [`SlotType`] exist).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityPauseAction {
+    /// Dispatch for the activity type was held.
+    Pause,
+    /// A previously held activity type was released.
+    Resume,
+}
+
+impl ActivityPauseAction {
+    /// Stable string representation, suitable for metric tag values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
         }
     }
 }
@@ -2256,6 +2358,24 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge `harvest_queue_paused{queue}`.
     fn record_queue_paused(&self, queue: &str, paused: bool) {
         let _ = (queue, paused);
+    }
+
+    /// An operator paused or resumed dispatch for a whole activity type
+    /// (issue #807).
+    ///
+    /// Emitted from the pause/resume write path, **gated on the action having
+    /// genuinely changed state** (`newly_paused` / `newly_resumed`) so an
+    /// idempotent retry after a lost response does not read as a second hold —
+    /// the same gating [`record_workflow_paused`](Self::record_workflow_paused)
+    /// uses (issue #383).
+    ///
+    /// **Cardinality (ADR-0001 §7):** `activity_name` MUST be the validated,
+    /// canonicalised registered activity name (bounded); `action` is bounded to
+    /// two values by [`ActivityPauseAction`]. `execution.id` is never a label.
+    ///
+    /// Maps to the counter `harvest_activity_pause_actions_total{activity, action}`.
+    fn record_activity_pause_action(&self, activity_name: &str, action: ActivityPauseAction) {
+        let _ = (activity_name, action);
     }
 
     /// Periodic snapshot of a worker's dispatch-slot occupancy for one slot
@@ -3816,6 +3936,41 @@ mod tests {
         assert_eq!(TunerDecision::Grow.as_str(), "grow");
         assert_eq!(TunerDecision::Shrink.as_str(), "shrink");
         assert_eq!(TunerDecision::Hold.as_str(), "hold");
+    }
+
+    // -----------------------------------------------------------------------
+    // Activity-type pause/resume counter (issue #807)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn activity_pause_actions_counter_has_correct_name_and_labels() {
+        // OTel semantic naming: instrument.noun (dot-separated). Deliberately
+        // NOT `harvest.activity.paused`: `harvest.queue.paused` is a gauge
+        // (#619) and `harvest.workflow.paused` is a counter (#383), so a third
+        // reuse of that noun would be ambiguous about instrument type.
+        assert_eq!(
+            METRIC_ACTIVITY_PAUSE_ACTIONS,
+            "harvest.activity.pause_actions"
+        );
+        assert_eq!(METRIC_LABEL_ACTION, "action");
+        // The plain `activity` label, not the dotted circuit-breaker variant.
+        assert_eq!(METRIC_LABEL_ACTIVITY, "activity");
+    }
+
+    #[test]
+    fn activity_pause_action_stringify_is_bounded() {
+        assert_eq!(ActivityPauseAction::Pause.as_str(), "pause");
+        assert_eq!(ActivityPauseAction::Resume.as_str(), "resume");
+    }
+
+    #[test]
+    fn activity_pause_action_counter_has_a_default_noop_impl() {
+        // record_activity_pause_action must exist on MetricsRecorder with a
+        // no-op default so adding it is not a breaking change for existing
+        // implementers (issue #807).
+        let rec = NoOpMetrics;
+        rec.record_activity_pause_action("charge_card", ActivityPauseAction::Pause);
+        rec.record_activity_pause_action("charge_card", ActivityPauseAction::Resume);
     }
 
     #[test]
