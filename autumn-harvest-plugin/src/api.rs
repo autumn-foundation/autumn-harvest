@@ -32914,6 +32914,43 @@ fn insert_activity_pause_fields(
     );
 }
 
+/// A single-activity read found nothing: is that a definitive "does not exist",
+/// or an unanswerable question?
+///
+/// Returning `404` asserts nonexistence. That assertion is only true when every
+/// expected shard was inspected — a pause row living **only** on an unreachable
+/// shard produces exactly the same empty result, and the routes deliberately
+/// accept unregistered names (a management node need not register every
+/// activity the fleet runs), so this is a reachable state, not a theoretical
+/// one. Answering `404` there tells an operator the hold does not exist while
+/// it is actively holding work on the shard that could not be read.
+///
+/// So the read fails **closed** with `503` while any shard is unaccounted for,
+/// naming them — the same rule the `(workflow_name, workflow_id)` resolver
+/// (issue #805) applies for the same reason: "fail closed with 503 rather than
+/// risk a false 404".
+fn activity_missing_error(
+    activity_name: &str,
+    status: shard_fanout::FanoutStatus,
+    unavailable: &[shard_fanout::UnavailableShard],
+) -> AutumnError {
+    if matches!(status, shard_fanout::FanoutStatus::Complete) {
+        return AutumnError::not_found_msg(format!(
+            "activity '{activity_name}' is not registered and is not paused"
+        ));
+    }
+    let shards = unavailable
+        .iter()
+        .map(|u| u.shard_id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    AutumnError::service_unavailable_msg(format!(
+        "activity '{activity_name}' is not registered here and no pause row was found, \
+         but shard(s) [{shards}] could not be inspected; cannot rule out a hold there \
+         without risking a false 404"
+    ))
+}
+
 /// The shard set a hold is expected to span, as a sorted `Vec`.
 ///
 /// One definition shared by the queue-pause (#619) and activity-pause (#807)
@@ -33092,11 +33129,14 @@ async fn get_activity_handler(
 
     // `merge_activity_catalog_rows` emits one entry per name in the union of
     // (catalogue, pause rows); both are already narrowed to this name, so an
-    // empty result means the name is genuinely unknown here.
+    // empty result means the name is unknown *on the shards that answered* --
+    // which is only the same as "unknown" when every shard answered.
     let Some(activity) = merged.pop() else {
-        return Err(AutumnError::not_found_msg(format!(
-            "activity '{activity_name}' is not registered and is not paused"
-        )));
+        return Err(activity_missing_error(
+            &activity_name,
+            collected.status,
+            &collected.unavailable_shards,
+        ));
     };
 
     Ok(Json(serde_json::json!({
@@ -42267,6 +42307,51 @@ mod tests {
             paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
             scope_shard_id: scope,
             held_task_count: held,
+        }
+    }
+
+    /// Issue #807 review: a single-activity read must not assert nonexistence
+    /// while a shard is unaccounted for.
+    ///
+    /// The routes deliberately accept **unregistered** names — a management node
+    /// need not register every activity the fleet runs — so "not in this
+    /// process's catalogue, and no pause row on the shards that answered" is
+    /// reachable with a live hold sitting on the shard that did not answer. A
+    /// `404` there tells an operator the hold does not exist while it is
+    /// actively holding work. Same rule as the `(workflow_name, workflow_id)`
+    /// resolver (#805): fail closed rather than risk a false 404.
+    #[test]
+    fn single_activity_read_fails_closed_while_a_shard_is_unaccounted_for() {
+        let down = vec![shard_fanout::UnavailableShard {
+            shard_id: 1,
+            reason: "connect timeout".to_string(),
+        }];
+
+        // Every shard answered: the negative is real, so 404 is the honest answer.
+        let complete =
+            activity_missing_error("charge_card", shard_fanout::FanoutStatus::Complete, &[]);
+        assert_eq!(
+            complete.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "a fully-observed miss is a genuine 404"
+        );
+
+        // A shard is missing: the hold may be there, so the read must not deny it.
+        for status in [
+            shard_fanout::FanoutStatus::Partial,
+            shard_fanout::FanoutStatus::Unavailable,
+        ] {
+            let err = activity_missing_error("charge_card", status, &down);
+            assert_eq!(
+                err.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{status:?}: an unobserved shard must not be reported as absence"
+            );
+            assert!(
+                format!("{err:?}").contains('1'),
+                "{status:?}: the unreachable shard must be named so the operator \
+                 knows where to re-check: {err:?}"
+            );
         }
     }
 

@@ -418,6 +418,41 @@ pub const fn resume_shift_scheduled_at_query() -> &'static str {
 /// for every task, paused or not — the exact trade this module's design notes
 /// reject for the claim path.
 ///
+/// # Why the ids round-trip through this process
+///
+/// The exclusion set is loaded into application memory and sent back as an
+/// array bind, so it is linear in the released backlog: one `Uuid` per shifted
+/// task, re-serialised onto the wire and re-materialised server-side by
+/// `unnest`. On a large incident backlog that is real memory and real
+/// connection traffic.
+///
+/// It is nevertheless the shipped design, because the obvious database-side
+/// alternative was **tried and reverted** on the queue-pause sibling (issue
+/// #619, rounds 23–24): capturing the ids into a transaction-scoped
+/// `CREATE TEMP TABLE ... ON COMMIT DROP` needs the database-level `TEMPORARY`
+/// privilege, which no migration grants and no preflight check validates — so a
+/// deployment that has revoked it (a recognised hardening step) passes every
+/// permission check and then fails **every** resume, rolling back the pause
+/// deletion and leaving the activity frozen at precisely the moment an operator
+/// is trying to thaw it. A rare, observable scale problem is a better failure
+/// than a deterministic, silent, config-dependent break of the feature's core
+/// operation.
+///
+/// Re-applying the credit instead of excluding is not an option either: the
+/// primary formula is a *relative* `+=`, so a second application over-credits —
+/// pushing `scheduled_at` past commit time, the one direction the queue-pause
+/// notes call out as unsafe. And folding both passes into one statement with a
+/// data-modifying CTE defeats the purpose outright: both halves would share a
+/// single snapshot, so the late pass would see exactly the rows the primary one
+/// did and catch nothing.
+///
+/// Exposure here is strictly smaller than the already-shipped queue sibling's:
+/// this set is one activity type's backlog, a subset of the queue backlog that
+/// one bounds. The proper fix is shared with it and tracked as a follow-up — a
+/// real handoff table keyed by a per-resume token, covered by the grants the
+/// migration already issues, rather than a privilege the deployment may not
+/// have.
+///
 /// Binds: `$1` = activity name, `$2` = the hold's `paused_at`, `$3` = the ids
 /// the primary pass reported shifting.
 #[must_use]

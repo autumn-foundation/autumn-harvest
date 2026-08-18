@@ -7276,7 +7276,7 @@
           "status",
           "unavailable_shards"
         ],
-        "notes": "`activity` is a single entry with the same shape as one element of `GET /activities` (see its notes). `status`/`unavailable_shards` are reported here too, and for the same reason: on a partial read `paused: false` means only \"not paused on the shards that could be reached\". A 404 on a partial read is likewise scoped to what could be observed -- re-check once every shard is reachable."
+        "notes": "`activity` is a single entry with the same shape as one element of `GET /activities` (see its notes). `status`/`unavailable_shards` are reported here too, and for the same reason: on a partial read `paused: false` means only \"not paused on the shards that could be reached\". A 404 is only returned when EVERY expected shard was inspected: the routes deliberately accept unregistered names, so \"not in this process's catalogue and no pause row on the shards that answered\" is reachable with a live hold sitting on a shard that did not answer, and asserting nonexistence there would deny a hold that is actively holding work. While any shard is unaccounted for the read fails closed with 503 naming those shards -- the same rule the (workflow_name, workflow_id) resolver applies."
       },
       "error_responses": [
         {
@@ -7285,7 +7285,7 @@
         },
         {
           "status": 404,
-          "description": "The activity is neither registered in this process nor currently paused on any reachable shard."
+          "description": "The activity is neither registered in this process nor currently paused, AND every expected shard was inspected. A miss on an incomplete read is reported as 503 instead, so a 404 always means a fully-observed absence."
         },
         {
           "status": 400,
@@ -7293,7 +7293,7 @@
         },
         {
           "status": 503,
-          "description": "Harvest storage pool is not configured."
+          "description": "Harvest storage pool is not configured, OR the activity was not found while at least one expected shard could not be inspected -- the read fails closed rather than returning a 404 that could deny a live hold on the unreachable shard. The message names the shard(s) to re-check."
         }
       ]
     },
