@@ -294,5 +294,14 @@ name = "dlq_aggregate_profile"
 required-features = ["db"]
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `stall_diagnosis::classify_execution` -- the pure root-cause classifier
+# behind `GET /api/harvest/workflows/{id}/diagnose` (issue #809). No feature
+# requirement: `stall_diagnosis` is pure and unconditional (no DB access). See
+# `benches/stall_diagnosis_profile.rs`.
+[[bench]]
+name = "stall_diagnosis_profile"
+harness = false
+
 [lints]
 workspace = true

@@ -664,6 +664,69 @@ pub const fn activity_precedence(blocked: &BlockedOn) -> u8 {
     }
 }
 
+/// Allocation-free precedence-only mirror of
+/// `activity_precedence(&classify_pending_activity(facts, now))`.
+///
+/// `classify_execution`'s activity fold ranks every pending row to find the
+/// single worst one, but `classify_pending_activity` clones
+/// `activity_name`/`last_error`/etc. on most branches to build the full
+/// `BlockedOn` — work that is wasted for every row except the eventual
+/// winner. This function walks the *identical* branch order and guard
+/// conditions (including the "flag set but its companion field is absent ->
+/// fall through to the next branch" semantics of the `&& let Some(...)`
+/// guards below) but returns only the bare precedence integer, with no
+/// `String` clone and no `BlockedOn` allocation — so a wide fan-out can be
+/// ranked in one allocation-free pass, and the real `BlockedOn` materialized
+/// exactly once, for the winning row only.
+///
+/// # Invariant
+///
+/// For every `facts`/`now` this MUST return the same value as
+/// `activity_precedence(&classify_pending_activity(facts, now))`. Any future
+/// edit to `classify_pending_activity`'s branch order or conditions must be
+/// mirrored here;
+/// `activity_precedence_for_facts_props::matches_classify_then_precedence`
+/// below is a property test guarding the two functions from drifting apart.
+#[must_use]
+fn activity_precedence_for_facts(facts: &PendingActivityFacts, now: DateTime<Utc>) -> u8 {
+    if facts.task_state != "PENDING" {
+        return if facts.claimant_is_live.unwrap_or(facts.has_live_worker) {
+            0 // HealthyInProgress
+        } else {
+            7 // ActivityNoWorker
+        };
+    }
+    if facts.queue_paused {
+        return 9; // ActivityQueuePaused
+    }
+    if facts.activity_paused && facts.activity_name.is_some() {
+        return 8; // ActivityPaused
+    }
+    if !facts.has_live_worker {
+        return 7; // ActivityNoWorker
+    }
+    if facts.rate_limit_bucket_missing && facts.rate_limit_key.is_some() {
+        return 6; // ActivityRateLimitBucketMissing
+    }
+    if facts.circuit_phase.is_some() && facts.activity_name.is_some() {
+        return 5; // ActivityCircuitOpen
+    }
+    if facts.scheduled_at > now {
+        return if facts.last_error.is_some() {
+            2 // ActivityRetrying
+        } else {
+            1 // ActivityDeferred
+        };
+    }
+    if facts.concurrency_saturated && facts.concurrency_key.is_some() {
+        return 4; // ActivityConcurrencyDeferred
+    }
+    if facts.rate_limit_saturated && facts.rate_limit_key.is_some() {
+        return 3; // ActivityRateLimited
+    }
+    0 // HealthyInProgress
+}
+
 /// Classify a single pending activity task row.
 ///
 /// A task a worker already holds (`RUNNING`) is [`BlockedOn::HealthyInProgress`]
@@ -1018,23 +1081,27 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
     // `max_by_key` keeps the LAST maximum, so the scan is written explicitly to
     // keep the FIRST row of an equal-ranked tie — deterministic given the
     // caller's own deterministic row ordering.
-    let worst_activity =
-        inputs
-            .activities
-            .iter()
-            .fold(None::<BlockedOn>, |worst: Option<BlockedOn>, facts| {
-                let candidate = classify_pending_activity(facts, now);
-                match worst {
-                    Some(current)
-                        if activity_precedence(&current) >= activity_precedence(&candidate) =>
-                    {
-                        Some(current)
-                    }
-                    _ => Some(candidate),
+    //
+    // Ranking is a two-pass split: first find the winning INDEX using only
+    // `activity_precedence_for_facts` (no `String` clone, no `BlockedOn`
+    // allocation per candidate), then materialize the actual `BlockedOn` via
+    // `classify_pending_activity` exactly once, for the winning row only —
+    // instead of once per candidate with every non-winning result
+    // immediately discarded.
+    let worst_activity_index = inputs.activities.iter().enumerate().fold(
+        None::<(usize, u8)>,
+        |worst: Option<(usize, u8)>, (idx, facts)| {
+            let candidate_precedence = activity_precedence_for_facts(facts, now);
+            match worst {
+                Some((_, current_precedence)) if current_precedence >= candidate_precedence => {
+                    worst
                 }
-            });
-    if let Some(verdict) = worst_activity {
-        return Some(verdict);
+                _ => Some((idx, candidate_precedence)),
+            }
+        },
+    );
+    if let Some((idx, _)) = worst_activity_index {
+        return Some(classify_pending_activity(&inputs.activities[idx], now));
     }
 
     // Category ladder below the activity bucket. Mirrors issue #486's own
@@ -3930,6 +3997,146 @@ mod tests {
                 !summary.contains("  "),
                 "{verdict:?} summary has a doubled space: {summary}",
             );
+        }
+    }
+
+    /// `activity_precedence_for_facts` MUST never disagree with
+    /// `activity_precedence(&classify_pending_activity(..))` -- if it did, the
+    /// allocation-free ranking pass in `classify_execution`'s activity fold
+    /// could pick a different winning row than the one it actually reports,
+    /// silently mis-diagnosing a stalled fan-out. Sweeps every
+    /// branch-relevant field independently (including the "flag set but its
+    /// companion field is absent" fallthrough shapes the guarded branches
+    /// rely on) so a future edit to either function's branch order or
+    /// conditions that drifts the two apart fails loudly here, in the same
+    /// commit, instead of silently at diagnosis time.
+    ///
+    /// Every `Option<String>` field varies only in `Some`/`None`, since the
+    /// decision tree never inspects string *content* -- only presence.
+    /// `PROPTEST_CASES` overrides the (low) default case count; on-disk
+    /// failure persistence is disabled to keep CI runners artifact-free.
+    mod activity_precedence_for_facts_props {
+        use super::{
+            BlockingCircuitPhase, PendingActivityFacts, activity_precedence,
+            activity_precedence_for_facts, classify_pending_activity, t,
+        };
+        use proptest::prelude::*;
+
+        fn config() -> proptest::test_runner::Config {
+            let cases = std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&c| c > 0)
+                .unwrap_or(512);
+            proptest::test_runner::Config {
+                cases,
+                failure_persistence: None,
+                ..proptest::test_runner::Config::default()
+            }
+        }
+
+        /// `Some("x")` vs `None` -- the decision tree only ever checks
+        /// presence, never content, for every `Option<String>` field below.
+        fn opt_string() -> impl Strategy<Value = Option<String>> {
+            any::<bool>().prop_map(|present| present.then(|| "x".to_string()))
+        }
+
+        fn task_state() -> impl Strategy<Value = String> {
+            prop_oneof![Just("PENDING"), Just("RUNNING"), Just("COMPLETED")].prop_map(String::from)
+        }
+
+        fn claimant_is_live() -> impl Strategy<Value = Option<bool>> {
+            prop_oneof![Just(None), Just(Some(true)), Just(Some(false))]
+        }
+
+        fn circuit_phase() -> impl Strategy<Value = Option<BlockingCircuitPhase>> {
+            prop_oneof![
+                Just(None),
+                Just(Some(BlockingCircuitPhase::Open)),
+                Just(Some(BlockingCircuitPhase::HalfOpen)),
+            ]
+        }
+
+        // proptest implements `Strategy` for tuples only up to a bounded
+        // arity, well under the 14 fields swept here -- grouped into two
+        // 7-tuples (each safely under that limit) composed as one 2-tuple.
+        #[allow(clippy::type_complexity)]
+        fn facts() -> impl Strategy<Value = PendingActivityFacts> {
+            let group_a = (
+                task_state(),
+                claimant_is_live(),
+                any::<bool>(), // has_live_worker
+                any::<bool>(), // queue_paused
+                any::<bool>(), // activity_paused
+                opt_string(),  // activity_name
+                any::<bool>(), // rate_limit_bucket_missing
+            );
+            let group_b = (
+                opt_string(), // rate_limit_key
+                circuit_phase(),
+                any::<bool>(), // scheduled_at after `now`
+                opt_string(),  // last_error
+                any::<bool>(), // concurrency_saturated
+                opt_string(),  // concurrency_key
+                any::<bool>(), // rate_limit_saturated
+            );
+            (group_a, group_b).prop_map(
+                |(
+                    (
+                        task_state,
+                        claimant_is_live,
+                        has_live_worker,
+                        queue_paused,
+                        activity_paused,
+                        activity_name,
+                        rate_limit_bucket_missing,
+                    ),
+                    (
+                        rate_limit_key,
+                        circuit_phase,
+                        scheduled_after_now,
+                        last_error,
+                        concurrency_saturated,
+                        concurrency_key,
+                        rate_limit_saturated,
+                    ),
+                )| PendingActivityFacts {
+                    activity_name,
+                    queue: "q".to_string(),
+                    task_state,
+                    attempt: 1,
+                    last_error,
+                    scheduled_at: if scheduled_after_now { t(10) } else { t(-10) },
+                    rate_limit_key,
+                    concurrency_key,
+                    queue_paused,
+                    activity_paused,
+                    has_live_worker,
+                    claimant_is_live,
+                    circuit_phase,
+                    circuit_cooldown_until: None,
+                    rate_limit_saturated,
+                    rate_limit_bucket_missing,
+                    concurrency_saturated,
+                },
+            )
+        }
+
+        proptest! {
+            #![proptest_config(config())]
+
+            #[test]
+            fn matches_classify_then_precedence(facts in facts()) {
+                let now = t(0);
+                let mirrored = activity_precedence_for_facts(&facts, now);
+                let via_classify = activity_precedence(&classify_pending_activity(&facts, now));
+                prop_assert_eq!(
+                    mirrored,
+                    via_classify,
+                    "precedence mirror drifted from classify_pending_activity for {:?}",
+                    facts
+                );
+            }
         }
     }
 }
