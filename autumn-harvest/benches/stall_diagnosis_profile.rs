@@ -144,11 +144,19 @@ fn no_worker_activity(idx: usize, now: DateTime<Utc>) -> PendingActivityFacts {
     }
 }
 
+/// Where [`build_inputs`] plants the genuine `activity_no_worker` root
+/// cause: two-thirds of the way into the fan-out, clamped to the last valid
+/// index. Shared with [`validate_workload_params`] so the planted position
+/// and the "is it actually interior" check can never drift apart.
+fn no_worker_index(n: usize) -> usize {
+    (n * 2 / 3).min(n.saturating_sub(1))
+}
+
 /// Build the fixed, realistic fan-out this harness diagnoses repeatedly:
 /// ~70% retry backoff, ~20% healthy, ~9% open-breaker, and exactly one
 /// genuine `activity_no_worker` row placed at two-thirds of the way through.
 fn build_inputs(n: usize, now: DateTime<Utc>) -> DiagnosisInputs {
-    let no_worker_index = (n * 2 / 3).min(n.saturating_sub(1));
+    let no_worker_index = no_worker_index(n);
     let activities: Vec<PendingActivityFacts> = (0..n)
         .map(|idx| {
             if idx == no_worker_index {
@@ -178,16 +186,65 @@ fn build_inputs(n: usize, now: DateTime<Utc>) -> DiagnosisInputs {
     }
 }
 
+/// Reads `key` as a `usize`, using `default` only when the variable is
+/// genuinely *absent*. A *present but malformed* value (a typo, e.g.
+/// `STALL_DIAGNOSIS_PROFILE_N=50O`, or non-Unicode content) is a
+/// configuration error, not silently substituted for the default -- a
+/// harness whose whole point is producing a specific, documented,
+/// reproducible number must not silently profile a *different*
+/// configuration than the one actually requested and report success as if
+/// nothing were wrong (the fixture's own sanity check would still pass,
+/// since it's computed from the same substituted value).
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Ok(raw) => raw
+            .parse()
+            .unwrap_or_else(|e| panic!("{key}={raw:?} is not a valid usize: {e}")),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            panic!("{key}={} is not valid Unicode", raw.to_string_lossy())
+        }
+    }
+}
+
+/// Rejects a workload size that would silently stop exercising the
+/// documented "wide fan-out with a genuine root cause away from either end"
+/// shape this harness exists to measure -- so shortening a Valgrind run
+/// can't quietly produce measurements for a degenerate workload instead.
+fn validate_workload_params(n: usize, reps: usize) {
+    // reps=0 skips the measured loop entirely -- the harness would exit 0
+    // and print a plausible-looking summary line without ever profiling the
+    // fold beyond the one unmeasured sanity call, which a profiler pointed
+    // at the resulting process could easily mistake for a valid
+    // (implausibly fast) measurement.
+    assert!(
+        reps >= 1,
+        "STALL_DIAGNOSIS_PROFILE_REPS must be at least 1, got 0"
+    );
+    // n=0 builds no activities at all, so the fold never finds the planted
+    // `activity_no_worker` row and the sanity check below fails with an
+    // opaque mismatch instead of a message naming the actual problem.
+    assert!(
+        n >= 1,
+        "STALL_DIAGNOSIS_PROFILE_N must be at least 1, got 0"
+    );
+    let idx = no_worker_index(n);
+    // For n in 1..=3 the planted row lands at index 0 or n-1 -- the first
+    // or last position -- no longer exercising the documented "away from
+    // either end" wide-fan-out workload the fold's worst-of tie-break logic
+    // is meant to be tested against.
+    assert!(
+        idx > 0 && idx < n - 1,
+        "STALL_DIAGNOSIS_PROFILE_N={n} is too small: the planted activity_no_worker row would \
+         land at index {idx} (the first or last position), no longer exercising the documented \
+         'away from either end' wide-fan-out workload -- use a larger N (>= 4)"
+    );
 }
 
 fn main() {
     let n = env_usize("STALL_DIAGNOSIS_PROFILE_N", 500);
     let reps = env_usize("STALL_DIAGNOSIS_PROFILE_REPS", 2_000);
+    validate_workload_params(n, reps);
     let now = now();
 
     let inputs = build_inputs(n, now);
