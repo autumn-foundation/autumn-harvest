@@ -259,8 +259,14 @@ fn main() {
         "fixture bug: fold did not find the planted worst-case row"
     );
 
-    let mut kind_tally: std::collections::HashMap<&'static str, u64> =
-        std::collections::HashMap::new();
+    // BTreeMap, not HashMap: this tally is read inside the measured loop
+    // below, and HashMap's default RandomState hasher is seeded per-process
+    // -- its SipHash instructions would leak into the profiled instruction
+    // count and make two "identical" runs diverge. BTreeMap is Ord-keyed
+    // (no hashing at all), so it costs nothing extra and keeps the profile
+    // reproducible bit-for-bit.
+    let mut kind_tally: std::collections::BTreeMap<&'static str, u64> =
+        std::collections::BTreeMap::new();
     for _ in 0..reps {
         // Mirrors the real HTTP handler: `db_verdict` first, then `blocked_on`
         // again after (in production, conditionally) populating replay-only
