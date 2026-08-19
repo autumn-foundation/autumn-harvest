@@ -1072,6 +1072,48 @@ pub struct ConcurrencyKeyStats {
     /// Number of tasks in `PENDING` state for this key+type (may be deferred
     /// by the cap if `in_flight >= max_concurrent`).
     pub pending: i64,
+    /// Workflow types observed on this key, each with the overflow strategy
+    /// their registered [`crate::concurrency::ConcurrencyPolicy`] declares
+    /// (issue #811).
+    ///
+    /// **Populated only by the management API** (`GET /admin/concurrency`),
+    /// which has the handler registry needed to resolve a declared strategy.
+    /// The worker's in-process concurrency sampler leaves this empty — it reads
+    /// only the counters above, so the extra join is never on its hot path.
+    /// `skip_serializing_if` keeps the sampler-shaped value byte-identical to
+    /// the pre-#811 wire form.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflows: Vec<ConcurrencyWorkflowStrategy>,
+}
+
+/// A workflow type observed on a concurrency key, with the overflow strategy
+/// its registered policy declares (issue #811).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConcurrencyWorkflowStrategy {
+    /// The workflow type name.
+    pub workflow_name: String,
+    /// Effective `on_conflict` strategy for new starts of this workflow type:
+    /// `"defer"` (wait for a slot) or `"cancel_running"` (latest-wins — cancel
+    /// the oldest running run(s) and admit the newcomer).
+    ///
+    /// A workflow whose registered `WorkflowInfo` declares no concurrency
+    /// policy reports `defer`, matching what the start path resolves.
+    pub on_conflict: crate::concurrency::ConcurrencyOnConflict,
+}
+
+/// A `(concurrency_key, task_type)` group and one workflow type observed on it.
+///
+/// Returned by [`concurrency_key_workflows`]; the management API joins these
+/// against the handler registry to resolve each workflow's declared
+/// `on_conflict` strategy (issue #811).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcurrencyKeyWorkflow {
+    /// The concurrency group key.
+    pub key: String,
+    /// Task type this row covers (`"workflow"` or `"activity"`).
+    pub task_type: String,
+    /// Workflow type owning the task(s) in this group.
+    pub workflow_name: String,
 }
 
 /// Return live concurrency stats for all keys visible in the given queues.
@@ -1127,9 +1169,73 @@ pub async fn concurrency_key_stats(
             max_concurrent: r.max_concurrent,
             in_flight: r.in_flight,
             pending: r.pending,
+            workflows: Vec::new(),
         })
         .collect())
 }
+
+/// Return the workflow types observed on each live `(concurrency_key,
+/// task_type)` group in the given queues (issue #811).
+///
+/// Mirrors [`concurrency_key_stats`]'s row filter exactly, joined to
+/// `harvest_workflow_executions` so each group can be attributed to the
+/// workflow type(s) that produced it. The management API joins the result
+/// against the handler registry to report each workflow's declared
+/// `on_conflict` strategy; the worker's sampler never calls this.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn concurrency_key_workflows(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+) -> HarvestResult<Vec<ConcurrencyKeyWorkflow>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        key: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        task_type: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        workflow_name: String,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(CONCURRENCY_ATTRIBUTION_SQL)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ConcurrencyKeyWorkflow {
+            key: r.key,
+            task_type: r.task_type,
+            workflow_name: r.workflow_name,
+        })
+        .collect())
+}
+
+/// SQL for [`concurrency_key_workflows`].
+///
+/// Named (rather than inlined) so a unit test can assert it shares
+/// [`concurrency_key_stats`]'s row filter — the two are separate statements
+/// and would otherwise be free to drift.
+const CONCURRENCY_ATTRIBUTION_SQL: &str = "SELECT \
+             t.concurrency_key AS key, \
+             t.task_type, \
+             e.workflow_name \
+         FROM harvest_task_queue t \
+         JOIN harvest_workflow_executions e ON e.id = t.workflow_exec_id \
+         WHERE t.concurrency_key IS NOT NULL \
+           AND t.concurrency_cap IS NOT NULL \
+           AND t.queue_name = ANY($1) \
+           AND (t.state = 'PENDING' OR (t.state = 'RUNNING' AND t.worker_id IS NOT NULL)) \
+         GROUP BY t.concurrency_key, t.task_type, e.workflow_name";
+
+/// Test probe: the attribution SQL, exposed so the drift guard can read it.
+#[cfg(test)]
+const CONCURRENCY_ATTRIBUTION_PREDICATE_PROBE: &str = CONCURRENCY_ATTRIBUTION_SQL;
 
 /// Mark a task as completed with the given output.
 ///
@@ -3864,6 +3970,100 @@ pub async fn pending_queue_demand_by_queue_name(
 mod tests {
     use super::*;
     use crate::error::CapabilityMissPhase;
+
+    // ── Issue #811: latest-wins strategy on the concurrency admin read ──────
+
+    /// `GET /admin/concurrency` is a `free_form` contract route, so the
+    /// `contract_regression` cross-check cannot catch a drift in this shape.
+    /// Pin it here: a sampler-shaped row (no registry, so no attribution) must
+    /// serialize byte-identically to the pre-#811 wire form, and an
+    /// admin-shaped row must carry the strategy an operator reads.
+    #[test]
+    fn concurrency_key_stats_serializes_workflows_only_when_populated() {
+        let sampler_shaped = ConcurrencyKeyStats {
+            key: "tenant-42".to_string(),
+            task_type: "workflow".to_string(),
+            max_concurrent: 1,
+            in_flight: 1,
+            pending: 3,
+            workflows: Vec::new(),
+        };
+        let json = serde_json::to_value(&sampler_shaped).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "key": "tenant-42",
+                "task_type": "workflow",
+                "max_concurrent": 1,
+                "in_flight": 1,
+                "pending": 3,
+            }),
+            "an empty attribution list must be omitted entirely, so the \
+             worker-sampler-shaped value is byte-identical to pre-#811"
+        );
+
+        let admin_shaped = ConcurrencyKeyStats {
+            workflows: vec![
+                ConcurrencyWorkflowStrategy {
+                    workflow_name: "doc_index".to_string(),
+                    on_conflict: crate::concurrency::ConcurrencyOnConflict::CancelRunning,
+                },
+                ConcurrencyWorkflowStrategy {
+                    workflow_name: "doc_report".to_string(),
+                    on_conflict: crate::concurrency::ConcurrencyOnConflict::Defer,
+                },
+            ],
+            ..sampler_shaped
+        };
+        let json = serde_json::to_value(&admin_shaped).expect("serialize");
+        assert_eq!(
+            json["workflows"],
+            serde_json::json!([
+                {"workflow_name": "doc_index", "on_conflict": "cancel_running"},
+                {"workflow_name": "doc_report", "on_conflict": "defer"},
+            ]),
+            "the admin read must surface each workflow's effective strategy \
+             using the same snake_case wire values the macro attribute accepts"
+        );
+
+        // Round-trips, so a client deserializing the admin shape (and an older
+        // client deserializing the sampler shape) both work.
+        let back: ConcurrencyKeyStats =
+            serde_json::from_value(json).expect("admin shape must round-trip");
+        assert_eq!(back.workflows.len(), 2);
+        let legacy: ConcurrencyKeyStats = serde_json::from_value(serde_json::json!({
+            "key": "k",
+            "task_type": "activity",
+            "max_concurrent": 2,
+            "in_flight": 0,
+            "pending": 0,
+        }))
+        .expect("a pre-#811 payload must still deserialize");
+        assert!(legacy.workflows.is_empty());
+    }
+
+    /// The attribution query must select exactly the same live rows the stats
+    /// query counts, or a key could report a workflow it has no live task for
+    /// (or omit the one it does). Pin the shared predicate textually — the two
+    /// are separate `sql_query` strings that can silently drift.
+    #[test]
+    fn concurrency_attribution_query_matches_the_stats_row_filter() {
+        // Both queries are private string literals; assert on the shared
+        // predicate fragments rather than the whole statement so formatting
+        // changes do not make this brittle.
+        for fragment in [
+            "concurrency_key IS NOT NULL",
+            "concurrency_cap IS NOT NULL",
+            "state = 'PENDING'",
+            "state = 'RUNNING'",
+            "worker_id IS NOT NULL",
+        ] {
+            assert!(
+                CONCURRENCY_ATTRIBUTION_PREDICATE_PROBE.contains(fragment),
+                "attribution query must share the stats row filter fragment `{fragment}`"
+            );
+        }
+    }
 
     // ── Issue #774: queue coverage — pending-demand query ───────────────────
 

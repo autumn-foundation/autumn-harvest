@@ -1505,6 +1505,7 @@ pub async fn trigger_unified_dag(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict::default(),
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -4411,12 +4412,14 @@ async fn tick_one_workflow_schedule(
             .clone()
             .unwrap_or(serde_json::Value::Null);
         let wf_info = registry.workflows.get(wf_name);
-        let (concurrency_key, concurrency_limit) = wf_info
-            .and_then(|info| info.concurrency.as_ref())
-            .map_or((None, None), |policy| {
-                let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
-                (key, Some(policy.limit))
-            });
+        let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+            wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
+                (None, None, crate::concurrency::ConcurrencyOnConflict::Defer),
+                |policy| {
+                    let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                    (key, Some(policy.limit), policy.on_conflict)
+                },
+            );
         let (owner, runbook_url, severity) = {
             let wf_meta = wf_info.map(|info| (info.owner, info.runbook_url, info.severity));
             let dag_meta = registered_dags.get(wf_name).map(|dag| {
@@ -4516,6 +4519,7 @@ async fn tick_one_workflow_schedule(
                     priority: None,
                     concurrency_key: concurrency_key.clone(),
                     concurrency_limit,
+                    concurrency_on_conflict: Some(concurrency_on_conflict),
                     owner: owner.map(str::to_string),
                     runbook_url: runbook_url.map(str::to_string),
                     severity: severity.map(str::to_string),
@@ -4631,6 +4635,7 @@ async fn tick_one_workflow_schedule(
                 inherited_chain_deadline_at: None,
                 concurrency_key,
                 concurrency_limit,
+                concurrency_on_conflict,
                 priority: Priority::default(),
                 max_workflow_input_bytes: wf_info
                     .and_then(|info| info.max_input_bytes)
@@ -6018,12 +6023,15 @@ async fn drain_buffered_schedule_runs(
                 .clone()
                 .unwrap_or(serde_json::Value::Null);
             let wf_info = registry.workflows.get(wf_name);
-            let (concurrency_key, concurrency_limit) = wf_info
-                .and_then(|info| info.concurrency.as_ref())
-                .map_or((None, None), |policy| {
-                    let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
-                    (key, Some(policy.limit))
-                });
+            let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+                wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
+                    (None, None, crate::concurrency::ConcurrencyOnConflict::Defer),
+                    |policy| {
+                        let key =
+                            crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                        (key, Some(policy.limit), policy.on_conflict)
+                    },
+                );
             let (owner, runbook_url, severity) = {
                 let wf_meta = wf_info.map(|info| (info.owner, info.runbook_url, info.severity));
                 let dag_meta = registered_dags.get(wf_name).map(|dag| {
@@ -6141,6 +6149,7 @@ async fn drain_buffered_schedule_runs(
                         priority: None,
                         concurrency_key: concurrency_key.clone(),
                         concurrency_limit,
+                        concurrency_on_conflict: Some(concurrency_on_conflict),
                         owner: owner.map(str::to_string),
                         runbook_url: runbook_url.map(str::to_string),
                         severity: severity.map(str::to_string),
@@ -6256,6 +6265,7 @@ async fn drain_buffered_schedule_runs(
                     inherited_chain_deadline_at: None,
                     concurrency_key,
                     concurrency_limit,
+                    concurrency_on_conflict,
                     priority: Priority::default(),
                     max_workflow_input_bytes: effective_cap,
                     start_at: None,

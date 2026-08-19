@@ -201,7 +201,7 @@ pub async fn admit_batched_start(
             BatchAdmitOutcome,
             Vec<crate::completion_trigger::DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
-            Vec<(String, String)>,
+            Vec<crate::execution::StartCancelledRun>,
         ), HarvestError, _>(async |conn| {
             let row: UpsertBatchRow = diesel::sql_query(sql)
                 .bind::<diesel::sql_types::Uuid, _>(new_id)
@@ -292,6 +292,7 @@ pub async fn admit_batched_start(
                         inherited_chain_deadline_at: None,
                         concurrency_key: opts.concurrency_key,
                         concurrency_limit: opts.concurrency_limit,
+                        concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
                         priority,
                         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
                         start_at: None,
@@ -379,14 +380,7 @@ pub async fn admit_batched_start(
         if outcome.is_flushed {
             m.record_admission_bypassed(crate::admission_gate::StartProducer::EventBatch.as_str());
         }
-        for (wf_name, q_name) in cancel_metrics {
-            crate::telemetry::emit_workflow_terminal(
-                m,
-                &wf_name,
-                &q_name,
-                crate::telemetry::WorkflowStatus::Cancelled,
-            );
-        }
+        crate::execution::emit_start_cancel_metrics(m, &cancel_metrics);
     }
 
     Ok(Some((outcome, deferred_starts)))
@@ -454,7 +448,7 @@ async fn fire_due_on_conn(
             String,
             Vec<crate::completion_trigger::DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
-            Vec<(String, String)>,
+            Vec<crate::execution::StartCancelledRun>,
         )> = Box::pin(conn.transaction(async |conn| {
             let due_rows: Vec<FireDueBatchRow> = if let Some(sid) = shard_id {
                 diesel::sql_query(due_sql)
@@ -504,14 +498,7 @@ async fn fire_due_on_conn(
                 m.record_admission_bypassed(
                     crate::admission_gate::StartProducer::EventBatch.as_str(),
                 );
-                for (wf_name, q_name) in cancel_metrics {
-                    crate::telemetry::emit_workflow_terminal(
-                        m,
-                        &wf_name,
-                        &q_name,
-                        crate::telemetry::WorkflowStatus::Cancelled,
-                    );
-                }
+                crate::execution::emit_start_cancel_metrics(m, &cancel_metrics);
             }
         } else {
             break;
@@ -530,7 +517,7 @@ async fn fire_claimed_batch_row(
         String,
         Vec<crate::completion_trigger::DeferredTriggerStart>,
         Vec<(ExecutionId, String)>,
-        Vec<(String, String)>,
+        Vec<crate::execution::StartCancelledRun>,
     )>,
 > {
     use diesel_async::RunQueryDsl;
@@ -598,6 +585,7 @@ async fn fire_claimed_batch_row(
         inherited_chain_deadline_at: None,
         concurrency_key: opts.concurrency_key,
         concurrency_limit: opts.concurrency_limit,
+        concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
         priority,
         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
         start_at: None,

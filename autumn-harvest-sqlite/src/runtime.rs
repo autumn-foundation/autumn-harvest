@@ -2750,10 +2750,7 @@ mod feature_gate_tests {
         rejected("retry_policy", &info);
 
         let mut info = base_wf_info();
-        info.concurrency = Some(ConcurrencyPolicy {
-            key_expr: "input.tenant_id",
-            limit: 10,
-        });
+        info.concurrency = Some(ConcurrencyPolicy::new("input.tenant_id", 10));
         rejected("concurrency", &info);
 
         let mut info = base_wf_info();

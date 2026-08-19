@@ -702,6 +702,7 @@ async fn no_debounce_policy_uses_normal_start_path() {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: Default::default(),
             priority: Default::default(),
             max_workflow_input_bytes: 0,
             start_at: None,

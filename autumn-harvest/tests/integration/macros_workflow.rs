@@ -17,6 +17,16 @@ async fn quick_workflow(_ctx: &WorkflowContext) -> Result<(), String> {
     Ok(())
 }
 
+#[workflow(concurrency(key = "input.doc_id", limit = 1, on_conflict = "cancel_running"))]
+async fn latest_wins_workflow(_ctx: &WorkflowContext, _input: String) -> Result<String, String> {
+    Ok(String::new())
+}
+
+#[workflow(concurrency(key = "input.doc_id", limit = 3, on_conflict = "defer"))]
+async fn explicit_defer_workflow(_ctx: &WorkflowContext, _input: String) -> Result<String, String> {
+    Ok(String::new())
+}
+
 #[workflow(concurrency(key = "input.tenant_id", limit = 10))]
 async fn concurrency_workflow(_ctx: &WorkflowContext, _input: String) -> Result<String, String> {
     Ok("done".into())
@@ -119,6 +129,49 @@ fn workflow_concurrency_macro_sets_policy() {
         .expect("concurrency workflow must have a policy");
     assert_eq!(policy.key_expr, "input.tenant_id");
     assert_eq!(policy.limit, 10);
+    // Issue #811 AC1: omitting `on_conflict` keeps today's defer behaviour.
+    assert_eq!(
+        policy.on_conflict,
+        autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+        "a policy that omits on_conflict must default to Defer, so every \
+         pre-#811 workflow is byte-for-byte unchanged"
+    );
+}
+
+#[test]
+fn workflow_concurrency_macro_parses_cancel_running() {
+    // Issue #811 AC1: the attribute parses and attaches the latest-wins
+    // strategy to the registered `WorkflowInfo`.
+    let info = __autumn_workflow_info_latest_wins_workflow();
+    assert_eq!(info.name, "latest_wins_workflow");
+    let policy = info
+        .concurrency
+        .expect("latest-wins workflow must have a policy");
+    assert_eq!(policy.key_expr, "input.doc_id");
+    assert_eq!(policy.limit, 1);
+    assert_eq!(
+        policy.on_conflict,
+        autumn_harvest::concurrency::ConcurrencyOnConflict::CancelRunning
+    );
+    assert!(policy.on_conflict.is_cancel_running());
+}
+
+#[test]
+fn workflow_concurrency_macro_parses_explicit_defer() {
+    // Spelling `on_conflict = "defer"` explicitly must resolve to exactly the
+    // same policy as omitting it — the attribute is additive, never a mode
+    // switch that changes the other fields' meaning.
+    let info = __autumn_workflow_info_explicit_defer_workflow();
+    let policy = info
+        .concurrency
+        .expect("explicit-defer workflow must have a policy");
+    assert_eq!(policy.key_expr, "input.doc_id");
+    assert_eq!(policy.limit, 3);
+    assert_eq!(
+        policy.on_conflict,
+        autumn_harvest::concurrency::ConcurrencyOnConflict::Defer
+    );
+    assert!(!policy.on_conflict.is_cancel_running());
 }
 
 #[workflow(

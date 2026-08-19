@@ -4900,10 +4900,7 @@ mod tests {
                 execution_timeout: None,
                 chain_execution_timeout: None,
                 sla: None,
-                concurrency: Some(ConcurrencyPolicy {
-                    key_expr: "input.tenant_id",
-                    limit: 0,
-                }),
+                concurrency: Some(ConcurrencyPolicy::new("input.tenant_id", 0)),
 
                 debounce: None,
                 batch: None,
@@ -5057,10 +5054,7 @@ mod tests {
                 execution_timeout: None,
                 chain_execution_timeout: None,
                 sla: None,
-                concurrency: Some(ConcurrencyPolicy {
-                    key_expr: "input.tenant_id",
-                    limit: 5,
-                }),
+                concurrency: Some(ConcurrencyPolicy::new("input.tenant_id", 5)),
 
                 debounce: None,
                 batch: None,

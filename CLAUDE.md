@@ -1378,6 +1378,46 @@ The guard is a `#[must_use]` RAII handle. It releases the lock on **any** of: dr
 
 Author-facing primitive only: exclusive-only, no reentrancy/upgrade/downgrade, and no operator force-release route (all out of scope per the issue). See `autumn-harvest/examples/mutex_ledger.rs` for a complete two-workflow serialized-ledger example.
 
+### Latest-Wins Concurrency — `on_conflict = "cancel_running"` (issue #811)
+
+Per-key concurrency (#247) has one overflow behaviour: **defer**. A new run over the cap is enqueued and waits at the claim gate. For an idempotent, replace-the-work-in-flight job — reindex a document, recompute a report, re-run a per-tenant sync — deferring is exactly backwards: the in-flight run is already stale the moment a newer one is requested, and the queue fills with runs whose output will be discarded.
+
+`on_conflict = "cancel_running"` makes the key **latest-wins**: admitting a new run cancels the oldest in-flight run(s) for the same key, so the newest request is the one that survives.
+
+```rust
+#[workflow(concurrency(key = "input.doc_id", limit = 1, on_conflict = "cancel_running"))]
+async fn doc_index(ctx: &WorkflowContext, req: IndexRequest) -> Result<(), String> {
+    // Only ever one indexing run per document; a newer request supersedes
+    // whatever is in flight, and this run itself is superseded if a newer
+    // request arrives while it runs.
+    ctx.execute_activity(&reindex_info(), req).await?;
+    Ok(())
+}
+```
+
+| | `on_conflict = "defer"` (default) | `on_conflict = "cancel_running"` |
+|---|---|---|
+| Over the cap | The task waits at the claim gate for a slot | The **oldest** in-flight run(s) are cancelled |
+| Which run's output survives | Every run eventually runs; all outputs land | Only the newest admitted run's |
+| Fits | Work where every request must be processed (charges, emails, exports) | Idempotent recompute where only the latest result matters (indexing, dashboards, per-tenant sync) |
+| Cost of a burst | Queue depth grows | Cancellations, not backlog |
+
+**Semantics.**
+
+- **`limit = 1`** — admitting a run cancels the single incumbent for the key.
+- **`limit = N > 1`** — cancels the **oldest** runs until the post-admission population is `<= N`. "Oldest" is `started_at`, tie-broken by execution id, so the order is deterministic.
+- **Deterministic tie-break** — the **later-admitted** run always wins. "Later" is admission order (the shard-local advisory lock the supersede pass takes), not wall-clock, so two concurrent starts resolve deterministically.
+- **Ordinary cooperative cancellation** — a superseded run reaches `CANCELLED` via the same path an operator cancel takes: its `ctx.is_cancelled()` / `check_cancellation()` observe it, Saga compensation fires, and its `ParentClosePolicy` cascade runs normally. It is **not** a force-terminate. **No new `WorkflowEvent` variant and no migration** — a `WorkflowCancelled` event is recorded exactly as today.
+- **Scoped to `(workflow_name, concurrency_key)`** — a *different* workflow type that merely resolved the same key string, and never opted in, is never cancelled.
+- **Bounded** — one admission sheds at most `SUPERSEDE_SCAN_LIMIT` (32) runs. Latest-wins is a per-key fair-share control, not a bulk-cancel tool; excess beyond that is shed by the *next* admission for the same key, so the population still converges without any single start paying an unbounded cost.
+- **Shard-local**, exactly like the #247 cap it extends — see `docs/sharding.md`. In a multi-shard deployment the guarantee is "at most `limit` per shard"; pin the key with an explicit `residency_key` if you need it globally.
+
+**Where it applies.** Every genuine *admission* path resolves the declared strategy: the plain start route, `signal-with-start`, `update-with-start`, an operator re-run, and the deferred debounce/throttle/batch fire paths. It does **not** apply to *in-flight continuation* — child spawn, detached child spawn, continue-as-new, and workflow-level retry (#523) all keep `Defer`, matching how the #618 admission gates and #607 throttles treat those paths. (Letting a retry supersede would invert latest-wins: a retry of an *older* run would cancel the newer one that replaced it.)
+
+**Observability.** Each supersede increments `harvest.concurrency.superseded{workflow}` (labelled by the *superseded* run's type; the concurrency key is deliberately not a label — unbounded tenant input). A superseded run also increments the ordinary `harvest.workflow.terminal{outcome="cancelled"}`; the new counter isolates the supersede subset. `GET /admin/concurrency` reports each key's live counters plus a `workflows` array naming the type(s) on it and the effective `on_conflict` each declares.
+
+**Out of scope** (per the issue): a hard `Terminate`/force-fail supersede, cross-shard latest-wins, trigger-layer debounce (that is #499), "keep oldest, reject newest", and per-activity latest-wins.
+
 ### Workflow Input/Output JSON Schema (issue #373)
 
 Operators and non-Rust callers can discover the expected JSON shape of each workflow's input and output through the management API without reading Rust source. Schema publishing is **opt-in** — workflows that don't attach a schema continue to work exactly as today.

@@ -131,6 +131,7 @@ async fn seed_execution(conn: &mut AsyncPgConnection, workflow_id: &str) -> Exec
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: Default::default(),
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,

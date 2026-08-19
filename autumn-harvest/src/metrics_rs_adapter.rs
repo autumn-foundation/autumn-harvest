@@ -50,19 +50,19 @@ use crate::telemetry::{
     METRIC_ADMISSION_BYPASSED, METRIC_ADMISSION_GATES_ACTIVE, METRIC_CANARY_FAILURE,
     METRIC_CANARY_ROUNDTRIP, METRIC_CANARY_SUCCESS, METRIC_CIRCUIT_CLOSED, METRIC_CIRCUIT_TRIPPED,
     METRIC_COMPLETION_TRIGGER_FIRED, METRIC_COMPLETION_TRIGGER_SKIPPED,
-    METRIC_CONNECTOR_DISPATCHED, METRIC_CONNECTOR_LAG, METRIC_CONNECTOR_POISONED,
-    METRIC_CONNECTOR_RECEIVED, METRIC_DEBOUNCE_FIRED, METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN,
-    METRIC_EXTERNAL_SIGNAL_SENT, METRIC_LABEL_ACTION, METRIC_LABEL_ACTIVITY,
-    METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID, METRIC_LABEL_DECISION,
-    METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY, METRIC_LABEL_KIND, METRIC_LABEL_NAME,
-    METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH, METRIC_LABEL_PRODUCER,
-    METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE,
-    METRIC_LABEL_SCANNER, METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE,
-    METRIC_LABEL_SOURCE, METRIC_LABEL_STATE, METRIC_LABEL_STATUS, METRIC_LABEL_TASK_TYPE,
-    METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE,
-    METRIC_MUTEX_CONTENTION, METRIC_MUTEX_HELD, METRIC_MUTEX_WAIT, METRIC_PAYLOAD_BYTES,
-    METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED, METRIC_PAYLOAD_REJECTED,
-    METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
+    METRIC_CONCURRENCY_SUPERSEDED, METRIC_CONNECTOR_DISPATCHED, METRIC_CONNECTOR_LAG,
+    METRIC_CONNECTOR_POISONED, METRIC_CONNECTOR_RECEIVED, METRIC_DEBOUNCE_FIRED,
+    METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN, METRIC_EXTERNAL_SIGNAL_SENT, METRIC_LABEL_ACTION,
+    METRIC_LABEL_ACTIVITY, METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID,
+    METRIC_LABEL_DECISION, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY, METRIC_LABEL_KIND,
+    METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH,
+    METRIC_LABEL_PRODUCER, METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON,
+    METRIC_LABEL_REASON_CODE, METRIC_LABEL_SCANNER, METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD,
+    METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATE, METRIC_LABEL_STATUS,
+    METRIC_LABEL_TASK_TYPE, METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW,
+    METRIC_LABEL_WORKFLOW_TYPE, METRIC_MUTEX_CONTENTION, METRIC_MUTEX_HELD, METRIC_MUTEX_WAIT,
+    METRIC_PAYLOAD_BYTES, METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED,
+    METRIC_PAYLOAD_REJECTED, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
     METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_PAUSED, METRIC_QUEUE_SCHEDULE_TO_START,
     METRIC_RATE_LIMIT_REFILL_RATE, METRIC_RATE_LIMIT_THROTTLED, METRIC_RATE_LIMIT_TOKENS_AVAILABLE,
     METRIC_RETENTION_DELETED, METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED,
@@ -548,6 +548,14 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_KEY => key.to_owned(),
         )
         .set(deferred as f64);
+    }
+
+    fn record_concurrency_superseded(&self, workflow: &str) {
+        counter!(
+            METRIC_CONCURRENCY_SUPERSEDED,
+            METRIC_LABEL_WORKFLOW => workflow.to_owned(),
+        )
+        .increment(1);
     }
 
     fn record_workflow_cache_hit(&self, workflow_name: &str, queue: &str) {
@@ -1570,6 +1578,93 @@ mod tests {
             )],
             "the bridge must register exactly the workflow label constant, \
              with no queue label and no value swap"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Latest-wins concurrency supersede bridge (issue #811)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bridges_concurrency_superseded_with_workflow_label_only() {
+        // Real label-content assertion: a local `metrics::Recorder` captures
+        // the registered counter key, so a swapped label, a dropped label, or
+        // an accidentally-added `key` label (the concurrency key is resolved
+        // from workflow input and is unbounded — ADR-0001 §7 forbids it) is
+        // caught here rather than as a cardinality incident in production.
+        type CounterKey = (String, Vec<(String, String)>);
+
+        #[derive(Default)]
+        struct CapturingRecorder {
+            counters: std::sync::Mutex<Vec<CounterKey>>,
+        }
+
+        impl metrics::Recorder for &CapturingRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                self.counters.lock().unwrap().push((
+                    key.name().to_owned(),
+                    key.labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                ));
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_concurrency_superseded("doc_index");
+        });
+
+        let counters = capture.counters.lock().unwrap().clone();
+        assert_eq!(
+            counters.as_slice(),
+            &[(
+                METRIC_CONCURRENCY_SUPERSEDED.to_owned(),
+                vec![(METRIC_LABEL_WORKFLOW.to_owned(), "doc_index".to_owned())],
+            )],
+            "the bridge must register exactly the workflow label constant, \
+             with no concurrency-key label and no value swap"
         );
     }
 

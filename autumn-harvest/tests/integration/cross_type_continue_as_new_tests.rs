@@ -172,6 +172,7 @@ async fn start_root(
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: Default::default(),
         priority: Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -227,6 +228,7 @@ async fn signal_with_start(
         max_workflow_chain_timeout_ceiling: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: Default::default(),
         signal_name: "upgrade",
         signal_payload,
         idempotency_key: None,
@@ -1295,10 +1297,9 @@ async fn successor_concurrency_key_is_resolved_from_the_new_type() {
 
     // Phase 2 declares its OWN policy over a different field.
     let mut target = wf(phase2, phase_two);
-    target.concurrency = Some(autumn_harvest::concurrency::ConcurrencyPolicy {
-        key_expr: "phase",
-        limit: 7,
-    });
+    target.concurrency = Some(autumn_harvest::concurrency::ConcurrencyPolicy::new(
+        "phase", 7,
+    ));
 
     let reg = registry(vec![wf(phase1, phase_one), target]);
     let (successor, _) = drive_transition(&url, predecessor, reg, "w-803-concurrency").await;

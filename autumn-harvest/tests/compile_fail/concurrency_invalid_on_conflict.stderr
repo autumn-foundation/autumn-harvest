@@ -1,0 +1,5 @@
+error: concurrency on_conflict must be "defer" or "cancel_running"
+ --> tests/compile_fail/concurrency_invalid_on_conflict.rs:7:71
+  |
+7 | #[workflow(concurrency(key = "input.doc_id", limit = 1, on_conflict = "cancel"))]
+  |                                                                       ^^^^^^^^

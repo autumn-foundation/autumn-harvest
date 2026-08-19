@@ -371,6 +371,12 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             max_workflow_chain_timeout_ceiling: ::std::option::Option::None,
                             concurrency_key,
                             concurrency_limit,
+                            concurrency_on_conflict: Self::info()
+                                .concurrency
+                                .map_or(
+                                    ::autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+                                    |p| p.on_conflict,
+                                ),
                             update_id,
                             update_name: #fn_name_str.to_string(),
                             update_args,
@@ -546,6 +552,12 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 max_workflow_chain_timeout_ceiling: ::std::option::Option::None,
                                 concurrency_key,
                                 concurrency_limit,
+                                concurrency_on_conflict: Self::info()
+                                    .concurrency
+                                    .map_or(
+                                        ::autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+                                        |p| p.on_conflict,
+                                    ),
                                 update_id,
                                 update_name: #fn_name_str.to_string(),
                                 update_args,

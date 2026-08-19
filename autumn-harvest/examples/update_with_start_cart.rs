@@ -147,6 +147,7 @@ async fn add_item_atomic(
             max_workflow_chain_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: Default::default(),
             update_id,
             update_name: "add_item".to_string(),
             update_args: serde_json::to_value(&item).unwrap(),

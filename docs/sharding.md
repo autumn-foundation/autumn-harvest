@@ -42,6 +42,30 @@ curl -X POST /api/harvest/workflows/order_flow/start \
 
 **Trade-off**: routing all of one tenant's workflows to the same shard concentrates load. Size shards to handle the worst-case tenant burst, or use rate limiting above Harvest to bound how fast new workflows can be started per tenant.
 
+### Latest-wins supersede is shard-local too (issue #811)
+
+The same scope contract applies to the `on_conflict = "cancel_running"` overflow strategy:
+
+```rust
+#[workflow(concurrency(key = "input.doc_id", limit = 1, on_conflict = "cancel_running"))]
+```
+
+When a new run for key `K` is admitted, the supersede pass serializes on a shard-local advisory lock (`pg_advisory_xact_lock(hashtext(K))` — the **same** namespace the claim-time concurrency gate uses) and scans **only the admitting shard's** `harvest_workflow_executions` for non-terminal runs of the same workflow type carrying `K`. It has no visibility into, and never cancels, a run on another shard.
+
+| Deployment | Effective latest-wins guarantee |
+|---|---|
+| Single-shard (default) | At most `limit` non-terminal runs per key, globally — the newest admission wins |
+| Multi-shard (N shards) | At most `limit` **per shard**, so up to `limit × N` globally; a run on shard A is never superseded by an admission on shard B |
+
+**Cross-shard latest-wins is explicitly out of scope.** A cross-shard supersede would need a distributed lock plus a cross-shard cancellation transaction, and neither exists (nor is planned) — the whole sharding design deliberately avoids cross-shard transactions.
+
+If you need a *global* "only one run per key, newest wins" guarantee in a multi-shard deployment, use the same fix as the cap above: pin every execution for the key to one shard with an explicit `residency_key`, so the shard-local guarantee **is** the global one.
+
+Two further scoping notes:
+
+- **Supersede is scoped to `(workflow_name, concurrency_key)`, not the key alone.** A *different* workflow type that merely resolved the same key string — and never opted in to latest-wins — is never cancelled. This is what makes the feature migration-free: the resolved key lives on `harvest_task_queue`, so no new column on `harvest_workflow_executions` is needed.
+- **A single admission sheds at most `SUPERSEDE_SCAN_LIMIT` (32) runs.** Latest-wins is a per-key fair-share control, not a bulk-cancel tool: one start must never open an unbounded transaction cancelling hundreds of executions. Any excess beyond that is shed by the *next* admission for the same key, so the population still converges.
+
 ---
 
 ## Explicit shard placement and data residency (issue #697)
@@ -254,6 +278,23 @@ Response:
 ```
 
 The `pending` field shows how many tasks are currently deferred because the key is at or above its cap.
+
+Each row also carries a `workflows` array attributing the key to the workflow type(s) with live tasks on it, and the effective overflow strategy each declares (issue #811). It is omitted when empty:
+
+```json
+[
+  {
+    "key": "doc-a",
+    "task_type": "workflow",
+    "max_concurrent": 1,
+    "in_flight": 1,
+    "pending": 0,
+    "workflows": [{ "workflow_name": "doc_index", "on_conflict": "cancel_running" }]
+  }
+]
+```
+
+A workflow whose registered `WorkflowInfo` declares no concurrency policy reports `"defer"` — the same value the start path resolves for it. Superseded runs are counted on `harvest.concurrency.superseded{workflow}`; the concurrency key is deliberately **not** a metric label (unbounded tenant input, per ADR-0001 §7), which is exactly why the per-key view lives here.
 
 The `harvest.concurrency.in_flight` metric (tagged by concurrency key) is emitted by the concurrency sampler at regular intervals. **Note**: the raw key value is tagged on the metric — ensure your key cardinality is bounded (e.g., use `tenant_id`, not `execution_id`) to avoid metric cardinality explosion. See ADR-0001 §7.
 

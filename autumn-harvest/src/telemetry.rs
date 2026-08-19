@@ -687,6 +687,20 @@ pub const METRIC_DEBOUNCE_FIRED: &str = "harvest.workflow.debounce_fired";
 /// and must never appear here.
 pub const METRIC_WORKFLOW_START_THROTTLED: &str = "harvest.workflow.start_throttled";
 
+/// Counter: incremented exactly once per in-flight run superseded by a newer
+/// admission under `ConcurrencyOnConflict::CancelRunning` (issue #811).
+///
+/// A latest-wins start that sheds K incumbents emits K samples. A `Defer` start
+/// (the default), an attach, and an admission that was already under its limit
+/// all emit nothing.
+///
+/// Labeled by `workflow` (workflow type name) only. The resolved concurrency key
+/// is high-cardinality (tenant/entity input), so per ADR-0001 §7 it is
+/// deliberately **not** a metric label — per-key state is exposed via the
+/// `GET /admin/concurrency` admin read instead. `execution.id` is span-only and
+/// must never appear here.
+pub const METRIC_CONCURRENCY_SUPERSEDED: &str = "harvest.concurrency.superseded";
+
 /// Counter: incremented exactly once per real saga compensation sequence
 /// (issue #801).
 ///
@@ -2310,6 +2324,16 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (key, deferred);
     }
 
+    /// A running execution was superseded by a newer admission for the same
+    /// concurrency key under `ConcurrencyOnConflict::CancelRunning` (issue #811).
+    ///
+    /// Maps to the counter [`METRIC_CONCURRENCY_SUPERSEDED`]. Called once per
+    /// superseded run. The concurrency key is deliberately not a label
+    /// (ADR-0001 §7 cardinality rule).
+    fn record_concurrency_superseded(&self, workflow: &str) {
+        let _ = workflow;
+    }
+
     /// Record the current available tokens for a rate limit bucket key.
     ///
     /// Maps to the gauge `harvest.rate_limit.tokens_available{key}`.
@@ -3095,6 +3119,30 @@ pub fn emit_workflow_terminal<M: MetricsRecorder + ?Sized>(
     metrics.record_workflow_terminal(workflow_name, queue, outcome);
 }
 
+/// Emit [`METRIC_CONCURRENCY_SUPERSEDED`] once per superseded run (issue #811).
+///
+/// Callers reach this through [`crate::execution::emit_start_cancel_metrics`],
+/// which walks the [`crate::execution::StartCancelledRun`] list a start returns
+/// and emits this counter for every entry whose `superseded` flag is set. It
+/// MUST be called only **after** the outer transaction commits — a rollback
+/// would otherwise leave a phantom count for a supersede that never became
+/// durable.
+///
+/// Canary probe workflows (issue #796) are excluded, mirroring
+/// [`emit_workflow_terminal`], so the synthetic liveness canary can never move a
+/// business-facing counter.
+pub fn emit_concurrency_superseded<M: MetricsRecorder + ?Sized>(
+    metrics: &M,
+    superseded_workflow_names: &[String],
+) {
+    for workflow_name in superseded_workflow_names {
+        if crate::canary::is_canary_workflow(workflow_name) {
+            continue;
+        }
+        metrics.record_concurrency_superseded(workflow_name);
+    }
+}
+
 /// Default metrics recorder that discards every sample.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoOpMetrics;
@@ -3373,6 +3421,11 @@ mod tests {
             "harvest.schedule.decision_write_failed"
         );
         assert_eq!(METRIC_RETENTION_DELETED, "harvest.retention.deleted");
+        // issue #811: latest-wins concurrency supersede counter.
+        assert_eq!(
+            METRIC_CONCURRENCY_SUPERSEDED,
+            "harvest.concurrency.superseded"
+        );
         assert_eq!(METRIC_SUMMARY_DELETED, "harvest.retention.summary_deleted");
         // issue #618: exempt-by-design start producers increment this counter.
         assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
@@ -3557,6 +3610,67 @@ mod tests {
             6,
             "should emit once for each of the 6 terminal outcomes"
         );
+    }
+
+    #[test]
+    fn emit_concurrency_superseded_skips_canary_and_records_business_workflows() {
+        // Issue #811 AC7: the counter fires exactly once per superseded run,
+        // carrying the SUPERSEDED run's workflow name. Canary probes are
+        // excluded, mirroring `emit_workflow_terminal`, so the synthetic
+        // liveness canary can never move a business-facing counter.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct SupersededCounter(AtomicUsize, std::sync::Mutex<Vec<String>>);
+        impl MetricsRecorder for SupersededCounter {
+            fn record_concurrency_superseded(&self, workflow: &str) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                self.1.lock().unwrap().push(workflow.to_owned());
+            }
+        }
+
+        let counter = Arc::new(SupersededCounter::default());
+
+        // An empty list (the overwhelmingly common `Defer` path) emits nothing.
+        emit_concurrency_superseded(counter.as_ref(), &[]);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+
+        // A canary probe records NOTHING.
+        emit_concurrency_superseded(
+            counter.as_ref(),
+            &[
+                crate::canary::CANARY_WORKFLOW_NAME_PREFIX.to_owned(),
+                "__harvest_canary_probe__default".to_owned(),
+            ],
+        );
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            0,
+            "a canary probe must never increment harvest.concurrency.superseded"
+        );
+
+        // Business workflows emit exactly once per superseded run, in order,
+        // including the same name twice when limit = N sheds two runs.
+        emit_concurrency_superseded(
+            counter.as_ref(),
+            &[
+                "doc_index".to_owned(),
+                "doc_index".to_owned(),
+                "checkout".to_owned(),
+            ],
+        );
+        assert_eq!(counter.0.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            counter.1.lock().unwrap().as_slice(),
+            &["doc_index", "doc_index", "checkout"],
+            "the counter must carry the superseded run's workflow name, once per run"
+        );
+
+        // Also works through a `&*Arc<dyn MetricsRecorder>` erased reference.
+        let erased: Arc<dyn MetricsRecorder> = counter.clone();
+        emit_concurrency_superseded(&*erased, &["billing".to_owned()]);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 4);
     }
 
     #[test]

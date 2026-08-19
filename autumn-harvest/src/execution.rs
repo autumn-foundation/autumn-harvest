@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::build_routing;
 use crate::completion_trigger::DeferredTriggerStart;
+use crate::concurrency::ConcurrencyOnConflict;
 use crate::error::{HarvestError, HarvestResult, database_error};
 use crate::event::WorkflowEvent;
 use crate::info::WorkflowInfo;
@@ -97,6 +98,18 @@ pub struct StartWorkflowParams<'a> {
     /// Maximum number of RUNNING workflow tasks allowed for [`Self::concurrency_key`].
     /// Required whenever `concurrency_key` is `Some`; ignored when it is `None`.
     pub concurrency_limit: Option<u32>,
+    /// What to do when admitting this run would exceed [`Self::concurrency_limit`]
+    /// (issue #811).
+    ///
+    /// Defaults to [`ConcurrencyOnConflict::Defer`] — today's behaviour, where the
+    /// task row is enqueued and simply waits for a slot at claim time. Setting
+    /// [`ConcurrencyOnConflict::CancelRunning`] makes the start *latest-wins*: the
+    /// admitted run supersedes the oldest in-flight run(s) for the same
+    /// `(workflow_name, concurrency_key)` pair via the ordinary cooperative
+    /// cancellation path.
+    ///
+    /// Ignored when [`Self::concurrency_key`] is `None`.
+    pub concurrency_on_conflict: ConcurrencyOnConflict,
     /// Within-queue claim priority for this workflow execution (issue #249).
     ///
     /// Stored on the task queue row; does not affect the event history or
@@ -228,6 +241,65 @@ impl StartWorkflowParams<'_> {
             0
         } else {
             shard.as_i32()
+        }
+    }
+}
+
+/// A run cancelled as a side effect of a workflow start, returned so the caller
+/// can emit its metrics AFTER the outer transaction commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartCancelledRun {
+    /// Workflow type name of the cancelled run.
+    pub workflow_name: String,
+    /// Task queue the cancelled run was on.
+    pub queue_name: String,
+    /// `true` when the cancellation was a latest-wins supersede (issue #811) —
+    /// i.e. a newer admission for the same `(workflow_name, concurrency_key)`
+    /// shed this run to respect the per-key limit. Drives
+    /// [`crate::telemetry::METRIC_CONCURRENCY_SUPERSEDED`] in addition to the
+    /// ordinary cancelled-terminal counter.
+    pub superseded: bool,
+}
+
+impl StartCancelledRun {
+    /// A cancellation that is NOT a latest-wins supersede (e.g. the
+    /// `TerminateIfRunning` / `terminate_existing` replace paths).
+    #[must_use]
+    pub const fn terminated(workflow_name: String, queue_name: String) -> Self {
+        Self {
+            workflow_name,
+            queue_name,
+            superseded: false,
+        }
+    }
+}
+
+/// Emit every metric owed for runs a start cancelled as a side effect.
+///
+/// The ONE place that turns a start's cancelled-run list into samples, so a new
+/// caller of [`start_or_load_workflow_execution_collect`] cannot emit the
+/// terminal counter while silently dropping
+/// [`crate::telemetry::METRIC_CONCURRENCY_SUPERSEDED`].
+///
+/// MUST be called only **after** the caller's outer transaction commits — a
+/// rollback would otherwise leave phantom counts for cancellations that never
+/// became durable.
+pub fn emit_start_cancel_metrics<M: crate::telemetry::MetricsRecorder + ?Sized>(
+    metrics: &M,
+    cancelled: &[StartCancelledRun],
+) {
+    for run in cancelled {
+        crate::telemetry::emit_workflow_terminal(
+            metrics,
+            &run.workflow_name,
+            &run.queue_name,
+            crate::telemetry::WorkflowStatus::Cancelled,
+        );
+        if run.superseded {
+            crate::telemetry::emit_concurrency_superseded(
+                metrics,
+                std::slice::from_ref(&run.workflow_name),
+            );
         }
     }
 }
@@ -433,7 +505,7 @@ pub async fn start_or_load_workflow_execution_collect(
     StartedWorkflowExecution,
     Vec<DeferredTriggerStart>,
     Vec<(ExecutionId, String)>,
-    Vec<(String, String)>,
+    Vec<StartCancelledRun>,
 )> {
     let exec_id = request.exec_id;
     let shard_id_value = request.shard_id();
@@ -504,7 +576,7 @@ pub async fn start_or_load_workflow_execution_collect(
     // deferred list so the caller spawns them only after its outer commit.
     let mut pre_check_deferred: Vec<DeferredTriggerStart> = Vec::new();
     let mut deferred_checks: Vec<(ExecutionId, String)> = Vec::new();
-    let mut pre_check_cancel_metrics: Vec<(String, String)> = Vec::new();
+    let mut pre_check_cancel_metrics: Vec<StartCancelledRun> = Vec::new();
 
     // Effective active-prior behavior from the two orthogonal axes (issue #685).
     // `terminate_via_pre_check` is the ONE case whose create-vs-attach decision is
@@ -567,8 +639,8 @@ pub async fn start_or_load_workflow_execution_collect(
             Ok((_cancelled, mut deferred, mut checks, metrics_opt)) => {
                 pre_check_deferred.append(&mut deferred);
                 deferred_checks.append(&mut checks);
-                if let Some(m) = metrics_opt {
-                    pre_check_cancel_metrics.push(m);
+                if let Some((wf_name, q_name)) = metrics_opt {
+                    pre_check_cancel_metrics.push(StartCancelledRun::terminated(wf_name, q_name));
                 }
             }
             Err(HarvestError::Config(_)) => {}
@@ -688,7 +760,7 @@ pub async fn start_or_load_workflow_execution_collect(
         StartedWorkflowExecution,
         Vec<DeferredTriggerStart>,
         Vec<(ExecutionId, String)>,
-        Vec<(String, String)>,
+        Vec<StartCancelledRun>,
     ), HarvestError, _>(async |conn| {
         let row = row;
         let enqueue = enqueue.clone();
@@ -813,11 +885,46 @@ pub async fn start_or_load_workflow_execution_collect(
             };
             store::append_events(conn, exec_id, &[started_event], 0).await?;
             queue::enqueue(conn, &enqueue).await?;
+
+            // Latest-wins supersede (issue #811). Runs HERE -- inside the start
+            // transaction, AFTER our own row + task are durable, and only on the
+            // fresh-insert path -- so:
+            //   * we never cancel the incumbent and then attach to it, and
+            //   * an attach (`created == false`) never cancels anything.
+            // The advisory lock inside `supersede_running_for_key` serializes
+            // concurrent admissions for the same key, which is what makes AC6's
+            // "later-admitted run wins" a function of admission order rather than
+            // wall-clock.
+            let started = StartedWorkflowExecution::from_row(execution, true);
+            let mut tx_cancel_metrics: Vec<StartCancelledRun> = Vec::new();
+            let mut supersede_deferred: Vec<DeferredTriggerStart> = Vec::new();
+            if request.concurrency_on_conflict.is_cancel_running()
+                && let Some(key) = request.concurrency_key.as_deref()
+            {
+                let outcome = crate::concurrency::supersede_running_for_key(
+                    conn,
+                    request.workflow_name,
+                    key,
+                    request.concurrency_limit.unwrap_or(1),
+                    exec_id,
+                )
+                .await?;
+                for run in &outcome.superseded {
+                    tx_cancel_metrics.push(StartCancelledRun {
+                        workflow_name: run.workflow_name.clone(),
+                        queue_name: run.queue_name.clone(),
+                        superseded: true,
+                    });
+                }
+                supersede_deferred = outcome.deferred_starts;
+                tx_deferred_checks.extend(outcome.deferred_checks);
+            }
+
             return Ok((
-                StartedWorkflowExecution::from_row(execution, true),
-                Vec::new(),
+                started,
+                supersede_deferred,
                 tx_deferred_checks,
-                Vec::new(),
+                tx_cancel_metrics,
             ));
         }
 
@@ -945,8 +1052,10 @@ pub async fn start_or_load_workflow_execution_collect(
                             workflow_id: request.workflow_id.to_string(),
                         });
                     }
-                    let tx_cancel_metrics =
-                        vec![(existing.workflow_name.clone(), existing.queue_name.clone())];
+                    let tx_cancel_metrics = vec![StartCancelledRun::terminated(
+                        existing.workflow_name.clone(),
+                        existing.queue_name.clone(),
+                    )];
                     let mut deferred = inline_cancel(
                         conn,
                         ExecutionId::from_uuid(existing.id),
@@ -1068,14 +1177,7 @@ pub async fn start_or_load_workflow_execution_collect(
                         .await;
                 }
                 if let Some(m) = metrics {
-                    for (wf_name, q_name) in cancel_metrics {
-                        crate::telemetry::emit_workflow_terminal(
-                            m,
-                            &wf_name,
-                            &q_name,
-                            crate::telemetry::WorkflowStatus::Cancelled,
-                        );
-                    }
+                    emit_start_cancel_metrics(m, &cancel_metrics);
                 }
             }
             Err(e)
@@ -1145,14 +1247,7 @@ pub async fn start_or_load_workflow_execution_with_metrics(
         let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
     }
     if let Some(m) = metrics {
-        for (wf_name, q_name) in cancel_metrics {
-            crate::telemetry::emit_workflow_terminal(
-                m,
-                &wf_name,
-                &q_name,
-                crate::telemetry::WorkflowStatus::Cancelled,
-            );
-        }
+        emit_start_cancel_metrics(m, &cancel_metrics);
     }
     Ok(result)
 }
@@ -1216,7 +1311,7 @@ pub async fn start_or_load_workflow_execution_idempotent(
             IdempotentStartOutcome,
             Vec<DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
-            Vec<(String, String)>,
+            Vec<StartCancelledRun>,
         ), HarvestError, _>(async |conn| {
             let request = request;
             // `gate` and `metrics` are `Copy`; captured directly by the `async |conn|` closure.
@@ -1279,14 +1374,7 @@ pub async fn start_or_load_workflow_execution_idempotent(
         let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
     }
     if let Some(m) = metrics {
-        for (wf_name, q_name) in cancel_metrics {
-            crate::telemetry::emit_workflow_terminal(
-                m,
-                &wf_name,
-                &q_name,
-                crate::telemetry::WorkflowStatus::Cancelled,
-            );
-        }
+        emit_start_cancel_metrics(m, &cancel_metrics);
     }
     Ok(outcome)
 }
@@ -3985,6 +4073,16 @@ pub struct SignalWithStartParams<'a> {
     /// Per-key concurrency cap. Forwarded to
     /// [`StartWorkflowParams::concurrency_limit`].
     pub concurrency_limit: Option<u32>,
+    /// Per-key overflow strategy. Forwarded to
+    /// [`StartWorkflowParams::concurrency_on_conflict`].
+    ///
+    /// A fresh start through this route is a genuine admission for the key, so
+    /// the workflow's declared strategy applies here exactly as it does on the
+    /// plain start route — otherwise an author declaring `cancel_running`
+    /// would silently get `defer` semantics depending on which door the start
+    /// came through (issue #811). An *attach* admits nothing and never
+    /// supersedes.
+    pub concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict,
     pub signal_name: &'a str,
     pub signal_payload: serde_json::Value,
     /// Optional dedup key. When present, repeated calls with the same
@@ -4195,7 +4293,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
             SignalWithStartOutcome,
             Vec<DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
-            Vec<(String, String)>,
+            Vec<StartCancelledRun>,
         ), HarvestError, _>(async |conn| {
             let request = request;
             let mut deferred_starts = Vec::new();
@@ -4254,8 +4352,8 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                     Ok((_cancelled, mut deferred, mut checks, metrics_opt)) => {
                         pre_check_deferred.append(&mut deferred);
                         deferred_checks.append(&mut checks);
-                        if let Some(m) = metrics_opt {
-                            cancel_metrics.push(m);
+                        if let Some((wf_name, q_name)) = metrics_opt {
+                            cancel_metrics.push(StartCancelledRun::terminated(wf_name, q_name));
                         }
                     }
                     Err(HarvestError::NotFound(_)) => {}
@@ -4306,6 +4404,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                     inherited_chain_deadline_at: None,
                     concurrency_key: request.concurrency_key.clone(),
                     concurrency_limit: request.concurrency_limit,
+                    concurrency_on_conflict: request.concurrency_on_conflict,
                     priority: Priority::default(),
                     max_workflow_input_bytes: 0,
                     start_at: None,
@@ -4503,14 +4602,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
         let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
     }
     if let Some(m) = metrics {
-        for (wf_name, q_name) in cancel_metrics {
-            crate::telemetry::emit_workflow_terminal(
-                m,
-                &wf_name,
-                &q_name,
-                crate::telemetry::WorkflowStatus::Cancelled,
-            );
-        }
+        emit_start_cancel_metrics(m, &cancel_metrics);
     }
 
     Ok(outcome)
@@ -4558,6 +4650,15 @@ pub struct RerunRequest<'a> {
     /// Per-key concurrency cap (issue #247); required whenever
     /// [`Self::concurrency_key`] is `Some`.
     pub concurrency_limit: Option<u32>,
+    /// Per-key overflow strategy (issue #811).
+    ///
+    /// A re-run is a **new** admission for the key, so a workflow declaring
+    /// `cancel_running` supersedes the incumbent here too. Threading it is the
+    /// consistent choice: leaving it `Defer` would let an operator's re-run sit
+    /// deferred behind exactly the run the author declared should be
+    /// superseded, and the "at most N non-terminal runs per key, newest wins"
+    /// invariant would hold on the start route but not this one.
+    pub concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict,
     /// Effective workflow-input byte cap (issue #252).
     pub max_workflow_input_bytes: u64,
     /// Server-side ceiling on the per-run execution timeout (issue #243).
@@ -4687,7 +4788,7 @@ pub async fn rerun_workflow_execution(
             RerunOutcome,
             Vec<DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
-            Vec<(String, String)>,
+            Vec<StartCancelledRun>,
         ), HarvestError, _>(async |conn| {
             let request = request;
 
@@ -5005,6 +5106,7 @@ pub async fn rerun_workflow_execution(
                 inherited_chain_deadline_at: None,
                 concurrency_key: request.concurrency_key.clone(),
                 concurrency_limit: request.concurrency_limit,
+                concurrency_on_conflict: request.concurrency_on_conflict,
                 // Documented gap: priority (issue #249) lives on the task-queue
                 // row, not the execution row, so it cannot be recovered here.
                 priority: Priority::default(),
@@ -5104,14 +5206,7 @@ pub async fn rerun_workflow_execution(
         let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
     }
     if let Some(m) = metrics {
-        for (wf_name, q_name) in cancel_metrics {
-            crate::telemetry::emit_workflow_terminal(
-                m,
-                &wf_name,
-                &q_name,
-                crate::telemetry::WorkflowStatus::Cancelled,
-            );
-        }
+        emit_start_cancel_metrics(m, &cancel_metrics);
     }
 
     Ok(outcome)
@@ -5317,6 +5412,14 @@ pub struct UpdateWithStartParams<'a> {
     pub concurrency_key: Option<String>,
     /// Per-key concurrency cap.
     pub concurrency_limit: Option<u32>,
+    /// Per-key overflow strategy. Forwarded to
+    /// [`StartWorkflowParams::concurrency_on_conflict`].
+    ///
+    /// A fresh start through this route is a genuine admission for the key, so
+    /// the workflow's declared strategy applies here exactly as it does on the
+    /// plain start route (issue #811). An *attach* admits nothing and never
+    /// supersedes.
+    pub concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict,
     /// Pre-generated update ID. When `idempotency_key` is `Some`, callers
     /// should derive this deterministically (e.g. `UUIDv5`) so the dedup lookup
     /// matches prior admitted updates.
@@ -5433,7 +5536,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
             UpdateWithStartOutcome,
             Vec<DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
-            Vec<(String, String)>,
+            Vec<StartCancelledRun>,
         ), HarvestError, _>(async |conn| {
             let request = request;
             let mut deferred_starts = Vec::new();
@@ -5510,6 +5613,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                     inherited_chain_deadline_at: None,
                     concurrency_key: request.concurrency_key.clone(),
                     concurrency_limit: request.concurrency_limit,
+                    concurrency_on_conflict: request.concurrency_on_conflict,
                     priority: Priority::default(),
                     max_workflow_input_bytes: 0,
                     start_at: None,
@@ -5726,14 +5830,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
         let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
     }
     if let Some(m) = metrics {
-        for (wf_name, q_name) in cancel_metrics {
-            crate::telemetry::emit_workflow_terminal(
-                m,
-                &wf_name,
-                &q_name,
-                crate::telemetry::WorkflowStatus::Cancelled,
-            );
-        }
+        emit_start_cancel_metrics(m, &cancel_metrics);
         // Post-outer-commit: emit update.admitted (issue #684) only when an
         // update was actually admitted (an idempotency dedup short-circuit
         // reports update_admitted == false and admits nothing).

@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use autumn_harvest::telemetry::{
     ActivityPauseAction, ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_PAUSE_ACTIONS,
-    METRIC_DLQ_ENTRIES, METRIC_LABEL_SCANNER, METRIC_LABEL_SHARD, METRIC_QUEUE_DEPTH,
-    METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_PAUSED, METRIC_RETENTION_DELETED,
+    METRIC_CONCURRENCY_SUPERSEDED, METRIC_DLQ_ENTRIES, METRIC_LABEL_SCANNER, METRIC_LABEL_SHARD,
+    METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_PAUSED, METRIC_RETENTION_DELETED,
     METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED, METRIC_SCANNER_TICK,
     METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
     METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED, METRIC_TASK_CAPABILITY_MISS,
@@ -251,6 +251,13 @@ impl MetricsRecorder for RecordingMetrics {
         self.samples.lock().unwrap().push(MetricSample {
             name: METRIC_QUEUE_DISPATCHED,
             labels: vec![("queue", queue_name.to_owned())],
+        });
+    }
+
+    fn record_concurrency_superseded(&self, workflow: &str) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_CONCURRENCY_SUPERSEDED,
+            labels: vec![("workflow", workflow.to_owned())],
         });
     }
 
@@ -697,6 +704,35 @@ fn schedule_skipped_reason_values_match_adr() {
     assert!(reasons.contains(&"paused".to_owned()));
     assert!(reasons.contains(&"max_active_runs_reached".to_owned()));
     assert!(reasons.contains(&"catchup_disabled".to_owned()));
+}
+
+#[test]
+fn concurrency_superseded_counter_reachable_and_never_labeled_by_key() {
+    // Issue #811: the latest-wins supersede counter must be reachable via the
+    // trait with exactly the workflow label. The concurrency key is resolved
+    // from workflow input (tenant/document ids) and is therefore unbounded --
+    // labeling by it would violate the ADR-0001 §7 cardinality rule, and the
+    // per-key view lives on `GET /admin/concurrency` instead.
+    let rec = RecordingMetrics::default();
+    rec.record_concurrency_superseded("doc_index");
+
+    let samples = rec.drain();
+    assert_eq!(samples.len(), 1);
+    let sample = &samples[0];
+    assert_eq!(sample.name, METRIC_CONCURRENCY_SUPERSEDED);
+
+    let keys: Vec<&str> = sample.labels.iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+        keys,
+        vec!["workflow"],
+        "harvest.concurrency.superseded must carry exactly the workflow label; got {sample:?}"
+    );
+    for (key, _) in &sample.labels {
+        assert!(
+            !key.contains("execution") && !key.contains("key"),
+            "forbidden high-cardinality label `{key}` on harvest.concurrency.superseded"
+        );
+    }
 }
 
 #[test]
