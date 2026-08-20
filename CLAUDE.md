@@ -1378,6 +1378,65 @@ The guard is a `#[must_use]` RAII handle. It releases the lock on **any** of: dr
 
 Author-facing primitive only: exclusive-only, no reentrancy/upgrade/downgrade, and no operator force-release route (all out of scope per the issue). See `autumn-harvest/examples/mutex_ledger.rs` for a complete two-workflow serialized-ledger example.
 
+### Latest-Wins Concurrency — `on_conflict = "cancel_running"` (issue #811)
+
+Per-key concurrency (#247) has one overflow behaviour: **defer**. A new run over the cap is enqueued and waits at the claim gate. For an idempotent, replace-the-work-in-flight job — reindex a document, recompute a report, re-run a per-tenant sync — deferring is exactly backwards: the in-flight run is already stale the moment a newer one is requested, and the queue fills with runs whose output will be discarded.
+
+`on_conflict = "cancel_running"` makes the key **latest-wins**: admitting a new run cancels the oldest in-flight run(s) for the same key, so the newest request is the one that survives.
+
+```rust
+#[workflow(concurrency(key = "input.doc_id", limit = 1, on_conflict = "cancel_running"))]
+async fn doc_index(ctx: &WorkflowContext, req: IndexRequest) -> Result<(), String> {
+    // Only ever one indexing run per document; a newer request supersedes
+    // whatever is in flight, and this run itself is superseded if a newer
+    // request arrives while it runs.
+    ctx.execute_activity(&reindex_info(), req).await?;
+    Ok(())
+}
+```
+
+| | `on_conflict = "defer"` (default) | `on_conflict = "cancel_running"` |
+|---|---|---|
+| Over the cap | The task waits at the claim gate for a slot | The **oldest** in-flight run(s) are cancelled |
+| Which run's output survives | Every run eventually runs; all outputs land | Only the newest admitted run's |
+| Fits | Work where every request must be processed (charges, emails, exports) | Idempotent recompute where only the latest result matters (indexing, dashboards, per-tenant sync) |
+| Cost of a burst | Queue depth grows | Cancellations, not backlog |
+
+**Semantics.**
+
+- **`limit = 1`** — admitting a run cancels the single incumbent for the key.
+- **`limit = N > 1`** — cancels the **oldest** runs until the post-admission population is `<= N`. "Oldest" is `started_at`, tie-broken by execution id, so the order is deterministic.
+- **Deterministic tie-break** — the **later-admitted** run always wins. "Later" is admission order (the shard-local advisory lock the supersede pass takes), not wall-clock, so two concurrent starts resolve deterministically.
+- **Ordinary cooperative cancellation** — a superseded run reaches `CANCELLED` via the same path an operator cancel takes: its `ctx.is_cancelled()` / `check_cancellation()` observe it, Saga compensation fires, and its `ParentClosePolicy` cascade runs normally. It is **not** a force-terminate. **No new `WorkflowEvent` variant and no migration** — a `WorkflowCancelled` event is recorded exactly as today.
+- **Scoped to `(workflow_name, concurrency_key)`** — a *different* workflow type that merely resolved the same key string, and never opted in, is never cancelled.
+- **Bounded** — one admission sheds at most `SUPERSEDE_SCAN_LIMIT` (32) runs. Latest-wins is a per-key fair-share control, not a bulk-cancel tool; excess beyond that is shed by the *next* admission for the same key, so the population still converges without any single start paying an unbounded cost.
+- **Shard-local**, exactly like the #247 cap it extends — see `docs/sharding.md`. In a multi-shard deployment the guarantee is "at most `limit` per shard"; pin the key with an explicit `residency_key` if you need it globally.
+
+**Where it applies.**
+
+| Start path | Resolves the declared strategy? | Why |
+|---|---|---|
+| Plain HTTP start, `signal-with-start`, `update-with-start`, operator re-run, trigger-now, scheduler tick, completion-trigger (inline + cross-shard relay), typed client stub, transactional start | **Yes** | Genuine admissions — a new run enters the key's population |
+| Deferred debounce / throttle / event-batch fire | **Yes** (carried on `DebounceStartOptions`, resolved at admission and replayed at fire) | Same admission, just deferred |
+| Child spawn, detached child spawn, continue-as-new, reset fork | **No** (`StartWorkflowParams` is never constructed) | In-flight continuation, not an admission |
+| Workflow-level retry (#523) | **No** — explicit `Defer` | Letting a retry supersede would invert latest-wins: a retry of an *older* run would cancel the newer one that replaced it |
+| Schedule **backfill**, outbox relay, Vantage manual trigger, plugin bootstrap | **No** — explicit `Defer` | These pass `concurrency_key: None`, so `on_conflict` is inert. Matches #247, which never applied per-key concurrency on those paths — a backfill deliberately materialises historical slots and must not cancel live work |
+
+This mirrors how the #618 admission gates and #607 throttles treat the same paths.
+
+**Interaction notes.**
+
+- **`ctx.mutex` (#691)** — combining `cancel_running` with the durable mutex on the same terminal path can produce a Postgres-detected lock-ordering cycle (`40P01`) on the *start*. It aborts atomically and is safe to retry; it is a liveness hazard, not a correctness one. See `docs/sharding.md` for the full note.
+- **Activity concurrency groups never latest-wins** — an activity task can carry a `concurrency_key` too (#247), but it is gated only at claim time and always defers; the supersede sheds workflow *executions* only.
+- **Nested admissions can leave a key transiently over its limit** — a superseded run's cancellation runs its terminal chokepoint, which can start a completion-trigger target inside the same transaction. That nested admission counts the still-uncommitted outer admission toward the key's population but structurally cannot cancel it (the caller is about to report that run as created). If the remaining overflow is entirely such protected in-flight admissions, the key stays over its limit until the next ordinary admission — which sees them unprotected and sheds them — and a `tracing::warn!` names the key and the gap. Same bounded-shed philosophy as `SUPERSEDE_SCAN_LIMIT`.
+- **Population** — the superseded set is *non-terminal runs* (`RUNNING`/`PAUSED` execution rows), which is a superset of what the #247 claim gate counts (`RUNNING` task rows with a live worker). A paused run, or one still deferred at the claim gate, occupies no dispatch slot yet is still superseded — that is the intended "at most `limit` non-terminal runs per key" reading.
+
+**Observability.** Each supersede increments `harvest.concurrency.superseded{workflow}` (labelled by the *superseded* run's type; the concurrency key is deliberately not a label — unbounded tenant input). A superseded run also increments the ordinary `harvest.workflow.terminal{outcome="cancelled"}`; the new counter isolates the supersede subset. `GET /admin/concurrency` reports each key's live counters plus a `workflows` array naming the type(s) on it and the effective `on_conflict` each declares. A `task_type = "activity"` row always reports `defer`, even when its owning workflow declares `cancel_running`: latest-wins is a workflow-*start* admission control and sheds workflow executions, so an activity concurrency group is gated purely at claim time and never superseded.
+
+**Source-visible change.** Five `pub` functions in `execution.rs` — `start_or_load_workflow_execution_collect`, `start_or_load_workflow_execution_idempotent`, `signal_with_start_workflow_execution_with_metrics`, `rerun_workflow_execution`, `update_with_start_workflow_execution_with_metrics` — changed their 4th tuple element from `Vec<(String, String)>` to `Vec<StartCancelledRun>` (a struct carrying `workflow_name`/`queue_name` plus a `superseded: bool` discriminator). A downstream caller that binds or iterates that element must adapt. The wrapper functions most callers use (`start_or_load_workflow_execution`, `..._with_metrics`) are unchanged.
+
+**Out of scope** (per the issue): a hard `Terminate`/force-fail supersede, cross-shard latest-wins, trigger-layer debounce (that is #499), "keep oldest, reject newest", and per-activity latest-wins.
+
 ### Workflow Input/Output JSON Schema (issue #373)
 
 Operators and non-Rust callers can discover the expected JSON shape of each workflow's input and output through the management API without reading Rust source. Schema publishing is **opt-in** — workflows that don't attach a schema continue to work exactly as today.

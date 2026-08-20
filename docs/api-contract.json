@@ -4625,7 +4625,7 @@
       "path": "/admin/concurrency",
       "category": "admin",
       "read_only": true,
-      "description": "Return per-activity concurrency statistics: configured cap, currently in-flight, and queued counts for each concurrency key.",
+      "description": "Return live per-key concurrency statistics, grouped by (concurrency_key, task_type) and summed across shards: configured cap (max_concurrent), currently in-flight, and queued (pending) counts. Each row also carries a workflows array attributing the key to the workflow type(s) observed on it, each with the effective on_conflict overflow strategy their registered policy declares (\"defer\" = wait for a slot, \"cancel_running\" = latest-wins, issue #811). A workflow declaring no concurrency policy reports \"defer\". The workflows array is omitted when empty. Latest-wins supersede is shard-local; see docs/sharding.md.",
       "params": [],
       "request_body": null,
       "success_response": {

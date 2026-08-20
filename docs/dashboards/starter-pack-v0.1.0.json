@@ -3599,6 +3599,55 @@
             }
           ],
           "description": "Dispatches rescheduled because a rate-limit bucket was empty."
+        },
+        {
+          "id": 930,
+          "type": "timeseries",
+          "title": "Latest-wins supersedes",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 70
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow) (rate(harvest_concurrency_superseded_total{workflow=~\"$workflow\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Running executions cancelled because a newer run superseded them under the latest-wins concurrency strategy (on_conflict = cancel_running, issue #811). The concurrency key is deliberately not a label (unbounded tenant input) \u2014 use GET /admin/concurrency for per-key detail."
         }
       ]
     },

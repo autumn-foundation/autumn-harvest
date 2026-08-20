@@ -42,6 +42,7 @@ mod claim_bench_support;
 mod claim_budget_tests;
 mod completion_callback_tests;
 mod concurrency_key_tests;
+mod concurrency_supersede_tests;
 mod context_headers_tests;
 #[cfg(feature = "db")]
 mod cross_type_continue_as_new_tests;

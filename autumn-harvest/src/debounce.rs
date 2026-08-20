@@ -148,6 +148,13 @@ pub struct DebounceStartOptions {
     pub concurrency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_limit: Option<u32>,
+    /// Effective per-key overflow strategy (issue #811), captured at admission so a
+    /// debounced / throttled / batched start does NOT silently drop a declared
+    /// `on_conflict = "cancel_running"` policy. Absent (`None`) means the default
+    /// [`crate::concurrency::ConcurrencyOnConflict::Defer`], so a pre-#811 carrier
+    /// row deserialises to today's behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_on_conflict: Option<crate::concurrency::ConcurrencyOnConflict>,
     /// Effective owner/runbook/severity resolved from `WorkflowInfo` at admission
     /// time, so a debounced run carries the same operator metadata as a normal
     /// start (the fire path has no access to the plugin registry).
@@ -533,7 +540,7 @@ type FiredDebounce = (
     String,
     Vec<crate::completion_trigger::DeferredTriggerStart>,
     Vec<(crate::types::ExecutionId, String)>,
-    Vec<(String, String)>,
+    Vec<crate::execution::StartCancelledRun>,
 );
 
 /// Scan and fire due debounce rows on a single shard connection. Returns the
@@ -651,14 +658,7 @@ pub async fn fire_due_debounced_starts(
                 )
                 .await;
             }
-            for (wf_name, q_name) in cancel_metrics {
-                crate::telemetry::emit_workflow_terminal(
-                    metrics,
-                    &wf_name,
-                    &q_name,
-                    crate::telemetry::WorkflowStatus::Cancelled,
-                );
-            }
+            crate::execution::emit_start_cancel_metrics(metrics, &cancel_metrics);
             metrics.record_debounce_fired(&workflow_name, &queue_name);
             // issue #618, F1: the debounce scanner relays a start already
             // admitted through the gate at HTTP time; count the deferred fire as
@@ -804,6 +804,7 @@ async fn fire_claimed_debounce_row(
         inherited_chain_deadline_at: None,
         concurrency_key: opts.concurrency_key,
         concurrency_limit: opts.concurrency_limit,
+        concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
         priority,
         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
         start_at: None,

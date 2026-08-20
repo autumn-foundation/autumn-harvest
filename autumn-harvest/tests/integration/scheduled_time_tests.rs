@@ -302,6 +302,7 @@ async fn manual_start_has_no_scheduled_time() {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: autumn_harvest::types::Priority::default(),
             max_workflow_input_bytes: 1_000_000,
             start_at: None,

@@ -16490,15 +16490,23 @@ pub(crate) async fn start_workflow(
         });
 
     // Resolve per-key concurrency policy from WorkflowInfo (issue #247).
-    let (concurrency_key, concurrency_limit) = runtime
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
         .workflows
         .get(&workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map_or((None, None), |policy| {
-            let key = autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
-            (key, Some(policy.limit))
-        });
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key =
+                    autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
 
     // Capture trace context for debounced starts — must be before the debounce
     // branch returns 202 since the normal path captures it inside a later OTel span.
@@ -16785,6 +16793,7 @@ pub(crate) async fn start_workflow(
                     priority: request.priority.map(Priority::as_i32),
                     concurrency_key: concurrency_key.clone(),
                     concurrency_limit,
+                    concurrency_on_conflict: Some(concurrency_on_conflict),
                     owner: info_owner.map(str::to_string),
                     runbook_url: info_runbook.map(str::to_string),
                     severity: info_severity.map(str::to_string),
@@ -17113,6 +17122,7 @@ pub(crate) async fn start_workflow(
                 priority: request.priority.map(Priority::as_i32),
                 concurrency_key: concurrency_key.clone(),
                 concurrency_limit,
+                concurrency_on_conflict: Some(concurrency_on_conflict),
                 owner: info_owner.map(str::to_string),
                 runbook_url: info_runbook.map(str::to_string),
                 severity: info_severity.map(str::to_string),
@@ -17513,6 +17523,7 @@ pub(crate) async fn start_workflow(
             priority: request.priority.map(Priority::as_i32),
             concurrency_key: concurrency_key.clone(),
             concurrency_limit,
+            concurrency_on_conflict: Some(concurrency_on_conflict),
             owner: owner.map(str::to_string),
             runbook_url: runbook_url.map(str::to_string),
             severity: severity.map(str::to_string),
@@ -17688,6 +17699,7 @@ pub(crate) async fn start_workflow(
                 inherited_chain_deadline_at: None,
                 concurrency_key,
                 concurrency_limit,
+                concurrency_on_conflict,
                 priority: request.priority.unwrap_or_default(),
                 max_workflow_input_bytes: effective_wf_cap,
                 start_at: request.start_at,
@@ -17918,6 +17930,7 @@ pub(crate) async fn start_workflow(
         inherited_chain_deadline_at: None,
         concurrency_key,
         concurrency_limit,
+        concurrency_on_conflict,
         priority: request.priority.unwrap_or_default(),
         max_workflow_input_bytes: effective_wf_cap,
         start_at: request.start_at,
@@ -18714,18 +18727,25 @@ async fn batch_start_workflows(
                     per_wf.max(max_wf_input_bytes)
                 });
 
-            let (concurrency_key, concurrency_limit) = runtime
+            let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
                 .registry
                 .workflows
                 .get(&item.workflow_name)
                 .and_then(|info| info.concurrency.as_ref())
-                .map_or((None, None), |policy| {
-                    let key = autumn_harvest::concurrency::resolve_concurrency_key(
-                        policy.key_expr,
-                        &input,
-                    );
-                    (key, Some(policy.limit))
-                });
+                .map_or(
+                    (
+                        None,
+                        None,
+                        autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+                    ),
+                    |policy| {
+                        let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                            policy.key_expr,
+                            &input,
+                        );
+                        (key, Some(policy.limit), policy.on_conflict)
+                    },
+                );
 
             let exec_id = ExecutionId::new_for_shard(*shard);
 
@@ -18850,6 +18870,7 @@ async fn batch_start_workflows(
                     priority: item.priority.map(Priority::as_i32),
                     concurrency_key: concurrency_key.clone(),
                     concurrency_limit,
+                    concurrency_on_conflict: Some(concurrency_on_conflict),
                     owner: owner.map(str::to_string),
                     runbook_url: runbook_url.map(str::to_string),
                     severity: severity.map(str::to_string),
@@ -18964,6 +18985,7 @@ async fn batch_start_workflows(
                     inherited_chain_deadline_at: None,
                     concurrency_key,
                     concurrency_limit,
+                    concurrency_on_conflict,
                     priority: item.priority.unwrap_or_default(),
                     max_workflow_input_bytes: effective_wf_cap,
                     start_at: None,
@@ -19018,17 +19040,12 @@ async fn batch_start_workflows(
                         .await;
                     }
                     let m = runtime.registry.telemetry().metrics.as_ref();
-                    for (wf_name, q_name) in cancel_metrics {
-                        // Route through the single choke point so a synthetic
-                        // liveness canary (issue #796, AC8) never leaks into
-                        // harvest.workflow.terminal via a batch cancel.
-                        autumn_harvest::telemetry::emit_workflow_terminal(
-                            m,
-                            &wf_name,
-                            &q_name,
-                            autumn_harvest::telemetry::WorkflowStatus::Cancelled,
-                        );
-                    }
+                    // Route through the single choke point so a synthetic
+                    // liveness canary (issue #796, AC8) never leaks into
+                    // harvest.workflow.terminal via a batch cancel, and so a
+                    // latest-wins supersede (issue #811) can never be emitted as
+                    // a plain cancel with its own counter dropped.
+                    autumn_harvest::execution::emit_start_cancel_metrics(m, &cancel_metrics);
                     Ok(started)
                 }
                 Err(e) => Err(e),
@@ -19989,16 +20006,25 @@ pub(crate) async fn signal_with_start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (concurrency_key, concurrency_limit) = runtime
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
         .workflows
         .get(&workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map_or((None, None), |policy| {
-            let key =
-                autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &start_input);
-            (key, Some(policy.limit))
-        });
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                    policy.key_expr,
+                    &start_input,
+                );
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
 
     let (
         owner,
@@ -20057,6 +20083,7 @@ pub(crate) async fn signal_with_start_workflow(
                 .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
             concurrency_key,
             concurrency_limit,
+            concurrency_on_conflict,
             signal_name: &request.signal_name,
             signal_payload,
             idempotency_key: request.idempotency_key.clone(),
@@ -20617,16 +20644,25 @@ async fn update_with_start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (concurrency_key, concurrency_limit) = runtime
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
         .workflows
         .get(&workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map_or((None, None), |policy| {
-            let key =
-                autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &start_input);
-            (key, Some(policy.limit))
-        });
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                    policy.key_expr,
+                    &start_input,
+                );
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
 
     let (
         owner,
@@ -20753,6 +20789,7 @@ async fn update_with_start_workflow(
             .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
         concurrency_key,
         concurrency_limit,
+        concurrency_on_conflict,
         update_id,
         update_name: request.update_name.clone(),
         update_args,
@@ -21612,18 +21649,25 @@ async fn rerun_workflow(
         });
 
     // Per-key concurrency (issue #247), resolved against the EFFECTIVE input.
-    let (concurrency_key, concurrency_limit) = runtime
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
         .workflows
         .get(&source.workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map_or((None, None), |policy| {
-            let key = autumn_harvest::concurrency::resolve_concurrency_key(
-                policy.key_expr,
-                &effective_input,
-            );
-            (key, Some(policy.limit))
-        });
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                    policy.key_expr,
+                    &effective_input,
+                );
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
 
     let metrics_ref: Option<&(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)> =
         Some(runtime.registry.telemetry().metrics.as_ref());
@@ -21634,6 +21678,7 @@ async fn rerun_workflow(
         started_by: Some(actor.as_str()),
         concurrency_key,
         concurrency_limit,
+        concurrency_on_conflict,
         max_workflow_input_bytes: effective_wf_cap,
         max_execution_timeout_ceiling: api_state
             .max_workflow_execution_timeout()
@@ -27269,15 +27314,23 @@ async fn trigger_schedule_now(
         .get(&workflow_name)
         .and_then(|info| info.chain_execution_timeout)
         .and_then(|d| chrono::Duration::from_std(d).ok());
-    let (concurrency_key, concurrency_limit) = runtime
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
         .workflows
         .get(&workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map_or((None, None), |policy| {
-            let key = autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
-            (key, Some(policy.limit))
-        });
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key =
+                    autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
     // Schedule-level retry_policy takes precedence over the workflow-type default,
     // mirroring the automated tick and backfill paths (scheduler.rs).
     let manual_trigger_retry_policy = schedule
@@ -27397,6 +27450,7 @@ async fn trigger_schedule_now(
             priority: None,
             concurrency_key: concurrency_key.clone(),
             concurrency_limit,
+            concurrency_on_conflict: Some(concurrency_on_conflict),
             owner: owner.map(str::to_string),
             runbook_url: runbook_url.map(str::to_string),
             severity: severity.map(str::to_string),
@@ -27565,6 +27619,7 @@ async fn trigger_schedule_now(
             inherited_chain_deadline_at: None,
             concurrency_key,
             concurrency_limit,
+            concurrency_on_conflict,
             priority: Priority::default(),
             max_workflow_input_bytes: runtime
                 .registry
@@ -28845,6 +28900,7 @@ async fn schedule_backfill(
                         priority: None,
                         concurrency_key: None,
                         concurrency_limit: None,
+                        concurrency_on_conflict: None,
                         owner: owner.map(str::to_string),
                         runbook_url: runbook_url.map(str::to_string),
                         severity: severity.map(str::to_string),
@@ -28998,6 +29054,8 @@ async fn schedule_backfill(
                         inherited_chain_deadline_at: None,
                         concurrency_key: None,
                         concurrency_limit: None,
+                        concurrency_on_conflict:
+                            autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                         priority: Priority::default(),
                         max_workflow_input_bytes: runtime
                             .registry
@@ -29343,6 +29401,8 @@ async fn schedule_backfill(
                         inherited_chain_deadline_at: None,
                         concurrency_key: None,
                         concurrency_limit: None,
+                        concurrency_on_conflict:
+                            autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                         priority: Priority::default(),
                         max_workflow_input_bytes: 0,
                         start_at: None,
@@ -31817,6 +31877,7 @@ async fn concurrency_status(
                     max_concurrent: stat.max_concurrent,
                     in_flight: 0,
                     pending: 0,
+                    workflows: Vec::new(),
                 });
             // Take the highest cap seen across shards, matching what
             // concurrency_key_stats() does within a shard (MAX(concurrency_cap)).
@@ -31824,11 +31885,79 @@ async fn concurrency_status(
             entry.in_flight += stat.in_flight;
             entry.pending += stat.pending;
         }
+
+        // Attribute each key to the workflow type(s) on it, so the declared
+        // overflow strategy is visible next to the live counters (issue #811
+        // AC7). Resolved against the registry here rather than in the core
+        // stats query: the worker's sampler has no registry and must not pay
+        // for the join.
+        let attributions = queue::concurrency_key_workflows(&mut conn, &runtime.queues)
+            .await
+            .map_err(map_error)?;
+        for attribution in attributions {
+            let Some(entry) =
+                merged.get_mut(&(attribution.key.clone(), attribution.task_type.clone()))
+            else {
+                // A row that appeared between the two reads; the next poll
+                // picks it up. Never fabricate a stats row from an attribution.
+                continue;
+            };
+            if entry
+                .workflows
+                .iter()
+                .any(|w| w.workflow_name == attribution.workflow_name)
+            {
+                continue;
+            }
+            let declared = runtime
+                .registry
+                .workflows
+                .get(&attribution.workflow_name)
+                .and_then(|info| info.concurrency)
+                .map_or_else(
+                    autumn_harvest::concurrency::ConcurrencyOnConflict::default,
+                    |policy| policy.on_conflict,
+                );
+            // Activity concurrency groups always defer (issue #811, Codex round 1).
+            let on_conflict = effective_admin_on_conflict(&attribution.task_type, declared);
+            entry.workflows.push(queue::ConcurrencyWorkflowStrategy {
+                workflow_name: attribution.workflow_name,
+                on_conflict,
+            });
+        }
     }
 
     let mut result: Vec<ConcurrencyKeyStats> = merged.into_values().collect();
+    for entry in &mut result {
+        entry
+            .workflows
+            .sort_by(|a, b| a.workflow_name.cmp(&b.workflow_name));
+    }
     result.sort_by(|a, b| a.key.cmp(&b.key).then(a.task_type.cmp(&b.task_type)));
     Ok(Json(result))
+}
+
+/// Effective `on_conflict` to report for one `/admin/concurrency` row (issue #811).
+///
+/// Latest-wins is a **workflow-start admission control**: the supersede runs
+/// inside `start_or_load_workflow_execution_collect` and sheds workflow
+/// *executions*. An activity task can carry a `concurrency_key` too, but it is
+/// gated purely at claim time (issue #247) and always defers — nothing sheds an
+/// in-flight activity for a newcomer.
+///
+/// So a `task_type = "activity"` row reports `Defer` even when its owning
+/// workflow declares `cancel_running`, because reporting the workflow's
+/// strategy there would advertise behaviour the engine does not enforce for
+/// that group. Only a `task_type = "workflow"` row reports the declared policy.
+fn effective_admin_on_conflict(
+    task_type: &str,
+    declared: autumn_harvest::concurrency::ConcurrencyOnConflict,
+) -> autumn_harvest::concurrency::ConcurrencyOnConflict {
+    if task_type == "workflow" {
+        declared
+    } else {
+        autumn_harvest::concurrency::ConcurrencyOnConflict::Defer
+    }
 }
 
 // ── Debounce Management (issue #499) ──────────────────────────────────────
@@ -43796,6 +43925,48 @@ mod reserved_idempotency_key_tests {
 
 #[cfg(test)]
 mod tests {
+
+    // ── issue #811 (Codex round 1, P2): activity concurrency groups always defer
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Latest-wins is a *workflow-start* admission control: the supersede runs
+    /// inside `start_or_load_workflow_execution_collect` and sheds workflow
+    /// *executions*. An activity task that carries a concurrency key is gated
+    /// purely at claim time and always defers, so reporting its owning
+    /// workflow's declared `cancel_running` on the `task_type = "activity"`
+    /// admin row advertises a strategy nothing enforces.
+    #[test]
+    fn admin_reports_defer_for_activity_rows_regardless_of_workflow_policy() {
+        use autumn_harvest::concurrency::ConcurrencyOnConflict;
+
+        // A workflow row reports whatever the workflow declares.
+        assert_eq!(
+            effective_admin_on_conflict("workflow", ConcurrencyOnConflict::CancelRunning),
+            ConcurrencyOnConflict::CancelRunning,
+        );
+        assert_eq!(
+            effective_admin_on_conflict("workflow", ConcurrencyOnConflict::Defer),
+            ConcurrencyOnConflict::Defer,
+        );
+
+        // An activity row always reports defer -- that is what is enforced.
+        assert_eq!(
+            effective_admin_on_conflict("activity", ConcurrencyOnConflict::CancelRunning),
+            ConcurrencyOnConflict::Defer,
+            "an activity concurrency group cannot latest-wins; reporting the \
+             owning workflow's cancel_running would advertise an unenforced strategy",
+        );
+        assert_eq!(
+            effective_admin_on_conflict("activity", ConcurrencyOnConflict::Defer),
+            ConcurrencyOnConflict::Defer,
+        );
+
+        // Defensive: an unrecognised task_type is not a workflow start either.
+        assert_eq!(
+            effective_admin_on_conflict("something_else", ConcurrencyOnConflict::CancelRunning),
+            ConcurrencyOnConflict::Defer,
+        );
+    }
     use super::*;
     use autumn_harvest::workers::WorkerHealth;
     use testcontainers::ContainerAsync;
@@ -46463,6 +46634,7 @@ mod tests {
                 inherited_chain_deadline_at: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                 priority: Priority::default(),
                 max_workflow_input_bytes: 0,
                 start_at: None,
@@ -46551,6 +46723,7 @@ mod tests {
                 inherited_chain_deadline_at: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                 priority: Priority::default(),
                 max_workflow_input_bytes: 0,
                 start_at: None,
@@ -46677,6 +46850,7 @@ mod tests {
                 inherited_chain_deadline_at: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                 priority: Priority::default(),
                 max_workflow_input_bytes: 0,
                 start_at: None,
@@ -46809,6 +46983,7 @@ mod tests {
                 inherited_chain_deadline_at: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                 priority: Priority::default(),
                 max_workflow_input_bytes: 0,
                 start_at: None,

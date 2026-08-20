@@ -71,6 +71,7 @@ fn params<'a>(
         max_workflow_chain_timeout_ceiling: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         signal_name,
         signal_payload,
         idempotency_key: None,

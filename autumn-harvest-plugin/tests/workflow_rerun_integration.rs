@@ -147,7 +147,9 @@ fn schema_info(name: &'static str) -> WorkflowInfo {
 /// A workflow carrying a per-key concurrency policy (issue #247).
 fn concurrency_info(name: &'static str, key_expr: &'static str, limit: u32) -> WorkflowInfo {
     WorkflowInfo {
-        concurrency: Some(autumn_harvest::concurrency::ConcurrencyPolicy { key_expr, limit }),
+        concurrency: Some(autumn_harvest::concurrency::ConcurrencyPolicy::new(
+            key_expr, limit,
+        )),
         ..plain_info(name)
     }
 }

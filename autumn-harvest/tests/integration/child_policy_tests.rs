@@ -130,6 +130,7 @@ async fn start_workflow(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -643,10 +644,7 @@ async fn detached_child_workflow_uses_registered_concurrency_policy() {
             wf_info_with_concurrency(
                 "capped_detached_child",
                 capped_child_wf,
-                ConcurrencyPolicy {
-                    key_expr: "input.tenant_id",
-                    limit: 2,
-                },
+                ConcurrencyPolicy::new("input.tenant_id", 2),
             ),
         ],
         vec![],

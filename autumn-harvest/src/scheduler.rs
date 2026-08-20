@@ -1505,6 +1505,7 @@ pub async fn trigger_unified_dag(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -4411,12 +4412,14 @@ async fn tick_one_workflow_schedule(
             .clone()
             .unwrap_or(serde_json::Value::Null);
         let wf_info = registry.workflows.get(wf_name);
-        let (concurrency_key, concurrency_limit) = wf_info
-            .and_then(|info| info.concurrency.as_ref())
-            .map_or((None, None), |policy| {
-                let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
-                (key, Some(policy.limit))
-            });
+        let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+            wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
+                (None, None, crate::concurrency::ConcurrencyOnConflict::Defer),
+                |policy| {
+                    let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                    (key, Some(policy.limit), policy.on_conflict)
+                },
+            );
         let (owner, runbook_url, severity) = {
             let wf_meta = wf_info.map(|info| (info.owner, info.runbook_url, info.severity));
             let dag_meta = registered_dags.get(wf_name).map(|dag| {
@@ -4516,6 +4519,7 @@ async fn tick_one_workflow_schedule(
                     priority: None,
                     concurrency_key: concurrency_key.clone(),
                     concurrency_limit,
+                    concurrency_on_conflict: Some(concurrency_on_conflict),
                     owner: owner.map(str::to_string),
                     runbook_url: runbook_url.map(str::to_string),
                     severity: severity.map(str::to_string),
@@ -4592,7 +4596,11 @@ async fn tick_one_workflow_schedule(
 
         // Provenance ref for a scheduled fire is the triggering schedule id (#740).
         let schedule_id_str = schedule.id.to_string();
-        let start_result = crate::execution::start_or_load_workflow_execution(
+        // Latest-wins supersede counters (issue #811, Codex round 1): the
+        // metrics-less wrapper discards the collected cancellations, so a
+        // scheduled fire that sheds an incumbent emitted neither
+        // `harvest.concurrency.superseded` nor the cancelled terminal.
+        let start_result = crate::execution::start_or_load_workflow_execution_with_metrics(
             conn,
             StartWorkflowParams {
                 workflow_name: wf_name,
@@ -4631,6 +4639,7 @@ async fn tick_one_workflow_schedule(
                 inherited_chain_deadline_at: None,
                 concurrency_key,
                 concurrency_limit,
+                concurrency_on_conflict,
                 priority: Priority::default(),
                 max_workflow_input_bytes: wf_info
                     .and_then(|info| info.max_input_bytes)
@@ -4664,6 +4673,7 @@ async fn tick_one_workflow_schedule(
                 start_source_ref: Some(schedule_id_str.as_str()),
                 started_by: None,
             },
+            Some(metrics.as_ref()),
             None,
         )
         .await;
@@ -6018,12 +6028,15 @@ async fn drain_buffered_schedule_runs(
                 .clone()
                 .unwrap_or(serde_json::Value::Null);
             let wf_info = registry.workflows.get(wf_name);
-            let (concurrency_key, concurrency_limit) = wf_info
-                .and_then(|info| info.concurrency.as_ref())
-                .map_or((None, None), |policy| {
-                    let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
-                    (key, Some(policy.limit))
-                });
+            let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+                wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
+                    (None, None, crate::concurrency::ConcurrencyOnConflict::Defer),
+                    |policy| {
+                        let key =
+                            crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                        (key, Some(policy.limit), policy.on_conflict)
+                    },
+                );
             let (owner, runbook_url, severity) = {
                 let wf_meta = wf_info.map(|info| (info.owner, info.runbook_url, info.severity));
                 let dag_meta = registered_dags.get(wf_name).map(|dag| {
@@ -6141,6 +6154,7 @@ async fn drain_buffered_schedule_runs(
                         priority: None,
                         concurrency_key: concurrency_key.clone(),
                         concurrency_limit,
+                        concurrency_on_conflict: Some(concurrency_on_conflict),
                         owner: owner.map(str::to_string),
                         runbook_url: runbook_url.map(str::to_string),
                         severity: severity.map(str::to_string),
@@ -6215,7 +6229,9 @@ async fn drain_buffered_schedule_runs(
 
             // Provenance ref for a buffered scheduled fire is the schedule id (#740).
             let schedule_id_str = schedule.id.to_string();
-            let start_result = crate::execution::start_or_load_workflow_execution(
+            // Latest-wins supersede counters (issue #811, Codex round 1) --
+            // the buffered drain shares the tick's gap.
+            let start_result = crate::execution::start_or_load_workflow_execution_with_metrics(
                 conn,
                 crate::execution::StartWorkflowParams {
                     workflow_name: wf_name,
@@ -6256,6 +6272,7 @@ async fn drain_buffered_schedule_runs(
                     inherited_chain_deadline_at: None,
                     concurrency_key,
                     concurrency_limit,
+                    concurrency_on_conflict,
                     priority: Priority::default(),
                     max_workflow_input_bytes: effective_cap,
                     start_at: None,
@@ -6283,6 +6300,7 @@ async fn drain_buffered_schedule_runs(
                     start_source_ref: Some(schedule_id_str.as_str()),
                     started_by: None,
                 },
+                Some(metrics.as_ref()),
                 None,
             )
             .await;

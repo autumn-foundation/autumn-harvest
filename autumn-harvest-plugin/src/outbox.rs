@@ -352,6 +352,7 @@ pub(crate) async fn dispatch_workflow_start_request(
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,

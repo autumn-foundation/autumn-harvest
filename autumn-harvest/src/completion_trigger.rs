@@ -959,6 +959,8 @@ pub struct DeferredTriggerStart {
     pub queue_name: Option<String>,
     pub concurrency_key: Option<String>,
     pub concurrency_limit: Option<u32>,
+    /// Per-key overflow strategy (issue #811) resolved at trigger-evaluation time.
+    pub concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict,
     pub priority: crate::types::Priority,
     pub max_workflow_input_bytes: u64,
     pub trigger_name: String,
@@ -1071,6 +1073,7 @@ impl DeferredTriggerStart {
                 inherited_chain_deadline_at: None,
                 concurrency_key: self.concurrency_key,
                 concurrency_limit: self.concurrency_limit,
+                concurrency_on_conflict: self.concurrency_on_conflict,
                 priority: self.priority,
                 max_workflow_input_bytes: self.max_workflow_input_bytes,
                 start_at: None,
@@ -1132,7 +1135,7 @@ pub fn evaluate_triggers_for_execution<'a>(
         use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
         use crate::schema::harvest_workflow_executions::dsl as execs_dsl;
         use crate::models::{CompletionTriggerDb, NewCompletionTriggerFireDb, WorkflowExecution, NewCompletionTriggerOutboxDb};
-        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution};
+        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution_with_metrics};
         use crate::types::WorkflowIdReusePolicy;
         use crate::types::Priority;
 
@@ -1501,15 +1504,15 @@ pub fn evaluate_triggers_for_execution<'a>(
             }
 
             // Resolve target concurrency parameters
-            let (concurrency_key, concurrency_limit) = {
+            let (concurrency_key, concurrency_limit, concurrency_on_conflict) = {
                 let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
                 lock.as_ref()
                     .and_then(|guard| guard.as_ref())
                     .and_then(|meta_map| meta_map.get(&trigger_db.target_workflow_name))
                     .and_then(|meta| meta.concurrency.as_ref())
-                    .map_or((None, None), |policy| {
+                    .map_or((None, None, crate::concurrency::ConcurrencyOnConflict::Defer), |policy| {
                         let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &target_input);
-                        (key, Some(policy.limit))
+                        (key, Some(policy.limit), policy.on_conflict)
                     })
             };
 
@@ -1539,7 +1542,25 @@ pub fn evaluate_triggers_for_execution<'a>(
                 };
 
                 let target_exec_id = crate::types::ExecutionId::new_for_shard(target_shard);
-                let start_res = match start_or_load_workflow_execution(
+                // `_with_metrics` (not the metrics-less wrapper) so a latest-wins
+                // supersede performed by this target is counted (issue #811,
+                // Codex round 2): the wrapper discards the collected
+                // cancellations, so `harvest.concurrency.superseded` and the
+                // incumbent's cancelled terminal were both dropped even though a
+                // recorder is in scope here. Emission is inline, matching every
+                // other counter this function already records inside the source's
+                // terminal transaction (`record_completion_trigger_fired`).
+                //
+                // Residual (Codex round 3): emission happens at return, not after
+                // the enclosing terminal transaction commits, so a rollback of that
+                // transaction leaves both counters emitted for a supersede that never
+                // became durable. Bounded to rolled-back terminal transactions, and
+                // strictly better than the pre-fix state (never emitted at all, an
+                // unconditional under-count). Deferring emission needs a post-commit
+                // collector threaded out of `evaluate_triggers_for_execution`, which
+                // changes its return type across 71 call sites; tracked as a
+                // follow-up issue.
+                let start_res = match start_or_load_workflow_execution_with_metrics(
                     conn,
                     StartWorkflowParams {
                         workflow_name: &trigger_db.target_workflow_name,
@@ -1560,6 +1581,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                         inherited_chain_deadline_at: None,
                         concurrency_key,
                         concurrency_limit,
+                        concurrency_on_conflict,
                         priority: Priority::default(),
                         max_workflow_input_bytes,
                         start_at: None,
@@ -1583,6 +1605,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                         start_source_ref: Some(source_exec_id_str.as_str()),
                         started_by: None,
                     },
+                    metrics,
                     // The inline same-shard completion-trigger start keeps its own
                     // unlocked pre-check gate above (it also performs the fires-row
                     // `admission_blocked` bookkeeping and the first-time-only block
@@ -1668,6 +1691,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                     queue_name: trigger_db.queue_name.clone(),
                     concurrency_key,
                     concurrency_limit,
+                    concurrency_on_conflict,
                     priority: Priority::default(),
                     max_workflow_input_bytes,
                     trigger_name,
@@ -1773,6 +1797,21 @@ pub async fn enforce_completion_triggers_outbox(
             .ok()
             .and_then(|g| *g);
 
+        // Latest-wins overflow strategy (issue #811) is re-resolved from the
+        // registered workflow metadata at relay time rather than persisted on the
+        // outbox row -- the row already carries the resolved key + limit, and
+        // adding a column would need a migration that AC5 rules out.
+        let relay_concurrency_on_conflict = {
+            let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
+            lock.as_ref()
+                .and_then(|guard| guard.as_ref())
+                .and_then(|meta_map| meta_map.get(&task.target_workflow_name))
+                .and_then(|meta| meta.concurrency.as_ref())
+                .map_or(crate::concurrency::ConcurrencyOnConflict::Defer, |policy| {
+                    policy.on_conflict
+                })
+        };
+
         // Provenance ref is the triggering (source) execution id (#740).
         let source_exec_id_str = task.source_exec_id.to_string();
         let params = crate::execution::StartWorkflowParams {
@@ -1796,6 +1835,7 @@ pub async fn enforce_completion_triggers_outbox(
             concurrency_limit: task
                 .concurrency_limit
                 .map(|l| u32::try_from(l).unwrap_or(0)),
+            concurrency_on_conflict: relay_concurrency_on_conflict,
             priority,
             max_workflow_input_bytes: u64::try_from(task.max_workflow_input_bytes).unwrap_or(0),
             start_at: None,

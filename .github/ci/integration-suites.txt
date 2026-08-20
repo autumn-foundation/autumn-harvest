@@ -64,6 +64,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          child_timeout_tests
 linux        autumn-harvest         integration                      -                          claim_budget_tests
 linux        autumn-harvest         integration                      -                          completion_callback_tests
+linux        autumn-harvest         integration                      -                          concurrency_supersede_tests
 linux        autumn-harvest         integration                      -                          cross_type_continue_as_new_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_await_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_signal_tests
@@ -107,6 +108,7 @@ linux        autumn-harvest-plugin  build_ramp_integration           -          
 linux        autumn-harvest-plugin  by_id_integration                -                          -
 linux        autumn-harvest-plugin  canary_integration               -                          -
 linux        autumn-harvest-plugin  completion_triggers_integration  -                          -
+linux        autumn-harvest-plugin  concurrency_admin_integration    -                          -
 linux        autumn-harvest-plugin  conflict_policy_integration      -                          -
 linux        autumn-harvest-plugin  connector_integration            connectors                 -
 linux        autumn-harvest-plugin  connector_sqs_broker             sqs                        -

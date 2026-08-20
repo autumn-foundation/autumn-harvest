@@ -263,6 +263,7 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_WORKFLOW_PAUSE_DURATION` | `harvest.workflow.pause_duration` | Histogram | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
 | `METRIC_SAGA_COMPENSATED`  | `harvest.saga.compensated`    | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
 | `METRIC_SAGA_COMPENSATION_FAILED` | `harvest.saga.compensation_failed` | Counter | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
+| `METRIC_CONCURRENCY_SUPERSEDED` | `harvest.concurrency.superseded` | Counter | `workflow` (= `METRIC_LABEL_WORKFLOW`, the **superseded** run's type) — **no `key` label**: the concurrency key is resolved from workflow input (tenant/document ids) and is unbounded; per-key detail lives on `GET /admin/concurrency` (issue #811) | `execution.id`, concurrency `key` |
 | `METRIC_ACTIVITY_PANIC`    | `harvest.activity.panic`      | Counter      | `activity` (= `METRIC_LABEL_ACTIVITY`, bounded), `queue` (bounded) | `execution.id`, `activity.id` |
 | `METRIC_WORKFLOW_PANIC`    | `harvest.workflow.panic`      | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id`        |
 | `METRIC_SIGNAL_RECEIVED`   | `harvest.signal.received`     | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` — **no `name` label**: signal names come from the free-form send route `POST /workflows/{id}/signal/{signal_name}` and have no declared registry to bound them (issue #684, Codex P2) | `execution.id`, signal `name` |

@@ -815,7 +815,7 @@ type FiredThrottle = (
     String, // queue_name
     Vec<crate::completion_trigger::DeferredTriggerStart>,
     Vec<(crate::types::ExecutionId, String)>,
-    Vec<(String, String)>,
+    Vec<crate::execution::StartCancelledRun>,
     // Whether this fire should count toward `harvest.schedule.runs` (issue
     // #607 code review): true only when the deferred start's persisted
     // `origin == "scheduled"` (set only by the scheduler-tick and
@@ -1017,6 +1017,7 @@ async fn fire_claimed_throttle_row(
         inherited_chain_deadline_at: None,
         concurrency_key: opts.concurrency_key,
         concurrency_limit: opts.concurrency_limit,
+        concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
         priority,
         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
         start_at: None,
@@ -1322,14 +1323,7 @@ pub async fn fire_due_throttled_starts(
                 )
                 .await;
             }
-            for (wf_name, q_name) in cancel_metrics {
-                crate::telemetry::emit_workflow_terminal(
-                    metrics,
-                    &wf_name,
-                    &q_name,
-                    crate::telemetry::WorkflowStatus::Cancelled,
-                );
-            }
+            crate::execution::emit_start_cancel_metrics(metrics, &cancel_metrics);
             // A throttled scheduler-tick / buffered-backfill-fire dispatch is
             // counted here, on the same terms its immediate-path sibling
             // uses (`if outcome.created() { metrics.record_schedule_run(...) }`)
