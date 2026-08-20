@@ -1454,21 +1454,25 @@ async fn eris_readonly_options_preflight_is_not_denied() {
 // ── Scoped API token layer (issue #942) ──────────────────────────────────────
 //
 // No-DB tests of the token verification/scope layer wired via
-// `from_fn_with_state`. Pass-through paths (absent/non-`hvst_` bearer, OPTIONS)
-// never touch the pool, so they hold without a database; a claimed `hvst_`
-// bearer with no store available must NOT pass through (503), proving a claimed
-// token is never trusted unverified.
+// `from_fn_with_state`. In composed mode, absent/non-`hvst_` bearers pass to
+// the embedder boundary; in token-only mode they fail closed without touching
+// the pool. OPTIONS also passes through. A claimed `hvst_` bearer with no store
+// available must NOT pass through (503), proving a claimed token is never
+// trusted unverified.
 
 use autumn_harvest_plugin::api_token::enforce_token_scope;
 use autumn_web::reexports::axum::middleware::from_fn_with_state;
 
-fn token_layer_app() -> impl tower::Service<
+fn token_layer_app(
+    with_embedder_boundary: bool,
+) -> impl tower::Service<
     Request<Body>,
     Response = autumn_web::reexports::axum::response::Response,
     Error = std::convert::Infallible,
     Future = impl std::future::Future,
 > + Clone {
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(with_embedder_boundary);
     harvest_api_router(api_state.clone())
         .layer(from_fn_with_state(api_state, enforce_token_scope))
         .with_state(AppState::for_test())
@@ -1490,7 +1494,7 @@ async fn token_layer_passes_through_absent_bearer() {
     // `/workflows`) because the no-pool test rig makes `/workflows` fail-closed
     // to 503 downstream (issue #756), which is orthogonal to — and would mask —
     // the token layer's pass-through behavior under test.
-    let app = token_layer_app();
+    let app = token_layer_app(true);
     let res = app.oneshot(get("/health")).await.unwrap();
     assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
     assert_ne!(res.status(), StatusCode::FORBIDDEN);
@@ -1502,7 +1506,7 @@ async fn token_layer_passes_through_non_hvst_bearer() {
     // AC7: a bearer that is not a harvest token is ignored — the embedder's own
     // JWT still governs. The token layer must not 401 it. `/health` is used for
     // the same rig reason as above (the no-pool `/workflows` 503 is downstream).
-    let app = token_layer_app();
+    let app = token_layer_app(true);
     let res = app
         .oneshot(get_bearer("/health", "eyJhbGciOiJIUzI1NiJ9.embedder.jwt"))
         .await
@@ -1514,7 +1518,7 @@ async fn token_layer_passes_through_non_hvst_bearer() {
 
 #[tokio::test]
 async fn token_layer_passes_through_options_preflight() {
-    let app = token_layer_app();
+    let app = token_layer_app(false);
     let req = Request::builder()
         .method(Method::OPTIONS)
         .uri("/workflows/abc/cancel")
@@ -1532,12 +1536,30 @@ async fn token_layer_rejects_hvst_bearer_when_store_unavailable() {
     // A claimed hvst_ token that cannot be verified (no pool installed) must NOT
     // pass through — under the admin boundary that would be an auth bypass. It
     // is rejected 503 (service unavailable), not silently trusted.
-    let app = token_layer_app();
+    let app = token_layer_app(false);
     let res = app
         .oneshot(get_bearer("/workflows", "hvst_someclaimedtoken"))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn token_only_layer_rejects_missing_and_non_harvest_bearers() {
+    // In standalone token-only mode there is no embedder boundary to secure
+    // unguarded management routes, so the token layer must fail closed before
+    // those routes can run.
+    let missing = token_layer_app(false)
+        .oneshot(get("/health"))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let non_harvest = token_layer_app(false)
+        .oneshot(get_bearer("/health", "eyJhbGciOiJIUzI1NiJ9.embedder.jwt"))
+        .await
+        .unwrap();
+    assert_eq!(non_harvest.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

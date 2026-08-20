@@ -345,9 +345,10 @@ impl HarvestPlugin {
     /// against the `harvest_api_tokens` table (rejecting an unknown/expired/
     /// revoked token 401, a `read`-scoped token attempting a mutating route
     /// 403), and its stable identity is threaded into the audit trail as
-    /// `token:{id}`. A bearer that does **not** begin with `hvst_` (or an absent
-    /// bearer) is passed through untouched, so token auth **composes with** — it
-    /// never replaces — an embedder's own `api_with_auth` middleware (AC7).
+    /// `token:{id}`. When combined with `api_with_auth`, a bearer that does
+    /// **not** begin with `hvst_` (or an absent bearer) is passed through to the
+    /// embedder's boundary. Without that boundary, token-only mode requires a
+    /// valid Harvest token for every non-OPTIONS management API request.
     ///
     /// Default off: an embedder that never calls this sees byte-for-byte
     /// unchanged behavior (no layer installed).
