@@ -1,0 +1,15 @@
+error[E0425]: cannot find value `QUEUE_PARK_BEFORE_UPDAT` in module `autumn_harvest::chaos::points`
+  --> tests/compile_fail/chaos_unknown_point_is_compile_error.rs:10:44
+   |
+10 |     let _ = autumn_harvest::chaos::points::QUEUE_PARK_BEFORE_UPDAT;
+   |                                            ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+  ::: src/chaos.rs
+   |
+   |     pub const QUEUE_PARK_BEFORE_UPDATE: ChaosPoint = ChaosPoint {
+   |     ---------------------------------------------- similarly named constant `QUEUE_PARK_BEFORE_UPDATE` defined here
+   |
+help: a constant with a similar name exists
+   |
+10 |     let _ = autumn_harvest::chaos::points::QUEUE_PARK_BEFORE_UPDATE;
+   |                                                                   +
