@@ -212,7 +212,17 @@ const INIT_SQL: &str = concat!(
     // claim, so without it every claim in this suite (and in every suite that
     // borrows `setup_test_database_url_or_env` from here) fails with
     // `column "capability_misses" does not exist`.
-    include_str!("../../migrations/20260720000000_harvest_task_capability_misses/up.sql")
+    include_str!("../../migrations/20260720000000_harvest_task_capability_misses/up.sql"),
+    "\n",
+    // issue #807: harvest_activity_pauses. REQUIRED, not optional -- the
+    // `paused_activities` MATERIALIZED CTE in `claim_task_query()` selects from
+    // this table on every claim, so without it every claim in this suite (and in
+    // every suite that borrows `setup_test_database_url_or_env` from here) fails
+    // with `relation "harvest_activity_pauses" does not exist`. The same
+    // migration also adds the partial `idx_harvest_tq_activity_pause` index on
+    // `harvest_task_queue`; that index is a performance aid rather than a
+    // correctness requirement, but it ships in the same file.
+    include_str!("../../migrations/20260722000000_harvest_activity_pause/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -915,6 +925,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -1995,6 +2006,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -2203,6 +2215,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
         priority: Priority::default(),
         max_workflow_input_bytes: 0,
         start_at: None,
@@ -6379,6 +6392,7 @@ mod reuse_policy_helpers {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -8265,6 +8279,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -8447,6 +8462,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
@@ -11274,10 +11290,12 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
 /// fixtures allowed to skip [`autumn_harvest::full_migrations_sql`]. That makes
 /// it a standing drift hazard: `queue::claim_task` runs on essentially every
 /// test in this suite — and in every suite that borrows
-/// `setup_test_database_url_or_env` from here (`child_timeout_tests`,
-/// `chain_timeout_tests`, `rate_limit_key_tests`, `workflow_retry_tests`) — so a
-/// migration that adds a table to the claim query and forgets this bundle takes
-/// out five suites at once with `relation "..." does not exist`.
+/// `setup_test_database_url_or_env` from here (`chain_timeout_tests`,
+/// `child_timeout_tests`, `cross_type_continue_as_new_tests`, `ctx_info_tests`,
+/// `dag_execution_timeout_tests`, `rate_limit_key_tests`,
+/// `workflow_retry_tests`) — so a migration that adds a table to the claim query
+/// and forgets this bundle takes out eight suites at once with
+/// `relation "..." does not exist`.
 ///
 /// That is exactly what issue #619's `harvest_queue_pauses` anti-join did. It
 /// cost a full Docker-backed CI cycle (~13 min) to surface, yet it is decidable
@@ -11323,9 +11341,10 @@ fn init_sql_creates_every_table_the_claim_path_references() {
         missing.is_empty(),
         "INIT_SQL is missing table(s) the claim path references: {missing:?}\n\
          Add the migration that creates them to the INIT_SQL concat! in this file. \
-         Without it every claim in this suite -- and in child_timeout_tests, \
-         chain_timeout_tests, rate_limit_key_tests and workflow_retry_tests, which \
-         reuse setup_test_database_url_or_env from here -- fails with \
-         `relation \"...\" does not exist` (issue #619)."
+         Without it every claim in this suite -- and in chain_timeout_tests, \
+         child_timeout_tests, cross_type_continue_as_new_tests, ctx_info_tests, \
+         dag_execution_timeout_tests, rate_limit_key_tests and \
+         workflow_retry_tests, which reuse setup_test_database_url_or_env from \
+         here -- fails with `relation \"...\" does not exist` (issues #619, #807)."
     );
 }

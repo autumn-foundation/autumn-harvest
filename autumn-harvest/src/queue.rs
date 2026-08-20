@@ -525,6 +525,25 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 /// new bind — it reuses `$2`, pre-filtering `harvest_queue_pauses` to the
 /// worker's own polled queues once via `paused_queues` rather than probing it
 /// once per candidate row (see the `NOTE` above `claim_task_query` for why).
+///
+/// The per-activity-type pause (issue #807) needs no bind either: unlike
+/// `paused_queues` there is no natural bound to pre-filter by — a worker's
+/// polled queues say nothing about which activity types are held — so
+/// `paused_activities` reads the whole table. That is deliberate and cheap: the
+/// table is keyed by activity name and holds one row per *currently paused*
+/// activity, so it is empty in steady state and a handful of rows during an
+/// incident. It is `MATERIALIZED` for the same reason `paused_queues` is —
+/// evaluated once per claim, never once per candidate row.
+///
+/// **Both activity-name gates (`$6` and `paused_activities`) are guarded by
+/// `task_type != 'activity' OR activity_name IS NULL` and this is load-bearing,
+/// not defensive noise.** `activity_name` is `NULL` for workflow tasks, and in
+/// SQL `NULL = ANY(array)` is `NULL` — so `NOT (activity_name = ANY(...))` is
+/// `NULL`, which is not `TRUE`, which excludes the row. Without the guard a
+/// single paused activity would silently stop every *workflow* task in the
+/// fleet from being claimed: a total orchestration outage produced by a
+/// surgical containment control. Pinned by
+/// `claim_query_activity_pause_gate_never_holds_workflow_tasks`.
 // The body is one SQL string literal; the line count is the query's, not
 // control flow's. `claim_task` carried the same allow before this query was
 // extracted for shape-testing.
@@ -539,11 +558,16 @@ pub const fn claim_task_query() -> &'static str {
              FROM harvest_queue_pauses \
              WHERE queue_name = ANY($2) \
          ), \
+         paused_activities AS MATERIALIZED ( \
+             SELECT COALESCE(array_agg(activity_name), ARRAY[]::text[]) AS names \
+             FROM harvest_activity_pauses \
+         ), \
          candidate AS ( \
              SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name \
              FROM harvest_task_queue \
              CROSS JOIN worker_info \
              CROSS JOIN paused_queues \
+             CROSS JOIN paused_activities \
              WHERE queue_name = ANY($2) \
                AND state = 'PENDING' \
                AND scheduled_at <= NOW() \
@@ -597,6 +621,11 @@ pub const fn claim_task_query() -> &'static str {
                    OR activity_name IS NULL \
                    OR required_capabilities IS NOT NULL \
                    OR NOT (activity_name = ANY($6)) \
+               ) \
+               AND ( \
+                   task_type != 'activity' \
+                   OR activity_name IS NULL \
+                   OR NOT (activity_name = ANY(paused_activities.names)) \
                ) \
                AND ( \
                    required_capabilities IS NULL \
@@ -910,6 +939,33 @@ pub async fn claim_task(
                     return Ok(None);
                 }
 
+                // Authoritative activity-pause re-check (issue #807). Same
+                // reasoning as the queue-pause re-check directly above: the
+                // `paused_activities` pre-filter in the claim is evaluated
+                // against that statement's snapshot, so a pause committing
+                // while the claim was in flight is invisible to it. This is a
+                // separate statement and therefore takes a fresh snapshot.
+                //
+                // Gated on `task_type` so a workflow task -- which can never be
+                // held by an activity pause -- pays no extra round trip on the
+                // hot claim path. The guard is not merely an optimization: it
+                // makes the added cost fall only on the rows the feature can
+                // actually hold.
+                //
+                // Unlike the queue-pause path there is no advisory-lock barrier
+                // here, so this verdict is authoritative as of its own snapshot
+                // rather than through commit. See the "Residual window" section
+                // on `activity_pause::release_claim_if_activity_paused` for the
+                // precise bound and why it is accepted.
+                if task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE
+                    && crate::activity_pause::release_claim_if_activity_paused(
+                        conn, task.id, worker_id,
+                    )
+                    .await?
+                {
+                    return Ok(None);
+                }
+
                 Ok(Some(task))
             },
         )
@@ -1016,7 +1072,67 @@ pub struct ConcurrencyKeyStats {
     /// Number of tasks in `PENDING` state for this key+type (may be deferred
     /// by the cap if `in_flight >= max_concurrent`).
     pub pending: i64,
+    /// Workflow types observed on this key, each with the overflow strategy
+    /// their registered [`crate::concurrency::ConcurrencyPolicy`] declares
+    /// (issue #811).
+    ///
+    /// **Populated only by the management API** (`GET /admin/concurrency`),
+    /// which has the handler registry needed to resolve a declared strategy.
+    /// The worker's in-process concurrency sampler leaves this empty — it reads
+    /// only the counters above, so the extra join is never on its hot path.
+    /// `skip_serializing_if` keeps the sampler-shaped value byte-identical to
+    /// the pre-#811 wire form.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflows: Vec<ConcurrencyWorkflowStrategy>,
 }
+
+/// A workflow type observed on a concurrency key, with the overflow strategy
+/// its registered policy declares (issue #811).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConcurrencyWorkflowStrategy {
+    /// The workflow type name.
+    pub workflow_name: String,
+    /// Effective `on_conflict` strategy for new starts of this workflow type:
+    /// `"defer"` (wait for a slot) or `"cancel_running"` (latest-wins — cancel
+    /// the oldest running run(s) and admit the newcomer).
+    ///
+    /// A workflow whose registered `WorkflowInfo` declares no concurrency
+    /// policy reports `defer`, matching what the start path resolves.
+    pub on_conflict: crate::concurrency::ConcurrencyOnConflict,
+}
+
+/// A `(concurrency_key, task_type)` group and one workflow type observed on it.
+///
+/// Returned by [`concurrency_key_workflows`]; the management API joins these
+/// against the handler registry to resolve each workflow's declared
+/// `on_conflict` strategy (issue #811).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcurrencyKeyWorkflow {
+    /// The concurrency group key.
+    pub key: String,
+    /// Task type this row covers (`"workflow"` or `"activity"`).
+    pub task_type: String,
+    /// Workflow type owning the task(s) in this group.
+    pub workflow_name: String,
+}
+
+/// SQL for [`concurrency_key_stats`].
+///
+/// Named (rather than inlined) so the drift guard can read BOTH this and
+/// [`CONCURRENCY_ATTRIBUTION_SQL`] and assert they share the same row filter —
+/// checking only one side could not detect drift in the other.
+const CONCURRENCY_STATS_SQL: &str = "SELECT \
+             concurrency_key AS key, \
+             task_type, \
+             MAX(concurrency_cap)::INT4 AS max_concurrent, \
+             COUNT(*) FILTER (WHERE state = 'RUNNING' AND worker_id IS NOT NULL) AS in_flight, \
+             COUNT(*) FILTER (WHERE state = 'PENDING') AS pending \
+         FROM harvest_task_queue \
+         WHERE concurrency_key IS NOT NULL \
+           AND concurrency_cap IS NOT NULL \
+           AND queue_name = ANY($1) \
+           AND (state = 'PENDING' OR (state = 'RUNNING' AND worker_id IS NOT NULL)) \
+         GROUP BY concurrency_key, task_type";
 
 /// Return live concurrency stats for all keys visible in the given queues.
 ///
@@ -1044,24 +1160,11 @@ pub async fn concurrency_key_stats(
         pending: i64,
     }
 
-    let rows: Vec<Row> = diesel::sql_query(
-        "SELECT \
-             concurrency_key AS key, \
-             task_type, \
-             MAX(concurrency_cap)::INT4 AS max_concurrent, \
-             COUNT(*) FILTER (WHERE state = 'RUNNING' AND worker_id IS NOT NULL) AS in_flight, \
-             COUNT(*) FILTER (WHERE state = 'PENDING') AS pending \
-         FROM harvest_task_queue \
-         WHERE concurrency_key IS NOT NULL \
-           AND concurrency_cap IS NOT NULL \
-           AND queue_name = ANY($1) \
-           AND (state = 'PENDING' OR (state = 'RUNNING' AND worker_id IS NOT NULL)) \
-         GROUP BY concurrency_key, task_type",
-    )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-    .load(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+    let rows: Vec<Row> = diesel::sql_query(CONCURRENCY_STATS_SQL)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
 
     Ok(rows
         .into_iter()
@@ -1071,9 +1174,69 @@ pub async fn concurrency_key_stats(
             max_concurrent: r.max_concurrent,
             in_flight: r.in_flight,
             pending: r.pending,
+            workflows: Vec::new(),
         })
         .collect())
 }
+
+/// Return the workflow types observed on each live `(concurrency_key,
+/// task_type)` group in the given queues (issue #811).
+///
+/// Mirrors [`concurrency_key_stats`]'s row filter exactly, joined to
+/// `harvest_workflow_executions` so each group can be attributed to the
+/// workflow type(s) that produced it. The management API joins the result
+/// against the handler registry to report each workflow's declared
+/// `on_conflict` strategy; the worker's sampler never calls this.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn concurrency_key_workflows(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+) -> HarvestResult<Vec<ConcurrencyKeyWorkflow>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        key: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        task_type: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        workflow_name: String,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(CONCURRENCY_ATTRIBUTION_SQL)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ConcurrencyKeyWorkflow {
+            key: r.key,
+            task_type: r.task_type,
+            workflow_name: r.workflow_name,
+        })
+        .collect())
+}
+
+/// SQL for [`concurrency_key_workflows`].
+///
+/// Named (rather than inlined) so a unit test can assert it shares
+/// [`concurrency_key_stats`]'s row filter — the two are separate statements
+/// and would otherwise be free to drift.
+const CONCURRENCY_ATTRIBUTION_SQL: &str = "SELECT \
+             t.concurrency_key AS key, \
+             t.task_type, \
+             e.workflow_name \
+         FROM harvest_task_queue t \
+         JOIN harvest_workflow_executions e ON e.id = t.workflow_exec_id \
+         WHERE t.concurrency_key IS NOT NULL \
+           AND t.concurrency_cap IS NOT NULL \
+           AND t.queue_name = ANY($1) \
+           AND (t.state = 'PENDING' OR (t.state = 'RUNNING' AND t.worker_id IS NOT NULL)) \
+         GROUP BY t.concurrency_key, t.task_type, e.workflow_name";
 
 /// Mark a task as completed with the given output.
 ///
@@ -1369,6 +1532,9 @@ pub const fn oldest_pending_ages_query() -> &'static str {
            AND scheduled_at <= NOW() \
            AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
          WHERE qp.queue_name = harvest_task_queue.queue_name) \
+           AND NOT EXISTS (SELECT 1 FROM harvest_activity_pauses ap \
+         WHERE ap.activity_name = harvest_task_queue.activity_name \
+           AND harvest_task_queue.task_type = 'activity') \
            AND ( \
                schedule_to_close_at IS NULL \
                OR schedule_to_close_at > NOW() \
@@ -3526,8 +3692,8 @@ pub struct ClaimablePendingDemand {
 /// site and the drift test share one source of truth.
 ///
 /// Mirrors **every** claim-time gate in [`claim_task_query`], including the
-/// issue #619 queue-pause anti-join. Bind: `$1` circuit-breaker-tracked
-/// activities.
+/// issue #619 queue-pause and issue #807 activity-pause anti-joins. Bind: `$1`
+/// circuit-breaker-tracked activities.
 #[must_use]
 pub fn claimable_pending_demand_query() -> String {
     // `sticky_owner` is NULL unless an unexpired lease binds the row to a
@@ -3544,6 +3710,16 @@ pub fn claimable_pending_demand_query() -> String {
     // worker-capacity alert during the hold). Generated from the shared
     // renderer, correlated against this query's `tq` alias.
     let queue_pause_gate = crate::queue_pause::queue_pause_anti_join("tq");
+    // Issue #807: identically, a paused activity type's backlog is held rather
+    // than stalled. The rendered anti-join carries `task_type = 'activity'`, and
+    // that predicate is REQUIRED, not redundant: a workflow row's
+    // `activity_name` is not reliably NULL -- the engine stamps the
+    // `'mixed_signal_suspension'` sentinel into that very column -- so
+    // NULL-safety alone would leave this query silently under-reporting demand
+    // whenever an activity happened to share that sentinel's name. See
+    // `activity_pause::activity_pause_anti_join`, and the shape assertion in
+    // `claim_gate_mirrors_carry_the_activity_pause_predicate` below.
+    let activity_pause_gate = crate::activity_pause::activity_pause_anti_join("tq");
     format!(
         "SELECT tq.queue_name, tq.required_capabilities, tq.required_build_id, \
                 {sticky_owner_expr} AS sticky_owner, tq.activity_name, \
@@ -3553,6 +3729,7 @@ pub fn claimable_pending_demand_query() -> String {
          WHERE tq.state = 'PENDING' \
            AND tq.scheduled_at <= NOW() \
            AND {queue_pause_gate} \
+           AND {activity_pause_gate} \
            AND ( \
                tq.schedule_to_close_at IS NULL \
                OR tq.schedule_to_close_at > NOW() \
@@ -3940,6 +4117,121 @@ mod tests {
     use super::*;
     use crate::error::CapabilityMissPhase;
 
+    // ── Issue #811: latest-wins strategy on the concurrency admin read ──────
+
+    /// `GET /admin/concurrency` is a `free_form` contract route, so the
+    /// `contract_regression` cross-check cannot catch a drift in this shape.
+    /// Pin it here: a sampler-shaped row (no registry, so no attribution) must
+    /// serialize byte-identically to the pre-#811 wire form, and an
+    /// admin-shaped row must carry the strategy an operator reads.
+    #[test]
+    fn concurrency_key_stats_serializes_workflows_only_when_populated() {
+        let sampler_shaped = ConcurrencyKeyStats {
+            key: "tenant-42".to_string(),
+            task_type: "workflow".to_string(),
+            max_concurrent: 1,
+            in_flight: 1,
+            pending: 3,
+            workflows: Vec::new(),
+        };
+        let json = serde_json::to_value(&sampler_shaped).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "key": "tenant-42",
+                "task_type": "workflow",
+                "max_concurrent": 1,
+                "in_flight": 1,
+                "pending": 3,
+            }),
+            "an empty attribution list must be omitted entirely, so the \
+             worker-sampler-shaped value is byte-identical to pre-#811"
+        );
+
+        let admin_shaped = ConcurrencyKeyStats {
+            workflows: vec![
+                ConcurrencyWorkflowStrategy {
+                    workflow_name: "doc_index".to_string(),
+                    on_conflict: crate::concurrency::ConcurrencyOnConflict::CancelRunning,
+                },
+                ConcurrencyWorkflowStrategy {
+                    workflow_name: "doc_report".to_string(),
+                    on_conflict: crate::concurrency::ConcurrencyOnConflict::Defer,
+                },
+            ],
+            ..sampler_shaped
+        };
+        let json = serde_json::to_value(&admin_shaped).expect("serialize");
+        assert_eq!(
+            json["workflows"],
+            serde_json::json!([
+                {"workflow_name": "doc_index", "on_conflict": "cancel_running"},
+                {"workflow_name": "doc_report", "on_conflict": "defer"},
+            ]),
+            "the admin read must surface each workflow's effective strategy \
+             using the same snake_case wire values the macro attribute accepts"
+        );
+
+        // Round-trips, so a client deserializing the admin shape (and an older
+        // client deserializing the sampler shape) both work.
+        let back: ConcurrencyKeyStats =
+            serde_json::from_value(json).expect("admin shape must round-trip");
+        assert_eq!(back.workflows.len(), 2);
+        let legacy: ConcurrencyKeyStats = serde_json::from_value(serde_json::json!({
+            "key": "k",
+            "task_type": "activity",
+            "max_concurrent": 2,
+            "in_flight": 0,
+            "pending": 0,
+        }))
+        .expect("a pre-#811 payload must still deserialize");
+        assert!(legacy.workflows.is_empty());
+    }
+
+    /// The attribution query must select exactly the same live rows the stats
+    /// query counts, or a key could report a workflow it has no live task for
+    /// (or omit the one it does). Pin the shared predicate textually — the two
+    /// are separate `sql_query` strings that can silently drift.
+    #[test]
+    fn concurrency_attribution_query_matches_the_stats_row_filter() {
+        // The two are separate `sql_query` string literals, so they are free to
+        // drift. Assert the shared predicate fragments are present in BOTH --
+        // checking only the attribution side would pass even if the STATS side
+        // changed, which is exactly the drift this guard exists to catch.
+        //
+        // The attribution query aliases `harvest_task_queue` as `t` (it joins
+        // the executions table), so strip that alias before comparing; the
+        // predicates are otherwise character-identical. Fragment-level rather
+        // than whole-statement so reformatting is not brittle.
+        let stats = CONCURRENCY_STATS_SQL.replace("t.", "");
+        let attribution = CONCURRENCY_ATTRIBUTION_SQL.replace("t.", "");
+        for fragment in [
+            "concurrency_key IS NOT NULL",
+            "concurrency_cap IS NOT NULL",
+            "queue_name = ANY($1)",
+            "(state = 'PENDING' OR (state = 'RUNNING' AND worker_id IS NOT NULL))",
+        ] {
+            assert!(
+                stats.contains(fragment),
+                "stats query must contain the shared row-filter fragment `{fragment}`"
+            );
+            assert!(
+                attribution.contains(fragment),
+                "attribution query must share the stats row filter fragment `{fragment}`"
+            );
+        }
+
+        // Both must group by the same key dimensions, or a key could report a
+        // workflow it has no live task for (or omit the one it does). The
+        // attribution query adds `workflow_name` (that is the whole point), so
+        // assert the shared prefix rather than equality.
+        assert!(stats.contains("GROUP BY concurrency_key, task_type"));
+        assert!(
+            attribution.contains("GROUP BY concurrency_key, task_type, e.workflow_name"),
+            "attribution groups by the same (key, task_type) dimensions, plus workflow_name"
+        );
+    }
+
     // ── Issue #774: queue coverage — pending-demand query ───────────────────
 
     /// The hot query embeds two `LEFT JOIN LATERAL ... LIMIT N` sample
@@ -4066,6 +4358,119 @@ mod tests {
             claim_task_query().matches("harvest_queue_pauses").count(),
             1,
             "the pause gate belongs only in the candidate (PENDING) scan"
+        );
+    }
+
+    // ── Activity pause: claim gate + its mirrors (issue #807) ───────────────
+
+    /// The per-activity pause gate must use the same pre-filtered-array shape
+    /// the queue gate was rewritten to, never a per-row correlated subquery.
+    ///
+    /// The `NOTE` above [`claim_task_query`] records that the correlated form
+    /// accounted for ~99% of this query's buffer touches at a 10k-row backlog,
+    /// because the planner re-probes the pause table once per *candidate row*
+    /// walked while sorting toward `LIMIT 1`. An activity pause is enforced on
+    /// the same scan, so it inherits the same cost model — and the same
+    /// prohibition.
+    #[test]
+    fn claim_query_excludes_paused_activities_via_a_prefiltered_array() {
+        let sql = claim_task_query();
+        assert!(
+            sql.contains("paused_activities AS MATERIALIZED"),
+            "the activity-pause pre-filter must be forced to materialize once, \
+             not be inlined back into a per-row correlated subquery; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("FROM harvest_activity_pauses"),
+            "paused_activities must read the durable pause table; got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("NOT EXISTS (SELECT 1 FROM harvest_activity_pauses"),
+            "the per-row correlated anti-join must never appear on the hot \
+             claim path; got:\n{sql}"
+        );
+    }
+
+    /// **A paused activity must never hold a workflow task.**
+    ///
+    /// `harvest_task_queue.activity_name` is `Nullable<Text>`: workflow tasks
+    /// carry `NULL`. In SQL, `NULL = ANY(array)` is `NULL`, and `NOT NULL` is
+    /// `NULL` — which is not `TRUE`, so a bare
+    /// `NOT (activity_name = ANY(paused))` silently filters out **every
+    /// workflow task in the fleet** the instant any one activity is paused.
+    /// That is a total orchestration outage produced by a surgical containment
+    /// control — the exact inverse of this feature's purpose.
+    ///
+    /// The `$6` capability-miss gate already defends against this with a
+    /// `task_type != 'activity' OR activity_name IS NULL` prefix; this test
+    /// pins the same defence onto the pause gate so it can never be dropped.
+    #[test]
+    fn claim_query_activity_pause_gate_never_holds_workflow_tasks() {
+        let sql = claim_task_query();
+        let gate = "task_type != 'activity' \
+                   OR activity_name IS NULL \
+                   OR NOT (activity_name = ANY(paused_activities.names))";
+        let normalized: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected: String = gate.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains(&expected),
+            "the activity-pause gate must short-circuit on non-activity rows \
+             and on a NULL activity_name before testing array membership, or a \
+             single paused activity halts every workflow task in the fleet. \
+             expected to find:\n  {expected}\nin:\n{sql}"
+        );
+    }
+
+    /// A pause holds *dispatch*: the gate lives in the PENDING-selection
+    /// predicate, never in the terminal/RUNNING paths, so in-flight work is
+    /// untouched (issue #807 AC4). Mirrors
+    /// `queue_pause_gate_appears_once_in_the_claim_candidate_scan`.
+    #[test]
+    fn activity_pause_gate_appears_once_in_the_claim_candidate_scan() {
+        assert_eq!(
+            claim_task_query()
+                .matches("harvest_activity_pauses")
+                .count(),
+            1,
+            "the activity-pause gate belongs only in the candidate (PENDING) \
+             scan, so an already-RUNNING instance runs to completion"
+        );
+    }
+
+    /// Both queries that document "mirrors every claim-time gate" must mirror
+    /// the activity-pause gate too, or a deliberately-held backlog surfaces as
+    /// unmet demand / a stale oldest-pending age and drives a false capacity
+    /// alert during exactly the incident the hold exists for.
+    #[test]
+    fn claim_gate_mirrors_carry_the_activity_pause_predicate() {
+        assert!(
+            oldest_pending_ages_query().contains(&crate::activity_pause::activity_pause_anti_join(
+                "harvest_task_queue"
+            )),
+            "oldest_pending_ages must mirror the activity-pause gate"
+        );
+        assert!(
+            claimable_pending_demand_query()
+                .contains(&crate::activity_pause::activity_pause_anti_join("tq")),
+            "claimable_pending_demand_by_queue must mirror the activity-pause gate"
+        );
+        // Pin the `task_type` scoping explicitly, not just via the renderer:
+        // these are read paths with no behavioural test asserting their
+        // predicate shape, so a contributor "simplifying" the guard away (on
+        // the mistaken belief that a workflow row's `activity_name` is always
+        // NULL) would otherwise reintroduce the `mixed_signal_suspension`
+        // sentinel hazard here with CI still green.
+        let scoping = format!(
+            "task_type = '{}'",
+            crate::activity_pause::ACTIVITY_TASK_TYPE
+        );
+        assert!(
+            oldest_pending_ages_query().contains(&scoping),
+            "oldest_pending_ages must scope the activity-pause gate by task_type"
+        );
+        assert!(
+            claimable_pending_demand_query().contains(&scoping),
+            "claimable_pending_demand_by_queue must scope the activity-pause gate by task_type"
         );
     }
 

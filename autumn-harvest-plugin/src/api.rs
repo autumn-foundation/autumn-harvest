@@ -34,12 +34,13 @@ use autumn_harvest::admission_gate::db as admission_gate_db;
 use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::{
     self, AuditFilters, CLASSIFIED_ROUTES, HEADER_ACTOR, HEADER_IDEMPOTENCY_KEY, HEADER_REQUEST_ID,
-    HEADER_SOURCE, OP_ACTIVITY_FAIL_NOW, OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT,
-    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR,
-    OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN,
-    OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY,
-    OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE,
-    OP_GATE_LIFT, OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_QUEUE_PAUSE,
+    HEADER_SOURCE, OP_ACTIVITY_FAIL_NOW, OP_ACTIVITY_PAUSE, OP_ACTIVITY_RESUME,
+    OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE,
+    OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE,
+    OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER,
+    OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
+    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
+    OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_QUEUE_PAUSE,
     OP_QUEUE_RESUME, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
     OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN,
@@ -4746,6 +4747,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/workflows/{id}/awaitables",
             get(get_workflow_awaitables).route_layer(require_admin.clone()),
         )
+        // Per-execution stall diagnosis (issue #809): admin-gated, same posture
+        // as the eligibility and awaitables triage endpoints — the response
+        // names queue / rate-limit / concurrency keys and fleet coverage state.
+        .route(
+            "/workflows/{id}/diagnose",
+            get(get_workflow_diagnose).route_layer(require_admin.clone()),
+        )
         .route("/workflows/{id}/run-chain", get(get_run_chain))
         // Single-execution replay diagnosis (issue #614): admin-gated, read-only.
         // POST (not GET) because it drives a replay of the workflow handler, but
@@ -5000,6 +5008,28 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route(
             "/admin/queues/{queue_name}/resume",
             post(resume_queue_handler).route_layer(require_admin.clone()),
+        )
+        // Per-activity-type pause/resume (issue #807): the surgical sibling of
+        // the queue hold above — stop dispatching ONE broken activity without
+        // touching the healthy work sharing its queue. All four are admin-gated:
+        // the two mutations are a fleet-wide dispatch kill switch, and the two
+        // reads expose operator-authored hold reasons and the shape of the
+        // registered activity catalogue.
+        .route(
+            "/activities",
+            get(list_activities_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/activities/{activity_name}",
+            get(get_activity_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/activities/{activity_name}/pause",
+            post(pause_activity_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/activities/{activity_name}/resume",
+            post(resume_activity_handler).route_layer(require_admin.clone()),
         )
         .route("/admin/metrics", get(prometheus_metrics))
         .route("/admin/history/exports", get(export_workflow_histories))
@@ -5928,6 +5958,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         // read-only. See docs/api-contract.json.
         ("GET", "/workflows/{id}/logs"),
         ("GET", "/workflows/{id}/awaitables"),
+        // Per-execution stall diagnosis (issue #809): admin-gated, read-only.
+        // See docs/api-contract.json.
+        ("GET", "/workflows/{id}/diagnose"),
         ("GET", "/workflows/{id}/run-chain"),
         // Single-execution replay diagnosis (issue #614): admin-gated, read-only
         // POST (post_for_body_only). See docs/api-contract.json.
@@ -6075,6 +6108,11 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/queues/paused"),
         ("POST", "/admin/queues/{queue_name}/pause"),
         ("POST", "/admin/queues/{queue_name}/resume"),
+        // ── per-activity-type pause/resume (issue #807) ───────────────────
+        ("GET", "/activities"),
+        ("GET", "/activities/{activity_name}"),
+        ("POST", "/activities/{activity_name}/pause"),
+        ("POST", "/activities/{activity_name}/resume"),
         ("GET", "/admin/metrics"),
         ("GET", "/admin/history/exports"),
         ("GET", "/admin/history/export-sample"),
@@ -6550,6 +6588,15 @@ pub const fn management_api_request_fields()
             "/admin/queues/{queue_name}/resume",
             Some(&["shard_id"]),
         ),
+        // ── per-activity-type pause/resume (issue #807) ───────────────────
+        // Both bodies are optional; resume carries no fields at all (it deletes
+        // the pause row, so there is no provenance for a field to set).
+        (
+            "POST",
+            "/activities/{activity_name}/pause",
+            Some(&["reason", "actor"]),
+        ),
+        ("POST", "/activities/{activity_name}/resume", Some(&[])),
         // ── scoped API tokens (issue #942) ────────────────────────────────────
         (
             "POST",
@@ -6694,6 +6741,32 @@ pub const fn management_api_response_fields()
                 "next_cursor",
                 "total_lines",
                 "truncated",
+            ]),
+        ),
+        (
+            "GET",
+            "/workflows/{id}/diagnose",
+            // Issue #809. `blocked_on` is an internally-tagged, snake_case
+            // discriminated object whose per-variant fields are documented in
+            // the route's contract description (the `/stack` precedent for
+            // nested shapes). `blocked_on`, `last_event_at`, `terminal_outcome`
+            // and `wait_set_reason` are omitted when absent
+            // (skip_serializing_if) but declared here so the registry <->
+            // contract cross-check covers them.
+            Some(&[
+                "execution_id",
+                "workflow_id",
+                "workflow_name",
+                "state",
+                "health",
+                "blocked_on",
+                "summary",
+                "last_event_age_seconds",
+                "last_event_at",
+                "terminal_outcome",
+                "contributing_reason_codes",
+                "wait_set",
+                "wait_set_reason",
             ]),
         ),
         (
@@ -7474,6 +7547,52 @@ pub const fn management_api_response_fields()
                 "ok",
                 "status",
                 "queue_name",
+                "newly_resumed",
+                "released_task_count",
+                "paused_duration_secs",
+                "released_reason",
+                "released_paused_by",
+                "provenance_uniform",
+                "shards",
+                "partial_failures",
+            ]),
+        ),
+        // ── per-activity-type pause/resume (issue #807) ───────────────────
+        (
+            "GET",
+            "/activities",
+            Some(&["activities", "status", "unavailable_shards"]),
+        ),
+        (
+            "GET",
+            "/activities/{activity_name}",
+            Some(&["activity", "status", "unavailable_shards"]),
+        ),
+        (
+            "POST",
+            "/activities/{activity_name}/pause",
+            Some(&[
+                "ok",
+                "status",
+                "activity_name",
+                "newly_paused",
+                "reason",
+                "paused_by",
+                "paused_at",
+                "scope_shard_id",
+                "held_task_count",
+                "provenance_uniform",
+                "shards",
+                "partial_failures",
+            ]),
+        ),
+        (
+            "POST",
+            "/activities/{activity_name}/resume",
+            Some(&[
+                "ok",
+                "status",
+                "activity_name",
                 "newly_resumed",
                 "released_task_count",
                 "paused_duration_secs",
@@ -10727,25 +10846,37 @@ async fn load_workflow_children_tree_from_shards(
             break;
         }
 
+        // Batch the WHOLE frontier into one `parent_id = ANY($1)` query per
+        // shard per depth level, instead of one query per *parent* per shard
+        // per depth level -- `O(depth × shards)` round trips instead of
+        // `O(nodes × shards)`, mirroring `load_workflow_children_batch`
+        // (the same batching `GET /workflows/{id}/tree`, issue #621, already
+        // does for this exact traversal shape). Which specific parent in the
+        // frontier produced a given child is never needed here: the next
+        // frontier is just the union of everyone's children, deduped by
+        // `seen`, and result filters only ever inspect the row itself.
+        let parent_uuids: Vec<uuid::Uuid> = frontier.iter().map(ExecutionId::as_uuid).collect();
         let mut next_frontier = Vec::new();
-        for parent in &frontier {
-            for (_shard, shard_pool) in pool.iter_shards() {
-                let mut conn = acquire_conn(shard_pool).await?;
-                let shard_rows =
-                    store::load_workflow_children(&mut conn, *parent, &traversal_filters, depth)
-                        .await
-                        .map_err(map_error)?;
-                for row in shard_rows {
-                    if !seen.insert(row.exec_id.as_uuid()) {
-                        continue;
-                    }
+        for (_shard, shard_pool) in pool.iter_shards() {
+            let mut conn = acquire_conn(shard_pool).await?;
+            let shard_rows = store::load_workflow_children_multi(
+                &mut conn,
+                &parent_uuids,
+                &traversal_filters,
+                depth,
+            )
+            .await
+            .map_err(map_error)?;
+            for row in shard_rows {
+                if !seen.insert(row.exec_id.as_uuid()) {
+                    continue;
+                }
 
-                    next_frontier.push(row.exec_id);
-                    if workflow_child_matches_filters(&row, filters)
-                        && workflow_child_is_after_cursor(&row, filters.cursor.as_ref())
-                    {
-                        rows.push(row);
-                    }
+                next_frontier.push(row.exec_id);
+                if workflow_child_matches_filters(&row, filters)
+                    && workflow_child_is_after_cursor(&row, filters.cursor.as_ref())
+                {
+                    rows.push(row);
                 }
             }
         }
@@ -12346,6 +12477,1528 @@ async fn get_workflow_awaitables(
 ) -> Result<Json<WorkflowAwaitablesResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     let report = build_awaitables_report(&api_state, exec_id).await?;
+    Ok(Json(report))
+}
+
+// ── Per-execution stall diagnosis (issue #809) ────────────────────────────
+
+/// The terminal outcome echoed for an already-finished execution.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct TerminalOutcomeResponse {
+    /// The terminal state (`COMPLETED`, `FAILED`, …).
+    pub state: String,
+    /// The recorded failure text, where the run failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// When the run reached its terminal state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Response of `GET /workflows/{id}/diagnose`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct WorkflowDiagnoseResponse {
+    /// The execution's id (echoed).
+    pub execution_id: String,
+    /// The business workflow id.
+    pub workflow_id: String,
+    /// The workflow type name.
+    pub workflow_name: String,
+    /// The execution's current state.
+    pub state: String,
+    /// The one-word triage verdict.
+    pub health: autumn_harvest::stall_diagnosis::ExecutionHealth,
+    /// The discriminated root cause. Absent for a terminal execution — there is
+    /// nothing to diagnose, and `terminal_outcome` carries the answer instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_on: Option<autumn_harvest::stall_diagnosis::BlockedOn>,
+    /// A one-sentence, human-readable rendering of the verdict.
+    pub summary: String,
+    /// Age of the most recent recorded event, in seconds. Informational only —
+    /// `health` is never derived from it, so a long durable sleep is never
+    /// reported as a stall (AC4). `null` when the execution has no events.
+    pub last_event_age_seconds: Option<f64>,
+    /// Timestamp of the most recent recorded event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Present only for a terminal execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_outcome: Option<TerminalOutcomeResponse>,
+    /// Every claim-time impediment that applies to the diagnosed activity, not
+    /// just the single highest-precedence one carried by `blocked_on`.
+    ///
+    /// Sourced verbatim from the eligibility explainer's own pure
+    /// [`task_intrinsic_impediment_reasons`] (issue #611), so the single-verdict
+    /// and multi-reason surfaces can never drift apart. Empty for every
+    /// non-activity verdict.
+    pub contributing_reason_codes: Vec<String>,
+    /// How the awaited-signal set was derived: `"replayed"`, `"history_only"`,
+    /// or `"not_consulted"` when the verdict was already decided by a
+    /// higher-precedence category and the replay drive was deliberately skipped.
+    pub wait_set: String,
+    /// Why the wait-set degraded to `history_only`, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_set_reason: Option<String>,
+}
+
+/// Sentinel `wait_set` value for the fast path: the verdict was fully decided by
+/// a category that outranks an awaited signal, so the replay drive was skipped.
+const WAIT_SET_NOT_CONSULTED: &str = "not_consulted";
+
+/// Builds the stall-diagnosis report for one execution (issue #809).
+///
+/// Correlates, in a single shard-local read, the five signals an operator would
+/// otherwise gather from four separate endpoints: the pending work itself
+/// (`/stack`), per-queue worker liveness (`/workers/health`, `/admin/queue-coverage`),
+/// the in-process circuit registry (`/admin/circuits`), rate-limit and per-key
+/// concurrency saturation (`/admin/rate-limits`, `/admin/concurrency`), plus the
+/// operator queue-pause table and the task row's own retry timing. The pure
+/// [`autumn_harvest::stall_diagnosis::classify_execution`] collapses them into
+/// one verdict.
+///
+/// ## Read-only by construction
+///
+/// No events are appended, no task-queue row is touched, no state is
+/// recomputed, and no migration is involved. The circuit registry is consulted
+/// through `list()` only — never `on_dispatch` / `on_result` / `force_*` — so
+/// diagnosing cannot itself advance a breaker's phase. Safe to call repeatedly.
+///
+/// ## Shard-local
+///
+/// A single execution lives on a single shard, so the read routes O(1) from the
+/// `ExecutionId` via `db_conn_for_execution`. There is no cross-shard fan-out.
+///
+/// ## Replay is consulted only when it can change the answer
+///
+/// An awaited-but-unsent signal exists solely as a parked command inside the
+/// coroutine — no side table can see it — so observing one requires the #615
+/// replay drive. That drive is comparatively expensive, and an awaited signal
+/// ranks *below* pending activities, external handoffs and pending children in
+/// the category ladder. So the drive runs **only** when the database-observable
+/// categories could not already decide the verdict (i.e. the run would otherwise
+/// report `sleeping_timer` or `no_pending_work`, the two verdicts an awaited
+/// signal outranks). The final verdict is identical either way; the common
+/// triage path — a wedged pending activity — never pays for a replay.
+///
+/// ## Payload-free
+///
+/// Names, ids, timestamps, queue/bucket keys and the task row's own error text
+/// only — never an activity input, signal payload or activity output. The one
+/// exception is the task row's `error` text surfaced as
+/// `ActivityRetrying.last_error`, which IS routed through read-path payload
+/// decoding (issue #608) exactly as `/stack` routes the same column for its own
+/// `last_failure`; otherwise an admin would read plaintext there and a
+/// ciphertext envelope here for the same column of the same row.
+/// The column tuple [`build_diagnosis_report`]'s narrow task projection loads.
+type DiagnoseTaskRow = (
+    String,                        // state
+    Option<String>,                // activity_name
+    String,                        // queue_name
+    i32,                           // attempt
+    Option<String>,                // error
+    chrono::DateTime<chrono::Utc>, // scheduled_at
+    Option<String>,                // rate_limit_key
+    Option<String>,                // concurrency_key
+    Option<i32>,                   // concurrency_cap
+    String,                        // task_type
+    Option<String>,                // required_build_id
+    Option<serde_json::Value>,     // required_capabilities
+    Option<uuid::Uuid>,            // session_id
+    Option<String>,                // sticky_worker_id
+    Option<String>,                // worker_id
+);
+
+/// The run's own workflow-task row, with the claim requirements its liveness
+/// answer depends on.
+type WorkflowTaskRow = (
+    String,                        // state
+    Option<String>,                // worker_id
+    String,                        // queue_name
+    chrono::DateTime<chrono::Utc>, // scheduled_at
+    Option<String>,                // required_build_id
+    Option<serde_json::Value>,     // required_capabilities
+    Option<uuid::Uuid>,            // session_id
+    Option<String>,                // sticky_worker_id
+);
+
+/// The narrow task-queue projection [`build_diagnosis_report`] reads.
+///
+/// Deliberately not `TaskQueueItem`: that model carries five jsonb payload
+/// columns this report never touches, and loading them on a wide fan-out of
+/// large activity inputs would move hundreds of megabytes to answer a triage
+/// question.
+struct DiagnoseTask {
+    state: String,
+    activity_name: Option<String>,
+    queue_name: String,
+    attempt: i32,
+    error: Option<String>,
+    scheduled_at: chrono::DateTime<chrono::Utc>,
+    rate_limit_key: Option<String>,
+    concurrency_key: Option<String>,
+    concurrency_cap: Option<i32>,
+    task_type: String,
+    /// Build routing (issue #171/#604) -- part of the claim predicate, so part
+    /// of whether any live worker can actually claim this row.
+    required_build_id: Option<String>,
+    /// Capability requirements (issue #804) -- likewise claim-time enforced.
+    required_capabilities: Option<serde_json::Value>,
+    /// Worker session membership (issue #606). A session member is claimable
+    /// ONLY by `sticky_worker_id`, and that pin never expires.
+    session_id: Option<uuid::Uuid>,
+    /// The pinned host recorded on the row.
+    sticky_worker_id: Option<String>,
+    /// The worker currently holding this row's claim, when it is held. Used to
+    /// answer the CLAIMANT's own liveness for a `RUNNING` row -- a distinct
+    /// question from whether the queue is claim-eligible right now.
+    worker_id: Option<String>,
+}
+
+/// The claim-time requirements of one task row.
+///
+/// Bundled so [`task_has_eligible_worker`] can mirror `claim_task`'s predicate
+/// dimension-for-dimension without an unreadable positional argument list.
+#[derive(Default, Clone, Copy)]
+struct TaskClaimRequirements<'a> {
+    queue_name: &'a str,
+    /// Build routing (issue #171/#604).
+    required_build_id: Option<&'a str>,
+    /// Capability requirements (issue #804).
+    required_capabilities: Option<&'a serde_json::Value>,
+    /// `true` when `required_capabilities` came from **this process's** registry
+    /// rather than the row's own snapshot, so it describes only workers running
+    /// this build. See [`registry_fallback_binds`].
+    capabilities_from_registry_fallback: bool,
+    /// Worker sessions (issue #606): the row belongs to a session, so it is
+    /// claimable ONLY by the host in `sticky_worker_id`, with no expiry.
+    is_session_member: bool,
+    /// The recorded pinned host. Load-bearing here only for a session member;
+    /// an ordinary sticky lease is deliberately not modelled (see below).
+    sticky_worker_id: Option<&'a str>,
+}
+
+impl TaskClaimRequirements<'_> {
+    /// The session clause of `claim_task_query`, verbatim:
+    /// `session_id IS NULL OR sticky_worker_id = $1`.
+    ///
+    /// A session member whose row carries no `sticky_worker_id` matches no
+    /// worker at all -- `sticky_worker_id = $1` can never hold against NULL.
+    fn session_admits(&self, worker_id: &str) -> bool {
+        !self.is_session_member || self.sticky_worker_id == Some(worker_id)
+    }
+}
+
+/// Can this worker claim a NEW task right now?
+///
+/// Deliberately stricter than [`crate::queue_coverage::worker_covers_queue`]:
+/// that predicate (issue #774) counts `Active` **or** `Draining`, which is the
+/// right, broader answer to the deploy-oriented "is anything still attached to
+/// this queue?" but the wrong answer to "can anything claim this row?".
+/// `Worker::run` leaves `run_poll_loop` **before** it transitions to
+/// `Draining` and then only waits for in-flight work, so a draining worker
+/// claims no new task for the whole drain window -- and a long drain would
+/// otherwise read as healthy progress on a queue nothing can pick up.
+///
+/// Queue/shard coverage itself still goes through the canonical #774 predicate
+/// so this surface and `GET /admin/queue-coverage` can never disagree about
+/// what a worker is attached to; only the liveness half is narrowed.
+/// Whether the worker currently HOLDING a task row is still alive.
+///
+/// A held row's progress question is not "can this queue be claimed right now?"
+/// but "is the claimant still running it?" -- and `Worker::run` transitions a
+/// worker to `Draining` BEFORE awaiting `drain_in_flight`, so an activity on a
+/// gracefully-shutting-down worker is still legitimately progressing.
+///
+/// This therefore reuses the canonical #774 predicate verbatim (which admits
+/// `Active` OR `Draining`), deliberately NOT the Active-only
+/// [`worker_can_claim_now`] that answers claim eligibility for PENDING rows.
+///
+/// Returns `None` when the row records no claimant, so the classifier can fall
+/// back to queue coverage rather than infer a stall from missing data.
+fn claimant_is_live(
+    workers: &[WorkerRow],
+    claimant: Option<&str>,
+    queue_name: &str,
+    shard_id: i32,
+) -> Option<bool> {
+    let claimant = claimant?;
+    Some(workers.iter().any(|w| {
+        w.worker.worker_id == claimant
+            && crate::queue_coverage::worker_covers_queue(w, queue_name, shard_id)
+    }))
+}
+
+fn worker_can_claim_now(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
+    crate::queue_coverage::worker_covers_queue(worker, queue_name, shard_id)
+        && worker.worker.status == autumn_harvest::workers::WorkerStatus::Active.as_str()
+}
+
+/// The capability requirements `claim_task` will enforce for this row, plus
+/// where they came from.
+///
+/// The row's own `required_capabilities` snapshot is authoritative when present
+/// -- `claim_task_query` short-circuits its ineligible-activities gate on
+/// `required_capabilities IS NOT NULL`, so the snapshot is what gates the claim
+/// and the registry must never override it (the registry may have changed since
+/// the row was enqueued). A snapshotted requirement is enforced **row-side**, so
+/// it applies to every worker regardless of build.
+///
+/// When the snapshot is **absent** the gate is NOT skipped: `claim_task` rejects
+/// any worker whose `ineligible_activities` list contains this row's
+/// `activity_name`, and that list is computed **on each worker** from **that
+/// worker's own** registry (`Worker::new`). Reading an absent snapshot as "no
+/// requirements" would report `healthy_in_progress` for a task no live worker
+/// can claim (issue #809, round 11) -- but the local registry describes only
+/// *this* process's build, so the fallback is per-worker evidence and callers
+/// must consult [`registry_fallback_binds`] before rejecting anyone on it.
+///
+/// Mirrors `queue::apply_activity_requirements` (the shard-health coverage
+/// backfill) and the eligibility explainer's own resolution (issue #611), so
+/// all three surfaces answer the capability question identically.
+fn resolve_required_capabilities<'a>(
+    row_capabilities: Option<&'a serde_json::Value>,
+    activity_name: Option<&str>,
+    registered: &'a std::collections::HashMap<String, serde_json::Value>,
+) -> ResolvedCapabilities<'a> {
+    row_capabilities.map_or_else(
+        || ResolvedCapabilities {
+            requirements: activity_name.and_then(|name| registered.get(name)),
+            from_registry_fallback: activity_name.is_some_and(|name| registered.contains_key(name)),
+        },
+        |snapshot| ResolvedCapabilities {
+            requirements: Some(snapshot),
+            from_registry_fallback: false,
+        },
+    )
+}
+
+/// The outcome of [`resolve_required_capabilities`].
+#[derive(Debug, Clone, Copy)]
+struct ResolvedCapabilities<'a> {
+    /// The requirements to enforce, if any.
+    requirements: Option<&'a serde_json::Value>,
+    /// `true` when they came from **this process's** registry rather than the
+    /// row's own snapshot, so they describe only workers running this build.
+    from_registry_fallback: bool,
+}
+
+/// May a registry-derived capability requirement be used to REJECT this worker?
+///
+/// Only when the worker runs the same build this process does. `claim_task`'s
+/// NULL-snapshot gate is `NOT (activity_name = ANY($6))`, and `$6` is the
+/// claiming worker's **own** `ineligible_activities`, built in `Worker::new`
+/// from **its own** registry's `ActivityInfo::requires`. During a rolling
+/// deployment those requirements differ by build: an old-build worker whose
+/// handler declares nothing has an empty ineligible list and IS admitted, even
+/// though this replica's newer handler demands a label that worker lacks.
+/// Rejecting it on our requirement would produce a false `activity_no_worker`
+/// -- the flagship stall verdict, and the worst error a triage tool can make.
+///
+/// Build identity is the only fleet-visible evidence of a shared build, so
+/// equality of the advertised `build_id` is the discriminator. Two consequences
+/// are deliberate:
+///
+/// - A deployment that configures **no** build ids (the default -- build
+///   routing is opt-in, issue #171) has `""` everywhere, so every worker
+///   compares equal and the fallback binds exactly as it did before. Such a
+///   deployment has no build signal at all, which is a pre-existing consequence
+///   of not configuring one.
+/// - Where the local build is **unknown** (an API-only replica, or a co-located
+///   worker that has not registered its row yet) it resolves to `""`, so the
+///   fallback binds for workers that also advertise no build -- the
+///   no-build-routing case above -- and not for any worker that does. A
+///   deployment that advertises builds therefore never has an unidentified
+///   replica reject a worker on a requirement it cannot attribute.
+///
+/// The residual: a rolling deploy in a deployment that configures **no** build
+/// ids is invisible here, so the false positive this guards against can still
+/// occur there. Configuring `WorkerConfig::build_id` (issue #171) is what makes
+/// a build skew observable at all.
+fn registry_fallback_binds(worker_build_id: &str, local_build_id: &str) -> bool {
+    worker_build_id == local_build_id
+}
+
+/// This process's build identity, read from the co-located worker's own
+/// advertised row.
+///
+/// The local worker registered with `WorkerConfig::build_id`, i.e. the build
+/// running in this very process -- the same build whose registry backs
+/// [`resolve_required_capabilities`]'s fallback. Empty when there is no
+/// co-located worker (an API-only replica) or it has not registered yet, which
+/// [`registry_fallback_binds`] treats as "no build identity configured".
+fn local_build_id_from_workers(workers: &[WorkerRow], local_worker_id: Option<&str>) -> String {
+    local_worker_id
+        .and_then(|local| workers.iter().find(|w| w.worker.worker_id == local))
+        .map(|w| w.worker.build_id.clone())
+        .unwrap_or_default()
+}
+
+/// Can ANY single live worker actually claim this task?
+///
+/// Queue coverage alone is not the claim predicate. `queue::claim_task` also
+/// enforces the task's `required_build_id` (exact, `harvest_build_compat`
+/// declared, or legacy empty-build worker), its `required_capabilities` (the
+/// same Exact/In label match), and its **session pin** -- so a task sitting on
+/// a well-covered queue can still be permanently unclaimable because no poller
+/// runs the right build, advertises the right labels, or *is* the session's
+/// pinned host. This endpoint must report that as a stall, not healthy
+/// progress.
+///
+/// Every dimension is checked against the **same** worker, exactly as the
+/// stranded-work sampler does (`worker.rs`): a task needing both a build and a
+/// label is not covered by two workers that each satisfy only one of them, and
+/// a session member is not covered by a peer that satisfies everything except
+/// being the pinned host.
+///
+/// # What is deliberately NOT modelled
+///
+/// An **ordinary sticky lease** (issue #235). Its claim clause is
+/// `sticky_worker_id IS NULL OR sticky_worker_id = $1 OR sticky_until IS NULL
+/// OR sticky_until <= NOW()`, so it releases to the whole fleet the moment
+/// `sticky_until` passes: a dead owner makes the row unclaimable only until
+/// that instant. Reporting a self-healing, seconds-long condition as
+/// `activity_no_worker`/`stalled` would be a false positive on the flagship
+/// verdict, which is the worst outcome for a triage tool -- so an unexpired
+/// lease is ignored and the transient over-optimism is accepted. A **session**
+/// pin has no such expiry, which is exactly why it IS modelled.
+/// `GET /admin/queues/{queue}/eligibility` (issue #611) remains the per-worker
+/// surface that reports `sticky_owned_by_other_worker`.
+///
+/// Unparseable `required_capabilities` fall back to the other dimensions rather
+/// than reporting a stall, so a value this endpoint cannot read can never
+/// fabricate a false `no_worker` verdict.
+fn task_has_eligible_worker(
+    workers: &[WorkerRow],
+    shard_id: i32,
+    reqs: TaskClaimRequirements<'_>,
+    compat_set: &autumn_harvest::build_routing::BuildCompatibilitySet,
+    local_build_id: &str,
+) -> bool {
+    !eligible_worker_ids(workers, shard_id, reqs, compat_set, local_build_id).is_empty()
+}
+
+/// WHICH workers could claim this task — the identities behind
+/// [`task_has_eligible_worker`]'s boolean.
+///
+/// Needed because the in-process circuit registry describes exactly one
+/// worker's breaker, so the endpoint must know whether that worker is the only
+/// one that could pick this row up before it treats the local phase as the
+/// answer (see [`local_circuit_snapshot_is_authoritative`]).
+fn eligible_worker_ids<'a>(
+    workers: &'a [WorkerRow],
+    shard_id: i32,
+    reqs: TaskClaimRequirements<'_>,
+    compat_set: &autumn_harvest::build_routing::BuildCompatibilitySet,
+    local_build_id: &str,
+) -> Vec<&'a str> {
+    let requirements = reqs.required_capabilities.and_then(|caps| {
+        serde_json::from_value::<Vec<autumn_harvest::eligibility::Requirement>>(caps.clone()).ok()
+    });
+
+    workers
+        .iter()
+        .filter(|w| {
+            if !reqs.session_admits(&w.worker.worker_id) {
+                return false;
+            }
+            if !worker_can_claim_now(w, reqs.queue_name, shard_id) {
+                return false;
+            }
+            if !compat_set.is_eligible(&w.worker.build_id, reqs.required_build_id) {
+                return false;
+            }
+            // A requirement recovered from THIS process's registry describes
+            // only workers running THIS build; `claim_task` asks each worker's
+            // own registry instead. Rejecting a different-build worker on it
+            // would fabricate `activity_no_worker` for a row that claim admits.
+            if reqs.capabilities_from_registry_fallback
+                && !registry_fallback_binds(&w.worker.build_id, local_build_id)
+            {
+                return true;
+            }
+            requirements.as_ref().is_none_or(|parsed| {
+                let labels: std::collections::HashMap<String, String> =
+                    serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                autumn_harvest::eligibility::matches_requirements(parsed, &labels)
+            })
+        })
+        .map(|w| w.worker.worker_id.as_str())
+        .collect()
+}
+
+/// May this process's circuit-breaker snapshot be reported as THE answer for a
+/// task whose eligible workers are `eligible_ids`?
+///
+/// The registry is deliberately **in-process and per-shard**
+/// (`circuit_breaker.rs`): every worker process constructs its own via
+/// `HandlerRegistry::new`, there is no table backing it, and the breaker that
+/// actually gates a dispatch is the one belonging to whichever worker ends up
+/// claiming the task (`process_activity_task`). A multi-replica fleet therefore
+/// has N independent breakers for one activity, and this API replica can only
+/// see its own.
+///
+/// So the local phase is authoritative only when the local worker is the
+/// **sole** worker that could claim the row. Otherwise a peer whose breaker is
+/// closed can still dispatch it, and reporting `activity_circuit_open` /
+/// `stalled` would be a false positive on the flagship stall verdict — the
+/// worst outcome for a triage tool, and the same principle that keeps a
+/// self-healing sticky lease out of `task_has_eligible_worker`.
+///
+/// The cost is a deliberate false *negative*: a genuinely fleet-wide outage
+/// (every replica open) is not reported as `activity_circuit_open`, and the run
+/// degrades to the next-ranked verdict instead. That is the safe direction for
+/// a stall verdict, and `GET /admin/circuits` remains the per-replica surface
+/// that shows each breaker's real phase.
+fn local_circuit_snapshot_is_authoritative(
+    eligible_ids: &[&str],
+    local_worker_id: Option<&str>,
+) -> bool {
+    match (eligible_ids, local_worker_id) {
+        ([only], Some(local)) => *only == local,
+        _ => false,
+    }
+}
+
+/// Decode the one activity error this response actually surfaces (issue #608).
+///
+/// `PendingActivityFacts::last_error` is carried RAW on purpose. The classifier
+/// only needs the error's *presence* — it is the failure-evidence discriminator
+/// that separates `activity_retrying` from `activity_deferred` — and at most one
+/// row's error ever reaches the caller, on the winning
+/// [`BlockedOn::ActivityRetrying`]. Decoding every row up front would decrypt a
+/// losing row's error and write a `payload.decode_read` audit record for data
+/// the caller never sees, breaking the #608 "decode exactly what is surfaced"
+/// contract.
+///
+/// Returns the outcome to merge into the request's decode accumulator; a
+/// non-retrying verdict, an absent error, or an inactive decoder all yield the
+/// empty outcome, leaving the audit row untouched.
+fn decode_surfaced_activity_error(
+    blocked_on: &mut autumn_harvest::stall_diagnosis::BlockedOn,
+    decoder: Option<&PayloadCodecs>,
+) -> LossyDecodeOutcome {
+    let (
+        Some(codecs),
+        autumn_harvest::stall_diagnosis::BlockedOn::ActivityRetrying {
+            last_error: Some(error),
+            ..
+        },
+    ) = (decoder, blocked_on)
+    else {
+        return LossyDecodeOutcome::default();
+    };
+    decode_error_field(codecs, error)
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn build_diagnosis_report(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+    decoder: Option<&PayloadCodecs>,
+    decode_outcome: &mut LossyDecodeOutcome,
+) -> Result<WorkflowDiagnoseResponse, AutumnError> {
+    use autumn_harvest::stall_diagnosis::{
+        AwaitedSignalFacts, BlockedOn, BlockingCircuitPhase, DiagnosisInputs, ExecutionHealth,
+        ExternalHandoffFacts, NdBlockFacts, PendingActivityFacts, PendingChildFacts,
+        PendingTimerFacts, ReplayWaitFacts, WorkflowTaskFacts, classify_execution, summarize,
+    };
+
+    let exec_uuid = exec_id.as_uuid();
+    let mut conn = db_conn_for_execution(api_state, exec_id).await?;
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(execution) => execution,
+        Err(HarvestError::NotFound(_)) => {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found \
+                 (classic DAG runs are not on the execution path)"
+            )));
+        }
+        Err(err) => return Err(map_error(err)),
+    };
+
+    // Snapshot `now` once so every deadline, age and backoff comparison in this
+    // response is judged against one consistent instant.
+    let now = chrono::Utc::now();
+
+    let last_event_at: Option<chrono::DateTime<chrono::Utc>> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
+        .select(diesel::dsl::max(harvest_events::timestamp))
+        .first::<Option<chrono::DateTime<chrono::Utc>>>(&mut conn)
+        .await
+        .map_err(database_error)?;
+    let last_event_age_seconds =
+        last_event_at.map(|ts| (now - ts).to_std().map_or(0.0, |d| d.as_secs_f64()));
+
+    let is_terminal = is_terminal_state(&execution.state);
+    if is_terminal {
+        return Ok(WorkflowDiagnoseResponse {
+            execution_id: exec_id.to_string(),
+            workflow_id: execution.workflow_id.clone(),
+            workflow_name: execution.workflow_name.clone(),
+            state: execution.state.clone(),
+            health: ExecutionHealth::Terminal,
+            blocked_on: None,
+            summary: format!(
+                "execution reached terminal state {} — nothing to diagnose",
+                execution.state
+            ),
+            last_event_age_seconds,
+            last_event_at,
+            terminal_outcome: Some(TerminalOutcomeResponse {
+                state: execution.state,
+                // Decode the TEXT `error` exactly as the pending-activity path
+                // below decodes a task row's `error` (issue #608): on a
+                // codec-encrypting deployment a failed execution's error is a
+                // serialized envelope, and returning it verbatim would hand an
+                // admin ciphertext while the decode audit recorded nothing.
+                error: execution.error.map(|mut error| {
+                    if let Some(codecs) = decoder {
+                        *decode_outcome =
+                            decode_outcome.merged(decode_error_field(codecs, &mut error));
+                    }
+                    error
+                }),
+                completed_at: execution.completed_at,
+            }),
+            contributing_reason_codes: Vec::new(),
+            wait_set: WAIT_SET_NOT_CONSULTED.to_string(),
+            wait_set_reason: None,
+        });
+    }
+
+    // ── Pending activity task rows ─────────────────────────────────────────
+    // Mirrors `/stack`'s own pending-task predicate and deterministic ordering,
+    // so the two surfaces always talk about the same rows in the same order
+    // (equal-precedence ties therefore resolve identically call to call).
+    // A NARROW projection on purpose. `TaskQueueItem::as_select()` would drag in
+    // five jsonb columns (`input`, `output`, `heartbeat_details`, `retry_policy`,
+    // `trace_context`) that this report never reads — on a wide fan-out of large
+    // activity inputs, exactly the stalled shape this endpoint exists to
+    // diagnose, that is hundreds of megabytes moved to answer a triage question.
+    // The ten scalars below are everything the classifier consumes.
+    //
+    // Deliberately UNBOUNDED: the worst-of fold must see every row or it can
+    // miss the one wedged slot behind a healthy majority, so a `LIMIT` would
+    // trade a correctness guarantee for a cost the narrow projection has
+    // already removed.
+    let task_rows: Vec<DiagnoseTaskRow> = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
+        .filter(harvest_task_queue::task_type.eq("activity"))
+        .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
+        .order((
+            harvest_task_queue::scheduled_at.asc(),
+            harvest_task_queue::id.asc(),
+        ))
+        .select((
+            harvest_task_queue::state,
+            harvest_task_queue::activity_name,
+            harvest_task_queue::queue_name,
+            harvest_task_queue::attempt,
+            harvest_task_queue::error,
+            harvest_task_queue::scheduled_at,
+            harvest_task_queue::rate_limit_key,
+            harvest_task_queue::concurrency_key,
+            harvest_task_queue::concurrency_cap,
+            harvest_task_queue::task_type,
+            harvest_task_queue::required_build_id,
+            harvest_task_queue::required_capabilities,
+            // Worker sessions (issue #606): the claim predicate admits a
+            // session member ONLY from `sticky_worker_id`, with no expiry, so
+            // a session whose host is gone is a permanent stall.
+            harvest_task_queue::session_id,
+            harvest_task_queue::sticky_worker_id,
+            // The CLAIMANT of a held row. A worker that has begun a graceful
+            // shutdown claims nothing new but is still finishing held work, so
+            // a `RUNNING` row's liveness must be answered from its own
+            // claimant, not from queue-level claim eligibility.
+            harvest_task_queue::worker_id,
+        ))
+        .load::<DiagnoseTaskRow>(&mut conn)
+        .await
+        .map_err(database_error)?;
+    let tasks: Vec<DiagnoseTask> = task_rows
+        .into_iter()
+        .map(
+            |(
+                state,
+                activity_name,
+                queue_name,
+                attempt,
+                error,
+                scheduled_at,
+                rate_limit_key,
+                concurrency_key,
+                concurrency_cap,
+                task_type,
+                required_build_id,
+                required_capabilities,
+                session_id,
+                sticky_worker_id,
+                worker_id,
+            )| DiagnoseTask {
+                state,
+                activity_name,
+                queue_name,
+                attempt,
+                error,
+                scheduled_at,
+                rate_limit_key,
+                concurrency_key,
+                concurrency_cap,
+                task_type,
+                required_build_id,
+                required_capabilities,
+                session_id,
+                sticky_worker_id,
+                worker_id,
+            },
+        )
+        .collect();
+
+    // ── The run's OWN workflow task row ────────────────────────────────────
+    // A non-terminal run always has exactly one, and it is the only place three
+    // states are visible: the handler EXECUTING right now (`worker_id` held),
+    // the decision cycle AWAITING DISPATCH (`PENDING`), and the genuinely
+    // PARKED row that is the lost-task shape. Without it, a run whose handler is
+    // mid-flight — canonically one running a long local activity (issue #98),
+    // which schedules no queue row at all — falls through every category below
+    // and reports the alarming `no_pending_work`/`stalled`.
+    //
+    // A separate single-row indexed lookup rather than widening the query above:
+    // that query's projection, ordering, and PENDING/`queues_in_play`
+    // partitioning are all activity-shaped, and one more cheap round trip is far
+    // safer than threading a second task type through all of it.
+    let workflow_task_row: Option<WorkflowTaskRow> = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
+        .filter(harvest_task_queue::task_type.eq("workflow"))
+        .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
+        .order(harvest_task_queue::id.asc())
+        .select((
+            harvest_task_queue::state,
+            harvest_task_queue::worker_id,
+            harvest_task_queue::queue_name,
+            harvest_task_queue::scheduled_at,
+            // Build routing applies to workflow tasks too (the claim
+            // predicate's `required_build_id` clause has no task-type guard),
+            // so its liveness answer needs the same eligibility check an
+            // activity row gets.
+            harvest_task_queue::required_build_id,
+            harvest_task_queue::required_capabilities,
+            harvest_task_queue::session_id,
+            harvest_task_queue::sticky_worker_id,
+        ))
+        .first::<WorkflowTaskRow>(&mut conn)
+        .await
+        .optional()
+        .map_err(database_error)?;
+
+    // ── Infra state for those rows (only what they actually reference) ──────
+    let pending_tasks: Vec<&DiagnoseTask> = tasks.iter().filter(|t| t.state == "PENDING").collect();
+
+    // Circuit-breaker phases. `list()` prunes each breaker's rolling window and
+    // reads its phase but NEVER transitions it (Open→HalfOpen is driven solely
+    // by dispatch), so consulting it here cannot perturb enforcement. A
+    // cooled-down breaker therefore still reads "open" until a real probe is
+    // admitted — a deliberate, documented read-only conservatism.
+    let (cb_phase, cb_tracked): (
+        std::collections::HashMap<String, autumn_harvest::circuit_breaker::CircuitSnapshot>,
+        Vec<String>,
+    ) = api_state.runtime().ok().map_or_else(
+        || (std::collections::HashMap::new(), Vec::new()),
+        |runtime| {
+            let breakers = runtime.registry().circuit_breakers();
+            let tracked = breakers.tracked_activity_names().to_vec();
+            let phases = breakers
+                .list(std::time::Instant::now())
+                .into_iter()
+                .map(|snap| (snap.activity_name.clone(), snap))
+                .collect();
+            (phases, tracked)
+        },
+    );
+
+    // This process's own worker, when one is co-located. The breaker registry
+    // above belongs to exactly this worker, so its phase is only ever the
+    // answer for a task nothing else could claim -- see
+    // `local_circuit_snapshot_is_authoritative`. `None` on an API-only replica:
+    // nothing drives that registry, so it describes no dispatcher at all.
+    let local_worker_id: Option<String> = api_state
+        .runtime()
+        .ok()
+        .and_then(|runtime| runtime.worker_id);
+
+    // Registered capability requirements, keyed by activity name (issue #804).
+    // Needed because a legacy or manually enqueued row can carry NULL
+    // `required_capabilities` while `claim_task`'s ineligible-activities gate
+    // still enforces the registered handler's `requires` -- see
+    // `effective_required_capabilities`. Empty when no runtime is installed,
+    // which degrades to today's snapshot-only answer rather than fabricating a
+    // stall.
+    let activity_requirements: std::collections::HashMap<String, serde_json::Value> = api_state
+        .runtime()
+        .ok()
+        .map(|runtime| runtime.registry().activity_requirements_json())
+        .unwrap_or_default();
+
+    // Rate-limit saturation. A circuit-breaker-tracked activity enforces its
+    // rate limit at DISPATCH rather than at claim (issue #369), so its bucket is
+    // never a claim-time impediment and is deliberately not consulted — the
+    // breaker verdict is the accurate one. Matches the eligibility explainer.
+    let rate_limit_keys: Vec<String> = pending_tasks
+        .iter()
+        .filter(|t| {
+            !t.activity_name
+                .as_ref()
+                .is_some_and(|name| cb_tracked.contains(name))
+        })
+        .filter_map(|t| t.rate_limit_key.clone())
+        // Deduped so a wide fan-out sharing one key binds a 1-element array
+        // rather than one entry per task row.
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let rate_limit_gate = rate_limit_gate_status(&mut conn, &rate_limit_keys).await?;
+
+    // Per-key concurrency, counted exactly as `claim_task` counts it: scoped by
+    // (concurrency_key, task_type) over RUNNING rows with a worker.
+    let concurrency_keys: Vec<String> = pending_tasks
+        .iter()
+        .filter_map(|t| t.concurrency_key.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let running_by_key = running_counts_for_concurrency_keys(&mut conn, &concurrency_keys).await?;
+
+    // Operator queue pauses (issue #619). Propagates on failure rather than
+    // defaulting to "nothing is held": this endpoint exists to answer "why is
+    // nothing happening?", and swallowing the read would answer it with a
+    // confident, wrong "nothing is holding this queue".
+    let paused_queues: std::collections::HashSet<String> =
+        autumn_harvest::queue_pause::paused_queue_names(&mut conn)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .collect();
+
+    // Operator ACTIVITY pauses (issue #807), the per-activity-type sibling of
+    // the read above. Load-bearing for the same reason: `claim_task`'s
+    // `paused_activities` anti-join rejects a held activity type on EVERY queue
+    // on the shard, so without this a paused activity on a well-covered queue
+    // would fall through to `healthy_in_progress` — a confident wrong answer.
+    // Deliberately unfiltered by queue, matching that CTE.
+    let paused_activities: std::collections::HashSet<String> =
+        autumn_harvest::activity_pause::paused_activity_names(&mut conn)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .collect();
+
+    // Worker eligibility inputs. Queue coverage goes through the SAME predicate
+    // `GET /admin/queue-coverage` uses (issue #774) so the two surfaces can
+    // never disagree about whether a queue has a live poller — the exact drift
+    // that bit `shard_health` in #1150 — but coverage alone is NOT the claim
+    // predicate: `task_has_eligible_worker` also applies each row's own
+    // `required_build_id` and `required_capabilities` against the SAME worker,
+    // so a task no live poller can actually claim is reported as a stall rather
+    // than as healthy progress.
+    //
+    // Evaluated for EVERY loaded row, not just the PENDING ones: a claimed
+    // (`RUNNING`) row also needs a truthful liveness answer, because a claimed
+    // row whose fleet is gone is an orphan rather than healthy work. Includes
+    // the workflow task's OWN row: its liveness answer is what separates "about
+    // to be claimed" from the workflow-task analogue of AC3's flagship
+    // no-live-worker stall.
+    let (live_workers, compat_set) = if tasks.is_empty() && workflow_task_row.is_none() {
+        (
+            Vec::new(),
+            autumn_harvest::build_routing::BuildCompatibilitySet::new(),
+        )
+    } else {
+        let stale_threshold = api_state.worker_stale_threshold();
+        let workers =
+            crate::queue_coverage::fetch_potentially_live_workers(&mut conn, stale_threshold)
+                .await
+                .map_err(map_error)?;
+        // Cross-build declarations, so a worker running a NEWER build that has
+        // declared itself compatible still counts as coverage for a task
+        // assigned an older build (issue #171). On load failure fall back to an
+        // empty set: exact-match and legacy-worker rules still apply, exactly
+        // as the stranded-work sampler degrades.
+        let compat = autumn_harvest::build_routing::load_compat_set(&mut conn)
+            .await
+            .unwrap_or_default();
+        (workers, compat)
+    };
+    // This process's build identity, read from the co-located worker's own
+    // advertised row. It scopes the registry capability fallback: a requirement
+    // recovered from THIS registry describes only workers running THIS build,
+    // and `claim_task` asks each worker's own registry instead (see
+    // [`registry_fallback_binds`]). `None` for an API-only replica.
+    let local_build_id = local_build_id_from_workers(&live_workers, local_worker_id.as_deref());
+    // The row's OWN recorded shard, not `exec_id.shard()`. A pre-sharding (or
+    // `ExecutionId::new()`) id carries the `ShardId::UNENCODED` sentinel
+    // (0xFFFF), which the router resolves to the default shard — but a worker
+    // registers `shard_assignments` with its real shard number, so comparing
+    // against the raw sentinel would match no worker and report a false
+    // `activity_no_worker` for a perfectly covered queue.
+    // `harvest_workflow_executions.shard_id` is the same value the worker
+    // itself is registered against, so the two always agree.
+    let shard_id = execution.shard_id;
+
+    let activities: Vec<PendingActivityFacts> = tasks
+        .iter()
+        .map(|t| {
+            let queue_paused = paused_queues.contains(&t.queue_name);
+            // Shares the eligibility explainer's own predicate (issue #807), so
+            // the two surfaces cannot drift on what "held" means.
+            let activity_paused = task_is_activity_paused(
+                &t.task_type,
+                t.activity_name.as_deref(),
+                &paused_activities,
+            );
+            let has_cb = t
+                .activity_name
+                .as_ref()
+                .is_some_and(|name| cb_tracked.contains(name));
+            // WHICH workers could claim this row. Computed once: it answers
+            // both "is anything alive for this task?" and "is our own
+            // in-process breaker the one that will actually gate its dispatch?".
+            let capabilities = resolve_required_capabilities(
+                t.required_capabilities.as_ref(),
+                t.activity_name.as_deref(),
+                &activity_requirements,
+            );
+            let eligible_ids = eligible_worker_ids(
+                &live_workers,
+                shard_id,
+                TaskClaimRequirements {
+                    queue_name: &t.queue_name,
+                    required_build_id: t.required_build_id.as_deref(),
+                    required_capabilities: capabilities.requirements,
+                    capabilities_from_registry_fallback: capabilities.from_registry_fallback,
+                    is_session_member: t.session_id.is_some(),
+                    sticky_worker_id: t.sticky_worker_id.as_deref(),
+                },
+                &compat_set,
+                &local_build_id,
+            );
+            // The breaker registry is in-process, so its phase describes only
+            // THIS replica. Treat it as the verdict only when our own worker is
+            // the sole worker that could claim the row -- otherwise a peer whose
+            // breaker is closed can still dispatch it and a fleet-wide
+            // `activity_circuit_open`/`stalled` would be a false positive.
+            let snapshot = if local_circuit_snapshot_is_authoritative(
+                &eligible_ids,
+                local_worker_id.as_deref(),
+            ) {
+                t.activity_name.as_ref().and_then(|name| cb_phase.get(name))
+            } else {
+                None
+            };
+            let (circuit_phase, circuit_cooldown_until) = match snapshot.map(|s| s.state) {
+                Some("open") => (
+                    Some(BlockingCircuitPhase::Open),
+                    snapshot
+                        .and_then(|s| s.time_until_probe_secs)
+                        .and_then(|secs| circuit_cooldown_until(now, secs)),
+                ),
+                Some("half_open") => (Some(BlockingCircuitPhase::HalfOpen), None),
+                _ => (None, None),
+            };
+            let concurrency_saturated = match (t.concurrency_key.as_ref(), t.concurrency_cap) {
+                (Some(key), Some(cap)) => {
+                    running_by_key
+                        .get(&(key.clone(), t.task_type.clone()))
+                        .copied()
+                        .unwrap_or(0)
+                        >= i64::from(cap)
+                }
+                _ => false,
+            };
+            PendingActivityFacts {
+                activity_name: t.activity_name.clone(),
+                queue: t.queue_name.clone(),
+                task_state: t.state.clone(),
+                attempt: t.attempt,
+                // RAW on purpose (issue #608: decode exactly what is surfaced).
+                // Classification only needs the error's PRESENCE — it is the
+                // failure-evidence discriminator that separates
+                // `activity_retrying` from `activity_deferred` — and at most one
+                // row's error ever reaches the response, on the winning
+                // `ActivityRetrying`. Decoding here would decrypt every losing
+                // row's error and write a `payload.decode_read` audit row for
+                // data the caller never sees. The winner is decoded after
+                // `classify_execution` picks it.
+                last_error: t.error.clone(),
+                scheduled_at: t.scheduled_at,
+                rate_limit_key: t.rate_limit_key.clone(),
+                concurrency_key: t.concurrency_key.clone(),
+                queue_paused,
+                activity_paused,
+                has_live_worker: !eligible_ids.is_empty(),
+                claimant_is_live: claimant_is_live(
+                    &live_workers,
+                    t.worker_id.as_deref(),
+                    &t.queue_name,
+                    shard_id,
+                ),
+                circuit_phase,
+                circuit_cooldown_until,
+                rate_limit_saturated: !has_cb
+                    && t.rate_limit_key
+                        .as_ref()
+                        .is_some_and(|k| rate_limit_gate.saturated.contains(k)),
+                // A key with NO bucket row is refused by the gate's `EXISTS`
+                // forever, so it is a stall rather than a refilling deferral.
+                rate_limit_bucket_missing: !has_cb
+                    && t.rate_limit_key
+                        .as_ref()
+                        .is_some_and(|k| rate_limit_gate.missing.contains(k)),
+                concurrency_saturated,
+            }
+        })
+        .collect();
+
+    // ── The remaining database-observable categories ───────────────────────
+    let handoff_filters = external_task::ExternalHandoffFilters {
+        states: vec!["PENDING".to_string()],
+        execution_id: Some(exec_id),
+        limit: MAX_EXTERNAL_HANDOFF_LIMIT,
+        ..external_task::ExternalHandoffFilters::default()
+    };
+    let external_handoffs: Vec<ExternalHandoffFacts> =
+        external_task::list_external_handoffs(&mut conn, &handoff_filters)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .map(|row| ExternalHandoffFacts {
+                token: row.token.to_string(),
+                activity_name: Some(row.activity_name),
+            })
+            .collect();
+
+    // AWAITED children only. A DETACHED child (issue #347) keeps `parent_id`
+    // but carries a non-null `parent_close_policy`, and the engine uses exactly
+    // that discriminator (`worker.rs`'s `is_detached_child`) to decide a child
+    // does NOT wake its parent on completion or failure. A fire-and-forget child
+    // is therefore never something the parent is waiting on, so counting it
+    // would report a healthy `pending_child` for a parent that is genuinely
+    // parked elsewhere -- masking an awaited signal or condition (which only the
+    // replay drive, ranked BELOW children, can see) and even masking a lost
+    // workflow task as healthy for as long as the detached child runs.
+    let children: Vec<PendingChildFacts> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::parent_id.eq(Some(exec_uuid)))
+        .filter(harvest_workflow_executions::parent_close_policy.is_null())
+        .filter(harvest_workflow_executions::state.ne_all([
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "CONTINUED_AS_NEW",
+            "TERMINATED",
+        ]))
+        .order(harvest_workflow_executions::id.asc())
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::state,
+        ))
+        .load::<(uuid::Uuid, String)>(&mut conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|(child_exec_id, child_state)| PendingChildFacts {
+            child_exec_id: child_exec_id.to_string(),
+            child_state,
+        })
+        .collect();
+
+    let timers: Vec<PendingTimerFacts> = harvest_timers::table
+        .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
+        .filter(harvest_timers::fired.eq(false))
+        .select(harvest_timers::fires_at)
+        .load::<chrono::DateTime<chrono::Utc>>(&mut conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|fires_at| PendingTimerFacts { fires_at })
+        .collect();
+
+    let workflow_task = workflow_task_row.map(
+        |(
+            state,
+            worker_id,
+            queue_name,
+            scheduled_at,
+            required_build_id,
+            required_capabilities,
+            session_id,
+            sticky_worker_id,
+        )| {
+            WorkflowTaskFacts {
+                has_worker: worker_id.is_some(),
+                queue_paused: paused_queues.contains(&queue_name),
+                has_live_worker: task_has_eligible_worker(
+                    &live_workers,
+                    shard_id,
+                    TaskClaimRequirements {
+                        queue_name: &queue_name,
+                        required_build_id: required_build_id.as_deref(),
+                        // Deliberately NOT backfilled from the registry, unlike
+                        // the activity site: `claim_task`'s
+                        // ineligible-activities gate is guarded by
+                        // `task_type != 'activity'`, so a workflow task is only
+                        // ever gated by its own snapshot.
+                        required_capabilities: required_capabilities.as_ref(),
+                        capabilities_from_registry_fallback: false,
+                        is_session_member: session_id.is_some(),
+                        sticky_worker_id: sticky_worker_id.as_deref(),
+                    },
+                    &compat_set,
+                    &local_build_id,
+                ),
+                claimant_is_live: claimant_is_live(
+                    &live_workers,
+                    worker_id.as_deref(),
+                    &queue_name,
+                    shard_id,
+                ),
+                state,
+                queue_name,
+                scheduled_at,
+            }
+        },
+    );
+
+    // The connection is released before any replay drive: user workflow code is
+    // never driven while a pool slot is held (the #612 discipline).
+    drop(conn);
+
+    let mut inputs = DiagnosisInputs {
+        is_terminal: false,
+        is_paused: execution.state == "PAUSED",
+        pause_actor: execution.pause_actor.clone(),
+        paused_since: execution.paused_at,
+        activities,
+        external_handoffs,
+        children,
+        awaited_signals: Vec::new(),
+        timers,
+        replay_waits: Vec::new(),
+        workflow_task,
+        // Issue #603: an nd-blocked run stays RUNNING with its workflow task
+        // re-pended at a backoff `scheduled_at`, indefinitely. That row shape is
+        // an ordinary deferral, so without this recorded fact a permanently
+        // wedged run reports `healthy_in_progress`. Terminal executions returned
+        // above, and a PAUSED one is answered by the higher-ranked `paused`
+        // verdict, so a stamped marker here is always a live block.
+        nd_block: execution.nd_blocked_at.map(|blocked_at| NdBlockFacts {
+            blocked_at,
+            reason: execution.nd_block_reason.clone(),
+            block_count: execution.nd_block_count,
+        }),
+    };
+
+    // ── Awaited-but-unsent signals, only when they could change the answer ──
+    let mut wait_set = WAIT_SET_NOT_CONSULTED.to_string();
+    let mut wait_set_reason = None;
+    let db_verdict = classify_execution(&inputs, now);
+    let replay_could_win = matches!(
+        db_verdict.as_ref().map(BlockedOn::kind),
+        Some("sleeping_timer" | "no_pending_work")
+    );
+    if replay_could_win {
+        // Deadline the whole replay. `build_awaitables_report` inflates offloaded
+        // payloads per event (issue #524) OUTSIDE the query timeout, so on a long
+        // history with a remote `PayloadStore` it can run for minutes. The
+        // degrade path below is exactly the right answer when it does.
+        let replay = tokio::time::timeout(
+            api_state.query_timeout(),
+            build_awaitables_report(api_state, exec_id),
+        )
+        .await;
+        match replay {
+            Ok(Ok(report)) => {
+                // `build_awaitables_report` can answer `terminal` if the run
+                // reached a terminal state between our own load and this replay.
+                // That is a real TOCTOU, but this response has already committed
+                // to a non-terminal verdict, so surface it as an unavailable
+                // wait set rather than leaking a fourth vocabulary value the
+                // contract does not document.
+                if report.wait_set == "terminal" {
+                    wait_set = "history_only".to_string();
+                    wait_set_reason = Some("execution_went_terminal".to_string());
+                } else {
+                    wait_set = report.wait_set;
+                    wait_set_reason = report.wait_set_reason;
+                }
+                inputs.awaited_signals = report
+                    .awaitables
+                    .iter()
+                    .filter(|a| a.kind == autumn_harvest::awaitables::AwaitableKind::Signal)
+                    .filter_map(|a| {
+                        a.name.clone().map(|signal_name| AwaitedSignalFacts {
+                            signal_name,
+                            since: a.since,
+                        })
+                    })
+                    .collect();
+                // Every OTHER kind replay can name. Signals have their own,
+                // more specific verdict above; the rest — a command-less
+                // `ctx.await_condition` park, a durable mutex acquire (#691),
+                // an admitted update awaiting its handler, a parked
+                // external-workflow operation (#492/#757/#751) — leave no row in
+                // any side table this endpoint reads, so replay is the ONLY
+                // source that can see them. Dropping them (as this filter once
+                // did) meant a run legitimately parked on any of them reported
+                // the alarming `no_pending_work`/`stalled`.
+                //
+                // Recorded/command order is deterministic, so taking them in
+                // order keeps the verdict stable call to call. The classifier
+                // consults them BELOW every side-table cause, so they can only
+                // ever replace a false lost-task verdict.
+                inputs.replay_waits = report
+                    .awaitables
+                    .iter()
+                    .filter(|a| a.kind != autumn_harvest::awaitables::AwaitableKind::Signal)
+                    .map(|a| ReplayWaitFacts {
+                        wait_kind: a.kind.as_str().to_string(),
+                        name: a.name.clone(),
+                        since: a.since,
+                    })
+                    .collect();
+            }
+            Ok(Err(error)) => {
+                // Degrade, never fail: this is a triage endpoint. Without the
+                // replay the verdict simply falls back to what the side tables
+                // can see, and the caller is told the wait set is unavailable.
+                tracing::warn!(
+                    %exec_id,
+                    ?error,
+                    "diagnose: awaited-signal replay unavailable; \
+                     serving the database-only verdict"
+                );
+                wait_set = "history_only".to_string();
+                wait_set_reason = Some("wait_set_unavailable".to_string());
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    %exec_id,
+                    "diagnose: awaited-signal replay exceeded the query timeout; \
+                     serving the database-only verdict"
+                );
+                wait_set = "history_only".to_string();
+                wait_set_reason = Some("wait_set_timed_out".to_string());
+            }
+        }
+    }
+
+    let mut blocked_on = classify_execution(&inputs, now).unwrap_or(BlockedOn::NoPendingWork);
+    *decode_outcome =
+        decode_outcome.merged(decode_surfaced_activity_error(&mut blocked_on, decoder));
+    let health = blocked_on.health();
+    let summary = summarize(&blocked_on);
+    let contributing_reason_codes = contributing_reasons_for(&inputs.activities);
+
+    Ok(WorkflowDiagnoseResponse {
+        execution_id: exec_id.to_string(),
+        workflow_id: execution.workflow_id,
+        workflow_name: execution.workflow_name,
+        state: execution.state,
+        health,
+        blocked_on: Some(blocked_on),
+        summary,
+        last_event_age_seconds,
+        last_event_at,
+        terminal_outcome: None,
+        contributing_reason_codes,
+        wait_set,
+        wait_set_reason,
+    })
+}
+
+/// Every claim-time impediment holding ANY of this execution's activity rows.
+///
+/// Deliberately a UNION across all rows rather than the single row `blocked_on`
+/// names. `blocked_on` is one triage verdict chosen by precedence, so a
+/// higher-ranked sibling would otherwise HIDE a lower-ranked one — in a fan-out
+/// where slot A sits on a paused queue (rank 6) and slot B has no live poller
+/// (rank 5), the `no_live_worker` condition holds but would appear nowhere in
+/// the response. Unioning is what makes the endpoint's "surfaced 100% of the
+/// time it holds" guarantee true, and what makes the runbook's promise that a
+/// task both rate-limited AND on a paused queue "shows both" literally correct.
+///
+/// Delegates to the eligibility explainer's own pure
+/// [`task_intrinsic_impediment_reasons`] (issue #611) so this list and
+/// `blocked_on` can never drift apart in how an impediment is named.
+fn contributing_reasons_for(
+    activities: &[autumn_harvest::stall_diagnosis::PendingActivityFacts],
+) -> Vec<String> {
+    // Derived from the FACTS, never from the raw in-process snapshot: a phase
+    // reaches a fact only when the local breaker is authoritative for that row
+    // (`local_circuit_snapshot_is_authoritative`). Reading the raw map here
+    // would put `circuit_open` next to a `healthy` headline whenever a peer
+    // replica could still dispatch the task -- the same two-surfaces-disagree
+    // bug the held-row liveness split fixed below.
+    let phases: std::collections::HashMap<String, &'static str> = activities
+        .iter()
+        .filter_map(|f| {
+            let name = f.activity_name.clone()?;
+            let phase = match f.circuit_phase? {
+                autumn_harvest::stall_diagnosis::BlockingCircuitPhase::Open => "open",
+                autumn_harvest::stall_diagnosis::BlockingCircuitPhase::HalfOpen => "half_open",
+                _ => return None,
+            };
+            Some((name, phase))
+        })
+        .collect();
+    let mut reasons: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for facts in activities {
+        // Worker liveness is a property of the fleet, not a claim-time *task*
+        // gate, so the shared helper does not model it — but it is the one cause
+        // that never self-heals, and it is equally real for a claimed row whose
+        // fleet has gone (a poison-pill orphan, issue #367).
+        //
+        // WHICH liveness question applies depends on the row's state, and must
+        // match `classify_pending_activity` exactly or the reason codes
+        // contradict the headline verdict:
+        //   * a PENDING row asks "can any worker CLAIM this?" (Active only), and
+        //   * a HELD row asks "is its own recorded CLAIMANT alive?" (Active OR
+        //     Draining — a gracefully-shutting-down worker claims nothing new
+        //     but IS finishing exactly this row).
+        // Without the split, a row held by a live draining claimant reports
+        // `healthy` yet carries `no_live_worker`, and an orphan held by a dead
+        // claimant OMITS it whenever a live Active peer happens to cover the
+        // queue — the one case the reason exists to surface.
+        let held = facts.task_state != "PENDING";
+        let worker_alive = if held {
+            facts.claimant_is_live.unwrap_or(facts.has_live_worker)
+        } else {
+            facts.has_live_worker
+        };
+        if !worker_alive {
+            reasons.insert("no_live_worker".to_string());
+        }
+        // Every remaining reason is a CLAIM-time gate, so none of them applies
+        // to a row a worker already holds. Reporting them for a claimed row
+        // would put `queue_paused` next to `health: healthy` for work that is
+        // actively running.
+        if held {
+            continue;
+        }
+        // The classifier already resolved which impediments hold, so the
+        // saturation sets handed to the shared helper are this row's own
+        // answers.
+        // A MISSING bucket row is folded in here on purpose: the headline
+        // verdict distinguishes permanence, but the reason code names *which
+        // gate* refuses the row, and that gate is the rate-limit gate either
+        // way. Omitting it would leave a task blocked solely by a missing
+        // bucket with an empty reason set.
+        let mut saturated_rate_limits = std::collections::HashSet::new();
+        if (facts.rate_limit_saturated || facts.rate_limit_bucket_missing)
+            && let Some(key) = facts.rate_limit_key.as_ref()
+        {
+            saturated_rate_limits.insert(key.clone());
+        }
+        reasons.extend(task_intrinsic_impediment_reasons(
+            facts.activity_name.as_deref(),
+            facts.rate_limit_key.as_deref(),
+            // `rate_limit_saturated` is already false for a breaker-tracked
+            // activity (dispatch-time enforcement, issue #369), so the
+            // suppression flag is redundant here and passing `false` keeps the
+            // two paths consistent.
+            false,
+            &saturated_rate_limits,
+            facts.concurrency_saturated,
+            &phases,
+            OperatorPauseHolds {
+                queue: facts.queue_paused,
+                activity: facts.activity_paused,
+            },
+        ));
+    }
+    let mut reasons: Vec<String> = reasons.into_iter().collect();
+    sort_reason_codes(&mut reasons);
+    reasons
+}
+
+/// Which of `keys` currently have fewer than one token available.
+///
+/// Uses the canonical refill expression Postgres itself evaluates in
+/// Absolute `cooldown_until` instant for an open circuit breaker.
+///
+/// [`autumn_harvest::circuit_breaker::CircuitSnapshot`] reports the remaining
+/// cooldown as *fractional seconds* (`time_until_probe_secs`), not an absolute
+/// timestamp, so the endpoint derives one. Every failure mode resolves to
+/// `None` rather than a panic or a wrapped instant: a NaN / negative / absurdly
+/// large value (`try_from_secs_f64`), a duration outside `chrono`'s range
+/// (`from_std`), or an instant that would overflow (`checked_add_signed`). A
+/// missing `cooldown_until` is already the documented shape for a
+/// force-opened breaker, so degrading to `None` is never a lie.
+fn circuit_cooldown_until(
+    now: chrono::DateTime<chrono::Utc>,
+    secs: f64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let std_dur = std::time::Duration::try_from_secs_f64(secs).ok()?;
+    let delta = chrono::Duration::from_std(std_dur).ok()?;
+    now.checked_add_signed(delta)
+}
+
+/// The two distinct ways `claim_task`'s rate-limit gate can refuse a key.
+///
+/// The gate is `EXISTS(bucket WHERE ... >= 1.0)`, which refuses a drained
+/// bucket **and** a key with no bucket row at all. Those look identical to the
+/// gate but are opposites to an operator: a drained bucket refills on its own,
+/// a missing row never does. Collapsing them would put a permanent condition
+/// behind a verdict whose summary promises automatic refill.
+#[derive(Debug, Default)]
+struct RateLimitGateStatus {
+    /// Keys whose bucket row exists but is currently below one token.
+    /// Transient — it refills.
+    saturated: std::collections::HashSet<String>,
+    /// Keys with **no bucket row at all**: auto-registration failed, the row
+    /// was deleted, or startup skipped it as an invalid config. Permanent —
+    /// the gate's `EXISTS` refuses it forever.
+    missing: std::collections::HashSet<String>,
+}
+
+/// `claim_task`'s rate-limit gate, decomposed, so a key this reports as
+/// refused is exactly a key the claim query would refuse — and the *reason*
+/// is preserved rather than flattened.
+///
+/// One query: it asks which rows exist and, for each, whether the canonical
+/// refill expression currently admits it. A key absent from the result has no
+/// row (`missing`); a key present but not admissible is drained (`saturated`).
+async fn rate_limit_gate_status(
+    conn: &mut diesel_async::AsyncPgConnection,
+    keys: &[String],
+) -> Result<RateLimitGateStatus, AutumnError> {
+    #[derive(diesel::QueryableByName)]
+    struct KeyRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        key: String,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        admissible: bool,
+    }
+
+    if keys.is_empty() {
+        return Ok(RateLimitGateStatus::default());
+    }
+    // Mirrors the gate's own refill expression exactly, so the two can never
+    // disagree about whether a present bucket admits a claim.
+    let rows: Vec<KeyRow> = diesel::sql_query(
+        "SELECT key, \
+                (LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) >= 1.0) AS admissible \
+         FROM harvest_rate_limit_buckets \
+         WHERE key = ANY($1)",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(keys)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+
+    let mut status = RateLimitGateStatus::default();
+    let present: std::collections::HashMap<String, bool> =
+        rows.into_iter().map(|r| (r.key, r.admissible)).collect();
+    for key in keys {
+        match present.get(key) {
+            // Present and admissible: not an impediment at all.
+            Some(true) => {}
+            Some(false) => {
+                status.saturated.insert(key.clone());
+            }
+            None => {
+                status.missing.insert(key.clone());
+            }
+        }
+    }
+    Ok(status)
+}
+
+/// `RUNNING` task counts per `(concurrency_key, task_type)`.
+///
+/// Shaped exactly like `claim_task`'s own cap subquery — `state = 'RUNNING'` and
+/// `worker_id IS NOT NULL`, grouped by key *and* task type — so a key this
+/// reports as at-cap is exactly a key the claim query would defer.
+async fn running_counts_for_concurrency_keys(
+    conn: &mut diesel_async::AsyncPgConnection,
+    keys: &[String],
+) -> Result<std::collections::HashMap<(String, String), i64>, AutumnError> {
+    #[derive(diesel::QueryableByName)]
+    struct ConcurrencyRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        key: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        task_type: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        running_count: i64,
+    }
+
+    if keys.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<ConcurrencyRow> = diesel::sql_query(
+        "SELECT concurrency_key AS key, task_type, COUNT(*) AS running_count \
+         FROM harvest_task_queue \
+         WHERE state = 'RUNNING' \
+           AND concurrency_key = ANY($1) \
+           AND worker_id IS NOT NULL \
+         GROUP BY concurrency_key, task_type",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(keys)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ((r.key, r.task_type), r.running_count))
+        .collect())
+}
+
+/// `GET /workflows/{id}/diagnose` — why is this execution not progressing?
+///
+/// Per-execution stall diagnosis (issue #809): the root-cause complement to
+/// issue #486's fleet-wide "which runs look stalled?" discovery. Returns one
+/// triage `health` verdict plus a discriminated `blocked_on` cause, correlating
+/// pending work with per-queue worker liveness, circuit-breaker phase,
+/// rate-limit and concurrency saturation, operator queue pauses, and task-queue
+/// retry timing — the four-endpoint correlation an operator does by hand today.
+///
+/// Admin-gated, matching the eligibility and `/awaitables` triage endpoints:
+/// the response names queue, bucket and concurrency keys (which can embed tenant
+/// identifiers) and the fleet's worker-coverage state.
+///
+/// Read-only: appends no events, mutates no task-queue row, adds no migration.
+async fn get_workflow_diagnose(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> Result<Json<WorkflowDiagnoseResponse>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    // Read-path payload decoding (issue #608). This report is payload-free
+    // EXCEPT for the task row's `error` text, which `/stack` already decodes for
+    // its own `last_failure` — without this an admin would see plaintext there
+    // and a ciphertext envelope here, for the same column of the same row.
+    let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
+    let mut outcome = LossyDecodeOutcome::default();
+    let report =
+        build_diagnosis_report(&api_state, exec_id, decoder.as_ref(), &mut outcome).await?;
+    if decoder.is_some() {
+        // No live connection is held here — `build_diagnosis_report` drops its
+        // own before returning — so the pool-acquiring branch is safe.
+        audit_decoded_read(
+            &api_state,
+            None,
+            &headers,
+            TARGET_WORKFLOW,
+            Some(&exec_id.to_string()),
+            "GET /workflows/{id}/diagnose",
+            Some(exec_id.shard()),
+            outcome,
+            None,
+        )
+        .await;
+    }
     Ok(Json(report))
 }
 
@@ -14837,15 +16490,23 @@ pub(crate) async fn start_workflow(
         });
 
     // Resolve per-key concurrency policy from WorkflowInfo (issue #247).
-    let (concurrency_key, concurrency_limit) = runtime
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
         .workflows
         .get(&workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map_or((None, None), |policy| {
-            let key = autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
-            (key, Some(policy.limit))
-        });
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key =
+                    autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
 
     // Capture trace context for debounced starts — must be before the debounce
     // branch returns 202 since the normal path captures it inside a later OTel span.
@@ -15132,6 +16793,7 @@ pub(crate) async fn start_workflow(
                     priority: request.priority.map(Priority::as_i32),
                     concurrency_key: concurrency_key.clone(),
                     concurrency_limit,
+                    concurrency_on_conflict: Some(concurrency_on_conflict),
                     owner: info_owner.map(str::to_string),
                     runbook_url: info_runbook.map(str::to_string),
                     severity: info_severity.map(str::to_string),
@@ -15460,6 +17122,7 @@ pub(crate) async fn start_workflow(
                 priority: request.priority.map(Priority::as_i32),
                 concurrency_key: concurrency_key.clone(),
                 concurrency_limit,
+                concurrency_on_conflict: Some(concurrency_on_conflict),
                 owner: info_owner.map(str::to_string),
                 runbook_url: info_runbook.map(str::to_string),
                 severity: info_severity.map(str::to_string),
@@ -15860,6 +17523,7 @@ pub(crate) async fn start_workflow(
             priority: request.priority.map(Priority::as_i32),
             concurrency_key: concurrency_key.clone(),
             concurrency_limit,
+            concurrency_on_conflict: Some(concurrency_on_conflict),
             owner: owner.map(str::to_string),
             runbook_url: runbook_url.map(str::to_string),
             severity: severity.map(str::to_string),
@@ -16035,6 +17699,7 @@ pub(crate) async fn start_workflow(
                 inherited_chain_deadline_at: None,
                 concurrency_key,
                 concurrency_limit,
+                concurrency_on_conflict,
                 priority: request.priority.unwrap_or_default(),
                 max_workflow_input_bytes: effective_wf_cap,
                 start_at: request.start_at,
@@ -16265,6 +17930,7 @@ pub(crate) async fn start_workflow(
         inherited_chain_deadline_at: None,
         concurrency_key,
         concurrency_limit,
+        concurrency_on_conflict,
         priority: request.priority.unwrap_or_default(),
         max_workflow_input_bytes: effective_wf_cap,
         start_at: request.start_at,
@@ -17061,18 +18727,25 @@ async fn batch_start_workflows(
                     per_wf.max(max_wf_input_bytes)
                 });
 
-            let (concurrency_key, concurrency_limit) = runtime
+            let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
                 .registry
                 .workflows
                 .get(&item.workflow_name)
                 .and_then(|info| info.concurrency.as_ref())
-                .map_or((None, None), |policy| {
-                    let key = autumn_harvest::concurrency::resolve_concurrency_key(
-                        policy.key_expr,
-                        &input,
-                    );
-                    (key, Some(policy.limit))
-                });
+                .map_or(
+                    (
+                        None,
+                        None,
+                        autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+                    ),
+                    |policy| {
+                        let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                            policy.key_expr,
+                            &input,
+                        );
+                        (key, Some(policy.limit), policy.on_conflict)
+                    },
+                );
 
             let exec_id = ExecutionId::new_for_shard(*shard);
 
@@ -17197,6 +18870,7 @@ async fn batch_start_workflows(
                     priority: item.priority.map(Priority::as_i32),
                     concurrency_key: concurrency_key.clone(),
                     concurrency_limit,
+                    concurrency_on_conflict: Some(concurrency_on_conflict),
                     owner: owner.map(str::to_string),
                     runbook_url: runbook_url.map(str::to_string),
                     severity: severity.map(str::to_string),
@@ -17311,6 +18985,7 @@ async fn batch_start_workflows(
                     inherited_chain_deadline_at: None,
                     concurrency_key,
                     concurrency_limit,
+                    concurrency_on_conflict,
                     priority: item.priority.unwrap_or_default(),
                     max_workflow_input_bytes: effective_wf_cap,
                     start_at: None,
@@ -17365,17 +19040,12 @@ async fn batch_start_workflows(
                         .await;
                     }
                     let m = runtime.registry.telemetry().metrics.as_ref();
-                    for (wf_name, q_name) in cancel_metrics {
-                        // Route through the single choke point so a synthetic
-                        // liveness canary (issue #796, AC8) never leaks into
-                        // harvest.workflow.terminal via a batch cancel.
-                        autumn_harvest::telemetry::emit_workflow_terminal(
-                            m,
-                            &wf_name,
-                            &q_name,
-                            autumn_harvest::telemetry::WorkflowStatus::Cancelled,
-                        );
-                    }
+                    // Route through the single choke point so a synthetic
+                    // liveness canary (issue #796, AC8) never leaks into
+                    // harvest.workflow.terminal via a batch cancel, and so a
+                    // latest-wins supersede (issue #811) can never be emitted as
+                    // a plain cancel with its own counter dropped.
+                    autumn_harvest::execution::emit_start_cancel_metrics(m, &cancel_metrics);
                     Ok(started)
                 }
                 Err(e) => Err(e),
@@ -18336,16 +20006,25 @@ pub(crate) async fn signal_with_start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (concurrency_key, concurrency_limit) = runtime
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
         .workflows
         .get(&workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map_or((None, None), |policy| {
-            let key =
-                autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &start_input);
-            (key, Some(policy.limit))
-        });
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                    policy.key_expr,
+                    &start_input,
+                );
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
 
     let (
         owner,
@@ -18404,6 +20083,7 @@ pub(crate) async fn signal_with_start_workflow(
                 .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
             concurrency_key,
             concurrency_limit,
+            concurrency_on_conflict,
             signal_name: &request.signal_name,
             signal_payload,
             idempotency_key: request.idempotency_key.clone(),
@@ -18964,16 +20644,25 @@ async fn update_with_start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (concurrency_key, concurrency_limit) = runtime
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
         .workflows
         .get(&workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map_or((None, None), |policy| {
-            let key =
-                autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &start_input);
-            (key, Some(policy.limit))
-        });
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                    policy.key_expr,
+                    &start_input,
+                );
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
 
     let (
         owner,
@@ -19100,6 +20789,7 @@ async fn update_with_start_workflow(
             .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
         concurrency_key,
         concurrency_limit,
+        concurrency_on_conflict,
         update_id,
         update_name: request.update_name.clone(),
         update_args,
@@ -19959,18 +21649,25 @@ async fn rerun_workflow(
         });
 
     // Per-key concurrency (issue #247), resolved against the EFFECTIVE input.
-    let (concurrency_key, concurrency_limit) = runtime
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
         .workflows
         .get(&source.workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map_or((None, None), |policy| {
-            let key = autumn_harvest::concurrency::resolve_concurrency_key(
-                policy.key_expr,
-                &effective_input,
-            );
-            (key, Some(policy.limit))
-        });
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                    policy.key_expr,
+                    &effective_input,
+                );
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
 
     let metrics_ref: Option<&(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)> =
         Some(runtime.registry.telemetry().metrics.as_ref());
@@ -19981,6 +21678,7 @@ async fn rerun_workflow(
         started_by: Some(actor.as_str()),
         concurrency_key,
         concurrency_limit,
+        concurrency_on_conflict,
         max_workflow_input_bytes: effective_wf_cap,
         max_execution_timeout_ceiling: api_state
             .max_workflow_execution_timeout()
@@ -25616,15 +27314,23 @@ async fn trigger_schedule_now(
         .get(&workflow_name)
         .and_then(|info| info.chain_execution_timeout)
         .and_then(|d| chrono::Duration::from_std(d).ok());
-    let (concurrency_key, concurrency_limit) = runtime
+    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = runtime
         .registry
         .workflows
         .get(&workflow_name)
         .and_then(|info| info.concurrency.as_ref())
-        .map_or((None, None), |policy| {
-            let key = autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
-            (key, Some(policy.limit))
-        });
+        .map_or(
+            (
+                None,
+                None,
+                autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            ),
+            |policy| {
+                let key =
+                    autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+                (key, Some(policy.limit), policy.on_conflict)
+            },
+        );
     // Schedule-level retry_policy takes precedence over the workflow-type default,
     // mirroring the automated tick and backfill paths (scheduler.rs).
     let manual_trigger_retry_policy = schedule
@@ -25744,6 +27450,7 @@ async fn trigger_schedule_now(
             priority: None,
             concurrency_key: concurrency_key.clone(),
             concurrency_limit,
+            concurrency_on_conflict: Some(concurrency_on_conflict),
             owner: owner.map(str::to_string),
             runbook_url: runbook_url.map(str::to_string),
             severity: severity.map(str::to_string),
@@ -25912,6 +27619,7 @@ async fn trigger_schedule_now(
             inherited_chain_deadline_at: None,
             concurrency_key,
             concurrency_limit,
+            concurrency_on_conflict,
             priority: Priority::default(),
             max_workflow_input_bytes: runtime
                 .registry
@@ -27192,6 +28900,7 @@ async fn schedule_backfill(
                         priority: None,
                         concurrency_key: None,
                         concurrency_limit: None,
+                        concurrency_on_conflict: None,
                         owner: owner.map(str::to_string),
                         runbook_url: runbook_url.map(str::to_string),
                         severity: severity.map(str::to_string),
@@ -27345,6 +29054,8 @@ async fn schedule_backfill(
                         inherited_chain_deadline_at: None,
                         concurrency_key: None,
                         concurrency_limit: None,
+                        concurrency_on_conflict:
+                            autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                         priority: Priority::default(),
                         max_workflow_input_bytes: runtime
                             .registry
@@ -27690,6 +29401,8 @@ async fn schedule_backfill(
                         inherited_chain_deadline_at: None,
                         concurrency_key: None,
                         concurrency_limit: None,
+                        concurrency_on_conflict:
+                            autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                         priority: Priority::default(),
                         max_workflow_input_bytes: 0,
                         start_at: None,
@@ -30164,6 +31877,7 @@ async fn concurrency_status(
                     max_concurrent: stat.max_concurrent,
                     in_flight: 0,
                     pending: 0,
+                    workflows: Vec::new(),
                 });
             // Take the highest cap seen across shards, matching what
             // concurrency_key_stats() does within a shard (MAX(concurrency_cap)).
@@ -30171,11 +31885,79 @@ async fn concurrency_status(
             entry.in_flight += stat.in_flight;
             entry.pending += stat.pending;
         }
+
+        // Attribute each key to the workflow type(s) on it, so the declared
+        // overflow strategy is visible next to the live counters (issue #811
+        // AC7). Resolved against the registry here rather than in the core
+        // stats query: the worker's sampler has no registry and must not pay
+        // for the join.
+        let attributions = queue::concurrency_key_workflows(&mut conn, &runtime.queues)
+            .await
+            .map_err(map_error)?;
+        for attribution in attributions {
+            let Some(entry) =
+                merged.get_mut(&(attribution.key.clone(), attribution.task_type.clone()))
+            else {
+                // A row that appeared between the two reads; the next poll
+                // picks it up. Never fabricate a stats row from an attribution.
+                continue;
+            };
+            if entry
+                .workflows
+                .iter()
+                .any(|w| w.workflow_name == attribution.workflow_name)
+            {
+                continue;
+            }
+            let declared = runtime
+                .registry
+                .workflows
+                .get(&attribution.workflow_name)
+                .and_then(|info| info.concurrency)
+                .map_or_else(
+                    autumn_harvest::concurrency::ConcurrencyOnConflict::default,
+                    |policy| policy.on_conflict,
+                );
+            // Activity concurrency groups always defer (issue #811, Codex round 1).
+            let on_conflict = effective_admin_on_conflict(&attribution.task_type, declared);
+            entry.workflows.push(queue::ConcurrencyWorkflowStrategy {
+                workflow_name: attribution.workflow_name,
+                on_conflict,
+            });
+        }
     }
 
     let mut result: Vec<ConcurrencyKeyStats> = merged.into_values().collect();
+    for entry in &mut result {
+        entry
+            .workflows
+            .sort_by(|a, b| a.workflow_name.cmp(&b.workflow_name));
+    }
     result.sort_by(|a, b| a.key.cmp(&b.key).then(a.task_type.cmp(&b.task_type)));
     Ok(Json(result))
+}
+
+/// Effective `on_conflict` to report for one `/admin/concurrency` row (issue #811).
+///
+/// Latest-wins is a **workflow-start admission control**: the supersede runs
+/// inside `start_or_load_workflow_execution_collect` and sheds workflow
+/// *executions*. An activity task can carry a `concurrency_key` too, but it is
+/// gated purely at claim time (issue #247) and always defers — nothing sheds an
+/// in-flight activity for a newcomer.
+///
+/// So a `task_type = "activity"` row reports `Defer` even when its owning
+/// workflow declares `cancel_running`, because reporting the workflow's
+/// strategy there would advertise behaviour the engine does not enforce for
+/// that group. Only a `task_type = "workflow"` row reports the declared policy.
+fn effective_admin_on_conflict(
+    task_type: &str,
+    declared: autumn_harvest::concurrency::ConcurrencyOnConflict,
+) -> autumn_harvest::concurrency::ConcurrencyOnConflict {
+    if task_type == "workflow" {
+        declared
+    } else {
+        autumn_harvest::concurrency::ConcurrencyOnConflict::Defer
+    }
 }
 
 // ── Debounce Management (issue #499) ──────────────────────────────────────
@@ -30891,6 +32673,13 @@ struct PauseProvenance<'a> {
     uniform: bool,
     /// Per-shard detail, so a divergent hold loses nothing.
     shards: Vec<Value>,
+    /// Every hold in effect, deduplicated by `(reason, operator)` and ordered
+    /// earliest first.
+    ///
+    /// [`Self::shards`] goes only to the transient HTTP response; this is what
+    /// the durable audit row carries, so an idempotent re-pause records the
+    /// provenance actually holding the fleet rather than the request's.
+    held_groups: Vec<HeldHoldGroup>,
 }
 
 /// Summarise a fleet-wide pause without discarding any shard's provenance.
@@ -30929,10 +32718,19 @@ fn summarise_pause_provenance(
             })
         })
         .collect();
+    let held_groups = group_held_holds(per_shard.iter().map(|(shard_id, o)| {
+        (
+            *shard_id,
+            o.reason.as_str(),
+            o.paused_by.as_str(),
+            o.paused_at,
+        )
+    }));
     Some(PauseProvenance {
         effective,
         uniform,
         shards,
+        held_groups,
     })
 }
 
@@ -31105,6 +32903,169 @@ impl ReleasedHoldGroup {
     }
 }
 
+/// A held `(reason, operator)` pair — the identity of one hold in effect.
+///
+/// The pause mirror of [`ReleasedHoldKey`]. `paused_by` is a plain `String`
+/// rather than an `Option`: a pause row always records an operator (the route
+/// falls back to the authenticated actor when the body supplies no label),
+/// whereas a *released* hold can come from a row written before that guarantee
+/// existed.
+type HeldHoldKey = (String, String);
+
+/// Cross-shard accumulator for one [`HeldHoldKey`].
+///
+/// The pause mirror of [`HoldGroupFold`], anchored on the EARLIEST stamp rather
+/// than the longest duration: at pause time nothing has been held for a
+/// measurable span yet, and the earliest hold is what the response's top-level
+/// provenance reports.
+struct HeldGroupFold {
+    shard_ids: Vec<i32>,
+    anchor_at: chrono::DateTime<chrono::Utc>,
+    anchor_shard_id: i32,
+}
+
+impl HeldGroupFold {
+    /// Seeded above the range of any real stamp so the first shard observed
+    /// always becomes the anchor.
+    const fn new() -> Self {
+        Self {
+            shard_ids: Vec::new(),
+            anchor_at: chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            anchor_shard_id: i32::MAX,
+        }
+    }
+
+    /// Fold in one shard's hold, keeping the group's EARLIEST stamp as the
+    /// anchor (lowest shard id on a tie, matching the `min_by_key` the
+    /// response's top-level provenance uses).
+    fn observe(&mut self, shard_id: i32, paused_at: chrono::DateTime<chrono::Utc>) {
+        self.shard_ids.push(shard_id);
+        if (paused_at, shard_id) < (self.anchor_at, self.anchor_shard_id) {
+            self.anchor_at = paused_at;
+            self.anchor_shard_id = shard_id;
+        }
+    }
+
+    fn finish(mut self, (reason, paused_by): HeldHoldKey) -> HeldHoldGroup {
+        self.shard_ids.sort_unstable();
+        HeldHoldGroup {
+            reason,
+            paused_by,
+            shard_ids: self.shard_ids,
+            anchor_at: self.anchor_at,
+            anchor_shard_id: self.anchor_shard_id,
+        }
+    }
+}
+
+/// One distinct hold in effect — a `(reason, operator)` pair — and the shards
+/// carrying it.
+///
+/// The pause mirror of [`ReleasedHoldGroup`]: shards holding for the *same*
+/// incident collapse into one entry, so the durable audit row grows with the
+/// number of genuinely distinct holds (a small, operator-authored quantity)
+/// rather than with the shard count, and the common fleet-wide case still
+/// renders as a single line.
+struct HeldHoldGroup {
+    reason: String,
+    paused_by: String,
+    /// Ascending.
+    shard_ids: Vec<i32>,
+    /// This group's earliest stamp, and the shard that carries it (lowest shard
+    /// id on an internal tie).
+    ///
+    /// Ordering groups by `(anchor_at, anchor_shard_id)` ascending reproduces
+    /// exactly the single-anchor `min_by_key` the response's top-level fields
+    /// use, so `held_groups[0]` is always the shard the response reports.
+    anchor_at: chrono::DateTime<chrono::Utc>,
+    anchor_shard_id: i32,
+}
+
+impl HeldHoldGroup {
+    /// `shards 0,2 by alice: stripe outage`
+    ///
+    /// No duration suffix (the resume sibling renders `(held Ns)`): at pause
+    /// time nothing has been held for a measurable span, and the response
+    /// already reports `paused_at`.
+    fn render(&self) -> String {
+        let ids = self
+            .shard_ids
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let label = if self.shard_ids.len() == 1 {
+            "shard"
+        } else {
+            "shards"
+        };
+        format!("{label} {ids} by {}: {}", self.paused_by, self.reason)
+    }
+}
+
+/// Group the shards carrying a hold by the `(reason, operator)` they actually
+/// hold it for, earliest hold first.
+///
+/// Feature-neutral (`&str`s and a timestamp) so the queue pause (#619) and the
+/// per-activity pause (#807) share one definition and can never drift on what
+/// their audit rows say about the same situation.
+fn group_held_holds<'a>(
+    per_shard: impl IntoIterator<Item = (i32, &'a str, &'a str, chrono::DateTime<chrono::Utc>)>,
+) -> Vec<HeldHoldGroup> {
+    // Keyed by the hold's identity so shards sharing one incident collapse;
+    // `BTreeMap` so groups that tie on the sort key below resolve
+    // deterministically.
+    let mut grouped: std::collections::BTreeMap<HeldHoldKey, HeldGroupFold> =
+        std::collections::BTreeMap::new();
+    for (shard_id, reason, paused_by, paused_at) in per_shard {
+        grouped
+            .entry((reason.to_string(), paused_by.to_string()))
+            .or_insert_with(HeldGroupFold::new)
+            .observe(shard_id, paused_at);
+    }
+    let mut groups: Vec<HeldHoldGroup> = grouped
+        .into_iter()
+        .map(|(key, fold)| fold.finish(key))
+        .collect();
+    groups.sort_by_key(|group| (group.anchor_at, group.anchor_shard_id));
+    groups
+}
+
+/// Render the holds actually IN EFFECT for the durable audit trail.
+///
+/// The pause mirror of [`released_holds_audit_reason`], and the reason a pause
+/// audit row does not simply echo the request: `pause_queue` / `pause_activity`
+/// preserve each shard's ORIGINAL provenance on an idempotent re-pause, so the
+/// request's reason can be in effect on no shard at all — most starkly when the
+/// re-pause omits a reason and resolves to the default while every shard is
+/// still held for the original incident. The response body already reports the
+/// effective provenance for exactly this reason (issue #619 review); this keeps
+/// the durable row — which outlives the response, since the resume `DELETE`s
+/// the pause rows — from telling a different story (issue #807 review).
+///
+/// A single hold — the overwhelmingly common case, including a fleet-wide hold
+/// placed by one operator for one incident — keeps the plain single-line form.
+/// Its shard list is deliberately omitted there, for the same reason the resume
+/// sibling omits it: with one `(reason, operator)` group there is nothing
+/// distinguishing to attribute, and the response already reports the counts.
+fn held_holds_audit_reason(groups: &[HeldHoldGroup]) -> Option<String> {
+    let (leading, rest) = groups.split_first()?;
+    if rest.is_empty() {
+        return Some(format!("hold by {}: {}", leading.paused_by, leading.reason));
+    }
+    let count = groups.len();
+    let detail = groups
+        .iter()
+        .map(HeldHoldGroup::render)
+        .collect::<Vec<_>>()
+        // `; ` and not ` | `: the latter separates this contribution from the
+        // partial-failure text in `queue_pause_audit_context`.
+        .join("; ");
+    Some(format!(
+        "{count} holds in effect (earliest first); {detail}"
+    ))
+}
+
 /// The cross-shard provenance summary of a resume, plus each shard's own row.
 struct ResumeProvenance {
     /// Reason of the longest-held (i.e. earliest-placed) released hold.
@@ -31248,7 +33209,17 @@ fn queue_pause_audit_context(reason: Option<&str>, partial: Option<&str>) -> Opt
 /// `(reason, operator)` group there is nothing distinguishing to attribute, and
 /// the response already reports the counts.
 fn resume_released_audit_reason(provenance: &ResumeProvenance) -> Option<String> {
-    let (leading, rest) = provenance.released_groups.split_first()?;
+    released_holds_audit_reason(&provenance.released_groups)
+}
+
+/// Render a set of released holds for the durable audit trail.
+///
+/// Extracted from [`resume_released_audit_reason`] so the per-activity-type
+/// resume (issue #807) renders a byte-identical line for a byte-identical
+/// situation — the two features present the same information to the same
+/// operator, so they must never drift on how it reads.
+fn released_holds_audit_reason(groups: &[ReleasedHoldGroup]) -> Option<String> {
+    let (leading, rest) = groups.split_first()?;
     if rest.is_empty() {
         return Some(format!(
             "released hold by {}: {}",
@@ -31256,9 +33227,8 @@ fn resume_released_audit_reason(provenance: &ResumeProvenance) -> Option<String>
             leading.reason
         ));
     }
-    let count = provenance.released_groups.len();
-    let detail = provenance
-        .released_groups
+    let count = groups.len();
+    let detail = groups
         .iter()
         .map(ReleasedHoldGroup::render)
         .collect::<Vec<_>>()
@@ -31423,9 +33393,15 @@ async fn pause_queue_handler(
     };
 
     let partial = (!failures.is_empty()).then(|| failures.join("; "));
-    // Carry the operator's reason into the audit row: the pause row that holds
-    // it is deleted on resume, so this is its only permanent home.
-    let audit_context = queue_pause_audit_context(Some(&reason), partial.as_deref());
+    // Carry the reason into the audit row: the pause row that holds it is
+    // deleted on resume, so this is its only permanent home. It is the
+    // EFFECTIVE provenance, not the request's — an idempotent re-pause
+    // preserves each shard's original row, so echoing the request would record
+    // a reason in effect on no shard at all (issue #807 review).
+    let audit_context = queue_pause_audit_context(
+        held_holds_audit_reason(&provenance.held_groups).as_deref(),
+        partial.as_deref(),
+    );
     write_queue_pause_audit(
         &targets,
         &actor,
@@ -31639,10 +33615,7 @@ async fn list_paused_queues_handler(
     // `scope_shard_id = NULL` on the shards it reached and no row on the ones it
     // missed, so real coverage is derived from the EXPECTED shard set rather
     // than the stored intent (issue #619 review).
-    let pools = shard_fanout::pools_by_shard(&api_state);
-    let expected: Vec<i32> = shard_fanout::expected_shards(&api_state, &pools)
-        .into_iter()
-        .collect();
+    let expected = expected_shard_ids(&api_state);
 
     Ok(Json(serde_json::json!({
         "paused_queues": merge_paused_queue_rows(collected.rows, &expected),
@@ -31749,6 +33722,1436 @@ fn merge_paused_queue_rows(
             })
         })
         .collect()
+}
+
+// ── Per-activity-type pause / resume (issue #807) ────────────────────────────
+//
+// The queue-pause sibling (#619) is the direct prior art for every helper in
+// this block and the shapes are deliberately identical, one granularity down:
+// same fleet-wide fan-out, same collect-don't-abort per-shard loop, same 207
+// partial-application contract, same earliest-hold / longest-hold provenance
+// rules, same audited-rejection path. Where a helper is genuinely
+// feature-neutral it is REUSED rather than copied (see
+// `queue_pause_partial_status`, `queue_pause_attach_partial`,
+// `HoldGroupFold`/`ReleasedHoldGroup`, `released_holds_audit_reason`), so the
+// two features can never drift on the parts an operator reads.
+//
+// The one structural difference is the read side: a queue is only ever visible
+// through its pause row, whereas an activity **type** has a registered
+// catalogue, so `GET /activities` is driven by the registry and the pause table
+// is a cross-reference. See `merge_activity_catalog_rows`.
+
+/// Body of `POST /activities/{activity_name}/pause` — entirely optional.
+///
+/// Unlike the queue-pause sibling, which *requires* a reason, both fields here
+/// are optional and a bare `POST` with no body at all is a valid fleet-wide
+/// hold. During an incident the operator's first move is to stop the bleeding;
+/// rejecting that with a `400` because a reason was not typed would put
+/// paperwork ahead of containment. The reason still has a durable home — it
+/// defaults to [`DEFAULT_ACTIVITY_PAUSE_REASON`] so the read API, the CLI and
+/// the audit row always have *something* to show, and the row is never `NULL`.
+///
+/// `deny_unknown_fields` for the reason the queue sibling documents: a field
+/// this route silently ignores is a field an operator believes took effect.
+/// A typo'd `{"reasons": "..."}` must be a `400`, not an unexplained hold.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PauseActivityRequest {
+    /// Human-readable reason for the hold, surfaced on the read API and in the
+    /// audit trail. Defaults to [`DEFAULT_ACTIVITY_PAUSE_REASON`].
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Operator identity to record as `paused_by`.
+    ///
+    /// This is a **label**, not authentication: it lets an automation
+    /// ("oncall-bot") attribute a hold to the human it acted for. The durable
+    /// audit row always carries the *authenticated* actor derived from the
+    /// request headers, and records the on-behalf-of relationship when the two
+    /// differ, so a body field can never rewrite the security trail. Defaults
+    /// to the authenticated actor.
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+/// Body of `POST /activities/{activity_name}/resume` — must be empty or `{}`.
+///
+/// A resume records no provenance of its own: it `DELETE`s the pause row, so
+/// there is no column an `actor` field could set. Rather than accept a field
+/// that would be silently dropped, the struct carries none and
+/// `deny_unknown_fields` turns one into an audited `400`. The audit row's actor
+/// comes from the authenticated request, exactly as it does for pause.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResumeActivityRequest {}
+
+/// Reason stored when an operator pauses without supplying one.
+///
+/// A pause row's `reason` is `NOT NULL` and is the only durable record of *why*
+/// dispatch is held (the row is deleted on resume), so the optional-body
+/// contract above needs a default rather than an empty string — "(no reason
+/// given)" tells the next operator that nobody typed one, where `""` would read
+/// as a rendering bug.
+const DEFAULT_ACTIVITY_PAUSE_REASON: &str = "operator pause (no reason given)";
+
+/// Resolve every shard an activity pause/resume must touch, plus any shard the
+/// router knows about that this process has no pool for.
+///
+/// Always fleet-wide. Issue #807's contract is that a hold "applies on every
+/// shard and every worker", so — unlike the queue sibling, which exposes a
+/// `shard_id` scope — there is no per-shard variant to resolve here and no
+/// `unknown shard_id` rejection. The core still carries a `scope_shard_id`
+/// column (a future scoped surface, and the CLI, can write it), so the read and
+/// mutation responses report it verbatim; this route always writes `NULL`.
+///
+/// The expected-shard set comes from [`shard_fanout::expected_shards`], not the
+/// local pool map: a shard the router knows but this process has no pool for
+/// (mid a shard-add rollout) must be *reported*, never silently omitted.
+/// Omitting it would let a hold return an unqualified success while that shard
+/// kept dispatching into the outage.
+fn activity_pause_target_pools(
+    api_state: &HarvestApiState,
+) -> Result<QueuePauseTargets, AutumnError> {
+    if api_state.storage_pool().is_err() {
+        return Err(AutumnError::service_unavailable_msg(
+            "harvest storage pool is not configured",
+        ));
+    }
+    let pools = shard_fanout::pools_by_shard(api_state);
+    let expected = shard_fanout::expected_shards(api_state, &pools);
+    let mut targets = Vec::new();
+    let mut unreachable = Vec::new();
+    for shard in expected {
+        if let Some(pool) = pools.get(&shard) {
+            targets.push((shard, pool.clone()));
+        } else {
+            unreachable.push(shard);
+        }
+    }
+    Ok((targets, unreachable))
+}
+
+/// Audit a rejected activity pause/resume and turn the error into a response.
+///
+/// Every rejection path is audited: a *refused* attempt on a fleet-wide
+/// dispatch kill switch is exactly what an incident review needs to see, and
+/// without it a mistyped activity name during an outage leaves no trace at all.
+async fn reject_activity_pause(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    operation: &'static str,
+    route: &'static str,
+    activity_name: &str,
+    status_error: AutumnError,
+    summary: &str,
+) -> axum::response::Response {
+    let (actor, source, request_id) = audit;
+    // A rejection happens before any shard target is resolved, so it writes to
+    // the first shard pool it can reach (the queue sibling's
+    // `write_queue_pause_rejection_audit` shape).
+    let pools: Vec<_> = shard_fanout::pools_by_shard(api_state)
+        .into_iter()
+        .collect();
+    write_activity_pause_audit(
+        &pools,
+        actor,
+        source,
+        request_id.as_deref(),
+        operation,
+        route,
+        activity_name,
+        STATUS_FAILED,
+        Some(summary),
+    )
+    .await;
+    status_error.into_response()
+}
+
+/// Validate the activity name and resolve the target shards for a
+/// pause/resume.
+///
+/// On rejection the audit row is written here and a ready-to-send response is
+/// returned in `Err`, so both handlers share one rejection contract. The
+/// returned `Vec<String>` seeds the per-shard failure list with any shard the
+/// router knows about but this process cannot reach.
+///
+/// The name is validated but **not** required to be registered on this node.
+/// A management API process need not register every activity the fleet runs
+/// (a heterogeneous deployment is the norm), so 404-ing an unregistered name
+/// would make a legitimately-remote activity unpausable during exactly the
+/// outage the operator is containing. The invisible-typo hazard that trade
+/// creates is closed on the read side instead: `GET /activities` surfaces a
+/// paused-but-unregistered activity with `registered: false` rather than
+/// dropping it (see [`merge_activity_catalog_rows`]).
+async fn prepare_activity_pause_targets(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    activity_name: &str,
+    operation: &'static str,
+    route: &'static str,
+) -> Result<
+    (
+        String,
+        Vec<(i32, ::autumn_harvest::worker::DbPool)>,
+        Vec<String>,
+    ),
+    axum::response::Response,
+> {
+    let canonical = match ::autumn_harvest::activity_pause::validate_activity_name(activity_name) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            let summary = error.to_string();
+            return Err(reject_activity_pause(
+                api_state,
+                audit,
+                operation,
+                route,
+                activity_name,
+                map_error(error),
+                &summary,
+            )
+            .await);
+        }
+    };
+    let (targets, unreachable) = match activity_pause_target_pools(api_state) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let summary = format!("{error:?}");
+            return Err(reject_activity_pause(
+                api_state,
+                audit,
+                operation,
+                route,
+                activity_name,
+                error,
+                &summary,
+            )
+            .await);
+        }
+    };
+    let failures = unreachable
+        .iter()
+        .map(|shard| format!("shard {shard}: known to the router but has no pool in this process"))
+        .collect();
+    Ok((canonical, targets, failures))
+}
+
+/// Best-effort audit row for an activity pause/resume.
+///
+/// Written on the first reachable target shard — the operation is a fleet-wide
+/// control, so one row per request (not per shard) is the honest record.
+/// Mirrors [`write_queue_pause_audit`]; a separate function rather than a
+/// parameterised one only because the target type differs
+/// ([`TARGET_ACTIVITY`] vs [`TARGET_QUEUE`]) and that helper is already at its
+/// argument limit.
+///
+/// `shard_id` is always `None`: this route is fleet-wide by construction, so
+/// there is no single shard the record belongs to.
+#[allow(clippy::too_many_arguments)]
+async fn write_activity_pause_audit(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    operation: &str,
+    route: &'static str,
+    activity_name: &str,
+    status: &str,
+    error_summary: Option<&str>,
+) {
+    for (_, pool) in targets {
+        if let Ok(mut conn) = acquire_conn(pool).await {
+            let ar = NewAuditRecord {
+                actor,
+                operation,
+                target_type: TARGET_ACTIVITY,
+                target_id: Some(activity_name),
+                route_or_command: route,
+                request_id,
+                idempotency_key: None,
+                status,
+                error_summary,
+                shard_id: None,
+                source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return;
+        }
+    }
+}
+
+/// Emit the issue #807 pause/resume counter, best-effort.
+///
+/// `changed_state` implements [`METRIC_ACTIVITY_PAUSE_ACTIONS`]'s documented
+/// emission contract: count only when the action genuinely flipped the hold,
+/// gating on `newly_paused` / `newly_resumed`. Both mutations are idempotent by
+/// design, so an operator retry after a lost response must not read as a second
+/// hold. On a fleet-wide fan-out "genuinely flipped" means *any* shard flipped,
+/// which is exactly what the response's own `newly_*` field reports.
+///
+/// Telemetry must never decide whether an outage can be contained, so a runtime
+/// that is not installed yet (the boot window) is skipped silently rather than
+/// failing the hold — the same posture as the audit write above.
+///
+/// [`METRIC_ACTIVITY_PAUSE_ACTIONS`]: ::autumn_harvest::telemetry::METRIC_ACTIVITY_PAUSE_ACTIONS
+fn record_activity_pause_metric(
+    api_state: &HarvestApiState,
+    activity_name: &str,
+    action: ::autumn_harvest::telemetry::ActivityPauseAction,
+    changed_state: bool,
+) {
+    if !changed_state {
+        return;
+    }
+    if let Ok(runtime) = api_state.runtime() {
+        // Bucket an UNREGISTERED name to the sentinel before it becomes a metric
+        // label. The pause routes accept unregistered names on purpose (an
+        // operator must be able to pre-pause an activity before its fleet rolls
+        // out, and a paused-but-unregistered hold must stay inspectable), so the
+        // raw name is caller-controlled free text — bounded in length, but not
+        // in CARDINALITY, which is what ADR-0001 §7 actually forbids. A
+        // remediation script templating a tenant id into the name would
+        // otherwise mint one permanent series per tenant. Same fix as the #684
+        // update-name label. The durable row and the read API keep the raw name.
+        let label = if runtime.registry.activities.contains_key(activity_name) {
+            activity_name
+        } else {
+            ::autumn_harvest::telemetry::UNREGISTERED_ACTIVITY_NAME
+        };
+        runtime
+            .registry
+            .telemetry()
+            .metrics
+            .record_activity_pause_action(label, action);
+    }
+}
+
+/// The fleet-wide roll-up of an activity pause applied shard by shard.
+struct ActivityPauseApplication {
+    /// True when at least one shard transitioned from dispatching to held.
+    newly_paused: bool,
+    /// Held tasks summed across every shard the hold reached.
+    held_task_count: i64,
+    /// Every shard that applied the hold, with its own effective row.
+    ///
+    /// Kept per-shard rather than collapsed to the first success: a re-pause
+    /// preserves each shard's ORIGINAL provenance, so a request landing over a
+    /// pre-existing hold leaves the shards disagreeing, and labelling the
+    /// fleet-wide `held_task_count` with one shard's reason, actor and
+    /// timestamp would then be untrue for the rest of the fleet.
+    per_shard: Vec<(i32, ::autumn_harvest::activity_pause::ActivityPauseOutcome)>,
+}
+
+/// Apply the hold on every target shard, appending any per-shard error to
+/// `failures` rather than aborting — one unreachable shard must not stop the
+/// others from being held.
+async fn apply_activity_pause_across_shards(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    canonical_activity: &str,
+    reason: &str,
+    paused_by: &str,
+    failures: &mut Vec<String>,
+) -> ActivityPauseApplication {
+    let mut applied = ActivityPauseApplication {
+        newly_paused: false,
+        held_task_count: 0,
+        per_shard: Vec::new(),
+    };
+    for (shard_id, pool) in targets {
+        let mut conn = match acquire_conn(pool).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                failures.push(format!("shard {shard_id}: {error}"));
+                continue;
+            }
+        };
+        match ::autumn_harvest::activity_pause::pause_activity(
+            &mut conn,
+            canonical_activity,
+            reason,
+            paused_by,
+            // Always fleet-wide — see `activity_pause_target_pools`.
+            None,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                applied.newly_paused |= outcome.newly_paused;
+                applied.held_task_count += outcome.held_task_count;
+                applied.per_shard.push((*shard_id, outcome));
+            }
+            Err(error) => failures.push(format!("shard {shard_id}: {error}")),
+        }
+    }
+    applied
+}
+
+/// The cross-shard provenance summary of an activity pause, plus each shard's
+/// own row.
+struct ActivityPauseProvenance<'a> {
+    /// The earliest hold — the deterministic top-level summary.
+    effective: &'a ::autumn_harvest::activity_pause::ActivityPauseOutcome,
+    /// False when the shards disagree on `(reason, paused_by, scope_shard_id)`.
+    uniform: bool,
+    /// Per-shard detail, so a divergent hold loses nothing.
+    shards: Vec<Value>,
+    /// Every hold in effect, deduplicated by `(reason, operator)` and ordered
+    /// earliest first — see [`PauseProvenance::held_groups`].
+    held_groups: Vec<HeldHoldGroup>,
+}
+
+/// Summarise a fleet-wide activity pause without discarding any shard's
+/// provenance.
+///
+/// The top-level summary is the **earliest** hold, tie-broken by shard id — the
+/// same rule [`merge_activity_catalog_rows`] uses, so the mutation response and
+/// the read endpoints can never tell an operator two different stories about
+/// one hold. `uniform` compares `(reason, paused_by, scope_shard_id)` and
+/// deliberately **not** `paused_at`: each shard stamps its own `NOW()`, so
+/// including it would flag essentially every healthy fleet-wide hold as
+/// divergent.
+///
+/// Returns `None` only when every target shard failed.
+fn summarise_activity_pause_provenance(
+    per_shard: &[(i32, ::autumn_harvest::activity_pause::ActivityPauseOutcome)],
+) -> Option<ActivityPauseProvenance<'_>> {
+    let (_, effective) = per_shard
+        .iter()
+        .min_by_key(|(shard_id, outcome)| (outcome.paused_at, *shard_id))?;
+    let uniform = per_shard.iter().all(|(_, outcome)| {
+        outcome.reason == effective.reason
+            && outcome.paused_by == effective.paused_by
+            && outcome.scope_shard_id == effective.scope_shard_id
+    });
+    let shards = per_shard
+        .iter()
+        .map(|(shard_id, outcome)| {
+            serde_json::json!({
+                "shard_id": shard_id,
+                "newly_paused": outcome.newly_paused,
+                "reason": outcome.reason,
+                "paused_by": outcome.paused_by,
+                "paused_at": outcome.paused_at,
+                "scope_shard_id": outcome.scope_shard_id,
+                "held_task_count": outcome.held_task_count,
+            })
+        })
+        .collect();
+    let held_groups = group_held_holds(per_shard.iter().map(|(shard_id, o)| {
+        (
+            *shard_id,
+            o.reason.as_str(),
+            o.paused_by.as_str(),
+            o.paused_at,
+        )
+    }));
+    Some(ActivityPauseProvenance {
+        effective,
+        uniform,
+        shards,
+        held_groups,
+    })
+}
+
+/// The fleet-wide roll-up of an activity resume applied shard by shard.
+struct ActivityResumeApplication {
+    /// True when at least one shard actually released a hold.
+    newly_resumed: bool,
+    /// Tasks credited their held time back, summed across shards.
+    released_task_count: i64,
+    /// The longest hold released, in seconds.
+    paused_duration_secs: i64,
+    /// Every shard that completed, with the provenance it released.
+    ///
+    /// Per-shard rather than first-success: the resume DELETEs the pause rows,
+    /// so anything dropped here is gone for good.
+    per_shard: Vec<(i32, ::autumn_harvest::activity_pause::ActivityResumeOutcome)>,
+    /// True when at least one shard completed without error.
+    any_ok: bool,
+}
+
+/// Release the hold on every target shard, appending any per-shard error to
+/// `failures` rather than aborting.
+async fn apply_activity_resume_across_shards(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    canonical_activity: &str,
+    failures: &mut Vec<String>,
+) -> ActivityResumeApplication {
+    let mut applied = ActivityResumeApplication {
+        newly_resumed: false,
+        released_task_count: 0,
+        paused_duration_secs: 0,
+        per_shard: Vec::new(),
+        any_ok: false,
+    };
+    for (shard_id, pool) in targets {
+        let mut conn = match acquire_conn(pool).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                failures.push(format!("shard {shard_id}: {error}"));
+                continue;
+            }
+        };
+        match ::autumn_harvest::activity_pause::resume_activity(&mut conn, canonical_activity).await
+        {
+            Ok(outcome) => {
+                applied.any_ok = true;
+                applied.newly_resumed |= outcome.newly_resumed;
+                applied.released_task_count += outcome.released_task_count;
+                applied.paused_duration_secs = applied
+                    .paused_duration_secs
+                    .max(outcome.paused_duration_secs);
+                applied.per_shard.push((*shard_id, outcome));
+            }
+            Err(error) => failures.push(format!("shard {shard_id}: {error}")),
+        }
+    }
+    applied
+}
+
+/// The cross-shard provenance summary of an activity resume, plus each shard's
+/// own row.
+struct ActivityResumeProvenance {
+    /// Reason of the longest-held released hold.
+    released_reason: Option<String>,
+    /// Operator who placed that same hold.
+    released_paused_by: Option<String>,
+    /// Every released hold, deduplicated by `(reason, operator)` and ordered
+    /// longest-held first.
+    ///
+    /// The pause rows are already deleted by the time this exists, so this —
+    /// not the transient [`Self::shards`] response array — is what the durable
+    /// audit row must carry. Reuses the queue sibling's
+    /// [`ReleasedHoldGroup`]/[`HoldGroupFold`] so the two features render an
+    /// identical audit line for an identical situation.
+    released_groups: Vec<ReleasedHoldGroup>,
+    /// Per-shard detail for the HTTP response.
+    shards: Vec<Value>,
+}
+
+impl ActivityResumeProvenance {
+    /// False when the shards that actually released disagree on
+    /// `(released_reason, released_paused_by)`.
+    ///
+    /// Derived from the grouping rather than computed separately, so the flag
+    /// and the audit rendering can never disagree about what "uniform" means.
+    /// A fleet-wide no-op releases nothing and is trivially uniform.
+    const fn uniform(&self) -> bool {
+        self.released_groups.len() <= 1
+    }
+}
+
+/// Summarise a fleet-wide activity resume without discarding any shard's
+/// provenance.
+///
+/// The top-level reason/operator come from the **longest** hold released,
+/// tie-broken by shard id — deliberately the same shard the
+/// `paused_duration_secs` maximum describes, so the duration and the story it
+/// is paired with always come from one shard.
+///
+/// Only shards that actually released a hold carry provenance (a shard that was
+/// not paused returns `None`), so both the summary and the grouping consider
+/// just those.
+fn summarise_activity_resume_provenance(
+    per_shard: &[(i32, ::autumn_harvest::activity_pause::ActivityResumeOutcome)],
+) -> ActivityResumeProvenance {
+    let mut grouped: std::collections::BTreeMap<ReleasedHoldKey, HoldGroupFold> =
+        std::collections::BTreeMap::new();
+    for (shard_id, outcome) in per_shard {
+        let Some(reason) = outcome.released_reason.as_ref() else {
+            continue;
+        };
+        let fold = grouped
+            .entry((reason.clone(), outcome.released_paused_by.clone()))
+            .or_insert_with(HoldGroupFold::new);
+        fold.observe(*shard_id, outcome.paused_duration_secs);
+    }
+    let mut released_groups: Vec<ReleasedHoldGroup> = grouped
+        .into_iter()
+        .map(|(key, fold)| fold.finish(key))
+        .collect();
+    released_groups
+        .sort_by_key(|group| (std::cmp::Reverse(group.anchor_secs), group.anchor_shard_id));
+    let shards = per_shard
+        .iter()
+        .map(|(shard_id, outcome)| {
+            serde_json::json!({
+                "shard_id": shard_id,
+                "newly_resumed": outcome.newly_resumed,
+                "released_task_count": outcome.released_task_count,
+                "paused_duration_secs": outcome.paused_duration_secs,
+                "released_reason": outcome.released_reason,
+                "released_paused_by": outcome.released_paused_by,
+            })
+        })
+        .collect();
+    ActivityResumeProvenance {
+        // `.as_slice()` and not `Vec::first`: diesel's `QueryDsl::first` is in
+        // scope here and shadows the inherent slice method on `Vec`.
+        released_reason: released_groups
+            .as_slice()
+            .first()
+            .map(|group| group.reason.clone()),
+        released_paused_by: released_groups
+            .as_slice()
+            .first()
+            .and_then(|group| group.paused_by.clone()),
+        released_groups,
+        shards,
+    }
+}
+
+/// Resolve the operator LABEL stored on the pause row, and the audit note that
+/// records an on-behalf-of relationship.
+///
+/// The label is body-supplied when present; the audit row always carries the
+/// AUTHENTICATED actor, and names the relationship when the two differ, so a
+/// body field can never rewrite the security trail. A blank or whitespace-only
+/// label falls back to the actor rather than storing `""`.
+fn resolve_pause_operator_label(requested: Option<&str>, actor: &str) -> (String, Option<String>) {
+    let paused_by = requested
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map_or_else(|| actor.to_string(), truncate_operator_reason);
+    let on_behalf_of = (paused_by != actor).then(|| format!("on behalf of: {paused_by}"));
+    (paused_by, on_behalf_of)
+}
+
+/// `POST /activities/{activity_name}/pause` — hold dispatch for one activity
+/// type, fleet-wide (issue #807).
+///
+/// Held tasks stay `PENDING`: a pause never fails, retries, or dead-letters
+/// work, and never aborts an already-`RUNNING` activity. Idempotent —
+/// re-pausing an already-paused type is a `200` no-op that preserves the
+/// original reason and operator (`newly_paused: false`).
+async fn pause_activity_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(activity_name): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    const ROUTE: &str = "POST /activities/{activity_name}/pause";
+    let audit = audit_context(&headers, &api_state);
+
+    let request = match parse_activity_pause_request(
+        &api_state,
+        &audit,
+        &activity_name,
+        &body,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let reason = resolve_activity_pause_reason(request.reason.as_deref());
+
+    let (canonical_activity, targets, mut failures) =
+        match prepare_activity_pause_targets_checked(&api_state, &audit, &activity_name, ROUTE)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
+
+    let (actor, source, request_id) = audit;
+
+    let (paused_by, on_behalf_of) = resolve_pause_operator_label(request.actor.as_deref(), &actor);
+
+    let ActivityPauseApplication {
+        newly_paused,
+        held_task_count,
+        per_shard,
+    } = apply_activity_pause_across_shards(
+        &targets,
+        &canonical_activity,
+        &reason,
+        &paused_by,
+        &mut failures,
+    )
+    .await;
+
+    let Some(provenance) = summarise_activity_pause_provenance(&per_shard) else {
+        // Every target shard failed: report it rather than claiming a hold that
+        // is not in effect anywhere.
+        let summary = failures.join("; ");
+        write_activity_pause_audit(
+            &targets,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_ACTIVITY_PAUSE,
+            ROUTE,
+            &canonical_activity,
+            STATUS_FAILED,
+            activity_pause_audit_context(Some(&reason), on_behalf_of.as_deref(), Some(&summary))
+                .as_deref(),
+        )
+        .await;
+        return AutumnError::internal_server_error_msg(format!("activity pause failed: {summary}"))
+            .into_response();
+    };
+
+    let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    // Carry the reason into the audit row: the pause row that holds it is
+    // deleted on resume, so this is its only permanent home. It is the
+    // EFFECTIVE provenance, not the request's — `pause_activity` preserves each
+    // shard's original row on an idempotent re-pause, so echoing the request
+    // would record a reason in effect on no shard at all (issue #807 review).
+    // `on_behalf_of` stays request-scoped by contrast: it records what THIS
+    // caller claimed, which is a security fact about the request rather than a
+    // description of the hold.
+    let audit_context = activity_pause_audit_context(
+        held_holds_audit_reason(&provenance.held_groups).as_deref(),
+        on_behalf_of.as_deref(),
+        partial.as_deref(),
+    );
+    write_activity_pause_audit(
+        &targets,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP_ACTIVITY_PAUSE,
+        ROUTE,
+        &canonical_activity,
+        if partial.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        audit_context.as_deref(),
+    )
+    .await;
+    record_activity_pause_metric(
+        &api_state,
+        &canonical_activity,
+        ::autumn_harvest::telemetry::ActivityPauseAction::Pause,
+        newly_paused,
+    );
+
+    activity_pause_response(
+        &canonical_activity,
+        newly_paused,
+        held_task_count,
+        &provenance,
+        partial,
+    )
+}
+
+/// Parse the optional `POST /activities/{activity_name}/pause` body.
+///
+/// An absent body is the documented fleet-wide default, not an error. A body
+/// that is present but malformed (including one carrying an unknown field — see
+/// [`PauseActivityRequest`]) is an audited `400`, matching the queue sibling's
+/// `parse_pause_request` contract: on rejection the audit row is written here
+/// and a ready-to-send response is returned in `Err`.
+async fn parse_activity_pause_request(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    activity_name: &str,
+    body: &axum::body::Bytes,
+    route: &'static str,
+) -> Result<PauseActivityRequest, axum::response::Response> {
+    if body.is_empty() {
+        return Ok(PauseActivityRequest::default());
+    }
+    match serde_json::from_slice(body) {
+        Ok(request) => Ok(request),
+        Err(error) => {
+            let summary = format!("invalid request body: {error}");
+            Err(reject_activity_pause(
+                api_state,
+                audit,
+                OP_ACTIVITY_PAUSE,
+                route,
+                activity_name,
+                AutumnError::bad_request_msg(summary.clone()),
+                &summary,
+            )
+            .await)
+        }
+    }
+}
+
+/// Resolve the durable pause reason from the optional body field.
+///
+/// Trims **before** truncating so the value that was checked for emptiness IS
+/// the value that gets stored, and so leading whitespace cannot eat the
+/// operator's actual words out of the 500-character budget. A missing or
+/// whitespace-only reason falls back to [`DEFAULT_ACTIVITY_PAUSE_REASON`]
+/// rather than storing `""`, which would read as a rendering bug on every
+/// surface that shows it.
+fn resolve_activity_pause_reason(reason: Option<&str>) -> String {
+    reason
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map_or_else(
+            || DEFAULT_ACTIVITY_PAUSE_REASON.to_string(),
+            truncate_operator_reason,
+        )
+}
+
+/// Build the `POST /activities/{activity_name}/pause` response body.
+///
+/// Split out of the handler so the handler stays under the line cap (the same
+/// treatment `resume_queue_response` gives its sibling); the response shape is
+/// also the interesting part to read on its own.
+fn activity_pause_response(
+    canonical_activity: &str,
+    newly_paused: bool,
+    held_task_count: i64,
+    provenance: &ActivityPauseProvenance<'_>,
+    partial: Option<String>,
+) -> axum::response::Response {
+    // `queue_pause_partial_status` / `queue_pause_attach_partial` are reused
+    // verbatim from the queue sibling — the partial-application contract is
+    // identical, so sharing them keeps the two features from drifting.
+    let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    let mut payload = serde_json::json!({
+        "ok": ok,
+        "status": status,
+        "activity_name": canonical_activity,
+        "newly_paused": newly_paused,
+        // The EFFECTIVE provenance, not the request's, and the EARLIEST hold
+        // rather than whichever shard the fan-out reached first: `pause_activity`
+        // preserves each shard's original row on an idempotent re-pause, so
+        // echoing the request would pair one story with a fleet-wide
+        // `held_task_count` that is untrue for other shards.
+        "reason": provenance.effective.reason,
+        "paused_by": provenance.effective.paused_by,
+        "paused_at": provenance.effective.paused_at,
+        "scope_shard_id": provenance.effective.scope_shard_id,
+        "held_task_count": held_task_count,
+        "provenance_uniform": provenance.uniform,
+        "shards": provenance.shards,
+    });
+    queue_pause_attach_partial(&mut payload, partial);
+    (status_code, Json(payload)).into_response()
+}
+
+/// Build the durable audit `error_summary` for an activity pause/resume.
+///
+/// The pause row holds the reason only while the hold is in effect — a resume
+/// `DELETE`s it — so without this the audit trail could say who paused an
+/// activity but never *why*, which is precisely the question a post-incident
+/// review asks. `harvest_audit_log` has no metadata column, so the reason
+/// (plus the on-behalf-of label and any partial-failure text) is carried in the
+/// one free-text field the record already has, each contribution labelled so
+/// they stay distinguishable.
+///
+/// `error_summary` is therefore non-`None` on a fully successful pause. That is
+/// deliberate: `status` remains the outcome discriminator, and the labelled
+/// prefixes keep a `reason:` context row from reading as a failure. Same shape
+/// and rationale as [`queue_pause_audit_context`], with the extra
+/// `on_behalf_of` contribution this route's body-supplied `actor` needs.
+fn activity_pause_audit_context(
+    reason: Option<&str>,
+    on_behalf_of: Option<&str>,
+    partial: Option<&str>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(reason) = reason.map(str::trim).filter(|r| !r.is_empty()) {
+        parts.push(format!("reason: {reason}"));
+    }
+    if let Some(label) = on_behalf_of.map(str::trim).filter(|l| !l.is_empty()) {
+        parts.push(label.to_string());
+    }
+    if let Some(partial) = partial.map(str::trim).filter(|p| !p.is_empty()) {
+        parts.push(format!("failures: {partial}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
+/// `POST /activities/{activity_name}/resume` — release the hold (issue #807).
+///
+/// Held tasks become immediately claimable again, and the time they spent held
+/// is credited back to `scheduled_at` so the thaw does not retroactively
+/// schedule-to-start-time-out the whole backlog. Idempotent — resuming an
+/// activity that is not paused is a `200` no-op (`newly_resumed: false`).
+async fn resume_activity_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(activity_name): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    const ROUTE: &str = "POST /activities/{activity_name}/resume";
+    let audit = audit_context(&headers, &api_state);
+
+    // The body is optional; when present it must be `{}` (see
+    // `ResumeActivityRequest`).
+    if !body.is_empty()
+        && let Err(error) = serde_json::from_slice::<ResumeActivityRequest>(&body)
+    {
+        let summary = format!("invalid request body: {error}");
+        return reject_activity_pause(
+            &api_state,
+            &audit,
+            OP_ACTIVITY_RESUME,
+            ROUTE,
+            &activity_name,
+            AutumnError::bad_request_msg(summary.clone()),
+            &summary,
+        )
+        .await;
+    }
+
+    let (canonical_activity, targets, mut failures) = match prepare_activity_pause_targets(
+        &api_state,
+        &audit,
+        &activity_name,
+        OP_ACTIVITY_RESUME,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let (actor, source, request_id) = audit;
+
+    let applied =
+        apply_activity_resume_across_shards(&targets, &canonical_activity, &mut failures).await;
+    let provenance = summarise_activity_resume_provenance(&applied.per_shard);
+
+    if !applied.any_ok {
+        let summary = failures.join("; ");
+        write_activity_pause_audit(
+            &targets,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_ACTIVITY_RESUME,
+            ROUTE,
+            &canonical_activity,
+            STATUS_FAILED,
+            activity_pause_audit_context(
+                released_holds_audit_reason(&provenance.released_groups).as_deref(),
+                None,
+                Some(&summary),
+            )
+            .as_deref(),
+        )
+        .await;
+        return AutumnError::internal_server_error_msg(format!(
+            "activity resume failed: {summary}"
+        ))
+        .into_response();
+    }
+
+    // A resume that did not reach every shard leaves work still held on the
+    // shards it missed. That is the safe direction, but reporting it as an
+    // unqualified success would leave an operator believing the thaw is
+    // complete while a backlog sits frozen, so it is surfaced with the same
+    // 207 / `status` vocabulary as a partial pause.
+    let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    let audit_context = activity_pause_audit_context(
+        released_holds_audit_reason(&provenance.released_groups).as_deref(),
+        None,
+        partial.as_deref(),
+    );
+    write_activity_pause_audit(
+        &targets,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP_ACTIVITY_RESUME,
+        ROUTE,
+        &canonical_activity,
+        if partial.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        audit_context.as_deref(),
+    )
+    .await;
+    record_activity_pause_metric(
+        &api_state,
+        &canonical_activity,
+        ::autumn_harvest::telemetry::ActivityPauseAction::Resume,
+        applied.newly_resumed,
+    );
+
+    activity_resume_response(&canonical_activity, &applied, &provenance, partial)
+}
+
+/// Build the `POST /activities/{activity_name}/resume` response body.
+///
+/// Split out of the handler for the same reason as
+/// [`activity_pause_response`] and `resume_queue_response`.
+fn activity_resume_response(
+    canonical_activity: &str,
+    applied: &ActivityResumeApplication,
+    provenance: &ActivityResumeProvenance,
+    partial: Option<String>,
+) -> axum::response::Response {
+    let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    let mut payload = serde_json::json!({
+        "ok": ok,
+        "status": status,
+        "activity_name": canonical_activity,
+        "newly_resumed": applied.newly_resumed,
+        "released_task_count": applied.released_task_count,
+        "paused_duration_secs": applied.paused_duration_secs,
+        // The resume DELETES the pause rows, so this is the only surviving
+        // record of what was released. The summary describes the LONGEST hold
+        // (the same shard `paused_duration_secs` reports, so the two are
+        // coherent) and `shards` keeps every shard's own released provenance.
+        "released_reason": provenance.released_reason,
+        "released_paused_by": provenance.released_paused_by,
+        "provenance_uniform": provenance.uniform(),
+        "shards": provenance.shards,
+    });
+    queue_pause_attach_partial(&mut payload, partial);
+    (status_code, Json(payload)).into_response()
+}
+
+/// The registered-catalogue facts `GET /activities` reports for an activity
+/// type, independent of whether it is paused.
+#[derive(Clone, Copy)]
+struct ActivityCatalogEntry {
+    /// The queue this activity dispatches on (`"default"` when undeclared) —
+    /// the context an operator needs to decide between this per-type hold and
+    /// the coarser queue pause (#619).
+    queue_name: &'static str,
+    /// Local activities run inline on the workflow worker and never take a
+    /// `harvest_task_queue` row, so a pause cannot hold one. Reported so the
+    /// read makes that visible rather than leaving an operator to wonder why a
+    /// hold is holding nothing.
+    is_local: bool,
+}
+
+/// Snapshot the registered activity catalogue for the read endpoints.
+fn registered_activity_catalog(
+    runtime: &HarvestApiRuntime,
+) -> std::collections::BTreeMap<String, ActivityCatalogEntry> {
+    runtime
+        .registry
+        .activities
+        .values()
+        .map(|info| {
+            (
+                info.name.to_string(),
+                ActivityCatalogEntry {
+                    queue_name: info.default_queue.unwrap_or("default"),
+                    is_local: info.is_local,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The operator-facing refusal when a pause could not possibly hold the named
+/// activity, or `None` when the pause may proceed.
+///
+/// # Why a pause on a local activity must be refused, not recorded
+///
+/// A `local = true` activity (issue #98) runs **inline on the workflow worker**
+/// inside the workflow task. It never takes a `harvest_task_queue` row, so the
+/// claim-path gate this whole feature is built on has nothing to skip: the
+/// pause row is written, the read model dutifully reports a hold, and every new
+/// invocation keeps running. Answering `ok: true` / `newly_paused: true` there
+/// is worse than answering nothing — during an incident it is the single call
+/// an operator makes to stop a broken dependency, and nobody re-reads a
+/// mutation that said it worked.
+///
+/// This is the same reasoning [`::autumn_harvest::activity_pause::validate_activity_name`]
+/// gives for rejecting a whitespace-padded name rather than trimming it: only
+/// rejecting cannot lie, and during an outage a `400` naming the problem beats
+/// a false green.
+///
+/// # Why an unregistered name still passes
+///
+/// These routes deliberately accept names this management node does not
+/// register — a management node need not register every activity the fleet
+/// runs, which is the same remote/unregistered case the read endpoints' 404-vs-
+/// 503 rule preserves. Refusing an unknown name would break pausing a genuinely
+/// remote activity, i.e. the feature's primary use. Only a name the node
+/// registers **and** knows to be local is refused.
+fn local_activity_pause_refusal(
+    catalog: &std::collections::BTreeMap<String, ActivityCatalogEntry>,
+    activity_name: &str,
+) -> Option<String> {
+    catalog
+        .get(activity_name)
+        .filter(|entry| entry.is_local)
+        .map(|_| {
+            format!(
+                "activity '{activity_name}' is registered as a local activity \
+                 (#[activity(local = true)]): it runs inline on the workflow worker and never \
+                 takes a task-queue row, so a pause cannot hold it. Refusing rather than \
+                 reporting a hold that would hold nothing. To contain it, pause the queue the \
+                 calling workflows are dispatched on (POST /queues/{{queue_name}}/pause, issue \
+                 #619), or rely on the activity's circuit breaker if one is declared (issue #369)."
+            )
+        })
+}
+
+/// [`prepare_activity_pause_targets`] plus the pause-only refusal of an
+/// activity a hold could not possibly reach (issue #807 review).
+///
+/// The refusal runs AFTER name validation, so a malformed name still reports
+/// the malformation rather than this, and BEFORE any pause row is written, so a
+/// refusal leaves no phantom hold behind. The decision itself lives in the pure
+/// [`local_activity_pause_refusal`] so it is testable without a runtime.
+///
+/// Resume deliberately does **not** get this check: a local pause row written
+/// by an older build must stay removable.
+///
+/// Deliberately fails **open** when the runtime is not installed yet: without
+/// it we cannot tell local from remote, and treating an unknowable activity as
+/// remote matches how an unregistered name is already handled. Failing closed
+/// would refuse EVERY pause during the boot window — including the ordinary
+/// remote ones an operator needs most mid-incident — to guard a case that is
+/// merely today's behaviour.
+async fn prepare_activity_pause_targets_checked(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    activity_name: &str,
+    route: &'static str,
+) -> Result<
+    (
+        String,
+        Vec<(i32, ::autumn_harvest::worker::DbPool)>,
+        Vec<String>,
+    ),
+    axum::response::Response,
+> {
+    let prepared =
+        prepare_activity_pause_targets(api_state, audit, activity_name, OP_ACTIVITY_PAUSE, route)
+            .await?;
+    let canonical = &prepared.0;
+    let Ok(runtime) = api_state.runtime() else {
+        return Ok(prepared);
+    };
+    let catalog = registered_activity_catalog(&runtime);
+    let Some(summary) = local_activity_pause_refusal(&catalog, canonical) else {
+        return Ok(prepared);
+    };
+    Err(reject_activity_pause(
+        api_state,
+        audit,
+        OP_ACTIVITY_PAUSE,
+        route,
+        canonical,
+        map_error(::autumn_harvest::error::HarvestError::Config(
+            summary.clone(),
+        )),
+        &summary,
+    )
+    .await)
+}
+
+/// Write one activity entry's pause block: the paused arm and the not-paused
+/// arm write the **same key set**, so a consumer never has to branch on which
+/// arm produced the entry.
+fn insert_activity_pause_fields(
+    map: &mut serde_json::Map<String, Value>,
+    shard_rows: &[(i32, ::autumn_harvest::activity_pause::PausedActivity)],
+    expected_shards: &[i32],
+) {
+    let Some((_, earliest)) = shard_rows
+        .iter()
+        .min_by_key(|(shard_id, row)| (row.paused_at, *shard_id))
+    else {
+        map.insert("paused".to_string(), Value::Bool(false));
+        map.insert("effective_scope".to_string(), Value::Null);
+        map.insert("paused_at".to_string(), Value::Null);
+        map.insert("paused_reason".to_string(), Value::Null);
+        map.insert("paused_actor".to_string(), Value::Null);
+        map.insert("scope_shard_id".to_string(), Value::Null);
+        map.insert("held_task_count".to_string(), serde_json::json!(0));
+        map.insert("provenance_uniform".to_string(), Value::Bool(true));
+        map.insert("shards".to_string(), serde_json::json!([]));
+        return;
+    };
+
+    let uniform = shard_rows.iter().all(|(_, row)| {
+        row.reason == earliest.reason
+            && row.paused_by == earliest.paused_by
+            && row.scope_shard_id == earliest.scope_shard_id
+    });
+    let held_total: i64 = shard_rows.iter().map(|(_, row)| row.held_task_count).sum();
+
+    // Real coverage, not stored intent. REUSES the queue-pause classifier
+    // rather than restating the rule, so the two read models can never
+    // disagree about what "fleet-wide" means.
+    let holding: Vec<i32> = shard_rows.iter().map(|(shard_id, _)| *shard_id).collect();
+    let scopes: Vec<Option<i32>> = shard_rows
+        .iter()
+        .map(|(_, row)| row.scope_shard_id)
+        .collect();
+    let coverage =
+        ::autumn_harvest::queue_pause::classify_pause_coverage(&holding, &scopes, expected_shards);
+
+    map.insert("paused".to_string(), Value::Bool(true));
+    map.insert("effective_scope".to_string(), serde_json::json!(coverage));
+    map.insert(
+        "paused_at".to_string(),
+        serde_json::json!(earliest.paused_at),
+    );
+    map.insert(
+        "paused_reason".to_string(),
+        Value::String(earliest.reason.clone()),
+    );
+    map.insert(
+        "paused_actor".to_string(),
+        Value::String(earliest.paused_by.clone()),
+    );
+    map.insert(
+        "scope_shard_id".to_string(),
+        serde_json::json!(earliest.scope_shard_id),
+    );
+    map.insert("held_task_count".to_string(), serde_json::json!(held_total));
+    map.insert("provenance_uniform".to_string(), Value::Bool(uniform));
+    map.insert(
+        "shards".to_string(),
+        serde_json::json!(
+            shard_rows
+                .iter()
+                .map(|(shard_id, row)| serde_json::json!({
+                    "shard_id": shard_id,
+                    "reason": row.reason,
+                    "paused_by": row.paused_by,
+                    "paused_at": row.paused_at,
+                    "scope_shard_id": row.scope_shard_id,
+                    "held_task_count": row.held_task_count,
+                }))
+                .collect::<Vec<_>>()
+        ),
+    );
+}
+
+/// A single-activity read found nothing: is that a definitive "does not exist",
+/// or an unanswerable question?
+///
+/// Returning `404` asserts nonexistence. That assertion is only true when every
+/// expected shard was inspected — a pause row living **only** on an unreachable
+/// shard produces exactly the same empty result, and the routes deliberately
+/// accept unregistered names (a management node need not register every
+/// activity the fleet runs), so this is a reachable state, not a theoretical
+/// one. Answering `404` there tells an operator the hold does not exist while
+/// it is actively holding work on the shard that could not be read.
+///
+/// So the read fails **closed** with `503` while any shard is unaccounted for,
+/// naming them — the same rule the `(workflow_name, workflow_id)` resolver
+/// (issue #805) applies for the same reason: "fail closed with 503 rather than
+/// risk a false 404".
+fn activity_missing_error(
+    activity_name: &str,
+    status: shard_fanout::FanoutStatus,
+    unavailable: &[shard_fanout::UnavailableShard],
+) -> AutumnError {
+    if matches!(status, shard_fanout::FanoutStatus::Complete) {
+        return AutumnError::not_found_msg(format!(
+            "activity '{activity_name}' is not registered and is not paused"
+        ));
+    }
+    let shards = unavailable
+        .iter()
+        .map(|u| u.shard_id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    AutumnError::service_unavailable_msg(format!(
+        "activity '{activity_name}' is not registered here and no pause row was found, \
+         but shard(s) [{shards}] could not be inspected; cannot rule out a hold there \
+         without risking a false 404"
+    ))
+}
+
+/// The shard set a hold is expected to span, as a sorted `Vec`.
+///
+/// One definition shared by the queue-pause (#619) and activity-pause (#807)
+/// read models: both derive real coverage from the shards the fleet is
+/// *supposed* to have, and computing that two ways is exactly how the two
+/// surfaces would come to disagree about whether the same partially-applied
+/// hold is fleet-wide.
+fn expected_shard_ids(api_state: &HarvestApiState) -> Vec<i32> {
+    let pools = shard_fanout::pools_by_shard(api_state);
+    shard_fanout::expected_shards(api_state, &pools)
+        .into_iter()
+        .collect()
+}
+
+/// Merge the registered activity catalogue with the cross-shard pause rows into
+/// one entry per activity type.
+///
+/// The list is driven by the **registered catalogue**, not the pause table, so a
+/// healthy activity appears with `paused: false` — the read is a fleet
+/// inventory an operator scans during an incident, and one that only listed the
+/// already-broken things could not answer "is `charge_card` held?".
+///
+/// A paused activity that this process does **not** have registered is still
+/// listed, flagged `registered: false`. Pause deliberately does not require
+/// registration (a management node need not register every activity the fleet
+/// runs — see [`prepare_activity_pause_targets`]), so without this a mistyped
+/// hold would be invisible on the one surface an operator uses to find it, and
+/// would keep silently holding nothing forever.
+///
+/// Per-activity pause provenance follows the same rules as the mutation
+/// response: the top-level summary is the **earliest** hold (tie-broken by
+/// shard id), `held_task_count` is the fleet-wide sum, `shards` carries every
+/// shard's own row, and `provenance_uniform` compares
+/// `(reason, paused_by, scope_shard_id)` — deliberately not `paused_at`, since
+/// each shard stamps its own `NOW()`.
+///
+/// `effective_scope` reports how much of the fleet the hold is **actually** in
+/// effect on, derived from `expected_shards` rather than from the stored
+/// `scope_shard_id` (issue #807 review). The distinction is load-bearing: a
+/// fleet-wide pause that only reached some shards returns 207 at mutation time,
+/// but the rows it *did* write are byte-identical to a complete hold
+/// (`scope_shard_id = NULL`) and the shards it missed hold no row at all — so a
+/// later read that reaches every shard has a `complete` status and rows that
+/// agree, and reading intent alone would present a clean fleet-wide hold while
+/// part of the fleet keeps dispatching the very activity the operator believes
+/// they stopped. An activity that is not held reports `null`: there is no hold,
+/// so there is no coverage, mirroring the other null provenance fields.
+fn merge_activity_catalog_rows(
+    catalog: &std::collections::BTreeMap<String, ActivityCatalogEntry>,
+    rows: Vec<(i32, ::autumn_harvest::activity_pause::PausedActivity)>,
+    expected_shards: &[i32],
+) -> Vec<Value> {
+    let mut paused_by_activity: std::collections::BTreeMap<
+        String,
+        Vec<(i32, ::autumn_harvest::activity_pause::PausedActivity)>,
+    > = std::collections::BTreeMap::new();
+    for (shard_id, row) in rows {
+        paused_by_activity
+            .entry(row.activity_name.clone())
+            .or_default()
+            .push((shard_id, row));
+    }
+
+    // `BTreeMap` keys are already sorted, so the union is emitted in a stable
+    // name order without a second sort. Owned keys, because the loop below
+    // drains `paused_by_activity` as it goes.
+    let names: std::collections::BTreeSet<String> = catalog
+        .keys()
+        .chain(paused_by_activity.keys())
+        .cloned()
+        .collect();
+
+    names
+        .into_iter()
+        .map(|name| {
+            let name = name.as_str();
+            let registered = catalog.get(name);
+            let mut entry = serde_json::json!({
+                "activity_name": name,
+                "registered": registered.is_some(),
+                "queue_name": registered.map(|e| e.queue_name),
+                "is_local": registered.map(|e| e.is_local),
+            });
+
+            let mut shard_rows = paused_by_activity.remove(name).unwrap_or_default();
+            shard_rows.sort_by_key(|(shard_id, _)| *shard_id);
+
+            let map = entry
+                .as_object_mut()
+                .expect("json! object literal is an object");
+            insert_activity_pause_fields(map, &shard_rows, expected_shards);
+            entry
+        })
+        .collect()
+}
+
+/// Read every activity's pause state across the fleet, degrading gracefully.
+///
+/// An unreachable shard is named in `unavailable_shards` and drops `status` to
+/// `partial` rather than failing the read — but a `paused: false` on a partial
+/// read is only "not paused on the shards we could reach", which is why both
+/// read endpoints surface `status` alongside the data.
+async fn observe_activity_pause_rows(
+    api_state: &HarvestApiState,
+) -> Result<FanoutRows<(i32, ::autumn_harvest::activity_pause::PausedActivity)>, AutumnError> {
+    let observations = observe_shards(api_state, |shard_id, mut conn| async move {
+        ::autumn_harvest::activity_pause::list_paused_activities(&mut conn)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (shard_id, row))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    Ok(collect_fanout_rows(observations))
+}
+
+/// `GET /activities` — every registered activity type with its pause state
+/// (issue #807).
+async fn list_activities_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Value>, AutumnError> {
+    let runtime = api_state.runtime()?;
+    let catalog = registered_activity_catalog(&runtime);
+    let collected = observe_activity_pause_rows(&api_state).await?;
+    let expected = expected_shard_ids(&api_state);
+
+    Ok(Json(serde_json::json!({
+        "activities": merge_activity_catalog_rows(&catalog, collected.rows, &expected),
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
+}
+
+/// `GET /activities/{activity_name}` — one activity type's pause state
+/// (issue #807).
+///
+/// `404` when the name is neither registered on this node **nor** currently
+/// paused anywhere the read could reach. The pause arm of that rule matters: an
+/// activity that is actively holding work is a real thing an operator must be
+/// able to inspect (and then resume), so 404-ing it merely because this
+/// process does not have its handler registered would be a lie told during
+/// exactly the incident the endpoint exists for.
+async fn get_activity_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(activity_name): Path<String>,
+) -> Result<Json<Value>, AutumnError> {
+    let runtime = api_state.runtime()?;
+    // Validate before looking anything up, so the read and the two writes agree
+    // on what a valid name is. Without this, `GET /activities/%20charge_card%20`
+    // answers 404 ("not registered and not paused") while
+    // `POST /activities/%20charge_card%20/pause` answers 400 — the same input
+    // diagnosed two different ways, and the 404 is the misleading one: it
+    // implies the activity does not exist rather than that the name is invalid.
+    let activity_name = ::autumn_harvest::activity_pause::validate_activity_name(&activity_name)
+        .map_err(|e| AutumnError::bad_request_msg(e.to_string()))?;
+    let catalog = registered_activity_catalog(&runtime);
+    let collected = observe_activity_pause_rows(&api_state).await?;
+
+    // Filter to the requested name BEFORE merging so an unrelated activity's
+    // rows can never leak into a single-record read.
+    let rows: Vec<_> = collected
+        .rows
+        .into_iter()
+        .filter(|(_, row)| row.activity_name == activity_name)
+        .collect();
+    let narrowed_catalog: std::collections::BTreeMap<String, ActivityCatalogEntry> = catalog
+        .get(&activity_name)
+        .map(|found| (activity_name.clone(), *found))
+        .into_iter()
+        .collect();
+    let expected = expected_shard_ids(&api_state);
+    let mut merged = merge_activity_catalog_rows(&narrowed_catalog, rows, &expected);
+
+    // `merge_activity_catalog_rows` emits one entry per name in the union of
+    // (catalogue, pause rows); both are already narrowed to this name, so an
+    // empty result means the name is unknown *on the shards that answered* --
+    // which is only the same as "unknown" when every shard answered.
+    let Some(activity) = merged.pop() else {
+        return Err(activity_missing_error(
+            &activity_name,
+            collected.status,
+            &collected.unavailable_shards,
+        ));
+    };
+
+    Ok(Json(serde_json::json!({
+        "activity": activity,
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
 }
 
 async fn prometheus_metrics(
@@ -39044,19 +42447,21 @@ pub struct TaskEligibilityResponse {
 
 /// Order a merged `reason_codes` array for the eligibility explainer.
 ///
-/// The operator's own deliberate queue hold (`queue_paused`, issue #619) leads;
-/// everything else is alphabetical so the array is stable across polls.
+/// The operator's own deliberate holds ([`OPERATOR_PAUSE_REASON_CODES`]) lead;
+/// everything else is alphabetical so the array is stable across polls. Within
+/// the leading group the order is alphabetical too, so a task held by *both* a
+/// queue pause and an activity pause reports them deterministically.
 ///
-/// This exists because [`task_intrinsic_impediment_reasons`] pushes
-/// `queue_paused` first but *both* eligibility merges collapse the per-task
-/// reason lists through a `HashSet` — destroying insertion order — and then
-/// re-sort. A plain `sort()` puts `concurrency_saturated` ahead of
-/// `queue_paused`, so the helper's documented priority never reached the
-/// response an operator actually reads (issue #619 review). Both merge sites
-/// call *this* function rather than sorting by hand, so they cannot drift.
+/// This exists because [`task_intrinsic_impediment_reasons`] pushes the pause
+/// codes first but *both* eligibility merges collapse the per-task reason lists
+/// through a `HashSet` — destroying insertion order — and then re-sort. A plain
+/// `sort()` puts `concurrency_saturated` ahead of `queue_paused`, so the
+/// helper's documented priority never reached the response an operator actually
+/// reads (issue #619 review). Both merge sites call *this* function rather than
+/// sorting by hand, so they cannot drift.
 fn sort_reason_codes(reason_codes: &mut [String]) {
     reason_codes.sort_by(|a, b| {
-        let rank = |code: &str| u8::from(code != QUEUE_PAUSED_REASON_CODE);
+        let rank = |code: &str| u8::from(!is_operator_pause_reason(code));
         rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
     });
 }
@@ -39067,19 +42472,89 @@ fn sort_reason_codes(reason_codes: &mut [String]) {
 /// cannot disagree about the string that carries the priority.
 const QUEUE_PAUSED_REASON_CODE: &str = "queue_paused";
 
+/// The eligibility reason code for a task held by an operator activity pause
+/// (issue #807), the per-activity-type sibling of
+/// [`QUEUE_PAUSED_REASON_CODE`].
+const ACTIVITY_PAUSED_REASON_CODE: &str = "activity_paused";
+
+/// Every reason code that represents a deliberate *operator hold* rather than a
+/// capacity or compatibility impediment.
+///
+/// These share two behaviours — they lead [`sort_reason_codes`], and they are
+/// excluded from [`is_worker_draining_only`] — so they are listed once here
+/// rather than enumerated at each site, where a future third hold would
+/// otherwise have to be remembered twice.
+const OPERATOR_PAUSE_REASON_CODES: [&str; 2] =
+    [QUEUE_PAUSED_REASON_CODE, ACTIVITY_PAUSED_REASON_CODE];
+
+/// Whether `code` is one of [`OPERATOR_PAUSE_REASON_CODES`].
+fn is_operator_pause_reason(code: &str) -> bool {
+    OPERATOR_PAUSE_REASON_CODES.contains(&code)
+}
+
+/// Whether an activity pause holds this task (issue #807).
+///
+/// **Mirrors the authoritative claim gate in `queue::claim_task` exactly**, and
+/// must keep doing so or the explainer lies about why a task is not moving:
+///
+/// - Scoped by `task_type == "activity"`. A **workflow** task can legitimately
+///   carry a non-NULL `activity_name` — the engine stamps the
+///   `'mixed_signal_suspension'` sentinel there — so keying on `activity_name`
+///   alone would report `activity_paused` on mixed-signal-suspended workflow
+///   tasks the gate never holds. The core pins this with
+///   `anti_join_is_scoped_by_task_type_not_by_a_null_activity_name`.
+/// - Not filtered by `scope_shard_id`. That column records operator *intent*
+///   and is consulted by neither the claim gate nor the anti-join; the row's
+///   presence on *this shard's database* is the hold, and
+///   `evaluate_eligibility_for_shard` already runs per-shard on that shard's
+///   connection.
+fn task_is_activity_paused(
+    task_type: &str,
+    activity_name: Option<&str>,
+    paused_activities: &std::collections::HashSet<String>,
+) -> bool {
+    task_type == autumn_harvest::activity_pause::ACTIVITY_TASK_TYPE
+        && activity_name.is_some_and(|name| paused_activities.contains(name))
+}
+
+/// Which operator holds apply to one task, for
+/// [`task_intrinsic_impediment_reasons`].
+///
+/// Grouped into a struct rather than passed as two more positional `bool`s
+/// because the helper already takes three (`has_cb`, `concurrency_saturated`,
+/// and formerly `queue_paused`): a fourth would put four bare booleans in a row
+/// at every call site, where transposing two is a silent semantic bug no type
+/// check catches. It also keeps the argument count at clippy's default
+/// `too_many_arguments` threshold instead of needing an `allow`.
+#[derive(Debug, Clone, Copy, Default)]
+struct OperatorPauseHolds {
+    /// The task's queue is held by an operator queue pause (issue #619).
+    queue: bool,
+    /// The task's activity type is held by an operator activity pause
+    /// (issue #807).
+    activity: bool,
+}
+
 /// Whether a worker's only *worker-level* impediment is that it is draining.
 ///
-/// [`QUEUE_PAUSED_REASON_CODE`] is filtered out because it describes the QUEUE,
-/// not the worker: the `all_draining` diagnosis is a statement about fleet
-/// state, and it stays true when an operator additionally holds the queue
-/// (issue #619). Reporting the pause therefore never silently downgrades the
-/// diagnosis — the two independent facts surface on their own channels, the
-/// diagnosis and the worker's `reason_codes`.
+/// The [`OPERATOR_PAUSE_REASON_CODES`] are filtered out because they describe
+/// the WORK, not the worker: the `all_draining` diagnosis is a statement about
+/// fleet state, and it stays true when an operator additionally holds the queue
+/// (issue #619) or one of its activity types (issue #807). Reporting a pause
+/// therefore never silently downgrades the diagnosis — the independent facts
+/// surface on their own channels, the diagnosis and the worker's
+/// `reason_codes`.
+///
+/// `activity_paused` is filtered for the same reason as `queue_paused` even
+/// though it is a *task*-level rather than a queue-level fact: on the
+/// worker-reason short-circuit there is no per-task context anyway, and the
+/// question this predicate answers ("is the fleet merely draining?") is about
+/// workers either way.
 fn is_worker_draining_only(reason_codes: &[String]) -> bool {
     let worker_level: Vec<&str> = reason_codes
         .iter()
         .map(String::as_str)
-        .filter(|code| *code != QUEUE_PAUSED_REASON_CODE)
+        .filter(|code| !is_operator_pause_reason(code))
         .collect();
     worker_level == ["worker_draining"]
 }
@@ -39100,9 +42575,12 @@ fn is_worker_draining_only(reason_codes: &[String]) -> bool {
 /// stale `rate_limit_exhausted` reason is never surfaced for it — its
 /// impediment is the circuit reason instead.
 ///
-/// Queue pause (issue #619): a held queue is reported as `queue_paused`. It is
-/// listed first because it is the *operator's own deliberate action* — the one
-/// impediment a triaging operator should see before anything else.
+/// Operator pauses (issues #619 and #807): a held queue is reported as
+/// `queue_paused` and a held activity type as `activity_paused`. They are
+/// listed first because they are the *operator's own deliberate action* — the
+/// impediments a triaging operator should see before anything else. Both are
+/// reported when both apply; a pause reorders the array, it never suppresses a
+/// co-occurring impediment.
 fn task_intrinsic_impediment_reasons(
     activity_name: Option<&str>,
     rate_limit_key: Option<&str>,
@@ -39110,15 +42588,22 @@ fn task_intrinsic_impediment_reasons(
     saturated_rate_limits: &std::collections::HashSet<String>,
     concurrency_saturated: bool,
     cb_phase: &std::collections::HashMap<String, &'static str>,
-    queue_paused: bool,
+    pauses: OperatorPauseHolds,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
 
-    // Issue #619: an operator queue pause blocks every worker equally, so
-    // without this the explainer would report an EMPTY reason set for a held
+    // Issues #619 / #807: an operator pause blocks every worker equally, so
+    // without these the explainer would report an EMPTY reason set for a held
     // task — a false "no impediment" during exactly the idle-worker triage
     // this endpoint exists for.
-    if queue_paused {
+    //
+    // Pushed in the same alphabetical order `sort_reason_codes` restores after
+    // the merges, so the producer and the response agree even for a task held
+    // by both.
+    if pauses.activity {
+        reasons.push(ACTIVITY_PAUSED_REASON_CODE.to_string());
+    }
+    if pauses.queue {
         reasons.push(QUEUE_PAUSED_REASON_CODE.to_string());
     }
 
@@ -39423,6 +42908,17 @@ async fn evaluate_eligibility_for_shard(
             .into_iter()
             .collect();
 
+    // Issue #807: the per-activity-type sibling of the read above, and
+    // propagating for the same reason. Unfiltered by `queue_name`, matching the
+    // `paused_activities` CTE in `queue::claim_task`: an activity pause holds
+    // that activity type across every queue on the shard.
+    let paused_activities: std::collections::HashSet<String> =
+        autumn_harvest::activity_pause::paused_activity_names(&mut conn)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .collect();
+
     // Hoisted out of the worker loop: the pause is a property of the queue under
     // evaluation, so both the worker-reason short-circuit and the per-task loop
     // below read the same answer.
@@ -39442,6 +42938,15 @@ async fn evaluate_eligibility_for_shard(
                     || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
         })
         .collect();
+
+    // Issue #807, for the worker-reason short-circuit below, which has no
+    // per-task context the way the per-task loop does. The queue-level analogue
+    // of "this task is held" is "the backlog under evaluation contains a held
+    // task", which is a true and actionable statement about why nothing is
+    // dispatching.
+    let any_pending_task_activity_paused = pending_tasks.iter().any(|t| {
+        task_is_activity_paused(&t.task_type, t.activity_name.as_deref(), &paused_activities)
+    });
 
     for w in &online_workers {
         let w_id = w.worker.worker_id.clone();
@@ -39511,7 +43016,13 @@ async fn evaluate_eligibility_for_shard(
             if queue_is_paused {
                 worker_reasons.push(QUEUE_PAUSED_REASON_CODE.to_string());
             }
-            // The per-task path below sorts; this one did not, so the pause
+            // Issue #807: same argument, one level down. A fleet drained for the
+            // very outage the operator paused an *activity type* for would
+            // otherwise never surface that hold either.
+            if any_pending_task_activity_paused {
+                worker_reasons.push(ACTIVITY_PAUSED_REASON_CODE.to_string());
+            }
+            // The per-task path below sorts; this one did not, so the pauses
             // would trail the worker reasons alphabetically instead of leading.
             sort_reason_codes(&mut worker_reasons);
             ineligible_workers.push(IneligibleWorkerInfo {
@@ -39567,7 +43078,14 @@ async fn evaluate_eligibility_for_shard(
                     &saturated_rate_limits,
                     concurrency_saturated,
                     &cb_phase,
-                    paused_queues.contains(&t.queue_name),
+                    OperatorPauseHolds {
+                        queue: paused_queues.contains(&t.queue_name),
+                        activity: task_is_activity_paused(
+                            &t.task_type,
+                            t.activity_name.as_deref(),
+                            &paused_activities,
+                        ),
+                    },
                 ));
 
                 let parsed_reqs = if t.task_type == "activity" {
@@ -39916,7 +43434,7 @@ async fn get_task_eligibility(
 
 #[cfg(test)]
 mod eligibility_reason_tests {
-    use super::task_intrinsic_impediment_reasons;
+    use super::{OperatorPauseHolds, task_intrinsic_impediment_reasons};
     use std::collections::{HashMap, HashSet};
 
     fn saturated(keys: &[&str]) -> HashSet<String> {
@@ -39936,14 +43454,19 @@ mod eligibility_reason_tests {
     fn queue_paused_is_reported_first_and_composes_with_other_reasons() {
         let saturated = std::collections::HashSet::new();
         let cb_phase = std::collections::HashMap::new();
+        let queue_held = OperatorPauseHolds {
+            queue: true,
+            activity: false,
+        };
 
         let only_pause = task_intrinsic_impediment_reasons(
-            None, None, false, &saturated, false, &cb_phase, true,
+            None, None, false, &saturated, false, &cb_phase, queue_held,
         );
         assert_eq!(only_pause, vec!["queue_paused".to_string()]);
 
-        let with_concurrency =
-            task_intrinsic_impediment_reasons(None, None, false, &saturated, true, &cb_phase, true);
+        let with_concurrency = task_intrinsic_impediment_reasons(
+            None, None, false, &saturated, true, &cb_phase, queue_held,
+        );
         assert_eq!(
             with_concurrency,
             vec![
@@ -39954,9 +43477,143 @@ mod eligibility_reason_tests {
         );
 
         let unpaused = task_intrinsic_impediment_reasons(
-            None, None, false, &saturated, false, &cb_phase, false,
+            None,
+            None,
+            false,
+            &saturated,
+            false,
+            &cb_phase,
+            OperatorPauseHolds::default(),
         );
         assert!(unpaused.is_empty(), "an unpaused queue contributes nothing");
+    }
+
+    /// Issue #807: an activity held by an operator pause must surface as
+    /// `activity_paused`, lead the array like its queue-level sibling, and
+    /// never suppress a co-occurring impediment.
+    #[test]
+    fn activity_paused_is_reported_first_and_composes_with_other_reasons() {
+        let saturated = std::collections::HashSet::new();
+        let cb_phase = std::collections::HashMap::new();
+        let activity_held = OperatorPauseHolds {
+            queue: false,
+            activity: true,
+        };
+
+        let only_pause = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            false,
+            &saturated,
+            false,
+            &cb_phase,
+            activity_held,
+        );
+        assert_eq!(only_pause, vec!["activity_paused".to_string()]);
+
+        let with_concurrency = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            false,
+            &saturated,
+            true,
+            &cb_phase,
+            activity_held,
+        );
+        assert_eq!(
+            with_concurrency,
+            vec![
+                "activity_paused".to_string(),
+                "concurrency_saturated".to_string()
+            ],
+            "a pause is listed first but never hides a co-occurring impediment"
+        );
+
+        let unpaused = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            false,
+            &saturated,
+            false,
+            &cb_phase,
+            OperatorPauseHolds::default(),
+        );
+        assert!(
+            unpaused.is_empty(),
+            "an unpaused activity contributes nothing"
+        );
+    }
+
+    /// A task held by BOTH pauses reports BOTH codes (issue #807).
+    ///
+    /// The two holds are independent — an operator can pause a queue and an
+    /// activity type during the same incident — so surfacing one must never
+    /// mask the other, or resuming the reported hold leaves the task still
+    /// stuck with no explanation on the endpoint built to give one.
+    #[test]
+    fn both_pauses_report_both_codes_ahead_of_other_impediments() {
+        let reasons = task_intrinsic_impediment_reasons(
+            Some("charge_card"),
+            None,
+            false,
+            &HashSet::new(),
+            true,
+            &phases(&[("charge_card", "open")]),
+            OperatorPauseHolds {
+                queue: true,
+                activity: true,
+            },
+        );
+        assert_eq!(
+            reasons,
+            vec![
+                "activity_paused".to_string(),
+                "queue_paused".to_string(),
+                "concurrency_saturated".to_string(),
+                "circuit_open".to_string(),
+            ],
+            "both deliberate holds lead (alphabetically among themselves, so the \
+             producer agrees with sort_reason_codes after the merges), and \
+             neither suppresses a co-occurring impediment; got {reasons:?}"
+        );
+    }
+
+    /// The explainer must key on `task_type` exactly as `queue::claim_task`'s
+    /// gate does (issue #807).
+    ///
+    /// A **workflow** task can legitimately carry a non-NULL `activity_name` —
+    /// the engine stamps the `'mixed_signal_suspension'` sentinel there — and
+    /// the claim gate is scoped by `task_type = 'activity'` precisely so a
+    /// pause never holds those. An explainer keyed on `activity_name` alone
+    /// would report `activity_paused` on tasks that are not held at all.
+    #[test]
+    fn activity_pause_predicate_matches_the_claim_gate_scoping() {
+        let held: HashSet<String> = ["charge_card", "mixed_signal_suspension"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        assert!(super::task_is_activity_paused(
+            "activity",
+            Some("charge_card"),
+            &held
+        ));
+        assert!(
+            !super::task_is_activity_paused("workflow", Some("mixed_signal_suspension"), &held),
+            "a workflow task carrying the sentinel is never held by the claim \
+             gate, so it must never be reported as activity_paused"
+        );
+        assert!(!super::task_is_activity_paused("activity", None, &held));
+        assert!(!super::task_is_activity_paused(
+            "activity",
+            Some("send_email"),
+            &held
+        ));
+        assert!(!super::task_is_activity_paused(
+            "activity",
+            Some("charge_card"),
+            &HashSet::new()
+        ));
     }
 
     #[test]
@@ -39968,7 +43625,7 @@ mod eligibility_reason_tests {
             &saturated(&["rl-key"]),
             false,
             &HashMap::new(),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert_eq!(reasons, vec!["rate_limit_exhausted".to_string()]);
     }
@@ -39984,7 +43641,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             true,
             &HashMap::new(),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert_eq!(reasons, vec!["concurrency_saturated".to_string()]);
     }
@@ -40000,7 +43657,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &phases(&[("charge_card", "open")]),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert!(
             reasons.contains(&"circuit_open".to_string()),
@@ -40019,7 +43676,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &phases(&[("charge_card", "half_open")]),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert!(
             reasons.contains(&"circuit_half_open".to_string()),
@@ -40037,7 +43694,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &phases(&[("charge_card", "closed")]),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
     }
@@ -40053,7 +43710,7 @@ mod eligibility_reason_tests {
             &saturated(&["rl-key"]),
             false,
             &phases(&[("charge_card", "open")]),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert!(
             reasons.contains(&"circuit_open".to_string()),
@@ -40075,7 +43732,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             true,
             &phases(&[("charge_card", "open")]),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert!(
             reasons.contains(&"concurrency_saturated".to_string()),
@@ -40097,7 +43754,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &HashMap::new(),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
     }
@@ -40116,7 +43773,7 @@ mod eligibility_reason_tests {
             &saturated(&["k"]),
             false,
             &phases(&[("a", "closed")]),
-            false,
+            OperatorPauseHolds::default(),
         );
         assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
     }
@@ -40138,15 +43795,35 @@ mod eligibility_reason_tests {
             "worker_draining"
         ])));
 
+        // Issue #807: the activity-level hold is filtered for the same reason,
+        // alone and alongside its queue-level sibling.
+        assert!(super::is_worker_draining_only(&owned(&[
+            "activity_paused",
+            "worker_draining"
+        ])));
+        assert!(super::is_worker_draining_only(&owned(&[
+            "activity_paused",
+            "queue_paused",
+            "worker_draining"
+        ])));
+
         // A genuine second worker-level condition still disqualifies it.
         assert!(!super::is_worker_draining_only(&owned(&[
             "queue_paused",
             "worker_draining",
             "wrong_shard_assignment"
         ])));
+        assert!(!super::is_worker_draining_only(&owned(&[
+            "activity_paused",
+            "worker_draining",
+            "wrong_shard_assignment"
+        ])));
         assert!(!super::is_worker_draining_only(&owned(&["worker_stopped"])));
-        // A queue hold alone is not a draining fleet.
+        // A hold alone is not a draining fleet.
         assert!(!super::is_worker_draining_only(&owned(&["queue_paused"])));
+        assert!(!super::is_worker_draining_only(&owned(&[
+            "activity_paused"
+        ])));
         assert!(!super::is_worker_draining_only(&[]));
     }
 }
@@ -40248,6 +43925,48 @@ mod reserved_idempotency_key_tests {
 
 #[cfg(test)]
 mod tests {
+
+    // ── issue #811 (Codex round 1, P2): activity concurrency groups always defer
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Latest-wins is a *workflow-start* admission control: the supersede runs
+    /// inside `start_or_load_workflow_execution_collect` and sheds workflow
+    /// *executions*. An activity task that carries a concurrency key is gated
+    /// purely at claim time and always defers, so reporting its owning
+    /// workflow's declared `cancel_running` on the `task_type = "activity"`
+    /// admin row advertises a strategy nothing enforces.
+    #[test]
+    fn admin_reports_defer_for_activity_rows_regardless_of_workflow_policy() {
+        use autumn_harvest::concurrency::ConcurrencyOnConflict;
+
+        // A workflow row reports whatever the workflow declares.
+        assert_eq!(
+            effective_admin_on_conflict("workflow", ConcurrencyOnConflict::CancelRunning),
+            ConcurrencyOnConflict::CancelRunning,
+        );
+        assert_eq!(
+            effective_admin_on_conflict("workflow", ConcurrencyOnConflict::Defer),
+            ConcurrencyOnConflict::Defer,
+        );
+
+        // An activity row always reports defer -- that is what is enforced.
+        assert_eq!(
+            effective_admin_on_conflict("activity", ConcurrencyOnConflict::CancelRunning),
+            ConcurrencyOnConflict::Defer,
+            "an activity concurrency group cannot latest-wins; reporting the \
+             owning workflow's cancel_running would advertise an unenforced strategy",
+        );
+        assert_eq!(
+            effective_admin_on_conflict("activity", ConcurrencyOnConflict::Defer),
+            ConcurrencyOnConflict::Defer,
+        );
+
+        // Defensive: an unrecognised task_type is not a workflow start either.
+        assert_eq!(
+            effective_admin_on_conflict("something_else", ConcurrencyOnConflict::CancelRunning),
+            ConcurrencyOnConflict::Defer,
+        );
+    }
     use super::*;
     use autumn_harvest::workers::WorkerHealth;
     use testcontainers::ContainerAsync;
@@ -40623,6 +44342,205 @@ mod tests {
         assert_eq!(scoped[0]["effective_scope"], "shard");
     }
 
+    fn paused_activity_row(
+        activity: &str,
+        reason: &str,
+        actor: &str,
+        secs_ago: i64,
+        scope: Option<i32>,
+        held: i64,
+    ) -> ::autumn_harvest::activity_pause::PausedActivity {
+        ::autumn_harvest::activity_pause::PausedActivity {
+            activity_name: activity.to_string(),
+            reason: reason.to_string(),
+            paused_by: actor.to_string(),
+            paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            scope_shard_id: scope,
+            held_task_count: held,
+        }
+    }
+
+    /// Issue #807 review: a single-activity read must not assert nonexistence
+    /// while a shard is unaccounted for.
+    ///
+    /// The routes deliberately accept **unregistered** names — a management node
+    /// need not register every activity the fleet runs — so "not in this
+    /// process's catalogue, and no pause row on the shards that answered" is
+    /// reachable with a live hold sitting on the shard that did not answer. A
+    /// `404` there tells an operator the hold does not exist while it is
+    /// actively holding work. Same rule as the `(workflow_name, workflow_id)`
+    /// resolver (#805): fail closed rather than risk a false 404.
+    #[test]
+    fn single_activity_read_fails_closed_while_a_shard_is_unaccounted_for() {
+        let down = vec![shard_fanout::UnavailableShard {
+            shard_id: 1,
+            reason: "connect timeout".to_string(),
+        }];
+
+        // Every shard answered: the negative is real, so 404 is the honest answer.
+        let complete =
+            activity_missing_error("charge_card", shard_fanout::FanoutStatus::Complete, &[]);
+        assert_eq!(
+            complete.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "a fully-observed miss is a genuine 404"
+        );
+
+        // A shard is missing: the hold may be there, so the read must not deny it.
+        for status in [
+            shard_fanout::FanoutStatus::Partial,
+            shard_fanout::FanoutStatus::Unavailable,
+        ] {
+            let err = activity_missing_error("charge_card", status, &down);
+            assert_eq!(
+                err.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{status:?}: an unobserved shard must not be reported as absence"
+            );
+            assert!(
+                format!("{err:?}").contains('1'),
+                "{status:?}: the unreachable shard must be named so the operator \
+                 knows where to re-check: {err:?}"
+            );
+        }
+    }
+
+    /// A pause must be REFUSED for an activity registered `local = true`, and
+    /// still ALLOWED for an unregistered name.
+    ///
+    /// Issue #807 review, Codex round 16. A local activity runs inline on the
+    /// workflow worker and never takes a `harvest_task_queue` row, so the
+    /// claim-path gate this feature is built on can never hold one. The pause
+    /// route nevertheless wrote its rows and answered `ok: true` /
+    /// `newly_paused: true` — during an incident, the one call an operator
+    /// makes to stop a broken dependency reported containment while every new
+    /// invocation kept running. The read model already labelled it a no-op, but
+    /// nobody re-reads a mutation that said it worked.
+    ///
+    /// The unregistered arm is the load-bearing half of the fix: these routes
+    /// deliberately accept names this management node does not register (the
+    /// same remote/unregistered case the 404-vs-503 read fix preserves), so a
+    /// blanket "must be registered" check would break pausing a genuinely
+    /// remote activity — the feature's primary use.
+    #[test]
+    fn a_pause_is_refused_for_a_registered_local_activity_but_not_a_remote_one() {
+        let catalog = std::collections::BTreeMap::from([
+            (
+                "compute_checksum".to_string(),
+                ActivityCatalogEntry {
+                    queue_name: "default",
+                    is_local: true,
+                },
+            ),
+            (
+                "charge_card".to_string(),
+                ActivityCatalogEntry {
+                    queue_name: "payments",
+                    is_local: false,
+                },
+            ),
+        ]);
+
+        let refusal = local_activity_pause_refusal(&catalog, "compute_checksum")
+            .expect("a registered local activity must be refused");
+        assert!(
+            refusal.contains("compute_checksum") && refusal.contains("local"),
+            "the refusal must name the activity and why it cannot be held: {refusal}"
+        );
+        assert!(
+            refusal.contains("queue"),
+            "and must point at the containment that does work: {refusal}"
+        );
+
+        assert!(
+            local_activity_pause_refusal(&catalog, "charge_card").is_none(),
+            "an ordinary dispatched activity is pausable"
+        );
+        assert!(
+            local_activity_pause_refusal(&catalog, "remote_unregistered").is_none(),
+            "an unregistered name may be a genuinely remote activity this node \
+             does not register -- refusing it would break the feature's main use"
+        );
+    }
+
+    /// Issue #807 review: the activity read model must report real coverage for
+    /// exactly the reason its queue-level sibling does.
+    ///
+    /// A fleet-wide activity pause that only reached some shards returns 207 at
+    /// mutation time, but the pause rows it *did* write are byte-identical to a
+    /// complete hold (`scope_shard_id = NULL`), and the missed shards hold no
+    /// row at all. A later read that reaches every shard therefore has a
+    /// `complete` status and rows that agree — so without comparing the holding
+    /// shards against the expected set, `GET /activities` presents a clean
+    /// fleet-wide hold while part of the fleet is still dispatching the very
+    /// activity an operator believes they stopped.
+    #[test]
+    fn activity_effective_scope_reflects_real_coverage_not_stored_intent() {
+        let catalog = std::collections::BTreeMap::from([(
+            "charge_card".to_string(),
+            ActivityCatalogEntry {
+                queue_name: "payments",
+                is_local: false,
+            },
+        )]);
+
+        // One of two expected shards holds it: intent says fleet, reality does not.
+        let partial = merge_activity_catalog_rows(
+            &catalog,
+            vec![(
+                0,
+                paused_activity_row("charge_card", "stripe outage", "alice", 30, None, 4),
+            )],
+            &[0, 1],
+        );
+        assert_eq!(
+            partial[0]["effective_scope"], "partial_fleet",
+            "a partially-applied fleet-wide hold must be reported as such"
+        );
+        assert_eq!(
+            partial[0]["scope_shard_id"],
+            serde_json::Value::Null,
+            "the recorded intent is still reported verbatim"
+        );
+
+        // Both expected shards hold it: the same intent really is fleet-wide.
+        let complete = merge_activity_catalog_rows(
+            &catalog,
+            vec![
+                (
+                    0,
+                    paused_activity_row("charge_card", "stripe outage", "alice", 30, None, 4),
+                ),
+                (
+                    1,
+                    paused_activity_row("charge_card", "stripe outage", "alice", 29, None, 6),
+                ),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(complete[0]["effective_scope"], "fleet");
+
+        // A deliberately shard-scoped hold is not "partially applied".
+        let scoped = merge_activity_catalog_rows(
+            &catalog,
+            vec![(
+                0,
+                paused_activity_row("charge_card", "shard-0 only", "alice", 30, Some(0), 4),
+            )],
+            &[0, 1],
+        );
+        assert_eq!(scoped[0]["effective_scope"], "shard");
+
+        // An activity that is not held at all has no coverage to report.
+        let unheld = merge_activity_catalog_rows(&catalog, Vec::new(), &[0, 1]);
+        assert_eq!(unheld[0]["paused"], serde_json::json!(false));
+        assert_eq!(
+            unheld[0]["effective_scope"],
+            serde_json::Value::Null,
+            "no hold means no coverage, mirroring the other null provenance fields"
+        );
+    }
+
     /// Issue #619 review: the operator's reason must reach the durable audit
     /// row, because `harvest_queue_pauses` (its only other home) is `DELETE`d on
     /// resume — leaving a post-incident review able to see *who* paused a queue
@@ -40764,6 +44682,110 @@ mod tests {
         );
     }
 
+    fn activity_pause_outcome(
+        reason: &str,
+        actor: &str,
+        secs_ago: i64,
+        held: i64,
+    ) -> ::autumn_harvest::activity_pause::ActivityPauseOutcome {
+        ::autumn_harvest::activity_pause::ActivityPauseOutcome {
+            activity_name: "charge_card".to_string(),
+            newly_paused: false,
+            reason: reason.to_string(),
+            paused_by: actor.to_string(),
+            paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            scope_shard_id: None,
+            held_task_count: held,
+        }
+    }
+
+    /// The pause audit row must record the hold that is actually IN EFFECT, not
+    /// the reason the request happened to carry (issue #807 review).
+    ///
+    /// `pause_activity` / `pause_queue` preserve each shard's ORIGINAL
+    /// provenance on an idempotent re-pause, so a second pause -- most starkly
+    /// one that omits the reason entirely and resolves to the default -- would
+    /// otherwise write an audit row claiming a reason that is in effect on no
+    /// shard at all. The response body already reports the effective provenance
+    /// for exactly this reason; the durable row must not tell a different story
+    /// than the response the operator just read.
+    #[test]
+    fn pause_audit_reason_records_the_effective_hold_not_the_request() {
+        // Both features, because the bug and the fix are identical and the two
+        // audit trails must never drift on the same question.
+        let queue_shards = [(0, pause_outcome("stripe outage", "alice", 900, None, 4))];
+        let queue = summarise_pause_provenance(&queue_shards).expect("a shard applied the hold");
+        assert_eq!(
+            held_holds_audit_reason(&queue.held_groups).as_deref(),
+            Some("hold by alice: stripe outage"),
+            "a uniform fleet-wide hold keeps the plain single-line form"
+        );
+
+        let activity_shards = [(0, activity_pause_outcome("stripe outage", "alice", 900, 4))];
+        let activity = summarise_activity_pause_provenance(&activity_shards)
+            .expect("a shard applied the hold");
+        assert_eq!(
+            held_holds_audit_reason(&activity.held_groups).as_deref(),
+            Some("hold by alice: stripe outage"),
+            "the per-activity hold must render byte-identically to the queue \
+             sibling for a byte-identical situation"
+        );
+    }
+
+    /// EVERY reason actually holding some part of the fleet must survive in the
+    /// durable row, not just the earliest one (issue #807 review).
+    ///
+    /// This is the retry-a-partial-fleet case: the first attempt reached shard 0
+    /// and stamped its reason there; the retry reaches shard 1 and stamps a
+    /// different one, while shard 0 idempotently keeps the original. Recording
+    /// only the request's reason hides shard 0's; recording only the earliest
+    /// hides shard 1's. The resume `DELETE`s both rows, so whichever is dropped
+    /// here is unrecoverable.
+    #[test]
+    fn pause_audit_reason_preserves_every_divergent_shard_reason() {
+        let per_shard = [
+            (0, activity_pause_outcome("stripe outage", "alice", 900, 1)),
+            (
+                1,
+                activity_pause_outcome("retry: fleet freeze", "bob", 60, 2),
+            ),
+            (2, activity_pause_outcome("stripe outage", "alice", 300, 3)),
+        ];
+        let provenance =
+            summarise_activity_pause_provenance(&per_shard).expect("shards applied the hold");
+        let rendered =
+            held_holds_audit_reason(&provenance.held_groups).expect("a hold is in effect");
+
+        for fragment in ["stripe outage", "alice", "retry: fleet freeze", "bob"] {
+            assert!(
+                rendered.contains(fragment),
+                "'{fragment}' is unrecoverable once the pause row is deleted; got {rendered}"
+            );
+        }
+
+        // Shards sharing one story collapse, so the row grows with the number of
+        // distinct holds (operator-authored, small) not the shard count.
+        assert!(
+            rendered.contains("shards 0,2"),
+            "the two shards sharing one incident must collapse into one entry; got {rendered}"
+        );
+        assert!(rendered.contains("shard 1"), "got {rendered}");
+        assert_eq!(
+            rendered.matches("stripe outage").count(),
+            1,
+            "the shared reason must not be repeated per shard; got {rendered}"
+        );
+
+        // The EARLIEST hold leads, matching the response's top-level `reason`
+        // and `paused_at`, so the row and the response stay coherent.
+        let stripe = rendered.find("stripe outage").expect("present");
+        let freeze = rendered.find("retry: fleet freeze").expect("present");
+        assert!(
+            stripe < freeze,
+            "the earliest hold must lead, matching the response summary; got {rendered}"
+        );
+    }
+
     /// A typo in a queue-control body must be REJECTED, not silently widened
     /// (issue #619 review).
     ///
@@ -40861,6 +44883,28 @@ mod tests {
         let mut empty: Vec<String> = Vec::new();
         sort_reason_codes(&mut empty);
         assert!(empty.is_empty());
+
+        // Issue #807: the activity-level hold leads too, and a task held by
+        // BOTH reports them in a deterministic order rather than whichever the
+        // HashSet merge happened to yield.
+        let mut both = vec![
+            "concurrency_saturated".to_string(),
+            "queue_paused".to_string(),
+            "worker_draining".to_string(),
+            "activity_paused".to_string(),
+        ];
+        sort_reason_codes(&mut both);
+        assert_eq!(
+            both,
+            vec![
+                "activity_paused".to_string(),
+                "queue_paused".to_string(),
+                "concurrency_saturated".to_string(),
+                "worker_draining".to_string(),
+            ],
+            "both deliberate holds lead, alphabetical within the group and \
+             within the remainder, so the array is stable across polls"
+        );
     }
 
     fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -42590,6 +46634,7 @@ mod tests {
                 inherited_chain_deadline_at: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                 priority: Priority::default(),
                 max_workflow_input_bytes: 0,
                 start_at: None,
@@ -42678,6 +46723,7 @@ mod tests {
                 inherited_chain_deadline_at: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                 priority: Priority::default(),
                 max_workflow_input_bytes: 0,
                 start_at: None,
@@ -42804,6 +46850,7 @@ mod tests {
                 inherited_chain_deadline_at: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                 priority: Priority::default(),
                 max_workflow_input_bytes: 0,
                 start_at: None,
@@ -42936,6 +46983,7 @@ mod tests {
                 inherited_chain_deadline_at: None,
                 concurrency_key: None,
                 concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                 priority: Priority::default(),
                 max_workflow_input_bytes: 0,
                 start_at: None,
@@ -46019,6 +50067,549 @@ mod tests {
         }
     }
 
+    // ── issue #809 / PR #1188 round 6: decode exactly what is surfaced ─────
+    //
+    // The per-row activity facts carry `last_error` RAW so a LOSING row's
+    // encrypted error is never decrypted and never written to the
+    // `payload.decode_read` audit row. Only the winning verdict's error is
+    // decoded, and only when a decoder is active.
+
+    /// Wrap `plaintext` the way a codec-encrypting deployment stores an
+    /// encoded TEXT error: the serialized form of a codec envelope around a
+    /// JSON string. Built through the public `encode_event` seam (encoding a
+    /// string-valued payload field) so the fixture can never drift from the
+    /// engine's real envelope shape.
+    fn encoded_error_envelope(plaintext: &str) -> String {
+        let codecs = reversing_codecs();
+        let event = autumn_harvest::WorkflowEvent::WorkflowCompleted {
+            output: serde_json::Value::String(plaintext.to_string()),
+        };
+        let event_data = codecs.encode_event(&event).expect("encode event");
+        let envelope = &event_data["data"]["output"];
+        assert_eq!(
+            envelope["_harvest_codec_envelope"], 1,
+            "fixture sanity: the encoded field must carry a codec envelope"
+        );
+        serde_json::to_string(envelope).expect("serialize envelope")
+    }
+
+    /// Build a live `WorkerRow` for the eligibility tests below.
+    fn eligibility_worker(
+        worker_id: &str,
+        queues: &[&str],
+        build_id: &str,
+        labels: serde_json::Value,
+    ) -> WorkerRow {
+        eligibility_worker_with_status(worker_id, queues, build_id, labels, "Active")
+    }
+
+    /// The same, with an explicit fleet status so the drain case is testable.
+    fn eligibility_worker_with_status(
+        worker_id: &str,
+        queues: &[&str],
+        build_id: &str,
+        labels: serde_json::Value,
+        status: &str,
+    ) -> WorkerRow {
+        use autumn_harvest::models::HarvestWorker;
+        use autumn_harvest::workers::WorkerHealth;
+
+        let now = chrono::Utc::now();
+        WorkerRow {
+            worker: HarvestWorker {
+                worker_id: worker_id.to_string(),
+                started_at: now,
+                last_heartbeat_at: now,
+                queues: serde_json::json!(queues),
+                shard_assignments: serde_json::json!([0]),
+                max_concurrency: 10,
+                in_flight_count: 0,
+                host: "localhost".to_string(),
+                version: None,
+                status: status.to_string(),
+                drain_deadline_at: None,
+                build_id: build_id.to_string(),
+                deployment_name: None,
+                labels,
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
+            },
+            health: WorkerHealth::Healthy,
+            active_task_ids: vec![],
+        }
+    }
+
+    /// The common case: a queue name and no other claim requirement.
+    fn claim_reqs(queue: &str) -> TaskClaimRequirements<'_> {
+        TaskClaimRequirements {
+            queue_name: queue,
+            ..TaskClaimRequirements::default()
+        }
+    }
+
+    #[test]
+    fn eligibility_requires_the_task_build_not_just_the_queue() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let workers = vec![eligibility_worker(
+            "w-old",
+            &["default"],
+            "build-1",
+            serde_json::json!({}),
+        )];
+
+        // No build requirement -> the queue poller is enough.
+        assert!(task_has_eligible_worker(
+            &workers,
+            0,
+            claim_reqs("default"),
+            &compat,
+            ""
+        ));
+        // Same build -> eligible.
+        assert!(task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-1"),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+        // A build the only queue poller does NOT run and is not declared
+        // compatible with: the task is unclaimable even though the queue is
+        // covered.
+        assert!(!task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-2"),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_honours_declared_build_compatibility() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        // `build-2` is declared able to process work assigned `build-1`.
+        let mut compat = BuildCompatibilitySet::new();
+        compat.add_declaration("build-2", "build-1");
+        let workers = vec![eligibility_worker(
+            "w-new",
+            &["default"],
+            "build-2",
+            serde_json::json!({}),
+        )];
+
+        assert!(task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-1"),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+        // A legacy worker (empty build_id) may claim anything.
+        let legacy = vec![eligibility_worker(
+            "w-legacy",
+            &["default"],
+            "",
+            serde_json::json!({}),
+        )];
+        assert!(task_has_eligible_worker(
+            &legacy,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-9"),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_requires_the_task_capabilities() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let gpu_req = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+        let cpu_only = vec![eligibility_worker(
+            "w-cpu",
+            &["default"],
+            "",
+            serde_json::json!({"gpu": "false"}),
+        )];
+        let gpu = vec![eligibility_worker(
+            "w-gpu",
+            &["default"],
+            "",
+            serde_json::json!({"gpu": "true"}),
+        )];
+
+        assert!(!task_has_eligible_worker(
+            &cpu_only,
+            0,
+            TaskClaimRequirements {
+                required_capabilities: Some(&gpu_req),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+        assert!(task_has_eligible_worker(
+            &gpu,
+            0,
+            TaskClaimRequirements {
+                required_capabilities: Some(&gpu_req),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_checks_every_dimension_against_the_same_worker() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let gpu_req = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+        // One worker satisfies the build, a DIFFERENT one satisfies the label.
+        // Neither can claim the task, so the split fleet is not coverage.
+        let split = vec![
+            eligibility_worker("w-build", &["default"], "build-2", serde_json::json!({})),
+            eligibility_worker(
+                "w-gpu",
+                &["default"],
+                "build-1",
+                serde_json::json!({"gpu": "true"}),
+            ),
+        ];
+        assert!(!task_has_eligible_worker(
+            &split,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-2"),
+                required_capabilities: Some(&gpu_req),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+
+        // The same worker satisfying both IS coverage.
+        let both = vec![eligibility_worker(
+            "w-both",
+            &["default"],
+            "build-2",
+            serde_json::json!({"gpu": "true"}),
+        )];
+        assert!(task_has_eligible_worker(
+            &both,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-2"),
+                required_capabilities: Some(&gpu_req),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_falls_back_to_other_dimensions_on_unparseable_capabilities() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let garbage = serde_json::json!({"not": "a requirement list"});
+        let workers = vec![eligibility_worker(
+            "w",
+            &["default"],
+            "",
+            serde_json::json!({}),
+        )];
+
+        // Never fabricate a stall from a value this endpoint cannot read: the
+        // capability dimension is skipped, the others still apply.
+        assert!(task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                required_capabilities: Some(&garbage),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+        assert!(!task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                required_capabilities: Some(&garbage),
+                ..claim_reqs("other-queue")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_session_member_requires_its_pinned_host() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        // A peer covers the queue, but the session's pinned host is gone.
+        let peer_only = vec![eligibility_worker(
+            "w-peer",
+            &["gpu"],
+            "",
+            serde_json::json!({}),
+        )];
+        assert!(
+            !task_has_eligible_worker(
+                &peer_only,
+                0,
+                TaskClaimRequirements {
+                    is_session_member: true,
+                    sticky_worker_id: Some("w-host"),
+                    ..claim_reqs("gpu")
+                },
+                &compat,
+                ""
+            ),
+            "a session member is claimable ONLY by its pinned host; a peer that \
+             covers the queue can never claim it, so this is a genuine stall"
+        );
+
+        // The pinned host itself is live -> claimable.
+        let with_host = vec![
+            eligibility_worker("w-peer", &["gpu"], "", serde_json::json!({})),
+            eligibility_worker("w-host", &["gpu"], "", serde_json::json!({})),
+        ];
+        assert!(task_has_eligible_worker(
+            &with_host,
+            0,
+            TaskClaimRequirements {
+                is_session_member: true,
+                sticky_worker_id: Some("w-host"),
+                ..claim_reqs("gpu")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_session_member_without_a_recorded_host_is_unclaimable() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        let workers = vec![eligibility_worker("w", &["gpu"], "", serde_json::json!({}))];
+
+        // `sticky_worker_id = $1` can never hold against a NULL column.
+        assert!(!task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                is_session_member: true,
+                sticky_worker_id: None,
+                ..claim_reqs("gpu")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_session_pin_still_applies_build_and_capabilities() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        // The pinned host is live and polls the queue but runs the wrong build:
+        // no OTHER worker may stand in for it, so the task is unclaimable.
+        let workers = vec![
+            eligibility_worker("w-host", &["gpu"], "build-1", serde_json::json!({})),
+            eligibility_worker("w-peer", &["gpu"], "build-2", serde_json::json!({})),
+        ];
+        assert!(!task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                required_build_id: Some("build-2"),
+                is_session_member: true,
+                sticky_worker_id: Some("w-host"),
+                ..claim_reqs("gpu")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_ignores_an_ordinary_sticky_lease() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        // Sticky owner recorded but NOT a session member: the lease self-heals
+        // at `sticky_until`, so any eligible poller counts and this is not a
+        // stall (see `task_has_eligible_worker`'s doc comment).
+        let peer_only = vec![eligibility_worker(
+            "w-peer",
+            &["default"],
+            "",
+            serde_json::json!({}),
+        )];
+        assert!(task_has_eligible_worker(
+            &peer_only,
+            0,
+            TaskClaimRequirements {
+                sticky_worker_id: Some("w-gone"),
+                ..claim_reqs("default")
+            },
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn eligibility_excludes_draining_workers() {
+        use autumn_harvest::build_routing::BuildCompatibilitySet;
+
+        let compat = BuildCompatibilitySet::default();
+        // `Worker::run` leaves its poll loop BEFORE transitioning to
+        // `Draining`, so a draining worker claims no new task for the whole
+        // drain window even though queue coverage still counts it.
+        let draining = vec![eligibility_worker_with_status(
+            "w-draining",
+            &["default"],
+            "",
+            serde_json::json!({}),
+            "Draining",
+        )];
+        assert!(!task_has_eligible_worker(
+            &draining,
+            0,
+            claim_reqs("default"),
+            &compat,
+            ""
+        ));
+
+        // The same worker while still `Active` IS coverage.
+        let active = vec![eligibility_worker(
+            "w-active",
+            &["default"],
+            "",
+            serde_json::json!({}),
+        )];
+        assert!(task_has_eligible_worker(
+            &active,
+            0,
+            claim_reqs("default"),
+            &compat,
+            ""
+        ));
+    }
+
+    #[test]
+    fn only_the_surfaced_activity_error_is_decoded() {
+        use autumn_harvest::stall_diagnosis::BlockedOn;
+
+        let codecs = reversing_codecs();
+        let encoded = encoded_error_envelope("card declined");
+
+        // The winning verdict's error IS decoded, and the outcome is non-empty
+        // so the caller's `payload.decode_read` audit row is written.
+        let mut winner = BlockedOn::ActivityRetrying {
+            activity_name: Some("charge_card".to_string()),
+            attempt: 3,
+            last_error: Some(encoded),
+            next_attempt_at: None,
+        };
+        let outcome = decode_surfaced_activity_error(&mut winner, Some(&codecs));
+        assert!(outcome.touched(), "a surfaced error must be audited");
+        let BlockedOn::ActivityRetrying {
+            last_error: Some(decoded),
+            ..
+        } = &winner
+        else {
+            panic!("verdict shape changed: {winner:?}");
+        };
+        assert_eq!(decoded, "card declined");
+        assert!(
+            !decoded.contains("_harvest_codec_envelope"),
+            "the surfaced error must not leak the envelope: {decoded}"
+        );
+    }
+
+    #[test]
+    fn a_losing_rows_error_is_never_decoded_or_audited() {
+        use autumn_harvest::stall_diagnosis::BlockedOn;
+
+        let codecs = reversing_codecs();
+        // The fan-out case Codex named: a retrying row loses precedence to a
+        // paused-queue row, so its error never reaches the caller.
+        let mut winner = BlockedOn::ActivityQueuePaused {
+            queue: "payments".to_string(),
+            activity_name: Some("charge_card".to_string()),
+        };
+        let outcome = decode_surfaced_activity_error(&mut winner, Some(&codecs));
+        assert!(
+            !outcome.touched(),
+            "an unsurfaced error must not write a decode audit row"
+        );
+    }
+
+    #[test]
+    fn decode_is_a_noop_without_an_active_decoder() {
+        use autumn_harvest::stall_diagnosis::BlockedOn;
+
+        let encoded = encoded_error_envelope("card declined");
+        let mut winner = BlockedOn::ActivityRetrying {
+            activity_name: None,
+            attempt: 1,
+            last_error: Some(encoded.clone()),
+            next_attempt_at: None,
+        };
+        let outcome = decode_surfaced_activity_error(&mut winner, None);
+        assert!(!outcome.touched());
+        let BlockedOn::ActivityRetrying {
+            last_error: Some(unchanged),
+            ..
+        } = &winner
+        else {
+            panic!("verdict shape changed: {winner:?}");
+        };
+        assert_eq!(
+            unchanged, &encoded,
+            "with no decoder the stored bytes must be returned verbatim"
+        );
+    }
+
+    #[test]
+    fn a_retrying_verdict_without_an_error_is_a_noop() {
+        use autumn_harvest::stall_diagnosis::BlockedOn;
+
+        let codecs = reversing_codecs();
+        let mut winner = BlockedOn::ActivityRetrying {
+            activity_name: None,
+            attempt: 1,
+            last_error: None,
+            next_attempt_at: None,
+        };
+        let outcome = decode_surfaced_activity_error(&mut winner, Some(&codecs));
+        assert!(!outcome.touched());
+    }
+
     fn read_path_test_codecs() -> PayloadCodecs {
         let mut codecs = PayloadCodecs::default();
         codecs.set_default(Arc::new(ReverseReadPathCodec));
@@ -47248,5 +51839,516 @@ mod tests {
              WorkflowInfo, registered under the DAG's own name"
         );
         assert_eq!(entry.sla_secs, Some(10_800));
+    }
+
+    // ── Stall diagnosis (issue #809) — derivation helpers ──────────────────
+
+    #[test]
+    fn circuit_cooldown_until_derives_an_absolute_deadline() {
+        let now = chrono::Utc::now();
+        let at = circuit_cooldown_until(now, 30.0).expect("30s is representable");
+        assert_eq!((at - now).num_seconds(), 30);
+    }
+
+    #[test]
+    fn circuit_cooldown_until_degrades_on_unrepresentable_input() {
+        // A missing `cooldown_until` is already the documented shape for a
+        // force-opened breaker, so degrading is never a lie — but it must never
+        // panic or wrap either.
+        let now = chrono::Utc::now();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 1e30] {
+            assert!(
+                circuit_cooldown_until(now, bad).is_none(),
+                "{bad} must not yield a cooldown"
+            );
+        }
+        // Zero is representable and simply means "probe now".
+        assert_eq!(circuit_cooldown_until(now, 0.0), Some(now));
+    }
+
+    #[test]
+    fn contributing_reasons_union_across_rows_not_just_the_winner() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // Slot A: paused queue (the highest-ranked verdict, so `blocked_on`
+        // names it). Slot B: no live poller. The `no_live_worker` condition
+        // holds and MUST still be surfaced — that is the endpoint's whole
+        // "100% of the time it holds" guarantee.
+        let base = |queue: &str| PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: queue.to_string(),
+            task_state: "PENDING".to_string(),
+            claimant_is_live: None,
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            activity_paused: false,
+            has_live_worker: true,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        let mut a = base("paused-q");
+        a.queue_paused = true;
+        let mut b = base("dead-q");
+        b.has_live_worker = false;
+
+        let reasons = contributing_reasons_for(&[a, b]);
+        assert!(
+            reasons.iter().any(|r| r == "queue_paused"),
+            "expected queue_paused in {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r == "no_live_worker"),
+            "a lower-ranked sibling's cause must not be hidden behind the winner: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_skip_claim_gates_for_a_claimed_row() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // A row a live worker already holds is running; reporting `queue_paused`
+        // next to `health: healthy` would be self-contradictory.
+        let facts = PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: "email".to_string(),
+            task_state: "RUNNING".to_string(),
+            claimant_is_live: None,
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: true,
+            activity_paused: false,
+            has_live_worker: true,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        assert!(contributing_reasons_for(&[facts]).is_empty());
+    }
+
+    #[test]
+    fn contributing_reasons_report_an_orphaned_claimed_row() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // The converse: a claimed row whose fleet is gone (issue #367) is an
+        // orphan, and worker liveness is not a claim-time gate — it holds for a
+        // claimed row too.
+        let facts = PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: "email".to_string(),
+            task_state: "RUNNING".to_string(),
+            claimant_is_live: None,
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            activity_paused: false,
+            has_live_worker: false,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        assert_eq!(
+            contributing_reasons_for(&[facts]),
+            vec!["no_live_worker".to_string()]
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_use_claimant_liveness_for_a_held_row() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // A row held by its own claimant, which has begun graceful shutdown
+        // (`Draining`, so it claims nothing new but IS finishing exactly this
+        // row). Queue-level claim eligibility is therefore false, but the
+        // claimant is alive and the classifier reports `healthy_in_progress` —
+        // so `no_live_worker` must NOT appear, or the reason codes would
+        // contradict the headline verdict.
+        let facts = PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: "email".to_string(),
+            task_state: "RUNNING".to_string(),
+            claimant_is_live: Some(true),
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            activity_paused: false,
+            // Nothing *Active* covers the queue, so a PENDING row here would
+            // genuinely be `no_live_worker`.
+            has_live_worker: false,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        assert!(
+            contributing_reasons_for(&[facts]).is_empty(),
+            "a held row whose own claimant is alive is progressing; \
+             reporting no_live_worker would contradict `healthy_in_progress`"
+        );
+    }
+
+    #[test]
+    fn contributing_reasons_report_an_orphan_even_when_an_active_peer_covers_the_queue() {
+        use autumn_harvest::stall_diagnosis::PendingActivityFacts;
+        // The mirror image: the recorded claimant is gone (a poison-pill orphan,
+        // issue #367) while a healthy Active peer still covers the queue. A peer
+        // cannot pick up an already-claimed row, so the classifier reports
+        // `activity_no_worker` and the reason code must be present.
+        let facts = PendingActivityFacts {
+            activity_name: Some("send_email".to_string()),
+            queue: "email".to_string(),
+            task_state: "RUNNING".to_string(),
+            claimant_is_live: Some(false),
+            attempt: 1,
+            last_error: None,
+            scheduled_at: chrono::Utc::now() - chrono::Duration::seconds(10),
+            rate_limit_key: None,
+            concurrency_key: None,
+            queue_paused: false,
+            activity_paused: false,
+            // An Active peer covers the queue, so claim eligibility is true.
+            has_live_worker: true,
+            circuit_phase: None,
+            circuit_cooldown_until: None,
+            rate_limit_saturated: false,
+            rate_limit_bucket_missing: false,
+            concurrency_saturated: false,
+        };
+        assert_eq!(
+            contributing_reasons_for(&[facts]),
+            vec!["no_live_worker".to_string()],
+            "an orphan held by a dead claimant must surface no_live_worker even \
+             when a live Active peer covers the queue"
+        );
+    }
+
+    #[test]
+    fn effective_capabilities_backfill_registered_requirements_for_an_unsnapshotted_row() {
+        // A legacy or manually enqueued activity row carries NULL
+        // `required_capabilities`, but `claim_task`'s ineligible-activities
+        // gate ($6) still enforces the REGISTERED handler's `requires`. The
+        // row's absent snapshot must not be read as "no requirements".
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::from([(
+                "gated".to_string(),
+                serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+            )]);
+
+        let resolved = resolve_required_capabilities(None, Some("gated"), &registered);
+        assert_eq!(
+            resolved.requirements,
+            registered.get("gated"),
+            "a NULL snapshot must resolve to the registered requirements"
+        );
+        assert!(
+            resolved.from_registry_fallback,
+            "and must report that they came from THIS process's registry"
+        );
+    }
+
+    #[test]
+    fn effective_capabilities_prefer_the_rows_own_snapshot() {
+        // A snapshot is what the row was enqueued with; the registry may have
+        // changed since. `claim_task` gates on the snapshot when present
+        // (`required_capabilities IS NOT NULL` short-circuits $6), so the
+        // snapshot must win and the registry must never override it.
+        let snapshot = serde_json::json!([{"Exact": {"key": "region", "value": "eu"}}]);
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::from([(
+                "gated".to_string(),
+                serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+            )]);
+
+        let resolved = resolve_required_capabilities(Some(&snapshot), Some("gated"), &registered);
+        assert_eq!(resolved.requirements, Some(&snapshot));
+        assert!(
+            !resolved.from_registry_fallback,
+            "a snapshotted requirement is row-side, so it gates every build"
+        );
+    }
+
+    #[test]
+    fn effective_capabilities_are_none_when_neither_source_has_any() {
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        for resolved in [
+            resolve_required_capabilities(None, Some("ungated"), &registered),
+            resolve_required_capabilities(None, None, &registered),
+        ] {
+            assert!(resolved.requirements.is_none());
+            assert!(!resolved.from_registry_fallback);
+        }
+    }
+
+    /// The circuit registry is **in-process** (`circuit_breaker.rs`) and each
+    /// worker process builds its own (`HandlerRegistry::new`), so a local
+    /// snapshot only describes the local worker's breaker. It may be treated as
+    /// the answer for a task ONLY when the local worker is the sole worker that
+    /// could claim that task — otherwise a peer replica whose breaker is closed
+    /// can still dispatch it, and reporting a fleet-wide stall would be a false
+    /// positive on the flagship verdict.
+    #[test]
+    fn local_circuit_snapshot_is_authoritative_only_for_a_sole_local_eligible_worker() {
+        // Sole eligible worker, and it is us: our breaker IS the one that will
+        // be consulted at dispatch.
+        assert!(local_circuit_snapshot_is_authoritative(
+            &["w-local"],
+            Some("w-local")
+        ));
+
+        // A peer is also eligible: its breaker may be closed, so our local
+        // snapshot cannot support a fleet-wide verdict.
+        assert!(!local_circuit_snapshot_is_authoritative(
+            &["w-local", "w-peer"],
+            Some("w-local")
+        ));
+
+        // The sole eligible worker is someone else entirely — our breaker is
+        // irrelevant to this task.
+        assert!(!local_circuit_snapshot_is_authoritative(
+            &["w-peer"],
+            Some("w-local")
+        ));
+
+        // No co-located worker in this process (an API-only replica): nothing
+        // drives our registry, so it describes no dispatcher at all.
+        assert!(!local_circuit_snapshot_is_authoritative(&["w-peer"], None));
+
+        // No eligible worker at all -- `activity_no_worker` outranks the
+        // breaker anyway, but the predicate must not claim authority.
+        assert!(!local_circuit_snapshot_is_authoritative(
+            &[],
+            Some("w-local")
+        ));
+    }
+
+    #[test]
+    fn eligible_worker_ids_lists_every_worker_that_can_claim() {
+        // Two pollers cover the queue; a third covers a different queue.
+        let workers = vec![
+            eligibility_worker("w-a", &["payments"], "", serde_json::json!({})),
+            eligibility_worker("w-b", &["payments"], "", serde_json::json!({})),
+            eligibility_worker("w-other", &["reports"], "", serde_json::json!({})),
+        ];
+        let compat = autumn_harvest::build_routing::BuildCompatibilitySet::new();
+        let reqs = TaskClaimRequirements {
+            queue_name: "payments",
+            ..TaskClaimRequirements::default()
+        };
+
+        let ids = eligible_worker_ids(&workers, 0, reqs, &compat, "");
+        assert_eq!(ids, vec!["w-a", "w-b"]);
+
+        // The boolean helper stays exactly "the set is non-empty", so every
+        // existing eligibility guarantee is preserved by construction.
+        assert_eq!(
+            task_has_eligible_worker(&workers, 0, reqs, &compat, ""),
+            !ids.is_empty()
+        );
+    }
+
+    #[test]
+    fn unsnapshotted_row_with_registered_requirements_has_no_eligible_worker() {
+        // The behavioural composition: an unsnapshotted row whose registered
+        // activity demands `gpu=true` is NOT claimable by a live poller that
+        // advertises `gpu=false`, so the endpoint must not read it as healthy.
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::from([(
+                "gated".to_string(),
+                serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+            )]);
+        let workers = vec![eligibility_worker(
+            "w-cpu",
+            &["payments"],
+            "",
+            serde_json::json!({"gpu": "false"}),
+        )];
+        let compat = autumn_harvest::build_routing::BuildCompatibilitySet::new();
+        let resolved = resolve_required_capabilities(None, Some("gated"), &registered);
+
+        assert!(
+            !task_has_eligible_worker(
+                &workers,
+                0,
+                TaskClaimRequirements {
+                    queue_name: "payments",
+                    required_capabilities: resolved.requirements,
+                    capabilities_from_registry_fallback: resolved.from_registry_fallback,
+                    ..TaskClaimRequirements::default()
+                },
+                &compat,
+                "",
+            ),
+            "an unsnapshotted row must still be gated by the registered requirements"
+        );
+
+        // The control: a worker that DOES advertise the label is coverage.
+        let workers = vec![eligibility_worker(
+            "w-gpu",
+            &["payments"],
+            "",
+            serde_json::json!({"gpu": "true"}),
+        )];
+        assert!(task_has_eligible_worker(
+            &workers,
+            0,
+            TaskClaimRequirements {
+                queue_name: "payments",
+                required_capabilities: resolved.requirements,
+                capabilities_from_registry_fallback: resolved.from_registry_fallback,
+                ..TaskClaimRequirements::default()
+            },
+            &compat,
+            "",
+        ));
+    }
+    #[test]
+    fn registry_fallback_binds_only_to_a_worker_on_the_local_build() {
+        // Same build -- the local registry genuinely describes that worker's
+        // handler, so its `requires` is what `claim_task` will enforce.
+        assert!(registry_fallback_binds("build-x", "build-x"));
+
+        // The default, no-build-routing deployment: every worker (and this
+        // process) advertises no build identity, so they are treated as one
+        // build and the fallback binds exactly as it did before.
+        assert!(registry_fallback_binds("", ""));
+
+        // Rolling deploy: the worker runs a DIFFERENT build, whose handler may
+        // declare no requirement at all. We have no evidence about it, so the
+        // fallback must not be used to reject it.
+        assert!(!registry_fallback_binds("build-old", "build-new"));
+
+        // One side unidentified is still not evidence of a shared build.
+        assert!(!registry_fallback_binds("build-old", ""));
+        assert!(!registry_fallback_binds("", "build-new"));
+    }
+
+    #[test]
+    fn local_build_id_reads_the_local_workers_advertised_build() {
+        let workers = vec![
+            eligibility_worker("w-peer", &["payments"], "build-old", serde_json::json!({})),
+            eligibility_worker("w-local", &["payments"], "build-new", serde_json::json!({})),
+        ];
+
+        assert_eq!(
+            local_build_id_from_workers(&workers, Some("w-local")),
+            "build-new",
+        );
+
+        // A co-located worker that has not registered a row yet, and an
+        // API-only replica, both leave the local build unidentified -- which
+        // `registry_fallback_binds` reads as "no build identity configured".
+        assert!(local_build_id_from_workers(&workers, Some("w-missing")).is_empty());
+        assert!(local_build_id_from_workers(&workers, None).is_empty());
+    }
+
+    #[test]
+    fn registry_fallback_does_not_gate_a_worker_on_a_different_build() {
+        // Rolling deploy. THIS replica runs `build-new`, whose `gated` handler
+        // declares `requires = gpu=true`. The row was enqueued by `build-old`,
+        // whose handler declared nothing, so its snapshot is NULL -- and
+        // `claim_task` admits the old worker, because that worker builds its
+        // own `ineligible_activities` from its OWN registry, which has no
+        // requirement for `gated`. Diagnosis must not reject it on our
+        // requirement and report a false `activity_no_worker`.
+        let registered: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::from([(
+                "gated".to_string(),
+                serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+            )]);
+        let compat = autumn_harvest::build_routing::BuildCompatibilitySet::new();
+        let resolved = resolve_required_capabilities(None, Some("gated"), &registered);
+        assert!(
+            resolved.from_registry_fallback,
+            "a NULL snapshot resolved from the registry IS a fallback"
+        );
+
+        let old_build = vec![eligibility_worker(
+            "w-old",
+            &["payments"],
+            "build-old",
+            serde_json::json!({}),
+        )];
+        assert_eq!(
+            eligible_worker_ids(
+                &old_build,
+                0,
+                TaskClaimRequirements {
+                    queue_name: "payments",
+                    required_capabilities: resolved.requirements,
+                    capabilities_from_registry_fallback: resolved.from_registry_fallback,
+                    ..TaskClaimRequirements::default()
+                },
+                &compat,
+                "build-new",
+            ),
+            vec!["w-old"],
+            "a worker on another build must not be rejected on OUR registry's requirement"
+        );
+
+        // Control 1 -- round 11 preserved. A worker on the SAME build is still
+        // gated by the fallback, because our registry does describe its handler.
+        let same_build = vec![eligibility_worker(
+            "w-new",
+            &["payments"],
+            "build-new",
+            serde_json::json!({"gpu": "false"}),
+        )];
+        assert!(
+            eligible_worker_ids(
+                &same_build,
+                0,
+                TaskClaimRequirements {
+                    queue_name: "payments",
+                    required_capabilities: resolved.requirements,
+                    capabilities_from_registry_fallback: resolved.from_registry_fallback,
+                    ..TaskClaimRequirements::default()
+                },
+                &compat,
+                "build-new",
+            )
+            .is_empty(),
+            "the fallback must still gate a worker running the build it came from"
+        );
+
+        // Control 2 -- a requirement carried on the ROW's own snapshot is what
+        // `claim_task` enforces server-side, independent of any worker's build,
+        // so it gates every build.
+        let snapshot = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+        let snapshotted =
+            resolve_required_capabilities(Some(&snapshot), Some("gated"), &registered);
+        assert!(!snapshotted.from_registry_fallback);
+        assert!(
+            eligible_worker_ids(
+                &old_build,
+                0,
+                TaskClaimRequirements {
+                    queue_name: "payments",
+                    required_capabilities: snapshotted.requirements,
+                    capabilities_from_registry_fallback: snapshotted.from_registry_fallback,
+                    ..TaskClaimRequirements::default()
+                },
+                &compat,
+                "build-new",
+            )
+            .is_empty(),
+            "a snapshotted requirement is row-side and gates every build"
+        );
     }
 }

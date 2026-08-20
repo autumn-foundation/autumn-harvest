@@ -1861,7 +1861,15 @@ pub fn merge_dlq_aggregates(
     }
 }
 
-type AggregateRow = (
+/// A single loaded `harvest_dead_letters` row, in the shape
+/// [`aggregate_dead_letters`] selects it: `(id, workflow_exec_id,
+/// activity_name, queue_name, task_type, failed_at, error)`.
+///
+/// `pub` (rather than the module-private alias this used to be) so
+/// [`group_dead_letter_rows`] -- and the `dlq_aggregate_profile` benchmark
+/// harness that drives it directly, without a database -- can be called from
+/// outside this module.
+pub type AggregateRow = (
     Uuid,
     Option<Uuid>,
     Option<String>,
@@ -1870,6 +1878,76 @@ type AggregateRow = (
     DateTime<Utc>,
     String,
 );
+
+/// Group already-loaded DLQ rows by the requested dimensions.
+///
+/// Pure and DB-free: the derived [`failure_signature`]/[`dlq_reason`]/
+/// [`error_class`] classification, the per-row grouping key, and the count/
+/// first-seen/last-seen/sample-id bookkeeping are all in-memory work with no
+/// I/O. Shared verbatim by [`aggregate_dead_letters`] (fed real DB rows) and
+/// the `dlq_aggregate_profile` benchmark harness (fed a synthetic but
+/// realistic incident-shaped batch), so both exercise byte-identical code —
+/// see `benches/dlq_aggregate_profile.rs` and
+/// `docs/performance-dlq-aggregate.md`.
+///
+/// Deliberately uses `entry(key.clone())` rather than a `get_mut`-first
+/// lookup: a `get_mut`-first rewrite was measured to save ~6% instructions
+/// on a hit-heavy (few groups, many rows -- the intended "DLQ flood"
+/// triage) workload, but `group_by` is fully caller-controlled, and the
+/// same rewrite was independently measured to *cost* ~4.5% instructions on
+/// an adversarial miss-heavy workload (a caller-chosen `group_by` that
+/// yields mostly-distinct keys, e.g. `[ActivityName]` on a fleet with many
+/// distinct activity names): `get_mut` plus a fallback `insert` pays two
+/// hash+probe passes on every miss, versus `entry()`'s one. `entry()`'s
+/// per-row cost is invariant to hit/miss ratio, which matters more for a
+/// caller-facing endpoint than optimizing one particular input shape at
+/// another's expense. See `docs/performance-dlq-aggregate.md`'s "Negative
+/// result" section for the full measurement.
+#[must_use]
+#[allow(
+    clippy::implicit_hasher,
+    reason = "internal aggregation helper with one caller using the default hasher; no genuine multi-hasher use case"
+)]
+pub fn group_dead_letter_rows(
+    rows: Vec<AggregateRow>,
+    params: &DlqAggregateParams,
+    workflow_names: &HashMap<Uuid, String>,
+) -> HashMap<Vec<Option<String>>, DlqRawGroup> {
+    let mut groups: HashMap<Vec<Option<String>>, DlqRawGroup> = HashMap::new();
+    for (id, exec_id, activity_name, queue_name, task_type, failed_at, error) in rows {
+        let key: Vec<Option<String>> = params
+            .group_by
+            .iter()
+            .map(|dim| match dim {
+                DlqGroupDimension::WorkflowName => {
+                    exec_id.and_then(|e| workflow_names.get(&e).cloned())
+                }
+                DlqGroupDimension::ActivityName => activity_name.clone(),
+                DlqGroupDimension::QueueName => Some(queue_name.clone()),
+                DlqGroupDimension::TaskType => Some(task_type.clone()),
+                DlqGroupDimension::TimeBucket => Some(params.time_bucket.format(failed_at)),
+                DlqGroupDimension::FailureSignature => Some(failure_signature(&error)),
+                DlqGroupDimension::DlqReason => Some(dlq_reason(&error)),
+                DlqGroupDimension::ErrorClass => Some(error_class(&error)),
+            })
+            .collect();
+
+        let entry = groups.entry(key.clone()).or_insert_with(|| DlqRawGroup {
+            key,
+            count: 0,
+            first_seen: None,
+            last_seen: None,
+            sample_ids: Vec::new(),
+        });
+        entry.count += 1;
+        entry.first_seen = min_instant(entry.first_seen, Some(failed_at));
+        entry.last_seen = max_instant(entry.last_seen, Some(failed_at));
+        if entry.sample_ids.len() < params.samples_per_group as usize {
+            entry.sample_ids.push(id.to_string());
+        }
+    }
+    groups
+}
 
 /// Compute a per-shard DLQ aggregate against the connection's own database.
 ///
@@ -1953,39 +2031,7 @@ pub async fn aggregate_dead_letters(
         HashMap::new()
     };
 
-    let mut groups: HashMap<Vec<Option<String>>, DlqRawGroup> = HashMap::new();
-    for (id, exec_id, activity_name, queue_name, task_type, failed_at, error) in rows {
-        let key: Vec<Option<String>> = params
-            .group_by
-            .iter()
-            .map(|dim| match dim {
-                DlqGroupDimension::WorkflowName => {
-                    exec_id.and_then(|e| workflow_names.get(&e).cloned())
-                }
-                DlqGroupDimension::ActivityName => activity_name.clone(),
-                DlqGroupDimension::QueueName => Some(queue_name.clone()),
-                DlqGroupDimension::TaskType => Some(task_type.clone()),
-                DlqGroupDimension::TimeBucket => Some(params.time_bucket.format(failed_at)),
-                DlqGroupDimension::FailureSignature => Some(failure_signature(&error)),
-                DlqGroupDimension::DlqReason => Some(dlq_reason(&error)),
-                DlqGroupDimension::ErrorClass => Some(error_class(&error)),
-            })
-            .collect();
-
-        let entry = groups.entry(key.clone()).or_insert_with(|| DlqRawGroup {
-            key,
-            count: 0,
-            first_seen: None,
-            last_seen: None,
-            sample_ids: Vec::new(),
-        });
-        entry.count += 1;
-        entry.first_seen = min_instant(entry.first_seen, Some(failed_at));
-        entry.last_seen = max_instant(entry.last_seen, Some(failed_at));
-        if entry.sample_ids.len() < params.samples_per_group as usize {
-            entry.sample_ids.push(id.to_string());
-        }
-    }
+    let groups = group_dead_letter_rows(rows, params, &workflow_names);
 
     Ok(DlqAggregatePartial {
         total,

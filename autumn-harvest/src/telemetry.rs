@@ -144,6 +144,55 @@ pub const METRIC_ACTIVITY_ATTEMPTS: &str = "harvest.activity.attempts";
 /// never appear as labels here.
 pub const METRIC_ACTIVITY_RETRIES: &str = "harvest.activity.retries";
 
+/// Counter: incremented once per **effective** operator pause/resume action on
+/// an activity type (issue #807).
+///
+/// Labels:
+/// - `activity` (= [`METRIC_LABEL_ACTIVITY`]): the registered activity name (bounded)
+/// - `action` (= [`METRIC_LABEL_ACTION`]): [`ActivityPauseAction::as_str`] —
+///   exactly `pause` or `resume`
+///
+/// **Why a counter, not a gauge.** Its closest sibling `harvest.queue.paused`
+/// (issue #619) is a *gauge*, because a queue hold is a binary state whose
+/// *duration* is the thing an operator pages on. This one answers the
+/// different question issue #807 asks — how often the fleet is reaching for
+/// this lever, and on what — so it counts point-in-time actions. The current
+/// *state* is deliberately not derivable from it; `GET /activities`
+/// is the read model for that.
+///
+/// **Why not the `paused` noun.** `harvest_queue_paused` (gauge, issue #619)
+/// and `harvest_workflow_paused_total` (counter, issue #383) already disagree
+/// on instrument type under that noun. A third spelling would leave an
+/// operator guessing which shape they are graphing, so this one is named for
+/// what it actually counts.
+///
+/// **Emission contract.** Counted only when the action genuinely changed
+/// state — gate on `ActivityPauseOutcome::newly_paused` /
+/// `ActivityResumeOutcome::newly_resumed`, mirroring how
+/// [`MetricsRecorder::record_workflow_paused`] is gated on `newly_paused`
+/// (issue #383). Both mutations are idempotent by design, so an operator
+/// retry after a lost response must not read as a second hold.
+///
+/// **Cardinality (ADR-0001 §7).** `activity` is bounded **by bucketing**, not by
+/// validation. `activity_pause::validate_activity_name` bounds the name's
+/// *length*, not its *cardinality*, and the pause routes deliberately accept an
+/// **unregistered** name (so an operator can pre-pause an activity before its
+/// fleet rolls out, and a paused-but-unregistered hold stays inspectable) — so
+/// the raw name is caller-controlled free text. The emitter therefore resolves
+/// it against the registered activity catalogue and substitutes
+/// [`UNREGISTERED_ACTIVITY_NAME`] when it is absent, keeping the label bounded
+/// to the app's real activity set plus one sentinel series. Same fix, and same
+/// reason, as the #684 update-name label. `action` is bounded to two values by
+/// construction ([`ActivityPauseAction`]). `execution.id` is span-only and MUST
+/// NOT appear here.
+///
+/// The plain `activity` label (not the dotted `activity.name`) is the right
+/// one: the dotted variant exists solely so the circuit-breaker counters
+/// (issue #369) can match the ADR-0001 `activity.name` *span* attribute, while
+/// every other activity counter — `attempts`, `retries`, `panic`,
+/// `rate_limit.throttled` — uses [`METRIC_LABEL_ACTIVITY`].
+pub const METRIC_ACTIVITY_PAUSE_ACTIONS: &str = "harvest.activity.pause_actions";
+
 /// Counter: incremented when a durable timer is persisted.
 pub const METRIC_TIMER_STARTED: &str = "harvest.timer.started";
 
@@ -637,6 +686,20 @@ pub const METRIC_DEBOUNCE_FIRED: &str = "harvest.workflow.debounce_fired";
 /// `GET /admin/start-throttle` admin read instead. `execution.id` is span-only
 /// and must never appear here.
 pub const METRIC_WORKFLOW_START_THROTTLED: &str = "harvest.workflow.start_throttled";
+
+/// Counter: incremented exactly once per in-flight run superseded by a newer
+/// admission under `ConcurrencyOnConflict::CancelRunning` (issue #811).
+///
+/// A latest-wins start that sheds K incumbents emits K samples. A `Defer` start
+/// (the default), an attach, and an admission that was already under its limit
+/// all emit nothing.
+///
+/// Labeled by `workflow` (workflow type name) only. The resolved concurrency key
+/// is high-cardinality (tenant/entity input), so per ADR-0001 §7 it is
+/// deliberately **not** a metric label — per-key state is exposed via the
+/// `GET /admin/concurrency` admin read instead. `execution.id` is span-only and
+/// must never appear here.
+pub const METRIC_CONCURRENCY_SUPERSEDED: &str = "harvest.concurrency.superseded";
 
 /// Counter: incremented exactly once per real saga compensation sequence
 /// (issue #801).
@@ -1135,6 +1198,26 @@ pub const METRIC_UPDATE_DURATION: &str = "harvest.update.duration";
 /// mislabeling any legitimately-registered (declarative or imperative) handler.
 pub const UNREGISTERED_UPDATE_NAME: &str = "__unregistered__";
 
+/// Sentinel `activity` label for [`METRIC_ACTIVITY_PAUSE_ACTIONS`] when the
+/// paused name is not in this process's registered activity catalogue
+/// (issue #807).
+///
+/// The pause routes deliberately accept an **unregistered** name: an operator
+/// must be able to pre-pause an activity type before its worker fleet rolls
+/// out, and a paused-but-unregistered activity is a real hold that must remain
+/// inspectable. That makes the raw name caller-controlled free text (bounded in
+/// *length* by `activity_pause::MAX_ACTIVITY_NAME_LEN`, but not in
+/// *cardinality*), which ADR-0001 §7 forbids as a metric label — a buggy
+/// remediation loop templating a tenant id into the name would mint unbounded
+/// permanent series.
+///
+/// Bucketing exactly that case here keeps the label bounded to the app's real
+/// activity set plus this one extra series, without mislabeling any legitimately
+/// registered activity. The durable `harvest_activity_pauses` row and the read
+/// API keep the raw name; only the metric label is bucketed. Same shape and
+/// same reasoning as [`UNREGISTERED_UPDATE_NAME`].
+pub const UNREGISTERED_ACTIVITY_NAME: &str = "__unregistered__";
+
 /// Bounded outcome classification for a worker-session acquisition attempt
 /// (issue #606).
 ///
@@ -1378,6 +1461,13 @@ pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
 /// Metric label: adaptive slot-tuner decision (`"grow"` / `"shrink"` / `"hold"`,
 /// issue #548).
 pub const METRIC_LABEL_DECISION: &str = "decision";
+/// Metric label: the operator action taken on an activity-type pause
+/// (`"pause"` / `"resume"`, issue #807).
+///
+/// Bounded by construction to the [`ActivityPauseAction`] variants — a call
+/// site passes the enum's `as_str()`, never a free string (same discipline as
+/// [`METRIC_LABEL_SCANNER`] and [`METRIC_LABEL_DECISION`]).
+pub const METRIC_LABEL_ACTION: &str = "action";
 /// Metric label: background control loop identity (issue #797).
 ///
 /// Bounded by construction to the [`Scanner`](crate::scanner_health::Scanner)
@@ -1801,6 +1891,32 @@ impl TunerDecision {
     }
 }
 
+/// The operator action taken on an activity-type pause (issue #807), used as
+/// the bounded `action` label on [`METRIC_ACTIVITY_PAUSE_ACTIONS`].
+///
+/// Exists so the label can never be a free string: the two values are the only
+/// two mutations `activity_pause` exposes, so cardinality is bounded by the
+/// type system rather than by convention (same reason [`TunerDecision`] and
+/// [`SlotType`] exist).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityPauseAction {
+    /// Dispatch for the activity type was held.
+    Pause,
+    /// A previously held activity type was released.
+    Resume,
+}
+
+impl ActivityPauseAction {
+    /// Stable string representation, suitable for metric tag values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+        }
+    }
+}
+
 /// Sink for the harvest engine's standard metrics.
 ///
 /// Implementations fan these calls into an OpenTelemetry meter (or whatever
@@ -2208,6 +2324,16 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (key, deferred);
     }
 
+    /// A running execution was superseded by a newer admission for the same
+    /// concurrency key under `ConcurrencyOnConflict::CancelRunning` (issue #811).
+    ///
+    /// Maps to the counter [`METRIC_CONCURRENCY_SUPERSEDED`]. Called once per
+    /// superseded run. The concurrency key is deliberately not a label
+    /// (ADR-0001 §7 cardinality rule).
+    fn record_concurrency_superseded(&self, workflow: &str) {
+        let _ = workflow;
+    }
+
     /// Record the current available tokens for a rate limit bucket key.
     ///
     /// Maps to the gauge `harvest.rate_limit.tokens_available{key}`.
@@ -2256,6 +2382,24 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge `harvest_queue_paused{queue}`.
     fn record_queue_paused(&self, queue: &str, paused: bool) {
         let _ = (queue, paused);
+    }
+
+    /// An operator paused or resumed dispatch for a whole activity type
+    /// (issue #807).
+    ///
+    /// Emitted from the pause/resume write path, **gated on the action having
+    /// genuinely changed state** (`newly_paused` / `newly_resumed`) so an
+    /// idempotent retry after a lost response does not read as a second hold —
+    /// the same gating [`record_workflow_paused`](Self::record_workflow_paused)
+    /// uses (issue #383).
+    ///
+    /// **Cardinality (ADR-0001 §7):** `activity_name` MUST be the validated,
+    /// canonicalised registered activity name (bounded); `action` is bounded to
+    /// two values by [`ActivityPauseAction`]. `execution.id` is never a label.
+    ///
+    /// Maps to the counter `harvest_activity_pause_actions_total{activity, action}`.
+    fn record_activity_pause_action(&self, activity_name: &str, action: ActivityPauseAction) {
+        let _ = (activity_name, action);
     }
 
     /// Periodic snapshot of a worker's dispatch-slot occupancy for one slot
@@ -2975,6 +3119,30 @@ pub fn emit_workflow_terminal<M: MetricsRecorder + ?Sized>(
     metrics.record_workflow_terminal(workflow_name, queue, outcome);
 }
 
+/// Emit [`METRIC_CONCURRENCY_SUPERSEDED`] once per superseded run (issue #811).
+///
+/// Callers reach this through [`crate::execution::emit_start_cancel_metrics`],
+/// which walks the [`crate::execution::StartCancelledRun`] list a start returns
+/// and emits this counter for every entry whose `superseded` flag is set. It
+/// MUST be called only **after** the outer transaction commits — a rollback
+/// would otherwise leave a phantom count for a supersede that never became
+/// durable.
+///
+/// Canary probe workflows (issue #796) are excluded, mirroring
+/// [`emit_workflow_terminal`], so the synthetic liveness canary can never move a
+/// business-facing counter.
+pub fn emit_concurrency_superseded<M: MetricsRecorder + ?Sized>(
+    metrics: &M,
+    superseded_workflow_names: &[String],
+) {
+    for workflow_name in superseded_workflow_names {
+        if crate::canary::is_canary_workflow(workflow_name) {
+            continue;
+        }
+        metrics.record_concurrency_superseded(workflow_name);
+    }
+}
+
 /// Default metrics recorder that discards every sample.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoOpMetrics;
@@ -3253,6 +3421,11 @@ mod tests {
             "harvest.schedule.decision_write_failed"
         );
         assert_eq!(METRIC_RETENTION_DELETED, "harvest.retention.deleted");
+        // issue #811: latest-wins concurrency supersede counter.
+        assert_eq!(
+            METRIC_CONCURRENCY_SUPERSEDED,
+            "harvest.concurrency.superseded"
+        );
         assert_eq!(METRIC_SUMMARY_DELETED, "harvest.retention.summary_deleted");
         // issue #618: exempt-by-design start producers increment this counter.
         assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
@@ -3437,6 +3610,67 @@ mod tests {
             6,
             "should emit once for each of the 6 terminal outcomes"
         );
+    }
+
+    #[test]
+    fn emit_concurrency_superseded_skips_canary_and_records_business_workflows() {
+        // Issue #811 AC7: the counter fires exactly once per superseded run,
+        // carrying the SUPERSEDED run's workflow name. Canary probes are
+        // excluded, mirroring `emit_workflow_terminal`, so the synthetic
+        // liveness canary can never move a business-facing counter.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct SupersededCounter(AtomicUsize, std::sync::Mutex<Vec<String>>);
+        impl MetricsRecorder for SupersededCounter {
+            fn record_concurrency_superseded(&self, workflow: &str) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                self.1.lock().unwrap().push(workflow.to_owned());
+            }
+        }
+
+        let counter = Arc::new(SupersededCounter::default());
+
+        // An empty list (the overwhelmingly common `Defer` path) emits nothing.
+        emit_concurrency_superseded(counter.as_ref(), &[]);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+
+        // A canary probe records NOTHING.
+        emit_concurrency_superseded(
+            counter.as_ref(),
+            &[
+                crate::canary::CANARY_WORKFLOW_NAME_PREFIX.to_owned(),
+                "__harvest_canary_probe__default".to_owned(),
+            ],
+        );
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            0,
+            "a canary probe must never increment harvest.concurrency.superseded"
+        );
+
+        // Business workflows emit exactly once per superseded run, in order,
+        // including the same name twice when limit = N sheds two runs.
+        emit_concurrency_superseded(
+            counter.as_ref(),
+            &[
+                "doc_index".to_owned(),
+                "doc_index".to_owned(),
+                "checkout".to_owned(),
+            ],
+        );
+        assert_eq!(counter.0.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            counter.1.lock().unwrap().as_slice(),
+            &["doc_index", "doc_index", "checkout"],
+            "the counter must carry the superseded run's workflow name, once per run"
+        );
+
+        // Also works through a `&*Arc<dyn MetricsRecorder>` erased reference.
+        let erased: Arc<dyn MetricsRecorder> = counter.clone();
+        emit_concurrency_superseded(&*erased, &["billing".to_owned()]);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 4);
     }
 
     #[test]
@@ -3816,6 +4050,41 @@ mod tests {
         assert_eq!(TunerDecision::Grow.as_str(), "grow");
         assert_eq!(TunerDecision::Shrink.as_str(), "shrink");
         assert_eq!(TunerDecision::Hold.as_str(), "hold");
+    }
+
+    // -----------------------------------------------------------------------
+    // Activity-type pause/resume counter (issue #807)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn activity_pause_actions_counter_has_correct_name_and_labels() {
+        // OTel semantic naming: instrument.noun (dot-separated). Deliberately
+        // NOT `harvest.activity.paused`: `harvest.queue.paused` is a gauge
+        // (#619) and `harvest.workflow.paused` is a counter (#383), so a third
+        // reuse of that noun would be ambiguous about instrument type.
+        assert_eq!(
+            METRIC_ACTIVITY_PAUSE_ACTIONS,
+            "harvest.activity.pause_actions"
+        );
+        assert_eq!(METRIC_LABEL_ACTION, "action");
+        // The plain `activity` label, not the dotted circuit-breaker variant.
+        assert_eq!(METRIC_LABEL_ACTIVITY, "activity");
+    }
+
+    #[test]
+    fn activity_pause_action_stringify_is_bounded() {
+        assert_eq!(ActivityPauseAction::Pause.as_str(), "pause");
+        assert_eq!(ActivityPauseAction::Resume.as_str(), "resume");
+    }
+
+    #[test]
+    fn activity_pause_action_counter_has_a_default_noop_impl() {
+        // record_activity_pause_action must exist on MetricsRecorder with a
+        // no-op default so adding it is not a breaking change for existing
+        // implementers (issue #807).
+        let rec = NoOpMetrics;
+        rec.record_activity_pause_action("charge_card", ActivityPauseAction::Pause);
+        rec.record_activity_pause_action("charge_card", ActivityPauseAction::Resume);
     }
 
     #[test]

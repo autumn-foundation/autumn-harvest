@@ -52,10 +52,7 @@ fn workflow_info_with_concurrency_policy() {
         execution_timeout: None,
         chain_execution_timeout: None,
         sla: None,
-        concurrency: Some(ConcurrencyPolicy {
-            key_expr: "input.tenant_id",
-            limit: 10,
-        }),
+        concurrency: Some(ConcurrencyPolicy::new("input.tenant_id", 10)),
 
         debounce: None,
         batch: None,
@@ -138,10 +135,7 @@ fn resolve_against_non_object_input() {
 
 #[test]
 fn concurrency_policy_debug() {
-    let policy = ConcurrencyPolicy {
-        key_expr: "input.tenant_id",
-        limit: 5,
-    };
+    let policy = ConcurrencyPolicy::new("input.tenant_id", 5);
     let s = format!("{policy:?}");
     assert!(s.contains("tenant_id"));
     assert!(s.contains('5'));

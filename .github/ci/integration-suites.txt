@@ -54,6 +54,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          activity_default_floor_tests
 linux        autumn-harvest         integration                      -                          activity_info_tests
 linux        autumn-harvest         integration                      -                          activity_interceptor_tests
+linux        autumn-harvest         integration                      -                          activity_pause_tests
 linux        autumn-harvest         integration                      -                          admission_gate_authoritative
 linux        autumn-harvest         integration                      -                          auto_heartbeat_tests
 linux        autumn-harvest         integration                      -                          business_day_timer_tests
@@ -63,6 +64,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          child_timeout_tests
 linux        autumn-harvest         integration                      -                          claim_budget_tests
 linux        autumn-harvest         integration                      -                          completion_callback_tests
+linux        autumn-harvest         integration                      -                          concurrency_supersede_tests
 linux        autumn-harvest         integration                      -                          cross_type_continue_as_new_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_await_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_signal_tests
@@ -106,6 +108,7 @@ linux        autumn-harvest-plugin  build_ramp_integration           -          
 linux        autumn-harvest-plugin  by_id_integration                -                          -
 linux        autumn-harvest-plugin  canary_integration               -                          -
 linux        autumn-harvest-plugin  completion_triggers_integration  -                          -
+linux        autumn-harvest-plugin  concurrency_admin_integration    -                          -
 linux        autumn-harvest-plugin  conflict_policy_integration      -                          -
 linux        autumn-harvest-plugin  connector_integration            connectors                 -
 linux        autumn-harvest-plugin  connector_sqs_broker             sqs                        -
@@ -130,6 +133,7 @@ linux        autumn-harvest-plugin  replay_sample_export_integration  -         
 linux        autumn-harvest-plugin  run_chain_integration            -                          -
 linux        autumn-harvest-plugin  schedule_runs_integration        -                          -
 linux        autumn-harvest-plugin  shard_placement_integration      -                          -
+linux        autumn-harvest-plugin  stall_diagnosis_integration      -                          -
 linux        autumn-harvest-plugin  start_idempotency_integration    -                          -
 linux        autumn-harvest-plugin  start_source_integration         -                          -
 linux        autumn-harvest-plugin  start_throttle_integration       -                          -
@@ -139,6 +143,7 @@ linux        autumn-harvest-plugin  token_auth_integration           -          
 linux        autumn-harvest-plugin  triage_integration               -                          -
 linux        autumn-harvest-plugin  ui_integration                   -                          -
 linux        autumn-harvest-plugin  webhook_receiver_integration     webhooks                   -
+linux        autumn-harvest-plugin  workflow_children_traversal_perf -                          -
 linux        autumn-harvest-plugin  workflow_logs_integration        -                          -
 linux        autumn-harvest-plugin  workflow_reachability_integration  -                          -
 linux        autumn-harvest-plugin  workflow_rerun_integration       -                          -

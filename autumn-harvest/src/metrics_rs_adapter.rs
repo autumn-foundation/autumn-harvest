@@ -44,20 +44,22 @@
 use metrics::{Key, Label, counter, gauge, histogram};
 
 use crate::telemetry::{
-    ActivityStatus, ConnectorOutcome, METRIC_ACTIVITY_ATTEMPTS, METRIC_ACTIVITY_DURATION,
-    METRIC_ACTIVITY_FAILED, METRIC_ACTIVITY_PANIC, METRIC_ACTIVITY_RETRIES,
-    METRIC_ADMISSION_BLOCKED, METRIC_ADMISSION_BYPASSED, METRIC_ADMISSION_GATES_ACTIVE,
-    METRIC_CANARY_FAILURE, METRIC_CANARY_ROUNDTRIP, METRIC_CANARY_SUCCESS, METRIC_CIRCUIT_CLOSED,
-    METRIC_CIRCUIT_TRIPPED, METRIC_COMPLETION_TRIGGER_FIRED, METRIC_COMPLETION_TRIGGER_SKIPPED,
-    METRIC_CONNECTOR_DISPATCHED, METRIC_CONNECTOR_LAG, METRIC_CONNECTOR_POISONED,
-    METRIC_CONNECTOR_RECEIVED, METRIC_DEBOUNCE_FIRED, METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN,
-    METRIC_EXTERNAL_SIGNAL_SENT, METRIC_LABEL_ACTIVITY, METRIC_LABEL_ACTIVITY_NAME,
-    METRIC_LABEL_BUILD_ID, METRIC_LABEL_DECISION, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY,
-    METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME,
-    METRIC_LABEL_PATH, METRIC_LABEL_PRODUCER, METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE,
-    METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE, METRIC_LABEL_SCANNER, METRIC_LABEL_SCOPE,
-    METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATE,
-    METRIC_LABEL_STATUS, METRIC_LABEL_TASK_TYPE, METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW,
+    ActivityPauseAction, ActivityStatus, ConnectorOutcome, METRIC_ACTIVITY_ATTEMPTS,
+    METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED, METRIC_ACTIVITY_PANIC,
+    METRIC_ACTIVITY_PAUSE_ACTIONS, METRIC_ACTIVITY_RETRIES, METRIC_ADMISSION_BLOCKED,
+    METRIC_ADMISSION_BYPASSED, METRIC_ADMISSION_GATES_ACTIVE, METRIC_CANARY_FAILURE,
+    METRIC_CANARY_ROUNDTRIP, METRIC_CANARY_SUCCESS, METRIC_CIRCUIT_CLOSED, METRIC_CIRCUIT_TRIPPED,
+    METRIC_COMPLETION_TRIGGER_FIRED, METRIC_COMPLETION_TRIGGER_SKIPPED,
+    METRIC_CONCURRENCY_SUPERSEDED, METRIC_CONNECTOR_DISPATCHED, METRIC_CONNECTOR_LAG,
+    METRIC_CONNECTOR_POISONED, METRIC_CONNECTOR_RECEIVED, METRIC_DEBOUNCE_FIRED,
+    METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN, METRIC_EXTERNAL_SIGNAL_SENT, METRIC_LABEL_ACTION,
+    METRIC_LABEL_ACTIVITY, METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID,
+    METRIC_LABEL_DECISION, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY, METRIC_LABEL_KIND,
+    METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH,
+    METRIC_LABEL_PRODUCER, METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON,
+    METRIC_LABEL_REASON_CODE, METRIC_LABEL_SCANNER, METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD,
+    METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATE, METRIC_LABEL_STATUS,
+    METRIC_LABEL_TASK_TYPE, METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW,
     METRIC_LABEL_WORKFLOW_TYPE, METRIC_MUTEX_CONTENTION, METRIC_MUTEX_HELD, METRIC_MUTEX_WAIT,
     METRIC_PAYLOAD_BYTES, METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED,
     METRIC_PAYLOAD_REJECTED, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
@@ -321,6 +323,15 @@ impl MetricsRecorder for MetricsRsRecorder {
         .set(if paused { 1.0 } else { 0.0 });
     }
 
+    fn record_activity_pause_action(&self, activity_name: &str, action: ActivityPauseAction) {
+        counter!(
+            METRIC_ACTIVITY_PAUSE_ACTIONS,
+            METRIC_LABEL_ACTIVITY => activity_name.to_string(),
+            METRIC_LABEL_ACTION => action.as_str(),
+        )
+        .increment(1);
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn record_worker_slots(&self, slot_type: SlotType, in_use: u64, available: u64) {
         gauge!(
@@ -537,6 +548,14 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_KEY => key.to_owned(),
         )
         .set(deferred as f64);
+    }
+
+    fn record_concurrency_superseded(&self, workflow: &str) {
+        counter!(
+            METRIC_CONCURRENCY_SUPERSEDED,
+            METRIC_LABEL_WORKFLOW => workflow.to_owned(),
+        )
+        .increment(1);
     }
 
     fn record_workflow_cache_hit(&self, workflow_name: &str, queue: &str) {
@@ -1563,6 +1582,93 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Latest-wins concurrency supersede bridge (issue #811)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bridges_concurrency_superseded_with_workflow_label_only() {
+        // Real label-content assertion: a local `metrics::Recorder` captures
+        // the registered counter key, so a swapped label, a dropped label, or
+        // an accidentally-added `key` label (the concurrency key is resolved
+        // from workflow input and is unbounded — ADR-0001 §7 forbids it) is
+        // caught here rather than as a cardinality incident in production.
+        type CounterKey = (String, Vec<(String, String)>);
+
+        #[derive(Default)]
+        struct CapturingRecorder {
+            counters: std::sync::Mutex<Vec<CounterKey>>,
+        }
+
+        impl metrics::Recorder for &CapturingRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                self.counters.lock().unwrap().push((
+                    key.name().to_owned(),
+                    key.labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                ));
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_concurrency_superseded("doc_index");
+        });
+
+        let counters = capture.counters.lock().unwrap().clone();
+        assert_eq!(
+            counters.as_slice(),
+            &[(
+                METRIC_CONCURRENCY_SUPERSEDED.to_owned(),
+                vec![(METRIC_LABEL_WORKFLOW.to_owned(), "doc_index".to_owned())],
+            )],
+            "the bridge must register exactly the workflow label constant, \
+             with no concurrency-key label and no value swap"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Active-workflow gauge bridge (issue #770)
     // -----------------------------------------------------------------------
 
@@ -2003,6 +2109,100 @@ mod tests {
             "the capability-miss bridge must register harvest.task.capability_miss \
              with exactly the queue/task_type/outcome label constants, values \
              un-swapped, for BOTH bounded outcomes"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // inline CapturingRecorder boilerplate
+    fn bridges_activity_pause_actions_counter_with_bounded_labels() {
+        // Issue #807: a local `metrics::Recorder` captures the registered
+        // counter key, so a swapped or dropped label value in the pause-action
+        // bridge is caught here (not just no-panic). Both bounded `action`
+        // values are exercised, because an operator dashboard that cannot
+        // separate a hold from a release is useless during exactly the outage
+        // this lever exists for.
+        type CounterKey = (String, Vec<(String, String)>);
+
+        #[derive(Default)]
+        struct CapturingRecorder {
+            counters: std::sync::Mutex<Vec<CounterKey>>,
+        }
+
+        impl metrics::Recorder for &CapturingRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                self.counters.lock().unwrap().push((
+                    key.name().to_owned(),
+                    key.labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                ));
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_activity_pause_action("charge_card", ActivityPauseAction::Pause);
+            rec.record_activity_pause_action("charge_card", ActivityPauseAction::Resume);
+        });
+
+        let labels = |action: &str| {
+            vec![
+                (METRIC_LABEL_ACTIVITY.to_owned(), "charge_card".to_owned()),
+                (METRIC_LABEL_ACTION.to_owned(), action.to_owned()),
+            ]
+        };
+
+        let counters = capture.counters.lock().unwrap().clone();
+        assert_eq!(
+            counters.as_slice(),
+            &[
+                (METRIC_ACTIVITY_PAUSE_ACTIONS.to_owned(), labels("pause")),
+                (METRIC_ACTIVITY_PAUSE_ACTIONS.to_owned(), labels("resume")),
+            ],
+            "the activity-pause bridge must register harvest.activity.pause_actions \
+             with exactly the activity/action label constants, values un-swapped, \
+             for BOTH bounded actions"
         );
     }
 

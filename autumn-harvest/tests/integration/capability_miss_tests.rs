@@ -934,21 +934,36 @@ fn decoy_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'
 ///
 /// A `OnceLock` rather than a parameter because a `WorkflowHandlerFn` is a bare
 /// `fn` pointer with a fixed signature and cannot capture.
+///
+/// A **pool**, not a URL, for exactly the reason [`CLAIM_THEFT_INJECTION`]
+/// documents one round later: the invalidation has to land inside the dispatch
+/// window, and the whole body has only `executor::SUSPENSION_TIMEOUT` (100 ms)
+/// to reach a command-emitting suspension. A fresh
+/// `AsyncPgConnection::establish` pays a full TCP+auth handshake *inside* that
+/// window on a database this suite shares; blow the 100 ms and the dispatch is
+/// failed with "workflow suspended without emitted commands", the run goes
+/// terminal, and this test fails claiming the decision used a stale snapshot
+/// when in truth the body never reached the miss at all. The pool must be
+/// pre-warmed before the worker starts — see [`prewarm_race_injection`].
 static RACE_INJECTION: std::sync::OnceLock<(DbPool, String)> = std::sync::OnceLock::new();
 
-/// Force [`RACE_INJECTION`]'s lazy `deadpool` to establish a connection now,
-/// mirroring [`prewarm_claim_theft_injection`] for the identical reason: an
-/// unwarmed pool pays the TCP+auth handshake on its first `get()`, which is
-/// exactly the handshake the pool exists to keep out of the 100 ms window.
+/// Force [`RACE_INJECTION`]'s lazy `deadpool` to establish a connection now, so
+/// the in-body invalidation pays only a warm checkout plus one statement.
+///
+/// Round-trips rather than merely checking out, for the same reason
+/// [`prewarm_claim_theft_injection`] does: `deadpool` hands back a connection
+/// object before the first statement proves the TCP+auth handshake actually
+/// completed, and it is the handshake — not the checkout — that is slow under
+/// load.
 async fn prewarm_race_injection() {
-    let (pool, _peer) = RACE_INJECTION
+    let (pool, _) = RACE_INJECTION
         .get()
         .expect("race injection is armed before it is pre-warmed");
-    let mut conn = pool.get().await.expect("race injection pre-warm connects");
+    let mut conn = pool.get().await.expect("race pre-warm connects");
     diesel::sql_query("SELECT 1")
         .execute(&mut conn)
         .await
-        .expect("race injection pre-warm round-trips");
+        .expect("race pre-warm round-trips");
 }
 
 /// The deterministic injection point for the round-27 race: a workflow body
@@ -2655,18 +2670,18 @@ async fn peer_reregistering_mid_dispatch_is_seen_by_the_decision() {
     seed_prior_missing_workers(&url, exec_id, &["pod-a"], "claim_race_wf").await;
     seed_live_worker(&url, "pod-a", Q_CLAIM_RACE).await;
 
-    // Arm the injection the workflow body performs while holding the claim,
-    // and pre-warm its pool so the in-body checkout pays only the `UPDATE`
-    // (see `RACE_INJECTION`'s doc comment for why an unwarmed raw connect
-    // blows the 100 ms suspension budget under load). `is_ok()` rather than
-    // `expect()` because `OnceLock::set` hands the rejected value back in the
-    // `Err`, and a `DbPool` is not `Debug` (`AsyncPgConnection` is not).
+    // Arm the injection the workflow body performs while holding the claim.
+    // `assert!` rather than `expect()` because `OnceLock::set` hands the
+    // rejected value back in the `Err`, and a `DbPool` is not `Debug`
+    // (`AsyncPgConnection` is not).
     assert!(
         RACE_INJECTION
             .set((build_pool(&url), "pod-a".to_string()))
             .is_ok(),
         "race injection is armed exactly once per process"
     );
+    // Pay the TCP+auth handshake HERE, not inside the dispatch window. See
+    // `RACE_INJECTION`'s docs: the body has 100 ms total.
     prewarm_race_injection().await;
 
     let metrics = Arc::new(CapabilityMetrics::default());

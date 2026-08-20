@@ -843,6 +843,59 @@
     },
     {
       "method": "GET",
+      "path": "/workflows/{id}/diagnose",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Per-execution stall diagnosis (issue #809): answers \"is this run healthily waiting or pathologically stuck, and what is the actionable root cause?\" in one call, replacing the 4+ endpoint correlation an operator does by hand today. Returns a one-word triage `health` (`healthy` | `stalled` | `blocked_external` | `terminal`), a discriminated `blocked_on` object, and `last_event_age_seconds`. `blocked_on` is internally tagged on `type` (snake_case) and closed over: `healthy_in_progress`; `awaiting_signal` {signal_name, since?}; `sleeping_timer` {fires_at}; `pending_child` {child_exec_id, child_state}; `activity_retrying` {activity_name, attempt, last_error?, next_attempt_at?}; `activity_deferred` {activity_name?, next_attempt_at}; `activity_no_worker` {queue, activity_name?}; `activity_circuit_open` {activity_name, phase, cooldown_until?} (`phase` is `open` | `half_open`: a half-open breaker admits a probe right now and closes on success, whereas an operator-forced open one needs an explicit force-close -- both report no `cooldown_until`, so the phase is the only discriminator; because a half-open breaker clears with no operator action its `health` is `healthy`, not `stalled`); `activity_rate_limited` {key, activity_name?}; `activity_rate_limit_bucket_missing` {key, activity_name?} (the bucket row does not exist, so the claim gate's `EXISTS` refuses it forever -- `stalled`, unlike the refilling `activity_rate_limited`); `activity_concurrency_deferred` {key, activity_name?}; `activity_queue_paused` {queue, activity_name?}; `activity_paused` {activity_name} (an operator paused the activity TYPE (#807), so claim_task's paused_activities anti-join holds it on every queue on the shard -- distinct from the queue-wide activity_queue_paused, and ranked just under it because the queue pause is the broader lever); `awaiting_external_handoff` {token, activity_name?}; `paused` {actor?, since?}; `non_determinism_blocked` {since, reason?, block_count}; `awaiting_replay_wait` {wait_kind, name?, since?}; `workflow_no_worker` {queue}; `workflow_queue_paused` {queue}; `timer_overdue{fires_at,overdue_by_seconds}`, `no_pending_work`. Optional members are omitted, never null. Correlates, in a single shard-local read: the pending stack, per-queue worker liveness (the canonical #774 worker_covers_queue predicate, so it cannot drift from /admin/queue-coverage) -- a PENDING row asks whether any worker can claim it right now (Active only, since a Draining worker claims nothing new), while a HELD row asks whether its own recorded claimant is still alive (Active OR Draining, because a worker that has begun a graceful shutdown still runs its held work to completion) plus the row's own claim gates -- required build (#171/#604), required capabilities (#804) and session pin (#606), each evaluated against the SAME worker; an activity row with NO required_capabilities snapshot (a legacy or manual enqueue) is still gated by its REGISTERED handler's requires, mirroring claim_task's ineligible-activities gate, so an un-snapshotted row no worker can claim is reported as a stall rather than as healthy progress, the in-process circuit registry (#369, consulted via list() only -- never on_dispatch/force_* -- so diagnosing can never advance a breaker's phase; and because that registry is per worker PROCESS, its phase is reported only when this API replica's own co-located worker is the SOLE worker that could claim the row, since a peer replica whose breaker is closed can still dispatch it -- a fleet-wide outage is therefore deliberately under-reported rather than risking a false stall, and /admin/circuits per replica remains the authoritative per-breaker surface), rate-limit bucket and per-key concurrency saturation (shaped exactly like claim_task's own gates), the operator queue-pause table (#619), and the task row's own attempt/error/scheduled_at retry timing. Every activity row is classified and the WORST by a fixed cross-task precedence ladder wins (queue_paused, then activity_paused, no_worker, rate_limit_bucket_missing, circuit_open, concurrency_deferred, rate_limited, retrying, deferred, healthy), so one wedged slot in a wide fan-out is never masked by healthy siblings. Within a single row the three non-self-healing gates (queue_paused, no_worker, circuit_open) are checked first, then the not-yet-due branch, then the two self-healing gates: a task that is not yet due has not reached the claim gates at all, so reporting a momentarily-saturated bucket would drop the attempt/last_error/next_attempt_at an operator needs. A future scheduled_at alone does NOT mean failed-and-retrying -- the dispatcher also pushes a task forward with no failure at all (dispatch-time rate-limit deferral, which even decrements the claim-time attempt back down, plus session-capacity and capability-miss redelivery), so the not-yet-due branch reports activity_retrying only when there is failure evidence (a recorded error, which a later deferral never clears) and activity_deferred otherwise. A claimed (RUNNING) row is healthy only while a live worker still polls its queue -- a claimed row whose fleet is gone is a poison-pill orphan (#367), not progress. health is derived from the verdict class alone and never from event age, so a long durable sleep reports healthy no matter how old its last event is. contributing_reason_codes is the UNION of every claim-time impediment across ALL of the execution's activity rows -- not just the row blocked_on names -- so a lower-ranked cause is never hidden behind a higher-ranked sibling in a fan-out; it is sourced verbatim from the eligibility explainer's own pure task_intrinsic_impediment_reasons (#611) so the single-verdict and multi-reason surfaces cannot drift in how a cause is named. Worker liveness is the one reason that is NOT a claim-time gate, so it is reported for a HELD row too -- but keyed on the same question the verdict asks: a PENDING row on claim eligibility (an Active worker could claim it), a HELD row on its own recorded claimant's liveness (Active OR Draining). Without that split the codes contradict the verdict in both directions -- a row held by a live draining claimant would report healthy yet carry no_live_worker, and an orphan held by a dead claimant would OMIT it whenever a live Active peer happens to cover the queue. An awaited-but-unsent signal is visible only to the #615 replay drive, which is comparatively expensive and ranks below activities/handoffs/children, so it is consulted ONLY when the database-observable categories would otherwise resolve to sleeping_timer or no_pending_work -- wait_set reports replayed, history_only (with wait_set_reason: an upstream reason such as handler_not_registered passed through verbatim, else wait_set_unavailable when the replay errors, wait_set_timed_out when it exceeds the query timeout, or execution_went_terminal on a TOCTOU race) or not_consulted accordingly; the replay is bounded by the server's query timeout; the verdict is identical either way and the common wedged-activity path never pays for a replay. Every OTHER awaitable kind replay can name -- a command-less ctx.await_condition park, a durable mutex acquire (#691), an admitted update awaiting its handler, a parked external-workflow operation (#492/#757/#751) -- leaves no row in any side table this endpoint reads, so replay is the only source that can see it; those report awaiting_replay_wait (blocked_external) naming the kind. They are consulted BELOW every side-table cause, so they can only ever replace what would otherwise be a false no_pending_work and can never mask a more precise verdict such as sleeping_timer. Below every category above sits the run's OWN workflow task row (task_type = 'workflow'), consulted purely as a fallback so it can never mask a real cause: a held claim means the handler is executing this instant (healthy_in_progress -- the shape a long local activity holds while scheduling no queue row at all) but ONLY while a live worker still polls its queue, since a claim left behind by a crashed worker is a poison-pill orphan (#367) and reports workflow_no_worker; a PENDING row means the decision cycle is awaiting dispatch and is classified by the same hard-impediment-first ladder an activity row uses -- workflow_queue_paused when an operator holds that queue, then workflow_no_worker (the workflow-task analogue of the no-live-worker stall) when nothing polls it, which outranks a not-yet-due dispatcher deferral on purpose because, unlike a timed sleep, a deferral only self-heals if something claims the row when the timestamp arrives, then healthy_in_progress; and a parked row (RUNNING with a NULL worker, which advances on a wake rather than a claim) is left to the lost-task verdict unchanged. A terminal execution returns health = terminal with terminal_outcome and NO blocked_on. Payload-free apart from the task row's own error text: names, ids, timestamps and queue/bucket keys only -- never an activity input, signal payload or output. That one error string IS routed through read-path payload decoding (#608), exactly as /stack routes the same column for its own last_failure, so an admin never reads plaintext there and a ciphertext envelope here. Admin-gated (the eligibility endpoints' posture: the body names queue, rate-limit and concurrency keys plus fleet coverage state). Shard-local: routed O(1) from the exec id's embedded shard, no cross-shard fan-out. An unfired durable timer more than 60s past its deadline reports timer_overdue (stalled) rather than a healthy sleep -- but ONLY when that timer actually owns the workflow's wake. Timers fire when a worker claims the owning workflow task, and only persist_started_timer reschedules that task to the deadline; every *_park path (signal wait, mutex acquire, activity wait, scheduled activities, child workflows, external handoff) discards the armed deadline and parks the task on the thing being awaited, so a timer armed alongside one of those goes overdue as a matter of course and fires on that wait's completion wake. The verdict is therefore gated on the task row itself -- a claimed or parked row means some other wake owns the run, so the more precise handoff/child/signal cause is reported instead, and only a PENDING row long past its own scheduled_at is a genuinely missed timer wake. Conversely, a durable side-table wait does not advance on its own either: a timer fires only when a worker claims the owning workflow task, so a HARD impediment on that task -- an operator queue pause (#619) or no live poller -- outranks every timer verdict and reports workflow_queue_paused / workflow_no_worker, naming the queue an operator must fix rather than a sleep that can never end. Only the hard impediments are hoisted; the task row's ordinary healthy-dispatch result stays a fallback so it never masks the more specific sleeping_timer. It is checked BELOW the activity bucket on purpose (a wedged activity names the specific thing to fix); ranking it above the handoff/child/signal categories is harmless by construction, because every one of those parks the workflow task and a parked row is not awaiting a claim. When replay diverges, the engine BLOCKS the run (#603) rather than failing it: the execution stays RUNNING and its workflow task is re-pended at a capped-exponential backoff INDEFINITELY, which by row shape alone is identical to an ordinary dispatcher deferral -- so a permanently wedged run would otherwise report healthy_in_progress. The execution row's own nd_blocked_at is authoritative and reports non_determinism_blocked (stalled) carrying the recorded divergence, the block instant and the re-fire count. It is ranked directly under paused because it is the same class of fact -- an explicit state the engine stamped on the execution row, not an inference from a liveness proxy -- and it outranks every side-table cause because the block re-fires on EVERY decision cycle regardless of what those rows are doing; nothing is lost, since a pending activity's own impediments still reach the operator through contributing_reason_codes, which is a union across rows rather than the winner's reasons. paused stays above it, mirroring the engine: a pause observed under the row lock supersedes the block and re-parks instead. Appends no WorkflowEvent, performs no task-queue mutation, adds no migration -- safe to call repeatedly.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "workflow_id",
+          "workflow_name",
+          "state",
+          "health",
+          "blocked_on",
+          "summary",
+          "last_event_age_seconds",
+          "last_event_at",
+          "terminal_outcome",
+          "contributing_reason_codes",
+          "wait_set",
+          "wait_set_reason"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID."
+        },
+        {
+          "status": 401,
+          "description": "Admin credentials required."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found (including a classic DAG run, which is not on the execution path)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
+    },
+    {
+      "method": "GET",
       "path": "/workflows/{id}/run-chain",
       "category": "workflow",
       "read_only": true,
@@ -4572,7 +4625,7 @@
       "path": "/admin/concurrency",
       "category": "admin",
       "read_only": true,
-      "description": "Return per-activity concurrency statistics: configured cap, currently in-flight, and queued counts for each concurrency key.",
+      "description": "Return live per-key concurrency statistics, grouped by (concurrency_key, task_type) and summed across shards: configured cap (max_concurrent), currently in-flight, and queued (pending) counts. Each row also carries a workflows array attributing the key to the workflow type(s) observed on it, each with the effective on_conflict overflow strategy their registered policy declares (\"defer\" = wait for a slot, \"cancel_running\" = latest-wins, issue #811). A workflow declaring no concurrency policy reports \"defer\". The workflows array is omitted when empty. Latest-wins supersede is shard-local; see docs/sharding.md.",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -7222,6 +7275,207 @@
     },
     {
       "method": "GET",
+      "path": "/activities",
+      "category": "admin",
+      "read_only": true,
+      "description": "List every REGISTERED activity type with its current pause state (issue #807). The list is driven by the registered activity catalogue, not the pause table, so a healthy activity appears with `paused: false` -- the read is a fleet inventory an operator scans during an incident, and one that only listed the already-broken things could not answer \"is charge_card held?\". An activity that is paused but NOT registered in this process is still listed, flagged `registered: false`, so a mistyped hold can never become invisible on the one surface used to find it. Cross-shard: an unreachable shard is named in `unavailable_shards` and drops `status` to \"partial\" rather than failing the read. Admin only.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "activities",
+          "status",
+          "unavailable_shards"
+        ],
+        "notes": "Each entry carries activity_name, registered, queue_name, is_local, paused, paused_at, paused_reason, paused_actor, scope_shard_id, held_task_count (summed across shards), provenance_uniform, effective_scope, and a shards array of per-shard objects {shard_id, reason, paused_by, paused_at, scope_shard_id, held_task_count}. For an unpaused activity, paused is false and paused_at/paused_reason/paused_actor/scope_shard_id/effective_scope are null, held_task_count is 0 and shards is empty. queue_name and is_local are null for a paused-but-unregistered activity (this process has no catalogue entry to read them from); is_local matters because a local activity runs inline on the workflow worker and never takes a task-queue row, so a hold on one holds nothing. The top-level paused_reason/paused_actor/paused_at/scope_shard_id summarise the EARLIEST hold (tie-broken by shard id -- the same rule the pause mutation response uses, so the two surfaces never disagree). Because pause is idempotent and preserves the original provenance on a re-pause, a request landing over a pre-existing hold can leave shards disagreeing; provenance_uniform is false in that case and the shards array carries each shard's own story. Uniformity compares reason/paused_by/scope_shard_id and deliberately not paused_at, since each shard stamps its own NOW(). effective_scope (\"fleet\" | \"partial_fleet\" | \"shard\") reports what the hold ACTUALLY covers, derived from the shards that hold the activity versus the expected shard set (every pool plus every shard the router knows about) -- distinct from scope_shard_id, which records only the INTENT of the request that wrote each row. A fleet-wide pause that reached only some shards persists scope_shard_id = NULL on the shards it reached and no row at all on the ones it missed, so intent alone cannot distinguish it from a complete hold while the missed shards keep dispatching the activity; effective_scope is \"partial_fleet\" in that case (re-issue the pause). An unreachable shard counts as expected-but-not-holding -- the safe direction, since it may still be dispatching -- so a partial read also reports \"partial_fleet\". IMPORTANT: on a partial read, `paused: false` means only \"not paused on the shards that could be reached\" -- always check `status` before trusting a negative."
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 400,
+          "description": "Harvest runtime is not started (the registered activity catalogue is unavailable)."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/activities/{activity_name}",
+      "category": "admin",
+      "read_only": true,
+      "description": "Get one activity type's pause state (issue #807). Returns 404 when the name is neither registered in this process NOR currently paused anywhere the read could reach. The pause arm of that rule is deliberate: an activity that is actively holding work is a real thing an operator must be able to inspect and then resume, so 404-ing it merely because this process does not have its handler registered would be a lie told during exactly the incident the endpoint exists for. Admin only.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [
+        {
+          "name": "activity_name",
+          "in": "path",
+          "required": true,
+          "description": "The activity type to inspect, matched EXACTLY (no trimming) against both the registered catalogue and the pause table."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "activity",
+          "status",
+          "unavailable_shards"
+        ],
+        "notes": "`activity` is a single entry with the same shape as one element of `GET /activities` (see its notes). `status`/`unavailable_shards` are reported here too, and for the same reason: on a partial read `paused: false` means only \"not paused on the shards that could be reached\". A 404 is only returned when EVERY expected shard was inspected: the routes deliberately accept unregistered names, so \"not in this process's catalogue and no pause row on the shards that answered\" is reachable with a live hold sitting on a shard that did not answer, and asserting nonexistence there would deny a hold that is actively holding work. While any shard is unaccounted for the read fails closed with 503 naming those shards -- the same rule the (workflow_name, workflow_id) resolver applies."
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 404,
+          "description": "The activity is neither registered in this process nor currently paused, AND every expected shard was inspected. A miss on an incomplete read is reported as 503 instead, so a 404 always means a fully-observed absence."
+        },
+        {
+          "status": 400,
+          "description": "Harvest runtime is not started (the registered activity catalogue is unavailable)."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured, OR the activity was not found while at least one expected shard could not be inspected -- the read fails closed rather than returning a 404 that could deny a live hold on the unreachable shard. The message names the shard(s) to re-check."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/activities/{activity_name}/pause",
+      "category": "admin",
+      "read_only": false,
+      "description": "Hold dispatch for ONE activity type, fleet-wide, during a scoped downstream outage (issue #807). This is the surgical sibling of the queue pause (issue #619): use it when many activity types share a queue and holding the whole queue would also stop healthy work. While paused, no worker claims NEW tasks of that activity type; held tasks stay PENDING and are never failed, retried, or dead-lettered, and an already-RUNNING attempt finishes naturally. The relative `schedule_to_start` timer is suspended for held tasks; the absolute `schedule_to_close` deadline (issue #378) keeps ticking, so a long hold can still time out work carrying one -- a pause is not an SLA extension. The hold is applied on EVERY shard: it is fleet-wide by construction and there is no shard-scoped variant on this route. Idempotent: re-pausing an already-paused type is a 200 no-op that preserves the original reason and operator (`newly_paused: false`). Body and both of its fields are optional -- during an incident, containment must not wait on paperwork. A partially-applied hold is reported as 207, not 200 -- see the success-response notes. Admin only; audited as `activity.pause`, including rejected attempts. A pause is REFUSED with a 400 when the named activity is registered on this node as a LOCAL activity (`#[activity(local = true)]`): a local activity runs inline on the workflow worker and never takes a task-queue row, so the claim-path gate cannot hold it -- reporting a successful hold there would be a false green at exactly the moment an operator relies on it. Contain a local activity by pausing the queue its calling workflows dispatch on (issue #619), or via its circuit breaker if one is declared (issue #369).",
+      "idempotency": "Re-pausing an already-paused activity returns 200 with `newly_paused: false` and preserves the original reason, operator, `paused_at` AND `scope_shard_id`. The response always describes the hold that is actually in effect, never the request.",
+      "params": [
+        {
+          "name": "activity_name",
+          "in": "path",
+          "required": true,
+          "description": "The activity type to hold, matched EXACTLY. Leading or trailing whitespace is rejected with a 400 rather than trimmed: the hold is matched on exact equality, so a stray space would either hold nothing or hold a different activity while reporting success. Registration is NOT required -- a management process need not register every activity the fleet runs, so an unregistered name is accepted and surfaces on the read endpoints with `registered: false`. A registered name whose activity is LOCAL is rejected with a 400 (see the route description); an unregistered name is still accepted, since it may be a genuinely remote activity this node does not register."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable reason for the hold, surfaced on the read API and carried into the audit trail (the pause row is deleted on resume, so the audit row is the reason's only permanent home). Truncated to 500 characters. Defaults to \"operator pause (no reason given)\"."
+          },
+          {
+            "name": "actor",
+            "required": false,
+            "description": "Operator identity to record as `paused_by`. This is a LABEL, not authentication: it lets an automation attribute a hold to the human it acted for. The audit row always carries the AUTHENTICATED actor derived from the request headers and records the on-behalf-of relationship when the two differ, so this field can never rewrite the security trail. Defaults to the authenticated actor."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "status",
+          "activity_name",
+          "newly_paused",
+          "reason",
+          "paused_by",
+          "paused_at",
+          "scope_shard_id",
+          "held_task_count",
+          "provenance_uniform",
+          "shards",
+          "partial_failures"
+        ],
+        "notes": "A hold applied to only SOME shards returns 207 Multi-Status with `ok: false` and `status: \"partial\"`, plus a `partial_failures` string naming the shards that were not reached (including a shard the router knows about but this process has no pool for). The hold is NOT in effect fleet-wide in that case -- the missed shards keep dispatching -- so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`, and omits `partial_failures`. Cross-shard provenance: `held_task_count` is the fleet-wide sum, while the top-level `reason`/`paused_by`/`paused_at`/`scope_shard_id` describe the EARLIEST hold (tie-broken by shard id -- the same rule the read endpoints use). Because an idempotent re-pause preserves each shard's ORIGINAL provenance, a request landing over a pre-existing hold leaves the shards disagreeing: `shards` then carries every shard's own `{shard_id, newly_paused, reason, paused_by, paused_at, scope_shard_id, held_task_count}` and `provenance_uniform` is false. `provenance_uniform` compares `(reason, paused_by, scope_shard_id)` and deliberately NOT `paused_at`, since each shard stamps its own NOW(). `scope_shard_id` is always null for a hold placed by this route (fleet-wide); it is reported because the underlying column records the INTENT of whichever surface wrote each row."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Blank, whitespace-padded, or oversized activity name; or a malformed request body (unknown fields are rejected, so a typo cannot become a silently-ignored setting)."
+        },
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 500,
+          "description": "Every shard failed; no hold is in effect."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/activities/{activity_name}/resume",
+      "category": "admin",
+      "read_only": false,
+      "description": "Release a per-activity-type hold, fleet-wide (issue #807). Held tasks become immediately claimable again, and the time each task spent held is credited back to its `scheduled_at` so the thaw does not retroactively schedule-to-start-time-out the whole backlog. `released_reason`/`released_paused_by` echo the provenance of the hold that was released -- the pause row is deleted by the resume, so this is the last moment the *why* is recoverable. Body is optional and carries no fields; a bare POST resumes fleet-wide. Idempotent: resuming an activity that is not paused is a 200 no-op (`newly_resumed: false`). A partially-applied resume is reported as 207, not 200. Admin only; audited as `activity.resume`, including rejected attempts.",
+      "idempotency": "Resuming an activity that is not paused returns 200 with `newly_resumed: false`.",
+      "params": [
+        {
+          "name": "activity_name",
+          "in": "path",
+          "required": true,
+          "description": "The activity type to release, matched EXACTLY. Leading or trailing whitespace is rejected with a 400 rather than trimmed, symmetrically with the pause route -- see its description for why."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "status",
+          "activity_name",
+          "newly_resumed",
+          "released_task_count",
+          "paused_duration_secs",
+          "released_reason",
+          "released_paused_by",
+          "provenance_uniform",
+          "shards",
+          "partial_failures"
+        ],
+        "notes": "A resume applied to only SOME shards returns 207 Multi-Status with `ok: false`, `status: \"partial\"` and a `partial_failures` string. Work remains held on the shards that were not reached -- the safe direction, but not a completed thaw -- so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`. Cross-shard provenance: the resume DELETES the pause rows, so this response and the audit row are the ONLY surviving record of what was released. `released_task_count` is the fleet-wide sum and `paused_duration_secs` the longest hold; the top-level `released_reason`/`released_paused_by` describe THAT same longest-held shard (tie-broken by lowest shard id), so the duration and the story it is paired with always come from one shard. `shards` carries every shard's own `{shard_id, newly_resumed, released_task_count, paused_duration_secs, released_reason, released_paused_by}`, and `provenance_uniform` is false when the released shards disagree on `(released_reason, released_paused_by)`. A shard that was not paused contributes null provenance and is ignored by the summary."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Blank, whitespace-padded, or oversized activity name; or a request body that is not empty or `{}` (the route accepts no fields, so anything else is a typo)."
+        },
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 500,
+          "description": "Every shard failed; the hold may still be in effect."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/queues/{queue_name}/eligibility",
       "category": "queue",
       "read_only": true,
@@ -7249,7 +7503,7 @@
           "shards",
           "shard_errors"
         ],
-        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the queue's tasks. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker \u2014 a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed, sorted."
+        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the queue's tasks. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker \u2014 a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), queue_paused (an operator holds the task's whole queue \u2014 issue #619), activity_paused (an operator holds the task's activity type fleet-wide \u2014 issue #807; reported only for task_type='activity' rows, matching the claim gate, so a workflow task carrying the 'mixed_signal_suspension' sentinel in activity_name is never reported held), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed. The deliberate operator holds (activity_paused, queue_paused) lead the array \u2014 a pause reorders the reasons, it never suppresses a co-occurring impediment \u2014 and the remainder is alphabetical so the array is stable across polls."
       },
       "error_responses": [
         {
@@ -7292,7 +7546,7 @@
           "ineligible_workers",
           "summary"
         ],
-        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the task. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker \u2014 a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed, sorted."
+        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the task. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker \u2014 a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), queue_paused (an operator holds the task's whole queue \u2014 issue #619), activity_paused (an operator holds the task's activity type fleet-wide \u2014 issue #807; reported only for task_type='activity' rows, matching the claim gate, so a workflow task carrying the 'mixed_signal_suspension' sentinel in activity_name is never reported held), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed. The deliberate operator holds (activity_paused, queue_paused) lead the array \u2014 a pause reorders the reasons, it never suppresses a co-occurring impediment \u2014 and the remainder is alphabetical so the array is stable across polls."
       },
       "error_responses": [
         {

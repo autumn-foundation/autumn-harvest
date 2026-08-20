@@ -8,6 +8,8 @@ mod activity_failure_tests;
 mod activity_info_tests;
 mod activity_interceptor_tests;
 mod activity_outcome_metrics_tests;
+#[cfg(feature = "db")]
+mod activity_pause_tests;
 mod admission_gate_authoritative_tests;
 mod admission_gate_tests;
 mod alert_pack_docs;
@@ -40,6 +42,7 @@ mod claim_bench_support;
 mod claim_budget_tests;
 mod completion_callback_tests;
 mod concurrency_key_tests;
+mod concurrency_supersede_tests;
 mod context_headers_tests;
 #[cfg(feature = "db")]
 mod cross_type_continue_as_new_tests;

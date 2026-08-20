@@ -3005,6 +3005,187 @@ fn queue_pause_requires_a_reason() {
     );
 }
 
+// ── Per-activity-type pause/resume (issue #807) ───────────────────────────────
+
+#[test]
+fn activity_pause_maps_to_post_with_reason_and_actor() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "activity",
+        "pause",
+        "charge_card",
+        "--reason",
+        "payments provider outage",
+        "--actor",
+        "alice",
+    ])
+    .expect("activity pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/activities/charge_card/pause");
+    assert_eq!(
+        request.body,
+        Some(json!({ "reason": "payments provider outage", "actor": "alice" }))
+    );
+}
+
+#[test]
+fn activity_pause_without_flags_sends_an_empty_body() {
+    // Unlike `queue pause`, `--reason` is OPTIONAL here: containment must not
+    // wait on paperwork. Omitted flags must be absent from the body entirely so
+    // the server applies its own documented defaults, rather than being
+    // overwritten with an empty string.
+    let cli = Cli::try_parse_from(["harvest", "activity", "pause", "charge_card"])
+        .expect("activity pause args should parse without --reason");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/activities/charge_card/pause");
+    assert_eq!(
+        request.body,
+        Some(json!({})),
+        "omitted --reason/--actor must send NO field, not an empty string"
+    );
+}
+
+#[test]
+fn activity_pause_sends_only_the_flag_that_was_given() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "activity",
+        "pause",
+        "charge_card",
+        "--actor",
+        "pagerduty-bot",
+    ])
+    .expect("activity pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.body, Some(json!({ "actor": "pagerduty-bot" })));
+}
+
+#[test]
+fn activity_resume_maps_to_post_with_empty_body() {
+    let cli = Cli::try_parse_from(["harvest", "activity", "resume", "charge_card"])
+        .expect("activity resume args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/activities/charge_card/resume");
+    assert_eq!(request.body, Some(json!({})));
+}
+
+#[test]
+fn activity_list_maps_to_the_read_route() {
+    let cli = Cli::try_parse_from(["harvest", "activity", "list"])
+        .expect("activity list args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/activities");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn activity_list_json_flag_is_render_only_and_never_reaches_the_request() {
+    // `--json` selects the OUTPUT rendering, so it must not leak into the wire
+    // request as a query param or body field. Pinned because the read route is
+    // shared with the default table path: a leak would send the server an
+    // unknown param that a strict handler could reject.
+    let plain = Cli::try_parse_from(["harvest", "activity", "list"])
+        .expect("activity list args should parse")
+        .api_request()
+        .expect("request should build");
+    let json = Cli::try_parse_from(["harvest", "activity", "list", "--json"])
+        .expect("activity list --json args should parse")
+        .api_request()
+        .expect("request should build");
+
+    assert_eq!(json.method, ApiMethod::Get);
+    assert_eq!(json.path, "/activities");
+    assert_eq!(json.body, None);
+    assert_eq!(
+        plain, json,
+        "--json must produce a byte-identical request to the default table path"
+    );
+}
+
+#[test]
+fn activity_get_maps_to_the_single_read_route() {
+    let cli = Cli::try_parse_from(["harvest", "activity", "get", "charge_card"])
+        .expect("activity get args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/activities/charge_card");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn activity_list_accepts_the_documented_aliases() {
+    // `list-paused` mirrors the queue command an operator already knows, and
+    // `status` mirrors the other read subcommands. Both must reach the SAME
+    // route -- an alias that silently 404s is worse than no alias.
+    for alias in ["list", "list-paused", "status"] {
+        let cli = Cli::try_parse_from(["harvest", "activity", alias])
+            .unwrap_or_else(|e| panic!("activity {alias} should parse: {e}"));
+        let request = cli.api_request().expect("request should build");
+        assert_eq!(
+            request.path, "/activities",
+            "alias {alias} must map to the read route"
+        );
+    }
+
+    // The plural top-level alias, for parity with `harvest queues`.
+    let cli = Cli::try_parse_from(["harvest", "activities", "list"])
+        .expect("the `activities` top-level alias should parse");
+    assert_eq!(
+        cli.api_request().expect("request should build").path,
+        "/activities"
+    );
+}
+
+#[test]
+fn activity_pause_percent_encodes_the_activity_name() {
+    let cli = Cli::try_parse_from(["harvest", "activity", "pause", "charge card/eu"])
+        .expect("activity pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.path, "/activities/charge%20card%2Feu/pause",
+        "an activity name with a space or slash must not break out of the path segment"
+    );
+}
+
+#[test]
+fn activity_routes_reject_url_dot_segment_names() {
+    // Identical hazard to the queue path: the WHATWG URL parser collapses
+    // dot-segments AFTER `ApiRequest.path` is assembled, so an activity named
+    // `.` would silently rewrite `/activities/./pause` to `/activities/pause`
+    // -- a different route. Every subcommand that interpolates the name must
+    // reject it, including the reads (a `..` on `get` would target `/`).
+    for bad in [".", "..", "%2e", "%2E", "%2e%2e", "%2E%2E"] {
+        for verb in ["pause", "resume", "get"] {
+            let cli = Cli::try_parse_from(["harvest", "activity", verb, bad])
+                .unwrap_or_else(|e| panic!("activity {verb} {bad:?} should parse: {e}"));
+
+            assert!(
+                cli.api_request().is_err(),
+                "activity {verb} name {bad:?} normalizes away in the URL path \
+                 and must be rejected"
+            );
+        }
+    }
+}
+
 // ── Queue coverage (issue #774) ────────────────────────────────────────────
 
 #[test]
@@ -3140,4 +3321,36 @@ fn token_rotate_maps_to_post_create_replacement() {
     let request = cli.api_request().expect("request should build");
     assert_eq!(request.method, ApiMethod::Post);
     assert_eq!(request.path, "/admin/tokens");
+}
+
+/// Issue #809: `workflow diagnose` maps onto the read-only diagnose route, and
+/// `--json` is a render-only flag that must not alter the wire request.
+#[test]
+fn workflow_diagnose_maps_to_the_diagnose_route() {
+    for args in [
+        vec![
+            "harvest",
+            "workflow",
+            "diagnose",
+            "00000000-0000-0000-0000-000000000001",
+        ],
+        vec![
+            "harvest",
+            "workflow",
+            "diagnose",
+            "00000000-0000-0000-0000-000000000001",
+            "--json",
+        ],
+    ] {
+        let diagnose = Cli::try_parse_from(args).expect("workflow diagnose args should parse");
+        let diagnose_request = diagnose
+            .api_request()
+            .expect("diagnose request should build");
+        assert_eq!(diagnose_request.method, ApiMethod::Get);
+        assert_eq!(
+            diagnose_request.path,
+            "/workflows/00000000-0000-0000-0000-000000000001/diagnose"
+        );
+        assert_eq!(diagnose_request.body, None);
+    }
 }

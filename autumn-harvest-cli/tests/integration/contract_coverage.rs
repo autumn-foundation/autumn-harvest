@@ -307,6 +307,15 @@ fn workflow_awaitables_is_covered() {
 }
 
 #[test]
+fn workflow_diagnose_is_covered() {
+    assert_covered(&[
+        "workflow",
+        "diagnose",
+        "00000000-0000-0000-0000-000000000001",
+    ]);
+}
+
+#[test]
 fn workflow_tree_is_covered() {
     assert_covered(&["workflow", "tree", "00000000-0000-0000-0000-000000000001"]);
 }
@@ -1250,6 +1259,41 @@ fn queue_resume_is_covered() {
 #[test]
 fn queue_list_paused_is_covered() {
     assert_covered(&["queue", "list-paused"]);
+}
+
+// ── Per-activity-type pause/resume (issue #807) ───────────────────────────────
+
+#[test]
+fn activity_pause_is_covered() {
+    assert_covered(&["activity", "pause", "charge_card"]);
+    assert_body_fields_documented(&[
+        "activity",
+        "pause",
+        "charge_card",
+        "--reason",
+        "outage",
+        "--actor",
+        "alice",
+    ]);
+}
+
+#[test]
+fn activity_resume_is_covered() {
+    assert_covered(&["activity", "resume", "charge_card"]);
+    assert_body_fields_documented(&["activity", "resume", "charge_card"]);
+}
+
+#[test]
+fn activity_list_is_covered() {
+    assert_covered(&["activity", "list"]);
+    // `--json` only swaps the rendering, so it must still resolve to the same
+    // documented route rather than becoming an undocumented variant.
+    assert_covered(&["activity", "list", "--json"]);
+}
+
+#[test]
+fn activity_get_is_covered() {
+    assert_covered(&["activity", "get", "charge_card"]);
 }
 
 // ── Queue coverage (issue #774) ─────────────────────────────────────────────

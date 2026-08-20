@@ -1,0 +1,27 @@
+Timing is off.
+TRUNCATE TABLE
+INSERT 0 10000
+VACUUM
+        label         | heap_pages | avg_row_bytes 
+----------------------+------------+---------------
+ fresh-insert-no-caps |        213 |           165
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 10000
+VACUUM
+         label          | heap_pages | avg_row_bytes | avg_caps_col_bytes 
+------------------------+------------+---------------+--------------------
+ fresh-insert-with-caps |        304 |           237 |                 70
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 10000
+UPDATE 10000
+ANALYZE
+          label           | heap_pages | avg_row_bytes 
+--------------------------+------------+---------------
+ fresh-insert-then-update |        516 |           237
+(1 row)
+
+TRUNCATE TABLE

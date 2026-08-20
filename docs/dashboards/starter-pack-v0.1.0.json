@@ -2043,6 +2043,56 @@
             }
           ],
           "description": "Alert: harvest_activity_retry_storm (docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm) Alert: harvest_activity_retry_storm_critical (docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm) Retries actually enqueued per second \u2014 the authoritative retry-storm signal. Starter defaults: ticket > 5/s, page > 20/s, both over 5m."
+        },
+        {
+          "id": 929,
+          "type": "timeseries",
+          "title": "Activity pause/resume actions",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 64
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (activity, action) (increase(harvest_activity_pause_actions_total[1h]))",
+              "legendFormat": "{{activity}} {{action}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Operator pause/resume actions on an activity type, counted only when the action actually changed state (issue #807). A rare-event counter, so increase() over 1h rather than a per-second rate. This is the ACTION log, not the state: a bar here means someone pulled the lever, and a flat line means nothing about whether a hold is currently in effect \u2014 read GET /api/harvest/activities for that. Pair with the activity failure-rate panel: a pause immediately after a failure spike is the intended containment response, while pauses with no preceding spike are worth asking about."
         }
       ]
     },
@@ -3549,6 +3599,55 @@
             }
           ],
           "description": "Dispatches rescheduled because a rate-limit bucket was empty."
+        },
+        {
+          "id": 930,
+          "type": "timeseries",
+          "title": "Latest-wins supersedes",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 70
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow) (rate(harvest_concurrency_superseded_total{workflow=~\"$workflow\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Running executions cancelled because a newer run superseded them under the latest-wins concurrency strategy (on_conflict = cancel_running, issue #811). The concurrency key is deliberately not a label (unbounded tenant input) \u2014 use GET /admin/concurrency for per-key detail."
         }
       ]
     },

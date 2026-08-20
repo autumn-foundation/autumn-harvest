@@ -62,6 +62,8 @@ pub const fn full_migrations_sql() -> &'static str {
     include_str!(concat!(env!("OUT_DIR"), "/all_migrations_bundle.sql"))
 }
 
+/// Per-activity-type pause/resume for surgical outage containment (issue #807).
+pub mod activity_pause;
 /// Admission gate primitive for incident-response operators (issue #377).
 pub mod admission_gate;
 /// History analyzer and linter.
@@ -210,6 +212,8 @@ pub mod signal_handler;
 pub mod simulator;
 /// Adaptive worker dispatch-slot tuner (issue #548).
 pub mod slot_tuner;
+/// Per-execution stall diagnosis — the root-cause classifier (issue #809).
+pub mod stall_diagnosis;
 /// Request-scoped idempotency keys for plain workflow starts (issue #808).
 pub mod start_idempotency;
 /// OpenTelemetry integration: trace-context propagation and metrics.
@@ -456,6 +460,13 @@ pub use shard::ShardedDbPool;
 pub use shard::{ShardPlacement, ShardPlacementError, ShardRouter, ShardRouterParts};
 pub use signal_handler::SignalHandlerRegistry;
 pub use simulator::{SimulatorResult, WorkflowSimulator};
+pub use stall_diagnosis::{
+    AwaitedSignalFacts, BlockedOn, BlockingCircuitPhase, DiagnosisInputs, ExecutionHealth,
+    ExternalHandoffFacts, NdBlockFacts, PendingActivityFacts, PendingChildFacts, PendingTimerFacts,
+    ReplayWaitFacts, TIMER_OVERDUE_GRACE_SECONDS, WorkflowTaskFacts, activity_precedence,
+    classify_execution, classify_pending_activity, classify_workflow_task, summarize,
+    workflow_task_hard_impediment, workflow_wake_was_missed,
+};
 #[cfg(feature = "db")]
 pub use store::AwaitMode;
 pub use telemetry::{

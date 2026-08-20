@@ -783,53 +783,18 @@ impl WorkflowHandleClient {
         let queue_name = self.resolve_transactional_queue_name(&options);
         let defaults = self.resolve_transactional_start_defaults(info, &input);
 
-        let params = StartWorkflowParams {
-            workflow_name,
-            workflow_id,
-            exec_id,
-            input,
-            parent_id: options.parent_id,
-            queue_name: &queue_name,
-            execution_timeout: defaults.execution_timeout,
-            memo: options.memo.clone(),
-            search_attrs: options.search_attrs.clone(),
-            reuse_policy: options.reuse_policy,
-            conflict_policy: options.conflict_policy,
-            trace_context: None,
-            max_execution_timeout_ceiling: defaults.max_workflow_execution_timeout_ceiling,
-            chain_execution_timeout: defaults.chain_execution_timeout,
-            max_workflow_chain_timeout_ceiling: defaults.max_workflow_chain_timeout_ceiling,
-            inherited_chain_deadline_at: None,
-            concurrency_key: defaults.concurrency_key,
-            concurrency_limit: defaults.concurrency_limit,
-            priority: crate::types::Priority::default(),
-            max_workflow_input_bytes: defaults.max_workflow_input_bytes,
-            start_at: None,
-            delay: None,
-            max_workflow_start_delay: Some(defaults.max_workflow_start_delay),
-            owner: info.owner,
-            runbook_url: info.runbook_url,
-            severity: info.severity,
-            context_headers: None,
-            sla: defaults.sla,
-            schedule_id: None,
-            scheduled_for: None,
-            // 1 = first attempt (see `StartWorkflowParams::workflow_attempt`'s doc
-            // comment). Every other fresh-start call site in the workspace uses
-            // `1`; using `0` here would silently grant one extra retry attempt
-            // beyond a workflow's configured `max_attempts` (e.g. a
-            // `max_attempts = 1` "never retry" policy would still retry once,
-            // since `0 >= 1` is false on the first attempt).
-            workflow_attempt: 1,
-            workflow_retry_policy: info.retry_policy.clone(),
-            retry_of_exec_id: None,
-            max_workflow_attempts_ceiling: self.inner.max_workflow_attempts,
-            origin: None,
-            completion_callbacks: None,
-            start_source: StartSource::Transactional,
-            start_source_ref: None,
-            started_by: None,
-        };
+        let params = self.build_transactional_start_params(
+            TransactionalStartIdentity {
+                workflow_name,
+                workflow_id,
+                queue_name: &queue_name,
+                exec_id,
+                input,
+            },
+            info,
+            &options,
+            defaults,
+        );
 
         // Gated via `GateMode::CheckCached` (issue #618/#377 "halt beats pace"),
         // not `GateMode::Check` — the same choice `throttle.rs`/
@@ -887,7 +852,7 @@ impl WorkflowHandleClient {
                     StartedWorkflowExecution,
                     Vec<DeferredTriggerStart>,
                     Vec<(ExecutionId, String)>,
-                    Vec<(String, String)>,
+                    Vec<crate::execution::StartCancelledRun>,
                 ), HarvestError, _>(async |conn| {
                     let params = params;
                     start_or_load_workflow_execution_collect(
@@ -1151,6 +1116,76 @@ impl WorkflowHandleClient {
             .unwrap_or_else(|| "default".to_string())
     }
 
+    /// Assemble the [`StartWorkflowParams`] for a transactional start (issue
+    /// #763), from the already-validated request plus its resolved defaults.
+    ///
+    /// Extracted purely so `start_workflow_transactional` stays under the
+    /// workspace's `clippy::too_many_lines` budget; it has no behaviour of its
+    /// own beyond field assembly.
+    fn build_transactional_start_params<'a>(
+        &self,
+        identity: TransactionalStartIdentity<'a>,
+        info: &crate::info::WorkflowInfo,
+        options: &TransactionalStartOptions,
+        defaults: ResolvedStartDefaults,
+    ) -> StartWorkflowParams<'a> {
+        let TransactionalStartIdentity {
+            workflow_name,
+            workflow_id,
+            queue_name,
+            exec_id,
+            input,
+        } = identity;
+        StartWorkflowParams {
+            workflow_name,
+            workflow_id,
+            exec_id,
+            input,
+            parent_id: options.parent_id,
+            queue_name,
+            execution_timeout: defaults.execution_timeout,
+            memo: options.memo.clone(),
+            search_attrs: options.search_attrs.clone(),
+            reuse_policy: options.reuse_policy,
+            conflict_policy: options.conflict_policy,
+            trace_context: None,
+            max_execution_timeout_ceiling: defaults.max_workflow_execution_timeout_ceiling,
+            chain_execution_timeout: defaults.chain_execution_timeout,
+            max_workflow_chain_timeout_ceiling: defaults.max_workflow_chain_timeout_ceiling,
+            inherited_chain_deadline_at: None,
+            concurrency_key: defaults.concurrency_key,
+            concurrency_limit: defaults.concurrency_limit,
+            concurrency_on_conflict: defaults.concurrency_on_conflict,
+            priority: crate::types::Priority::default(),
+            max_workflow_input_bytes: defaults.max_workflow_input_bytes,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: Some(defaults.max_workflow_start_delay),
+            owner: info.owner,
+            runbook_url: info.runbook_url,
+            severity: info.severity,
+            context_headers: None,
+            sla: defaults.sla,
+            schedule_id: None,
+            scheduled_for: None,
+            // 1 = first attempt (see `StartWorkflowParams::workflow_attempt`'s doc
+            // comment). Every other fresh-start call site in the workspace uses
+            // `1`; using `0` here would silently grant one extra retry attempt
+            // beyond a workflow's configured `max_attempts` (e.g. a
+            // `max_attempts = 1` "never retry" policy would still retry once,
+            // since `0 >= 1` is false on the first attempt).
+            workflow_attempt: 1,
+            workflow_retry_policy: info.retry_policy.clone(),
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: self.inner.max_workflow_attempts,
+            origin: None,
+            completion_callbacks: None,
+            start_source: StartSource::Transactional,
+            start_source_ref: None,
+            started_by: None,
+        }
+    }
+
     /// Resolve every `WorkflowInfo`-derived (and client-ceiling-derived)
     /// default for a transactional start (issue #763), mirroring
     /// `POST /workflows/{name}/start`'s resolution exactly. Returns owned
@@ -1168,6 +1203,12 @@ impl WorkflowHandleClient {
             .as_ref()
             .and_then(|policy| crate::concurrency::resolve_concurrency_key(policy.key_expr, input));
         let concurrency_limit = info.concurrency.as_ref().map(|policy| policy.limit);
+        let concurrency_on_conflict = info
+            .concurrency
+            .as_ref()
+            .map_or(crate::concurrency::ConcurrencyOnConflict::Defer, |policy| {
+                policy.on_conflict
+            });
 
         let execution_timeout = info
             .execution_timeout
@@ -1198,6 +1239,7 @@ impl WorkflowHandleClient {
         ResolvedStartDefaults {
             concurrency_key,
             concurrency_limit,
+            concurrency_on_conflict,
             execution_timeout,
             sla,
             chain_execution_timeout,
@@ -1230,7 +1272,7 @@ impl WorkflowHandleClient {
         StartedWorkflowExecution,
         Vec<DeferredTriggerStart>,
         Vec<(ExecutionId, String)>,
-        Vec<(String, String)>,
+        Vec<crate::execution::StartCancelledRun>,
     )> {
         let new_exec_id = params.exec_id;
         let shard_id = params.shard_id();
@@ -1248,7 +1290,7 @@ impl WorkflowHandleClient {
             StartedWorkflowExecution,
             Vec<DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
-            Vec<(String, String)>,
+            Vec<crate::execution::StartCancelledRun>,
         ), HarvestError, _>(async |conn| {
             let params = params;
             let workflow_name = params.workflow_name.to_string();
@@ -1410,12 +1452,26 @@ impl TransactionalStartOptions {
     }
 }
 
+/// Caller-supplied identity for one transactional start (issue #763): the
+/// borrowed name/id/queue plus the freshly-minted execution id and input.
+///
+/// Bundled purely so [`WorkflowHandleClient::build_transactional_start_params`]
+/// stays within the workspace's argument-count lint; it carries no behaviour.
+struct TransactionalStartIdentity<'a> {
+    workflow_name: &'a str,
+    workflow_id: &'a str,
+    queue_name: &'a str,
+    exec_id: ExecutionId,
+    input: Value,
+}
+
 /// Owned, `WorkflowInfo`-derived defaults resolved for a transactional start
 /// (issue #763) — see
 /// [`WorkflowHandleClient::resolve_transactional_start_defaults`].
 struct ResolvedStartDefaults {
     concurrency_key: Option<String>,
     concurrency_limit: Option<u32>,
+    concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict,
     execution_timeout: Option<chrono::Duration>,
     sla: Option<chrono::Duration>,
     chain_execution_timeout: Option<chrono::Duration>,
@@ -1436,7 +1492,7 @@ struct ResolvedStartDefaults {
 struct PendingStartFollowUps {
     starts: Vec<DeferredTriggerStart>,
     checks: Vec<(ExecutionId, String)>,
-    cancel_metrics: Vec<(String, String)>,
+    cancel_metrics: Vec<crate::execution::StartCancelledRun>,
 }
 
 /// Result of a staged, in-transaction workflow start (issue #763).
@@ -1520,14 +1576,10 @@ impl TransactionalStartOutcome {
                 }
             }
         }
-        for (workflow_name, queue_name) in self.deferred.cancel_metrics {
-            crate::telemetry::emit_workflow_terminal(
-                self.client.inner.metrics.as_ref(),
-                &workflow_name,
-                &queue_name,
-                crate::telemetry::WorkflowStatus::Cancelled,
-            );
-        }
+        crate::execution::emit_start_cancel_metrics(
+            self.client.inner.metrics.as_ref(),
+            &self.deferred.cancel_metrics,
+        );
     }
 }
 

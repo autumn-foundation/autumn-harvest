@@ -26,6 +26,8 @@ use crate::attr_util::is_valid_task_duration;
 struct ConcurrencyArgs {
     key_expr: String,
     limit: u32,
+    /// Overflow strategy (issue #811). `None` = the default `Defer`.
+    on_conflict: Option<String>,
 }
 
 struct DebounceArgs {
@@ -327,6 +329,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         } else if meta.path.is_ident("concurrency") {
             let mut key_expr: Option<String> = None;
             let mut limit: Option<u32> = None;
+            let mut on_conflict: Option<String> = None;
             meta.parse_nested_meta(|inner| {
                 if inner.path.is_ident("key") {
                     let value: LitStr = inner.value()?.parse()?;
@@ -340,8 +343,19 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                     }
                     limit = Some(n);
                     Ok(())
+                } else if inner.path.is_ident("on_conflict") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    let raw = value.value();
+                    if !matches!(raw.as_str(), "defer" | "cancel_running") {
+                        return Err(syn::Error::new(
+                            value.span(),
+                            "concurrency on_conflict must be \"defer\" or \"cancel_running\"",
+                        ));
+                    }
+                    on_conflict = Some(raw);
+                    Ok(())
                 } else {
-                    Err(inner.error("expected `key` or `limit`"))
+                    Err(inner.error("expected `key`, `limit`, or `on_conflict`"))
                 }
             })?;
             let key_expr = key_expr.ok_or_else(|| {
@@ -356,7 +370,11 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                     "concurrency requires `limit = N`",
                 )
             })?;
-            result.concurrency = Some(ConcurrencyArgs { key_expr, limit });
+            result.concurrency = Some(ConcurrencyArgs {
+                key_expr,
+                limit,
+                on_conflict,
+            });
             Ok(())
         } else if meta.path.is_ident("debounce") {
             let mut key_expr: Option<String> = None;
@@ -819,15 +837,25 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Emit concurrency as Option<ConcurrencyPolicy>.
     let concurrency_expr = match attrs.concurrency {
         None => quote! { ::std::option::Option::None },
-        Some(ConcurrencyArgs { key_expr, limit }) => {
-            quote! {
-                ::std::option::Option::Some(
-                    ::autumn_harvest::concurrency::ConcurrencyPolicy {
-                        key_expr: #key_expr,
-                        limit: #limit,
-                    }
-                )
-            }
+        Some(ConcurrencyArgs {
+            key_expr,
+            limit,
+            on_conflict,
+        }) => {
+            let policy = quote! {
+                ::autumn_harvest::concurrency::ConcurrencyPolicy::new(#key_expr, #limit)
+            };
+            // Only emit `.with_on_conflict(..)` when the author asked for a
+            // non-default strategy, so the omitted case stays byte-identical.
+            let policy = match on_conflict.as_deref() {
+                Some("cancel_running") => quote! {
+                    #policy.with_on_conflict(
+                        ::autumn_harvest::concurrency::ConcurrencyOnConflict::CancelRunning,
+                    )
+                },
+                _ => policy,
+            };
+            quote! { ::std::option::Option::Some(#policy) }
         }
     };
 
@@ -1149,11 +1177,11 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
                     });
 
-                    let (concurrency_key, concurrency_limit) = if let Some(ref policy) = info.concurrency {
+                    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = if let Some(ref policy) = info.concurrency {
                         let key = ::autumn_harvest::concurrency::resolve_concurrency_key(&policy.key_expr, &input);
-                        (key, Some(policy.limit))
+                        (key, Some(policy.limit), policy.on_conflict)
                     } else {
-                        (None, None)
+                        (None, None, ::autumn_harvest::concurrency::ConcurrencyOnConflict::Defer)
                     };
 
                     let execution_timeout = match opts.execution_timeout.or(info.execution_timeout) {
@@ -1226,6 +1254,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         inherited_chain_deadline_at: ::std::option::Option::None,
                         concurrency_key,
                         concurrency_limit,
+                        concurrency_on_conflict,
                         priority: opts.priority.unwrap_or_default(),
                         max_workflow_input_bytes: client.max_workflow_input_bytes(info.max_input_bytes),
                         start_at: opts.start_at,
@@ -1337,11 +1366,11 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
                     });
 
-                    let (concurrency_key, concurrency_limit) = if let Some(ref policy) = info.concurrency {
+                    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = if let Some(ref policy) = info.concurrency {
                         let key = ::autumn_harvest::concurrency::resolve_concurrency_key(&policy.key_expr, &input);
-                        (key, Some(policy.limit))
+                        (key, Some(policy.limit), policy.on_conflict)
                     } else {
-                        (None, None)
+                        (None, None, ::autumn_harvest::concurrency::ConcurrencyOnConflict::Defer)
                     };
 
                     let execution_timeout = match opts.execution_timeout.or(info.execution_timeout) {
@@ -1397,6 +1426,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         max_workflow_chain_timeout_ceiling: ::std::option::Option::None,
                         concurrency_key,
                         concurrency_limit,
+                        concurrency_on_conflict,
                         signal_name: &signal_name.into(),
                         signal_payload: payload,
                         idempotency_key: opts.idempotency_key,

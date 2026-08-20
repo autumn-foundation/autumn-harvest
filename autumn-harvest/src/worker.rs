@@ -5936,6 +5936,15 @@ async fn clear_nd_block(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> H
     Ok(())
 }
 
+/// Resolve `(concurrency_key, limit)` for a worker-side enqueue.
+///
+/// Deliberately does NOT surface [`crate::concurrency::ConcurrencyOnConflict`]
+/// (issue #811): every caller here populates a [`queue::EnqueueParams`] task row
+/// for *in-flight continuation* — a child spawn, a detached child, or a
+/// continue-as-new successor — rather than admitting a fresh run through
+/// [`crate::execution::start_or_load_workflow_execution`]. Latest-wins supersede
+/// is an *admission* decision and is scoped to the start path, matching how
+/// admission gates (#618) and start throttles (#607) treat these same paths.
 fn resolve_workflow_concurrency(
     registry: &HandlerRegistry,
     workflow_name: &str,
@@ -6196,6 +6205,11 @@ async fn persist_workflow_failure(
                     inherited_chain_deadline_at: exec_ref.chain_deadline_at,
                     concurrency_key: concurrency_key.clone(),
                     concurrency_limit,
+                    // Workflow-level retry (issue #523) is the same logical run
+                    // continuing, not a fresh admission, so it never supersedes
+                    // (issue #811). Letting it cancel a run admitted AFTER the
+                    // failure would invert latest-wins.
+                    concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict::Defer,
                     priority,
                     max_workflow_input_bytes: 0,
                     start_at: None,
