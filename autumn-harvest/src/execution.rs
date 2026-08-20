@@ -896,29 +896,8 @@ pub async fn start_or_load_workflow_execution_collect(
             // "later-admitted run wins" a function of admission order rather than
             // wall-clock.
             let started = StartedWorkflowExecution::from_row(execution, true);
-            let mut tx_cancel_metrics: Vec<StartCancelledRun> = Vec::new();
-            let mut supersede_deferred: Vec<DeferredTriggerStart> = Vec::new();
-            if request.concurrency_on_conflict.is_cancel_running()
-                && let Some(key) = request.concurrency_key.as_deref()
-            {
-                let outcome = crate::concurrency::supersede_running_for_key(
-                    conn,
-                    request.workflow_name,
-                    key,
-                    request.concurrency_limit.unwrap_or(1),
-                    exec_id,
-                )
-                .await?;
-                for run in &outcome.superseded {
-                    tx_cancel_metrics.push(StartCancelledRun {
-                        workflow_name: run.workflow_name.clone(),
-                        queue_name: run.queue_name.clone(),
-                        superseded: true,
-                    });
-                }
-                supersede_deferred = outcome.deferred_starts;
-                tx_deferred_checks.extend(outcome.deferred_checks);
-            }
+            let (tx_cancel_metrics, supersede_deferred) =
+                run_latest_wins_supersede(conn, &request, exec_id, &mut tx_deferred_checks).await?;
 
             return Ok((
                 started,
@@ -1052,7 +1031,7 @@ pub async fn start_or_load_workflow_execution_collect(
                             workflow_id: request.workflow_id.to_string(),
                         });
                     }
-                    let tx_cancel_metrics = vec![StartCancelledRun::terminated(
+                    let mut tx_cancel_metrics = vec![StartCancelledRun::terminated(
                         existing.workflow_name.clone(),
                         existing.queue_name.clone(),
                     )];
@@ -1066,6 +1045,13 @@ pub async fn start_or_load_workflow_execution_collect(
                         replace_execution(conn, existing, &row, &enqueue, exec_id, &request, now)
                             .await?;
                     deferred.append(&mut extra_deferred);
+                    // A replacement is a fresh admission too (issue #811, Codex
+                    // round 2): shed other runs on the key, not just our own prior.
+                    let (mut sup_metrics, mut sup_deferred) =
+                        run_latest_wins_supersede(conn, &request, exec_id, &mut tx_deferred_checks)
+                            .await?;
+                    tx_cancel_metrics.append(&mut sup_metrics);
+                    deferred.append(&mut sup_deferred);
                     Ok((started_wf, deferred, tx_deferred_checks, tx_cancel_metrics))
                 }
             }
@@ -1097,11 +1083,22 @@ pub async fn start_or_load_workflow_execution_collect(
                                 });
                             }
                             // Only these two explicitly abnormal states start fresh.
-                            let (started_wf, deferred) = replace_execution(
+                            let (started_wf, mut deferred) = replace_execution(
                                 conn, existing, &row, &enqueue, exec_id, &request, now,
                             )
                             .await?;
-                            Ok((started_wf, deferred, tx_deferred_checks, Vec::new()))
+                            // Replacing our own terminal prior still admits a new
+                            // run into the key's population (issue #811, Codex
+                            // round 2).
+                            let (sup_metrics, mut sup_deferred) = run_latest_wins_supersede(
+                                conn,
+                                &request,
+                                exec_id,
+                                &mut tx_deferred_checks,
+                            )
+                            .await?;
+                            deferred.append(&mut sup_deferred);
+                            Ok((started_wf, deferred, tx_deferred_checks, sup_metrics))
                         }
                         _ => {
                             // COMPLETED, TIMED_OUT, SUSPENDED, or any other
@@ -1129,10 +1126,16 @@ pub async fn start_or_load_workflow_execution_collect(
                             workflow_id: request.workflow_id.to_string(),
                         });
                     }
-                    let (started_wf, extra_deferred) =
+                    let (started_wf, mut extra_deferred) =
                         replace_execution(conn, existing, &row, &enqueue, exec_id, &request, now)
                             .await?;
-                    Ok((started_wf, extra_deferred, tx_deferred_checks, Vec::new()))
+                    // Same as the two arms above: a replacement admits a new run
+                    // (issue #811, Codex round 2).
+                    let (sup_metrics, mut sup_deferred) =
+                        run_latest_wins_supersede(conn, &request, exec_id, &mut tx_deferred_checks)
+                            .await?;
+                    extra_deferred.append(&mut sup_deferred);
+                    Ok((started_wf, extra_deferred, tx_deferred_checks, sup_metrics))
                 }
             }
         }
@@ -1923,6 +1926,58 @@ mod resolve_by_workflow_id_tests {
 /// Transition `existing` to `CONTINUED_AS_NEW` (releasing the partial unique
 /// index slot) then insert `new_row` as a fresh execution with its own
 /// `WorkflowStarted` event and task queue entry.
+/// Run the latest-wins supersede pass for an admission that created a fresh run
+/// (issue #811).
+///
+/// Called from EVERY fresh-admission path inside the start transaction: the
+/// plain `ON CONFLICT DO NOTHING` insert, and all three `replace_execution`
+/// arms (`ActiveConflictBehavior::Terminate`, `AllowDuplicateFailedOnly` over a
+/// FAILED/CANCELLED prior, and `TerminateIfRunning` over a terminal prior).
+///
+/// A replacement is a fresh admission too (Codex round 2): it seals THIS
+/// `workflow_id`'s own prior, which says nothing about a *different*
+/// `workflow_id` holding the same concurrency key. Skipping the pass there let a
+/// `limit = 1` group retain both runs despite `cancel_running`.
+///
+/// A no-op (returns two empty vecs, issues zero statements) unless the request
+/// declares `CancelRunning` AND resolved a concurrency key, so `Defer` starts are
+/// byte-for-byte unchanged.
+#[cfg(feature = "db")]
+async fn run_latest_wins_supersede(
+    conn: &mut AsyncPgConnection,
+    request: &StartWorkflowParams<'_>,
+    exec_id: ExecutionId,
+    tx_deferred_checks: &mut Vec<(ExecutionId, String)>,
+) -> HarvestResult<(Vec<StartCancelledRun>, Vec<DeferredTriggerStart>)> {
+    if !request.concurrency_on_conflict.is_cancel_running() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let Some(key) = request.concurrency_key.as_deref() else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+
+    let outcome = crate::concurrency::supersede_running_for_key(
+        conn,
+        request.workflow_name,
+        key,
+        request.concurrency_limit.unwrap_or(1),
+        exec_id,
+    )
+    .await?;
+
+    let metrics = outcome
+        .superseded
+        .iter()
+        .map(|run| StartCancelledRun {
+            workflow_name: run.workflow_name.clone(),
+            queue_name: run.queue_name.clone(),
+            superseded: true,
+        })
+        .collect();
+    tx_deferred_checks.extend(outcome.deferred_checks);
+    Ok((metrics, outcome.deferred_starts))
+}
+
 async fn replace_execution(
     conn: &mut AsyncPgConnection,
     existing: WorkflowExecution,

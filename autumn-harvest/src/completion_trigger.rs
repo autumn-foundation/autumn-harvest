@@ -1135,7 +1135,7 @@ pub fn evaluate_triggers_for_execution<'a>(
         use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
         use crate::schema::harvest_workflow_executions::dsl as execs_dsl;
         use crate::models::{CompletionTriggerDb, NewCompletionTriggerFireDb, WorkflowExecution, NewCompletionTriggerOutboxDb};
-        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution};
+        use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution_with_metrics};
         use crate::types::WorkflowIdReusePolicy;
         use crate::types::Priority;
 
@@ -1542,7 +1542,15 @@ pub fn evaluate_triggers_for_execution<'a>(
                 };
 
                 let target_exec_id = crate::types::ExecutionId::new_for_shard(target_shard);
-                let start_res = match start_or_load_workflow_execution(
+                // `_with_metrics` (not the metrics-less wrapper) so a latest-wins
+                // supersede performed by this target is counted (issue #811,
+                // Codex round 2): the wrapper discards the collected
+                // cancellations, so `harvest.concurrency.superseded` and the
+                // incumbent's cancelled terminal were both dropped even though a
+                // recorder is in scope here. Emission is inline, matching every
+                // other counter this function already records inside the source's
+                // terminal transaction (`record_completion_trigger_fired`).
+                let start_res = match start_or_load_workflow_execution_with_metrics(
                     conn,
                     StartWorkflowParams {
                         workflow_name: &trigger_db.target_workflow_name,
@@ -1587,6 +1595,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                         start_source_ref: Some(source_exec_id_str.as_str()),
                         started_by: None,
                     },
+                    metrics,
                     // The inline same-shard completion-trigger start keeps its own
                     // unlocked pre-check gate above (it also performs the fires-row
                     // `admission_blocked` bookkeeping and the first-time-only block

@@ -217,6 +217,55 @@ async fn start_run_full(
     )
 }
 
+/// Same as [`start_run`] but with an explicit reuse policy, so the
+/// `replace_execution` admission arms can be driven (issue #811, Codex round 2).
+async fn start_run_with_reuse(
+    conn: &mut AsyncPgConnection,
+    metrics: &CapturingMetrics,
+    wf: &str,
+    wf_id: &str,
+    key: &str,
+    limit: u32,
+    on_conflict: ConcurrencyOnConflict,
+    reuse_policy: WorkflowIdReusePolicy,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut p = params(wf, wf_id, exec_id, key, limit, on_conflict);
+    p.reuse_policy = reuse_policy;
+    let started = start_or_load_workflow_execution_with_metrics(conn, p, Some(metrics), None)
+        .await
+        .expect("start must succeed");
+    ExecutionId::from_uuid(started.exec_id.as_uuid())
+}
+
+/// Force a run terminal so it becomes a replaceable prior for its own
+/// `workflow_id` while leaving the key's other runs untouched.
+async fn mark_terminal(conn: &mut AsyncPgConnection, exec_id: ExecutionId, state: &str) {
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = $1, completed_at = NOW() WHERE id = $2",
+    )
+    .bind::<Text, _>(state)
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .execute(conn)
+    .await
+    .expect("mark terminal");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'COMPLETED' WHERE workflow_exec_id = $1",
+    )
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .execute(conn)
+    .await
+    .expect("close tasks");
+}
+
+async fn mark_failed(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    mark_terminal(conn, exec_id, "FAILED").await;
+}
+
+async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    mark_terminal(conn, exec_id, "COMPLETED").await;
+}
+
 fn build_pool(url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     deadpool::managed::Pool::builder(manager)
@@ -1150,4 +1199,364 @@ async fn scheduled_tick_supersede_emits_the_counters() {
         &[wf.to_string()],
         "a scheduled supersede must emit the cancelled terminal counter too"
     );
+}
+
+// ── Replacement admissions supersede too (issue #811, Codex round 2, P2) ──
+
+/// A `replace_execution` admission is a fresh admission — it must shed too.
+///
+/// `AllowDuplicateFailedOnly` over a FAILED prior, and `TerminateIfRunning`
+/// over a terminal prior, both seal THIS `workflow_id`'s own prior and insert a
+/// fresh run. Sealing our own prior says nothing about a *different*
+/// `workflow_id` holding the same concurrency key, so skipping the supersede
+/// pass on those arms let a `limit = 1` group retain BOTH runs despite
+/// `cancel_running`.
+#[tokio::test]
+async fn allow_duplicate_failed_only_replacement_sheds_other_runs_on_the_key() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    let wf = "doc_index";
+    let key = "replace-adfo";
+    let metrics = CapturingMetrics::default();
+
+    // `req-1` runs and then FAILS, so it is a terminal prior for its own
+    // workflow_id and is out of the key's population.
+    let first = start_run(
+        &mut conn,
+        &metrics,
+        wf,
+        "req-1",
+        key,
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+    mark_failed(&mut conn, first).await;
+
+    // A DIFFERENT workflow_id becomes the live incumbent on the key.
+    let incumbent = start_run(
+        &mut conn,
+        &metrics,
+        wf,
+        "req-2",
+        key,
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+    assert_eq!(state_of(&mut conn, incumbent).await, "RUNNING");
+    assert_eq!(non_terminal_count(&mut conn, wf).await, 1);
+
+    metrics.superseded.lock().unwrap().clear();
+    metrics.cancelled_terminals.lock().unwrap().clear();
+
+    // Re-admitting `req-1` takes the `replace_execution` arm (its own prior is
+    // FAILED). It is still a fresh admission into the key's population.
+    let replacement = start_run_with_reuse(
+        &mut conn,
+        &metrics,
+        wf,
+        "req-1",
+        key,
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+        WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+    )
+    .await;
+
+    assert_eq!(
+        state_of(&mut conn, incumbent).await,
+        "CANCELLED",
+        "a replacement admission must shed the other run on the key"
+    );
+    assert_eq!(state_of(&mut conn, replacement).await, "RUNNING");
+    assert_eq!(
+        non_terminal_count(&mut conn, wf).await,
+        1,
+        "limit = 1 must hold across a replacement admission"
+    );
+    assert_eq!(
+        *metrics.superseded.lock().unwrap(),
+        vec![wf.to_string()],
+        "the shed run must be counted"
+    );
+    assert_eq!(
+        *metrics.cancelled_terminals.lock().unwrap(),
+        vec![wf.to_string()]
+    );
+}
+
+/// Same, for `TerminateIfRunning` over a terminal prior.
+#[tokio::test]
+async fn terminate_if_running_replacement_sheds_other_runs_on_the_key() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    let wf = "doc_index";
+    let key = "replace-tir";
+    let metrics = CapturingMetrics::default();
+
+    let first = start_run(
+        &mut conn,
+        &metrics,
+        wf,
+        "req-1",
+        key,
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+    mark_completed(&mut conn, first).await;
+
+    let incumbent = start_run(
+        &mut conn,
+        &metrics,
+        wf,
+        "req-2",
+        key,
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+    assert_eq!(non_terminal_count(&mut conn, wf).await, 1);
+
+    metrics.superseded.lock().unwrap().clear();
+
+    let replacement = start_run_with_reuse(
+        &mut conn,
+        &metrics,
+        wf,
+        "req-1",
+        key,
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+        WorkflowIdReusePolicy::TerminateIfRunning,
+    )
+    .await;
+
+    assert_eq!(
+        state_of(&mut conn, incumbent).await,
+        "CANCELLED",
+        "TerminateIfRunning over a terminal prior is still a fresh admission"
+    );
+    assert_eq!(state_of(&mut conn, replacement).await, "RUNNING");
+    assert_eq!(non_terminal_count(&mut conn, wf).await, 1);
+    assert_eq!(*metrics.superseded.lock().unwrap(), vec![wf.to_string()]);
+}
+
+/// A `Defer` replacement admission still cancels nothing (no regression).
+#[tokio::test]
+async fn defer_replacement_admission_sheds_nothing() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    let wf = "doc_index";
+    let key = "replace-defer";
+    let metrics = CapturingMetrics::default();
+
+    let first = start_run(
+        &mut conn,
+        &metrics,
+        wf,
+        "req-1",
+        key,
+        1,
+        ConcurrencyOnConflict::Defer,
+    )
+    .await;
+    mark_failed(&mut conn, first).await;
+
+    let incumbent = start_run(
+        &mut conn,
+        &metrics,
+        wf,
+        "req-2",
+        key,
+        1,
+        ConcurrencyOnConflict::Defer,
+    )
+    .await;
+
+    let _ = start_run_with_reuse(
+        &mut conn,
+        &metrics,
+        wf,
+        "req-1",
+        key,
+        1,
+        ConcurrencyOnConflict::Defer,
+        WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+    )
+    .await;
+
+    assert_eq!(
+        state_of(&mut conn, incumbent).await,
+        "RUNNING",
+        "Defer must never cancel anything, replacement or not"
+    );
+    assert_eq!(non_terminal_count(&mut conn, wf).await, 2);
+    assert!(metrics.superseded.lock().unwrap().is_empty());
+}
+
+// ── Completion-trigger supersede metrics (issue #811, Codex round 2, P2) ──
+
+/// A completion-trigger target that supersedes must emit the counters too.
+///
+/// `evaluate_triggers_for_execution` propagates the target's declared
+/// `on_conflict`, so a same-shard inline trigger start genuinely *does*
+/// supersede an incumbent — but it called the metrics-discarding
+/// `start_or_load_workflow_execution` wrapper, which drops the collected
+/// cancellations. Neither `harvest.concurrency.superseded` nor the incumbent's
+/// cancelled terminal was emitted even though a recorder is in scope, so AC7's
+/// "once per superseded run" did not hold for trigger-created runs.
+#[tokio::test]
+async fn completion_trigger_supersede_emits_the_counters() {
+    use autumn_harvest::completion_trigger::{
+        GLOBAL_WORKFLOW_METADATA, TerminalState, WorkflowMetadata, evaluate_triggers_for_execution,
+    };
+    use autumn_harvest::concurrency::ConcurrencyPolicy;
+
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+    conn.batch_execute(
+        "DELETE FROM harvest_completion_trigger_fires; DELETE FROM harvest_completion_triggers;",
+    )
+    .await
+    .expect("scrub triggers");
+
+    let source_wf = "trigger_source";
+    let target_wf = "trigger_target";
+    let key = "tenant-trigger";
+
+    // The trigger path resolves routing through the process-global router.
+    autumn_harvest::shard::install_global_router(autumn_harvest::shard::ShardRouter::single());
+
+    // Publish the target's declared policy the way the worker does at startup,
+    // so `evaluate_triggers_for_execution` resolves `cancel_running`.
+    // Restored below so the process-global does not leak to sibling tests.
+    // `WorkflowMetadata` is not `Clone`, so take the whole map out and put it
+    // back at the end rather than cloning it.
+    let previous = {
+        let mut lock = GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock");
+        lock.take()
+    };
+    {
+        let mut lock = GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock");
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            target_wf.to_string(),
+            WorkflowMetadata {
+                concurrency: Some(
+                    ConcurrencyPolicy::new("input.doc_id", 1)
+                        .with_on_conflict(ConcurrencyOnConflict::CancelRunning),
+                ),
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                input_schema: None,
+                sla: None,
+                retry_policy: None,
+            },
+        );
+        *lock = Some(map);
+    }
+
+    let trigger_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_triggers \
+         (id, source_workflow_name, terminal_states, target_workflow_name, input_mapping, is_static) \
+         VALUES ($1, $2, '[\"Completed\"]'::jsonb, $3, '{\"type\":\"Passthrough\"}'::jsonb, TRUE)",
+    )
+    .bind::<SqlUuid, _>(trigger_id)
+    .bind::<Text, _>(source_wf)
+    .bind::<Text, _>(target_wf)
+    .execute(&mut conn)
+    .await
+    .expect("insert trigger");
+
+    let metrics = CapturingMetrics::default();
+
+    // A live incumbent of the TARGET workflow on the key.
+    let incumbent = start_run(
+        &mut conn,
+        &metrics,
+        target_wf,
+        "incumbent-1",
+        key,
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+    assert_eq!(state_of(&mut conn, incumbent).await, "RUNNING");
+
+    // The source run, completing with an output that carries the same key so
+    // the Passthrough mapping resolves `input.doc_id` to it.
+    let source = start_run(
+        &mut conn,
+        &metrics,
+        source_wf,
+        "src-1",
+        key,
+        1,
+        ConcurrencyOnConflict::Defer,
+    )
+    .await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+         SET state = 'COMPLETED', completed_at = NOW(), output = $1::jsonb WHERE id = $2",
+    )
+    .bind::<Text, _>(serde_json::json!({ "doc_id": key }).to_string())
+    .bind::<SqlUuid, _>(source.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("complete source");
+
+    metrics.superseded.lock().unwrap().clear();
+    metrics.cancelled_terminals.lock().unwrap().clear();
+
+    let deferred = evaluate_triggers_for_execution(
+        &mut conn,
+        source,
+        TerminalState::Completed,
+        Some(&metrics),
+    )
+    .await
+    .expect("trigger evaluation must succeed");
+    for start in deferred {
+        start.spawn();
+    }
+
+    // The supersede itself must have happened...
+    assert_eq!(
+        state_of(&mut conn, incumbent).await,
+        "CANCELLED",
+        "the trigger-created target must supersede the incumbent"
+    );
+    assert_eq!(
+        non_terminal_count(&mut conn, target_wf).await,
+        1,
+        "limit = 1 must hold for a trigger-created run"
+    );
+    // ...AND it must be counted. This is the assertion that was RED: pre-fix the
+    // cancel above still happened, but the recorder saw nothing.
+    assert_eq!(
+        *metrics.superseded.lock().unwrap(),
+        vec![target_wf.to_string()],
+        "a completion-trigger supersede must emit harvest.concurrency.superseded"
+    );
+    assert_eq!(
+        *metrics.cancelled_terminals.lock().unwrap(),
+        vec![target_wf.to_string()],
+        "the superseded run's cancelled terminal must be counted too"
+    );
+
+    if let Ok(mut lock) = GLOBAL_WORKFLOW_METADATA.write() {
+        *lock = previous;
+    }
 }

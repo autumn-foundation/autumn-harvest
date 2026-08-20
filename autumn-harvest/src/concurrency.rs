@@ -147,6 +147,55 @@ pub const fn supersede_count(existing_others: usize, limit: u32) -> usize {
     (existing_others + 1).saturating_sub(cap)
 }
 
+/// Shed decision for one latest-wins supersede pass (issue #811, Codex round 2).
+///
+/// `candidates` are the shed-eligible non-terminal runs on the key; `protected`
+/// are in-flight admissions whose start transaction is still open on this task
+/// (see `ADMITTING`). Protected runs **count toward the population** — they are
+/// real non-terminal runs — but are never selected, so a nested admission can
+/// never cancel the outer admission that spawned it.
+///
+/// Returns both numbers deliberately:
+/// * `target` — how many runs the key is over its limit (clamped to
+///   `SUPERSEDE_SCAN_LIMIT`).
+/// * `shed` — how many we may actually cancel (`target`, capped by the number of
+///   shed-eligible candidates).
+///
+/// `shed < target` means the remaining overflow is entirely protected in-flight
+/// admissions. The key stays transiently over its limit and converges on the next
+/// ordinary admission, which sees those runs unprotected — the same bounded-shed
+/// philosophy as `SUPERSEDE_SCAN_LIMIT`.
+///
+/// Counting `protected` is what fixes the nested case: excluding it entirely (the
+/// first cut) computed `supersede_count(0, 1) == 0` for a nested admission and
+/// preserved BOTH runs on a `limit = 1` key.
+#[must_use]
+pub const fn supersede_plan(candidates: usize, protected: usize, limit: u32) -> SupersedePlan {
+    let target = {
+        let raw = supersede_count(candidates + protected, limit);
+        if raw > SUPERSEDE_SCAN_LIMIT {
+            SUPERSEDE_SCAN_LIMIT
+        } else {
+            raw
+        }
+    };
+    let shed = if target > candidates {
+        candidates
+    } else {
+        target
+    };
+    SupersedePlan { target, shed }
+}
+
+/// Outcome of [`supersede_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupersedePlan {
+    /// How many runs the key is over its declared limit (clamped).
+    pub target: usize,
+    /// How many of those may actually be cancelled by this pass.
+    pub shed: usize,
+}
+
 /// Resolve a dot-notation key expression against a JSON input payload.
 ///
 /// The `"input."` prefix is stripped if present so both `"tenant_id"` and
@@ -302,6 +351,13 @@ async fn lock_concurrency_key(
 /// **non-terminal runs** per key, newest wins", which is the operator-visible
 /// population, not the momentary dispatch occupancy.
 ///
+/// # Protected in-flight admissions
+///
+/// Only `self_exec_id` is excluded. An outer admission whose start transaction is
+/// still open on this task (see `ADMITTING`) IS returned, so the caller can count
+/// it toward the population while filtering it out of the shed set (issue #811,
+/// Codex round 2).
+///
 /// # Bounded fetch
 ///
 /// `fetch_cap` bounds the result set. The caller only needs enough rows to compute
@@ -314,7 +370,6 @@ async fn active_runs_for_key(
     workflow_name: &str,
     concurrency_key: &str,
     self_exec_id: crate::types::ExecutionId,
-    exclude: &[crate::types::ExecutionId],
     fetch_cap: i64,
 ) -> crate::error::HarvestResult<Vec<SupersededRun>> {
     use diesel_async::RunQueryDsl;
@@ -329,9 +384,12 @@ async fn active_runs_for_key(
         queue_name: String,
     }
 
-    let mut excluded: Vec<uuid::Uuid> = Vec::with_capacity(exclude.len() + 1);
-    excluded.push(self_exec_id.as_uuid());
-    excluded.extend(exclude.iter().map(crate::types::ExecutionId::as_uuid));
+    // Only the admitted run itself is excluded from the scan. A protected
+    // in-flight admission (issue #811, Codex round 2) is deliberately RETURNED
+    // here so it still counts toward the key's population; the caller filters it
+    // out of the shed set. Excluding it from the query too would under-count the
+    // group and let a nested admission preserve an over-limit population.
+    let excluded: Vec<uuid::Uuid> = vec![self_exec_id.as_uuid()];
 
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT e.id, e.workflow_name, e.queue_name \
@@ -468,16 +526,50 @@ async fn supersede_inner(
     // `limit` can never overflow the bind.
     let fetch_cap =
         i64::from(limit).saturating_add(i64::try_from(SUPERSEDE_SCAN_LIMIT).unwrap_or(i64::MAX));
-    let candidates = active_runs_for_key(
+    let others = active_runs_for_key(
         conn,
         workflow_name,
         concurrency_key,
         self_exec_id,
-        &inherited,
         fetch_cap,
     )
     .await?;
-    let shed = supersede_count(candidates.len(), limit).min(SUPERSEDE_SCAN_LIMIT);
+
+    // Protected in-flight admissions COUNT toward the population but are never
+    // shed (issue #811, Codex round 2).
+    //
+    // `inherited` holds the outer admission(s) whose start transaction is still
+    // open on this task -- see `ADMITTING`. Excluding them from the population
+    // entirely (as the first cut did) under-counted the group: a nested
+    // admission spawned while cancelling an incumbent would compute
+    // `supersede_count(0, 1) == 0` and preserve BOTH the outer run and itself on
+    // a `limit = 1` key. Counting them here makes the shed target honest, so
+    // every overflow that CAN be shed is shed.
+    let (candidates, protected): (Vec<SupersededRun>, Vec<SupersededRun>) = others
+        .into_iter()
+        .partition(|run| !inherited.contains(&run.exec_id));
+
+    let SupersedePlan {
+        target: shed_target,
+        shed,
+    } = supersede_plan(candidates.len(), protected.len(), limit);
+    if shed_target > shed {
+        // The only over-limit runs are protected in-flight admissions. The group
+        // stays transiently over its declared limit and converges on the next
+        // ordinary admission for the key, which sees them unprotected -- the same
+        // bounded-shed philosophy as `SUPERSEDE_SCAN_LIMIT`.
+        tracing::warn!(
+            workflow = %workflow_name,
+            concurrency_key = %concurrency_key,
+            limit,
+            shed_target,
+            shed,
+            protected = protected.len(),
+            "harvest: latest-wins supersede could not shed the full overflow because the \
+             remaining runs are protected in-flight admissions; the key stays over its \
+             declared limit until the next admission",
+        );
+    }
     if shed == 0 {
         return Ok(SupersedeOutcome::default());
     }
@@ -659,6 +751,67 @@ mod tests {
     // decision: after our own execution is admitted, how many of the OTHER
     // non-terminal runs for this key must be cancelled so that the post-admit
     // in-flight count is <= limit.
+    // ── issue #811 Codex round 2: protected in-flight admissions count ────
+
+    #[test]
+    fn plan_counts_protected_toward_the_population() {
+        // The nested case: limit 1, the ONLY other run on the key is the outer
+        // admission (protected). The population is 2, so the key is 1 over --
+        // even though nothing may be shed.
+        let plan = supersede_plan(0, 1, 1);
+        assert_eq!(plan.target, 1, "protected run must count toward population");
+        assert_eq!(plan.shed, 0, "a protected run must never be shed");
+    }
+
+    #[test]
+    fn plan_ignoring_protected_would_report_no_overflow() {
+        // Falsifies the pre-fix behaviour, which passed only the candidate count:
+        // `supersede_count(0, 1) == 0` -> the nested admission preserved BOTH runs.
+        assert_eq!(supersede_count(0, 1), 0);
+        assert_eq!(supersede_plan(0, 1, 1).target, 1);
+    }
+
+    #[test]
+    fn plan_sheds_every_candidate_the_honest_count_demands() {
+        // limit 2, one protected + two candidates -> population 4, over by 2.
+        // Pre-fix this computed `supersede_count(2, 2) == 1` and shed only one.
+        let plan = supersede_plan(2, 1, 2);
+        assert_eq!(plan.target, 2);
+        assert_eq!(plan.shed, 2);
+    }
+
+    #[test]
+    fn plan_shed_is_capped_by_available_candidates() {
+        // Over by 2 but only one shed-eligible run: shed what we can, and report
+        // the gap so the caller can warn.
+        let plan = supersede_plan(1, 2, 2);
+        assert_eq!(plan.target, 2);
+        assert_eq!(plan.shed, 1);
+    }
+
+    #[test]
+    fn plan_with_no_protected_matches_supersede_count() {
+        // The common (non-nested) path is byte-for-byte unchanged.
+        for candidates in 0_usize..6 {
+            for limit in 1_u32..4 {
+                let plan = supersede_plan(candidates, 0, limit);
+                let expected = supersede_count(candidates, limit).min(SUPERSEDE_SCAN_LIMIT);
+                assert_eq!(
+                    plan.target, expected,
+                    "candidates={candidates} limit={limit}"
+                );
+                assert_eq!(plan.shed, expected.min(candidates));
+            }
+        }
+    }
+
+    #[test]
+    fn plan_clamps_target_to_the_scan_limit() {
+        let plan = supersede_plan(SUPERSEDE_SCAN_LIMIT * 4, 0, 1);
+        assert_eq!(plan.target, SUPERSEDE_SCAN_LIMIT);
+        assert_eq!(plan.shed, SUPERSEDE_SCAN_LIMIT);
+    }
+
     #[test]
     fn supersede_count_limit_one_cancels_the_single_incumbent() {
         assert_eq!(supersede_count(1, 1), 1);
