@@ -90,6 +90,14 @@ macro_rules! chaos_drop_notify {
     }};
 }
 
+// Re-export the crate-internal chaos macros by path so injection sites can call
+// `crate::chaos_point!(NAME)` regardless of module-declaration order (a plain
+// `macro_rules!` is only visible by bare name to code textually after it). Each
+// `use` resolves to whichever cfg arm compiled, so it is config-agnostic. Not
+// `#[macro_export]`: these are test-harness internals, never public API.
+#[allow(unused_imports)]
+pub(crate) use {chaos_drop_notify, chaos_fallible, chaos_point};
+
 #[cfg(feature = "db")]
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();

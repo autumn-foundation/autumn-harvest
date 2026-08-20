@@ -3159,6 +3159,12 @@ async fn park_workflow_task_inner(
     // CTE clears it; doing this as a SELECT-then-UPDATE in two round trips
     // would race with `wake_workflow_task`'s fallback UPDATE in exactly the
     // gap this mechanism exists to close.
+    //
+    // Chaos: kill/delay between the pre-park liveness check and the park's
+    // atomic UPDATE — the #601 lost-wake window a concurrent wake can land in
+    // (AC4). A kill here (owned conn in the reproducer's spawned task) rolls the
+    // park back, leaving the task RUNNING with a dead worker.
+    crate::chaos_point!(QUEUE_PARK_BEFORE_UPDATE);
     let rows: Vec<WakeRequestedRow> = if let Some(hint) = sticky {
         let timeout = hint.chrono_timeout()?;
         diesel::sql_query(park_workflow_task_sticky_query(reset_capability_misses))

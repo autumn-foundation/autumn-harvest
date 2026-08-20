@@ -2390,6 +2390,14 @@ async fn persist_external_signal_inline(
                             continue;
                         }
 
+                        // Chaos: pause/kill after the *Requested event is durable
+                        // but before the inline terminal, still inside the txn —
+                        // the #492 window where a concurrent outbox sweep can
+                        // observe a half-written external signal (AC4). Reached
+                        // only for a same-shard fresh signal (cross-shard
+                        // `continue`d above).
+                        crate::chaos_point!(OUTBOX_INLINE_AFTER_REQUESTED);
+
                         // Same-shard delivery attempt. A deduped insert
                         // (`Ok(false)`, idempotency-key collision) means the
                         // signal already landed once — that is success, so
@@ -16058,6 +16066,12 @@ async fn process_workflow_task(
                     .await?;
                     (retry_scheduled, deferred_checks, Vec::new())
                 };
+            // Chaos: kill/delay inside the persist transaction, after the
+            // outcome is written but before the outer commit — the #367 window
+            // (worker dies after claim, before the terminal is durable). A kill
+            // (owned conn in the reproducer's spawned task) rolls the persist
+            // back, leaving the task RUNNING with a dead worker (AC4).
+            crate::chaos_point!(WORKER_PERSIST_BEFORE_COMMIT);
             Ok(WorkflowPersistFlow::Persisted {
                 retry_scheduled,
                 deferred_checks,
@@ -16077,6 +16091,11 @@ async fn process_workflow_task(
             deferred_checks,
             race_deferred_triggers,
         }) => {
+            // Chaos: kill/delay after the outer persist commit but before the
+            // deferred-trigger fan-out — committed work whose in-process
+            // follow-up side effects have not fired yet. Convergence must still
+            // hold: the completion-trigger outbox recovers un-fired triggers.
+            crate::chaos_point!(WORKER_AFTER_OUTER_COMMIT);
             // Only spawned now that the transaction above has committed (see
             // apply_race_loser_cancellations's doc comment) — spawning inside
             // the transaction closure could start a trigger workflow for a

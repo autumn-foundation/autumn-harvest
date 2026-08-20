@@ -3238,6 +3238,12 @@ pub async fn claim_and_fire_workflow_schedule(
     }
     metrics.record_schedule_fire_attempt(snapshot_wf_name, "claimed");
 
+    // Chaos: kill/delay after the HA claim UPDATE commits but before the fire —
+    // the #350 window where the claiming replica crashes mid-fire. The 30 s
+    // claim TTL must expire and a healthy peer must re-fire the slot exactly
+    // once (AC4).
+    crate::chaos_point!(SCHED_AFTER_CLAIM);
+
     // ── Post-claim refresh (issue #771 AC7) ───────────────────────────────
     // Never fire from the pre-claim snapshot: re-read the row now that the
     // claim is held so a non-cadence edit that committed between the due-list
@@ -4732,6 +4738,12 @@ async fn tick_one_workflow_schedule(
             }
         }
     }
+
+    // Chaos: kill/delay after this tick's scheduled starts have committed but
+    // before next_run_at/last_run_at advance — the #350 crash-after-fire window.
+    // A re-fire on recovery must dedupe (reject_duplicate on the sched: id) to
+    // exactly one run (AC4).
+    crate::chaos_point!(SCHED_AFTER_START_BEFORE_ADVANCE);
 
     // Deferred catchup slots become next_run_at so the next tick retries them.
     // last_run_at only advances to the last slot actually started.
