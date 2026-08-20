@@ -21,6 +21,7 @@
 //! (`CHAOS_SEEDS=<seed> cargo test --features chaos ...`).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use autumn_harvest::chaos::points::{
     OUTBOX_INLINE_AFTER_REQUESTED, QUEUE_PARK_BEFORE_UPDATE, SCHED_AFTER_CLAIM,
@@ -29,16 +30,18 @@ use autumn_harvest::chaos::points::{
 use autumn_harvest::chaos::{ChaosPlan, arm};
 use autumn_harvest::prelude::*;
 use autumn_harvest::telemetry::NoOpMetrics;
-use autumn_harvest::worker::{HandlerRegistry, chaos_drive_one_workflow_task};
+use autumn_harvest::worker::{DbPool, HandlerRegistry, chaos_drive_one_workflow_task};
 use autumn_harvest::{
     DagCatalog, ExecutionId, SchedulerMonitor, ShardId, StartWorkflowParams, WorkflowIdReusePolicy,
     tick_once,
 };
+use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 
@@ -63,6 +66,26 @@ async fn chaos_noop(
     _input: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!("ok"))
+}
+
+/// Sends one external signal to the `target` execution named in its input, then
+/// completes — the caller that reaches `persist_external_signal_inline` and so
+/// the `OUTBOX_INLINE_AFTER_REQUESTED` window (issue #492 / AC4). The target is
+/// passed as an `ExecutionId` string in `input["target"]`.
+#[workflow]
+async fn chaos_signal_external(
+    ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let target: ExecutionId = input["target"]
+        .as_str()
+        .ok_or("missing target")?
+        .parse()
+        .map_err(|e: uuid::Error| e.to_string())?;
+    ctx.signal_external_workflow(target, "go", serde_json::json!({ "from": "chaos" }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!("signaled"))
 }
 
 // ── DB setup ────────────────────────────────────────────────────────────────
@@ -212,6 +235,94 @@ async fn dangling_external_requests(conn: &mut AsyncPgConnection) -> i64 {
 struct CountRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     n: i64,
+}
+
+/// A pooled `DbPool` for the scheduler tick (which takes a pool by value).
+fn make_pool(url: &str) -> DbPool {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    deadpool::managed::Pool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("pool")
+}
+
+/// Insert a due workflow schedule (fires 5 s ago) and return its id. Mirrors the
+/// `scheduler_ha_tests` helper so the fired execution counts are comparable.
+async fn insert_due_schedule(conn: &mut AsyncPgConnection, wf_name: &str) -> uuid::Uuid {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    let now = Utc::now();
+    let id = uuid::Uuid::new_v4();
+    diesel::insert_into(dsl::harvest_schedules)
+        .values((
+            dsl::id.eq(id),
+            dsl::workflow_name.eq(wf_name),
+            dsl::schedule_expr.eq("interval:60"),
+            dsl::timezone.eq("UTC"),
+            dsl::catchup.eq(false),
+            dsl::max_active_runs.eq(10),
+            dsl::is_paused.eq(false),
+            dsl::next_run_at.eq(now - chrono::Duration::seconds(5)),
+            dsl::jitter_secs.eq(0_i64),
+            dsl::overlap_policy.eq("skip"),
+            dsl::buffered_runs.eq(serde_json::json!([])),
+            dsl::buffer_all_max.eq(100),
+            dsl::skip_policy.eq("skip"),
+        ))
+        .execute(conn)
+        .await
+        .expect("insert schedule");
+    id
+}
+
+/// Count executions of a workflow type.
+async fn exec_count(conn: &mut AsyncPgConnection, wf_name: &str) -> i64 {
+    use autumn_harvest::schema::harvest_workflow_executions::dsl;
+    dsl::harvest_workflow_executions
+        .filter(dsl::workflow_name.eq(wf_name))
+        .count()
+        .get_result(conn)
+        .await
+        .expect("count executions")
+}
+
+/// Read a schedule's `(fire_claim_token, live)` where `live` is true iff the
+/// claim is held and unexpired.
+async fn schedule_claim(conn: &mut AsyncPgConnection, id: uuid::Uuid) -> (Option<uuid::Uuid>, bool) {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    let (token, until): (Option<uuid::Uuid>, Option<chrono::DateTime<Utc>>) = dsl::harvest_schedules
+        .find(id)
+        .select((dsl::fire_claim_token, dsl::fire_claimed_until))
+        .first(conn)
+        .await
+        .expect("load schedule claim");
+    let live = token.is_some() && until.is_some_and(|u| u > Utc::now());
+    (token, live)
+}
+
+/// Count events of a given `event_type` on one execution.
+async fn event_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId, event_type: &str) -> i64 {
+    diesel::sql_query(
+        "SELECT COUNT(*)::bigint AS n FROM harvest_events \
+         WHERE workflow_exec_id = $1 AND event_type = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(event_type)
+    .get_result::<CountRow>(conn)
+    .await
+    .expect("count events")
+    .n
+}
+
+/// Count queued signal rows for a target execution — the immediate delivery
+/// artifact (`harvest_signals`) the inline path writes via `send_signal_*`.
+async fn signals_for(conn: &mut AsyncPgConnection, target: ExecutionId) -> i64 {
+    use autumn_harvest::schema::harvest_signals::dsl;
+    dsl::harvest_signals
+        .filter(dsl::workflow_exec_id.eq(target.as_uuid()))
+        .count()
+        .get_result(conn)
+        .await
+        .expect("count signals")
 }
 
 // ── Reproducer 1 — issue #601 lost-wake (`wake_requested`) window ────────────
@@ -399,6 +510,266 @@ async fn chaos_repro_367_crash_orphan_is_reclaimed() {
     assert!(worker.is_none(), "recovered task must have no worker_id");
 }
 
+// ── Reproducer 3 — issue #492 outbox vs inline external-signal persist ───────
+
+/// A same-shard external signal appends `ExternalSignalRequested` and its
+/// `ExternalSignalDelivered` terminal inside ONE transaction
+/// (`persist_external_signal_inline`, the #492 fix). HOLD at
+/// `OUTBOX_INLINE_AFTER_REQUESTED` — the `Requested` event is written but the
+/// txn is uncommitted — and run the background outbox on a separate connection:
+/// under READ COMMITTED it cannot observe the half-written request, so it
+/// delivers nothing (returns 0) and the signal lands exactly once. Exercises the
+/// ERROR-free HOLD/DELAY window (AC1b/AC1d shape) and the #492 fix (AC4).
+///
+/// RED procedure: remove the `conn.transaction(...)` wrapper in
+/// `persist_external_signal_inline` so `ExternalSignalRequested` commits in its
+/// own statement before the terminal. During the hold the outbox then sees a
+/// committed `Requested`-without-terminal on a `RUNNING` execution and delivers
+/// it a SECOND time — two `harvest_signals` rows for the target and a second
+/// `ExternalSignalDelivered` — and the `== 1` / `outbox == 0` asserts fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
+    let (url, _c) = chaos_db().await;
+    let mut conn = connect(&url).await;
+
+    // Target (same shard 0) — a live RUNNING execution to receive the signal.
+    // Parked on its own queue so the `default` claim below can only pick the
+    // caller (the target's task is never polled here).
+    let target_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut target_params =
+        base_params("chaos_wait_signal", "c492-target", target_id, serde_json::json!(null));
+    target_params.queue_name = "chaos-target-q";
+    autumn_harvest::execution::start_or_load_workflow_execution(&mut conn, target_params, None)
+        .await
+        .expect("start target");
+
+    // Caller (same shard 0) that signals the target.
+    let caller_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let caller_input = serde_json::json!({ "target": target_id.to_string() });
+    autumn_harvest::execution::start_or_load_workflow_execution(
+        &mut conn,
+        base_params("chaos_signal_external", "c492-caller", caller_id, caller_input),
+        None,
+    )
+    .await
+    .expect("start caller");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![chaos_signal_external_info(), chaos_wait_signal_info()],
+        vec![],
+    ));
+
+    // Claim the caller's workflow task for the drive worker.
+    let task = autumn_harvest::queue::claim_task(
+        &mut conn,
+        &["default".to_string()],
+        "c492-caller-worker",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim")
+    .expect("caller task claimable");
+    assert_eq!(
+        task.workflow_exec_id,
+        Some(caller_id.as_uuid()),
+        "must claim the caller task (target parks on its signal)"
+    );
+
+    // HOLD inside the inline persist txn, after Requested is appended.
+    let guard = arm(ChaosPlan::scripted().hold_at(OUTBOX_INLINE_AFTER_REQUESTED)).await;
+    let hold = guard.hold(OUTBOX_INLINE_AFTER_REQUESTED);
+
+    let drive_url = url.clone();
+    let drive_registry = Arc::clone(&registry);
+    let drive = tokio::spawn(async move {
+        chaos_drive_one_workflow_task(
+            &drive_url,
+            drive_registry,
+            task,
+            "c492-caller-worker".to_string(),
+        )
+        .await
+    });
+
+    hold.reached().await;
+
+    // The outbox on a separate connection cannot see the uncommitted Requested —
+    // the #492 invariant: zero deliveries during the open inline txn.
+    let delivered = autumn_harvest::timeout::enforce_external_signals_outbox(
+        &mut conn,
+        &NoOpMetrics,
+        Duration::from_secs(300),
+        &None,
+        &[],
+    )
+    .await
+    .expect("outbox sweep");
+    assert_eq!(
+        delivered, 0,
+        "the outbox must not observe (or double-deliver) the half-written inline \
+         signal; {}",
+        guard.diagnostics()
+    );
+    assert_eq!(
+        signals_for(&mut conn, target_id).await,
+        0,
+        "no signal may be queued to the target while the inline txn is open; {}",
+        guard.diagnostics()
+    );
+
+    hold.release();
+    let outcome = drive.await.expect("drive join").expect("drive spawn join");
+    outcome.expect("caller cycle must persist cleanly");
+
+    assert_eq!(
+        guard.hits(OUTBOX_INLINE_AFTER_REQUESTED),
+        1,
+        "the inline persist point must be hit exactly once; {}",
+        guard.diagnostics()
+    );
+    assert!(
+        guard.actions_fired() >= 1,
+        "the HOLD must have fired (anti-vacuity); {}",
+        guard.diagnostics()
+    );
+    drop(guard);
+
+    // Exactly-once: one Requested + one Delivered on the caller, one queued
+    // signal on the target. A double-delivery would show 2 signals / 2 Delivered.
+    assert_eq!(
+        event_count(&mut conn, caller_id, "ExternalSignalRequested").await,
+        1,
+        "exactly one ExternalSignalRequested"
+    );
+    assert_eq!(
+        event_count(&mut conn, caller_id, "ExternalSignalDelivered").await,
+        1,
+        "exactly one ExternalSignalDelivered"
+    );
+    assert_eq!(
+        signals_for(&mut conn, target_id).await,
+        1,
+        "the signal must land on the target exactly once"
+    );
+    assert_eq!(
+        dangling_external_requests(&mut conn).await,
+        0,
+        "no ExternalSignalRequested without a terminal"
+    );
+}
+
+// ── Reproducer 4 — issue #350 schedule fire claim expiring mid-fire ──────────
+
+/// A scheduler replica that crashes after winning the HA claim but before firing
+/// must leave the slot fire-able by a healthy peer *exactly once*, and no peer
+/// may double-fire while the claim is still live. KILL at `SCHED_AFTER_CLAIM`
+/// (the claim UPDATE has committed in autocommit, the fire has not) via a spawned
+/// `tick_once` → `JoinError`; the live claim then blocks a peer tick, and only
+/// after the 30 s claim TTL expires does a peer fire the slot once (AC4).
+///
+/// RED procedure: remove the HA claim guard in
+/// `claim_and_fire_workflow_schedule` (fire unconditionally, ignore
+/// `fire_claim_token`/`fire_claimed_until`). The live-claim peer tick then fires
+/// a SECOND time while the first fire is still in flight — the `exec_count == 0`
+/// (live-claim) or final `== 1` (single fire) assertion fails with 2 executions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
+    let (url, _c) = chaos_db().await;
+    let wf = "chaos_sched_350";
+    let sched_id = {
+        let mut conn = connect(&url).await;
+        insert_due_schedule(&mut conn, wf).await
+    };
+    let registry = Arc::new(HandlerRegistry::new(vec![chaos_noop_info()], vec![]));
+
+    // Crash mid-fire: KILL after the claim commits, before the fire. The tick is
+    // spawned so the panic surfaces as a JoinError instead of aborting the test.
+    let guard = arm(ChaosPlan::scripted().kill_at(SCHED_AFTER_CLAIM)).await;
+    let crash = tokio::spawn(tick_once(
+        make_pool(&url),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    ))
+    .await;
+    assert!(
+        crash.is_err(),
+        "the KILL must crash the tick mid-fire (JoinError); {}",
+        guard.diagnostics()
+    );
+    assert!(
+        guard.actions_fired() >= 1,
+        "the KILL must have fired (anti-vacuity); {}",
+        guard.diagnostics()
+    );
+    drop(guard);
+
+    // The crash left the claim held (committed in autocommit) with no fire.
+    {
+        let mut conn = connect(&url).await;
+        let (token, live) = schedule_claim(&mut conn, sched_id).await;
+        assert!(token.is_some(), "the HA claim must be committed by the crash");
+        assert!(live, "the claim TTL must still be live right after the crash");
+        assert_eq!(
+            exec_count(&mut conn, wf).await,
+            0,
+            "the crash must have fired nothing"
+        );
+    }
+
+    // A healthy peer tick while the claim is live must NOT double-fire.
+    tick_once(
+        make_pool(&url),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("peer tick (live claim)");
+    {
+        let mut conn = connect(&url).await;
+        assert_eq!(
+            exec_count(&mut conn, wf).await,
+            0,
+            "a live claim must block the peer from firing"
+        );
+    }
+
+    // Expire the claim (the 30 s TTL elapses) → a peer re-fires the slot ONCE.
+    {
+        let mut conn = connect(&url).await;
+        diesel::sql_query(
+            "UPDATE harvest_schedules SET fire_claimed_until = NOW() - INTERVAL '1 minute' \
+             WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(sched_id)
+        .execute(&mut conn)
+        .await
+        .expect("expire claim");
+    }
+    tick_once(
+        make_pool(&url),
+        registry,
+        Arc::new(DagCatalog::default()),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("peer tick (expired claim)");
+
+    let mut conn = connect(&url).await;
+    assert_eq!(
+        exec_count(&mut conn, wf).await,
+        1,
+        "the crashed slot must be re-fired by a peer exactly once after the claim expires"
+    );
+}
+
 // ── AC5 — seeded convergence sweep ───────────────────────────────────────────
 
 /// Documented default seed set for the sweep (AC5: N ≥ 5 distinct seeds). CI
@@ -530,13 +901,17 @@ async fn chaos_seeded_convergence_sweep() {
 }
 
 /// Count `RUNNING` tasks whose `worker_id` has no live `harvest_workers`
-/// heartbeat — the stranded-orphan invariant probe.
+/// heartbeat — the stranded-orphan invariant probe. Mirrors the poison-pill
+/// reclaimer's own liveness definition (`orphaned_running_tasks_query`): a
+/// worker is dead when no row carries its `worker_id` with a fresh heartbeat.
 async fn stranded_running_with_dead_worker(conn: &mut AsyncPgConnection) -> i64 {
     diesel::sql_query(
         "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue t \
          WHERE t.state = 'RUNNING' AND t.worker_id IS NOT NULL \
            AND NOT EXISTS ( \
-             SELECT 1 FROM harvest_workers w WHERE w.id = t.worker_id \
+             SELECT 1 FROM harvest_workers w \
+             WHERE w.worker_id = t.worker_id \
+               AND w.last_heartbeat_at > NOW() - INTERVAL '30 seconds' \
            )",
     )
     .get_result::<CountRow>(conn)
