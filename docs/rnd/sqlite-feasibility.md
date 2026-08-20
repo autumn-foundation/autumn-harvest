@@ -55,7 +55,7 @@ module counts at the audited revision, recomputed by CI:
 | Mechanism | Reach | Portable? |
 |---|---|---|
 | `diesel` query layer | 44 modules | Query construction is mechanical; the *type* layer is not. |
-| `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 13 modules | Only by dropping multi-worker concurrency. |
+| `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 15 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 15 modules | Subsumed by the single write lock. |
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 9 modules | Yes — integer epoch milliseconds. |
 | `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 28 modules | Case by case — the SQL must be read, not inferred from the ORM. |
@@ -65,7 +65,7 @@ module counts at the audited revision, recomputed by CI:
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
 | `gen_random_uuid` server-side ids | 1 module | Yes — mint application-side. |
 
-Plus **86 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
+Plus **87 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
 `INTERVAL`, `UUID`, partial indexes, `gen_random_uuid()` defaults), none of
 which apply to SQLite. The SQLite crate does not translate them; it declares
 its own schema.
@@ -203,7 +203,7 @@ Classification rule:
 | `worker` | diesel, skip-locked, row-lock, advisory-lock, listen/notify, raw-pg-sql, raw-sql | (c) | The dispatch loop; wakeups and persistence are interleaved. |
 | `workers` | diesel, interval-sql, raw-pg-sql, raw-sql | (b) | Fleet registry rows, but the sticky-lease filter embeds `NOW()` and the capability-miss fleet lookup adds an `INTERVAL` liveness window plus a `queues @> to_jsonb($2::text)` containment test. SQLite: `CURRENT_TIMESTAMP`/epoch ms; JSON1 `EXISTS (SELECT 1 FROM json_each(queues) …)` for the containment. |
 
-**Totals: (a) 8 · (b) 18 · (c) 18.**
+**Totals: (a) 7 · (b) 18 · (c) 19.**
 
 The shape matters more than the totals. The (a) column is genuinely
 mechanical CRUD. The (b) column is dominated by **pessimistic row locking**:
@@ -250,9 +250,10 @@ A trait that genuinely allowed a second backend would need, at minimum:
 3. **The scanner family** — `timeout`, `retention`, `poison_pill`, `debounce`,
    `throttle`, `completion_callback`, `event_batch`: seven claim-batch-mutate
    loops, each relying on `FOR UPDATE SKIP LOCKED` for its concurrency safety.
-   (Those seven are part of the 13 `skip-locked` modules in the table above;
-   the rest are `queue`/`queue_pause`/`execution`/`completion_trigger` plus the
-   two comment-only consumers below.)
+   (Those seven are part of the `skip-locked` modules in the table above; the
+   rest are `queue`/`queue_pause`/`execution`/`completion_trigger` plus the
+   comment-only consumers described above. That count is kept current by CI,
+   not by this prose.)
 4. **Coordination primitives** — advisory locks with a *defined lock ordering*
    (documented in `timeout.rs` and the mutex work) and the notification
    channel.

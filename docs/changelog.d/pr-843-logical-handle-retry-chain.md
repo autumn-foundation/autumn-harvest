@@ -226,4 +226,37 @@ moved to 1.98.0, which added `clippy::map_or_identity` and widened
 `clippy::missing_const_for_fn`; seven pre-existing violations in `timeout.rs` (3) and
 `det_check.rs` (4) — neither file touched by this PR — turned the shared `Lint` job red
 on every branch. Healed in place (`map_or(x, |d| d)` → `unwrap_or(x)`; four helpers
-made `const fn`), following the repo's existing inherited-lint-heal precedent.
+made `const fn`), following the repo's existing inherited-lint-heal precedent. A second
+1.98 lint, `clippy::result_large_err`, then fired on nine more pre-existing sites —
+`api.rs` (`probe_committed_uws_replay`, `prepare_queue_pause_targets`,
+`parse_pause_request`, `prepare_activity_pause_targets`, `parse_activity_pause_request`,
+`prepare_activity_pause_targets_checked`), `ui.rs` (`find_schedule_row`), and, behind
+the `mcp` feature, `mcp_tools.rs` (`load_owned_execution`, `resolve_if_chained`) — none
+of them touched by this PR (verified against `origin/trunk-dev`). All nine are the
+plugin's pervasive `Result<T, axum::response::Response>` early-return idiom, and the
+128-byte `Err` is `axum::response::Response` itself, so the lint's suggested remedy
+(boxing) would mean deref churn at every `?` site in inherited code for no runtime
+benefit. Healed with a per-function `#[allow(clippy::result_large_err)]`, matching the
+three such allows that already exist in `api.rs` for exactly this idiom. The two
+`mcp_tools.rs` sites are only reachable under `--features mcp`, so they surface on the
+dedicated `Clippy autumn-harvest-plugin (mcp feature)` CI step rather than the default
+one — the full per-feature sweep is what caught them. A third 1.98 lint,
+`clippy::unused_async_trait_impl` (a new sibling of `clippy::unused_async`), fired on
+`ActivityContext::check_cancellation` in `context.rs` — also untouched by this PR — but
+only via the `autumn-harvest-cli` / `autumn-harvest-sqlite` steps, which build
+`autumn-harvest` with `default-features = false`: without `db` the body has no `.await`.
+That function already carried `#[cfg_attr(not(feature = "db"), allow(clippy::unused_async))]`
+for exactly this reason; because 1.98 introduced a *separately named* lint, the existing
+allow no longer covered it, so the `cfg_attr` was extended to name both. The lint's own
+suggestion (drop `async`, return `impl Future`) was rejected: it would change the
+signature of a public inherent method to silence a lint that is only reachable in a
+feature configuration where the `async` is genuinely vestigial. Fixing those three
+unblocked the `Lint` job far enough to reach its two docs-guard steps, which surfaced a
+fourth failure in `docs/rnd/sqlite-feasibility.md`: its `skip-locked` reach cell read 13
+modules where the tree has 15 (identical on `origin/trunk-dev`, so also inherited) and
+its derived `**Totals:**` line disagreed with the report's own inventory table — both
+corrected, and the one prose sentence that re-hardcoded the same count was rewritten to
+defer to the table, matching the policy the document already states for that figure
+("kept current by CI, not this prose"). The same guard's migration count **is** this
+PR's own drift — `20260723000000_harvest_retry_chain_index` takes the live count 86 →
+87 — and was bumped accordingly.

@@ -15352,6 +15352,7 @@ async fn probe_committed_sws_replay(
 /// core invariant — a committed replay is never rejected by tightened validation —
 /// even under a transient owning-shard error; a keyed client retries 503
 /// idempotently.
+#[allow(clippy::result_large_err)]
 async fn probe_committed_uws_replay(
     api_state: &HarvestApiState,
     workflow_name: &str,
@@ -32588,6 +32589,7 @@ async fn reject_queue_pause(
 /// returned in `Err`, so both handlers share one rejection contract. The
 /// returned `Vec<String>` seeds the per-shard failure list with any shard the
 /// router knows about but this process cannot reach.
+#[allow(clippy::result_large_err)]
 async fn prepare_queue_pause_targets(
     api_state: &HarvestApiState,
     audit: &QueuePauseAuditCtx,
@@ -32642,6 +32644,7 @@ async fn prepare_queue_pause_targets(
 /// operator, so an empty `reason` is rejected here rather than stored. On
 /// rejection the audit row is written and a ready-to-send response returned in
 /// `Err`, matching [`prepare_queue_pause_targets`]'s contract.
+#[allow(clippy::result_large_err)]
 async fn parse_pause_request(
     api_state: &HarvestApiState,
     audit: &QueuePauseAuditCtx,
@@ -33975,6 +33978,7 @@ async fn reject_activity_pause(
 /// creates is closed on the read side instead: `GET /activities` surfaces a
 /// paused-but-unregistered activity with `registered: false` rather than
 /// dropping it (see [`merge_activity_catalog_rows`]).
+#[allow(clippy::result_large_err)]
 async fn prepare_activity_pause_targets(
     api_state: &HarvestApiState,
     audit: &QueuePauseAuditCtx,
@@ -34538,6 +34542,7 @@ async fn pause_activity_handler(
 /// [`PauseActivityRequest`]) is an audited `400`, matching the queue sibling's
 /// `parse_pause_request` contract: on rejection the audit row is written here
 /// and a ready-to-send response is returned in `Err`.
+#[allow(clippy::result_large_err)]
 async fn parse_activity_pause_request(
     api_state: &HarvestApiState,
     audit: &QueuePauseAuditCtx,
@@ -34897,6 +34902,7 @@ fn local_activity_pause_refusal(
 /// would refuse EVERY pause during the boot window — including the ordinary
 /// remote ones an operator needs most mid-incident — to guard a case that is
 /// merely today's behaviour.
+#[allow(clippy::result_large_err)]
 async fn prepare_activity_pause_targets_checked(
     api_state: &HarvestApiState,
     audit: &QueuePauseAuditCtx,
