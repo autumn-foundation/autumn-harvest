@@ -4067,11 +4067,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{id}/timeline", get(get_workflow_timeline))
         .route("/workflows/{id}/run-chain", get(get_run_chain))
-        // Ephemeral workflow progress SSE stream (issue #791). Deliberately NOT
-        // admin-gated — an app's end-users stream their own workflows (AC5). It
-        // inherits the general management API auth middleware (api_with_auth)
-        // like the other non-admin `/workflows/{id}/…` read routes.
-        .route("/workflows/{id}/stream", get(stream_workflow_progress))
+        // Progress chunks can contain sensitive, non-persisted workflow output
+        // and every subscriber owns a dedicated LISTEN connection. Apply the
+        // management admin guard before establishing either resource.
+        .route(
+            "/workflows/{id}/stream",
+            get(stream_workflow_progress).route_layer(require_admin.clone()),
+        )
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route(
             "/workflows/{workflow_name}/signal-with-start",
@@ -5016,7 +5018,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/timeline"),
         ("GET", "/workflows/{id}/run-chain"),
         // Ephemeral workflow progress SSE stream (issue #791). Read-only,
-        // text/event-stream; NOT admin-gated (AC5). See docs/api-contract.json.
+        // text/event-stream; admin-gated because chunks may be sensitive.
+        // See docs/api-contract.json.
         ("GET", "/workflows/{id}/stream"),
         ("POST", "/workflows/{workflow_name}/start"),
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
@@ -27656,12 +27659,11 @@ async fn progress_stream_end_reason(
 /// over Postgres LISTEN/NOTIFY, with sub-second delivery and no DB connection
 /// held between chunks.
 ///
-/// **Auth**: this route inherits the management API's configured auth middleware
-/// (`HarvestPlugin::api_with_auth`); it is deliberately **NOT** admin-gated
-/// (issue #791 AC5 — an app's end-users stream their own workflows). If no
-/// middleware is configured the route is open — embedders exposing streams to
-/// untrusted end-users should configure `api_with_auth` or front it with their
-/// own auth.
+/// **Authorization**: this route requires the same Harvest administrator access
+/// as the execution event stream. This prevents an execution ID from acting as
+/// a bearer capability for potentially sensitive progress chunks and ensures
+/// unauthenticated callers cannot consume dedicated Postgres `LISTEN`
+/// connections.
 ///
 /// SSE wire format:
 /// ```text
@@ -27679,15 +27681,6 @@ async fn progress_stream_end_reason(
 /// replayed, and there is **no backfill** on (re)connect. A subscriber that
 /// connects after a chunk was published will not see it — deliberate, since
 /// chunk content may be non-deterministic precisely because it is never stored.
-///
-/// **Authorization**: this route only checks that the execution exists (→ 404
-/// otherwise). `exec_id` is effectively a bearer capability for this run's live
-/// chunk *content*; embedders exposing sensitive workflow output MUST add their
-/// own per-execution authorization on top. `exec_id` is a random `UUIDv4` (not
-/// enumerable), which mitigates blind probing but is not an access-control
-/// substitute. Each subscriber also holds one dedicated (non-pooled) Postgres
-/// `LISTEN` connection for the stream's lifetime, so embedders should rate-limit
-/// and/or cap concurrent streams per user to avoid DB connection exhaustion.
 ///
 /// Responses: `404` if the execution does not exist; `503` if the LISTEN/NOTIFY
 /// database URL is not configured or the notification database is unreachable

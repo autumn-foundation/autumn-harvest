@@ -177,31 +177,16 @@ What a subscriber should do:
 
 ## Auth — default posture (AC5)
 
-The stream route is **deliberately not** `require_admin`. It is an
-**end-user-facing** read path — an app's users stream their own workflows —
-distinct from the admin-only engine-event tail (#324).
+The stream route requires `require_admin`, just like the admin-only engine-event
+tail (#324). Progress chunks may contain sensitive, non-persisted workflow
+output, and each subscriber holds a dedicated, non-pooled Postgres `LISTEN`
+connection for the lifetime of the stream. Requiring administrator access before
+the handler runs prevents an execution ID from acting as a bearer capability and
+prevents unauthenticated callers from exhausting database connections.
 
-It inherits the general `api_with_auth` middleware you configure on the Harvest
-API, exactly like the other management routes. **If you configure no auth, the
-route is open.** Embedders surfacing streams to untrusted end-users **must** front
-this route with their own authentication and per-execution authorization
-(typically your app already knows which `exec_id` belongs to the requesting
-user). Do not expose an unauthenticated `/stream` to the public internet.
-
-**`exec_id` is a bearer capability for live chunk content.** The engine only
-checks that the execution *exists* (returning `404` otherwise) — it performs **no
-authorization**. Anyone who presents a valid `exec_id` receives that run's live
-chunk **content**, which may include sensitive workflow output. If your chunks
-carry anything sensitive, you **must** add a per-execution authorization check in
-your own middleware. `exec_id` is a random UUIDv4 (not enumerable), which
-mitigates blind probing but is **not** an access-control substitute.
-
-**Cap concurrent streams (DoS).** Each subscriber holds **one dedicated,
-non-pooled Postgres `LISTEN` connection** for the lifetime of the stream. A flood
-of concurrent `/stream` requests can therefore exhaust database connections.
-Embedders should rate-limit stream opens and/or cap concurrent streams per user.
-A global concurrent-stream cap is a possible future enhancement; today it is the
-embedder's responsibility.
+Deployments that need end-user progress streaming should provide a separate
+application endpoint with explicit per-execution authorization and a bounded
+connection policy.
 
 ## Out of scope
 

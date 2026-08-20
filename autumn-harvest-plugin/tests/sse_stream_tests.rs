@@ -150,14 +150,11 @@ fn progress_stream_route_is_classified_as_read_only() {
     );
 }
 
-/// AC5: the progress stream is deliberately NOT admin-gated — an app's
-/// end-users stream their own workflows. Prove it by contrast: with the admin
-/// boundary closed and no session, the admin-gated events stream rejects the
-/// request (401), while the same unauthenticated request to the progress stream
-/// REACHES the handler (never 401/403; here it fails config-side because no
-/// notification URL is set). This is the exact posture #791 AC5 requires.
+/// Progress chunks may carry sensitive output and each subscription consumes a
+/// dedicated Postgres LISTEN connection, so the route must reject an
+/// unauthenticated request before it reaches the stream handler.
 #[tokio::test]
-async fn progress_stream_is_not_admin_gated() {
+async fn progress_stream_requires_admin_access() {
     use autumn_web::reexports::axum::body::Body;
     use autumn_web::reexports::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
@@ -186,7 +183,7 @@ async fn progress_stream_is_not_admin_gated() {
         "control: the admin-gated events stream must reject an unauthenticated request"
     );
 
-    // The progress stream reaches the handler for the SAME request (not admin-gated).
+    // The progress stream must enforce the same admin boundary.
     let resp = app
         .clone()
         .oneshot(
@@ -198,25 +195,10 @@ async fn progress_stream_is_not_admin_gated() {
         )
         .await
         .unwrap();
-    assert_ne!(
+    assert_eq!(
         resp.status(),
         StatusCode::UNAUTHORIZED,
-        "progress stream must NOT be admin-gated (issue #791 AC5)"
-    );
-    assert_ne!(
-        resp.status(),
-        StatusCode::FORBIDDEN,
-        "progress stream must NOT be admin-gated (issue #791 AC5)"
-    );
-    assert_ne!(
-        resp.status(),
-        StatusCode::NOT_FOUND,
-        "progress stream route must be registered"
-    );
-    assert_ne!(
-        resp.status(),
-        StatusCode::METHOD_NOT_ALLOWED,
-        "progress stream route registered with wrong HTTP method"
+        "progress stream must reject unauthenticated requests before opening a LISTEN connection"
     );
 }
 
@@ -230,7 +212,11 @@ async fn progress_stream_returns_service_unavailable_when_not_configured() {
     use autumn_web::reexports::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
 
-    let app = autumn_harvest_plugin::api::harvest_api_router(HarvestApiState::new())
+    let state = HarvestApiState::new();
+    // Model the embedder-provided auth boundary so the request may reach the
+    // handler and exercise its configuration error path.
+    state.set_admin_auth_boundary(true);
+    let app = autumn_harvest_plugin::api::harvest_api_router(state)
         .with_state(autumn_web::AppState::for_test());
 
     let req = Request::builder()
