@@ -45,5 +45,7 @@ fn compile_fail_cases() {
     t.compile_fail("tests/compile_fail/workflow_dependency_paren_container.rs");
     t.compile_fail("tests/compile_fail/workflow_duplicate_dependency_attr.rs");
     t.compile_fail("tests/compile_fail/workflow_unsupported_attribute.rs");
+    // Issue #940 AC2: an unknown chaos injection-point name is a compile error.
+    t.compile_fail("tests/compile_fail/chaos_unknown_point_is_compile_error.rs");
     t.pass("tests/compile_fail/suppressed_guardrails.rs");
 }
