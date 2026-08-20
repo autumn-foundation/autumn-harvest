@@ -1550,6 +1550,16 @@ pub fn evaluate_triggers_for_execution<'a>(
                 // recorder is in scope here. Emission is inline, matching every
                 // other counter this function already records inside the source's
                 // terminal transaction (`record_completion_trigger_fired`).
+                //
+                // Residual (Codex round 3): emission happens at return, not after
+                // the enclosing terminal transaction commits, so a rollback of that
+                // transaction leaves both counters emitted for a supersede that never
+                // became durable. Bounded to rolled-back terminal transactions, and
+                // strictly better than the pre-fix state (never emitted at all, an
+                // unconditional under-count). Deferring emission needs a post-commit
+                // collector threaded out of `evaluate_triggers_for_execution`, which
+                // changes its return type across 71 call sites; tracked as a
+                // follow-up issue.
                 let start_res = match start_or_load_workflow_execution_with_metrics(
                     conn,
                     StartWorkflowParams {
