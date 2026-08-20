@@ -12148,22 +12148,15 @@ async fn handle_suspended_workflow(
         .await
     } else {
         let error = suspended_workflow_error(commands);
-        persist_workflow_failure(
+        fail_suspended_workflow_if_still_claimed(
             conn,
-            context.persistence.task.id,
+            context.persistence.task,
             context.persistence.exec_id,
             context.persistence.next_event_id,
             context.persistence.worker_id,
             &error,
-            None,
-            None,
-            None,
-            None,
-            None,
-            crate::types::Priority::default(),
         )
         .await
-        .map(|_| ())
     };
 
     fail_execution_on_error(
@@ -12193,8 +12186,110 @@ async fn fail_execution_on_error<T>(
     if error.handler_not_registered().is_some() {
         return Err(error);
     }
+    // Issue #1182 (Codex review round 2): an ambiguous suspended-dispatch
+    // claim is the identical "blameless, no decision made" shape as a
+    // capability miss -- pass it through un-failed so the caller can roll
+    // back the enclosing transaction and perform the standalone claim
+    // release afterward, rather than terminally failing the run here.
+    if error.suspended_claim_ambiguous().is_some() {
+        return Err(error);
+    }
     fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
     Err(error)
+}
+
+/// Fail a suspended workflow dispatch that made **zero** replay-significant
+/// progress -- an empty command set, or a command combination this worker
+/// does not know how to persist -- but only when this worker still holds the
+/// claim (issue #1182).
+///
+/// [`handle_suspended_workflow`]'s catch-all branch used to reach straight for
+/// [`persist_workflow_failure`], with no ownership recheck at all. A live
+/// dispatch that suspends empty-handed because it was still mid-flight on
+/// some other I/O -- a slow downstream call, a database round trip -- when
+/// [`crate::executor::SUSPENSION_TIMEOUT`] elapses would then be failed
+/// terminally under the **stale** `worker_id`, even when the row had already
+/// changed hands to a concurrent poison-pill reclaim, an operator action, or
+/// exactly the claim-theft race issue #804's round-28 fix guards the
+/// `AfterHandler` capability-miss branch against. That guard covers only the
+/// path reached via [`persist_scheduled_activities`]; a handler that never
+/// got far enough to push a single command skips that branch and lands here,
+/// where nothing checked the claim.
+///
+/// This reuses the same commit-if-still-claimed guarantee
+/// ([`commit_terminal_failure_if_still_claimed`]) with no escalation
+/// attached, so a [`TerminalWriteOutcome::ClaimLost`] result writes nothing
+/// terminal. `EvidenceChanged` cannot occur here (it is only produced when an
+/// `escalation` is supplied) but is handled identically for completeness and
+/// to keep this function robust to a future change in that guarantee.
+///
+/// `ClaimLost` does not, by itself, mean the row's new owner is free to drive
+/// the run to completion -- [`queue::claim_still_held_for_update`]'s `SKIP
+/// LOCKED` guard cannot distinguish a genuine ownership transfer from a
+/// concurrent, *unrelated* lock holder (e.g. [`queue::wake_workflow_task`]'s
+/// `wake_requested` fallback, momentarily locking this exact row for a
+/// sibling event) merely contending for it at that instant; both read back
+/// as "not ours right now" (Codex review of #1182). If this dispatch simply
+/// returned `Ok(())` in that second case, the row would strand `RUNNING`
+/// under a worker who has already given up on it, with nothing left to ever
+/// re-claim it -- so a lost claim (or a changed evidence snapshot) must
+/// still be released.
+///
+/// **The release itself does not happen here.** This function is called
+/// from inside `process_workflow_task`'s persistence transaction, which
+/// holds the *execution* row's lock for its whole duration
+/// ([`check_paused_and_park`]'s `FOR UPDATE`). `commit_terminal_failure_if_
+/// still_claimed` opens its own transaction internally, but since one is
+/// already open here, Diesel issues a `SAVEPOINT` rather than a fresh
+/// `BEGIN` -- and Postgres does **not** release a lock held by the outer
+/// transaction when a nested savepoint is released, only when the
+/// *outermost* transaction ends. Attempting the blocking, non-`SKIP LOCKED`
+/// [`queue::release_suspended_workflow_claim`] from here would therefore
+/// contend for the task row *while still holding the execution row* -- the
+/// exact ABBA cycle against `poison_pill::quarantine_orphan`'s reversed
+/// (task-row-first) lock order that `SKIP LOCKED` exists to avoid in the
+/// first place (Codex review round 2 of #1182).
+///
+/// So an ambiguous claim is surfaced as [`HarvestError::SuspendedClaimAmbiguous`]
+/// instead, and propagated with `?`. This forces the *entire* enclosing
+/// transaction to roll back -- releasing the execution-row lock, and
+/// discarding any bookkeeping write [`handle_suspended_workflow`] made
+/// earlier in the same dispatch cycle, so a rolled-back "no decision" can
+/// never commit half of one -- before the release is even attempted. Only
+/// after that rollback and the enclosing `.await` have both returned does
+/// the caller invoke [`queue::release_suspended_workflow_claim`] standalone,
+/// holding no other lock: a genuine transfer updates nothing (the new owner
+/// keeps the row, unchanged), while a spurious skip-locked miss is released
+/// back to `PENDING` for a fresh dispatch attempt.
+#[doc(hidden)]
+pub async fn fail_suspended_workflow_if_still_claimed(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    worker_id: &str,
+    error: &str,
+) -> HarvestResult<()> {
+    let preloaded = PreloadedFailureHistory::Loaded {
+        exec_id,
+        next_event_id,
+    };
+    let write = commit_terminal_failure_if_still_claimed(
+        conn,
+        task,
+        worker_id,
+        error,
+        preloaded,
+        None,
+        |_| {},
+    )
+    .await?;
+    match write {
+        TerminalWriteOutcome::Committed(_) => Ok(()),
+        TerminalWriteOutcome::ClaimLost | TerminalWriteOutcome::EvidenceChanged(_) => {
+            Err(HarvestError::SuspendedClaimAmbiguous { task_id: task.id })
+        }
+    }
 }
 
 /// Terminal-fail wrapper for the `process_workflow_task` drive loop that also
@@ -16091,10 +16186,35 @@ async fn process_workflow_task(
             .await;
         }
         Err(error) => {
-            // Preserve per-path error handling: a terminal-with-commands persist
-            // failure durably fails the task + execution (matching the prior
-            // `fail_execution_on_error` wrapping); a suspended/simple-terminal
-            // persist failure propagates so the task is retried.
+            // Issue #1182 (Codex review round 3): an ambiguous suspended-
+            // dispatch claim is deliberately NOT intercepted here, unlike
+            // round 2's first cut. `?` inside the transaction closure has
+            // already rolled the *whole* persistence transaction back --
+            // releasing the execution row's lock and discarding any
+            // bookkeeping write made earlier in this cycle (see
+            // `fail_suspended_workflow_if_still_claimed`'s doc comment for
+            // why the release cannot happen from inside that transaction) --
+            // but the release itself is a deliberately *blocking* (not
+            // `SKIP LOCKED`) wait for a transient lock holder to clear, and
+            // this whole function's future is wrapped in the issue #494
+            // `workflow_task_timeout` budget by `run_under_workflow_body_
+            // budget`. Performing the release here risked that wait alone
+            // consuming the remaining budget and being cancelled mid-flight
+            // -- reporting `BodyTimedOut` and banking a timeout strike
+            // against a workflow whose handler had in fact completed fine;
+            // only the *cleanup* waited on unrelated row contention (Codex
+            // review round 3). So this error, like a capability miss, is
+            // simply propagated here: the caller (`process_task`) performs
+            // the release *after* the budgeted cycle has already returned,
+            // exactly mirroring how it already handles
+            // `handler_not_registered()`.
+            //
+            // Preserve per-path error handling otherwise: a
+            // terminal-with-commands persist failure durably fails the task
+            // + execution (matching the prior `fail_execution_on_error`
+            // wrapping, which itself passes an ambiguous-claim error through
+            // un-failed); a suspended/simple-terminal persist failure
+            // (including this one) propagates so the caller can act on it.
             if is_terminal_with_commands {
                 return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(error)).await;
             }
@@ -16193,6 +16313,57 @@ async fn run_under_workflow_body_budget<F: std::future::Future>(
         Some(budget) => tokio::time::timeout(budget, body).await.ok(),
         None => Some(body.await),
     }
+}
+
+/// Issue #1182 (Codex review round 3): performs the release for an ambiguous
+/// suspended-dispatch claim -- if `error` names one -- and returns `None`
+/// (a no-op) for every other error, so the caller falls through to the
+/// capability-miss check unchanged.
+///
+/// Deliberately called from `process_task` *after*
+/// [`run_under_workflow_body_budget`] has already returned, rather than from
+/// inside `process_workflow_task`'s own timeout-wrapped decision cycle: the
+/// release is intentionally blocking (see
+/// `fail_suspended_workflow_if_still_claimed`'s doc comment on why it must
+/// wait for the row lock rather than skip ownership verification), so
+/// performing it *inside* the budget risked the wait alone consuming the
+/// remaining issue #494 `workflow_task_timeout` and being cancelled --
+/// reporting a false [`TaskDispatchOutcome::BodyTimedOut`] and banking a
+/// timeout strike against a workflow whose handler had in fact already
+/// completed within its budget; only the *cleanup* waited on unrelated row
+/// contention.
+async fn handle_ambiguous_suspended_claim(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    error: &HarvestError,
+) -> Option<HarvestResult<TaskDispatchOutcome>> {
+    let task_id = error.suspended_claim_ambiguous()?;
+    let released =
+        match queue::release_suspended_workflow_claim(conn, task_id, worker_id, task.crash_strikes)
+            .await
+        {
+            Ok(released) => released,
+            Err(err) => return Some(Err(err)),
+        };
+    tracing::info!(
+        task_id = %task_id,
+        queue = %task.queue_name,
+        released,
+        "a suspended workflow dispatch made no replay-significant progress; the claim guard \
+         could not confirm ownership (a genuine transfer, or a concurrent, unrelated lock \
+         holder), so the enclosing transaction was rolled back and no terminal decision was \
+         made; the task was released back to the queue if it was still ours"
+    );
+    // The handler ran to a conclusion -- this is the "suspended, empty-
+    // handed" persist path, reached only after the workflow body returned --
+    // and only the final claim recheck found ambiguity, so this dispatch is
+    // genuine evidence of health: clear the issue #494 timeout strike,
+    // mirroring the `AfterHandler` capability-miss rule
+    // (`TaskDispatchOutcome::Released`'s doc comment).
+    Some(Ok(TaskDispatchOutcome::Released {
+        clears_timeout_strike: true,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16310,6 +16481,14 @@ async fn process_task(
     let Err(error) = &outcome else {
         return outcome.map(|()| TaskDispatchOutcome::Completed);
     };
+    // Issue #1182 (Codex review round 3): an ambiguous suspended-dispatch
+    // claim is intercepted HERE -- after `run_under_workflow_body_budget`
+    // has already returned -- rather than inside `process_workflow_task`.
+    // See `handle_ambiguous_suspended_claim`'s doc comment for why.
+    if let Some(result) = handle_ambiguous_suspended_claim(&mut conn, &task, worker_id, error).await
+    {
+        return result;
+    }
     let Some((kind, name)) = error.handler_not_registered() else {
         return outcome.map(|()| TaskDispatchOutcome::Completed);
     };
