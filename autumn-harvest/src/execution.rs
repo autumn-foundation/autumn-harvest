@@ -2503,9 +2503,10 @@ pub async fn resolve_live_attempt(
         .expect("walk_retry_chain always returns at least the addressed row"))
 }
 
-/// Walk the workflow-level retry chain (issue #523) from `exec_id` and return
-/// every attempt in walk order: `exec_id` itself at index 0, the live attempt
-/// last. A workflow that never retried yields a one-element vector.
+/// Walk the workflow-level retry chain (issue #523) from `exec_id`.
+///
+/// Returns every attempt in walk order: `exec_id` itself at index 0, the live
+/// attempt last. A workflow that never retried yields a one-element vector.
 ///
 /// This is the shared primitive behind [`resolve_live_attempt`] (which takes
 /// the last element) and [`retry_chain_ids`]. It costs exactly the same number
