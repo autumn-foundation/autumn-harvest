@@ -898,4 +898,213 @@ mod controller {
         }
         hash
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::chaos::points::{
+            NOTIFY_TASK_ENQUEUED, POISON_RECLAIM_BEFORE_LOAD, QUEUE_PARK_BEFORE_UPDATE,
+        };
+
+        // ---- deterministic mixers (AC3) ------------------------------------
+
+        #[test]
+        fn splitmix64_is_deterministic_and_disperses() {
+            assert_eq!(splitmix64(0), splitmix64(0));
+            assert_eq!(splitmix64(42), splitmix64(42));
+            assert_ne!(splitmix64(0), splitmix64(1));
+            assert_ne!(splitmix64(1), splitmix64(2));
+        }
+
+        #[test]
+        fn fnv1a_is_deterministic_and_distinguishes_names() {
+            assert_eq!(
+                fnv1a("queue.park.before_update"),
+                fnv1a("queue.park.before_update")
+            );
+            assert_ne!(
+                fnv1a("queue.park.before_update"),
+                fnv1a("notify.task_enqueued")
+            );
+            // Every catalogue name hashes to a distinct stream base, so no two
+            // points share a seeded stream.
+            let mut hashes: Vec<u64> = ALL.iter().map(|p| fnv1a(p.name())).collect();
+            let before = hashes.len();
+            hashes.sort_unstable();
+            hashes.dedup();
+            assert_eq!(before, hashes.len(), "two point names collide under fnv1a");
+        }
+
+        // ---- seeded plans (AC3) --------------------------------------------
+
+        #[test]
+        fn seeded_plan_is_reproducible_for_a_fixed_seed() {
+            let a = ChaosPlan::seeded(12345);
+            let b = ChaosPlan::seeded(12345);
+            assert_eq!(a.seed, Some(12345));
+            let ka: Vec<&&'static str> = a.directives.keys().collect();
+            let kb: Vec<&&'static str> = b.directives.keys().collect();
+            assert_eq!(ka, kb, "seeded plan point set differs across builds");
+            for (name, da) in &a.directives {
+                let db = b.directives.get(name).expect("same key set");
+                assert_eq!(
+                    format!("{:?}{:?}", da.action, da.trigger),
+                    format!("{:?}{:?}", db.action, db.trigger),
+                    "directive for {name} differs across builds",
+                );
+            }
+        }
+
+        #[test]
+        fn seeded_plans_differ_across_seeds() {
+            // Not a per-pair guarantee, but across a spread of seeds the
+            // activated-point signatures must not all be identical.
+            let sig = |seed: u64| -> Vec<&'static str> {
+                let mut v: Vec<&'static str> =
+                    ChaosPlan::seeded(seed).directives.keys().copied().collect();
+                v.sort_unstable();
+                v
+            };
+            let sigs: std::collections::BTreeSet<Vec<&'static str>> = (0u64..32).map(sig).collect();
+            assert!(
+                sigs.len() > 1,
+                "every seed produced the same activated-point set"
+            );
+        }
+
+        #[test]
+        fn seeded_plan_never_selects_hold_and_respects_caps() {
+            for seed in 0u64..200 {
+                for (name, d) in &ChaosPlan::seeded(seed).directives {
+                    assert!(
+                        !matches!(d.action, Action::Hold),
+                        "seeded plan chose Hold for {name} (seed {seed})",
+                    );
+                    let caps = ALL
+                        .iter()
+                        .find(|p| p.name() == *name)
+                        .expect("directive names a catalogue point")
+                        .caps();
+                    let ok = match &d.action {
+                        Action::Kill => caps & CAP_KILL != 0,
+                        Action::Error(_) => caps & CAP_ERROR != 0,
+                        Action::DropNotify => caps & CAP_DROP_NOTIFY != 0,
+                        Action::Delay(_) => caps & CAP_DELAY != 0,
+                        Action::Hold => false,
+                    };
+                    assert!(
+                        ok,
+                        "seeded action {:?} violates caps of {name} (seed {seed})",
+                        d.action
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn pick_seeded_action_respects_caps_and_never_holds() {
+            for stream in 0u64..64 {
+                if let Some(a) = pick_seeded_action(POISON_RECLAIM_BEFORE_LOAD, stream) {
+                    assert!(matches!(a, Action::Error(_)));
+                }
+                if let Some(a) = pick_seeded_action(NOTIFY_TASK_ENQUEUED, stream) {
+                    assert!(matches!(a, Action::DropNotify));
+                }
+                if let Some(a) = pick_seeded_action(QUEUE_PARK_BEFORE_UPDATE, stream) {
+                    assert!(matches!(a, Action::Kill | Action::Delay(_)));
+                }
+            }
+        }
+
+        // ---- scripted builders + resolve accounting ------------------------
+
+        #[test]
+        fn scripted_kill_at_fires_on_the_nth_hit_only() {
+            let state =
+                ChaosState::from_plan(ChaosPlan::scripted().kill_at_hit(QUEUE_PARK_BEFORE_UPDATE, 2));
+            assert!(matches!(
+                state.resolve(QUEUE_PARK_BEFORE_UPDATE),
+                Resolved::Continue
+            ));
+            assert!(matches!(
+                state.resolve(QUEUE_PARK_BEFORE_UPDATE),
+                Resolved::Kill
+            ));
+            assert!(matches!(
+                state.resolve(QUEUE_PARK_BEFORE_UPDATE),
+                Resolved::Continue
+            ));
+            assert_eq!(state.hits_of(QUEUE_PARK_BEFORE_UPDATE), 3);
+            assert_eq!(state.actions_fired.load(Ordering::Relaxed), 1);
+        }
+
+        #[test]
+        fn scripted_error_at_fires_every_hit() {
+            let state = ChaosState::from_plan(
+                ChaosPlan::scripted().error_at(POISON_RECLAIM_BEFORE_LOAD, ChaosError::EventIdUnique),
+            );
+            for _ in 0..3 {
+                assert!(matches!(
+                    state.resolve(POISON_RECLAIM_BEFORE_LOAD),
+                    Resolved::Error(ChaosError::EventIdUnique)
+                ));
+            }
+            assert_eq!(state.actions_fired.load(Ordering::Relaxed), 3);
+        }
+
+        #[test]
+        fn scripted_drop_notify_and_delay_resolve_expected() {
+            let s1 = ChaosState::from_plan(ChaosPlan::scripted().drop_notify_at(NOTIFY_TASK_ENQUEUED));
+            assert!(matches!(
+                s1.resolve(NOTIFY_TASK_ENQUEUED),
+                Resolved::DropNotify
+            ));
+
+            let s2 =
+                ChaosState::from_plan(ChaosPlan::scripted().delay_at(QUEUE_PARK_BEFORE_UPDATE, 7));
+            assert!(matches!(
+                s2.resolve(QUEUE_PARK_BEFORE_UPDATE),
+                Resolved::Delay(7)
+            ));
+        }
+
+        #[test]
+        fn unarmed_point_resolves_continue() {
+            let state = ChaosState::from_plan(ChaosPlan::scripted());
+            assert!(matches!(
+                state.resolve(NOTIFY_TASK_ENQUEUED),
+                Resolved::Continue
+            ));
+            assert_eq!(state.actions_fired.load(Ordering::Relaxed), 0);
+        }
+
+        // ---- error conversions (AC1(b)) ------------------------------------
+
+        #[test]
+        fn chaos_error_maps_into_harvest_and_diesel() {
+            let h: crate::error::HarvestError = ChaosError::Generic.into();
+            assert!(matches!(h, crate::error::HarvestError::Database(_)));
+
+            let d: diesel::result::Error = ChaosError::EventIdUnique.into();
+            assert!(matches!(
+                d,
+                diesel::result::Error::DatabaseError(
+                    diesel::result::DatabaseErrorKind::UniqueViolation,
+                    _
+                )
+            ));
+            let d2: diesel::result::Error = ChaosError::Generic.into();
+            assert!(matches!(d2, diesel::result::Error::QueryBuilderError(_)));
+        }
+
+        #[test]
+        fn describe_embeds_seed_and_fired_count() {
+            let state =
+                ChaosState::from_plan(ChaosPlan::seeded(99).kill_at(QUEUE_PARK_BEFORE_UPDATE));
+            let _ = state.resolve(QUEUE_PARK_BEFORE_UPDATE);
+            let d = state.describe();
+            assert!(d.contains("seed=Some(99)"), "describe: {d}");
+            assert!(d.contains("fired="), "describe: {d}");
+        }
+    }
 }
