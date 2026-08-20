@@ -2491,8 +2491,18 @@ pub async fn resolve_live_attempt(
         if execution.state != "FAILED" {
             return Ok(execution);
         }
+        // Exactly one successor can exist: `update_workflow_execution_failed`
+        // filters `state = 'RUNNING'`, so only one transaction can seal a row
+        // `FAILED`, and only that transaction inserts its successor. The
+        // `ORDER BY` is defensive — it makes the walk total (and stable across
+        // the two resolutions of a re-drive loop) even if that invariant were
+        // ever broken, rather than picking arbitrarily and oscillating.
         let next: Option<Uuid> = harvest_workflow_executions::table
             .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(execution.id)))
+            .order((
+                harvest_workflow_executions::started_at.asc(),
+                harvest_workflow_executions::id.asc(),
+            ))
             .select(harvest_workflow_executions::id)
             .first(conn)
             .await
@@ -2505,6 +2515,16 @@ pub async fn resolve_live_attempt(
             None => return Ok(execution),
         }
     }
+    // Unreachable for any real chain (`max_workflow_attempts` is far below the
+    // bound), so exhausting it means a pathological / corrupted chain. Returning
+    // the deepest row we reached is the safe answer, but it may not be the live
+    // attempt — say so rather than silently reintroducing the bug #843 fixes.
+    tracing::warn!(
+        execution_id = %exec_id,
+        max_depth = RETRY_CHAIN_MAX_DEPTH,
+        "harvest: retry chain exceeded the maximum walk depth; \
+         returning the deepest attempt reached, which may not be the live one"
+    );
     Ok(execution)
 }
 
@@ -2658,6 +2678,98 @@ pub async fn terminate_live_attempt(
         }
     }
     terminate_workflow_execution(conn, target, reason, metrics).await
+}
+
+/// Pause the **live attempt** of the logical run named by `exec_id` (#843).
+///
+/// The routed sibling of [`pause_workflow_execution`]. Pause only accepts a
+/// `RUNNING`/`PAUSED` execution, so without routing an operator holding the id
+/// returned by `start` would be told a retried run "is already terminal
+/// (FAILED)" and could not reach for the reversible containment lever at all —
+/// leaving only the destructive cancel/terminate escalation.
+///
+/// Race handling: pause errors against a terminal row, so an `Err` that
+/// coincides with a chain advance is re-driven against the new live attempt.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::NotFound`] when the execution does not exist,
+/// [`HarvestError::Config`] when the resolved live attempt is terminal (an
+/// exhausted chain), and [`HarvestError::Database`] for persistence failures.
+pub async fn pause_live_attempt(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    reason: Option<&str>,
+    actor: &str,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+) -> HarvestResult<PausedWorkflowExecution> {
+    let mut target = resolve_live_attempt_id(conn, exec_id).await?;
+    for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
+        match pause_workflow_execution(conn, target, reason, actor, metrics).await {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                let fresh = resolve_live_attempt_id(conn, exec_id)
+                    .await
+                    .unwrap_or(target);
+                if !redrive_target(target, fresh) {
+                    return Err(error);
+                }
+                target = fresh;
+            }
+        }
+    }
+    pause_workflow_execution(conn, target, reason, actor, metrics).await
+}
+
+/// Resume the **live attempt** of the logical run named by `exec_id` (#843).
+///
+/// The routed sibling of [`resume_workflow_execution`]. Resume is an idempotent
+/// success no-op against any non-paused execution (issue #609 AC7), so without
+/// routing a resume against a sealed `FAILED` predecessor would report success
+/// while the paused retry stayed parked — the same silent-no-op failure mode
+/// routing closes for terminate.
+///
+/// Race handling: a no-op against a row that is `FAILED` (the only terminal
+/// state a chain advance can produce) is re-driven against the freshly resolved
+/// live attempt; every other outcome is final.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::NotFound`] when the execution does not exist and
+/// [`HarvestError::Database`] for persistence failures.
+pub async fn resume_live_attempt(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    actor: &str,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+) -> HarvestResult<ResumedWorkflowExecution> {
+    let mut target = resolve_live_attempt_id(conn, exec_id).await?;
+    for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
+        match resume_workflow_execution(conn, target, actor, metrics).await {
+            Ok(result) if result.newly_resumed || result.state != "FAILED" => {
+                return Ok(result);
+            }
+            Ok(result) => {
+                let fresh = resolve_live_attempt_id(conn, exec_id)
+                    .await
+                    .unwrap_or(target);
+                if !redrive_target(target, fresh) {
+                    return Ok(result);
+                }
+                target = fresh;
+            }
+            Err(error) => {
+                let fresh = resolve_live_attempt_id(conn, exec_id)
+                    .await
+                    .unwrap_or(target);
+                if !redrive_target(target, fresh) {
+                    return Err(error);
+                }
+                target = fresh;
+            }
+        }
+    }
+    resume_workflow_execution(conn, target, actor, metrics).await
 }
 
 /// Maximum length of an operator-supplied pause reason (issue #383).
@@ -7598,6 +7710,51 @@ mod rerun_tests {
             assert!(
                 !RERUNNABLE_SOURCE_STATES.contains(&state),
                 "{state} is not terminal and must not be re-runnable"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod retry_chain_routing_tests {
+    use super::{RETRY_CHAIN_MAX_DEPTH, RETRY_CHAIN_MAX_REDRIVES, redrive_target};
+    use crate::types::ExecutionId;
+
+    /// Issue #843: the pure re-drive decision. Returning `false` for an
+    /// unchanged target is what terminates every routed operation's loop AND
+    /// what stops a genuine error (an unknown id, an exhausted chain whose
+    /// final outcome really is `FAILED`) from being retried forever.
+    #[test]
+    fn redrive_only_when_the_target_actually_changed() {
+        let a = ExecutionId::new();
+        let b = ExecutionId::new();
+        assert_ne!(a, b, "two fresh ids must differ");
+
+        assert!(
+            !redrive_target(a, a),
+            "an unchanged target must NOT re-drive — this is the loop's termination condition"
+        );
+        assert!(
+            redrive_target(a, b),
+            "a target that advanced down the chain must re-drive"
+        );
+        // Direction-independent: the helper answers "did it change?", not
+        // "did it advance?" — the walk itself guarantees the descent.
+        assert!(redrive_target(b, a));
+    }
+
+    /// The re-drive bound must be at least the walk bound: a re-drive can only
+    /// fire once per chain advance, so a lower cap would give up on a chain the
+    /// resolver is still willing to walk.
+    #[test]
+    fn redrive_bound_is_not_below_the_walk_bound() {
+        const {
+            assert!(RETRY_CHAIN_MAX_REDRIVES >= RETRY_CHAIN_MAX_DEPTH);
+        }
+        const {
+            assert!(
+                RETRY_CHAIN_MAX_DEPTH >= 64,
+                "the bound must sit far above any realistic max_attempts"
             );
         }
     }

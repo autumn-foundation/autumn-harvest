@@ -6271,23 +6271,24 @@ async fn persist_workflow_failure(
                             },
                         )
                         .await?;
-                        // Issue #843: carry pending signals across the
-                        // fresh-history boundary. A signal staged on this
-                        // attempt but never ingested into its history is not
-                        // reflected anywhere, so moving it to the successor
-                        // loses nothing and stops it being silently dropped
-                        // with the failed attempt. Consumed signals stay put
-                        // (audit); the retry replays a fresh history and must
-                        // not re-observe them. Mirrors the identical
-                        // reassignment `continue_as_new` already performs.
+                        // Issue #843: carry the logical run's whole signal
+                        // mailbox across the fresh-history boundary, re-arming
+                        // consumed rows. The retry replays an EMPTY history and
+                        // re-runs every step from zero, so a signal this attempt
+                        // observed is one the retry must observe again — else a
+                        // workflow that replays back to `wait_for_signal` blocks
+                        // forever on a signal its caller was already told landed.
+                        // This attempt's own `SignalReceived` events stay in its
+                        // history, so the audit record is unaffected.
                         let forwarded =
-                            crate::signal::forward_unconsumed_signals(conn, exec_id, rid).await?;
+                            crate::signal::forward_signals_to_retry_attempt(conn, exec_id, rid)
+                                .await?;
                         if forwarded > 0 {
                             tracing::debug!(
                                 execution_id = %exec_id,
                                 retry_exec_id = %rid,
                                 forwarded,
-                                "harvest: forwarded unconsumed signals to the retry attempt"
+                                "harvest: forwarded signal mailbox to the retry attempt"
                             );
                         }
                         retry_committed = true;
@@ -13402,6 +13403,14 @@ async fn persist_workflow_continue_as_new(
         // delivered while the workflow body was running do not disappear
         // through the transition. Consumed signals stay on the old run
         // for audit purposes.
+        //
+        // Deliberately NARROWER than the retry path's
+        // `signal::forward_signals_to_retry_attempt` (issue #843), which moves
+        // the WHOLE mailbox and re-arms `consumed`: a continue-as-new is
+        // VOLUNTARY and carries whatever it still needs in the successor's
+        // input, so a signal this run already observed has already been folded
+        // into that input. A retry carries nothing forward and replays from an
+        // empty history, so it must observe those signals again.
         diesel::update(
             harvest_signals::table
                 .filter(harvest_signals::workflow_exec_id.eq(exec_id.as_uuid()))

@@ -520,6 +520,109 @@ async fn update_route_admits_onto_the_live_retry_attempt() {
 }
 
 #[tokio::test]
+async fn pause_and_resume_routes_act_on_the_live_retry_attempt() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let (first, second) = seed_chain(&pool).await;
+    seed_workflow_task(&pool, second).await;
+
+    // Pause is the REVERSIBLE containment lever, and it accepts only a
+    // RUNNING/PAUSED row — so unrouted it 409s against the sealed FAILED
+    // predecessor, leaving an operator only the destructive levers.
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{first}/pause"),
+        json!({ "reason": "investigating" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(
+        body["execution_id"],
+        json!(second.to_string()),
+        "pause must report the live attempt it paused: {body}"
+    );
+    assert_eq!(execution_state(&pool, second).await, "PAUSED");
+
+    let (status, body) = post_json(&app, &format!("/workflows/{first}/resume"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(
+        body["execution_id"],
+        json!(second.to_string()),
+        "resume must report the live attempt it resumed: {body}"
+    );
+    assert_eq!(
+        body["newly_resumed"],
+        json!(true),
+        "an unrouted resume would be an idempotent success no-op while the live \
+         attempt stayed parked: {body}"
+    );
+    assert_eq!(execution_state(&pool, second).await, "RUNNING");
+    assert_eq!(
+        execution_state(&pool, first).await,
+        "FAILED",
+        "the sealed predecessor must be left untouched"
+    );
+}
+
+#[tokio::test]
+async fn update_result_route_reads_the_live_retry_attempt() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let (first, second) = seed_chain(&pool).await;
+
+    // Admit against the addressed (sealed) id — routing lands it on the live
+    // attempt, and the 202 carries ONLY the update_id.
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{first}/update/set_priority?wait=admitted"),
+        json!({ "input": { "priority": "high" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body={body}");
+    let update_id = body["update_id"]
+        .as_str()
+        .expect("the admitted ack must carry an update_id")
+        .to_string();
+
+    // The paired READ must follow the same chain, or it 404s forever against
+    // the addressed predecessor whose history never held the admission.
+    let (status, body) = get(
+        &app,
+        &format!("/workflows/{first}/update/{update_id}/result"),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the update-result read must route to the live attempt, not 404 against \
+         the sealed predecessor: {body}"
+    );
+
+    // Sanity: the addressed id genuinely never held the admission, so the read
+    // above could only have succeeded by routing.
+    let mut conn = pool.get().await.expect("pooled conn");
+    let sealed = store::load_history(&mut conn, first)
+        .await
+        .expect("load sealed history");
+    assert!(
+        !sealed
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::UpdateAdmitted { .. })),
+    );
+    let live = store::load_history(&mut conn, second)
+        .await
+        .expect("load live history");
+    assert!(
+        live.events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::UpdateAdmitted { .. })),
+    );
+}
+
+#[tokio::test]
 async fn describe_route_still_reads_the_addressed_execution() {
     let (url, _c) = setup().await;
     let pool = build_pool(&url);

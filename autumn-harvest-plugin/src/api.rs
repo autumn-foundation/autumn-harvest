@@ -125,8 +125,8 @@ use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, TriageFieldChange,
     TriageOutcome, TriagePatch, UpdateWithStartOutcome, UpdateWithStartParams,
-    WorkflowHandleClient, WorkflowResult, annotate_workflow_execution, pause_workflow_execution,
-    resume_workflow_execution, signal_with_start_workflow_execution_with_metrics,
+    WorkflowHandleClient, WorkflowResult, annotate_workflow_execution,
+    signal_with_start_workflow_execution_with_metrics,
     start_or_load_workflow_execution_with_metrics,
     update_with_start_workflow_execution_with_metrics,
 };
@@ -4427,6 +4427,13 @@ async fn signal_workflow_by_id(
         });
         // Forward the #843 routed-live-attempt marker when the inner handler
         // set it, so a by-id caller can also see that the retry chain moved.
+        //
+        // The two ids are deliberately distinct and both correct:
+        // `execution_id` (and the `X-Harvest-Execution-Id` header) is what the
+        // BUSINESS KEY resolved to — the #805 contract, unchanged — while
+        // `routed_execution_id` is the live attempt the signal actually landed
+        // on. Rewriting the #805 id to the routed one would make a by-id
+        // caller's recorded handle drift to an inner attempt.
         if let Some(routed) = ack.get("routed_execution_id").cloned()
             && let Some(map) = out.as_object_mut()
         {
@@ -21141,11 +21148,19 @@ async fn cancel_workflow(
             Err(map_error(e))
         }
         Ok(cancelled) => {
+            // Issue #843: the audit record's subject is the execution actually
+            // mutated, which after routing may be a retry successor rather than
+            // the addressed id. Keying on the mutated row is what lets an
+            // auditor asking "who terminated/cancelled A3?" find this row; the
+            // addressed id stays reconstructible either way, because the
+            // `retry_of_exec_id` chain is durable. The failure path above keeps
+            // the addressed id, since nothing was mutated.
+            let cancelled_id_str = cancelled.exec_id.to_string();
             let ar = NewAuditRecord {
                 actor: &actor,
                 operation: OP_WORKFLOW_CANCEL,
                 target_type: TARGET_WORKFLOW,
-                target_id: Some(exec_id_str.as_str()),
+                target_id: Some(cancelled_id_str.as_str()),
                 route_or_command: route,
                 request_id: request_id.as_deref(),
                 idempotency_key: None,
@@ -21274,11 +21289,14 @@ async fn terminate_workflow(
             Err(map_error(e))
         }
         Ok(terminated) => {
+            // Issue #843: audit the execution actually sealed (see the cancel
+            // handler for the full rationale).
+            let terminated_id_str = terminated.exec_id.to_string();
             let ar = NewAuditRecord {
                 actor: &actor,
                 operation: OP_WORKFLOW_TERMINATE,
                 target_type: TARGET_WORKFLOW,
-                target_id: Some(exec_id_str.as_str()),
+                target_id: Some(terminated_id_str.as_str()),
                 route_or_command: route,
                 request_id: request_id.as_deref(),
                 idempotency_key: None,
@@ -21880,7 +21898,11 @@ async fn pause_workflow(
     let exec_id_str = exec_id.to_string();
     let metrics_ref = metrics_recorder_or_noop(&api_state);
 
-    let result = pause_workflow_execution(
+    // Issue #843: route to the live attempt of the retry chain (#523). Pause
+    // only accepts a `RUNNING`/`PAUSED` row, so an unrouted pause of a retried
+    // run 409s against its sealed `FAILED` predecessor — denying the operator
+    // the one reversible containment lever.
+    let result = autumn_harvest::execution::pause_live_attempt(
         &mut conn,
         exec_id,
         request.reason.as_deref(),
@@ -21893,11 +21915,15 @@ async fn pause_workflow(
         Ok(_) => (STATUS_SUCCEEDED, None),
         Err(e) => (STATUS_FAILED, Some(e.to_string())),
     };
+    // Issue #843: audit the execution actually paused (see `cancel_workflow`).
+    let audited_id = result
+        .as_ref()
+        .map_or_else(|_| exec_id_str.clone(), |p| p.exec_id.to_string());
     let ar = NewAuditRecord {
         actor: &actor,
         operation: OP_WORKFLOW_PAUSE,
         target_type: TARGET_WORKFLOW,
-        target_id: Some(exec_id_str.as_str()),
+        target_id: Some(audited_id.as_str()),
         route_or_command: route,
         request_id: request_id.as_deref(),
         idempotency_key: None,
@@ -21944,17 +21970,31 @@ async fn resume_workflow(
     let exec_id_str = exec_id.to_string();
     let metrics_ref = metrics_recorder_or_noop(&api_state);
 
-    let result = resume_workflow_execution(&mut conn, exec_id, &actor, metrics_ref.as_ref()).await;
+    // Issue #843: route to the live attempt of the retry chain (#523). Resume is
+    // an idempotent success no-op against a non-paused row, so an unrouted
+    // resume of a retried run would report success while the paused live
+    // attempt stayed parked.
+    let result = autumn_harvest::execution::resume_live_attempt(
+        &mut conn,
+        exec_id,
+        &actor,
+        metrics_ref.as_ref(),
+    )
+    .await;
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),
         Err(e) => (STATUS_FAILED, Some(e.to_string())),
     };
+    // Issue #843: audit the execution actually resumed (see `cancel_workflow`).
+    let audited_id = result
+        .as_ref()
+        .map_or_else(|_| exec_id_str.clone(), |r| r.exec_id.to_string());
     let ar = NewAuditRecord {
         actor: &actor,
         operation: OP_WORKFLOW_RESUME,
         target_type: TARGET_WORKFLOW,
-        target_id: Some(exec_id_str.as_str()),
+        target_id: Some(audited_id.as_str()),
         route_or_command: route,
         request_id: request_id.as_deref(),
         idempotency_key: None,
@@ -23707,11 +23747,13 @@ pub(crate) async fn signal_workflow(
             Ok(true) => {
                 // Same success audit + response the normal on-conflict path
                 // writes when `send_signal_idempotent` returns `Ok(false)`.
+                // Issue #843: audit the routed attempt the key landed on.
+                let target_id_str = target.to_string();
                 let ar = NewAuditRecord {
                     actor: &actor,
                     operation: OP_WORKFLOW_SIGNAL,
                     target_type: TARGET_WORKFLOW,
-                    target_id: Some(exec_id_str.as_str()),
+                    target_id: Some(target_id_str.as_str()),
                     route_or_command: route,
                     request_id: request_id.as_deref(),
                     idempotency_key: idempotency_key.as_deref(),
@@ -23790,9 +23832,14 @@ pub(crate) async fn signal_workflow(
     }
 
     // Signal payload is intentionally not stored in the audit record (no PII).
-    let signal_result = signal::send_signal_to_live_attempt(
+    // `target` was resolved above and is what the #610 schema check validated
+    // against, so hand it straight to the delivery rather than walking the chain
+    // a second time (one full row load per hop, on the highest-volume mutating
+    // route). A re-drive inside still re-resolves from `exec_id`.
+    let signal_result = signal::send_signal_from_resolved(
         &mut conn,
         exec_id,
+        target,
         &signal_name,
         payload,
         idempotency_key.as_deref(),
@@ -23820,11 +23867,13 @@ pub(crate) async fn signal_workflow(
             return map_error(e).into_response();
         }
     };
+    // Issue #843: audit the routed attempt the signal was queued for.
+    let delivered_to_str = delivered_to.to_string();
     let ar = NewAuditRecord {
         actor: &actor,
         operation: OP_WORKFLOW_SIGNAL,
         target_type: TARGET_WORKFLOW,
-        target_id: Some(exec_id_str.as_str()),
+        target_id: Some(delivered_to_str.as_str()),
         route_or_command: route,
         request_id: request_id.as_deref(),
         idempotency_key: idempotency_key.as_deref(),
@@ -41049,12 +41098,14 @@ pub(crate) async fn admit_update(
     // workflow-level retry chain (#523/#842) to the live attempt before both
     // validating and admitting. A retry successor is minted on the
     // predecessor's shard, so `conn` above already owns the whole chain.
-    let mut target =
-        match autumn_harvest::execution::resolve_live_attempt_id(&mut conn, exec_id).await {
-            Ok(t) => t,
-            Err(e) => return map_error(e).into_response(),
-        };
-    let execution_for_validation = load_execution(&mut conn, target).await;
+    // `resolve_live_attempt` returns the resolved row, so the validation below
+    // reuses it rather than re-loading the identical row by id.
+    let resolved = match autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id).await {
+        Ok(ex) => ex,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let mut target = ExecutionId::from_uuid(resolved.id);
+    let execution_for_validation: Result<_, autumn_harvest::HarvestError> = Ok(resolved);
 
     // Resolve the registered update handler once and reuse it for both the
     // #610 schema-400 check and the #684 validator-422 check. Scoped by
@@ -41313,7 +41364,18 @@ async fn get_update_result(
         Err(e) => return e.into_response(),
     };
 
-    let history = match store::load_history(&mut conn, exec_id).await {
+    // Issue #843: `admit_update` routes admission to the live attempt of the
+    // workflow-level retry chain, and its `wait=admitted` 202 carries only the
+    // `update_id` — no execution id. So this paired read MUST resolve the same
+    // way, or the caller's only follow-up would 404 forever against a sealed
+    // predecessor that never carried the `UpdateAdmitted` event.
+    let target = match autumn_harvest::execution::resolve_live_attempt_id(&mut conn, exec_id).await
+    {
+        Ok(t) => t,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    let history = match store::load_history(&mut conn, target).await {
         Ok(h) => h,
         Err(e) => return map_error(e).into_response(),
     };
@@ -41329,7 +41391,7 @@ async fn get_update_result(
     let mut terminal_state = get_terminal_workflow_state(&history.events);
     if (terminal_state == Some("CANCELLED") || terminal_state == Some("FAILED"))
         && let Ok(Some(db_state)) = harvest_workflow_executions::table
-            .find(exec_id.as_uuid())
+            .find(target.as_uuid())
             .select(harvest_workflow_executions::state)
             .first::<String>(&mut conn)
             .await

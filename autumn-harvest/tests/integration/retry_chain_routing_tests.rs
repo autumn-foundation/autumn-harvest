@@ -129,9 +129,15 @@ impl CallCounter {
 
 /// Records which attempt numbers actually started executing, so a test can
 /// prove a cancelled chain never spawned a further attempt.
+///
+/// `started` de-duplicates by execution id rather than by history length: a
+/// workflow body is re-driven on every replay cycle, and gating on
+/// `history_event_count()` would miscount an attempt whose first task already
+/// ingested a staged signal.
 #[derive(Debug, Default)]
 struct AttemptLog {
     seen: Mutex<Vec<usize>>,
+    started: Mutex<std::collections::HashSet<uuid::Uuid>>,
 }
 
 fn make_shared_state(
@@ -158,10 +164,13 @@ fn fail_then_park_handler(
         .state::<Arc<AttemptLog>>()
         .expect("AttemptLog in shared state")
         .clone();
+    let exec_uuid = ctx.info().execution_id.as_uuid();
     Box::pin(async move {
-        // Only count the first entry per attempt: the body is re-driven on
-        // every replay cycle, so gate on whether this execution already parked.
-        if ctx.history_event_count() <= 1 {
+        // Count each ATTEMPT once. The body is re-driven on every replay cycle,
+        // so key on the execution id — not on history length, which an ingested
+        // signal would perturb.
+        let first_sight = log.started.lock().unwrap().insert(exec_uuid);
+        if first_sight {
             let n = counter.increment();
             log.seen.lock().unwrap().push(n);
             if n == 1 {
@@ -267,6 +276,20 @@ const fn fast_retry_policy(max_attempts: u32) -> RetryPolicy {
     }
 }
 
+/// A retry policy whose backoff is long enough that the successor's workflow
+/// task stays `PENDING` with a future `scheduled_at` for the whole test — the
+/// "queued retry" state AC2 names.
+const fn slow_retry_policy(max_attempts: u32) -> RetryPolicy {
+    RetryPolicy {
+        max_attempts,
+        initial_interval: Duration::from_secs(3600),
+        backoff_coefficient: 1.0,
+        max_interval: Duration::from_secs(3600),
+        non_retryable_errors: vec![],
+        jitter: JitterPolicy::None,
+    }
+}
+
 async fn start_workflow(
     conn: &mut AsyncPgConnection,
     workflow_name: &'static str,
@@ -357,6 +380,42 @@ async fn wait_for_parked_retry(conn: &mut AsyncPgConnection, original: Execution
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("retry successor of {original} never parked on its timer");
+}
+
+/// Count the retry's still-delayed `PENDING` workflow task rows — the "queued
+/// retry" AC2 says a cancel must stop from ever starting.
+async fn delayed_pending_workflow_tasks(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
+    harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_task_queue::task_type.eq("workflow"))
+        .filter(harvest_task_queue::state.eq("PENDING"))
+        .filter(harvest_task_queue::scheduled_at.gt(chrono::Utc::now()))
+        .count()
+        .get_result(conn)
+        .await
+        .expect("count delayed pending workflow tasks")
+}
+
+/// Wait until the retry successor of `original` exists and is still QUEUED —
+/// its workflow task is `PENDING` with a future `scheduled_at`, so the body has
+/// not run. Requires a long-backoff retry policy (see `slow_retry_policy`).
+async fn wait_for_queued_retry(conn: &mut AsyncPgConnection, original: ExecutionId) -> ExecutionId {
+    for _ in 0..600 {
+        let rows: Vec<uuid::Uuid> = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(original.as_uuid())))
+            .select(harvest_workflow_executions::id)
+            .load(conn)
+            .await
+            .expect("load retry executions");
+        for id in rows {
+            let exec_id = ExecutionId::from_uuid(id);
+            if delayed_pending_workflow_tasks(conn, exec_id).await > 0 {
+                return exec_id;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("retry successor of {original} never appeared as a queued (delayed) task");
 }
 
 /// Drive a worker until attempt 1 has failed and attempt 2 is parked.
@@ -491,6 +550,95 @@ async fn cancelled_chain_never_spawns_a_further_attempt() {
     drop(conn);
 
     chain.stop().await;
+}
+
+/// AC2's second half — "prevent a queued retry from starting" — for the state
+/// that phrase actually names: a retry whose backoff has NOT elapsed, so its
+/// workflow task is still `PENDING` with a future `scheduled_at`.
+///
+/// `cancelled_chain_never_spawns_a_further_attempt` cannot prove this: there the
+/// retry is already claimed and parked on a 3600 s timer, so it would never fail
+/// again and would never spawn attempt 3 with or without the cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_removes_a_queued_retrys_delayed_task() {
+    let (url, container) = setup().await;
+    let mut conn = connect(&url).await;
+    // A 1-hour backoff keeps the successor's task delayed for the whole test.
+    let policy = slow_retry_policy(3);
+    let original = start_workflow(
+        &mut conn,
+        "routing_wf",
+        "route-cancel-queued-001",
+        Some(policy.clone()),
+    )
+    .await;
+    drop(conn);
+
+    let counter = Arc::new(CallCounter::default());
+    let log = Arc::new(AttemptLog::default());
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker(
+        vec![wf_info("routing_wf", fail_then_park_handler, Some(policy))],
+        make_shared_state(counter.clone(), log.clone()),
+    ));
+    let worker_ref = worker.clone();
+    let handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(60), worker_ref.run(&pool)).await;
+    });
+
+    let mut conn = connect(&url).await;
+    let retry = wait_for_queued_retry(&mut conn, original).await;
+
+    // Precondition: the retry exists but has NOT started — its task is a
+    // still-delayed `PENDING` row and no attempt 2 body has run.
+    let delayed_before = delayed_pending_workflow_tasks(&mut conn, retry).await;
+    assert_eq!(
+        delayed_before, 1,
+        "precondition: the queued retry must have exactly one still-delayed PENDING workflow task"
+    );
+    assert_eq!(
+        log.seen.lock().unwrap().as_slice(),
+        &[1usize],
+        "precondition: only attempt 1 may have run"
+    );
+
+    let result = autumn_harvest::execution::cancel_live_attempt(
+        &mut conn,
+        original,
+        "stop the queued retry",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel must succeed against the queued retry");
+
+    assert_eq!(
+        result.exec_id, retry,
+        "cancel must route to the queued retry, not the sealed predecessor"
+    );
+    assert!(result.newly_cancelled);
+    assert_eq!(get_state(&mut conn, retry).await, "CANCELLED");
+
+    // The whole point of AC2's second half: the queued work is GONE, so the
+    // retry can never be claimed once its backoff elapses.
+    assert_eq!(
+        delayed_pending_workflow_tasks(&mut conn, retry).await,
+        0,
+        "the queued retry's delayed workflow task must be removed by the cancel"
+    );
+
+    // And the worker never starts it, even given time to try.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        log.seen.lock().unwrap().as_slice(),
+        &[1usize],
+        "a cancelled queued retry must never start"
+    );
+    assert_eq!(counter.get(), 1);
+    drop(conn);
+
+    worker.shutdown();
+    let _ = handle.await;
+    drop(container);
 }
 
 // ── AC2: terminate routes to the live attempt ─────────────────────────────
@@ -640,14 +788,15 @@ async fn keyed_signal_dedupes_on_the_routed_live_attempt() {
     chain.stop().await;
 }
 
-// ── AC1: unconsumed signals are forwarded across the retry boundary ───────
+// ── AC1: the whole signal mailbox is forwarded across the retry boundary ──
 
-/// Signals staged on a failing attempt but never ingested into its history are
-/// reassigned to the retry successor — mirroring the continue-as-new behavior
-/// the engine already has for the same fresh-history transition. Consumed
-/// signals stay with the attempt that consumed them, for audit.
+/// A retry replays an **empty** history and re-executes every step from zero, so
+/// a signal the failed attempt already observed is one the retry must observe
+/// again — else a workflow that replays back to `wait_for_signal` blocks forever
+/// on a signal its caller was already told had landed. So every row moves and
+/// `consumed` is re-armed, not just the unconsumed ones.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unconsumed_signals_are_forwarded_to_the_retry_successor() {
+async fn the_whole_signal_mailbox_is_forwarded_and_re_armed() {
     let (url, _container) = setup().await;
     let mut conn = connect(&url).await;
 
@@ -668,69 +817,278 @@ async fn unconsumed_signals_are_forwarded_to_the_retry_successor() {
     }
 
     let moved =
-        autumn_harvest::signal::forward_unconsumed_signals(&mut conn, predecessor, successor)
+        autumn_harvest::signal::forward_signals_to_retry_attempt(&mut conn, predecessor, successor)
             .await
-            .expect("forward unconsumed signals");
-    assert_eq!(moved, 1, "exactly the unconsumed signal must move");
+            .expect("forward the signal mailbox");
+    assert_eq!(moved, 2, "BOTH rows must move — consumed included");
 
-    let on_successor: Vec<String> = harvest_signals::table
+    let mut on_successor: Vec<(String, bool)> = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(successor.as_uuid()))
-        .select(harvest_signals::signal_name)
+        .select((harvest_signals::signal_name, harvest_signals::consumed))
         .load(&mut conn)
         .await
         .expect("load successor signals");
-    assert_eq!(on_successor, vec!["fresh".to_string()]);
+    on_successor.sort();
+    assert_eq!(
+        on_successor,
+        vec![
+            ("already-seen".to_string(), false),
+            ("fresh".to_string(), false),
+        ],
+        "every forwarded row must be re-armed (consumed = false) so the retry \
+         can observe it against its fresh history"
+    );
 
-    let on_predecessor: Vec<String> = harvest_signals::table
+    let left_behind: i64 = harvest_signals::table
         .filter(harvest_signals::workflow_exec_id.eq(predecessor.as_uuid()))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count predecessor signals");
+    assert_eq!(
+        left_behind, 0,
+        "nothing may be stranded against the sealed predecessor"
+    );
+}
+
+/// The forwarding is actually WIRED into the retry transaction — not just a
+/// helper nobody calls. Without the `worker.rs` call site this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_worker_forwards_the_mailbox_when_it_schedules_a_retry() {
+    let (url, container) = setup().await;
+    let mut conn = connect(&url).await;
+    let policy = fast_retry_policy(3);
+    let original = start_workflow(
+        &mut conn,
+        "routing_wf",
+        "route-fwd-wiring-001",
+        Some(policy.clone()),
+    )
+    .await;
+
+    // Stage a signal against the ORIGINAL before the worker ever runs, so it is
+    // sitting in attempt 1's mailbox when attempt 1 fails.
+    diesel::insert_into(harvest_signals::table)
+        .values((
+            harvest_signals::workflow_exec_id.eq(original.as_uuid()),
+            harvest_signals::signal_name.eq("pre-staged"),
+            harvest_signals::payload.eq(serde_json::json!({"n": 7})),
+            harvest_signals::consumed.eq(false),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("seed signal");
+    drop(conn);
+
+    let counter = Arc::new(CallCounter::default());
+    let log = Arc::new(AttemptLog::default());
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker(
+        vec![wf_info("routing_wf", fail_then_park_handler, Some(policy))],
+        make_shared_state(counter.clone(), log.clone()),
+    ));
+    let worker_ref = worker.clone();
+    let handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(60), worker_ref.run(&pool)).await;
+    });
+
+    let mut conn = connect(&url).await;
+    let retry = wait_for_parked_retry(&mut conn, original).await;
+
+    let on_retry: Vec<String> = harvest_signals::table
+        .filter(harvest_signals::workflow_exec_id.eq(retry.as_uuid()))
         .select(harvest_signals::signal_name)
         .load(&mut conn)
         .await
-        .expect("load predecessor signals");
+        .expect("load retry signals");
     assert_eq!(
-        on_predecessor,
-        vec!["already-seen".to_string()],
-        "a consumed signal must stay with the attempt that consumed it"
+        on_retry,
+        vec!["pre-staged".to_string()],
+        "the retry transaction must forward the mailbox to the successor"
     );
+    let stranded: i64 = harvest_signals::table
+        .filter(harvest_signals::workflow_exec_id.eq(original.as_uuid()))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count stranded");
+    assert_eq!(stranded, 0);
+    drop(conn);
+
+    worker.shutdown();
+    let _ = handle.await;
+    drop(container);
 }
 
 // ── AC3: queries/updates route to the live attempt ────────────────────────
 
-/// An update admitted against the ORIGINAL execution id must be admitted on the
-/// live retry attempt rather than rejected as not-running.
+/// An update submitted against the ORIGINAL execution id must be admitted on
+/// the live retry attempt rather than rejected as not-running.
+///
+/// Driven through `WorkflowHandle::execute_update_in_process` — the real
+/// production entry point — so the routing inside it is what is under test, not
+/// a hand-resolved target the test pre-computed for itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn update_routes_to_the_live_retry_attempt() {
     let chain = parked_chain("route-update-001").await;
     let url = chain.url.clone();
     let (original, retry) = (chain.original, chain.retry);
+
+    let client =
+        autumn_harvest::handle::WorkflowHandleClient::single(build_pool(&url), url.clone());
+    let handle = client.handle(original);
     let mut conn = connect(&url).await;
 
-    let update_id = autumn_harvest::UpdateId::new();
-    let target = autumn_harvest::execution::resolve_live_attempt_id(&mut conn, original)
-        .await
-        .expect("resolve live attempt");
-    assert_eq!(target, retry);
+    // The parked workflow registers no `adjust` handler, so the resolved result
+    // is irrelevant — what matters is WHERE the admission landed.
+    let _ = handle
+        .execute_update_in_process(
+            &mut conn,
+            "routing_wf",
+            "adjust",
+            serde_json::json!({"delta": 1}),
+            Duration::from_secs(3),
+        )
+        .await;
 
-    autumn_harvest::store::admit_update_event(
-        &mut conn,
-        target,
-        update_id,
-        "adjust".to_string(),
-        serde_json::json!({"delta": 1}),
-        None,
-    )
-    .await
-    .expect("update must be admitted on the live attempt");
-
-    let history = autumn_harvest::store::load_history(&mut conn, retry)
+    let retry_history = autumn_harvest::store::load_history(&mut conn, retry)
         .await
         .expect("load retry history");
     assert!(
-        history.events.iter().any(|e| matches!(
+        retry_history.events.iter().any(|e| matches!(
             e,
             autumn_harvest::event::WorkflowEvent::UpdateAdmitted { .. }
         )),
-        "the live attempt's history must carry the admitted update"
+        "the LIVE attempt's history must carry the admitted update"
+    );
+
+    let original_history = autumn_harvest::store::load_history(&mut conn, original)
+        .await
+        .expect("load original history");
+    assert!(
+        !original_history.events.iter().any(|e| matches!(
+            e,
+            autumn_harvest::event::WorkflowEvent::UpdateAdmitted { .. }
+        )),
+        "the sealed predecessor must never receive the admission"
+    );
+    drop(conn);
+
+    chain.stop().await;
+}
+
+// ── AC5: the handle surface routes too ────────────────────────────────────
+
+/// `WorkflowHandle::cancel` — the typed-client surface AC5 names — must route
+/// through the chain exactly as the core primitive does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handle_cancel_routes_to_the_live_retry_attempt() {
+    let chain = parked_chain("route-handle-cancel-001").await;
+    let url = chain.url.clone();
+    let (original, retry) = (chain.original, chain.retry);
+
+    let client =
+        autumn_harvest::handle::WorkflowHandleClient::single(build_pool(&url), url.clone());
+    let result = client
+        .handle(original)
+        .cancel("handle-level cancel")
+        .await
+        .expect("handle cancel must succeed");
+
+    assert_eq!(
+        result.exec_id, retry,
+        "the handle must report the live attempt it cancelled"
+    );
+    assert!(result.newly_cancelled);
+
+    let mut conn = connect(&url).await;
+    assert_eq!(get_state(&mut conn, retry).await, "CANCELLED");
+    assert_eq!(get_state(&mut conn, original).await, "FAILED");
+    drop(conn);
+
+    chain.stop().await;
+}
+
+/// `WorkflowHandle::terminate` likewise — and terminate is the sharpest case,
+/// because it is idempotent on any terminal state, so an unrouted terminate
+/// silently reports success while the live attempt keeps running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handle_terminate_routes_to_the_live_retry_attempt() {
+    let chain = parked_chain("route-handle-terminate-001").await;
+    let url = chain.url.clone();
+    let (original, retry) = (chain.original, chain.retry);
+
+    let client =
+        autumn_harvest::handle::WorkflowHandleClient::single(build_pool(&url), url.clone());
+    let result = client
+        .handle(original)
+        .terminate("handle-level terminate")
+        .await
+        .expect("handle terminate must succeed");
+
+    assert_eq!(result.exec_id, retry);
+    assert!(
+        result.newly_cancelled,
+        "an unrouted terminate would report a no-op against the FAILED predecessor"
+    );
+
+    let mut conn = connect(&url).await;
+    assert_eq!(get_state(&mut conn, retry).await, "TERMINATED");
+    assert_eq!(get_state(&mut conn, original).await, "FAILED");
+    drop(conn);
+
+    chain.stop().await;
+}
+
+// ── AC5: pause/resume — the REVERSIBLE containment lever ──────────────────
+
+/// Pause is the first rung of the containment ladder
+/// (`docs/runbooks/contain-runaway-execution.md`), and it accepts only a
+/// `RUNNING`/`PAUSED` row — so unrouted it 409s against the sealed `FAILED`
+/// predecessor, leaving an operator holding the logical handle only the
+/// destructive levers. Resume must round-trip it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_and_resume_route_to_the_live_retry_attempt() {
+    let chain = parked_chain("route-pause-001").await;
+    let url = chain.url.clone();
+    let (original, retry) = (chain.original, chain.retry);
+    let mut conn = connect(&url).await;
+
+    let paused = autumn_harvest::execution::pause_live_attempt(
+        &mut conn,
+        original,
+        Some("investigating"),
+        "operator",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("pause must succeed against the live attempt");
+    assert_eq!(
+        paused.exec_id, retry,
+        "pause must route to the live attempt, not 409 on the FAILED predecessor"
+    );
+    assert!(paused.newly_paused);
+    assert_eq!(get_state(&mut conn, retry).await, "PAUSED");
+
+    let resumed = autumn_harvest::execution::resume_live_attempt(
+        &mut conn,
+        original,
+        "operator",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("resume must succeed against the live attempt");
+    assert_eq!(resumed.exec_id, retry);
+    assert!(
+        resumed.newly_resumed,
+        "an unrouted resume would be an idempotent success no-op while the live \
+         attempt stayed parked"
+    );
+    assert_eq!(get_state(&mut conn, retry).await, "RUNNING");
+    assert_eq!(
+        get_state(&mut conn, original).await,
+        "FAILED",
+        "the sealed predecessor is never touched"
     );
     drop(conn);
 
@@ -765,7 +1123,7 @@ async fn resolve_live_attempt_walks_the_chain() {
     chain.stop().await;
 }
 
-/// AC6 regression guard: with no retry chain, resolution is a strict no-op —
+/// Non-regression guard: with no retry chain, resolution is a strict no-op —
 /// including for a genuinely-failed run whose failure is the final outcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resolve_live_attempt_is_a_noop_without_a_retry_chain() {

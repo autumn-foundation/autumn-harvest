@@ -66,18 +66,37 @@ ingested into history when the task is claimed — exactly the behaviour a signa
 sent to any not-yet-claimed workflow already gets. **No signal is rejected, and
 no synthetic buffering layer exists.**
 
-**Unconsumed signals are forwarded across the retry boundary.** When a retry is
-scheduled, the same transaction moves every still-unconsumed `harvest_signals`
-row from the predecessor to the successor. This mirrors the long-standing
-continue-as-new precedent: a signal that was never ingested into any history is
-not reflected anywhere, so moving it loses nothing, while leaving it behind would
-strand it against a sealed row forever. Already-consumed rows stay put for audit.
+**The whole signal mailbox is forwarded across the retry boundary, re-armed.**
+When a retry is scheduled, the same transaction moves *every* `harvest_signals`
+row from the predecessor to the successor and resets `consumed` to `false`.
+
+Forwarding the *unconsumed* rows is obvious: a signal that was never ingested
+into any history is not reflected anywhere, so leaving it behind would strand it
+against a sealed row forever.
+
+Forwarding the **consumed** ones is the less obvious half, and it is required.
+`consumed = true` means "already ingested into *that attempt's* history" — and a
+retry starts from a completely fresh, empty history and re-executes every step
+from zero. A signal the failed attempt observed is therefore one the retry must
+observe again, or a workflow that replays back to its `wait_for_signal` blocks
+forever on a signal its caller was already told had been delivered (and has no
+reason to re-send). Re-observing is consistent with the retry re-running every
+activity: nothing from the discarded attempt carries over except the mailbox.
+The failed attempt's own `SignalReceived` events stay in its history, so the
+audit record of what it observed is unaffected by the move.
+
+This deliberately **diverges** from the narrower reassignment `continue_as_new`
+performs (unconsumed only). A continue-as-new is *voluntary*, and the workflow
+explicitly carries whatever it still needs into the successor's input; a retry
+carries nothing forward at all.
 
 **Idempotency keys (#521) keep their scope.** Dedupe stays keyed on
-`(workflow_exec_id, idempotency_key)`. A key that landed on attempt *N* does not
-suppress the same key on attempt *N+1* — each attempt is a genuinely distinct
-execution with a fresh history, so re-delivering the signal to the new attempt is
-the correct behaviour, not a duplicate.
+`(workflow_exec_id, idempotency_key)`. Because a forwarded row takes its key with
+it, a caller's at-least-once re-send of an already-delivered key dedupes against
+the **live attempt** rather than being swallowed by a sealed predecessor. A key
+that landed on attempt *N* and whose row has moved to attempt *N+1* therefore
+still dedupes; a key delivered after the move that never existed on the chain is
+delivered normally.
 
 ### Cancel — cancels the live attempt *and* stops a queued retry
 
@@ -107,30 +126,95 @@ Because the successor row always exists (above), there is no "gap" behaviour to
 define — an update admitted while the retry's task is still delayed is handled
 when that task is claimed, exactly like any admitted update on a parked run.
 
+`GET /workflows/{id}/update/{update_id}/result` — the paired read for a
+`wait=admitted` admission, whose `202` carries only the `update_id` — resolves
+the chain the same way, so the caller's single follow-up id keeps working.
+
+**Known limitation — an admitted-but-unresolved update is not carried across a
+retry.** Unlike signals (a table), an update lives in the attempt's *history* as
+an `UpdateAdmitted` event, and a retry starts from an empty history. An update
+admitted onto attempt *N* that *N* fails before resolving is therefore lost: the
+poll for its result on attempt *N+1* finds nothing and times out. Re-submit the
+update against the logical handle (it routes to the live attempt). Carrying
+admitted updates across the boundary would need a durable pending-update record
+outside the event log and is tracked separately.
+
 ### `result_snapshot()` — follows the chain
 
 The zero-wait snapshot now follows the chain, matching what `result_snapshot_with_wait`
 and the HTTP `GET /workflows/{id}/result` route already did. The core handle was
 the outlier and was internally incoherent with its own waiting sibling.
 
+### Pause and resume — the live attempt
+
+Both route. Pause is the *reversible* containment lever the runbook
+(`docs/runbooks/contain-runaway-execution.md`) tells operators to reach for
+first, with cancel/terminate as escalation — and `pause_workflow_execution`
+accepts only a `RUNNING`/`PAUSED` row, so an unrouted pause of a retried run
+returns `409 … is already terminal (FAILED)`. Leaving it unrouted while cancel
+and terminate *were* routed would have inverted the containment ladder, leaving
+an operator holding the logical handle only the destructive levers. Resume is an
+idempotent success no-op against a non-paused row, so unrouted it would report
+success while the paused live attempt stayed parked — the same silent-no-op
+failure mode routing closes for terminate.
+
 ### Describe is deliberately **not** routed
 
-`GET /workflows/{id}` (describe), history export, the timeline, the stack, and
-the DLQ are **specific-`exec_id` reads**. They must keep reporting the addressed
-row so an operator can inspect exactly the attempt that failed. Use
-`GET /workflows/{id}/run-chain` (#701) or the `retry_of_exec_id` linkage to walk
-attempts explicitly.
+`GET /workflows/{id}` (describe), history export, the timeline, the stack, the
+awaitables, the per-execution logs, the event stream, `/diagnose`, the registered
+`/queries` listing, and the DLQ are **specific-`exec_id` reads**. They must keep
+reporting the addressed row so an operator can inspect exactly the attempt that
+failed. Use `GET /workflows/{id}/run-chain` (#701) or the `retry_of_exec_id`
+linkage to walk attempts explicitly.
+
+### Operations deliberately **not** routed
+
+Routing is scoped to the *interactive and mutating* surface issue #843 names
+(signal, cancel, terminate, pause, resume, query, update, `result_snapshot`).
+These mutating operations are deliberately left addressing the specific
+execution, because each one acts on the **recorded artifact** of one attempt
+rather than steering the live run:
+
+| Operation | Why it stays specific-`exec_id` |
+|---|---|
+| `POST /workflows/{id}/reset` (#148) | Forks a *new* run from a specific attempt's recorded history; the attempt is the input, not a pointer to be re-aimed |
+| `POST /workflows/{id}/erase-payloads` (#495) | Scrubs one terminal attempt's stored payloads. Erasing a logical run across a whole chain is a separate, wider operation |
+| `POST /workflows/{id}/legal-hold` (#747) | Holds one attempt's history against retention, same reasoning as erase |
+| `POST /workflows/{id}/triage` (#814) | Annotates one attempt's post-mortem record |
+| `.../activities/{id}/retry-now`, `.../fail-now` (#516, #765) | Address a specific task row, which belongs to exactly one attempt |
+| `POST /dead-letters/{id}/replay`, `/redrive` | Address a DLQ row, likewise |
+
+`POST /workflows/{id}/rerun` (#777) takes the **opposite** policy and *rejects*
+a chain predecessor outright, with an error telling the operator to re-run the
+chain's latest attempt. That is deliberate: re-run mints a brand-new logical run
+from an attempt's inputs, so silently re-aiming it at a different attempt would
+change which inputs the new run gets. Routing it would be a behaviour change
+outside this issue's scope.
+
+An erase / legal-hold that spans the whole retry chain is a genuine (GDPR-
+relevant) gap; it is tracked separately rather than smuggled into this change.
 
 ## Surfaces
 
 Routing is applied consistently across:
 
-* the core `WorkflowHandle` (`cancel`, `terminate`, `signal`, `query`, `update`,
-  `result`, `result_snapshot`);
-* `TypedWorkflowHandle`, which wraps the same untyped handle;
-* the HTTP routes `POST /workflows/{id}/signal/{name}`, `/cancel`, `/terminate`,
-  `GET|POST /workflows/{id}/query/{name}`, `POST /workflows/{id}/update/{name}`,
-  and `GET /workflows/{id}/result`.
+* the core `WorkflowHandle` — `cancel`, `terminate`, the in-process query and
+  update paths, `result`, and `result_snapshot`. (`WorkflowHandle` itself has no
+  `signal` method; signalling from Rust goes through the generated typed stub
+  below.)
+* `TypedWorkflowHandle`, which wraps the same untyped handle — including
+  `result_snapshot`, whose typed `error_type`/`error_details`/`non_retryable`
+  are loaded from the execution the snapshot was actually read from, so a
+  routed snapshot can never mix an outer run's error with an inner attempt's
+  typed metadata;
+* the `#[signal]`-generated typed client stubs, both `signal_{name}` and its
+  `signal_{name}_idempotent` sibling;
+* the HTTP routes `POST /workflows/{id}/signal/{name}` (and the
+  `by-id/{workflow_name}/{workflow_id}` sibling), `/cancel`, `/terminate`,
+  `/pause`, `/resume`, `GET|POST /workflows/{id}/query/{name}`,
+  `POST /workflows/{id}/update/{name}`,
+  `GET /workflows/{id}/update/{update_id}/result`, and
+  `GET /workflows/{id}/result`.
 
 ### Observing where an operation landed
 
@@ -152,12 +236,19 @@ act).
 The loop is deliberately **never** entered after an operation that *did* take
 effect: re-driving a delivered signal would double-deliver it. Concretely:
 
-* **signal** — re-drives only on an `Err`. A rejected insert is rolled back, so
-  nothing was delivered.
+* **signal** — re-drives on an `Err` (a rejected insert is rolled back, so
+  nothing was delivered) *and* on a keyed dedup that reported "not delivered".
+  A keyed insert short-circuits on the unique-index conflict **before** the
+  state check, so it can report success against a row that has since sealed
+  `FAILED`; treating that as final would swallow a re-send the live attempt
+  still needs. Both shapes mean nothing was queued, so neither can
+  double-deliver.
 * **update** — re-drives only on an `Err`. `admit_update_event` verifies
   `RUNNING` under the same `FOR UPDATE` lock it inserts under and rolls back on
   rejection, so a re-driven admit can never double-admit.
-* **cancel** — re-drives only on an `Err`.
+* **cancel** and **pause** — re-drive only on an `Err`.
+* **resume** — like terminate, additionally re-drives on an idempotent no-op
+  against a `FAILED` row.
 * **terminate** — additionally re-drives on an *idempotent no-op against a
   `FAILED` row*, which is the only signal available that the chain advanced (a
   no-op against any other terminal state is the final answer).
@@ -167,11 +258,23 @@ because an unchanged target ends it — which is what stops a genuine error (an
 unknown id, or an exhausted chain whose final outcome really is `FAILED`) from
 being retried forever. `RETRY_CHAIN_MAX_DEPTH` (256) bounds both the walk and the
 re-drive count so a pathological database state can never spin a request forever.
+Exhausting the walk depth is logged (`tracing::warn!`) rather than silently
+returning a possibly-stale attempt as if it were live — it is unreachable for any
+real chain, so hitting it means a corrupted `retry_of_exec_id` graph.
 
 ## Invariants
 
-No new `WorkflowEvent` variant, no migration, no change to the adjacently-tagged
-event JSON, and no replay-determinism impact. Routing is a read-side resolution
-plus a re-target of already-existing mutating primitives; signal forwarding
-reuses the existing `harvest_signals.workflow_exec_id` column and the same
+No new `WorkflowEvent` variant, no change to the adjacently-tagged event JSON,
+and no replay-determinism impact. Routing is a read-side resolution plus a
+re-target of already-existing mutating primitives; signal forwarding reuses the
+existing `harvest_signals.workflow_exec_id` / `consumed` columns and the same
 transaction the retry already commits.
+
+One **index-only** migration (`20260723000000_harvest_retry_chain_index`) adds a
+partial index on `retry_of_exec_id`. Routing moves the successor lookup onto the
+hot path of every mutating operator endpoint, and the costly case is the *miss*
+— proving "this `FAILED` run has no retry successor" — which without an index is
+a full sequential scan of the hub table. It mirrors
+`idx_harvest_wfx_continued_from`, the structurally identical successor-link index
+for the continue-as-new chain (#701). No column is added and no data is
+rewritten.

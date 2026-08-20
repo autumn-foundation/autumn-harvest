@@ -185,9 +185,12 @@ pub struct RoutedSignalDelivery {
 /// correctly, because the retry replays a fresh history that has not seen it.
 ///
 /// Race handling: if the attempt we resolved seals `FAILED` between the
-/// resolution and the insert, the insert is rejected and rolled back (nothing
-/// was queued), so re-driving against the freshly resolved live attempt cannot
-/// double-deliver.
+/// resolution and the insert, the delivery does not take effect — either the
+/// insert is rejected and rolled back by the state check, or a keyed insert
+/// dedupes against the stale attempt's existing row without ever reaching that
+/// check. Both report "not delivered", so both are re-driven against the
+/// freshly resolved live attempt; neither can double-deliver, because a
+/// re-drive only ever follows a delivery that was *not* queued.
 ///
 /// # Errors
 ///
@@ -203,12 +206,62 @@ pub async fn send_signal_to_live_attempt(
     payload: serde_json::Value,
     idempotency_key: Option<&str>,
 ) -> HarvestResult<RoutedSignalDelivery> {
-    let mut target = crate::execution::resolve_live_attempt_id(conn, exec_id).await?;
+    let target = crate::execution::resolve_live_attempt_id(conn, exec_id).await?;
+    send_signal_from_resolved(conn, exec_id, target, signal_name, payload, idempotency_key).await
+}
+
+/// [`send_signal_to_live_attempt`] for a caller that has **already** resolved
+/// the live attempt (issue #843).
+///
+/// `logical_exec_id` is the id the caller addressed (the one a re-drive
+/// re-resolves from); `resolved` is the live attempt that resolution produced.
+/// A handler that must inspect the resolved execution before delivering — the
+/// management API's `/signal` route validates the #610 payload schema against
+/// the resolved row's `workflow_name` — uses this so one request performs one
+/// chain walk instead of two, and so the row it validated against is provably
+/// the row it delivers to.
+///
+/// # Errors
+///
+/// See [`send_signal_to_live_attempt`].
+#[cfg(feature = "db")]
+pub async fn send_signal_from_resolved(
+    conn: &mut AsyncPgConnection,
+    logical_exec_id: ExecutionId,
+    resolved: ExecutionId,
+    signal_name: &str,
+    payload: serde_json::Value,
+    idempotency_key: Option<&str>,
+) -> HarvestResult<RoutedSignalDelivery> {
+    let exec_id = logical_exec_id;
+    let mut target = resolved;
     for _ in 0..crate::execution::RETRY_CHAIN_MAX_REDRIVES {
         match send_signal_idempotent(conn, target, signal_name, payload.clone(), idempotency_key)
             .await
         {
-            Ok(delivered) => return Ok(RoutedSignalDelivery { target, delivered }),
+            // A fresh insert is final: it landed on the attempt we resolved.
+            Ok(true) => {
+                return Ok(RoutedSignalDelivery {
+                    target,
+                    delivered: true,
+                });
+            }
+            // A keyed dedup (`Ok(false)`) short-circuits *before* the state
+            // check, so it can report success against a row that has since
+            // sealed `FAILED` — swallowing a re-send the live attempt still
+            // needs. Nothing was queued, so re-driving cannot double-deliver.
+            Ok(false) => {
+                let fresh = crate::execution::resolve_live_attempt_id(conn, exec_id)
+                    .await
+                    .unwrap_or(target);
+                if !crate::execution::redrive_target(target, fresh) {
+                    return Ok(RoutedSignalDelivery {
+                        target,
+                        delivered: false,
+                    });
+                }
+                target = fresh;
+            }
             Err(error) => {
                 // The delivery was rolled back, so re-driving is safe: it can
                 // never double-deliver a signal that was actually queued.
@@ -227,24 +280,40 @@ pub async fn send_signal_to_live_attempt(
     Ok(RoutedSignalDelivery { target, delivered })
 }
 
-/// Reassign every **unconsumed** signal of `from` to `to`, returning how many
-/// rows moved (issue #843).
+/// Reassign **every** signal of `from` to `to`, resetting `consumed`, and
+/// return how many rows moved (issue #843).
 ///
-/// Used when a fresh-history transition replaces one execution with another so
-/// signals delivered while the previous run was executing do not disappear
-/// through the transition. Consumed signals stay with the attempt that consumed
-/// them, for audit — the replacement replays a fresh history and must not
-/// re-observe them.
+/// Called inside the transaction that seals a failed attempt and inserts its
+/// workflow-level retry successor (#523), so the successor inherits the logical
+/// run's whole signal mailbox.
 ///
-/// This mirrors, verbatim, the reassignment `continue_as_new` already performs
-/// for the same class of transition, so both fresh-history paths carry pending
-/// signals forward identically.
+/// **Consumed signals move too, and are re-armed.** `consumed = true` means
+/// "already ingested into *that attempt's* history" — and a retry starts from a
+/// completely fresh, empty history and re-executes every step from zero. A
+/// signal the failed attempt observed is therefore one the retry must observe
+/// again, or a workflow whose retry replays back to its `wait_for_signal` would
+/// block forever on a signal its caller was already told was delivered (and has
+/// no reason to re-send). Re-observing is the consistent choice for the same
+/// reason the retry re-runs every activity: nothing from the discarded attempt
+/// carries over except the mailbox.
+///
+/// The failed attempt's own `SignalReceived` events remain in its history, so
+/// the audit record of what it observed is unaffected by the move.
+///
+/// This deliberately diverges from the narrower reassignment `continue_as_new`
+/// performs (unconsumed only): a continue-as-new is *voluntary* and the
+/// workflow explicitly carries whatever it still needs into the successor's
+/// input, whereas a retry carries nothing forward at all.
+///
+/// #521 idempotency keys move with their rows, so a caller's at-least-once
+/// re-send of an already-delivered key still dedupes against the live attempt
+/// rather than being swallowed by a sealed predecessor.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] when the update fails.
 #[cfg(feature = "db")]
-pub async fn forward_unconsumed_signals(
+pub async fn forward_signals_to_retry_attempt(
     conn: &mut AsyncPgConnection,
     from: ExecutionId,
     to: ExecutionId,
@@ -252,11 +321,12 @@ pub async fn forward_unconsumed_signals(
     use crate::schema::harvest_signals;
 
     diesel::update(
-        harvest_signals::table
-            .filter(harvest_signals::workflow_exec_id.eq(from.as_uuid()))
-            .filter(harvest_signals::consumed.eq(false)),
+        harvest_signals::table.filter(harvest_signals::workflow_exec_id.eq(from.as_uuid())),
     )
-    .set(harvest_signals::workflow_exec_id.eq(to.as_uuid()))
+    .set((
+        harvest_signals::workflow_exec_id.eq(to.as_uuid()),
+        harvest_signals::consumed.eq(false),
+    ))
     .execute(conn)
     .await
     .map_err(crate::error::database_error)

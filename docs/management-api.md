@@ -740,8 +740,11 @@ A present `Idempotency-Key` header that is empty or not valid UTF-8 is
 rejected with `400 Bad Request` rather than silently degraded to
 at-least-once. Dedupe scope is shard-local, keyed on
 `(execution_id, idempotency_key)` — the same upstream event id may safely
-target different executions. Omitting the key preserves the legacy
-at-least-once contract exactly: every call delivers a distinct signal event.
+target different executions. Note that `execution_id` there is the execution
+the signal actually **landed on**, which for a workflow-level retry chain is
+the live attempt rather than the addressed id — see *Retry-chain routing*
+below. Omitting the key preserves the legacy at-least-once contract exactly:
+every call delivers a distinct signal event.
 
 ### Retry-chain routing (issue #843)
 
@@ -753,7 +756,11 @@ different execution than the one addressed, the ack carries an additional
 `routed_execution_id`; it is omitted otherwise, so a non-retried run's response
 is unchanged. Idempotency-key dedupe scope is unaffected — it stays keyed on
 `(execution_id, idempotency_key)` against the execution the signal actually
-landed on. See [the logical-handle contract](logical-handle.md).
+landed on. When a retry is scheduled, the whole signal mailbox moves to the
+successor (re-armed) in the retry's own transaction, so a keyed row moves with
+its key and an at-least-once re-send still dedupes against the live attempt
+rather than being swallowed by a sealed predecessor. See
+[the logical-handle contract](logical-handle.md).
 
 ### Response
 

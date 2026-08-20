@@ -1446,6 +1446,7 @@
         ]
       },
       "success_response": {
+        "notes": "Issue #843: the addressed id names the logical run, so this operation is routed to the live attempt of the workflow-level retry chain (#523) -- the deepest execution reachable by following retry_of_exec_id successors from FAILED rows. For a workflow with no retry policy this resolves to the addressed id and is a strict no-op. The returned execution_id reports the attempt actually cancelled, which may differ from the addressed id.",
         "status": 200,
         "fields": [
           "ok",
@@ -1498,6 +1499,7 @@
         ]
       },
       "success_response": {
+        "notes": "Issue #843: the addressed id names the logical run, so this operation is routed to the live attempt of the workflow-level retry chain (#523) -- the deepest execution reachable by following retry_of_exec_id successors from FAILED rows. For a workflow with no retry policy this resolves to the addressed id and is a strict no-op. The returned execution_id reports the attempt actually sealed, which may differ from the addressed id.",
         "status": 202,
         "fields": [
           "ok",
@@ -1625,6 +1627,7 @@
         ]
       },
       "success_response": {
+        "notes": "Issue #843: the addressed id names the logical run, so this operation is routed to the live attempt of the workflow-level retry chain (#523) -- the deepest execution reachable by following retry_of_exec_id successors from FAILED rows. For a workflow with no retry policy this resolves to the addressed id and is a strict no-op. The returned execution_id reports the attempt actually paused, which may differ from the addressed id.",
         "status": 200,
         "fields": [
           "ok",
@@ -1676,6 +1679,7 @@
         "fields": []
       },
       "success_response": {
+        "notes": "Issue #843: the addressed id names the logical run, so this operation is routed to the live attempt of the workflow-level retry chain (#523) -- the deepest execution reachable by following retry_of_exec_id successors from FAILED rows. For a workflow with no retry policy this resolves to the addressed id and is a strict no-op. The returned execution_id reports the attempt actually resumed, which may differ from the addressed id.",
         "status": 200,
         "fields": [
           "ok",
@@ -2531,6 +2535,7 @@
       ],
       "request_body": null,
       "success_response": {
+        "notes": "Issue #843: the addressed id names the logical run, so this operation is routed to the live attempt of the workflow-level retry chain (#523) -- the deepest execution reachable by following retry_of_exec_id successors from FAILED rows. For a workflow with no retry policy this resolves to the addressed id and is a strict no-op. This read resolves the chain the same way admit_update does, so the update_id returned by a wait=admitted 202 (which carries no execution id) keeps working against the addressed id.",
         "status": 200,
         "free_form": true
       },

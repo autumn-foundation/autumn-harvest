@@ -1735,8 +1735,27 @@ impl WorkflowHandle {
         // waiting caller on the very same handle kept going — an incoherent
         // handle. For a workflow with no retry policy this is exactly
         // `load_execution()`.
+        self.result_snapshot_resolved().await.map(|(_, r)| r)
+    }
+
+    /// [`Self::result_snapshot`], also returning the [`ExecutionId`] the
+    /// snapshot was read from.
+    ///
+    /// Because the snapshot follows the workflow-level retry chain (#843), the
+    /// row it reports may not be `self.exec_id()`. A caller that needs to load
+    /// anything *else* about that same row — notably
+    /// [`TypedWorkflowHandle::result_snapshot`], which enriches the snapshot
+    /// with the typed `WorkflowFailure` fields from the terminal
+    /// `WorkflowFailed` event (#767) — must use this id, or it would mix fields
+    /// from two different executions.
+    pub(crate) async fn result_snapshot_resolved(
+        &self,
+    ) -> HarvestResult<(ExecutionId, WorkflowResult)> {
         let execution = self.load_effective_execution().await?;
-        Ok(WorkflowResult::from_execution(&execution))
+        Ok((
+            ExecutionId::from_uuid(execution.id),
+            WorkflowResult::from_execution(&execution),
+        ))
     }
 
     /// Wait up to `timeout` for a terminal compact snapshot.
@@ -1899,11 +1918,11 @@ impl WorkflowHandle {
     /// branch, since it performs an extra history load.
     ///
     /// `exec_id` is an explicit parameter (rather than `self.exec_id`) because
-    /// `result_raw` follows the workflow-level retry chain (issue #523) and must
-    /// recover the typed failure from the *effective* (final-attempt) execution,
-    /// not the original handle id. `result_snapshot` (which reports the original
-    /// row, not the chain) passes `self.exec_id()` so its typed fields stay
-    /// consistent with the execution row it actually reports.
+    /// every result read follows the workflow-level retry chain (issues #523 and
+    /// #843) and must recover the typed failure from the execution the result
+    /// was actually read from — never from the addressed handle id. Callers pass
+    /// the resolved id (`result_snapshot_resolved` returns it precisely so the
+    /// typed metadata can never be paired with another attempt's `error`).
     ///
     /// # Errors
     ///
