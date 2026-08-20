@@ -2438,6 +2438,228 @@ pub async fn cancel_workflow_execution(
     Ok(cancel_result)
 }
 
+// ── Logical-handle routing across the workflow-level retry chain (#843) ────
+
+/// Upper bound on how far [`resolve_live_attempt`] walks the workflow-level
+/// retry chain (issue #523).
+///
+/// A cycle is impossible by construction — every retry is inserted with a fresh
+/// `exec_id` — so this is a defensive backstop, not a correctness dependency.
+/// It is far above any realistic `max_attempts` (which the builder ceiling
+/// clamps well below it).
+pub const RETRY_CHAIN_MAX_DEPTH: usize = 256;
+
+/// Bound on how many times a mutating operation is re-driven when the retry
+/// chain advanced underneath it (see [`redrive_target`]).
+///
+/// Each re-drive strictly descends the chain, so the walk terminates well
+/// before this bound; it exists only so a pathological database state can never
+/// spin an operator request forever.
+pub const RETRY_CHAIN_MAX_REDRIVES: usize = RETRY_CHAIN_MAX_DEPTH;
+
+/// Follow the workflow-level retry chain (issue #523) from `exec_id` to the
+/// **live attempt** and return it.
+///
+/// While the current row is `FAILED` *and* a successor with
+/// `retry_of_exec_id = id` exists, advance to that successor; otherwise stop.
+/// The returned execution is therefore:
+///
+/// * the row itself, for any non-`FAILED` state (including a live `RUNNING` or
+///   `PAUSED` run, and every non-retry workflow) — a strict no-op;
+/// * the row itself, for a `FAILED` run whose failure is the chain's final
+///   outcome (no retry was scheduled), so post-mortem operations still target
+///   it;
+/// * otherwise the deepest (most recent) attempt.
+///
+/// **There is no window in which the chain has no execution row.** The retry
+/// successor is inserted in the *same transaction* that seals the predecessor
+/// `FAILED` and appends `WorkflowRetryScheduled`, so an external reader either
+/// sees the predecessor still live, or sees it `FAILED` with its successor
+/// already present. The successor's *task* may still be delayed (a queued
+/// retry), but the row it routes to always exists.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::NotFound`] when `exec_id` does not exist and
+/// [`HarvestError::Database`] for query failures.
+pub async fn resolve_live_attempt(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<WorkflowExecution> {
+    let mut execution = load_execution_row(conn, exec_id).await?;
+    for _ in 0..RETRY_CHAIN_MAX_DEPTH {
+        if execution.state != "FAILED" {
+            return Ok(execution);
+        }
+        let next: Option<Uuid> = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(execution.id)))
+            .select(harvest_workflow_executions::id)
+            .first(conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
+        match next {
+            Some(next_id) => {
+                execution = load_execution_row(conn, ExecutionId::from_uuid(next_id)).await?;
+            }
+            None => return Ok(execution),
+        }
+    }
+    Ok(execution)
+}
+
+/// [`resolve_live_attempt`], returning only the resolved [`ExecutionId`].
+///
+/// # Errors
+///
+/// See [`resolve_live_attempt`].
+pub async fn resolve_live_attempt_id(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<ExecutionId> {
+    resolve_live_attempt(conn, exec_id)
+        .await
+        .map(|e| ExecutionId::from_uuid(e.id))
+}
+
+/// Load one execution row by id.
+async fn load_execution_row(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<WorkflowExecution> {
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)?
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
+}
+
+/// Pure decision helper for the mutating-operation re-drive loop (issue #843).
+///
+/// A mutating operation resolves the live attempt, acts on it, and — only when
+/// the act provably did **not** take effect — asks whether to try again against
+/// a freshly resolved target. Re-driving is correct exactly when the chain
+/// advanced underneath the operation (the attempt we acted on sealed `FAILED`
+/// and spawned its successor between our resolution and our act).
+///
+/// Returning `false` when the target is unchanged is what makes the loop
+/// terminate and what stops a genuine error (an unknown id, an exhausted chain
+/// whose final outcome really is `FAILED`) from being retried forever.
+///
+/// This is deliberately **never** consulted after an operation that DID take
+/// effect: re-driving a delivered signal would double-deliver it.
+#[must_use]
+pub const fn redrive_target(acted_on: ExecutionId, freshly_resolved: ExecutionId) -> bool {
+    acted_on.as_uuid().as_u128() != freshly_resolved.as_uuid().as_u128()
+}
+
+/// Cancel the **live attempt** of the logical run named by `exec_id` (#843).
+///
+/// Resolves the workflow-level retry chain (#523) and cancels the deepest
+/// attempt, so a caller still holding the id returned by `start` stops the run
+/// that is actually executing rather than no-opping against a sealed `FAILED`
+/// predecessor. For a workflow with no retry policy this is exactly
+/// [`cancel_workflow_execution`].
+///
+/// The queued-retry case is covered by the same routing: a retry whose start
+/// delay has not elapsed has its delayed task row deleted by the cancel, and a
+/// retry whose task is already claimable is sealed `CANCELLED` before it can
+/// commit any non-cancelled terminal (both the completion and failure writers
+/// filter on `state = 'RUNNING'`), so the chain cannot escape the cancel.
+///
+/// Race handling: if the attempt we resolved seals `FAILED` between the
+/// resolution and the cancel, the cancel fails and the chain has advanced, so
+/// the operation is re-driven against the new live attempt.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::NotFound`] when the execution does not exist,
+/// [`HarvestError::Config`] when the resolved live attempt is already terminal
+/// (an exhausted chain), and [`HarvestError::Database`] for persistence
+/// failures.
+pub async fn cancel_live_attempt(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    reason: &str,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+) -> HarvestResult<CancelledWorkflowExecution> {
+    let mut target = resolve_live_attempt_id(conn, exec_id).await?;
+    for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
+        match cancel_workflow_execution(conn, target, reason, metrics).await {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                let fresh = resolve_live_attempt_id(conn, exec_id)
+                    .await
+                    .unwrap_or(target);
+                if !redrive_target(target, fresh) {
+                    return Err(error);
+                }
+                target = fresh;
+            }
+        }
+    }
+    cancel_workflow_execution(conn, target, reason, metrics).await
+}
+
+/// Terminate the **live attempt** of the logical run named by `exec_id` (#843).
+///
+/// The routed sibling of [`terminate_workflow_execution`]. Terminate is an
+/// idempotent no-op against any already-terminal state, so without routing a
+/// terminate against a sealed `FAILED` predecessor would silently succeed while
+/// the retry kept running — the sharpest failure mode this routing closes.
+///
+/// Terminate fails every open (`PENDING`/`RUNNING`) task row of the attempt it
+/// seals, so a queued retry cannot subsequently be claimed.
+///
+/// Race handling: an idempotent no-op that landed on a row which has since
+/// sealed `FAILED` is re-driven against the freshly resolved live attempt.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::NotFound`] when the execution does not exist and
+/// [`HarvestError::Database`] for persistence failures.
+pub async fn terminate_live_attempt(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    reason: &str,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+) -> HarvestResult<CancelledWorkflowExecution> {
+    let mut target = resolve_live_attempt_id(conn, exec_id).await?;
+    for _ in 0..RETRY_CHAIN_MAX_REDRIVES {
+        match terminate_workflow_execution(conn, target, reason, metrics).await {
+            // A genuine seal, or an idempotent no-op against a row that is
+            // terminal for a reason OTHER than a retryable failure, is the
+            // final answer. Only a no-op against a `FAILED` row can mean the
+            // chain advanced underneath us.
+            Ok(result) if result.newly_cancelled || result.state != "FAILED" => {
+                return Ok(result);
+            }
+            Ok(result) => {
+                let fresh = resolve_live_attempt_id(conn, exec_id)
+                    .await
+                    .unwrap_or(target);
+                if !redrive_target(target, fresh) {
+                    return Ok(result);
+                }
+                target = fresh;
+            }
+            Err(error) => {
+                let fresh = resolve_live_attempt_id(conn, exec_id)
+                    .await
+                    .unwrap_or(target);
+                if !redrive_target(target, fresh) {
+                    return Err(error);
+                }
+                target = fresh;
+            }
+        }
+    }
+    terminate_workflow_execution(conn, target, reason, metrics).await
+}
+
 /// Maximum length of an operator-supplied pause reason (issue #383).
 pub const MAX_PAUSE_REASON_LEN: usize = 500;
 

@@ -2284,8 +2284,10 @@
         "status": 202,
         "fields": [
           "ok",
-          "signal_delivered"
-        ]
+          "signal_delivered",
+          "routed_execution_id"
+        ],
+        "notes": "routed_execution_id (issue #843) is present only when the addressed execution id differed from the live workflow-level-retry attempt the signal actually landed on; it is omitted when the signal landed on the addressed execution itself."
       },
       "error_responses": [
         {
@@ -7884,8 +7886,10 @@
         "fields": [
           "execution_id",
           "ok",
-          "signal_delivered"
-        ]
+          "signal_delivered",
+          "routed_execution_id"
+        ],
+        "notes": "routed_execution_id (issue #843) is present only when the resolved execution id differed from the live workflow-level-retry attempt the signal actually landed on; it is omitted otherwise."
       },
       "error_responses": [
         {

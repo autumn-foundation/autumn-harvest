@@ -125,10 +125,9 @@ use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, TriageFieldChange,
     TriageOutcome, TriagePatch, UpdateWithStartOutcome, UpdateWithStartParams,
-    WorkflowHandleClient, WorkflowResult, annotate_workflow_execution, cancel_workflow_execution,
-    pause_workflow_execution, resume_workflow_execution,
-    signal_with_start_workflow_execution_with_metrics,
-    start_or_load_workflow_execution_with_metrics, terminate_workflow_execution,
+    WorkflowHandleClient, WorkflowResult, annotate_workflow_execution, pause_workflow_execution,
+    resume_workflow_execution, signal_with_start_workflow_execution_with_metrics,
+    start_or_load_workflow_execution_with_metrics,
     update_with_start_workflow_execution_with_metrics,
 };
 
@@ -2016,6 +2015,24 @@ pub(crate) struct SignalQuery {
 pub(crate) struct SignalAck {
     ok: bool,
     signal_delivered: bool,
+    /// The execution the signal was actually queued for, when it differs from
+    /// the requested id because the workflow-level retry chain (#523) had
+    /// advanced and the request was routed to the live attempt (issue #843).
+    ///
+    /// Omitted entirely when no routing occurred, so an unretried workflow's
+    /// response stays byte-identical to a pre-#843 build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routed_execution_id: Option<String>,
+}
+
+/// The routed live attempt, reported only when routing actually moved the
+/// target (issue #843). `None` keeps a non-routed response byte-identical to
+/// its pre-#843 shape.
+fn routed_execution_id(
+    requested: autumn_harvest::ExecutionId,
+    routed: autumn_harvest::ExecutionId,
+) -> Option<String> {
+    (requested != routed).then(|| routed.to_string())
 }
 
 #[derive(Debug, Serialize)]
@@ -4400,7 +4417,7 @@ async fn signal_workflow_by_id(
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .unwrap_or_else(|| serde_json::json!({}));
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "execution_id": exec_id.to_string(),
             "ok": ack.get("ok").cloned().unwrap_or(Value::Bool(true)),
             "signal_delivered": ack
@@ -4408,6 +4425,13 @@ async fn signal_workflow_by_id(
                 .cloned()
                 .unwrap_or(Value::Bool(false)),
         });
+        // Forward the #843 routed-live-attempt marker when the inner handler
+        // set it, so a by-id caller can also see that the retry chain moved.
+        if let Some(routed) = ack.get("routed_execution_id").cloned()
+            && let Some(map) = out.as_object_mut()
+        {
+            map.insert("routed_execution_id".to_string(), routed);
+        }
         let mut resp = (parts.status, Json(out)).into_response();
         insert_exec_id_header(&mut resp, exec_id);
         resp
@@ -7059,7 +7083,10 @@ pub const fn management_api_response_fields()
         (
             "POST",
             "/workflows/{id}/signal/{signal_name}",
-            Some(&["ok", "signal_delivered"]),
+            // `routed_execution_id` (issue #843) is present only when the
+            // request's execution id differed from the live retry attempt the
+            // signal actually landed on; omitted otherwise.
+            Some(&["ok", "signal_delivered", "routed_execution_id"]),
         ),
         ("GET", "/workflows/{id}/queries", None), // Vec<String> query names
         ("GET", "/workflows/{id}/query/{query_name}", None), // opaque handler return
@@ -7096,7 +7123,12 @@ pub const fn management_api_response_fields()
         (
             "POST",
             "/workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
-            Some(&["execution_id", "ok", "signal_delivered"]),
+            Some(&[
+                "execution_id",
+                "ok",
+                "signal_delivered",
+                "routed_execution_id",
+            ]),
         ),
         (
             "GET",
@@ -10654,6 +10686,11 @@ async fn workflow_result_snapshot_following_can(
 /// retry chain (issue #523): while the current row is `FAILED` and a successor
 /// with `retry_of_exec_id = id` exists, advance to that successor. Returns the
 /// deepest (most recent) execution. Uses only DB reads — no listener required.
+///
+/// Delegates to the single canonical walker
+/// [`autumn_harvest::execution::resolve_live_attempt`] so the management API and
+/// the core `WorkflowHandle` cannot drift on what "the live attempt" means
+/// (issue #843).
 async fn load_execution_following_retries(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
@@ -10661,29 +10698,7 @@ async fn load_execution_following_retries(
     let mut conn = db_conn_for_execution(api_state, exec_id)
         .await
         .map_err(|e| HarvestError::Database(e.to_string()))?;
-    let mut execution = load_execution(&mut conn, exec_id).await?;
-    // Bounded by max_attempts; self-referential cycles are impossible (each
-    // retry gets a fresh exec_id).
-    for _ in 0..256 {
-        if execution.state != "FAILED" {
-            return Ok(execution);
-        }
-        let next: Option<uuid::Uuid> = harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(execution.id)))
-            .select(harvest_workflow_executions::id)
-            .first(&mut conn)
-            .await
-            .optional()
-            .map_err(database_error)?;
-        match next {
-            Some(next_uuid) => {
-                let next_id = ExecutionId::from_uuid(next_uuid);
-                execution = load_execution(&mut conn, next_id).await?;
-            }
-            None => return Ok(execution),
-        }
-    }
-    Ok(execution)
+    autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id).await
 }
 
 /// Load the successor execution ID from a `WorkflowContinuedAsNew` event in
@@ -21092,13 +21107,20 @@ async fn cancel_workflow(
         .unwrap_or("workflow cancellation requested");
     let exec_id_str = exec_id.to_string();
 
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry.telemetry().metrics),
-        );
-    let cancel_result =
-        cancel_workflow_execution(&mut conn, exec_id, reason, metrics_ref.as_ref()).await;
+    let metrics_ref = metrics_recorder_or_noop(&api_state);
+    // Issue #843: route to the LIVE attempt of the workflow-level retry chain
+    // (#523). Without this, a cancel issued against the id returned by `start`
+    // no-ops against the sealed `FAILED` predecessor while the retry keeps
+    // running — the sharpest correctness gap this routing closes. The response's
+    // `execution_id` reports the attempt actually cancelled. For a workflow with
+    // no retry policy this is exactly `cancel_workflow_execution`.
+    let cancel_result = autumn_harvest::execution::cancel_live_attempt(
+        &mut conn,
+        exec_id,
+        reason,
+        metrics_ref.as_ref(),
+    )
+    .await;
     match cancel_result {
         Err(e) => {
             let err_str = e.to_string();
@@ -21159,6 +21181,18 @@ async fn cancel_workflow(
 /// `ExecutionId`), audited via `OP_WORKFLOW_TERMINATE`, and idempotent against
 /// an already-terminal execution (non-mutating no-op, `newly_terminated:
 /// false`).
+/// The runtime's metrics recorder, or a no-op when the runtime is not installed
+/// (the boot window). Shared by the cancel/terminate/pause/resume handlers so
+/// the fall-back is resolved identically everywhere.
+fn metrics_recorder_or_noop(
+    api_state: &HarvestApiState,
+) -> Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> {
+    api_state.runtime().map_or_else(
+        |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+        |rt| Arc::clone(&rt.registry.telemetry().metrics),
+    )
+}
+
 async fn terminate_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
@@ -21212,13 +21246,14 @@ async fn terminate_workflow(
         .unwrap_or("workflow termination requested");
     let exec_id_str = exec_id.to_string();
 
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry.telemetry().metrics),
-        );
-    let terminate_result =
-        terminate_workflow_execution(&mut conn, exec_id, reason, metrics_ref.as_ref()).await;
+    let metrics_ref = metrics_recorder_or_noop(&api_state);
+    let terminate_result = autumn_harvest::execution::terminate_live_attempt(
+        &mut conn,
+        exec_id,
+        reason,
+        metrics_ref.as_ref(),
+    )
+    .await;
     match terminate_result {
         Err(e) => {
             let err_str = e.to_string();
@@ -21843,11 +21878,7 @@ async fn pause_workflow(
 
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry.telemetry().metrics),
-        );
+    let metrics_ref = metrics_recorder_or_noop(&api_state);
 
     let result = pause_workflow_execution(
         &mut conn,
@@ -21911,11 +21942,7 @@ async fn resume_workflow(
     let exec_id = parse_execution_id(&id)?;
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
     let exec_id_str = exec_id.to_string();
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry.telemetry().metrics),
-        );
+    let metrics_ref = metrics_recorder_or_noop(&api_state);
 
     let result = resume_workflow_execution(&mut conn, exec_id, &actor, metrics_ref.as_ref()).await;
 
@@ -23629,7 +23656,13 @@ pub(crate) async fn signal_workflow(
     };
     let exec_id_str = exec_id.to_string();
 
-    let execution = match load_execution(&mut conn, exec_id).await {
+    // Issue #843: a signal names the LOGICAL run, so it is routed to the live
+    // attempt of the workflow-level retry chain (#523). Without this, a signal
+    // sent after attempt 1 sealed `FAILED` was inserted against — and dropped
+    // with — the sealed predecessor while the retry ran on. For a workflow with
+    // no retry policy this resolves to `exec_id` and is a strict no-op.
+    let execution = match autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id).await
+    {
         Ok(ex) => ex,
         Err(e) => {
             let err_str = e.to_string();
@@ -23651,6 +23684,10 @@ pub(crate) async fn signal_workflow(
         }
     };
 
+    // The routed live attempt — the execution the signal will actually be
+    // queued for. Equal to `exec_id` unless the retry chain has advanced.
+    let target = ExecutionId::from_uuid(execution.id);
+
     // Issues #521 / #610: committed keyed-replay short-circuit. A keyed retry
     // whose `(exec_id, idempotency_key)` row already landed must return the
     // documented dedup no-op (202, `signal_delivered: false`) *before* the #610
@@ -23666,7 +23703,7 @@ pub(crate) async fn signal_workflow(
     // to validation + the `ON CONFLICT` insert. Skipped when no key is present,
     // so fresh + unkeyed deliveries are still fully validated before enqueue.
     if let Some(key) = idempotency_key.as_deref() {
-        match signal::signal_idempotency_key_exists(&mut conn, exec_id, key).await {
+        match signal::signal_idempotency_key_exists(&mut conn, target, key).await {
             Ok(true) => {
                 // Same success audit + response the normal on-conflict path
                 // writes when `send_signal_idempotent` returns `Ok(false)`.
@@ -23691,6 +23728,7 @@ pub(crate) async fn signal_workflow(
                     Json(SignalAck {
                         ok: true,
                         signal_delivered: false,
+                        routed_execution_id: routed_execution_id(exec_id, target),
                     }),
                 )
                     .into_response();
@@ -23752,7 +23790,7 @@ pub(crate) async fn signal_workflow(
     }
 
     // Signal payload is intentionally not stored in the audit record (no PII).
-    let signal_result = signal::send_signal_idempotent(
+    let signal_result = signal::send_signal_to_live_attempt(
         &mut conn,
         exec_id,
         &signal_name,
@@ -23761,8 +23799,8 @@ pub(crate) async fn signal_workflow(
     )
     .await;
 
-    let signal_delivered = match signal_result {
-        Ok(delivered) => delivered,
+    let (signal_delivered, delivered_to) = match signal_result {
+        Ok(delivery) => (delivery.delivered, delivery.target),
         Err(e) => {
             let err_str = e.to_string();
             let ar = NewAuditRecord {
@@ -23803,6 +23841,7 @@ pub(crate) async fn signal_workflow(
         Json(SignalAck {
             ok: true,
             signal_delivered,
+            routed_execution_id: routed_execution_id(exec_id, delivered_to),
         }),
     )
         .into_response()
@@ -23817,9 +23856,14 @@ async fn hydrate_ctx_for_query(
 ) -> Result<WorkflowContext, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let mut conn = db_conn_for_execution(api_state, exec_id).await?;
-    let execution = load_execution(&mut conn, exec_id)
+    // Issue #843: a query addresses the LOGICAL run, so follow the
+    // workflow-level retry chain (#523/#842) to the live attempt. A retry
+    // successor is minted on the predecessor's shard, so the connection
+    // resolved from `exec_id` above already owns the whole chain.
+    let execution = autumn_harvest::execution::resolve_live_attempt(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
+    let target = ExecutionId::from_uuid(execution.id);
 
     // Terminal executions are now queryable for post-mortem state inspection
     // (issue #612): the workflow function is driven through replay and the query
@@ -23841,7 +23885,7 @@ async fn hydrate_ctx_for_query(
     // takes precedence over the terminal-seal check below.
     if terminal && erase::execution_input_is_erased(&execution.input) {
         return Err(map_error(HarvestError::HistoryUnavailable {
-            exec_id,
+            exec_id: target,
             reason: "payloads erased".to_string(),
         }));
     }
@@ -23856,7 +23900,7 @@ async fn hydrate_ctx_for_query(
                 execution.workflow_name
             ))
         })?;
-    let history = store::load_history(&mut conn, exec_id)
+    let history = store::load_history(&mut conn, target)
         .await
         .map_err(map_error)?;
 
@@ -23875,7 +23919,7 @@ async fn hydrate_ctx_for_query(
     let sealed = terminal && history_reached_terminal_seal(&history.events);
 
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
-        exec_id,
+        target,
         history.events,
         runtime.registry.shared_state(),
         runtime.registry.history_policy(),
@@ -23960,7 +24004,7 @@ async fn hydrate_ctx_for_query(
             // distinct 410.
             TerminalQueryDecision::HistoryUnavailable => {
                 Err(map_error(HarvestError::HistoryUnavailable {
-                    exec_id,
+                    exec_id: target,
                     reason: "pruned by retention, released, or replay diverged from \
                              recorded history (workflow code changed)"
                         .to_string(),
@@ -23980,7 +24024,7 @@ async fn hydrate_ctx_for_query(
         // `Panicked` to an error via `classify_terminal_query`.
         if matches!(outcome, QueryReplayOutcome::Panicked) {
             return Err(map_error(HarvestError::QueryHandlerPanicked(format!(
-                "workflow handler panicked during query replay for execution {exec_id}"
+                "workflow handler panicked during query replay for execution {target}"
             ))));
         }
         Ok(ctx)
@@ -41000,7 +41044,17 @@ pub(crate) async fn admit_update(
     // becoming durable history that runs/fails deep inside the workflow.
     // Scoped by (workflow_name, update_name), not update_name alone, since two
     // different workflows may register update handlers with the same name.
-    let execution_for_validation = load_execution(&mut conn, exec_id).await;
+    //
+    // Issue #843: an update addresses the LOGICAL run, so follow the
+    // workflow-level retry chain (#523/#842) to the live attempt before both
+    // validating and admitting. A retry successor is minted on the
+    // predecessor's shard, so `conn` above already owns the whole chain.
+    let mut target =
+        match autumn_harvest::execution::resolve_live_attempt_id(&mut conn, exec_id).await {
+            Ok(t) => t,
+            Err(e) => return map_error(e).into_response(),
+        };
+    let execution_for_validation = load_execution(&mut conn, target).await;
 
     // Resolve the registered update handler once and reuse it for both the
     // #610 schema-400 check and the #684 validator-422 check. Scoped by
@@ -41051,21 +41105,46 @@ pub(crate) async fn admit_update(
     // the workflow could complete between a separate state read and the insert.
     // UpdateRejected is returned if the execution is no longer RUNNING. The
     // recorder emits harvest.update.admitted post-commit (issue #684).
-    if let Err(e) = store::admit_update_event(
+    //
+    // Issue #843: if the resolved attempt failed and the chain advanced under
+    // us between the resolve above and the admit, re-drive onto the fresh live
+    // attempt. `admit_update_event` verifies RUNNING under the same FOR UPDATE
+    // lock and rolls back on rejection, so a re-driven admit can never
+    // double-admit.
+    let mut admit = store::admit_update_event(
         &mut conn,
-        exec_id,
+        target,
         update_id,
-        update_name,
-        request.input,
+        update_name.clone(),
+        request.input.clone(),
         Some(runtime.registry.telemetry().metrics.as_ref()),
     )
-    .await
-    {
+    .await;
+    for _ in 0..autumn_harvest::execution::RETRY_CHAIN_MAX_REDRIVES {
+        let Err(error) = admit else { break };
+        let fresh = autumn_harvest::execution::resolve_live_attempt_id(&mut conn, exec_id)
+            .await
+            .unwrap_or(target);
+        if !autumn_harvest::execution::redrive_target(target, fresh) {
+            return map_error(error).into_response();
+        }
+        target = fresh;
+        admit = store::admit_update_event(
+            &mut conn,
+            target,
+            update_id,
+            update_name.clone(),
+            request.input.clone(),
+            Some(runtime.registry.telemetry().metrics.as_ref()),
+        )
+        .await;
+    }
+    if let Err(e) = admit {
         return map_error(e).into_response();
     }
 
     // Wake the workflow worker so it picks up the new admitted update.
-    if let Err(e) = queue::wake_workflow_task(&mut conn, exec_id).await {
+    if let Err(e) = queue::wake_workflow_task(&mut conn, target).await {
         return map_error(e).into_response();
     }
 
@@ -41086,7 +41165,7 @@ pub(crate) async fn admit_update(
         Ok(p) => p,
         Err(e) => return map_error(e).into_response(),
     };
-    poll_update_result(&pool, exec_id, update_id, timeout_secs).await
+    poll_update_result(&pool, target, update_id, timeout_secs).await
 }
 
 /// Poll history until `update_id` resolves to `UpdateCompleted`/`UpdateFailed`

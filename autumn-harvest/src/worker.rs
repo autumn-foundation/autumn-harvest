@@ -6271,6 +6271,25 @@ async fn persist_workflow_failure(
                             },
                         )
                         .await?;
+                        // Issue #843: carry pending signals across the
+                        // fresh-history boundary. A signal staged on this
+                        // attempt but never ingested into its history is not
+                        // reflected anywhere, so moving it to the successor
+                        // loses nothing and stops it being silently dropped
+                        // with the failed attempt. Consumed signals stay put
+                        // (audit); the retry replays a fresh history and must
+                        // not re-observe them. Mirrors the identical
+                        // reassignment `continue_as_new` already performs.
+                        let forwarded =
+                            crate::signal::forward_unconsumed_signals(conn, exec_id, rid).await?;
+                        if forwarded > 0 {
+                            tracing::debug!(
+                                execution_id = %exec_id,
+                                retry_exec_id = %rid,
+                                forwarded,
+                                "harvest: forwarded unconsumed signals to the retry attempt"
+                            );
+                        }
                         retry_committed = true;
                     }
                     Err(e) => {

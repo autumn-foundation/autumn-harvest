@@ -129,6 +129,7 @@ mod replayer_tests;
 mod retention_overrides_tests;
 mod retention_summary_tests;
 mod retry_after_tests;
+mod retry_chain_routing_tests;
 mod retry_now_tests;
 mod saga_tests;
 mod scanner_liveness_tests;
