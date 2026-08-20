@@ -997,3 +997,157 @@ async fn scan_limit_clamps_shed_per_admission_and_still_converges() {
     );
     assert_eq!(state_of(&mut conn, last).await, "RUNNING");
 }
+
+// ── Scheduler-tick supersede metrics (issue #811, Codex round 1, P2) ───────
+
+/// A scheduled fire that supersedes must emit the counters too.
+///
+/// The scheduler resolves the declared `on_conflict` from the registered
+/// `WorkflowInfo` and threads it into `StartWorkflowParams`, so a scheduled
+/// tick genuinely *does* supersede an incumbent. But it called the
+/// metrics-discarding `start_or_load_workflow_execution` wrapper, so neither
+/// `harvest.concurrency.superseded` nor the cancelled terminal counter was
+/// emitted for that shed run — AC7 says "once per superseded run", and a
+/// scheduled fire is a superseding run like any other.
+///
+/// Drives the REAL public `tick_once` against a due schedule with a live
+/// incumbent, so the fix has to be in the production plumbing rather than in a
+/// test-only shim.
+#[tokio::test]
+async fn scheduled_tick_supersede_emits_the_counters() {
+    use autumn_harvest::worker::HandlerRegistry;
+    use autumn_harvest::{DagCatalog, SchedulerMonitor, WorkflowContext, tick_once};
+
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    let wf = "sched_latest_wins";
+    let key = "tenant-sched";
+
+    // A live incumbent on the key, admitted the ordinary way.
+    let incumbent = start_run(
+        &mut conn,
+        &CapturingMetrics::default(),
+        wf,
+        "incumbent",
+        key,
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+    assert_eq!(state_of(&mut conn, incumbent).await, "RUNNING");
+
+    // A due schedule for the same workflow type. The scheduler resolves the
+    // key + strategy from the registered WorkflowInfo below.
+    // `harvest_schedules.workflow_name` is globally unique, so clear any row a
+    // prior run of this suite left behind in a reused database.
+    diesel::sql_query("DELETE FROM harvest_schedules WHERE workflow_name = $1")
+        .bind::<Text, _>(wf)
+        .execute(&mut conn)
+        .await
+        .expect("clear stale schedule");
+    let sched_id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_schedules \
+         (id, workflow_name, schedule_expr, timezone, catchup, max_active_runs, \
+          is_paused, next_run_at, jitter_secs, overlap_policy, buffered_runs, \
+          buffer_all_max, skip_policy, workflow_input) \
+         VALUES ($1, $2, 'interval:60', 'UTC', false, 10, false, \
+                 NOW() - INTERVAL '5 seconds', 0, 'skip', '[]'::jsonb, 100, 'skip', $3)",
+    )
+    .bind::<SqlUuid, _>(sched_id)
+    .bind::<Text, _>(wf)
+    .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!({ "tenant_id": key }))
+    .execute(&mut conn)
+    .await
+    .expect("insert schedule");
+
+    drop(conn);
+
+    fn noop<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+    > {
+        Box::pin(async { Ok(serde_json::Value::Null) })
+    }
+
+    let metrics: Arc<CapturingMetrics> = Arc::new(CapturingMetrics::default());
+    let telemetry = Arc::new(autumn_harvest::telemetry::TelemetryConfig {
+        metrics: Arc::clone(&metrics) as Arc<dyn MetricsRecorder>,
+        ..Default::default()
+    });
+
+    let info = autumn_harvest::WorkflowInfo {
+        name: "sched_latest_wins",
+        module: "concurrency_supersede_tests",
+        handler: noop,
+        concurrency: Some(
+            autumn_harvest::concurrency::ConcurrencyPolicy::new("input.tenant_id", 1)
+                .with_on_conflict(ConcurrencyOnConflict::CancelRunning),
+        ),
+        declared_activities: None,
+        declared_children: None,
+        mcp: false,
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        sla: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    };
+
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![info],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+    ));
+
+    tick_once(
+        build_pool(&url),
+        registry,
+        Arc::new(DagCatalog::default()),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("tick_once must succeed");
+
+    let mut conn = connect(&url).await;
+
+    // The scheduled fire superseded the incumbent...
+    assert_eq!(
+        state_of(&mut conn, incumbent).await,
+        "CANCELLED",
+        "the scheduled fire must supersede the incumbent"
+    );
+    assert_eq!(
+        non_terminal_count(&mut conn, wf).await,
+        1,
+        "exactly the scheduled run survives"
+    );
+
+    // ...and therefore must have counted it (AC7).
+    assert_eq!(
+        metrics.superseded.lock().unwrap().as_slice(),
+        &[wf.to_string()],
+        "a scheduled supersede must emit harvest.concurrency.superseded exactly once"
+    );
+    assert_eq!(
+        metrics.cancelled_terminals.lock().unwrap().as_slice(),
+        &[wf.to_string()],
+        "a scheduled supersede must emit the cancelled terminal counter too"
+    );
+}

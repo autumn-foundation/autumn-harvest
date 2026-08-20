@@ -322,3 +322,99 @@ async fn admin_concurrency_dedups_repeated_workflow_names_on_one_key() {
     assert_eq!(workflows[0]["workflow_name"], json!("doc_index"));
     assert_eq!(workflows[0]["on_conflict"], json!("cancel_running"));
 }
+
+/// An **activity** concurrency group always reports `defer`, even when its
+/// owning workflow declares `cancel_running` (issue #811, Codex round 1).
+///
+/// Latest-wins is a workflow-*start* admission control: the supersede runs
+/// inside the start primitive and sheds workflow *executions*. An activity task
+/// that carries a concurrency key is gated purely at claim time (issue #247)
+/// and always defers — nothing sheds an in-flight activity for a newcomer. So
+/// resolving the owning workflow's declared strategy onto the
+/// `task_type = "activity"` row would advertise behaviour the engine does not
+/// enforce for that group.
+#[tokio::test]
+async fn admin_concurrency_reports_defer_for_activity_rows() {
+    use diesel::sql_types::{Int4, Text, Uuid as SqlUuid};
+    use diesel_async::RunQueryDsl;
+
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+
+    // The owning workflow DECLARES cancel_running.
+    let latest_wins = info(
+        "doc_index",
+        Some(
+            ConcurrencyPolicy::new("input.tenant_id", 1)
+                .with_on_conflict(ConcurrencyOnConflict::CancelRunning),
+        ),
+    );
+    let app = build_app(&pool, vec![latest_wins]);
+
+    // A workflow task on the key (reports cancel_running), plus an ACTIVITY
+    // task on the SAME key owned by the SAME cancel_running workflow.
+    seed_run(&pool, "doc_index", "act-a", "acme-act", 1).await;
+
+    let mut conn = pool.get().await.expect("pool conn");
+    let owner: uuid::Uuid = diesel::sql_query(
+        "SELECT id FROM harvest_workflow_executions WHERE workflow_name = 'doc_index' \
+         AND workflow_id = 'act-a' LIMIT 1",
+    )
+    .get_result::<OwnerRow>(&mut conn)
+    .await
+    .expect("owner execution")
+    .id;
+
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, activity_name, input, state, \
+          priority, attempt, max_attempts, scheduled_at, concurrency_key, concurrency_cap) \
+         VALUES (gen_random_uuid(), 'default', 'activity', $1, 'do_index', '{}'::jsonb, \
+                 'PENDING', 0, 0, 3, NOW(), $2, $3)",
+    )
+    .bind::<SqlUuid, _>(owner)
+    .bind::<Text, _>("acme-act")
+    .bind::<Int4, _>(1)
+    .execute(&mut conn)
+    .await
+    .expect("seed activity task");
+    drop(conn);
+
+    let (status, body) = get_json(&app, "/admin/concurrency").await;
+    assert_eq!(status, StatusCode::OK, "admin read: {body:?}");
+    let rows = body.as_array().expect("array response");
+
+    // The workflow row still reports the declared strategy.
+    let wf_row = rows
+        .iter()
+        .find(|r| r["key"] == json!("acme-act") && r["task_type"] == json!("workflow"))
+        .unwrap_or_else(|| panic!("no (acme-act, workflow) row in {rows:?}"));
+    assert_eq!(
+        wf_row["workflows"][0]["on_conflict"],
+        json!("cancel_running"),
+        "the workflow row must still report the declared strategy"
+    );
+
+    // The activity row must report defer -- that is what is enforced.
+    let act_row = rows
+        .iter()
+        .find(|r| r["key"] == json!("acme-act") && r["task_type"] == json!("activity"))
+        .unwrap_or_else(|| panic!("no (acme-act, activity) row in {rows:?}"));
+    assert_eq!(
+        act_row["workflows"][0]["workflow_name"],
+        json!("doc_index"),
+        "the activity row is still attributed to its owning workflow type"
+    );
+    assert_eq!(
+        act_row["workflows"][0]["on_conflict"],
+        json!("defer"),
+        "an activity concurrency group cannot latest-wins, so the admin read must \
+         not advertise the owning workflow's cancel_running for it"
+    );
+}
+
+#[derive(diesel::QueryableByName)]
+struct OwnerRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
+}

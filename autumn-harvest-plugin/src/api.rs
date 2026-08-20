@@ -31909,7 +31909,7 @@ async fn concurrency_status(
             {
                 continue;
             }
-            let on_conflict = runtime
+            let declared = runtime
                 .registry
                 .workflows
                 .get(&attribution.workflow_name)
@@ -31918,6 +31918,8 @@ async fn concurrency_status(
                     autumn_harvest::concurrency::ConcurrencyOnConflict::default,
                     |policy| policy.on_conflict,
                 );
+            // Activity concurrency groups always defer (issue #811, Codex round 1).
+            let on_conflict = effective_admin_on_conflict(&attribution.task_type, declared);
             entry.workflows.push(queue::ConcurrencyWorkflowStrategy {
                 workflow_name: attribution.workflow_name,
                 on_conflict,
@@ -31933,6 +31935,29 @@ async fn concurrency_status(
     }
     result.sort_by(|a, b| a.key.cmp(&b.key).then(a.task_type.cmp(&b.task_type)));
     Ok(Json(result))
+}
+
+/// Effective `on_conflict` to report for one `/admin/concurrency` row (issue #811).
+///
+/// Latest-wins is a **workflow-start admission control**: the supersede runs
+/// inside `start_or_load_workflow_execution_collect` and sheds workflow
+/// *executions*. An activity task can carry a `concurrency_key` too, but it is
+/// gated purely at claim time (issue #247) and always defers — nothing sheds an
+/// in-flight activity for a newcomer.
+///
+/// So a `task_type = "activity"` row reports `Defer` even when its owning
+/// workflow declares `cancel_running`, because reporting the workflow's
+/// strategy there would advertise behaviour the engine does not enforce for
+/// that group. Only a `task_type = "workflow"` row reports the declared policy.
+fn effective_admin_on_conflict(
+    task_type: &str,
+    declared: autumn_harvest::concurrency::ConcurrencyOnConflict,
+) -> autumn_harvest::concurrency::ConcurrencyOnConflict {
+    if task_type == "workflow" {
+        declared
+    } else {
+        autumn_harvest::concurrency::ConcurrencyOnConflict::Defer
+    }
 }
 
 // ── Debounce Management (issue #499) ──────────────────────────────────────
@@ -43900,6 +43925,48 @@ mod reserved_idempotency_key_tests {
 
 #[cfg(test)]
 mod tests {
+
+    // ── issue #811 (Codex round 1, P2): activity concurrency groups always defer
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Latest-wins is a *workflow-start* admission control: the supersede runs
+    /// inside `start_or_load_workflow_execution_collect` and sheds workflow
+    /// *executions*. An activity task that carries a concurrency key is gated
+    /// purely at claim time and always defers, so reporting its owning
+    /// workflow's declared `cancel_running` on the `task_type = "activity"`
+    /// admin row advertises a strategy nothing enforces.
+    #[test]
+    fn admin_reports_defer_for_activity_rows_regardless_of_workflow_policy() {
+        use autumn_harvest::concurrency::ConcurrencyOnConflict;
+
+        // A workflow row reports whatever the workflow declares.
+        assert_eq!(
+            effective_admin_on_conflict("workflow", ConcurrencyOnConflict::CancelRunning),
+            ConcurrencyOnConflict::CancelRunning,
+        );
+        assert_eq!(
+            effective_admin_on_conflict("workflow", ConcurrencyOnConflict::Defer),
+            ConcurrencyOnConflict::Defer,
+        );
+
+        // An activity row always reports defer -- that is what is enforced.
+        assert_eq!(
+            effective_admin_on_conflict("activity", ConcurrencyOnConflict::CancelRunning),
+            ConcurrencyOnConflict::Defer,
+            "an activity concurrency group cannot latest-wins; reporting the \
+             owning workflow's cancel_running would advertise an unenforced strategy",
+        );
+        assert_eq!(
+            effective_admin_on_conflict("activity", ConcurrencyOnConflict::Defer),
+            ConcurrencyOnConflict::Defer,
+        );
+
+        // Defensive: an unrecognised task_type is not a workflow start either.
+        assert_eq!(
+            effective_admin_on_conflict("something_else", ConcurrencyOnConflict::CancelRunning),
+            ConcurrencyOnConflict::Defer,
+        );
+    }
     use super::*;
     use autumn_harvest::workers::WorkerHealth;
     use testcontainers::ContainerAsync;

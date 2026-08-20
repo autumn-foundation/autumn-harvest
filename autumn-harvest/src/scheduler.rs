@@ -4596,7 +4596,11 @@ async fn tick_one_workflow_schedule(
 
         // Provenance ref for a scheduled fire is the triggering schedule id (#740).
         let schedule_id_str = schedule.id.to_string();
-        let start_result = crate::execution::start_or_load_workflow_execution(
+        // Latest-wins supersede counters (issue #811, Codex round 1): the
+        // metrics-less wrapper discards the collected cancellations, so a
+        // scheduled fire that sheds an incumbent emitted neither
+        // `harvest.concurrency.superseded` nor the cancelled terminal.
+        let start_result = crate::execution::start_or_load_workflow_execution_with_metrics(
             conn,
             StartWorkflowParams {
                 workflow_name: wf_name,
@@ -4669,6 +4673,7 @@ async fn tick_one_workflow_schedule(
                 start_source_ref: Some(schedule_id_str.as_str()),
                 started_by: None,
             },
+            Some(metrics.as_ref()),
             None,
         )
         .await;
@@ -6224,7 +6229,9 @@ async fn drain_buffered_schedule_runs(
 
             // Provenance ref for a buffered scheduled fire is the schedule id (#740).
             let schedule_id_str = schedule.id.to_string();
-            let start_result = crate::execution::start_or_load_workflow_execution(
+            // Latest-wins supersede counters (issue #811, Codex round 1) --
+            // the buffered drain shares the tick's gap.
+            let start_result = crate::execution::start_or_load_workflow_execution_with_metrics(
                 conn,
                 crate::execution::StartWorkflowParams {
                     workflow_name: wf_name,
@@ -6293,6 +6300,7 @@ async fn drain_buffered_schedule_runs(
                     start_source_ref: Some(schedule_id_str.as_str()),
                     started_by: None,
                 },
+                Some(metrics.as_ref()),
                 None,
             )
             .await;
