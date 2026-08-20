@@ -21958,6 +21958,77 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
 }
 
 // ---------------------------------------------------------------------------
+// Chaos drive helpers (issue #940) — test-only, `chaos` feature.
+// ---------------------------------------------------------------------------
+
+/// Drive exactly one already-claimed workflow task through the production
+/// [`process_workflow_task`] decision cycle, on its **own dedicated,
+/// non-pooled** connection, inside a spawned task — so a chaos `Kill` at a
+/// wired injection point crashes *this* task (surfacing as a `JoinError`) and
+/// drops the owned connection mid-flight, which rolls back any uncommitted
+/// work server-side exactly as a crashed worker process would. The claim
+/// (`RUNNING` + `worker_id`), committed by `claim_task` before this runs,
+/// survives the crash, leaving the row stranded `RUNNING` with a now-dead
+/// worker — the #367 poison-pill orphan condition (issue #940 AC1a / AC4).
+///
+/// Non-`Kill` faults (`Hold`, `Delay`) drive the cycle to completion; the
+/// `Ok(HarvestResult<()>)` mirrors what the poll loop would observe.
+///
+/// The connection is established fresh from `db_url` rather than borrowed from
+/// a pool precisely so its drop closes a real socket: a pooled connection
+/// returned to the pool on unwind may be recycled rather than closed, which
+/// would not reproduce the server-side rollback of a crashed process.
+///
+/// All defaults mirror the poll-loop call site: `build_id = ""`,
+/// `sticky_timeout = 5s`, `max_local_activity_start_to_close = 60s`, a fresh
+/// 16-slot [`crate::cache::WorkflowCache`], `dispatched_at = Instant::now()`,
+/// a fresh per-run panic-strike map, `workflow_panic_max_attempts = 3`,
+/// `workflow_task_deadline = None`, and a fresh frontier-reset flag.
+///
+/// # Errors
+///
+/// Returns the [`tokio::task::JoinError`] when the driven cycle panics — the
+/// chaos `Kill` path. The inner `HarvestResult<()>` is `process_workflow_task`'s
+/// own result on every non-panic path.
+#[cfg(feature = "chaos")]
+pub async fn chaos_drive_one_workflow_task(
+    db_url: &str,
+    registry: Arc<HandlerRegistry>,
+    task: TaskQueueItem,
+    worker_id: String,
+) -> Result<HarvestResult<()>, tokio::task::JoinError> {
+    let db_url = db_url.to_string();
+    tokio::spawn(async move {
+        let mut conn = AsyncPgConnection::establish(&db_url)
+            .await
+            .expect("chaos: establish owned workflow-task connection");
+        let workflow_cache =
+            Arc::new(tokio::sync::Mutex::new(crate::cache::WorkflowCache::new(16)));
+        let workflow_panic_strikes = Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::<uuid::Uuid, u32>::new(),
+        ));
+        let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
+        process_workflow_task(
+            &mut conn,
+            registry.as_ref(),
+            &task,
+            &worker_id,
+            "",
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            workflow_cache,
+            std::time::Instant::now(),
+            &workflow_panic_strikes,
+            3,
+            None,
+            &frontier_reset_committed,
+        )
+        .await
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
 // Tests (unit, no DB)
 // ---------------------------------------------------------------------------
 
