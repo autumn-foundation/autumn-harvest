@@ -1412,9 +1412,26 @@ async fn doc_index(ctx: &WorkflowContext, req: IndexRequest) -> Result<(), Strin
 - **Bounded** — one admission sheds at most `SUPERSEDE_SCAN_LIMIT` (32) runs. Latest-wins is a per-key fair-share control, not a bulk-cancel tool; excess beyond that is shed by the *next* admission for the same key, so the population still converges without any single start paying an unbounded cost.
 - **Shard-local**, exactly like the #247 cap it extends — see `docs/sharding.md`. In a multi-shard deployment the guarantee is "at most `limit` per shard"; pin the key with an explicit `residency_key` if you need it globally.
 
-**Where it applies.** Every genuine *admission* path resolves the declared strategy: the plain start route, `signal-with-start`, `update-with-start`, an operator re-run, and the deferred debounce/throttle/batch fire paths. It does **not** apply to *in-flight continuation* — child spawn, detached child spawn, continue-as-new, and workflow-level retry (#523) all keep `Defer`, matching how the #618 admission gates and #607 throttles treat those paths. (Letting a retry supersede would invert latest-wins: a retry of an *older* run would cancel the newer one that replaced it.)
+**Where it applies.**
+
+| Start path | Resolves the declared strategy? | Why |
+|---|---|---|
+| Plain HTTP start, `signal-with-start`, `update-with-start`, operator re-run, trigger-now, scheduler tick, completion-trigger (inline + cross-shard relay), typed client stub, transactional start | **Yes** | Genuine admissions — a new run enters the key's population |
+| Deferred debounce / throttle / event-batch fire | **Yes** (carried on `DebounceStartOptions`, resolved at admission and replayed at fire) | Same admission, just deferred |
+| Child spawn, detached child spawn, continue-as-new, reset fork | **No** (`StartWorkflowParams` is never constructed) | In-flight continuation, not an admission |
+| Workflow-level retry (#523) | **No** — explicit `Defer` | Letting a retry supersede would invert latest-wins: a retry of an *older* run would cancel the newer one that replaced it |
+| Schedule **backfill**, outbox relay, Vantage manual trigger, plugin bootstrap | **No** — explicit `Defer` | These pass `concurrency_key: None`, so `on_conflict` is inert. Matches #247, which never applied per-key concurrency on those paths — a backfill deliberately materialises historical slots and must not cancel live work |
+
+This mirrors how the #618 admission gates and #607 throttles treat the same paths.
+
+**Interaction notes.**
+
+- **`ctx.mutex` (#691)** — combining `cancel_running` with the durable mutex on the same terminal path can produce a Postgres-detected lock-ordering cycle (`40P01`) on the *start*. It aborts atomically and is safe to retry; it is a liveness hazard, not a correctness one. See `docs/sharding.md` for the full note.
+- **Population** — the superseded set is *non-terminal runs* (`RUNNING`/`PAUSED` execution rows), which is a superset of what the #247 claim gate counts (`RUNNING` task rows with a live worker). A paused run, or one still deferred at the claim gate, occupies no dispatch slot yet is still superseded — that is the intended "at most `limit` non-terminal runs per key" reading.
 
 **Observability.** Each supersede increments `harvest.concurrency.superseded{workflow}` (labelled by the *superseded* run's type; the concurrency key is deliberately not a label — unbounded tenant input). A superseded run also increments the ordinary `harvest.workflow.terminal{outcome="cancelled"}`; the new counter isolates the supersede subset. `GET /admin/concurrency` reports each key's live counters plus a `workflows` array naming the type(s) on it and the effective `on_conflict` each declares.
+
+**Source-visible change.** Five `pub` functions in `execution.rs` — `start_or_load_workflow_execution_collect`, `start_or_load_workflow_execution_idempotent`, `signal_with_start_workflow_execution_with_metrics`, `rerun_workflow_execution`, `update_with_start_workflow_execution_with_metrics` — changed their 4th tuple element from `Vec<(String, String)>` to `Vec<StartCancelledRun>` (a struct carrying `workflow_name`/`queue_name` plus a `superseded: bool` discriminator). A downstream caller that binds or iterates that element must adapt. The wrapper functions most callers use (`start_or_load_workflow_execution`, `..._with_metrics`) are unchanged.
 
 **Out of scope** (per the issue): a hard `Terminate`/force-fail supersede, cross-shard latest-wins, trigger-layer debounce (that is #499), "keep oldest, reject newest", and per-activity latest-wins.
 

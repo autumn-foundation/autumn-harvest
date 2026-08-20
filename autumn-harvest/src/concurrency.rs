@@ -21,7 +21,7 @@
 //! # Overflow strategy (issue #811)
 //!
 //! By default an over-limit start is *deferred*: the task row is enqueued and
-//! simply waits for a slot at claim time. [`ConcurrencyOnConflict::CancelRunning`]
+//! simply waits for a slot at claim time. [`crate::concurrency::ConcurrencyOnConflict::CancelRunning`]
 //! flips that to *latest-wins* — the newest admitted run supersedes the oldest
 //! in-flight run(s) for the same key, using the ordinary cooperative
 //! cancellation path (no new event variant, no migration).
@@ -57,8 +57,14 @@ pub enum ConcurrencyOnConflict {
 }
 
 impl ConcurrencyOnConflict {
-    /// Stable wire/label spelling (`snake_case`), used by the macro attribute,
-    /// the HTTP surface, and `GET /admin/concurrency`.
+    /// Stable wire spelling (`snake_case`), identical to what the serde
+    /// `rename_all` derive emits (pinned by `on_conflict_serde_round_trip_is_snake_case`).
+    ///
+    /// Paired with [`Self::parse`] as the string round-trip for any surface that
+    /// carries the strategy as text. Neither is on a production path today: the
+    /// `#[workflow]` macro validates the attribute in the proc-macro crate (which
+    /// cannot depend on this type), and `GET /admin/concurrency` serialises via
+    /// serde. They exist so a future HTTP/CLI surface has one canonical spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -67,9 +73,9 @@ impl ConcurrencyOnConflict {
         }
     }
 
-    /// Parse a wire/attribute spelling. Trim- and case-tolerant so an
-    /// operator-supplied HTTP body value works; unknown values return `None`
-    /// (never a silent fallback to `Defer`).
+    /// Parse a wire spelling. Trim- and case-tolerant so an operator-supplied
+    /// value works; unknown values return `None` (never a silent fallback to
+    /// `Defer`). See [`Self::as_str`] for why this has no production caller yet.
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -231,13 +237,35 @@ pub struct SupersedeOutcome {
 ///
 /// Uses the SAME `hashtext(key)::bigint` namespace the claim-time concurrency
 /// gate uses (`queue::claim_task`'s `pg_try_advisory_xact_lock`), so a supersede
-/// pass and a claim never interleave for the same key. Deadlock-free by
-/// construction: the claim side uses the NON-blocking `pg_try_advisory_xact_lock`
-/// and simply skips the row when it cannot take the lock, so it never waits on
-/// us while holding row locks we need.
+/// pass and a claim never interleave for the same key.
 ///
 /// Taken ONLY on the `CancelRunning` path, so `Defer` starts are byte-for-byte
 /// unchanged (zero extra statements).
+///
+/// # Lock-ordering scope (what is and is NOT guaranteed)
+///
+/// **Against `queue::claim_task`: deadlock-free by construction.** The claim side
+/// uses the NON-blocking `pg_try_advisory_xact_lock` and simply skips the row when
+/// it cannot take the lock, so it never waits on us while holding row locks we need.
+///
+/// **Against the durable-mutex lock (issue #691): a lock-ordering inversion is
+/// possible.** Postgres's one-argument advisory locks share a single 64-bit space,
+/// and `mutex::lock_mutex_key` takes a *blocking* `pg_advisory_xact_lock(hashtext(..))`
+/// in that same space. Two orders exist and they are inverted:
+///
+/// * *mutex-key then concurrency-key* — a mutex holder reaching a terminal state
+///   runs `mutex::sweep_terminal_holder_and_wake` (holding the mutex lock to commit)
+///   and its completion trigger then starts a `cancel_running` workflow.
+/// * *concurrency-key then mutex-key* — this function, holding the concurrency lock
+///   while cancelling an incumbent that itself holds a mutex.
+///
+/// If both happen concurrently Postgres detects the cycle and aborts one side with
+/// SQLSTATE `40P01`, surfacing as [`crate::error::HarvestError::Database`]. The
+/// aborted transaction rolls back atomically — no partial supersede, no orphaned
+/// cancellation — and the start is safe to retry. It is a liveness hazard, not a
+/// correctness one. Reaching it requires a workflow that *both* declares
+/// `on_conflict = "cancel_running"` *and* participates in `ctx.mutex` on the same
+/// terminal path; see `docs/sharding.md` for the operator note.
 #[cfg(feature = "db")]
 async fn lock_concurrency_key(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -263,12 +291,31 @@ async fn lock_concurrency_key(
 ///
 /// `SUSPENDED` is deliberately absent: it is not a persisted state (the state
 /// CHECK constraint forbids it), so `RUNNING`/`PAUSED` is the complete active set.
+///
+/// # Population note (differs from the claim-time gate)
+///
+/// This counts non-terminal *execution rows*; the #247 claim gate
+/// (`queue::claim_task`) counts *task rows* that are `RUNNING` with a non-null
+/// `worker_id`. So a `PAUSED` run — or one whose workflow task is still deferred
+/// at the claim gate — occupies no claim-time slot yet still counts here, and can
+/// therefore be superseded. That is deliberate: latest-wins enforces "at most N
+/// **non-terminal runs** per key, newest wins", which is the operator-visible
+/// population, not the momentary dispatch occupancy.
+///
+/// # Bounded fetch
+///
+/// `fetch_cap` bounds the result set. The caller only needs enough rows to compute
+/// `supersede_count(len, limit).min(SUPERSEDE_SCAN_LIMIT)`, which saturates once
+/// `len >= limit + SUPERSEDE_SCAN_LIMIT` — so a key with a large backlog never
+/// materialises the whole backlog while holding the advisory lock.
 #[cfg(feature = "db")]
 async fn active_runs_for_key(
     conn: &mut diesel_async::AsyncPgConnection,
     workflow_name: &str,
     concurrency_key: &str,
     self_exec_id: crate::types::ExecutionId,
+    exclude: &[crate::types::ExecutionId],
+    fetch_cap: i64,
 ) -> crate::error::HarvestResult<Vec<SupersededRun>> {
     use diesel_async::RunQueryDsl;
 
@@ -282,23 +329,29 @@ async fn active_runs_for_key(
         queue_name: String,
     }
 
+    let mut excluded: Vec<uuid::Uuid> = Vec::with_capacity(exclude.len() + 1);
+    excluded.push(self_exec_id.as_uuid());
+    excluded.extend(exclude.iter().map(crate::types::ExecutionId::as_uuid));
+
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT e.id, e.workflow_name, e.queue_name \
          FROM harvest_workflow_executions e \
          WHERE e.workflow_name = $1 \
            AND e.state IN ('RUNNING', 'PAUSED') \
-           AND e.id <> $2 \
+           AND e.id <> ALL($2) \
            AND EXISTS ( \
                SELECT 1 FROM harvest_task_queue t \
                WHERE t.workflow_exec_id = e.id \
                  AND t.task_type = 'workflow' \
                  AND t.concurrency_key = $3 \
            ) \
-         ORDER BY e.started_at ASC, e.id ASC",
+         ORDER BY e.started_at ASC, e.id ASC \
+         LIMIT $4",
     )
     .bind::<diesel::sql_types::Text, _>(workflow_name)
-    .bind::<diesel::sql_types::Uuid, _>(self_exec_id.as_uuid())
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(excluded)
     .bind::<diesel::sql_types::Text, _>(concurrency_key)
+    .bind::<diesel::sql_types::BigInt, _>(fetch_cap)
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -315,6 +368,37 @@ async fn active_runs_for_key(
 
 /// Cancellation reason recorded on a superseded run.
 pub const SUPERSEDE_CANCEL_REASON: &str = "superseded by a newer run for the same concurrency key";
+
+/// `true` when a [`crate::error::HarvestError::Config`] raised by a cancel is the
+/// benign "candidate reached a terminal state between the scan and the cancel"
+/// race, rather than a genuine fault.
+///
+/// `Config` is a general-purpose variant, so matching it wholesale would also
+/// swallow real faults reachable from inside `cancel_workflow_execution_collect`
+/// (a malformed `parent_close_policy` column, a completion-trigger start rejected
+/// by an admission gate). Those must stay visible — silently skipping one leaves
+/// the key over its declared limit with no diagnostic.
+#[must_use]
+pub fn is_already_terminal_cancel_race(message: &str) -> bool {
+    message.contains("is already terminal (") || message.contains("is no longer running")
+}
+
+#[cfg(feature = "db")]
+tokio::task_local! {
+    /// Execution ids whose start transaction is still open on this task.
+    ///
+    /// A cancellation performed by [`supersede_running_for_key`] runs the superseded
+    /// run's terminal chokepoint, which can start a completion-trigger target
+    /// **in the same transaction** — and that nested start may itself supersede.
+    /// Because the outer admission's row is already inserted (uncommitted but
+    /// visible within the transaction) and carries the same concurrency key, a
+    /// nested pass with a different `self_exec_id` would otherwise treat it as a
+    /// candidate and cancel the very run the outer start is reporting as created.
+    ///
+    /// Each pass scopes its own id (plus everything it inherited) for the duration
+    /// of its cancellations, and every nested scan excludes the whole set.
+    static ADMITTING: Vec<crate::types::ExecutionId>;
+}
 
 /// Latest-wins: cancel the OLDEST in-flight runs for `(workflow_name, key)` until
 /// the post-admission population respects `limit` (issue #811).
@@ -348,10 +432,51 @@ pub async fn supersede_running_for_key(
     limit: u32,
     self_exec_id: crate::types::ExecutionId,
 ) -> crate::error::HarvestResult<SupersedeOutcome> {
+    let inherited: Vec<crate::types::ExecutionId> =
+        ADMITTING.try_with(Clone::clone).unwrap_or_default();
+    let mut protected = inherited.clone();
+    protected.push(self_exec_id);
+
+    ADMITTING
+        .scope(
+            protected,
+            supersede_inner(
+                conn,
+                workflow_name,
+                concurrency_key,
+                limit,
+                self_exec_id,
+                inherited,
+            ),
+        )
+        .await
+}
+
+#[cfg(feature = "db")]
+async fn supersede_inner(
+    conn: &mut diesel_async::AsyncPgConnection,
+    workflow_name: &str,
+    concurrency_key: &str,
+    limit: u32,
+    self_exec_id: crate::types::ExecutionId,
+    inherited: Vec<crate::types::ExecutionId>,
+) -> crate::error::HarvestResult<SupersedeOutcome> {
     lock_concurrency_key(conn, concurrency_key).await?;
 
-    let candidates =
-        active_runs_for_key(conn, workflow_name, concurrency_key, self_exec_id).await?;
+    // Enough rows to compute the (clamped) shed count exactly -- see
+    // `active_runs_for_key`'s "Bounded fetch" note. Saturating so a pathological
+    // `limit` can never overflow the bind.
+    let fetch_cap =
+        i64::from(limit).saturating_add(i64::try_from(SUPERSEDE_SCAN_LIMIT).unwrap_or(i64::MAX));
+    let candidates = active_runs_for_key(
+        conn,
+        workflow_name,
+        concurrency_key,
+        self_exec_id,
+        &inherited,
+        fetch_cap,
+    )
+    .await?;
     let shed = supersede_count(candidates.len(), limit).min(SUPERSEDE_SCAN_LIMIT);
     if shed == 0 {
         return Ok(SupersedeOutcome::default());
@@ -372,9 +497,23 @@ pub async fn supersede_running_for_key(
                 // cancel (it finished on its own, or an operator cancelled it).
                 // The goal -- "not running" -- is already met, so this is a skip,
                 // never a failed admission.
-                Err(
-                    crate::error::HarvestError::NotFound(_) | crate::error::HarvestError::Config(_),
-                ) => {
+                Err(crate::error::HarvestError::NotFound(_)) => continue,
+                Err(crate::error::HarvestError::Config(msg)) => {
+                    if !is_already_terminal_cancel_race(&msg) {
+                        // Not the benign race: a genuine fault inside the cancel.
+                        // Skipping keeps one corrupt neighbour from wedging every
+                        // future admission for this key, but it must never be
+                        // silent -- the key stays over its limit until next time.
+                        tracing::warn!(
+                            candidate = %candidate.exec_id,
+                            workflow = %workflow_name,
+                            concurrency_key = %concurrency_key,
+                            error = %msg,
+                            "harvest: latest-wins supersede skipped a candidate on an \
+                             unexpected error; the key may remain over its declared limit \
+                             until the next admission",
+                        );
+                    }
                     continue;
                 }
                 Err(e) => return Err(e),

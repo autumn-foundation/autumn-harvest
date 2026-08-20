@@ -225,7 +225,7 @@ async fn start_workflow(database_url: &str, workflow_id: &str) -> ExecutionId {
             inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
-            concurrency_on_conflict: Default::default(),
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,

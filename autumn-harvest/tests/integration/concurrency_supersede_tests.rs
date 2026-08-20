@@ -45,7 +45,9 @@ use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::{
     ExecutionId, ShardId, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
+use autumn_harvest::worker::DbPool;
 use diesel::sql_types::{Text, Uuid as SqlUuid};
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -184,8 +186,24 @@ async fn start_run(
     limit: u32,
     on_conflict: ConcurrencyOnConflict,
 ) -> ExecutionId {
+    start_run_full(conn, metrics, wf, wf_id, key, limit, on_conflict)
+        .await
+        .0
+}
+
+/// Same as [`start_run`] but also reports whether the start CREATED a fresh
+/// execution (`true`) or ATTACHED to an existing one (`false`).
+async fn start_run_full(
+    conn: &mut AsyncPgConnection,
+    metrics: &CapturingMetrics,
+    wf: &str,
+    wf_id: &str,
+    key: &str,
+    limit: u32,
+    on_conflict: ConcurrencyOnConflict,
+) -> (ExecutionId, bool) {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
-    start_or_load_workflow_execution_with_metrics(
+    let started = start_or_load_workflow_execution_with_metrics(
         conn,
         params(wf, wf_id, exec_id, key, limit, on_conflict),
         Some(metrics),
@@ -193,7 +211,18 @@ async fn start_run(
     )
     .await
     .expect("start must succeed");
-    exec_id
+    (
+        ExecutionId::from_uuid(started.exec_id.as_uuid()),
+        started.created,
+    )
+}
+
+fn build_pool(url: &str) -> DbPool {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    deadpool::managed::Pool::builder(manager)
+        .max_size(12)
+        .build()
+        .expect("build pool")
 }
 
 async fn state_of(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String {
@@ -210,8 +239,7 @@ async fn state_of(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String 
             .expect("load state");
     rows.into_iter()
         .next()
-        .map(|r| r.state)
-        .unwrap_or_else(|| panic!("execution {exec_id} must exist"))
+        .map_or_else(|| panic!("execution {exec_id} must exist"), |r| r.state)
 }
 
 async fn non_terminal_count(conn: &mut AsyncPgConnection, wf: &str) -> i64 {
@@ -246,6 +274,46 @@ async fn cancelled_event_count(conn: &mut AsyncPgConnection, exec_id: ExecutionI
     .await
     .expect("count events");
     rows[0].n
+}
+
+/// State of an execution's `task_type = 'workflow'` queue row, if any.
+async fn workflow_task_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Option<String> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Text)]
+        state: String,
+    }
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT state FROM harvest_task_queue \
+         WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+    )
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .load(conn)
+    .await
+    .expect("load task state");
+    rows.into_iter().next().map(|r| r.state)
+}
+
+/// The `reason` recorded on an execution's `WorkflowCancelled` event.
+async fn cancelled_event_reason(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> Option<String> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+        reason: Option<String>,
+    }
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT event_data->'data'->>'reason' AS reason FROM harvest_events \
+         WHERE workflow_exec_id = $1 AND event_data->>'type' = 'WorkflowCancelled' \
+         ORDER BY id ASC LIMIT 1",
+    )
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .load(conn)
+    .await
+    .expect("load cancel reason");
+    rows.into_iter().next().and_then(|r| r.reason)
 }
 
 // ── AC3: limit = 1 supersedes the incumbent ────────────────────────────────
@@ -568,4 +636,364 @@ async fn success_metric_hundred_rapid_starts_leave_exactly_one_survivor() {
         99,
         "exactly one supersede count per superseded run"
     );
+
+    // The survivor must be able to actually RUN. A supersede pass that failed
+    // (or that cancelled the survivor's OWN task row) would leave the execution
+    // row `RUNNING` forever while the run hangs -- and every assertion above
+    // would still pass. Assert the workflow task is claimable.
+    assert_eq!(
+        workflow_task_state(&mut conn, last).await.as_deref(),
+        Some("PENDING"),
+        "the survivor's workflow task must still be PENDING (claimable)"
+    );
+}
+
+// ── AC6: admission order, NOT wall-clock ───────────────────────────────────
+
+/// The distinguishing half of AC6.
+///
+/// Every other test in this file starts runs strictly sequentially, so
+/// admission order and `started_at` order coincide — an implementation that
+/// resolved the winner purely from wall-clock would pass them all. Here the
+/// incumbent's `started_at` is pushed into the FUTURE before the second run is
+/// admitted, so the two orders disagree: a wall-clock implementation would
+/// keep the "newest" (future-stamped) incumbent and cancel the newcomer.
+/// Latest-wins must still supersede the incumbent, because the newcomer is the
+/// later ADMISSION.
+#[tokio::test]
+async fn later_admitted_run_wins_even_when_its_started_at_is_older() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    let metrics = CapturingMetrics::default();
+    let incumbent = start_run(
+        &mut conn,
+        &metrics,
+        "doc_index",
+        "wall-clock-1",
+        "doc-42",
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+
+    // Make the incumbent look like the NEWEST run by wall clock.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET started_at = NOW() + INTERVAL '1 hour' \
+         WHERE id = $1",
+    )
+    .bind::<SqlUuid, _>(incumbent.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("backdate");
+
+    let newcomer = start_run(
+        &mut conn,
+        &metrics,
+        "doc_index",
+        "wall-clock-2",
+        "doc-42",
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+
+    assert_eq!(
+        state_of(&mut conn, incumbent).await,
+        "CANCELLED",
+        "the earlier-ADMITTED run must be superseded even though its started_at is later"
+    );
+    assert_eq!(state_of(&mut conn, newcomer).await, "RUNNING");
+    assert_eq!(non_terminal_count(&mut conn, "doc_index").await, 1);
+    assert_eq!(metrics.superseded.lock().unwrap().len(), 1);
+}
+
+/// AC3's "**in the same shard-local serialized critical section**" + AC6 under
+/// genuine contention: N same-key admissions racing on separate pooled
+/// connections must converge to exactly ONE survivor with zero errors.
+///
+/// The advisory lock in `supersede_running_for_key` is what makes this hold; a
+/// build without it would let two admissions each observe the other as absent
+/// and leave two non-terminal runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_admissions_converge_to_one_survivor() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    {
+        let mut conn = pool.get().await.expect("pool conn");
+        scrub(&mut conn).await;
+    }
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    let n = 10usize;
+    let mut handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let pool = pool.clone();
+        let metrics = Arc::clone(&metrics);
+        handles.push(tokio::spawn(async move {
+            let mut conn = pool.get().await.expect("pool conn");
+            start_run(
+                &mut conn,
+                &metrics,
+                "doc_index",
+                &format!("race-{i}"),
+                "contended-key",
+                1,
+                ConcurrencyOnConflict::CancelRunning,
+            )
+            .await
+        }));
+    }
+
+    let mut ids = Vec::with_capacity(n);
+    for h in handles {
+        ids.push(h.await.expect("task join"));
+    }
+
+    let mut conn = pool.get().await.expect("pool conn");
+    assert_eq!(
+        non_terminal_count(&mut conn, "doc_index").await,
+        1,
+        "{n} concurrent same-key admissions must converge to exactly one survivor"
+    );
+
+    let mut cancelled = 0usize;
+    let mut running = 0usize;
+    for id in &ids {
+        match state_of(&mut conn, *id).await.as_str() {
+            "CANCELLED" => cancelled += 1,
+            "RUNNING" => running += 1,
+            other => panic!("unexpected state {other}"),
+        }
+    }
+    assert_eq!(running, 1, "exactly one run survives");
+    assert_eq!(cancelled, n - 1, "every other run is superseded");
+    assert_eq!(
+        metrics.superseded.lock().unwrap().len(),
+        n - 1,
+        "one supersede count per superseded run, even under contention"
+    );
+}
+
+// ── AC3: PAUSED runs are part of the active set ────────────────────────────
+
+/// `PAUSED` is in the candidate scan's active set (`SUSPENDED` is not a
+/// persisted state). Dropping `'PAUSED'` from the scan passes every other test
+/// in this file, so it is asserted directly.
+#[tokio::test]
+async fn paused_incumbent_is_superseded() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    let metrics = CapturingMetrics::default();
+    let incumbent = start_run(
+        &mut conn,
+        &metrics,
+        "doc_index",
+        "paused-1",
+        "doc-paused",
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+
+    autumn_harvest::execution::pause_workflow_execution(
+        &mut conn,
+        incumbent,
+        Some("operator hold"),
+        "tester",
+        &metrics,
+    )
+    .await
+    .expect("pause must succeed");
+    assert_eq!(state_of(&mut conn, incumbent).await, "PAUSED");
+
+    let newcomer = start_run(
+        &mut conn,
+        &metrics,
+        "doc_index",
+        "paused-2",
+        "doc-paused",
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+
+    assert_eq!(
+        state_of(&mut conn, incumbent).await,
+        "CANCELLED",
+        "a PAUSED incumbent is still an active run and must be superseded"
+    );
+    assert_eq!(state_of(&mut conn, newcomer).await, "RUNNING");
+    assert_eq!(metrics.superseded.lock().unwrap().len(), 1);
+}
+
+// ── Attach must never supersede ────────────────────────────────────────────
+
+/// Superseding is gated on `created == true`. An ATTACH admits nothing, so it
+/// must cancel nothing — otherwise a duplicate start would cancel runs on
+/// behalf of an admission that never happened.
+#[tokio::test]
+async fn attach_does_not_supersede() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    let metrics = CapturingMetrics::default();
+    let (first, created_first) = start_run_full(
+        &mut conn,
+        &metrics,
+        "doc_index",
+        "same-wf-id",
+        "doc-attach",
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+    assert!(created_first, "the first start creates a fresh execution");
+
+    // Same workflow_id + AllowDuplicate over a live prior => ATTACH.
+    let (second, created_second) = start_run_full(
+        &mut conn,
+        &metrics,
+        "doc_index",
+        "same-wf-id",
+        "doc-attach",
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+    assert!(!created_second, "the second start must ATTACH, not create");
+    assert_eq!(second, first, "attach returns the existing execution");
+
+    assert_eq!(
+        state_of(&mut conn, first).await,
+        "RUNNING",
+        "an attach must never cancel the run it attached to"
+    );
+    assert!(
+        metrics.superseded.lock().unwrap().is_empty(),
+        "an attach admits nothing, so it supersedes nothing"
+    );
+    assert_eq!(non_terminal_count(&mut conn, "doc_index").await, 1);
+}
+
+// ── The superseded run's cancellation reason ───────────────────────────────
+
+/// `SUPERSEDE_CANCEL_REASON` is the operator's only signal distinguishing a
+/// latest-wins supersede from an ordinary operator cancel.
+#[tokio::test]
+async fn supersede_records_the_supersede_reason() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    let metrics = CapturingMetrics::default();
+    let incumbent = start_run(
+        &mut conn,
+        &metrics,
+        "doc_index",
+        "reason-1",
+        "doc-reason",
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+    let _ = start_run(
+        &mut conn,
+        &metrics,
+        "doc_index",
+        "reason-2",
+        "doc-reason",
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+
+    let reason = cancelled_event_reason(&mut conn, incumbent)
+        .await
+        .expect("a superseded run records a WorkflowCancelled reason");
+    assert!(
+        reason.contains(autumn_harvest::concurrency::SUPERSEDE_CANCEL_REASON),
+        "cancel reason must name the supersede, got: {reason}"
+    );
+}
+
+// ── SUPERSEDE_SCAN_LIMIT clamps one admission's shed count ─────────────────
+
+/// The documented safety bound: one admission never cancels more than
+/// `SUPERSEDE_SCAN_LIMIT` runs; the excess is shed by the NEXT admission, so
+/// the population still converges. Removing the `.min(SUPERSEDE_SCAN_LIMIT)`
+/// clamp (or flipping it to `max`) is undetectable without this.
+#[tokio::test]
+async fn scan_limit_clamps_shed_per_admission_and_still_converges() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    let cap = autumn_harvest::concurrency::SUPERSEDE_SCAN_LIMIT;
+    let backlog = cap + 2;
+
+    // Build the backlog under Defer, which never cancels anything.
+    let metrics = CapturingMetrics::default();
+    for i in 0..backlog {
+        let _ = start_run(
+            &mut conn,
+            &metrics,
+            "doc_index",
+            &format!("backlog-{i}"),
+            "over-cap",
+            1,
+            ConcurrencyOnConflict::Defer,
+        )
+        .await;
+    }
+    assert_eq!(
+        non_terminal_count(&mut conn, "doc_index").await,
+        backlog as i64,
+        "Defer must not cancel anything while the backlog is built"
+    );
+
+    // One latest-wins admission: sheds at most `cap`, leaving
+    // backlog + 1 (self) - cap non-terminal.
+    let _ = start_run(
+        &mut conn,
+        &metrics,
+        "doc_index",
+        "clamped-1",
+        "over-cap",
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+    assert_eq!(
+        metrics.superseded.lock().unwrap().len(),
+        cap,
+        "one admission sheds at most SUPERSEDE_SCAN_LIMIT runs"
+    );
+    assert_eq!(
+        non_terminal_count(&mut conn, "doc_index").await,
+        (backlog + 1 - cap) as i64,
+        "the excess is deliberately left for the next admission"
+    );
+
+    // The next admission finishes the job -- the population converges.
+    let last = start_run(
+        &mut conn,
+        &metrics,
+        "doc_index",
+        "clamped-2",
+        "over-cap",
+        1,
+        ConcurrencyOnConflict::CancelRunning,
+    )
+    .await;
+    assert_eq!(
+        non_terminal_count(&mut conn, "doc_index").await,
+        1,
+        "the population converges on the next admission"
+    );
+    assert_eq!(state_of(&mut conn, last).await, "RUNNING");
 }

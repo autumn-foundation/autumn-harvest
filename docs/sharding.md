@@ -64,7 +64,14 @@ If you need a *global* "only one run per key, newest wins" guarantee in a multi-
 Two further scoping notes:
 
 - **Supersede is scoped to `(workflow_name, concurrency_key)`, not the key alone.** A *different* workflow type that merely resolved the same key string — and never opted in to latest-wins — is never cancelled. This is what makes the feature migration-free: the resolved key lives on `harvest_task_queue`, so no new column on `harvest_workflow_executions` is needed.
-- **A single admission sheds at most `SUPERSEDE_SCAN_LIMIT` (32) runs.** Latest-wins is a per-key fair-share control, not a bulk-cancel tool: one start must never open an unbounded transaction cancelling hundreds of executions. Any excess beyond that is shed by the *next* admission for the same key, so the population still converges.
+- **A single admission sheds at most `SUPERSEDE_SCAN_LIMIT` (32) runs.** Latest-wins is a per-key fair-share control, not a bulk-cancel tool: one start must never open an unbounded transaction cancelling hundreds of executions. Any excess beyond that is shed by the *next* admission for the same key, so the population still converges. The candidate scan itself is bounded to `limit + 32` rows for the same reason, so flipping a long-backlogged `Defer` key to `cancel_running` never materialises the whole backlog while holding the advisory lock.
+- **The superseded population is "non-terminal runs", not "runs currently occupying a dispatch slot".** The claim-time gate (issue #247) counts `RUNNING` *task* rows with a live worker; the supersede scan counts `RUNNING`/`PAUSED` *execution* rows. So a paused run — or one whose workflow task is still deferred at the claim gate — occupies no dispatch slot yet is still superseded. That is the intended reading: latest-wins enforces "at most `limit` **non-terminal runs** per key, newest wins", which is the operator-visible population.
+
+### Operator note: combining `cancel_running` with `ctx.mutex` (issue #691)
+
+Postgres's one-argument advisory locks share a single 64-bit space, and the durable mutex (`ctx.mutex`, issue #691) takes a *blocking* lock in that same space. A latest-wins admission holds its concurrency lock while cancelling an incumbent, and that cancellation runs the incumbent's terminal chokepoint — which can take a mutex lock. The reverse order also exists (a mutex holder reaching a terminal state whose completion trigger starts a `cancel_running` workflow), so the two orders are inverted.
+
+If both happen concurrently Postgres detects the cycle and aborts one side with SQLSTATE `40P01`, surfacing as a database error on the *start*. The aborted transaction rolls back atomically — no partial supersede, no orphaned cancellation — and the start is safe to retry. It is a **liveness** hazard, not a correctness one, and it needs a workflow that both declares `on_conflict = "cancel_running"` and participates in `ctx.mutex` on the same terminal path. If you see `40P01` on such a start, retry it; if it recurs, split the mutex usage out of the latest-wins workflow.
 
 ---
 

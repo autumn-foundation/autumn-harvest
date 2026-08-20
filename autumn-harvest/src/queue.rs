@@ -1116,6 +1116,24 @@ pub struct ConcurrencyKeyWorkflow {
     pub workflow_name: String,
 }
 
+/// SQL for [`concurrency_key_stats`].
+///
+/// Named (rather than inlined) so the drift guard can read BOTH this and
+/// [`CONCURRENCY_ATTRIBUTION_SQL`] and assert they share the same row filter —
+/// checking only one side could not detect drift in the other.
+const CONCURRENCY_STATS_SQL: &str = "SELECT \
+             concurrency_key AS key, \
+             task_type, \
+             MAX(concurrency_cap)::INT4 AS max_concurrent, \
+             COUNT(*) FILTER (WHERE state = 'RUNNING' AND worker_id IS NOT NULL) AS in_flight, \
+             COUNT(*) FILTER (WHERE state = 'PENDING') AS pending \
+         FROM harvest_task_queue \
+         WHERE concurrency_key IS NOT NULL \
+           AND concurrency_cap IS NOT NULL \
+           AND queue_name = ANY($1) \
+           AND (state = 'PENDING' OR (state = 'RUNNING' AND worker_id IS NOT NULL)) \
+         GROUP BY concurrency_key, task_type";
+
 /// Return live concurrency stats for all keys visible in the given queues.
 ///
 /// Only rows where `concurrency_key IS NOT NULL` contribute. Results are
@@ -1142,24 +1160,11 @@ pub async fn concurrency_key_stats(
         pending: i64,
     }
 
-    let rows: Vec<Row> = diesel::sql_query(
-        "SELECT \
-             concurrency_key AS key, \
-             task_type, \
-             MAX(concurrency_cap)::INT4 AS max_concurrent, \
-             COUNT(*) FILTER (WHERE state = 'RUNNING' AND worker_id IS NOT NULL) AS in_flight, \
-             COUNT(*) FILTER (WHERE state = 'PENDING') AS pending \
-         FROM harvest_task_queue \
-         WHERE concurrency_key IS NOT NULL \
-           AND concurrency_cap IS NOT NULL \
-           AND queue_name = ANY($1) \
-           AND (state = 'PENDING' OR (state = 'RUNNING' AND worker_id IS NOT NULL)) \
-         GROUP BY concurrency_key, task_type",
-    )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-    .load(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+    let rows: Vec<Row> = diesel::sql_query(CONCURRENCY_STATS_SQL)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
 
     Ok(rows
         .into_iter()
@@ -1232,10 +1237,6 @@ const CONCURRENCY_ATTRIBUTION_SQL: &str = "SELECT \
            AND t.queue_name = ANY($1) \
            AND (t.state = 'PENDING' OR (t.state = 'RUNNING' AND t.worker_id IS NOT NULL)) \
          GROUP BY t.concurrency_key, t.task_type, e.workflow_name";
-
-/// Test probe: the attribution SQL, exposed so the drift guard can read it.
-#[cfg(test)]
-const CONCURRENCY_ATTRIBUTION_PREDICATE_PROBE: &str = CONCURRENCY_ATTRIBUTION_SQL;
 
 /// Mark a task as completed with the given output.
 ///
@@ -4048,21 +4049,42 @@ mod tests {
     /// are separate `sql_query` strings that can silently drift.
     #[test]
     fn concurrency_attribution_query_matches_the_stats_row_filter() {
-        // Both queries are private string literals; assert on the shared
-        // predicate fragments rather than the whole statement so formatting
-        // changes do not make this brittle.
+        // The two are separate `sql_query` string literals, so they are free to
+        // drift. Assert the shared predicate fragments are present in BOTH --
+        // checking only the attribution side would pass even if the STATS side
+        // changed, which is exactly the drift this guard exists to catch.
+        //
+        // The attribution query aliases `harvest_task_queue` as `t` (it joins
+        // the executions table), so strip that alias before comparing; the
+        // predicates are otherwise character-identical. Fragment-level rather
+        // than whole-statement so reformatting is not brittle.
+        let stats = CONCURRENCY_STATS_SQL.replace("t.", "");
+        let attribution = CONCURRENCY_ATTRIBUTION_SQL.replace("t.", "");
         for fragment in [
             "concurrency_key IS NOT NULL",
             "concurrency_cap IS NOT NULL",
-            "state = 'PENDING'",
-            "state = 'RUNNING'",
-            "worker_id IS NOT NULL",
+            "queue_name = ANY($1)",
+            "(state = 'PENDING' OR (state = 'RUNNING' AND worker_id IS NOT NULL))",
         ] {
             assert!(
-                CONCURRENCY_ATTRIBUTION_PREDICATE_PROBE.contains(fragment),
+                stats.contains(fragment),
+                "stats query must contain the shared row-filter fragment `{fragment}`"
+            );
+            assert!(
+                attribution.contains(fragment),
                 "attribution query must share the stats row filter fragment `{fragment}`"
             );
         }
+
+        // Both must group by the same key dimensions, or a key could report a
+        // workflow it has no live task for (or omit the one it does). The
+        // attribution query adds `workflow_name` (that is the whole point), so
+        // assert the shared prefix rather than equality.
+        assert!(stats.contains("GROUP BY concurrency_key, task_type"));
+        assert!(
+            attribution.contains("GROUP BY concurrency_key, task_type, e.workflow_name"),
+            "attribution groups by the same (key, task_type) dimensions, plus workflow_name"
+        );
     }
 
     // ── Issue #774: queue coverage — pending-demand query ───────────────────
