@@ -707,7 +707,12 @@ By default (or when `wait=completed`), this endpoint admits the update and then 
 GET /workflows/{id}/update/{update_id}/result
 ```
 
-Looks up the result of an admitted update. Returns:
+Looks up the result of an admitted update. The read follows the workflow-level
+retry chain (#523): because an `update_id` is minted per admission and lives on
+exactly one attempt, it searches the chain (deepest attempt first) for the
+attempt whose history carries the admission — so a result that resolved on an
+earlier attempt stays readable after that attempt fails and a retry starts. See
+[the logical-handle contract](logical-handle.md). Returns:
 - `200 OK` with the JSON output if completed successfully.
 - `409 Conflict` with the failure error string if failed.
 - `202 Accepted` if the update is still in-flight.

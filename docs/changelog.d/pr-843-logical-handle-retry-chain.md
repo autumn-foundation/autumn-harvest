@@ -190,3 +190,40 @@ chain-independent controls (the fixture sanity check, the no-chain no-op guard, 
 the two mailbox-forwarding tests, which exercise the worker/helper rather than
 resolution). Both suites registered in `.github/ci/integration-suites.txt` and
 executed green against a real local Postgres 16.
+
+**Post-review hardening (Codex round 1, two P2s):** (1) **The update-result read now
+searches the chain, not just the live attempt.** An `update_id` is minted per
+admission and therefore lives on exactly *one* attempt, so resolving
+`GET /workflows/{id}/update/{update_id}/result` straight to the live attempt made a
+result that *had already resolved* on attempt *N* permanently inaccessible once *N*
+failed and *N+1* started — the durable `UpdateAdmitted`/`UpdateCompleted` pair stays
+on *N* while *N+1* replays an empty history, so the read 404'd forever. The route now
+walks the chain and returns the attempt whose history actually carries the admission,
+deepest first (the live attempt is the common case, and a workflow that never retried
+has a one-element chain — exactly the single history load this read always performed).
+The `wait=completed` admit path is unaffected: it already polls the attempt it
+admitted onto. The narrower known limitation stands and is re-scoped in the docs — an
+admitted-but-*unresolved* update still does not survive a retry, because nothing will
+ever run it. New `update_result_route_finds_a_result_left_on_an_earlier_attempt`
+(plugin suite, now 10 tests). (2) **A retry chain deeper than the walk bound now fails
+closed.** `RETRY_CHAIN_MAX_DEPTH` (256) is a defensive backstop, not an enforced
+invariant — `RetryPolicy` takes an arbitrary `u32` `max_attempts` and the builder's
+`max_workflow_attempts` ceiling is optional — so exhausting the walk previously
+`warn!`ed and returned the deepest row reached, which may itself be `FAILED` with a
+live successor beyond the bound: every routed signal / cancel / terminate / query /
+update / result would then silently target a stale attempt, the exact bug this
+contract exists to fix. `resolve_live_attempt` now returns `HarvestError::Config`
+(and logs `tracing::error!`) instead. The walk was refactored into a shared
+`walk_retry_chain` (returning every attempt in walk order) with `resolve_live_attempt`
+taking its last element and the new `retry_chain_ids` feeding fix (1) — zero extra row
+loads, since the walk already had to load each intermediate row to read its `state`.
+New `a_chain_deeper_than_the_walk_bound_fails_closed` (core suite, now 16 tests) seeds
+a chain of `RETRY_CHAIN_MAX_DEPTH + 2` links whose deepest attempt is genuinely
+`RUNNING`, so the pre-fix behaviour is falsified directly.
+
+**Inherited-lint heal (unrelated to #843, separate commit).** The CI runner's clippy
+moved to 1.98.0, which added `clippy::map_or_identity` and widened
+`clippy::missing_const_for_fn`; seven pre-existing violations in `timeout.rs` (3) and
+`det_check.rs` (4) — neither file touched by this PR — turned the shared `Lint` job red
+on every branch. Healed in place (`map_or(x, |d| d)` → `unwrap_or(x)`; four helpers
+made `const fn`), following the repo's existing inherited-lint-heal precedent.

@@ -622,6 +622,97 @@ async fn update_result_route_reads_the_live_retry_attempt() {
     );
 }
 
+/// Codex review (PR #1200): resolving the update-result read *straight to the
+/// live attempt* is not enough. An `update_id` is minted per admission, so it
+/// lives on exactly ONE attempt. When an update is admitted (and completed) on
+/// attempt N and N then fails and schedules N+1, the durable
+/// `UpdateAdmitted`/`UpdateCompleted` pair stays on N while N+1 replays an
+/// empty history — so a live-attempt-only resolve would 404 forever and make a
+/// durable, already-computed result permanently inaccessible.
+#[tokio::test]
+async fn update_result_route_finds_a_result_left_on_an_earlier_attempt() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // Attempt 1 is live, so the admission lands on it directly (no chain yet).
+    let first = seed_execution(&pool, "RUNNING", "attempt-1", None).await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{first}/update/set_priority?wait=admitted"),
+        json!({ "input": { "priority": "high" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body={body}");
+    let update_id_str = body["update_id"]
+        .as_str()
+        .expect("the admitted ack must carry an update_id")
+        .to_string();
+    let update_id: autumn_harvest::types::UpdateId =
+        update_id_str.parse().expect("parse update id");
+
+    // The handler completes on attempt 1: the result is now durable there.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        let history = store::load_history(&mut conn, first)
+            .await
+            .expect("load attempt-1 history");
+        store::append_events(
+            &mut conn,
+            first,
+            &[WorkflowEvent::UpdateCompleted {
+                update_id,
+                output: json!({ "applied": "high" }),
+            }],
+            history.next_event_id,
+        )
+        .await
+        .expect("append UpdateCompleted");
+    }
+
+    // ...and only THEN does attempt 1 fail and schedule attempt 2.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "UPDATE harvest_workflow_executions \
+             SET state = 'FAILED', completed_at = NOW() WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(first.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seal attempt 1 FAILED");
+    }
+    let second = seed_execution(&pool, "RUNNING", "attempt-2", Some(first)).await;
+
+    // The read must locate the attempt that actually carries the admission.
+    let (status, body) = get(
+        &app,
+        &format!("/workflows/{first}/update/{update_id_str}/result"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an update completed on an earlier attempt must stay readable after the \
+         chain advances, not 404 against the empty live attempt: {body}"
+    );
+    assert_eq!(body["output"], json!({ "applied": "high" }), "body={body}");
+
+    // Sanity: the live attempt genuinely never held the admission, so the read
+    // above could only have succeeded by searching the chain.
+    let mut conn = pool.get().await.expect("pooled conn");
+    let live = store::load_history(&mut conn, second)
+        .await
+        .expect("load live history");
+    assert!(
+        !live
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::UpdateAdmitted { .. })),
+        "the live attempt must have an empty (retry-fresh) history"
+    );
+}
+
 #[tokio::test]
 async fn describe_route_still_reads_the_addressed_execution() {
     let (url, _c) = setup().await;

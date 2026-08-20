@@ -2445,8 +2445,17 @@ pub async fn cancel_workflow_execution(
 ///
 /// A cycle is impossible by construction — every retry is inserted with a fresh
 /// `exec_id` — so this is a defensive backstop, not a correctness dependency.
-/// It is far above any realistic `max_attempts` (which the builder ceiling
-/// clamps well below it).
+/// It sits far above any realistic `max_attempts` for *workflow-level* retry,
+/// where each attempt is a whole fresh execution.
+///
+/// The bound is **not** an enforced invariant: [`crate::policy::RetryPolicy`]
+/// accepts an arbitrary `u32` `max_attempts` and the builder's
+/// `max_workflow_attempts` ceiling is optional, so a chain deeper than this is
+/// expressible. Exhausting the walk is therefore treated as a pathological
+/// chain and **fails closed** with [`HarvestError::Config`] rather than
+/// returning the deepest row reached: that row may itself be `FAILED` with a
+/// live successor beyond the bound, and returning it would silently route every
+/// routed operation to a stale attempt — the exact bug issue #843 fixes.
 pub const RETRY_CHAIN_MAX_DEPTH: usize = 256;
 
 /// Bound on how many times a mutating operation is re-driven when the retry
@@ -2480,16 +2489,49 @@ pub const RETRY_CHAIN_MAX_REDRIVES: usize = RETRY_CHAIN_MAX_DEPTH;
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::NotFound`] when `exec_id` does not exist and
-/// [`HarvestError::Database`] for query failures.
+/// Returns [`HarvestError::NotFound`] when `exec_id` does not exist,
+/// [`HarvestError::Database`] for query failures, and
+/// [`HarvestError::Config`] when the chain exceeds [`RETRY_CHAIN_MAX_DEPTH`]
+/// (fail-closed — see that constant).
 pub async fn resolve_live_attempt(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<WorkflowExecution> {
-    let mut execution = load_execution_row(conn, exec_id).await?;
+    let mut chain = walk_retry_chain(conn, exec_id).await?;
+    Ok(chain
+        .pop()
+        .expect("walk_retry_chain always returns at least the addressed row"))
+}
+
+/// Walk the workflow-level retry chain (issue #523) from `exec_id` and return
+/// every attempt in walk order: `exec_id` itself at index 0, the live attempt
+/// last. A workflow that never retried yields a one-element vector.
+///
+/// This is the shared primitive behind [`resolve_live_attempt`] (which takes
+/// the last element) and [`retry_chain_ids`]. It costs exactly the same number
+/// of row loads the plain resolve already performed — the walk had to load
+/// every intermediate row anyway to read its `state`.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::NotFound`] when `exec_id` does not exist,
+/// [`HarvestError::Database`] for query failures, and
+/// [`HarvestError::Config`] when the chain exceeds [`RETRY_CHAIN_MAX_DEPTH`]
+/// (see the fail-closed rationale on that constant).
+pub async fn walk_retry_chain(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Vec<WorkflowExecution>> {
+    let mut chain = vec![load_execution_row(conn, exec_id).await?];
     for _ in 0..RETRY_CHAIN_MAX_DEPTH {
-        if execution.state != "FAILED" {
-            return Ok(execution);
+        let (current_id, current_failed) = {
+            let current = chain
+                .last()
+                .expect("the chain is seeded with the addressed row");
+            (current.id, current.state == "FAILED")
+        };
+        if !current_failed {
+            return Ok(chain);
         }
         // Exactly one successor can exist: `update_workflow_execution_failed`
         // filters `state = 'RUNNING'`, so only one transaction can seal a row
@@ -2498,7 +2540,7 @@ pub async fn resolve_live_attempt(
         // the two resolutions of a re-drive loop) even if that invariant were
         // ever broken, rather than picking arbitrarily and oscillating.
         let next: Option<Uuid> = harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(execution.id)))
+            .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(current_id)))
             .order((
                 harvest_workflow_executions::started_at.asc(),
                 harvest_workflow_executions::id.asc(),
@@ -2508,24 +2550,47 @@ pub async fn resolve_live_attempt(
             .await
             .optional()
             .map_err(database_error)?;
-        match next {
-            Some(next_id) => {
-                execution = load_execution_row(conn, ExecutionId::from_uuid(next_id)).await?;
-            }
-            None => return Ok(execution),
-        }
+        let Some(next_id) = next else {
+            return Ok(chain);
+        };
+        chain.push(load_execution_row(conn, ExecutionId::from_uuid(next_id)).await?);
     }
-    // Unreachable for any real chain (`max_workflow_attempts` is far below the
-    // bound), so exhausting it means a pathological / corrupted chain. Returning
-    // the deepest row we reached is the safe answer, but it may not be the live
-    // attempt — say so rather than silently reintroducing the bug #843 fixes.
-    tracing::warn!(
+    // Unreachable for any real chain (see `RETRY_CHAIN_MAX_DEPTH`). Reaching it
+    // means the chain is pathological — a cycle, or a `max_attempts` far above
+    // the bound. FAIL CLOSED: the deepest row reached may itself be `FAILED`
+    // with a live successor beyond the bound, so returning it would silently
+    // route every signal / cancel / terminate / query / update / result to a
+    // stale attempt — exactly the bug issue #843 exists to fix. An operator
+    // seeing this error has a corrupted chain (or a `max_attempts` that needs
+    // capping), not a bad request.
+    tracing::error!(
         execution_id = %exec_id,
         max_depth = RETRY_CHAIN_MAX_DEPTH,
-        "harvest: retry chain exceeded the maximum walk depth; \
-         returning the deepest attempt reached, which may not be the live one"
+        "harvest: retry chain exceeded the maximum walk depth; refusing to route \
+         to a possibly-stale attempt"
     );
-    Ok(execution)
+    Err(HarvestError::Config(format!(
+        "retry chain for execution {exec_id} exceeds the maximum walk depth of \
+         {RETRY_CHAIN_MAX_DEPTH}; refusing to route to a possibly-stale attempt"
+    )))
+}
+
+/// [`walk_retry_chain`], returning only the [`ExecutionId`]s.
+///
+/// Ordered `exec_id` first, live attempt last.
+///
+/// # Errors
+///
+/// See [`walk_retry_chain`].
+pub async fn retry_chain_ids(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Vec<ExecutionId>> {
+    Ok(walk_retry_chain(conn, exec_id)
+        .await?
+        .into_iter()
+        .map(|e| ExecutionId::from_uuid(e.id))
+        .collect())
 }
 
 /// [`resolve_live_attempt`], returning only the resolved [`ExecutionId`].

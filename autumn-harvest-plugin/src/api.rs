@@ -41366,27 +41366,38 @@ async fn get_update_result(
 
     // Issue #843: `admit_update` routes admission to the live attempt of the
     // workflow-level retry chain, and its `wait=admitted` 202 carries only the
-    // `update_id` — no execution id. So this paired read MUST resolve the same
-    // way, or the caller's only follow-up would 404 forever against a sealed
-    // predecessor that never carried the `UpdateAdmitted` event.
-    let target = match autumn_harvest::execution::resolve_live_attempt_id(&mut conn, exec_id).await
-    {
-        Ok(t) => t,
+    // `update_id` — no execution id. So this paired read MUST follow the same
+    // chain, or the caller's only follow-up would 404 forever.
+    //
+    // Resolving *straight to the live attempt* is not enough, though. An
+    // `update_id` is minted per admission, so it lives on exactly ONE attempt;
+    // if the update was admitted (and possibly already completed) on attempt N
+    // and N then failed and scheduled N+1, the durable `UpdateAdmitted` /
+    // `UpdateCompleted` pair stays on N while the live attempt N+1 replays an
+    // empty history. So search the CHAIN for the attempt that actually carries
+    // this admission — deepest first, because the live attempt is the common
+    // case (an update admitted moments ago) and a workflow that never retried
+    // has a one-element chain, i.e. exactly today's single history load.
+    let chain = match autumn_harvest::execution::retry_chain_ids(&mut conn, exec_id).await {
+        Ok(c) => c,
         Err(e) => return map_error(e).into_response(),
     };
-
-    let history = match store::load_history(&mut conn, target).await {
-        Ok(h) => h,
-        Err(e) => return map_error(e).into_response(),
-    };
-
-    // Confirm the update was ever admitted.
-    let admitted = history.events.iter().any(
-        |ev| matches!(ev, WorkflowEvent::UpdateAdmitted { update_id: id, .. } if *id == update_id),
-    );
-    if !admitted {
-        return AutumnError::not_found_msg(format!("update {update_id_str}")).into_response();
+    let mut found = None;
+    for candidate in chain.into_iter().rev() {
+        let history = match store::load_history(&mut conn, candidate).await {
+            Ok(h) => h,
+            Err(e) => return map_error(e).into_response(),
+        };
+        if history.events.iter().any(
+            |ev| matches!(ev, WorkflowEvent::UpdateAdmitted { update_id: id, .. } if *id == update_id),
+        ) {
+            found = Some((candidate, history));
+            break;
+        }
     }
+    let Some((target, history)) = found else {
+        return AutumnError::not_found_msg(format!("update {update_id_str}")).into_response();
+    };
 
     let mut terminal_state = get_terminal_workflow_state(&history.events);
     if (terminal_state == Some("CANCELLED") || terminal_state == Some("FAILED"))

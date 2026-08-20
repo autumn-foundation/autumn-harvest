@@ -1153,6 +1153,79 @@ async fn resolve_live_attempt_is_a_noop_without_a_retry_chain() {
     );
 }
 
+/// Codex review (PR #1200): `RETRY_CHAIN_MAX_DEPTH` is a defensive backstop, not
+/// an enforced invariant — `RetryPolicy` accepts an arbitrary `u32`
+/// `max_attempts` and the builder's ceiling is optional, so a chain deeper than
+/// the bound is expressible. Exhausting the walk must FAIL CLOSED: the deepest
+/// row reached may itself be `FAILED` with a live successor beyond the bound, so
+/// returning it would silently route every signal / cancel / terminate / query /
+/// update / result to a stale attempt — the exact bug #843 exists to fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_deeper_than_the_walk_bound_fails_closed() {
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+
+    // Build a chain strictly deeper than the bound, every link `FAILED` so the
+    // walk never short-circuits, and the deepest row `RUNNING` (a live attempt
+    // that the bounded walk provably cannot reach).
+    let depth = autumn_harvest::execution::RETRY_CHAIN_MAX_DEPTH + 2;
+    let mut previous: Option<ExecutionId> = None;
+    let mut head: Option<ExecutionId> = None;
+    for i in 0..depth {
+        let exec_id = ExecutionId::new();
+        let state = if i + 1 == depth { "RUNNING" } else { "FAILED" };
+        diesel::sql_query(
+            "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, shard_id, input, queue_name, state, \
+              retry_of_exec_id, completed_at) \
+             VALUES ($1, 'deep_wf', $2, 0, '{}'::jsonb, 'default', $3, $4, \
+                     CASE WHEN $3 = 'FAILED' THEN NOW() ELSE NULL END)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+        .bind::<diesel::sql_types::Text, _>(state)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(
+            previous.map(|e| e.as_uuid()),
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed deep chain link");
+        head.get_or_insert(exec_id);
+        previous = Some(exec_id);
+    }
+    let head = head.expect("chain is non-empty");
+    let live = previous.expect("chain is non-empty");
+
+    let error = autumn_harvest::execution::resolve_live_attempt_id(&mut conn, head)
+        .await
+        .expect_err("a chain deeper than the walk bound must fail closed, not return a stale row");
+    assert!(
+        matches!(error, autumn_harvest::HarvestError::Config(_)),
+        "expected a Config error naming the depth, got {error:?}"
+    );
+
+    // Falsifier: the live attempt genuinely IS beyond the bound, so the pre-fix
+    // behaviour (return the deepest row reached) would have handed back a
+    // `FAILED` row that still has a live successor.
+    let live_state: String = harvest_workflow_executions::table
+        .find(live.as_uuid())
+        .select(harvest_workflow_executions::state)
+        .first(&mut conn)
+        .await
+        .expect("load live state");
+    assert_eq!(live_state, "RUNNING");
+
+    // A chain *at* the bound still resolves normally — the guard is not a
+    // blanket rejection of deep chains.
+    let shallow = start_workflow(&mut conn, "plain_wf", "deep-guard-001", None).await;
+    assert_eq!(
+        autumn_harvest::execution::resolve_live_attempt_id(&mut conn, shallow)
+            .await
+            .expect("a chain within the bound still resolves"),
+        shallow
+    );
+}
+
 /// The counter helper is used by the chain fixture; assert it is wired so a
 /// silently-broken fixture cannot make the routing tests vacuous.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -127,17 +127,27 @@ define — an update admitted while the retry's task is still delayed is handled
 when that task is claimed, exactly like any admitted update on a parked run.
 
 `GET /workflows/{id}/update/{update_id}/result` — the paired read for a
-`wait=admitted` admission, whose `202` carries only the `update_id` — resolves
-the chain the same way, so the caller's single follow-up id keeps working.
+`wait=admitted` admission, whose `202` carries only the `update_id` — follows the
+same chain, so the caller's single follow-up id keeps working. It does **not**
+resolve straight to the live attempt, though: an `update_id` is minted per
+admission and therefore lives on exactly *one* attempt, so the read searches the
+chain (deepest attempt first, since the live attempt is the common case) for the
+attempt whose history actually carries the `UpdateAdmitted`. That keeps a result
+that *did* resolve on attempt *N* readable after *N* fails and *N+1* starts —
+without it, the durable answer would 404 forever against *N+1*'s empty history.
+A workflow that never retried has a one-element chain, i.e. exactly the single
+history load this read always performed.
 
-**Known limitation — an admitted-but-unresolved update is not carried across a
+**Known limitation — an admitted-but-*unresolved* update is not carried across a
 retry.** Unlike signals (a table), an update lives in the attempt's *history* as
 an `UpdateAdmitted` event, and a retry starts from an empty history. An update
-admitted onto attempt *N* that *N* fails before resolving is therefore lost: the
-poll for its result on attempt *N+1* finds nothing and times out. Re-submit the
-update against the logical handle (it routes to the live attempt). Carrying
-admitted updates across the boundary would need a durable pending-update record
-outside the event log and is tracked separately.
+admitted onto attempt *N* that *N* fails **before the handler resolves** is
+therefore lost: nothing will ever run it, so the chain search finds only an
+unresolved admission and the poll times out. (An update that *did* resolve on
+*N* stays readable — see above.) Re-submit the update against the logical handle
+(it routes to the live attempt). Carrying admitted-but-unresolved updates across
+the boundary would need a durable pending-update record outside the event log and
+is tracked separately.
 
 ### `result_snapshot()` — follows the chain
 
@@ -258,9 +268,16 @@ because an unchanged target ends it — which is what stops a genuine error (an
 unknown id, or an exhausted chain whose final outcome really is `FAILED`) from
 being retried forever. `RETRY_CHAIN_MAX_DEPTH` (256) bounds both the walk and the
 re-drive count so a pathological database state can never spin a request forever.
-Exhausting the walk depth is logged (`tracing::warn!`) rather than silently
-returning a possibly-stale attempt as if it were live — it is unreachable for any
-real chain, so hitting it means a corrupted `retry_of_exec_id` graph.
+The bound is a defensive backstop, **not an enforced invariant**: `RetryPolicy`
+accepts an arbitrary `u32` `max_attempts` and the builder's `max_workflow_attempts`
+ceiling is optional, so a chain deeper than 256 is expressible. Exhausting the walk
+therefore **fails closed** — `resolve_live_attempt` returns
+`HarvestError::Config` (and logs `tracing::error!`) rather than handing back the
+deepest row it reached. That row may itself be `FAILED` with a live successor
+beyond the bound, so returning it would silently route every signal / cancel /
+terminate / query / update / result to a stale attempt — the exact bug this
+contract exists to fix. Hitting it means either a corrupted `retry_of_exec_id`
+graph or a `max_attempts` that needs capping.
 
 ## Invariants
 
