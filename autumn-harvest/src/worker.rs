@@ -2393,10 +2393,20 @@ async fn persist_external_signal_inline(
                         // Chaos: pause/kill after the *Requested event is durable
                         // but before the inline terminal, still inside the txn —
                         // the #492 window where a concurrent outbox sweep can
-                        // observe a half-written external signal (AC4). Reached
-                        // only for a same-shard fresh signal (cross-shard
-                        // `continue`d above).
-                        crate::chaos_point!(OUTBOX_INLINE_AFTER_REQUESTED);
+                        // observe a half-written external signal (AC4). Fire only
+                        // for a same-shard *fresh* signal: the half-write window
+                        // exists only because *this* txn just appended the
+                        // `ExternalSignalRequested` event above. On a
+                        // crash-recovery re-delivery (`already_requested`) that
+                        // event is durable from a prior, crashed attempt and
+                        // this txn appends nothing before the inline terminal, so
+                        // there is no new half-write to observe — skip the point,
+                        // matching its name and the #492 reproducer's intent.
+                        // (Cross-shard signals `continue`d to the outbox above,
+                        // so this is reached only for same-shard delivery.)
+                        if !run.already_requested {
+                            crate::chaos_point!(OUTBOX_INLINE_AFTER_REQUESTED);
+                        }
 
                         // Same-shard delivery attempt. A deduped insert
                         // (`Ok(false)`, idempotency-key collision) means the

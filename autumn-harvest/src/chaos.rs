@@ -802,6 +802,30 @@ mod controller {
         /// leak a fault into a later test after its plan is gone. `SeqCst`
         /// pairs with the store in [`arm`]/`Drop` so the fence orders against
         /// the disarm.
+        ///
+        /// This gate is intentionally *not* one serialized commit with the side
+        /// effect that follows it (the panic/sleep/rendezvous/error a caller runs
+        /// after a `true`). Two things make a serialized commit both unnecessary
+        /// and, as literally suggested, unimplementable:
+        ///
+        /// - *No stateful bleed.* Which plan a resolved action belongs to is
+        ///   settled by the entry snapshot ([`entry_snapshot`]) plus this
+        ///   generation fence, both *before* any side effect runs. A side effect
+        ///   that executes in the tiny gap after a `true` runs on the *spawned
+        ///   task* and touches no global chaos state and no later test's
+        ///   workload, so it cannot make a later test non-deterministic — the
+        ///   overlap is temporal only.
+        /// - *A lock across the fire would deadlock.* Holding a lock from this
+        ///   check through the side effect would have to span `Hold`'s
+        ///   `gate.rendezvous().await` and `Delay`'s `sleep().await`; the guard's
+        ///   `Drop` needs that same lock to disarm and `release_all_holds`, so the
+        ///   rendezvous could never complete.
+        ///
+        /// The practical guarantee against a fault outliving its test is
+        /// *await-discipline*: a reproducer drives the faulted work in a
+        /// `tokio::spawn`ed task and awaits its `JoinHandle` before dropping the
+        /// guard (see `worker::chaos_drive_one_workflow_task`), so no side effect
+        /// executes past disarm in correct usage.
         fn fire_if_current(&self) -> bool {
             if self.generation != ARMED_GEN.load(Ordering::SeqCst) {
                 return false;
@@ -847,6 +871,39 @@ mod controller {
 
     fn current_state() -> Option<Arc<ChaosState>> {
         STATE.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Atomically snapshot the armed state *and* the generation it belongs to.
+    ///
+    /// The disarmed fast path is a single `Relaxed` load and early return — no
+    /// lock, no clone — so the zero-cost-when-disarmed property the entry
+    /// points ([`hit`]/[`hit_fallible`]/[`should_drop_notify`]) document still
+    /// holds. When armed, the generation is captured *before* the `STATE` read
+    /// and the state is rejected (returns `None`) unless it belongs to that
+    /// same generation.
+    ///
+    /// This closes the gap the old two-load entry (`ARMED` bool, then
+    /// `current_state`) left open: a task that observed the harness armed under
+    /// one plan, was preempted across a guard drop + re-arm, then read `STATE`
+    /// would otherwise adopt the *newer* plan's state and resolve (firing) a
+    /// directive it was never meant to. Fencing on the captured entry
+    /// generation makes such a straddling task a no-op. [`arm`] publishes
+    /// `STATE` before `ARMED_GEN`, so observing a generation implies its state
+    /// is already visible; the only rejected pairs are genuinely torn (entry
+    /// generation from the outgoing plan, `STATE` from the incoming one). The
+    /// generation is fenced *again* at fire time via
+    /// [`ChaosState::fire_if_current`], so a disarm landing after this snapshot
+    /// still fires nothing. `SeqCst` pairs with the stores in [`arm`]/`Drop`.
+    fn entry_snapshot() -> Option<Arc<ChaosState>> {
+        if !ARMED.load(Ordering::Relaxed) {
+            return None;
+        }
+        let entry_gen = ARMED_GEN.load(Ordering::SeqCst);
+        let state = current_state()?;
+        if state.generation != entry_gen {
+            return None;
+        }
+        Some(state)
     }
 
     /// Install a chaining panic hook (once, idempotently) that prints a compact
@@ -989,10 +1046,10 @@ mod controller {
     /// [`Kill`](Action::Kill) at `point`. That is the intended fault: it
     /// simulates a task crash and must be triggered inside a spawned task.
     pub async fn hit(point: ChaosPoint) {
-        if !ARMED.load(Ordering::Relaxed) {
-            return;
-        }
-        let Some(state) = current_state() else {
+        // One consistent (state, generation) snapshot — see `entry_snapshot`:
+        // rejects a task that straddled a disarm+rearm so it can't fire a
+        // newer plan's directive.
+        let Some(state) = entry_snapshot() else {
             return;
         };
         match state.resolve(point) {
@@ -1050,10 +1107,8 @@ mod controller {
     /// Panics with `harvest-chaos-kill: {point}` when the armed plan resolves a
     /// [`Kill`](Action::Kill) at `point`.
     pub async fn hit_fallible(point: ChaosPoint) -> Result<(), ChaosError> {
-        if !ARMED.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let Some(state) = current_state() else {
+        // One consistent (state, generation) snapshot — see `entry_snapshot`.
+        let Some(state) = entry_snapshot() else {
             return Ok(());
         };
         match state.resolve(point) {
@@ -1107,10 +1162,8 @@ mod controller {
     /// a single `Relaxed` atomic load.
     #[must_use]
     pub fn should_drop_notify(point: ChaosPoint) -> bool {
-        if !ARMED.load(Ordering::Relaxed) {
-            return false;
-        }
-        let Some(state) = current_state() else {
+        // One consistent (state, generation) snapshot — see `entry_snapshot`.
+        let Some(state) = entry_snapshot() else {
             return false;
         };
         match state.resolve(point) {
@@ -1446,6 +1499,45 @@ mod controller {
             assert!(current.fire_if_current());
             assert_eq!(current.actions_fired.load(Ordering::Relaxed), 1);
             drop(newer);
+        }
+
+        // ---- Fix 3 (Codex review round 2): the entry snapshot rejects a state
+        //      whose generation != the armed generation, so a task that
+        //      straddled a disarm+rearm between the `ARMED` read and the `STATE`
+        //      read cannot adopt a *newer* plan's directive. Unlike Fix 1 (a
+        //      *captured* Arc fenced at fire time), this rejects the torn read at
+        //      the entry point, before `resolve` even bumps the hit counter -----
+
+        #[tokio::test]
+        async fn entry_snapshot_rejects_a_torn_state_from_a_different_generation() {
+            // Holding the guard keeps `SERIAL` for the whole test, so no other
+            // arming test can observe the STATE we poke below.
+            let _guard = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
+            let armed_gen = ARMED_GEN.load(Ordering::SeqCst);
+
+            // The torn read a straddling task would observe: STATE holds a state
+            // whose generation is NOT the currently-armed ARMED_GEN, as if a
+            // disarm+rearm slipped between the entry generation read and the
+            // STATE read. `entry_snapshot` must reject it (return `None`) so the
+            // task resolves nothing against the mismatched plan.
+            let mismatched = Arc::new(ChaosState::from_plan(
+                ChaosPlan::scripted(),
+                armed_gen.wrapping_add(1),
+            ));
+            *STATE.write().unwrap_or_else(PoisonError::into_inner) = Some(mismatched);
+            assert!(
+                entry_snapshot().is_none(),
+                "a state whose generation != ARMED_GEN is a torn straddle and must be rejected",
+            );
+
+            // A state whose generation matches the armed generation is accepted.
+            let consistent = Arc::new(ChaosState::from_plan(ChaosPlan::scripted(), armed_gen));
+            *STATE.write().unwrap_or_else(PoisonError::into_inner) = Some(consistent);
+            assert!(
+                entry_snapshot().is_some(),
+                "a state whose generation == ARMED_GEN is consistent and accepted",
+            );
+            // `_guard` drop restores STATE=None / disarmed for the next test.
         }
 
         #[test]

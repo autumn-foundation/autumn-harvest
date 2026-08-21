@@ -48,6 +48,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Compile chaos suite
         run: cargo test -p autumn-harvest --features chaos --test integration --no-run
+      - name: Run chaos harness unit tests (no DB)
+        # The controller's own invariants — generation fencing, the entry-snapshot
+        # torn-read rejection (a straddling task can't adopt a newer plan), the
+        # scripted-cap validation, and seeded determinism — are no-DB lib tests.
+        # Run them here (fast, no container) so a regression in the harness
+        # *itself* is caught, not merely compiled by the always-on lint job.
+        run: cargo test -p autumn-harvest --features chaos --lib chaos:: -- --test-threads=1
       - name: Run chaos reproducers + seeded convergence sweep
         # `--test-threads=1`: the harness serialises armed plans on a process-wide
         # mutex anyway, and each test spins its own Postgres container — running

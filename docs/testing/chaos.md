@@ -55,8 +55,7 @@ off.
 | `POISON_RECLAIM_BEFORE_LOAD` | `poison.reclaim.before_load` | ERROR | AC1(b) — a transient Diesel/connection error at the reclaim scan |
 | `NOTIFY_TASK_ENQUEUED` | `notify.task_enqueued` | DROP_NOTIFY | AC1(c) — a dropped `LISTEN`/`NOTIFY` wake; dispatch must converge via the poll loop |
 
-Caps (the primitive classes a *seeded* plan may pick for a point; scripted
-`kill_at`/`hold_at` ignore caps and are always honoured):
+Caps declare the primitive classes a point can host:
 
 - **KILL** — the point runs inside a spawned task, so a panic there simulates a
   task crash rather than crashing the test driver.
@@ -64,6 +63,18 @@ Caps (the primitive classes a *seeded* plan may pick for a point; scripted
   `ChaosError`.
 - **DROP_NOTIFY** — a `LISTEN`/`NOTIFY` send site whose wake can be dropped.
 - **DELAY** — tolerates a bounded artificial delay.
+
+A **seeded** plan only ever picks a cap the point declares. A **scripted** `*_at`
+builder is validated the **same way, at plan-build time**: `kill_at` /
+`kill_at_hit` / `hold_at` / `error_at` / `drop_notify_at` / `delay_at` assert
+(via `assert_scripted_cap`) that the point's declared caps allow the action and
+**panic next to the offending call** otherwise — e.g. `kill_at(NOTIFY_TASK_ENQUEUED)`
+(a `DROP_NOTIFY`-only point) panics at build time rather than blowing up far away
+at the entry point. `hold_at` additionally requires an **async** site — one
+declaring any of `KILL`/`ERROR`/`DELAY` — because a `Hold` rendezvous parks the
+point on `.await`; a synchronous `DROP_NOTIFY`-only point cannot host it (its
+`should_drop_notify` is not `async`, so a scripted `Hold` there would hang the
+test's `reached().await` forever).
 
 `CHAOS_POINTS_MAX` (currently 16) is a ratchet on the catalogue size — bump it
 deliberately, never silently. A source-scan drift test
@@ -106,9 +117,16 @@ assert!(outcome.is_err(), "the KILL must crash the cycle; {}", guard.diagnostics
 
 - `kill_at(p)` / `kill_at_hit(p, n)` — panic on the first / `n`th hit.
 - `hold_at(p)` — a two-phase rendezvous; retrieve the handle with
-  `guard.hold(p)`, `handle.reached().await`, `handle.release()`.
+  `guard.hold(p)`, `handle.reached().await`, `handle.release()`. The point must
+  be an **async** site (declare `KILL`, `ERROR`, or `DELAY`); a `DROP_NOTIFY`-only
+  point panics at plan-build time (see the caps section above).
 - `error_at(p, ChaosError::Generic)` — inject an error on every hit.
 - `drop_notify_at(p)` / `delay_at(p, ms)`.
+
+Each `*_at` builder validates the point's declared caps at plan-build time, so a
+caps/site mismatch (`kill_at` on a `DROP_NOTIFY`-only point, `error_at` on a
+non-`ERROR` point, …) panics next to the call rather than silently mis-scripting
+a directive that would blow up at the entry point.
 - `ChaosGuard::hits(p)`, `.actions_fired()` (anti-vacuity: assert `>= 1`),
   `.seed()`, `.diagnostics()`.
 
@@ -117,6 +135,19 @@ A **KILL must be triggered inside a spawned task** — the harness's
 owned (non-pooled) connection inside `tokio::spawn`, so the panic surfaces as a
 `JoinError` and the dropped connection rolls back mid-flight work server-side
 exactly as a crashed worker process would.
+
+**Await-discipline (cross-test isolation).** A reproducer **awaits the spawned
+task's `JoinHandle` before dropping the guard**, so a fired fault never executes
+past disarm. Isolation has two layers that together make cross-test bleed
+impossible: (1) *stateful* — the entry snapshot + the armed-generation fence
+decide which plan a resolved action belongs to *before* any side effect, so a
+straddling task can never adopt a newer plan's directive; (2) *temporal* —
+await-discipline keeps a fault's side effect within its own test. The generation
+fence deliberately is not held across the side effect (a lock spanning a `Hold`
+rendezvous / `Delay` sleep would deadlock the guard's `Drop`), because layer (1)
+already prevents the only *stateful* bleed and a side effect that ran in the gap
+would touch no global chaos state or later-test workload — a temporal overlap
+with no correctness consequence.
 
 The four historical race classes are reproduced in
 `tests/integration/chaos_tests.rs`; each has an inline **RED procedure** describing

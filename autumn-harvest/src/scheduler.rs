@@ -4742,8 +4742,16 @@ async fn tick_one_workflow_schedule(
     // Chaos: kill/delay after this tick's scheduled starts have committed but
     // before next_run_at/last_run_at advance — the #350 crash-after-fire window.
     // A re-fire on recovery must dedupe (reject_duplicate on the sched: id) to
-    // exactly one run (AC4).
-    crate::chaos_point!(SCHED_AFTER_START_BEFORE_ADVANCE);
+    // exactly one run (AC4). Fire only when this tick actually committed or
+    // deferred at least one start (`dispatched` counts both — a throttle defer at
+    // 4585 and a committed/attached start at 4688): a tick that dispatched
+    // nothing (empty due list, jitter not-yet-due, calendar exclusion,
+    // max_active_runs cap, or an exhausted budget) reaches here with
+    // `dispatched == 0` and has no crash-after-fire window to model, so the point
+    // is skipped — matching its name and the #350 reproducer's intent.
+    if dispatched > 0 {
+        crate::chaos_point!(SCHED_AFTER_START_BEFORE_ADVANCE);
+    }
 
     // Deferred catchup slots become next_run_at so the next tick retries them.
     // last_run_at only advances to the last slot actually started.
