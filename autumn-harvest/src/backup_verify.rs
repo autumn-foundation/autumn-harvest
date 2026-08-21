@@ -913,10 +913,10 @@ fn parse_dsn_identity(dsn: &str) -> Option<DsnIdentity> {
     // whoever connects -- not knowable here, and different on the operator's
     // machine than in the deployed config -- so we fail closed by refusing to
     // produce an identity at all (`None` makes the guard return `true`).
-    let database = match config.get_dbname().or_else(|| config.get_user()) {
-        Some(db) => db.to_string(),
-        None => return None,
-    };
+    let database = config
+        .get_dbname()
+        .or_else(|| config.get_user())?
+        .to_string();
     Some(DsnIdentity {
         hosts,
         hostaddrs,

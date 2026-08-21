@@ -508,6 +508,80 @@ async fn the_read_only_session_pin_makes_postgres_reject_writes() {
     );
 }
 
+/// AC3, the skew signal itself. The other cross-shard tests catch a *specific*
+/// broken reference; this one catches the condition that produces them
+/// wholesale — two shards restored to materially different points in time.
+///
+/// It is deliberately Advisory, not Incoherent: unequal newest-event
+/// timestamps are a symptom, and a fleet can be legitimately skewed simply
+/// because one shard was idle. The concrete broken references are what carry
+/// the Incoherent verdict. The runbook's fencing procedure ("restore all,
+/// verify all, THEN start workers") is what this signal exists to trigger.
+#[tokio::test]
+async fn detects_restore_point_skew_across_shards() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let on_a = ExecutionId::new_for_shard(ShardId::new(0));
+    let on_b = ExecutionId::new_for_shard(ShardId::new(1));
+
+    seed_execution(&mut a, on_a, "orders", "ord-skew-a", "RUNNING", 0).await;
+    append_event(&mut a, on_a, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    seed_execution(&mut b, on_b, "orders", "ord-skew-b", "RUNNING", 1).await;
+    append_event(&mut b, on_b, 1, "WorkflowStarted", json!({ "input": {} })).await;
+
+    // Shard B was restored to an hour earlier than shard A. Its newest event
+    // is correspondingly older -- the proxy the check reads.
+    diesel::sql_query("UPDATE harvest_events SET timestamp = NOW() - INTERVAL '1 hour'")
+        .execute(&mut b)
+        .await
+        .expect("backdate shard b");
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::RestorePointSkew),
+        "an hour of skew must be flagged: {report:#?}"
+    );
+    let secs = report
+        .restore_point_skew_secs
+        .expect("skew must be reported numerically, not just as a finding");
+    assert!(
+        (3500..=3700).contains(&secs),
+        "expected ~3600s of skew, got {secs}"
+    );
+}
+
+/// The control: shards restored to the same point are NOT flagged. Without
+/// this the test above would pass even if the check fired unconditionally,
+/// which would make every healthy multi-shard drill report a finding.
+#[tokio::test]
+async fn shards_restored_to_the_same_point_are_not_flagged_as_skewed() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let on_a = ExecutionId::new_for_shard(ShardId::new(0));
+    let on_b = ExecutionId::new_for_shard(ShardId::new(1));
+
+    seed_execution(&mut a, on_a, "orders", "ord-even-a", "RUNNING", 0).await;
+    append_event(&mut a, on_a, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    seed_execution(&mut b, on_b, "orders", "ord-even-b", "RUNNING", 1).await;
+    append_event(&mut b, on_b, 1, "WorkflowStarted", json!({ "input": {} })).await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::RestorePointSkew),
+        "an evenly-restored fleet must not be flagged: {report:#?}"
+    );
+}
+
 /// AC3: cross-shard skew — a parent's recorded child terminal is missing on the
 /// child's own shard (that shard was restored to an earlier point).
 #[tokio::test]

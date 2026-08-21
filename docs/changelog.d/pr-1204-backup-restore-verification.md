@@ -270,3 +270,14 @@ Also fixes a CI break from round 2: three `dsn_guard_*` unit tests called a
 `tokio_postgres::Config` — deliberately the same parser `diesel_async` uses at
 connect time — and `tokio-postgres` is enabled only by `db`, so the tests take
 the gate too.
+
+**AC coverage gap closed.** `RestorePointSkew` — the AC3 signal that two shards
+were restored to materially different points — had only a pure unit test
+(`compute_skew_needs_two_timestamps`); nothing exercised the detection
+end to end. Added `detects_restore_point_skew_across_shards` (two shards, one
+backdated an hour, asserting both the finding *and* the reported
+`restore_point_skew_secs`) and the control
+`shards_restored_to_the_same_point_are_not_flagged_as_skewed`, without which the
+positive test would pass even if the check fired unconditionally — which would
+make every healthy multi-shard drill report a finding. Falsified by neutering
+the threshold comparison. **31** DB integration tests.
