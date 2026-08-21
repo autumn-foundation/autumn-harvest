@@ -437,18 +437,20 @@ pub use event::{SideEffectKind, WorkflowEvent};
 #[cfg(feature = "db")]
 pub use execution::{
     CancelledWorkflowExecution, IdempotentStartOutcome, ORIGIN_BACKFILL, ORIGIN_MANUAL_TRIGGER,
-    ORIGIN_SCHEDULED, PausedWorkflowExecution, ResolvedRun, ResumedWorkflowExecution,
-    ScheduleRunQuery, ScheduleRunRow, ScheduleRunStateCount, SignalWithStartOutcome,
-    SignalWithStartParams, StartWorkflowParams, StartedWorkflowExecution, TriageFieldChange,
-    TriageOutcome, TriagePatch, UpdateWithStartOutcome, UpdateWithStartParams,
+    ORIGIN_SCHEDULED, PausedWorkflowExecution, RETRY_CHAIN_MAX_DEPTH, RETRY_CHAIN_MAX_REDRIVES,
+    ResolvedRun, ResumedWorkflowExecution, ScheduleRunQuery, ScheduleRunRow, ScheduleRunStateCount,
+    SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, StartedWorkflowExecution,
+    TriageFieldChange, TriageOutcome, TriagePatch, UpdateWithStartOutcome, UpdateWithStartParams,
     WorkflowCountDimension, WorkflowCountQuery, WorkflowCountRow, WorkflowTypeNonTerminalCount,
-    annotate_workflow_execution, auto_resume_expired_pauses, cancel_workflow_execution,
-    count_workflow_executions_grouped, list_schedule_runs, non_terminal_counts_by_workflow_name,
-    pause_workflow_execution, resolve_execution_id_by_workflow_id, resume_workflow_execution,
+    annotate_workflow_execution, auto_resume_expired_pauses, cancel_live_attempt,
+    cancel_workflow_execution, count_workflow_executions_grouped, list_schedule_runs,
+    non_terminal_counts_by_workflow_name, pause_live_attempt, pause_workflow_execution,
+    redrive_target, resolve_execution_id_by_workflow_id, resolve_live_attempt,
+    resolve_live_attempt_id, resume_live_attempt, resume_workflow_execution,
     schedule_run_state_summary, select_resolved_run, signal_with_start_workflow_execution,
     signal_with_start_workflow_execution_with_metrics, start_or_load_workflow_execution,
     start_or_load_workflow_execution_idempotent, start_or_load_workflow_execution_with_metrics,
-    terminate_workflow_execution, update_with_start_workflow_execution,
+    terminate_live_attempt, terminate_workflow_execution, update_with_start_workflow_execution,
     update_with_start_workflow_execution_with_metrics,
 };
 pub use executor::{WorkflowOutcome, run_workflow};

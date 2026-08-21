@@ -13941,7 +13941,14 @@ impl ActivityContext {
     ///
     /// Returns [`HarvestError::ActivityCancelled`] when cancellation has been
     /// requested (regular activities only).  Returns [`Ok(())`] otherwise.
-    #[cfg_attr(not(feature = "db"), allow(clippy::unused_async))]
+    // The `async` is load-bearing under `db` (it awaits the durable
+    // queue-row check below); without `db` the body has no `.await`, so both
+    // no-await lints fire. `unused_async_trait_impl` is clippy 1.98's new
+    // sibling of `unused_async` and needs its own name here.
+    #[cfg_attr(
+        not(feature = "db"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     pub async fn check_cancellation(&self) -> crate::HarvestResult<()> {
         if self.cancel.is_cancelled() {
             return Err(HarvestError::ActivityCancelled(
