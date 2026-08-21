@@ -115,6 +115,7 @@ resume, not because anything is wrong.
 | `external_target_missing` | A `*Requested` event names a target execution absent from the shard that owns it. |
 | `child_execution_missing` | A parent awaits a child whose execution row is absent from its shard. The parent will park forever. |
 | `child_terminal_rolled_back` | The parent recorded the child's terminal, but the child's shard was restored to an *earlier* point where the child is still running. See §6 — this is the signature multi-shard skew failure. |
+| `wedged_schedule_claim` | A schedule with a claim token but a **NULL** `fire_claimed_until` — a torn claim pair. The scheduler claims on `fire_claim_token IS NULL OR fire_claimed_until < NOW()`, which such a row matches neither half of, so the schedule never fires again. Un-claim it by hand (`UPDATE harvest_schedules SET fire_claim_token = NULL, fire_claimed_until = NULL WHERE id = …`) before starting workers. Contrast `expired_schedule_claim`, which self-heals. |
 | `replay_divergence` | A sampled history no longer replays against the deployed workflow code. Not caused by the restore; caused by a code/history mismatch. Fix by rolling *back* the workflow code, then resume (see `nondeterminism-block.md`). |
 
 A report containing any of these exits **1**. Do not start workers.
@@ -143,14 +144,22 @@ pg_restore -d harvest_scratch /backups/harvest-2026-08-20.dump
 #   ...or your provider's PITR clone, targeting a fresh instance.
 
 # 2. Verify resumability. Read-only. (~seconds to a minute.)
+#    Pass --live-dsn (once per live shard) so the guard can actually refuse a
+#    DSN that resolves to production. Do NOT reflexively pass
+#    --i-know-this-is-scratch: it DISABLES that check, and a run that is not
+#    guarded says so on stderr.
 harvest backup verify \
   --shard 'postgres://…@scratch-host/harvest_scratch' \
-  --i-know-this-is-scratch
+  --live-dsn 'postgres://…@live-host/harvest'
 
 # 3. Decide, from the exit code:
 #      0 -> resumable. Start workers.
 #      1 -> INCOHERENT. Do not start workers. Restore again from a different point.
 #      2 -> UNDETERMINED. The drill did not actually check. Fix and re-run.
+#
+#    Note: the shipped CLI reports `replay: NOT VERIFIED` -- it links no
+#    application workflow handlers. See §4.3 for the embedder recipe that
+#    adds replay coverage.
 ```
 
 Multi-shard (§6) adds one rule: **restore all shards, verify all shards, then
@@ -169,13 +178,17 @@ harvest backup verify --shard <[SHARD_ID=]DSN> [--shard …] [flags]
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--shard <[N=]DSN>` | *(required, repeatable)* | A scratch DSN. Optionally prefixed `N=` to declare its shard id (e.g. `--shard '1=postgres://…'`). Unprefixed means shard `0`. |
-| `--i-know-this-is-scratch` | off | Required if a supplied DSN targets the same host/port/database as the live config. |
+| `--shard <[N=]DSN>` | *(required, repeatable)* | A scratch DSN. Optionally prefixed `N=` to declare its shard id (e.g. `--shard '1=postgres://…'`). Unprefixed takes its **positional** index (first `--shard` is `0`, second is `1`, …), so prefix explicitly whenever your shard ids are not `0..n`. |
+| `--live-dsn <DSN>` | `$HARVEST_DATABASE_URL` | A live DSN to guard against. **Repeatable — supply one per live shard.** A live shard you do not name here is not guarded against. |
+| `--i-know-this-is-scratch` | off | **Disables** the live-DSN guard entirely. Use it only when you have already confirmed by other means that every `--shard` target is a throwaway. |
 | `--format text\|json` | `text` | `json` is the machine-readable report (AC2d). |
 | `--replay-sample <N>` | `50` | How many non-terminal histories to replay per shard. `0` disables replay. |
 | `--worker-stale-secs <N>` | `60` | Heartbeat age past which a worker counts as dead. |
 
 The live DSN for the guard comes from `HARVEST_DATABASE_URL` (or `--live-dsn`).
+When no live DSN is supplied at all, or when `--i-know-this-is-scratch` is
+passed, the guard does not run and the command prints a `WARNING:` line on
+stderr saying so. Silence means the guard genuinely ran.
 
 ### 4.1 It is read-only, mechanically
 
@@ -184,6 +197,14 @@ This is enforced three ways, not by convention:
 1. **Every connection issues `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`
    immediately on connect.** Any write attempt fails with SQLSTATE `25006`. This
    is a Postgres-level guarantee, not a code review promise.
+
+   > **Caveat — connection poolers.** The pin is *session*-scoped. Under
+   > PgBouncer in `transaction` or `statement` pooling mode the session is not
+   > yours between transactions, so the pin may not apply to later statements.
+   > Point `--shard` at the scratch database **directly**, not through a
+   > transaction-pooling proxy. (`session` pooling mode is fine.) The pin also
+   > does not restrict temporary tables — verify creates none, but that is a
+   > code property, not a server-enforced one.
 2. **No mutating scanner is ever called.** The AC asks for the scanners to "run
    once and report what they would reclaim". Those scanners *mutate*. So verify
    reuses their **selection predicates verbatim** — the same
@@ -216,13 +237,42 @@ ack, it refuses; with the ack, it still only reads.
 - **(d) A machine-readable report** (`--format json`) with a nonzero exit on any
   failed check.
 
-### 4.3 Replay honesty
+### 4.3 Replay honesty — read this before trusting a `clean` verdict
 
-If the replayer has no handler registered for a workflow type, verify does
-**not** call that a divergence — it records `replay_skipped_no_handler` and the
-report will not claim replay was verified. A report where nothing could be
-replayed says so, rather than presenting a vacuous pass. Check the replay line
-before treating a `clean` verdict as covering your workflow code.
+**The shipped `harvest` CLI cannot replay your workflows.** It is a generic
+binary; it does not link your application's `#[workflow]` handlers, so its
+replayer is always empty. Every sampled history is therefore recorded as
+`replay_skipped_no_handler`, and the report prints:
+
+```
+  replay: NOT VERIFIED — 12 sampled, 12 skipped (no handler), 0 unreadable.
+```
+
+That is the truth, not a failure: skipping is **not** a divergence, and the
+report never claims coverage it does not have. But it does mean checks (b), (c)
+and the cross-shard checks are what the CLI actually gives you. `clean` from the
+CLI means *"the data is coherent and every stuck artifact has a scanner that
+heals it"* — it does **not** mean *"your deployed workflow code still replays
+this history"*.
+
+To get check (a), call the library from a binary that links your handlers:
+
+```rust
+use autumn_harvest::backup_verify::{ShardTarget, VerifyOptions, verify_restore};
+use autumn_harvest::testing::WorkflowReplayer;
+
+let replayer = WorkflowReplayer::new()
+    .register_fn("onboarding", onboarding_handler)
+    .register_fn("fulfil_order", fulfil_order_handler);
+
+let targets = vec![ShardTarget::new(0, std::env::var("SCRATCH_DSN")?)];
+let report = verify_restore(&targets, &VerifyOptions::default(), &replayer).await;
+std::process::exit(report.status.exit_code());
+```
+
+A workflow type with no registered handler is still skipped, never called a
+divergence — so a partially-registered replayer degrades honestly too. Check the
+`replay:` line before treating any `clean` verdict as covering workflow code.
 
 ---
 
@@ -302,10 +352,17 @@ harvest backup verify \
   --shard '0=postgres://…/harvest_scratch_0' \
   --shard '1=postgres://…/harvest_scratch_1' \
   --shard '2=postgres://…/harvest_scratch_2' \
-  --i-know-this-is-scratch
+  --live-dsn 'postgres://…@live-host/harvest'
 
 # 3. Only on exit 0: start workers — all shards at once, not one at a time.
 ```
+
+One class of external request is unadjudicable by design: a **business-key
+addressed** signal/cancel (`ctx.signal_external_workflow_by_id`, issue #751)
+resolves its target at *delivery* time, so the recorded event carries no
+execution id to look up. Verify reports these as `workflow_id_target_unchecked`
+(advisory) with the target keys, rather than silently passing over them — check
+by hand that the named `(workflow_name, workflow_id)` pairs have a live run.
 
 Do **not** verify shards one at a time in separate invocations. A single-shard
 run cannot see the other side of a cross-shard reference; it reports

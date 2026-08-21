@@ -155,7 +155,11 @@ pub enum FindingClass {
     ExpiredSessionLease,
     /// A durable mutex lock whose lease elapsed.
     ExpiredMutexLease,
-    /// A completion delivery frozen `INFLIGHT` with an elapsed lease.
+    /// A completion delivery frozen `INFLIGHT`.
+    ///
+    /// Any `INFLIGHT` row in a restored snapshot is frozen by definition — the
+    /// worker that claimed it is gone with the process, so the lease is
+    /// irrelevant to whether it is stuck.
     InflightCompletionDelivery,
     /// An external signal/cancel/await request with no recorded terminal and a
     /// target that is still resolvable — the outbox will retry it.
@@ -172,6 +176,11 @@ pub enum FindingClass {
     /// A parent recorded `ChildWorkflowStarted` with no terminal, but the
     /// child's execution row is absent from the child's shard.
     ChildExecutionMissing,
+    /// A schedule with a claim token but a NULL `fire_claimed_until` — a torn
+    /// claim pair. The scheduler's claim predicate is
+    /// `fire_claim_token IS NULL OR fire_claimed_until < NOW()`, so such a row
+    /// satisfies neither disjunct and the schedule never fires again.
+    WedgedScheduleClaim,
     /// A parent recorded a child's terminal, but the child's own shard shows
     /// that child still non-terminal — the signature of a skewed multi-shard
     /// restore.
@@ -191,6 +200,9 @@ pub enum FindingClass {
     /// A cross-shard reference points at a shard whose DSN was not supplied to
     /// this run, so its coherence could not be checked either way.
     UninspectedShardReference,
+    /// A business-key-addressed external request (#751) that carries no
+    /// execution id, so this tool cannot adjudicate its target.
+    WorkflowIdTargetUnchecked,
 
     // ── Undetermined: the check could not run ───────────────────────────────
     /// A probe could not execute at all — most commonly a missing table,
@@ -204,7 +216,7 @@ pub enum FindingClass {
 
 impl FindingClass {
     /// Every class, in a stable order. Used by tests and by the runbook table.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 21] = [
         Self::DeadWorkerRunningTask,
         Self::TimedOutTask,
         Self::WorkflowDeadlineExpired,
@@ -217,12 +229,14 @@ impl FindingClass {
         Self::DanglingEventExecution,
         Self::ExternalTargetMissing,
         Self::ChildExecutionMissing,
+        Self::WedgedScheduleClaim,
         Self::ChildTerminalRolledBack,
         Self::ReplayDivergence,
         Self::RestorePointSkew,
         Self::ReplaySkippedNoHandler,
         Self::HistoryUnreadable,
         Self::UninspectedShardReference,
+        Self::WorkflowIdTargetUnchecked,
         Self::ProbeFailed,
     ];
 
@@ -247,13 +261,15 @@ impl FindingClass {
             | Self::DanglingEventExecution
             | Self::ExternalTargetMissing
             | Self::ChildExecutionMissing
+            | Self::WedgedScheduleClaim
             | Self::ChildTerminalRolledBack
             | Self::ReplayDivergence => FindingSeverity::Incoherent,
 
             Self::RestorePointSkew
             | Self::ReplaySkippedNoHandler
             | Self::HistoryUnreadable
-            | Self::UninspectedShardReference => FindingSeverity::Advisory,
+            | Self::UninspectedShardReference
+            | Self::WorkflowIdTargetUnchecked => FindingSeverity::Advisory,
 
             Self::ProbeFailed => FindingSeverity::Undetermined,
         }
@@ -267,6 +283,7 @@ impl FindingClass {
             Self::TimedOutTask => "timed_out_task",
             Self::WorkflowDeadlineExpired => "workflow_deadline_expired",
             Self::ExpiredScheduleClaim => "expired_schedule_claim",
+            Self::WedgedScheduleClaim => "wedged_schedule_claim",
             Self::ExpiredSessionLease => "expired_session_lease",
             Self::ExpiredMutexLease => "expired_mutex_lease",
             Self::InflightCompletionDelivery => "inflight_completion_delivery",
@@ -281,6 +298,7 @@ impl FindingClass {
             Self::ReplaySkippedNoHandler => "replay_skipped_no_handler",
             Self::HistoryUnreadable => "history_unreadable",
             Self::UninspectedShardReference => "uninspected_shard_reference",
+            Self::WorkflowIdTargetUnchecked => "workflow_id_target_unchecked",
             Self::ProbeFailed => "probe_failed",
         }
     }
@@ -299,14 +317,19 @@ impl FindingClass {
             Self::ExpiredScheduleClaim => {
                 "the claim expires and a healthy replica re-claims the slot (issue #350)"
             }
+            Self::WedgedScheduleClaim => {
+                "torn claim pair (token set, fire_claimed_until NULL): the scheduler's \
+                 claim predicate can never match it again, so the schedule is permanently \
+                 wedged and must be un-claimed by hand (issue #350)"
+            }
             Self::ExpiredSessionLease => {
                 "marked BROKEN by the session reclaim sweep; member activities fail \
                  non-retryably (issue #606)"
             }
             Self::ExpiredMutexLease => "reclaimed and granted to the next FIFO waiter (issue #691)",
             Self::InflightCompletionDelivery => {
-                "re-attempted after the lease lapses; the receiver MUST dedupe on \
-                 delivery_id (issue #605)"
+                "claimed by a worker that no longer exists; re-attempted once the lease \
+                 lapses. The receiver MUST dedupe on delivery_id (issue #605)"
             }
             Self::PendingExternalRequest => {
                 "re-attempted by the external outbox scanner once workers start \
@@ -339,6 +362,10 @@ impl FindingClass {
             Self::UninspectedShardReference => {
                 "references a shard whose DSN was not supplied; supply every shard to \
                  check cross-shard coherence"
+            }
+            Self::WorkflowIdTargetUnchecked => {
+                "addressed by business key (#751), so it has no execution id to \
+                 look up; verify its target workflow by hand"
             }
             Self::ProbeFailed => {
                 "the check could not run (a missing table usually means the restore \
@@ -376,8 +403,12 @@ pub struct Finding {
     pub detail: Option<String>,
     /// What heals it, or what it breaks.
     pub explanation: &'static str,
-    /// True when `count` was clipped by the probe's row limit, so the real
-    /// population may be larger.
+    /// True when `samples` does not enumerate the whole population.
+    ///
+    /// `count` is **always exact** — it comes from `COUNT(*) OVER ()`, computed
+    /// before `LIMIT`. Only the sample identifiers are bounded, so `truncated`
+    /// means "there are more rows than the ones listed here", never "the count
+    /// itself is a lower bound".
     pub truncated: bool,
 }
 
@@ -413,7 +444,7 @@ impl Finding {
         self
     }
 
-    /// Marks the finding's `count` as clipped by a probe row limit.
+    /// Marks `samples` as a partial enumeration (`count` stays exact).
     #[must_use]
     pub const fn with_truncated(mut self, truncated: bool) -> Self {
         self.truncated = truncated;
@@ -555,7 +586,11 @@ pub struct ShardVerifyReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_event_at: Option<DateTime<Utc>>,
     /// Count of non-terminal (`RUNNING`/`PAUSED`) executions.
-    pub non_terminal_executions: u64,
+    ///
+    /// `None` when the count probe itself failed — never `0`, which would read
+    /// as a drained fleet. A failure also raises `probe_failed`, so the shard
+    /// is `Undetermined` rather than falsely clean.
+    pub non_terminal_executions: Option<u64>,
     /// Replay tally for this shard's sampled histories.
     pub replay: ReplaySummary,
     /// Findings observed on this shard.
@@ -572,7 +607,7 @@ impl ShardVerifyReport {
             reachable: false,
             unreachable_reason: Some(reason.into()),
             latest_event_at: None,
-            non_terminal_executions: 0,
+            non_terminal_executions: None,
             replay: ReplaySummary::default(),
             findings: Vec::new(),
         }
@@ -595,6 +630,15 @@ pub struct RestoreVerifyReport {
     pub restore_point_skew_secs: Option<i64>,
     /// Fleet-wide replay tally.
     pub replay: ReplaySummary,
+    /// Whether check (a) — replay — actually ran on anything.
+    ///
+    /// Surfaced at the top level so a JSON consumer can gate on it without
+    /// re-deriving [`ReplaySummary::verified`]. `false` means the `status`
+    /// verdict says nothing about whether the deployed workflow code still
+    /// replays these histories: the shipped `harvest` CLI links no application
+    /// handlers, so it always reports `false` (see the runbook's "Replay
+    /// honesty" section).
+    pub replay_verified: bool,
     /// Count of findings per severity, for a one-line summary.
     pub totals_by_severity: BTreeMap<String, u64>,
 }
@@ -635,6 +679,7 @@ impl RestoreVerifyReport {
             shards,
             cross_shard,
             restore_point_skew_secs,
+            replay_verified: replay.verified(),
             replay,
             totals_by_severity,
         }
@@ -700,6 +745,7 @@ pub fn compute_skew(latest: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> 
 /// An unparseable DSN on either side compares **equal**: a guard that cannot
 /// read the DSN must fail closed, never wave the drill through.
 #[must_use]
+#[cfg(feature = "db")]
 pub fn dsn_targets_same_database(candidate: &str, live: &str) -> bool {
     let (Some(a), Some(b)) = (parse_dsn_identity(candidate), parse_dsn_identity(live)) else {
         return true;
@@ -707,40 +753,93 @@ pub fn dsn_targets_same_database(candidate: &str, live: &str) -> bool {
     a == b
 }
 
-/// `(host, port, database)` identity of a Postgres DSN, or `None` when it
+/// `(hosts, ports, database)` identity of a Postgres DSN, or `None` when it
 /// cannot be parsed.
-fn parse_dsn_identity(dsn: &str) -> Option<(String, u16, String)> {
-    let url = url::Url::parse(dsn.trim()).ok()?;
-    if !matches!(url.scheme(), "postgres" | "postgresql") {
+///
+/// Parsed with **`tokio_postgres::Config`** — the exact parser
+/// `diesel_async` hands the DSN to when it opens the connection. Using any
+/// other parser (`url::Url`, say) is a guard bypass waiting to happen: the two
+/// disagree on percent-decoding (`/%68arvest` is database `harvest`), on
+/// libpq query parameters (`?dbname=`, `?host=`, `?port=`, `?hostaddr=` all
+/// override the URL form), and on comma-separated multi-host failover. Every
+/// one of those parses cleanly under `url` while resolving somewhere else
+/// entirely at connect time — so a guard built on `url` waves through a DSN
+/// that lands on production. Sharing the connector's parser makes that class
+/// of disagreement impossible by construction.
+///
+/// `hostaddr` is folded into the host set because tokio-postgres prefers it
+/// for the TCP connection, falling back to `host`; ignoring it would let
+/// `?hostaddr=<prod-ip>` slip past.
+#[cfg(feature = "db")]
+fn parse_dsn_identity(dsn: &str) -> Option<(Vec<String>, Vec<u16>, String)> {
+    use std::str::FromStr as _;
+
+    let config = tokio_postgres::Config::from_str(dsn.trim()).ok()?;
+
+    let mut hosts: Vec<String> = config
+        .get_hosts()
+        .iter()
+        .map(|h| match h {
+            tokio_postgres::config::Host::Tcp(name) => name.to_ascii_lowercase(),
+            #[cfg(unix)]
+            tokio_postgres::config::Host::Unix(path) => path.to_string_lossy().to_lowercase(),
+        })
+        .collect();
+    hosts.extend(config.get_hostaddrs().iter().map(ToString::to_string));
+    if hosts.is_empty() {
         return None;
     }
-    let host = url.host_str()?.to_ascii_lowercase();
-    let port = url.port().unwrap_or(5432);
-    let database = url.path().trim_start_matches('/').to_string();
-    Some((host, port, database))
+    hosts.sort_unstable();
+    hosts.dedup();
+
+    // tokio-postgres emits either one port for all hosts or one per host.
+    let mut ports: Vec<u16> = config.get_ports().to_vec();
+    if ports.is_empty() {
+        ports.push(5432);
+    }
+    ports.sort_unstable();
+    ports.dedup();
+
+    let database = config.get_dbname().unwrap_or_default().to_string();
+    Some((hosts, ports, database))
 }
 
-/// Returns the DSN with its password replaced by `***`, for safe logging.
+/// Returns the DSN with every password-bearing element replaced by `***`, for
+/// safe logging.
 ///
-/// A DSN that cannot be parsed is redacted wholesale rather than echoed, so a
-/// malformed-but-secret-bearing string can never reach a report or a log line.
+/// A DSN that cannot be parsed is redacted **wholesale** rather than echoed, so
+/// a malformed-but-secret-bearing string can never reach a report or a log
+/// line. The same applies to any DSN carrying a `password` connection
+/// parameter: `tokio_postgres::Config` accepts `?password=` in the query string
+/// and in the libpq `key=value` form, and neither survives a naive URL
+/// userinfo rewrite — so rather than emit a string we cannot prove is clean,
+/// we withhold it. The report needs the DSN only to name which shard is being
+/// discussed, and the shard id already does that.
 #[must_use]
 pub fn redact_dsn(dsn: &str) -> String {
-    match url::Url::parse(dsn.trim()) {
-        Ok(mut url) if url.password().is_some() => {
-            let _ = url.set_password(Some("***"));
-            url.to_string()
-        }
-        Ok(url) => url.to_string(),
-        Err(_) => "<unparseable dsn>".to_string(),
+    let trimmed = dsn.trim();
+    let Ok(mut url) = url::Url::parse(trimmed) else {
+        return "<unparseable dsn>".to_string();
+    };
+    // A password can hide in the query string as well as in the userinfo. We
+    // cannot rewrite what we cannot enumerate, so withhold the whole thing.
+    if url
+        .query_pairs()
+        .any(|(k, _)| k.eq_ignore_ascii_case("password"))
+    {
+        return "<redacted dsn>".to_string();
     }
+    if url.password().is_some() {
+        let _ = url.set_password(Some("***"));
+    }
+    url.to_string()
 }
 
 // ── Verification driver (db-gated) ───────────────────────────────────────────
 
 /// One shard to inspect: its logical id and the DSN of the **restored scratch**
 /// database that holds it.
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", feature = "testing"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardTarget {
     /// The logical shard id, matching what `ExecutionId::shard()` decodes.
@@ -749,7 +848,7 @@ pub struct ShardTarget {
     pub dsn: String,
 }
 
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", feature = "testing"))]
 impl ShardTarget {
     /// Build a target for `shard_id` at `dsn`.
     #[must_use]
@@ -762,13 +861,16 @@ impl ShardTarget {
 }
 
 /// Knobs for one verification run. Every field has a conservative default.
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", feature = "testing"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyOptions {
     /// How many non-terminal histories to sample and replay per shard.
     pub replay_sample: usize,
     /// Cap on rows returned per probe. Exact counts are always reported; only
     /// the sample identifiers are bounded.
+    ///
+    /// Floored at `1` at the probe site: a non-positive value would emit
+    /// `LIMIT 0` and make every probe read as clean.
     pub probe_limit: i64,
     /// Worker-heartbeat staleness threshold, in seconds, used by the
     /// dead-worker and broken-session probes.
@@ -783,7 +885,7 @@ pub struct VerifyOptions {
     pub scratch_ack: bool,
 }
 
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", feature = "testing"))]
 impl Default for VerifyOptions {
     fn default() -> Self {
         Self {
@@ -796,7 +898,7 @@ impl Default for VerifyOptions {
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", feature = "testing"))]
 impl VerifyOptions {
     /// Set the per-shard replay sample size (clamped to [`MAX_REPLAY_SAMPLE`]).
     #[must_use]
@@ -824,11 +926,12 @@ impl VerifyOptions {
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", feature = "testing"))]
 mod probes {
     use std::collections::BTreeMap;
 
     use chrono::{DateTime, Utc};
+    use diesel::OptionalExtension as _;
     use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz};
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
     use uuid::Uuid;
@@ -877,6 +980,10 @@ mod probes {
         workflow_exec_id: Uuid,
         #[diesel(sql_type = diesel::sql_types::Jsonb)]
         event_data: serde_json::Value,
+        /// Exact matching-row count, computed by a window function *before*
+        /// `LIMIT`, so truncation is detectable rather than silent.
+        #[diesel(sql_type = BigInt)]
+        total: i64,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -891,6 +998,37 @@ mod probes {
     /// selection predicates (or a hand-written `SELECT` in this module); it is
     /// never caller input, so the string interpolation carries no injection
     /// surface.
+    /// The session-reclaim candidate set the scanner will *act* on.
+    ///
+    /// `sessions::broken_session_candidates_query()` is only the broad SQL
+    /// scan; `sessions::resolve_broken_reason` then applies one Rust-side
+    /// suppression the SQL cannot express — a session whose ONLY qualifying
+    /// reason is an elapsed lease, but which still has a `RUNNING` member
+    /// task, is deliberately NOT broken (the lease is refreshed on member
+    /// completion, so a long-running member is independent proof of progress).
+    ///
+    /// Reusing the scan alone would over-report. Mirror the suppression here
+    /// so the report matches what the fleet actually reclaims; the host and
+    /// owning-workflow reasons take priority in the scanner and so are
+    /// deliberately NOT suppressed.
+    fn session_candidates_matching_the_scanner() -> String {
+        format!(
+            "SELECT c.* FROM ({}) c WHERE NOT ( \
+               EXISTS (SELECT 1 FROM harvest_task_queue q \
+                       WHERE q.session_id = c.id AND q.state = 'RUNNING') \
+               AND NOT EXISTS (SELECT 1 FROM harvest_workflow_executions e2 \
+                       WHERE e2.id = c.workflow_exec_id \
+                         AND e2.state IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT', \
+                                          'TERMINATED', 'CONTINUED_AS_NEW')) \
+               AND EXISTS (SELECT 1 FROM harvest_workers w2 \
+                       WHERE w2.worker_id = c.host_worker_id \
+                         AND w2.last_heartbeat_at > NOW() - ($1::bigint * INTERVAL '1 second') \
+                         AND w2.status NOT IN ('Draining', 'Stopped')) \
+             )",
+            crate::sessions::broken_session_candidates_query()
+        )
+    }
+
     fn bounded(inner: &str, ident_expr: &str, limit: i64) -> String {
         format!(
             "SELECT {ident_expr} AS ident, COUNT(*) OVER () AS total \
@@ -983,8 +1121,23 @@ mod probes {
 
         let mut findings = Vec::new();
         let mut soft_errors: Vec<String> = Vec::new();
-        let limit = options.probe_limit;
-        let stale = options.worker_stale_secs;
+        // A non-positive limit would emit `LIMIT 0`: every probe returns no
+        // sample rows, every condition reads as absent, and the run exits 0
+        // having looked at nothing. Floor it at 1 so a mis-set knob degrades
+        // to "one sample per finding", never to a fabricated all-clear.
+        // (Exact counts come from `COUNT(*) OVER ()`, so they are unaffected.)
+        let limit = options.probe_limit.max(1);
+        // Clamp to the same bound the poison-pill reclaimer applies at its own
+        // entry point before binding. Without this an out-of-range
+        // `--worker-stale-secs` would have the report evaluate a threshold that
+        // scanner would never actually use, so the report would disagree with
+        // what the running fleet reclaims. (`sessions::enforce_broken_sessions`
+        // binds unclamped; we clamp both uniformly, which only diverges for
+        // absurd inputs -- above a year, or negative -- and diverges toward a
+        // value Postgres interval arithmetic can actually represent.)
+        let stale = options
+            .worker_stale_secs
+            .clamp(0, crate::poison_pill::MAX_WORKER_STALE_SECS);
 
         // ── Reclaimable: what the existing scanners will heal ───────────────
         //
@@ -1018,6 +1171,15 @@ mod probes {
             ),
             (
                 FindingClass::WorkflowDeadlineExpired,
+                // The one predicate reused here that the engine does NOT
+                // execute: `workflow_execution_timeout_query` renders `NOW()`
+                // illustratively and the real scanner
+                // (`enforce_workflow_execution_timeouts`) uses the equivalent
+                // Diesel DSL with a Rust-captured `now`. The two are
+                // semantically identical and `timeout.rs` pins the const's
+                // shape, but a DSL-only change would not break this reuse --
+                // so unlike every sibling probe, this one is faithful by
+                // review rather than by construction.
                 bounded(
                     crate::timeout::workflow_execution_timeout_query(),
                     "sub.id::text",
@@ -1036,9 +1198,19 @@ mod probes {
                 None,
             ),
             (
+                FindingClass::WedgedScheduleClaim,
+                bounded(
+                    "SELECT s.id FROM harvest_schedules s \
+                     WHERE s.fire_claim_token IS NOT NULL AND s.fire_claimed_until IS NULL",
+                    "sub.id::text",
+                    limit,
+                ),
+                None,
+            ),
+            (
                 FindingClass::ExpiredSessionLease,
                 bounded(
-                    crate::sessions::broken_session_candidates_query(),
+                    &session_candidates_matching_the_scanner(),
                     "sub.id::text",
                     limit,
                 ),
@@ -1102,26 +1274,51 @@ mod probes {
         }
 
         // ── Non-terminal population + newest event timestamp ────────────────
-        let non_terminal: i64 = diesel::sql_query(
+        // Both reads feed operator-visible report fields, and a swallowed
+        // error here is the worst possible failure mode: a count that reads
+        // `0` looks like a drained fleet, and a `None` timestamp silently
+        // disables the cross-shard skew check. Record the error instead so
+        // the shard is Undetermined rather than falsely clean.
+        let non_terminal: Option<i64> = match diesel::sql_query(
             "SELECT COUNT(*) AS n FROM harvest_workflow_executions \
              WHERE state IN ('RUNNING', 'PAUSED', 'SUSPENDED')",
         )
         .get_result::<CountRow>(&mut conn)
         .await
-        .map(|r| r.n)
-        .unwrap_or(0);
+        {
+            Ok(r) => Some(r.n),
+            Err(e) => {
+                soft_errors.push(format!("non-terminal execution count failed: {e}"));
+                None
+            }
+        };
 
         let latest_event_at =
-            diesel::sql_query("SELECT MAX(timestamp) AS latest FROM harvest_events")
+            match diesel::sql_query("SELECT MAX(timestamp) AS latest FROM harvest_events")
                 .get_result::<LatestEventRow>(&mut conn)
                 .await
-                .ok()
-                .and_then(|r| r.latest);
+            {
+                Ok(r) => r.latest,
+                Err(e) => {
+                    soft_errors.push(format!("latest event timestamp probe failed: {e}"));
+                    None
+                }
+            };
 
         // ── Cross-shard references asserted by this shard's history ─────────
         let mut refs = Vec::new();
         match collect_refs(&mut conn, shard_id, limit).await {
-            Ok(r) => refs = r,
+            Ok(scan) => {
+                refs = scan.refs;
+                // A truncated scan did not adjudicate the remainder, so it is
+                // Undetermined -- never a silent pass.
+                if let Some(note) = scan.truncation {
+                    soft_errors.push(note);
+                }
+                if let Some(advisory) = scan.workflow_id_targets {
+                    findings.push(advisory);
+                }
+            }
             Err(e) => soft_errors.push(e),
         }
 
@@ -1158,7 +1355,7 @@ mod probes {
                 reachable: true,
                 unreachable_reason: None,
                 latest_event_at,
-                non_terminal_executions: u64::try_from(non_terminal).unwrap_or(0),
+                non_terminal_executions: non_terminal.and_then(|n| u64::try_from(n).ok()),
                 replay,
                 findings,
             },
@@ -1172,9 +1369,23 @@ mod probes {
         conn: &mut AsyncPgConnection,
         shard_id: i32,
         limit: i64,
-    ) -> Result<Vec<PendingRef>, String> {
-        let scan = scan_reference_events(conn, limit).await?;
-        Ok(build_refs(scan, shard_id))
+    ) -> Result<CollectedRefs, String> {
+        let (scan, truncation) = scan_reference_events(conn, limit).await?;
+        let workflow_id_targets = scan.workflow_id_targets.clone();
+        Ok(CollectedRefs {
+            refs: build_refs(scan, shard_id),
+            truncation,
+            workflow_id_targets,
+        })
+    }
+
+    /// What one shard's reference scan produced: the cross-shard references to
+    /// adjudicate, an optional truncation note, and an optional advisory for
+    /// business-key-addressed requests that carry no execution id.
+    struct CollectedRefs {
+        refs: Vec<PendingRef>,
+        truncation: Option<String>,
+        workflow_id_targets: Option<Finding>,
     }
 
     /// The per-owning-execution reference bookkeeping one shard's history
@@ -1189,19 +1400,25 @@ mod probes {
         requested: BTreeMap<Uuid, Vec<(Uuid, Uuid)>>,
         /// owner -> correlation ids whose terminal the owner recorded.
         resolved: BTreeMap<Uuid, Vec<Uuid>>,
+        /// Advisory for business-key-addressed external requests, which carry
+        /// no execution id to adjudicate.
+        workflow_id_targets: Option<Finding>,
     }
 
     /// Read this shard's child/external history events and fold them into a
     /// [`RefScan`].
+    ///
+    /// Returns the fold plus, when the scan was truncated, a note for the
+    /// caller to raise as `ProbeFailed`.
     async fn scan_reference_events(
         conn: &mut AsyncPgConnection,
         limit: i64,
-    ) -> Result<RefScan, String> {
+    ) -> Result<(RefScan, Option<String>), String> {
         // Only non-terminal owning executions matter — a terminal parent's
         // recorded child terminal is history, not a live dependency, and
         // retention may legitimately have collected the child.
         let sql = format!(
-            "SELECT ev.workflow_exec_id, ev.event_data \
+            "SELECT ev.workflow_exec_id, ev.event_data, COUNT(*) OVER () AS total \
              FROM harvest_events ev \
              JOIN harvest_workflow_executions e ON e.id = ev.workflow_exec_id \
              WHERE e.state IN ('RUNNING', 'PAUSED', 'SUSPENDED') \
@@ -1218,11 +1435,54 @@ mod probes {
             .await
             .map_err(|e| format!("cross-shard reference scan failed: {e}"))?;
 
+        // Truncation handling, in two parts.
+        //
+        // (1) The cut must land on an execution BOUNDARY. The scan is ordered
+        //     `(workflow_exec_id, event_id)`, so a raw `LIMIT` slices through
+        //     the middle of the last execution -- keeping its
+        //     `ChildWorkflowStarted` but dropping the matching
+        //     `ChildWorkflowCompleted`. `build_refs` would then classify that
+        //     child as still-awaited rather than terminal-recorded, and
+        //     `resolve_refs` would report `ChildExecutionMissing` --
+        //     Incoherent, exit 1, "do not start workers" -- on a healthy
+        //     restore whose child had simply been collected by retention.
+        //     Dropping the partial tail makes that false positive impossible.
+        //
+        // (2) Whatever we dropped was NOT adjudicated, so it is Undetermined.
+        //     Reporting a clean verdict over an arbitrary 1000-event prefix of
+        //     a real fleet is exactly the false-clean this module exists to
+        //     refuse.
+        let total = rows.as_slice().first().map_or(0, |r| r.total);
+        let truncated = total > i64::try_from(rows.len()).unwrap_or(i64::MAX);
+        let rows: Vec<EventRow> = if truncated {
+            let boundary = rows.as_slice().last().map(|r| r.workflow_exec_id);
+            rows.into_iter()
+                .filter(|r| Some(r.workflow_exec_id) != boundary)
+                .collect()
+        } else {
+            rows
+        };
+        let truncation = truncated.then(|| {
+            format!(
+                "cross-shard reference scan truncated: {} of {total} matching events \
+                 inspected (probe_limit={limit}); the remainder was NOT adjudicated",
+                rows.len()
+            )
+        });
+
+        Ok((fold_reference_events(rows), truncation))
+    }
+
+    /// Fold decoded child/external events into a [`RefScan`].
+    ///
+    /// Split out of `scan_reference_events` so the SQL/truncation half and the
+    /// event-decoding half stay separately readable.
+    fn fold_reference_events(rows: Vec<EventRow>) -> RefScan {
         let mut scan = RefScan::default();
         // `ExternalTarget::WorkflowId` requests resolve by business key at
         // delivery time, not by a fixed execution id, so there is no row this
         // check could look up -- they are deliberately not tracked here.
-        let mut workflow_id_targets: u64 = 0;
+        let mut workflow_id_targets: Vec<String> = Vec::new();
 
         for row in rows {
             let Ok(event) = serde_json::from_value::<WorkflowEvent>(row.event_data) else {
@@ -1253,7 +1513,12 @@ mod probes {
                         .entry(owner)
                         .or_default()
                         .push((signal_id.as_uuid(), t.as_uuid())),
-                    ExternalTarget::WorkflowId { .. } => workflow_id_targets += 1,
+                    ExternalTarget::WorkflowId {
+                        workflow_name,
+                        workflow_id,
+                    } => workflow_id_targets.push(format!(
+                        "signal -> {workflow_name}/{workflow_id} (from {owner})"
+                    )),
                 },
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => match target {
                     ExternalTarget::ExecutionId(t) => scan
@@ -1261,7 +1526,12 @@ mod probes {
                         .entry(owner)
                         .or_default()
                         .push((cancel_id.as_uuid(), t.as_uuid())),
-                    ExternalTarget::WorkflowId { .. } => workflow_id_targets += 1,
+                    ExternalTarget::WorkflowId {
+                        workflow_name,
+                        workflow_id,
+                    } => workflow_id_targets.push(format!(
+                        "cancel -> {workflow_name}/{workflow_id} (from {owner})"
+                    )),
                 },
                 WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
                     scan.requested
@@ -1293,8 +1563,21 @@ mod probes {
                 _ => {}
             }
         }
-        let _ = workflow_id_targets;
-        Ok(scan)
+        // A business-key-addressed request (#751) resolves at delivery time, so
+        // there is no fixed execution id to look up and we cannot adjudicate it.
+        // Every other unadjudicable case in this module gets an advisory
+        // (`UninspectedShardReference`, `ReplaySkippedNoHandler`); silently
+        // discarding these would be the one blind spot with no signal at all.
+        if !workflow_id_targets.is_empty() {
+            let n = workflow_id_targets.len() as u64;
+            scan.workflow_id_targets = Some(Finding::new(
+                FindingClass::WorkflowIdTargetUnchecked,
+                None,
+                n,
+                workflow_id_targets,
+            ));
+        }
+        scan
     }
 
     /// Turn a shard-local [`RefScan`] into the cross-shard references that still
@@ -1306,6 +1589,7 @@ mod probes {
             child_terminal,
             requested,
             resolved,
+            workflow_id_targets: _,
         } = scan;
 
         let mut out = Vec::new();
@@ -1476,6 +1760,80 @@ mod probes {
     /// A reference pointing at a shard whose DSN was not supplied cannot be
     /// adjudicated either way, so it is reported as an advisory rather than
     /// silently passing.
+    /// The per-reference adjudication buckets for one owning shard.
+    #[derive(Default)]
+    struct RefBuckets {
+        missing_child: Vec<String>,
+        rolled_back: Vec<String>,
+        missing_external: Vec<String>,
+        pending_external: Vec<String>,
+        lookup_errors: Vec<String>,
+    }
+
+    /// Look up each reference's target on its owning shard and bucket the
+    /// verdict. Split out of `resolve_refs` so the per-shard connection
+    /// handling and the per-reference verdict logic stay separately readable.
+    async fn adjudicate_refs(conn: &mut AsyncPgConnection, owned: &[&PendingRef]) -> RefBuckets {
+        let mut out = RefBuckets::default();
+        for r in owned {
+            // `.optional()` is load-bearing: `get_result` returns
+            // `Err(NotFound)` for zero rows AND `Err(DatabaseError)` for a
+            // real failure. Collapsing both with `.ok()` would make a
+            // transient query error read as "this execution is absent" --
+            // an Incoherent verdict (exit 1, "do not start workers") on a
+            // perfectly good restore -- and, for a recorded terminal, read
+            // as ordinary retention, hiding a genuine rollback.
+            let looked_up =
+                diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
+                    .bind::<diesel::sql_types::Uuid, _>(r.target)
+                    .get_result::<StateRow>(conn)
+                    .await
+                    .optional();
+
+            let state: Option<String> = match looked_up {
+                Ok(row) => row.map(|row| row.state),
+                Err(e) => {
+                    out.lookup_errors
+                        .push(format!("{} lookup failed: {e}", r.target));
+                    continue;
+                }
+            };
+
+            match (r.kind, state) {
+                (RefKind::AwaitedChild, None) => {
+                    out.missing_child.push(format!(
+                        "{} (awaited by {} on shard {})",
+                        r.target, r.source_exec, r.source_shard
+                    ));
+                }
+                (RefKind::ChildTerminalRecorded, Some(s))
+                    if !crate::erase::is_terminal_state(&s) =>
+                {
+                    out.rolled_back.push(format!(
+                        "{} is {s} on shard {} but {} on shard {} recorded its terminal",
+                        r.target, r.owner_shard, r.source_exec, r.source_shard
+                    ));
+                }
+                // A recorded child terminal whose execution row is gone is
+                // ordinary retention, not incoherence.
+                (RefKind::ChildTerminalRecorded, _) | (RefKind::AwaitedChild, Some(_)) => {}
+                (RefKind::ExternalTarget, None) => {
+                    out.missing_external.push(format!(
+                        "{} (requested by {} on shard {})",
+                        r.target, r.source_exec, r.source_shard
+                    ));
+                }
+                (RefKind::ExternalTarget, Some(_)) => {
+                    out.pending_external.push(format!(
+                        "{} (requested by {} on shard {})",
+                        r.target, r.source_exec, r.source_shard
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     pub(super) async fn resolve_refs(refs: &[PendingRef], targets: &[ShardTarget]) -> Vec<Finding> {
         use std::collections::BTreeSet;
 
@@ -1504,64 +1862,48 @@ mod probes {
             if owned.is_empty() {
                 continue;
             }
-            let Ok(mut conn) = connect_read_only(&target.dsn).await else {
-                // Unreachability is already reported by `verify_shard`.
-                continue;
+            // This is a SECOND, independent connection: `verify_shard` opened
+            // and dropped its own long before we got here. So a failure now is
+            // NOT "already reported by verify_shard" -- that shard is recorded
+            // `reachable: true` and carries no unreachable finding, meaning a
+            // silent `continue` here would drop every cross-shard check for it
+            // and still report exit 0. That is precisely the false-clean the
+            // Undetermined tier exists to prevent.
+            let mut conn = match connect_read_only(&target.dsn).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    findings.push(Finding::new(
+                        FindingClass::ProbeFailed,
+                        Some(target.shard_id),
+                        1,
+                        vec![format!(
+                            "cross-shard reference resolution could not connect to \
+                             shard {}: {e}",
+                            target.shard_id
+                        )],
+                    ));
+                    continue;
+                }
             };
 
-            let mut missing_child = Vec::new();
-            let mut rolled_back = Vec::new();
-            let mut missing_external = Vec::new();
-            let mut pending_external = Vec::new();
-
-            for r in owned {
-                let state: Option<String> = diesel::sql_query(
-                    "SELECT state FROM harvest_workflow_executions WHERE id = $1",
-                )
-                .bind::<diesel::sql_types::Uuid, _>(r.target)
-                .get_result::<StateRow>(&mut conn)
-                .await
-                .ok()
-                .map(|row| row.state);
-
-                match (r.kind, state) {
-                    (RefKind::AwaitedChild, None) => {
-                        missing_child.push(format!(
-                            "{} (awaited by {} on shard {})",
-                            r.target, r.source_exec, r.source_shard
-                        ));
-                    }
-                    (RefKind::ChildTerminalRecorded, Some(s))
-                        if !crate::erase::is_terminal_state(&s) =>
-                    {
-                        rolled_back.push(format!(
-                            "{} is {s} on shard {} but {} on shard {} recorded its terminal",
-                            r.target, r.owner_shard, r.source_exec, r.source_shard
-                        ));
-                    }
-                    // A recorded child terminal whose execution row is gone is
-                    // ordinary retention, not incoherence.
-                    (RefKind::ChildTerminalRecorded, _) | (RefKind::AwaitedChild, Some(_)) => {}
-                    (RefKind::ExternalTarget, None) => {
-                        missing_external.push(format!(
-                            "{} (requested by {} on shard {})",
-                            r.target, r.source_exec, r.source_shard
-                        ));
-                    }
-                    (RefKind::ExternalTarget, Some(_)) => {
-                        pending_external.push(format!(
-                            "{} (requested by {} on shard {})",
-                            r.target, r.source_exec, r.source_shard
-                        ));
-                    }
-                }
-            }
+            let buckets = adjudicate_refs(&mut conn, &owned).await;
+            let RefBuckets {
+                missing_child,
+                rolled_back,
+                missing_external,
+                pending_external,
+                lookup_errors,
+            } = buckets;
 
             for (class, samples) in [
                 (FindingClass::ChildExecutionMissing, missing_child),
                 (FindingClass::ChildTerminalRolledBack, rolled_back),
                 (FindingClass::ExternalTargetMissing, missing_external),
                 (FindingClass::PendingExternalRequest, pending_external),
+                // A reference we could not adjudicate is Undetermined, never a
+                // pass: the row may be missing, or the query may simply have
+                // failed, and we must not guess which.
+                (FindingClass::ProbeFailed, lookup_errors),
             ] {
                 if !samples.is_empty() {
                     findings.push(Finding::new(
@@ -1621,7 +1963,7 @@ mod probes {
 ///
 /// Never mutates any database (AC4) and never starts a worker, a scanner, or a
 /// scheduler tick — the reclaimable classes are *reported*, never applied.
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", feature = "testing"))]
 pub async fn verify_restore(
     targets: &[ShardTarget],
     options: &VerifyOptions,
@@ -1639,19 +1981,60 @@ mod tests {
     }
 
     #[test]
-    fn severity_truth_table() {
+    fn severity_truth_table_is_pinned_for_every_class() {
+        // EXHAUSTIVE by construction: the expected table is matched against
+        // `FindingClass::ALL`, so demoting any single class (the mutation that
+        // previously survived every test in this module) fails here, and
+        // adding a class without deciding its severity fails here too.
+        //
+        // Severity is the whole product: it decides the exit code, and
+        // therefore whether an operator starts workers on a broken fleet.
+        use FindingSeverity::{Advisory, Incoherent, Reclaimable, Undetermined};
+        let expected: &[(FindingClass, FindingSeverity)] = &[
+            // Heals itself once workers start.
+            (FindingClass::DeadWorkerRunningTask, Reclaimable),
+            (FindingClass::TimedOutTask, Reclaimable),
+            (FindingClass::WorkflowDeadlineExpired, Reclaimable),
+            (FindingClass::ExpiredScheduleClaim, Reclaimable),
+            (FindingClass::ExpiredSessionLease, Reclaimable),
+            (FindingClass::ExpiredMutexLease, Reclaimable),
+            (FindingClass::InflightCompletionDelivery, Reclaimable),
+            (FindingClass::PendingExternalRequest, Reclaimable),
+            // A broken invariant: no scanner repairs these.
+            (FindingClass::DanglingTaskExecution, Incoherent),
+            (FindingClass::DanglingEventExecution, Incoherent),
+            (FindingClass::ExternalTargetMissing, Incoherent),
+            (FindingClass::ChildExecutionMissing, Incoherent),
+            (FindingClass::WedgedScheduleClaim, Incoherent),
+            (FindingClass::ChildTerminalRolledBack, Incoherent),
+            (FindingClass::ReplayDivergence, Incoherent),
+            // Worth an operator's eye; does not fail the gate.
+            (FindingClass::RestorePointSkew, Advisory),
+            (FindingClass::ReplaySkippedNoHandler, Advisory),
+            (FindingClass::HistoryUnreadable, Advisory),
+            (FindingClass::UninspectedShardReference, Advisory),
+            (FindingClass::WorkflowIdTargetUnchecked, Advisory),
+            // Looked at nothing -- never a pass.
+            (FindingClass::ProbeFailed, Undetermined),
+        ];
         assert_eq!(
-            FindingClass::DeadWorkerRunningTask.severity(),
-            FindingSeverity::Reclaimable
+            expected.len(),
+            FindingClass::ALL.len(),
+            "every class must have a pinned severity"
         );
-        assert_eq!(
-            FindingClass::DanglingTaskExecution.severity(),
-            FindingSeverity::Incoherent
-        );
-        assert_eq!(
-            FindingClass::RestorePointSkew.severity(),
-            FindingSeverity::Advisory
-        );
+        for (class, want) in expected {
+            assert_eq!(
+                class.severity(),
+                *want,
+                "{class} severity changed -- this changes the exit code"
+            );
+        }
+        for class in FindingClass::ALL {
+            assert!(
+                expected.iter().any(|(c, _)| *c == class),
+                "{class} is not pinned in the severity truth table"
+            );
+        }
     }
 
     #[test]
@@ -1817,7 +2200,7 @@ mod tests {
             reachable: true,
             unreachable_reason: None,
             latest_event_at: None,
-            non_terminal_executions: 3,
+            non_terminal_executions: Some(3),
             replay: ReplaySummary {
                 sampled: 3,
                 clean: 2,

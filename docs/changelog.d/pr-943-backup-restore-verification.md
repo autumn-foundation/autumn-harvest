@@ -25,9 +25,13 @@ plus a read-only DB half (`db`-gated):
   `undetermined_outranks_incoherent_and_reclaimable`,
   `advisory_classes_never_escalate_the_verdict`) and the DB test
   `an_unmigrated_restore_is_undetermined_never_a_pass`.
-- **19 `FindingClass` variants** (8 reclaimable / 6 incoherent / 4 advisory / 1
+- **21 `FindingClass` variants** (8 reclaimable / 7 incoherent / 5 advisory / 1
   undetermined), each carrying a `const fn explanation()` that names the healing
   mechanism and its issue number, so the report teaches rather than just alarms.
+  The severity table is pinned exhaustively against `FindingClass::ALL`
+  (`severity_truth_table_is_pinned_for_every_class`), so demoting any single
+  class — which changes the exit code, and therefore whether an operator starts
+  workers on a broken fleet — fails a test.
 - **`VerifyStatus::{Clean, ResumableWithReclaim, Incoherent, Unavailable}`** with
   `const fn exit_code()` → 0 / 0 / 1 / 2.
 
@@ -95,13 +99,44 @@ runtime behavior change.** This is a CLI + docs + read-mostly verification slice
 over existing primitives; the only non-CLI production edits are three additive
 `WorkflowReplayer` accessors.
 
-**Tests.** 22 pure unit tests in `backup_verify.rs`; 10 testcontainers
-integration tests in `tests/integration/backup_verify_tests.rs` seeding the
-issue's ≥5 incoherence classes plus a pristine-restore control, an AC4
-never-mutates assertion (snapshots row counts and task states before/after), a
-genuine two-database cross-shard `child_terminal_rolled_back` case, an
-unreachable shard, and the unmigrated-database false-clean regression; 17 CLI
-tests in `autumn-harvest-cli/tests/integration/backup_verify_cli.rs` plus 3
-clap-parse unit tests. DB suites ran green against a real local Postgres 16 and
-are registered in `.github/ci/integration-suites.txt` for the Docker-backed
-Linux run.
+**Replay honesty.** The shipped `harvest` CLI links no application `#[workflow]`
+handlers, so its replayer is structurally empty and check (a) is **always**
+reported `NOT VERIFIED` — never silently claimed. `RestoreVerifyReport` carries
+a top-level `replay_verified: bool` so a JSON consumer can gate on it without
+re-deriving the rule, and the runbook's §4.3 leads with the limitation and gives
+the embedder recipe (call `verify_restore` from a binary that registers your
+handlers) for operators who want check (a) too.
+
+**Post-review hardening** (multi-angle review before submission): the severity
+table is now pinned exhaustively (a class demotion previously survived every
+test); `non_terminal_executions` became `Option<u64>` so a failed count probe
+reports `null` + `probe_failed` instead of a fabricated `0` that reads as a
+drained fleet, and a failed newest-event probe no longer silently disables the
+skew check; `probe_limit` is floored at `1` so a mis-set knob can never emit
+`LIMIT 0` and fabricate an all-clear; a new `wedged_schedule_claim` class
+(Incoherent) catches a torn claim pair (`fire_claim_token` set,
+`fire_claimed_until` NULL), which the scheduler's claim predicate can never
+match again — permanently wedged, not merely expired; the session-reclaim probe
+mirrors the scanner's Rust-side "elapsed lease but a member is still RUNNING"
+suppression instead of over-reporting; `--live-dsn` is repeatable so a sharded
+fleet is fully guarded, and a run whose guard did not actually run (no live DSN,
+or `--i-know-this-is-scratch`) now prints a `WARNING:` on stderr rather than
+being silently inert; and the runbook documents the read-only pin's
+connection-pooler caveat (session-scoped, so not durable under PgBouncer
+transaction pooling) plus the one reused predicate that is faithful by review
+rather than by construction.
+
+**Tests.** 22 pure unit tests in `backup_verify.rs` (including the exhaustive
+severity pin); 14 testcontainers integration tests in
+`tests/integration/backup_verify_tests.rs` seeding the issue's ≥5 incoherence
+classes plus a pristine-restore control, an AC4 never-mutates assertion that
+snapshots **state** (not just row counts) across every probed table and asserts
+the run genuinely found something, a direct SQLSTATE-25006 proof of the
+read-only pin, genuine two-database cross-shard `child_terminal_rolled_back`
+**and** `child_execution_missing` cases, the torn-claim and
+suppressed-session-lease predicate-fidelity cases, an unreachable shard, and the
+unmigrated-database false-clean regression; 22 CLI tests in
+`autumn-harvest-cli/tests/integration/backup_verify_cli.rs` plus 3 clap-parse
+unit tests. DB suites ran green against a real local Postgres 16 and are
+registered in `.github/ci/integration-suites.txt` for the Docker-backed Linux
+run.

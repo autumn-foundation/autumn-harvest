@@ -353,6 +353,47 @@ async fn verify_never_mutates_the_database() {
     )
     .await;
 
+    // Seed every table a probe reads, so "untouched" is a claim about the
+    // tables verify actually queries -- not a claim about three of them while
+    // six went unexercised.
+    let sched = uuid::Uuid::new_v4();
+    exec_sql(
+        &mut conn,
+        &format!(
+            "INSERT INTO harvest_schedules \
+             (id, workflow_name, schedule_expr, queue_name, workflow_input, is_paused, \
+              fire_claim_token, fire_claimed_until) \
+             VALUES ('{sched}', 'order_flow', '@every 60s', 'default', '{{}}'::jsonb, false, \
+                     gen_random_uuid(), NOW() - INTERVAL '1 hour')"
+        ),
+    )
+    .await;
+    exec_sql(
+        &mut conn,
+        &format!(
+            "INSERT INTO harvest_sessions \
+             (id, workflow_exec_id, host_worker_id, queue_name, state, expires_at) \
+             VALUES (gen_random_uuid(), '{}', 'dead-worker-2', 'default', 'ACTIVE', \
+                     NOW() - INTERVAL '1 hour')",
+            exec.as_uuid()
+        ),
+    )
+    .await;
+    exec_sql(
+        &mut conn,
+        &format!(
+            "INSERT INTO harvest_completion_deliveries \
+             (id, workflow_exec_id, shard_id, callback_index, workflow_name, workflow_id, \
+              target_url, event_filter, terminal_state, payload, state, attempt, \
+              max_attempts, retry_policy, next_attempt_at) \
+             VALUES (gen_random_uuid(), '{}', 0, 0, 'order_flow', 'o-2', \
+                     'https://example.invalid/hook', '{{}}'::jsonb, 'completed', \
+                     '{{}}'::jsonb, 'INFLIGHT', 1, 10, '{{}}'::jsonb, NOW())",
+            exec.as_uuid()
+        ),
+    )
+    .await;
+
     #[derive(diesel::QueryableByName)]
     struct Snap {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -363,13 +404,34 @@ async fn verify_never_mutates_the_database() {
         events: i64,
         #[diesel(sql_type = diesel::sql_types::Text)]
         task_states: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        exec_states: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        schedule_claims: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        session_states: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        delivery_states: String,
     }
+    // `state` is the field every scanner would MUTATE, so a snapshot that
+    // counts rows but never captures state cannot catch the regression this
+    // test exists for: a probe that reclaims instead of reporting.
     let snap_sql = "SELECT \
         (SELECT COUNT(*) FROM harvest_workflow_executions) AS execs, \
         (SELECT COUNT(*) FROM harvest_task_queue) AS tasks, \
         (SELECT COUNT(*) FROM harvest_events) AS events, \
         (SELECT COALESCE(string_agg(state || ':' || COALESCE(worker_id, '-'), ',' ORDER BY id), '') \
-           FROM harvest_task_queue) AS task_states";
+           FROM harvest_task_queue) AS task_states, \
+        (SELECT COALESCE(string_agg(state, ',' ORDER BY id), '') \
+           FROM harvest_workflow_executions) AS exec_states, \
+        (SELECT COALESCE(string_agg( \
+             COALESCE(fire_claim_token::text, '-') || ':' || \
+             COALESCE(fire_claimed_until::text, '-'), ',' ORDER BY id), '') \
+           FROM harvest_schedules) AS schedule_claims, \
+        (SELECT COALESCE(string_agg(state, ',' ORDER BY id), '') \
+           FROM harvest_sessions) AS session_states, \
+        (SELECT COALESCE(string_agg(state || ':' || attempt::text, ',' ORDER BY id), '') \
+           FROM harvest_completion_deliveries) AS delivery_states";
 
     let before: Snap = diesel::sql_query(snap_sql)
         .get_result(&mut conn)
@@ -392,6 +454,57 @@ async fn verify_never_mutates_the_database() {
     assert_eq!(
         before.task_states, after.task_states,
         "the verifier must never reclaim, only report"
+    );
+    assert_eq!(
+        before.exec_states, after.exec_states,
+        "no execution may be sealed TIMED_OUT by a read-only drill"
+    );
+    assert_eq!(
+        before.schedule_claims, after.schedule_claims,
+        "no schedule claim may be stolen by a read-only drill"
+    );
+    assert_eq!(
+        before.session_states, after.session_states,
+        "no session may be marked BROKEN by a read-only drill"
+    );
+    assert_eq!(
+        before.delivery_states, after.delivery_states,
+        "no completion delivery may be re-attempted by a read-only drill"
+    );
+    // And the run must have genuinely LOOKED -- an all-clean report here would
+    // mean the assertions above passed vacuously.
+    let report = verify_restore(&one_shard(&url), &opts(), &WorkflowReplayer::new()).await;
+    assert!(
+        report.all_findings().count() > 0,
+        "the seeded fixtures must have produced findings; otherwise \
+         `untouched` proves nothing: {report:?}"
+    );
+}
+
+/// AC4, mechanically: the read-only session pin is a *server*-enforced
+/// guarantee, not a promise about our own SQL. Prove Postgres rejects a write
+/// with SQLSTATE 25006 once the pin the verifier issues is in effect.
+#[tokio::test]
+async fn the_read_only_session_pin_makes_postgres_reject_writes() {
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    diesel::sql_query(autumn_harvest::backup_verify::READ_ONLY_SESSION_SQL)
+        .execute(&mut conn)
+        .await
+        .expect("pin the session read-only");
+
+    let err = diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions (id, workflow_name, workflow_id, state, input) \
+         VALUES (gen_random_uuid(), 'x', 'x', 'RUNNING', '{}'::jsonb)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect_err("a write on a read-only session must be refused by the server");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read-only transaction"),
+        "expected SQLSTATE 25006 (read-only transaction), got: {msg}"
     );
 }
 
@@ -438,6 +551,125 @@ async fn detects_cross_shard_child_terminal_rolled_back() {
         "expected rolled-back child terminal: {report:#?}"
     );
     assert_eq!(report.status, VerifyStatus::Incoherent);
+}
+
+/// The success metric names "cross-shard missing child" explicitly, and it is a
+/// DIFFERENT invariant from a rolled-back terminal: the parent is still awaiting
+/// a child whose execution row is simply absent from the shard that owns it.
+#[tokio::test]
+async fn detects_cross_shard_child_execution_missing() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+
+    let parent = ExecutionId::new_for_shard(ShardId::new(0));
+    let child = ExecutionId::new_for_shard(ShardId::new(1));
+
+    seed_execution(&mut a, parent, "parent_flow", "pf-2", "RUNNING", 0).await;
+    append_event(&mut a, parent, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        parent,
+        2,
+        "ChildWorkflowStarted",
+        json!({ "child_id": child.to_string(), "workflow_name": "child_flow", "input": {} }),
+    )
+    .await;
+    // No terminal recorded: the parent is still awaiting the child. Shard 1 is
+    // restored to a point BEFORE the child was ever created, so it has no row.
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::ChildExecutionMissing),
+        "an awaited child absent from its own shard is incoherent: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Incoherent);
+}
+
+/// A torn claim pair (`fire_claim_token` set, `fire_claimed_until` NULL) is
+/// PERMANENTLY wedged, not merely expired: the scheduler's claim predicate is
+/// `fire_claim_token IS NULL OR fire_claimed_until < NOW()`, which such a row
+/// satisfies neither half of. Reporting it as reclaimable would tell an
+/// operator to start workers on a schedule that will never fire again.
+#[tokio::test]
+async fn a_torn_schedule_claim_is_incoherent_not_reclaimable() {
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    exec_sql(
+        &mut conn,
+        "INSERT INTO harvest_schedules \
+         (id, workflow_name, schedule_expr, queue_name, workflow_input, is_paused, \
+          fire_claim_token, fire_claimed_until) \
+         VALUES (gen_random_uuid(), 'order_flow', '@every 60s', 'default', '{}'::jsonb, false, \
+                 gen_random_uuid(), NULL)",
+    )
+    .await;
+
+    let report = verify_restore(&one_shard(&url), &opts(), &WorkflowReplayer::new()).await;
+    assert!(
+        report.detected(FindingClass::WedgedScheduleClaim),
+        "a torn claim pair must be detected: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::ExpiredScheduleClaim),
+        "a NULL fire_claimed_until is not an EXPIRED claim: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Incoherent);
+}
+
+/// The session reclaim scanner does NOT break a session whose only qualifying
+/// reason is an elapsed lease while a member task is still `RUNNING`. Mirror
+/// that, or the report over-reports work the fleet will never actually do.
+#[tokio::test]
+async fn an_expired_lease_with_a_running_member_and_a_live_host_is_not_reported() {
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+
+    let exec = ExecutionId::new_for_shard(ShardId::new(0));
+    seed_execution(&mut conn, exec, "order_flow", "o-live", "RUNNING", 0).await;
+    // A genuinely LIVE host: fresh heartbeat, Active.
+    exec_sql(
+        &mut conn,
+        "INSERT INTO harvest_workers \
+         (worker_id, queues, shard_assignments, max_concurrency, in_flight_count, \
+          status, last_heartbeat_at, started_at, host) \
+         VALUES ('live-worker', '[\"default\"]'::jsonb, '[0]'::jsonb, 4, 0, \
+                 'Active', NOW(), NOW(), 'test-host')",
+    )
+    .await;
+    let session = uuid::Uuid::new_v4();
+    exec_sql(
+        &mut conn,
+        &format!(
+            "INSERT INTO harvest_sessions \
+             (id, workflow_exec_id, host_worker_id, queue_name, state, expires_at) \
+             VALUES ('{session}', '{}', 'live-worker', 'default', 'ACTIVE', \
+                     NOW() - INTERVAL '1 hour')",
+            exec.as_uuid()
+        ),
+    )
+    .await;
+    // ...and a member still in flight: independent proof of progress.
+    exec_sql(
+        &mut conn,
+        &format!(
+            "INSERT INTO harvest_task_queue \
+             (id, workflow_exec_id, task_type, queue_name, state, worker_id, started_at, \
+              scheduled_at, input, session_id) \
+             VALUES (gen_random_uuid(), '{}', 'activity', 'default', 'RUNNING', 'live-worker', \
+                     NOW(), NOW(), '{{}}'::jsonb, '{session}')",
+            exec.as_uuid()
+        ),
+    )
+    .await;
+
+    let report = verify_restore(&one_shard(&url), &opts(), &WorkflowReplayer::new()).await;
+    assert!(
+        !report.detected(FindingClass::ExpiredSessionLease),
+        "the scanner suppresses this case; the report must too: {report:#?}"
+    );
 }
 
 /// An unreachable shard must report `Unavailable` (exit 2) — never a false

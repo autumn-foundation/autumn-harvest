@@ -101,23 +101,29 @@ pub enum BackupCommand {
     /// Verify a restored (scratch) snapshot is resumable.
     Verify {
         /// A scratch-database DSN to inspect. Repeat once per shard. Accepts a
-        /// bare DSN (shard `0`) or an explicit `<shard_id>=<dsn>` pair.
+        /// bare DSN or an explicit `<shard_id>=<dsn>` pair. An unprefixed DSN
+        /// takes its POSITIONAL index as its shard id (first `--shard` is
+        /// shard `0`, second is shard `1`, ...) — so prefix explicitly
+        /// whenever your shard ids are not `0..n`.
         ///
         /// Supply EVERY shard: a cross-shard reference into a shard that was
         /// not supplied is reported as an advisory, never silently passed.
         #[arg(long = "shard", value_name = "DSN", required = true)]
         shards: Vec<String>,
 
-        /// The live (production) DSN to guard against. When a `--shard` target
+        /// A live (production) DSN to guard against. When a `--shard` target
         /// resolves to the same `(host, port, database)`, the run is refused
         /// unless `--i-know-this-is-scratch` is passed.
+        ///
+        /// Repeat once per live shard: a fleet whose other shards are not
+        /// named here is NOT guarded against, and the run warns saying so.
         #[arg(
-            long,
+            long = "live-dsn",
             value_name = "DSN",
             env = "HARVEST_DATABASE_URL",
             hide_env_values = true
         )]
-        live_dsn: Option<String>,
+        live_dsn: Vec<String>,
 
         /// Acknowledge that every `--shard` target is a throwaway scratch copy,
         /// overriding the live-DSN guard.
@@ -2802,7 +2808,7 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     {
         return run_backup_verify(
             shards,
-            live_dsn.as_deref(),
+            live_dsn,
             *i_know_this_is_scratch,
             *format,
             *replay_sample,
@@ -3686,31 +3692,63 @@ pub fn parse_shard_targets(raw: &[String]) -> Result<Vec<ShardTarget>, CliError>
 ///
 /// [`CliError::InvalidInput`] when a target matches `live` and `ack` is false.
 /// The message names the override flag and never echoes a password.
-pub fn scratch_guard(dsns: &[String], live: Option<&str>, ack: bool) -> Result<(), CliError> {
-    let Some(live) = live else {
-        return Ok(());
-    };
-    if ack {
+pub fn scratch_guard(dsns: &[String], live: &[String], ack: bool) -> Result<(), CliError> {
+    if ack || live.is_empty() {
         return Ok(());
     }
     for dsn in dsns {
-        // Strip an optional `<shard_id>=` prefix before comparing.
-        let candidate = match dsn.split_once('=') {
-            Some((head, tail)) if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) => {
-                tail
+        let candidate = strip_shard_prefix(dsn);
+        for l in live {
+            if dsn_targets_same_database(candidate, l) {
+                return Err(CliError::InvalidInput(format!(
+                    "refusing to verify `{}`: it resolves to the same database as the live \
+                     configuration. Restore into a scratch database first, or pass \
+                     --i-know-this-is-scratch if this really is a throwaway copy.",
+                    redact_dsn(candidate)
+                )));
             }
-            _ => dsn.as_str(),
-        };
-        if dsn_targets_same_database(candidate, live) {
-            return Err(CliError::InvalidInput(format!(
-                "refusing to verify `{}`: it resolves to the same database as the live \
-                 configuration. Restore into a scratch database first, or pass \
-                 --i-know-this-is-scratch if this really is a throwaway copy.",
-                redact_dsn(candidate)
-            )));
         }
     }
     Ok(())
+}
+
+/// Strip an optional `<shard_id>=` prefix from a `--shard` value.
+fn strip_shard_prefix(dsn: &str) -> &str {
+    match dsn.split_once('=') {
+        Some((head, tail)) if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) => tail,
+        _ => dsn,
+    }
+}
+
+/// The stderr notice to print when the live-DSN guard could not actually
+/// protect anything.
+///
+/// The guard is silent by design in two cases, and silence is the dangerous
+/// part: an operator who believes a safety net is engaged will point the
+/// command at whatever DSN is to hand. Say so out loud instead.
+///
+/// * No `--live-dsn` was supplied at all — nothing was compared.
+/// * `--i-know-this-is-scratch` was passed — the comparison was skipped.
+///
+/// Returns `None` when the guard genuinely ran against at least one live DSN.
+#[must_use]
+pub fn scratch_guard_warning(live: &[String], ack: bool) -> Option<String> {
+    if ack {
+        return Some(
+            "WARNING: --i-know-this-is-scratch was passed, so the live-database guard did \
+             NOT run. Nothing checked that these DSNs are scratch copies."
+                .to_string(),
+        );
+    }
+    if live.is_empty() {
+        return Some(
+            "WARNING: no --live-dsn was supplied (and HARVEST_DATABASE_URL is unset), so the \
+             live-database guard did NOT run. Pass --live-dsn once per live shard to be \
+             refused if a --shard target resolves to production."
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// Serialise a restore-verification report as pretty JSON.
@@ -3760,7 +3798,11 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
             let _ = writeln!(
                 out,
                 "\nshard {} ({}) — {} non-terminal execution(s)",
-                shard.shard_id, shard.dsn, shard.non_terminal_executions
+                shard.shard_id,
+                shard.dsn,
+                shard
+                    .non_terminal_executions
+                    .map_or_else(|| "unknown".to_string(), |n| n.to_string())
             );
         } else {
             let _ = writeln!(
@@ -3861,13 +3903,19 @@ pub fn backup_verify_gate(report: &RestoreVerifyReport) -> Option<CliError> {
 /// report fails the gate. The report itself is always printed first.
 pub async fn run_backup_verify(
     shards: &[String],
-    live_dsn: Option<&str>,
+    live_dsn: &[String],
     ack: bool,
     format: BackupVerifyFormat,
     replay_sample: usize,
     worker_stale_secs: i64,
 ) -> Result<(), CliError> {
     scratch_guard(shards, live_dsn, ack)?;
+    // Say out loud when the guard could not protect anything -- an operator
+    // who believes a safety net is engaged is the one who points this at
+    // production. On stderr so `-o json` stdout stays parseable.
+    if let Some(w) = scratch_guard_warning(live_dsn, ack) {
+        eprintln!("{w}");
+    }
     let targets = parse_shard_targets(shards)?;
 
     let options = VerifyOptions::default()

@@ -1,7 +1,9 @@
 //! Integration tests for the `harvest backup verify` subcommand (issue #943).
 //!
 //! Black-box tests over the crate's public backup-verify surface: the pure
-//! guard/format/gate helpers plus `run_backup_verify` end to end. The DB half is
+//! guard/format/gate helpers. `run_backup_verify` itself needs a live database
+//! and is not exercised here; its parts (guard, format, gate) are, and the DB
+//! half is
 //! covered by the core crate's `backup_verify_tests` integration suite; these
 //! tests own the *operator-facing contract*: the scratch-DSN guard (AC4), the
 //! exit-code mapping (`AC2d`), and the machine-readable report shape.
@@ -10,8 +12,8 @@ use autumn_harvest::backup_verify::{
     Finding, FindingClass, ReplaySummary, RestoreVerifyReport, ShardVerifyReport, VerifyStatus,
 };
 use autumn_harvest_cli::{
-    BackupVerifyFormat, backup_verify_gate, backup_verify_json, format_backup_verify_text,
-    parse_shard_targets, scratch_guard,
+    BackupVerifyFormat, CliError, backup_verify_gate, backup_verify_json,
+    format_backup_verify_text, parse_shard_targets, scratch_guard, scratch_guard_warning,
 };
 
 fn shard(findings: Vec<Finding>) -> ShardVerifyReport {
@@ -21,7 +23,7 @@ fn shard(findings: Vec<Finding>) -> ShardVerifyReport {
         reachable: true,
         unreachable_reason: None,
         latest_event_at: None,
-        non_terminal_executions: 3,
+        non_terminal_executions: Some(3),
         replay: ReplaySummary {
             sampled: 3,
             clean: 3,
@@ -43,7 +45,7 @@ fn report(findings: Vec<Finding>) -> RestoreVerifyReport {
 fn a_dsn_matching_the_live_config_is_refused_without_the_ack() {
     let live = "postgres://app:secret@prod-db.internal:5432/harvest";
     let same = "postgres://reader@prod-db.internal:5432/harvest";
-    let err = scratch_guard(&[same.to_string()], Some(live), false)
+    let err = scratch_guard(&[same.to_string()], &[live.to_string()], false)
         .expect_err("a live-matching DSN must be refused");
     let msg = err.to_string();
     assert!(
@@ -60,7 +62,7 @@ fn a_dsn_matching_the_live_config_is_refused_without_the_ack() {
 fn the_explicit_ack_overrides_the_live_dsn_guard() {
     let live = "postgres://app:secret@prod-db.internal:5432/harvest";
     let same = "postgres://reader@prod-db.internal:5432/harvest";
-    scratch_guard(&[same.to_string()], Some(live), true)
+    scratch_guard(&[same.to_string()], &[live.to_string()], true)
         .expect("an explicit acknowledgement must be honoured");
 }
 
@@ -68,18 +70,68 @@ fn the_explicit_ack_overrides_the_live_dsn_guard() {
 fn a_genuine_scratch_dsn_needs_no_ack() {
     let live = "postgres://app:secret@prod-db.internal:5432/harvest";
     let scratch = "postgres://postgres@127.0.0.1:5433/harvest_restore_drill";
-    scratch_guard(&[scratch.to_string()], Some(live), false)
+    scratch_guard(&[scratch.to_string()], &[live.to_string()], false)
         .expect("a genuinely different target must not be refused");
 }
 
 #[test]
-fn with_no_live_config_supplied_the_guard_is_inert() {
+fn with_no_live_config_supplied_the_guard_is_inert_but_says_so() {
     scratch_guard(
         &["postgres://postgres@127.0.0.1:5432/anything".to_string()],
-        None,
+        &[],
         false,
     )
     .expect("nothing to compare against means nothing to refuse");
+    // Inert is fine; SILENTLY inert is not -- an operator who believes the
+    // safety net is engaged is the one who points this at production.
+    let w = scratch_guard_warning(&[], false).expect("an unguarded run must warn");
+    assert!(
+        w.contains("--live-dsn"),
+        "the warning must name the fix: {w}"
+    );
+}
+
+#[test]
+fn the_ack_override_warns_that_nothing_was_checked() {
+    let w = scratch_guard_warning(
+        &["postgres://postgres@127.0.0.1:5432/live".to_string()],
+        true,
+    )
+    .expect("an acked run must warn that the guard did not run");
+    assert!(
+        w.contains("--i-know-this-is-scratch"),
+        "the warning must name the flag that disabled the guard: {w}"
+    );
+}
+
+#[test]
+fn a_run_guarded_against_a_real_live_dsn_does_not_warn() {
+    assert!(
+        scratch_guard_warning(
+            &["postgres://postgres@127.0.0.1:5432/live".to_string()],
+            false
+        )
+        .is_none(),
+        "a genuinely guarded run must be silent"
+    );
+}
+
+#[test]
+fn every_live_shard_dsn_is_guarded_against_not_just_the_first() {
+    // A sharded fleet needs one --live-dsn per live shard. The guard must
+    // compare against ALL of them, or naming shard 0 would let a --shard
+    // pointed at live shard 1 through.
+    let live = vec![
+        "postgres://postgres@127.0.0.1:5432/live0".to_string(),
+        "postgres://postgres@127.0.0.1:5432/live1".to_string(),
+    ];
+    let err = scratch_guard(
+        &["1=postgres://postgres@127.0.0.1:5432/live1".to_string()],
+        &live,
+        false,
+    )
+    .expect_err("the second live shard must be guarded against too");
+    assert!(matches!(err, CliError::InvalidInput(_)));
 }
 
 // ── AC3: multiple shard DSNs ───────────────────────────────────────────────
@@ -182,6 +234,34 @@ fn a_clean_report_passes_the_gate() {
 // ── AC2(d): the machine-readable report ────────────────────────────────────
 
 #[test]
+fn json_output_says_whether_replay_actually_ran() {
+    // A JSON consumer must be able to tell "the data is coherent" from "your
+    // workflow code still replays it" WITHOUT re-deriving the rule -- the
+    // shipped CLI can never do the latter.
+    let mut s = shard(Vec::new());
+    s.replay = ReplaySummary {
+        sampled: 4,
+        clean: 0,
+        divergent: 0,
+        skipped_no_handler: 4,
+        unreadable: 0,
+    };
+    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let v: serde_json::Value =
+        serde_json::from_str(&backup_verify_json(&r).expect("serialise")).expect("valid json");
+    assert_eq!(
+        v["replay_verified"],
+        serde_json::json!(false),
+        "an all-skipped run must not read as replay-verified: {v}"
+    );
+    assert_eq!(
+        v["status"],
+        serde_json::json!("clean"),
+        "skipping replay is not itself a failure: {v}"
+    );
+}
+
+#[test]
 fn json_output_is_machine_readable_and_carries_the_verdict() {
     let r = report(vec![Finding::new(
         FindingClass::ChildTerminalRolledBack,
@@ -234,14 +314,36 @@ fn text_output_reports_replay_coverage_honestly() {
     };
     let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
+    // `contains("skipped")` alone is not falsifiable -- the verified branch
+    // prints that word too. Pin the verdict token that only the unverified
+    // branch emits, so a renderer that silently claims coverage fails here.
     assert!(
-        text.contains("skipped"),
-        "a report where nothing was replayable must say so: {text}"
+        text.contains("NOT VERIFIED"),
+        "a report where nothing was replayable must say NOT VERIFIED: {text}"
     );
     assert!(
         !r.replay.verified(),
         "replay must not count as verified when every sample was skipped"
     );
+}
+
+#[test]
+fn text_output_does_not_claim_not_verified_when_replay_really_ran() {
+    let mut s = shard(Vec::new());
+    s.replay = ReplaySummary {
+        sampled: 5,
+        clean: 5,
+        divergent: 0,
+        skipped_no_handler: 0,
+        unreadable: 0,
+    };
+    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let text = format_backup_verify_text(&r);
+    assert!(
+        !text.contains("NOT VERIFIED"),
+        "genuine replay coverage must not be reported as unverified: {text}"
+    );
+    assert!(r.replay.verified(), "5 clean of 5 sampled is verified");
 }
 
 #[test]
