@@ -41,17 +41,18 @@ use autumn_harvest::audit::{
     OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
     OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_QUEUE_PAUSE,
-    OP_QUEUE_RESUME, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
-    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
-    OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN,
-    OP_WORKFLOW_ANNOTATE, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE,
-    OP_WORKFLOW_RERUN, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL,
-    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
-    OP_WORKFLOW_UPDATE_WITH_START, RouteClass, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT,
-    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE,
-    TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
-    deny_readonly_mutation,
+    OP_QUEUE_RESUME, OP_RATE_LIMIT_OVERRIDE_CLEAR, OP_RATE_LIMIT_OVERRIDE_SET,
+    OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
+    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE,
+    OP_START_THROTTLE_OVERRIDE_CLEAR, OP_START_THROTTLE_OVERRIDE_SET, OP_TASK_REPRIORITIZE,
+    OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN, OP_WORKFLOW_ANNOTATE, OP_WORKFLOW_CANCEL,
+    OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RERUN, OP_WORKFLOW_RESET,
+    OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
+    OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, RouteClass, SOURCE_API, STATUS_FAILED,
+    STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING,
+    TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RETENTION, TARGET_SCHEDULE,
+    TARGET_TASK, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW, deny_readonly_mutation,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -5008,8 +5009,16 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(list_rate_limits).route_layer(require_admin.clone()),
         )
         .route(
-            "/admin/rate-limits/{key}",
-            post(set_rate_limit).route_layer(require_admin.clone()),
+            "/admin/rate-limits/{activity_name}/override",
+            post(set_activity_pacing_override)
+                .delete(clear_activity_pacing_override)
+                .route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/start-throttle/{workflow_name}/override",
+            post(set_workflow_pacing_override)
+                .delete(clear_workflow_pacing_override)
+                .route_layer(require_admin.clone()),
         )
         .route(
             "/admin/circuits",
@@ -6129,7 +6138,10 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/debounce"),
         ("GET", "/admin/start-throttle"),
         ("GET", "/admin/rate-limits"),
-        ("POST", "/admin/rate-limits/{key}"),
+        ("POST", "/admin/rate-limits/{activity_name}/override"),
+        ("DELETE", "/admin/rate-limits/{activity_name}/override"),
+        ("POST", "/admin/start-throttle/{workflow_name}/override"),
+        ("DELETE", "/admin/start-throttle/{workflow_name}/override"),
         ("GET", "/admin/circuits"),
         ("GET", "/admin/circuits/{activity_name}"),
         ("POST", "/admin/circuits/{activity_name}/force-open"),
@@ -7507,7 +7519,26 @@ pub const fn management_api_response_fields()
         ("GET", "/admin/debounce", None), // Vec<PendingDebounceRecord> (external model)
         ("GET", "/admin/start-throttle", None), // Vec<ThrottleBacklogEntry> (external model)
         ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucket> (external model)
-        ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
+        (
+            "POST",
+            "/admin/rate-limits/{activity_name}/override",
+            Some(&["ok"]),
+        ),
+        (
+            "DELETE",
+            "/admin/rate-limits/{activity_name}/override",
+            Some(&["ok"]),
+        ),
+        (
+            "POST",
+            "/admin/start-throttle/{workflow_name}/override",
+            Some(&["ok"]),
+        ),
+        (
+            "DELETE",
+            "/admin/start-throttle/{workflow_name}/override",
+            Some(&["ok"]),
+        ),
         ("GET", "/admin/circuits", None), // Vec<CircuitSnapshot> (external model)
         (
             "GET",
@@ -32180,99 +32211,218 @@ async fn list_rate_limits(
     Ok(Json(merged.into_values().collect()))
 }
 
+/// Maximum lifetime of an emergency pacing override (24 hours).
+pub const PACING_OVERRIDE_MAX_TTL_SECS: u64 = 86_400;
+
 #[derive(Debug, Deserialize)]
-struct SetRateLimitRequest {
-    refill_rate: f64,
-    burst: f64,
+struct SetPacingOverrideRequest {
+    refill_per_sec: Option<f64>,
+    burst: Option<f64>,
+    ttl_secs: u64,
 }
 
-async fn set_rate_limit(
-    Extension(api_state): Extension<HarvestApiState>,
-    headers: axum::http::HeaderMap,
-    Path(key_param): Path<String>,
-    Json(request): Json<SetRateLimitRequest>,
-) -> Result<Json<BasicAck>, AutumnError> {
-    if request.refill_rate <= 0.0 {
-        return Err(AutumnError::bad_request_msg(
-            "refill_rate must be greater than zero",
-        ));
+fn validate_pacing_request(request: &SetPacingOverrideRequest) -> Result<(), AutumnError> {
+    if request.ttl_secs == 0 || request.ttl_secs > PACING_OVERRIDE_MAX_TTL_SECS {
+        return Err(AutumnError::bad_request_msg(format!(
+            "ttl_secs must be between 1 and {PACING_OVERRIDE_MAX_TTL_SECS}"
+        )));
     }
-    if request.burst < 1.0 {
-        return Err(AutumnError::bad_request_msg("burst must be at least 1.0"));
-    }
-
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "POST /admin/rate-limits/{key}";
-
-    let pool = api_state.storage_pool().map_err(map_error)?;
-
-    let upsert_sql = "INSERT INTO harvest_rate_limit_buckets \
-         (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at) \
-         VALUES ($1, $2, $3, $3, NOW(), NOW(), NOW()) \
-         ON CONFLICT (key) DO UPDATE \
-         SET refill_rate = EXCLUDED.refill_rate, \
-             burst = EXCLUDED.burst, \
-             tokens = LEAST(EXCLUDED.burst, harvest_rate_limit_buckets.tokens), \
-             last_refilled_at = NOW(), \
-             updated_at = NOW()";
-
-    // Fail fast on any shard error: an emergency throttle must be applied to the
-    // entire fleet.  A partial write would leave some shards with the old bucket
-    // while operators believe the limit is active everywhere.
-    let mut shard_error: Option<String> = None;
-
-    for (_shard, shard_pool) in pool.iter_shards() {
-        match acquire_conn(shard_pool).await {
-            Ok(mut conn) => {
-                if let Err(e) = diesel::sql_query(upsert_sql)
-                    .bind::<diesel::sql_types::Text, _>(&key_param)
-                    .bind::<diesel::sql_types::Double, _>(request.refill_rate)
-                    .bind::<diesel::sql_types::Double, _>(request.burst)
-                    .execute(&mut conn)
-                    .await
-                {
-                    tracing::warn!(key = %key_param, error = %e, "rate-limit upsert failed on shard");
-                    if shard_error.is_none() {
-                        shard_error = Some(e.to_string());
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(key = %key_param, error = %e, "failed to acquire shard connection for rate-limit upsert");
-                if shard_error.is_none() {
-                    shard_error = Some(format!("shard connection unavailable: {e}"));
-                }
-            }
+    for (name, value) in [
+        ("refill_per_sec", request.refill_per_sec),
+        ("burst", request.burst),
+    ] {
+        if value.is_some_and(|v| !v.is_finite() || v <= 0.0) {
+            return Err(AutumnError::bad_request_msg(format!(
+                "{name} must be finite and greater than zero"
+            )));
         }
     }
+    Ok(())
+}
 
-    let mut audit_conn = acquire_conn(pool.default_pool()).await?;
-    let (status, err_summary) = shard_error
-        .as_ref()
-        .map_or((STATUS_SUCCEEDED, None), |err_str| {
-            (STATUS_FAILED, Some(err_str.as_str()))
-        });
-    let ar = NewAuditRecord {
-        actor: &actor,
-        operation: "rate_limit_override",
-        target_type: "rate_limit",
-        target_id: Some(&key_param),
-        route_or_command: route,
-        request_id: request_id.as_deref(),
-        idempotency_key: None,
-        status,
-        error_summary: err_summary,
-        shard_id: None,
-        source: &source,
-    };
-    let _ = audit::insert_audit(&mut audit_conn, &ar).await;
-
-    if let Some(err_str) = shard_error {
+async fn mutate_pacing_override(
+    api_state: &HarvestApiState,
+    headers: &axum::http::HeaderMap,
+    kind: &'static str,
+    name: &str,
+    request: Option<&SetPacingOverrideRequest>,
+    operation: &'static str,
+    route: &'static str,
+) -> Result<Json<BasicAck>, AutumnError> {
+    if let Some(request) = request {
+        validate_pacing_request(request)?;
+    }
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut failures = Vec::new();
+    for (shard, shard_pool) in pool.iter_shards() {
+        let result = async {
+            let mut conn = acquire_conn(shard_pool).await?;
+            if let Some(request) = request {
+                diesel::sql_query("INSERT INTO harvest_pacing_overrides (policy_kind, declared_name, refill_per_sec, burst, expires_at) VALUES ($1,$2,$3,$4,NOW() + ($5 * INTERVAL '1 second')) ON CONFLICT (policy_kind, declared_name) DO UPDATE SET refill_per_sec=EXCLUDED.refill_per_sec, burst=EXCLUDED.burst, expires_at=EXCLUDED.expires_at, updated_at=NOW()")
+                    .bind::<diesel::sql_types::Text,_>(kind)
+                    .bind::<diesel::sql_types::Text,_>(name)
+                    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>,_>(request.refill_per_sec)
+                    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>,_>(request.burst)
+                    .bind::<diesel::sql_types::BigInt,_>(i64::try_from(request.ttl_secs).unwrap_or(i64::MAX))
+                    .execute(&mut conn).await.map_err(database_error)?;
+            } else {
+                diesel::sql_query("DELETE FROM harvest_pacing_overrides WHERE policy_kind=$1 AND declared_name=$2")
+                    .bind::<diesel::sql_types::Text,_>(kind).bind::<diesel::sql_types::Text,_>(name)
+                    .execute(&mut conn).await.map_err(database_error)?;
+            }
+            Ok::<_, AutumnError>(())
+        }.await;
+        if let Err(error) = result {
+            failures.push(format!("shard {shard}: {error}"));
+        }
+    }
+    let (actor, source, request_id) = audit_context(headers, api_state);
+    let summary = (!failures.is_empty()).then(|| failures.join("; "));
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+    let _ = audit::insert_audit(
+        &mut conn,
+        &NewAuditRecord {
+            actor: &actor,
+            operation,
+            target_type: kind,
+            target_id: Some(name),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: if summary.is_some() {
+                STATUS_FAILED
+            } else {
+                STATUS_SUCCEEDED
+            },
+            error_summary: summary.as_deref(),
+            shard_id: None,
+            source: &source,
+        },
+    )
+    .await;
+    if let Some(summary) = summary {
         return Err(AutumnError::service_unavailable_msg(format!(
-            "rate-limit override not fully applied — shard error: {err_str}"
+            "partial-shard failure: {summary}"
         )));
     }
     Ok(Json(BasicAck { ok: true }))
+}
+
+async fn set_activity_pacing_override(
+    Extension(state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+    Json(request): Json<SetPacingOverrideRequest>,
+) -> Result<Json<BasicAck>, AutumnError> {
+    let runtime = state.runtime().map_err(map_error)?;
+    let declared = runtime
+        .registry()
+        .activities
+        .get(&name)
+        .filter(|a| a.rate_limit_rps.is_some());
+    if declared.is_none() {
+        return Err(AutumnError::not_found_msg(format!(
+            "activity '{name}' has no declared rate limit"
+        )));
+    }
+    mutate_pacing_override(
+        &state,
+        &headers,
+        "activity",
+        &name,
+        Some(&request),
+        OP_RATE_LIMIT_OVERRIDE_SET,
+        "POST /admin/rate-limits/{activity_name}/override",
+    )
+    .await
+}
+
+async fn clear_activity_pacing_override(
+    Extension(state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<BasicAck>, AutumnError> {
+    let runtime = state.runtime().map_err(map_error)?;
+    if runtime
+        .registry()
+        .activities
+        .get(&name)
+        .and_then(|a| a.rate_limit_rps)
+        .is_none()
+    {
+        return Err(AutumnError::not_found_msg(format!(
+            "activity '{name}' has no declared rate limit"
+        )));
+    }
+    mutate_pacing_override(
+        &state,
+        &headers,
+        "activity",
+        &name,
+        None,
+        OP_RATE_LIMIT_OVERRIDE_CLEAR,
+        "DELETE /admin/rate-limits/{activity_name}/override",
+    )
+    .await
+}
+
+async fn set_workflow_pacing_override(
+    Extension(state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+    Json(request): Json<SetPacingOverrideRequest>,
+) -> Result<Json<BasicAck>, AutumnError> {
+    let runtime = state.runtime().map_err(map_error)?;
+    if runtime
+        .registry()
+        .workflows
+        .get(&name)
+        .and_then(|w| w.throttle)
+        .is_none()
+    {
+        return Err(AutumnError::not_found_msg(format!(
+            "workflow '{name}' has no declared throttle policy"
+        )));
+    }
+    mutate_pacing_override(
+        &state,
+        &headers,
+        "workflow",
+        &name,
+        Some(&request),
+        OP_START_THROTTLE_OVERRIDE_SET,
+        "POST /admin/start-throttle/{workflow_name}/override",
+    )
+    .await
+}
+
+async fn clear_workflow_pacing_override(
+    Extension(state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<BasicAck>, AutumnError> {
+    let runtime = state.runtime().map_err(map_error)?;
+    if runtime
+        .registry()
+        .workflows
+        .get(&name)
+        .and_then(|w| w.throttle)
+        .is_none()
+    {
+        return Err(AutumnError::not_found_msg(format!(
+            "workflow '{name}' has no declared throttle policy"
+        )));
+    }
+    mutate_pacing_override(
+        &state,
+        &headers,
+        "workflow",
+        &name,
+        None,
+        OP_START_THROTTLE_OVERRIDE_CLEAR,
+        "DELETE /admin/start-throttle/{workflow_name}/override",
+    )
+    .await
 }
 
 // ── Circuit Breaker Management (issue #369) ─────────────────────────────────

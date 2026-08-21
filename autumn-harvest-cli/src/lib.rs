@@ -582,6 +582,11 @@ enum Commands {
         #[command(subcommand)]
         command: RateLimitCommand,
     },
+    /// Manage temporary workflow start-throttle overrides.
+    Throttle {
+        #[command(subcommand)]
+        command: ThrottleCommand,
+    },
     /// Manage batch operations.
     Batch {
         #[command(subcommand)]
@@ -2167,16 +2172,33 @@ enum RateLimitCommand {
     /// Show all active per-activity rate limit token buckets and refill rates.
     Status,
     /// Insert or dynamically override a rate limit configuration.
-    Set {
-        /// Opaque rate limit identifier key.
-        key: String,
-        /// Rate at which tokens are added to the bucket per second.
+    Override {
+        activity_name: String,
         #[arg(long)]
-        refill_rate: f64,
-        /// Maximum capacity of the token bucket.
+        refill: Option<f64>,
         #[arg(long)]
-        burst: f64,
+        burst: Option<f64>,
+        #[arg(long)]
+        ttl: u64,
     },
+    /// Clear an activity override immediately.
+    Clear { activity_name: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum ThrottleCommand {
+    /// Temporarily override a declared workflow throttle.
+    Override {
+        workflow_name: String,
+        #[arg(long)]
+        refill: Option<f64>,
+        #[arg(long)]
+        burst: Option<f64>,
+        #[arg(long)]
+        ttl: u64,
+    },
+    /// Clear a workflow override immediately.
+    Clear { workflow_name: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2539,7 +2561,8 @@ impl Cli {
             Commands::Queue { command } => queue_request(command),
             Commands::Activity { command } => activity_request(command),
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
-            Commands::RateLimit { command } => Ok(rate_limit_request(command)),
+            Commands::RateLimit { command } => rate_limit_request(command),
+            Commands::Throttle { command } => throttle_request(command),
             Commands::Batch { command } => batch_request(command),
             Commands::Audit { command } => Ok(audit_request(command)),
             Commands::Gate { command } => gate_request(command),
@@ -2638,6 +2661,14 @@ fn build_routing_request(command: &BuildRoutingCommand) -> ApiRequest {
 }
 
 impl ApiRequest {
+    fn delete(path: impl Into<String>) -> Self {
+        Self {
+            method: ApiMethod::Delete,
+            path: path.into(),
+            body: None,
+        }
+    }
+
     fn get(path: impl Into<String>) -> Self {
         Self {
             method: ApiMethod::Get,
@@ -8139,20 +8170,46 @@ fn checked_activity_segment(activity_name: &str) -> Result<String, CliError> {
     Ok(path_segment(activity_name))
 }
 
-fn rate_limit_request(command: &RateLimitCommand) -> ApiRequest {
+fn rate_limit_request(command: &RateLimitCommand) -> Result<ApiRequest, CliError> {
     match command {
-        RateLimitCommand::Status => ApiRequest::get("/admin/rate-limits"),
-        RateLimitCommand::Set {
-            key,
-            refill_rate,
+        RateLimitCommand::Status => Ok(ApiRequest::get("/admin/rate-limits")),
+        RateLimitCommand::Override {
+            activity_name,
+            refill,
             burst,
-        } => ApiRequest::post(
-            format!("/admin/rate-limits/{}", path_segment(key)),
-            Some(json!({
-                "refill_rate": refill_rate,
-                "burst": burst,
-            })),
-        ),
+            ttl,
+        } => Ok(ApiRequest::post(
+            format!(
+                "/admin/rate-limits/{}/override",
+                checked_activity_segment(activity_name)?
+            ),
+            Some(json!({"refill_per_sec": refill, "burst": burst, "ttl_secs": ttl})),
+        )),
+        RateLimitCommand::Clear { activity_name } => Ok(ApiRequest::delete(format!(
+            "/admin/rate-limits/{}/override",
+            checked_activity_segment(activity_name)?
+        ))),
+    }
+}
+
+fn throttle_request(command: &ThrottleCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        ThrottleCommand::Override {
+            workflow_name,
+            refill,
+            burst,
+            ttl,
+        } => Ok(ApiRequest::post(
+            format!(
+                "/admin/start-throttle/{}/override",
+                checked_activity_segment(workflow_name)?
+            ),
+            Some(json!({"refill_per_sec": refill, "burst": burst, "ttl_secs": ttl})),
+        )),
+        ThrottleCommand::Clear { workflow_name } => Ok(ApiRequest::delete(format!(
+            "/admin/start-throttle/{}/override",
+            checked_activity_segment(workflow_name)?
+        ))),
     }
 }
 
@@ -11038,23 +11095,35 @@ mod reuse_policy_tests {
 
     #[test]
     #[allow(clippy::float_cmp)]
-    fn rate_limit_set_builds_post_request() {
+    fn rate_limit_override_builds_post_request() {
         let req = parse(&[
             "rate-limit",
-            "set",
-            "my-key",
-            "--refill-rate",
+            "override",
+            "email",
+            "--refill",
             "10.5",
             "--burst",
             "20",
+            "--ttl",
+            "60",
         ])
         .api_request()
         .unwrap();
         assert_eq!(req.method, ApiMethod::Post);
-        assert_eq!(req.path, "/admin/rate-limits/my-key");
+        assert_eq!(req.path, "/admin/rate-limits/email/override");
         let body = req.body.as_ref().unwrap();
-        assert_eq!(body["refill_rate"].as_f64().unwrap(), 10.5);
+        assert_eq!(body["refill_per_sec"].as_f64().unwrap(), 10.5);
         assert_eq!(body["burst"].as_f64().unwrap(), 20.0);
+        assert_eq!(body["ttl_secs"].as_u64().unwrap(), 60);
+    }
+
+    #[test]
+    fn throttle_clear_builds_delete_request() {
+        let req = parse(&["throttle", "clear", "checkout"])
+            .api_request()
+            .unwrap();
+        assert_eq!(req.method, ApiMethod::Delete);
+        assert_eq!(req.path, "/admin/start-throttle/checkout/override");
     }
 
     #[test]

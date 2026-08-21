@@ -15,9 +15,9 @@ use crate::schema::{
     harvest_calendars, harvest_completion_deliveries, harvest_completion_trigger_fires,
     harvest_completion_trigger_outbox, harvest_completion_triggers, harvest_dead_letters,
     harvest_events, harvest_execution_summaries, harvest_external_tasks, harvest_mutex_locks,
-    harvest_mutex_waiters, harvest_payload_refs, harvest_rate_limit_buckets,
-    harvest_schedule_decisions, harvest_schedules, harvest_sessions, harvest_signals,
-    harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
+    harvest_mutex_waiters, harvest_pacing_overrides, harvest_payload_refs,
+    harvest_rate_limit_buckets, harvest_schedule_decisions, harvest_schedules, harvest_sessions,
+    harvest_signals, harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
     harvest_workflow_executions, harvest_workflow_logs,
 };
 
@@ -562,6 +562,23 @@ pub struct NewRateLimitBucket<'a> {
     pub burst: f64,
     pub tokens: f64,
     pub last_refilled_at: DateTime<Utc>,
+}
+
+/// Shard-replicated pacing configuration; token enforcement remains shard-local.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_pacing_overrides)]
+#[diesel(primary_key(policy_kind, declared_name))]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct PacingOverride {
+    pub policy_kind: String,
+    pub declared_name: String,
+    pub refill_per_sec: Option<f64>,
+    pub burst: Option<f64>,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 // ── Schedule ──────────────────────────────────────────────────────────────────
