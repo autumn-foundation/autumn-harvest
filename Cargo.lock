@@ -286,6 +286,7 @@ dependencies = [
  "loom",
  "lru 0.16.4",
  "metrics",
+ "proc-macro2",
  "proptest",
  "rand 0.8.6",
  "schemars 0.8.22",
