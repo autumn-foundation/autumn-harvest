@@ -24,6 +24,80 @@ macro_rules! cfg_db {
     ($($item:item)*) => {};
 }
 
+/// Await a chaos injection point (statement position). See [`chaos`].
+///
+/// `#[allow(unused_macros)]`: every call site lives in a `#[cfg(feature =
+/// "db")]` module (`queue`, `worker`, `scheduler`, ...), so a no-`db` build
+/// (e.g. `--no-default-features --features testing`) compiles the macro but
+/// none of its invocations — an unused-macro warning that CI's `-D warnings`
+/// would fail on. Mirrors `chaos_fallible!`.
+#[cfg(feature = "chaos")]
+#[allow(unused_macros)]
+macro_rules! chaos_point {
+    ($name:ident) => {
+        $crate::chaos::hit($crate::chaos::points::$name).await
+    };
+}
+
+/// Await a chaos injection point (compiled out; const-checks the point name).
+#[cfg(not(feature = "chaos"))]
+#[allow(unused_macros)]
+macro_rules! chaos_point {
+    ($name:ident) => {{
+        const _: $crate::chaos::points::ChaosPoint = $crate::chaos::points::$name;
+    }};
+}
+
+/// Await a fallible chaos injection point at a `?` site; propagates an injected
+/// error via `From` into the enclosing function's error type. See [`chaos`].
+#[cfg(feature = "chaos")]
+#[allow(unused_macros)]
+macro_rules! chaos_fallible {
+    ($name:ident) => {
+        $crate::chaos::hit_fallible($crate::chaos::points::$name).await?
+    };
+}
+
+/// Fallible chaos injection point (compiled out; const-checks the point name).
+#[cfg(not(feature = "chaos"))]
+#[allow(unused_macros)]
+macro_rules! chaos_fallible {
+    ($name:ident) => {{
+        const _: $crate::chaos::points::ChaosPoint = $crate::chaos::points::$name;
+    }};
+}
+
+/// Ask a `LISTEN`/`NOTIFY` send site whether its wake should be dropped
+/// (expression position, evaluates to `bool`). Synchronous — no `.await`. See
+/// [`chaos`].
+#[cfg(feature = "chaos")]
+#[allow(unused_macros)]
+macro_rules! chaos_drop_notify {
+    ($name:ident) => {
+        $crate::chaos::should_drop_notify($crate::chaos::points::$name)
+    };
+}
+
+/// Drop-notify query (compiled out; const-checks the point name, always
+/// `false`). The `false` is a compile-time constant, so the guarded `NOTIFY`
+/// branch is dead-code-eliminated in a non-chaos build — zero hot-path cost.
+#[cfg(not(feature = "chaos"))]
+#[allow(unused_macros)]
+macro_rules! chaos_drop_notify {
+    ($name:ident) => {{
+        const _: $crate::chaos::points::ChaosPoint = $crate::chaos::points::$name;
+        false
+    }};
+}
+
+// Re-export the crate-internal chaos macros by path so injection sites can call
+// `crate::chaos_point!(NAME)` regardless of module-declaration order (a plain
+// `macro_rules!` is only visible by bare name to code textually after it). Each
+// `use` resolves to whichever cfg arm compiled, so it is config-agnostic. Not
+// `#[macro_export]`: these are test-harness internals, never public API.
+#[allow(unused_imports)]
+pub(crate) use {chaos_drop_notify, chaos_fallible, chaos_point};
+
 #[cfg(feature = "db")]
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();
@@ -92,6 +166,13 @@ pub mod calendar;
 /// Reserved names + predicates for the throwaway workflow that probes the live
 /// execution path. Distinct from the #512 replay canary.
 pub mod canary;
+/// Deterministic chaos/fault-injection test harness (issue #940).
+///
+/// [`chaos::points`] is unconditional (a zero-cost const catalogue of named
+/// injection points); the controller (`arm`, `hit`, `ChaosPlan`, ...) is
+/// `#[cfg(feature = "chaos")]` and never part of a production binary.
+#[doc(hidden)]
+pub mod chaos;
 /// Per-activity circuit breaker that fast-fails dispatch during downstream
 /// outages (issue #369).
 pub mod circuit_breaker;

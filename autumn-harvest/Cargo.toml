@@ -35,6 +35,11 @@ schema = ["dep:schemars"]
 # --workspace`, default features, never compiles wasmtime). See
 # docs/rnd/wasm-activities-spike.md.
 wasm-activities = ["dep:wasmtime", "dep:wat", "db"]
+# Deterministic chaos / fault-injection test harness (issue #940). Off by
+# default and never in `default`: injection points compile to a zero-cost
+# const-check when this feature is off, so a non-chaos build has no hot-path
+# cost (AC2/AC6). Requires `db` (the reproducers drive real Postgres paths).
+chaos = ["db"]
 
 [dependencies]
 autumn-harvest-macros = { version = "0.5.0", path = "../autumn-harvest-macros" }
@@ -198,6 +203,14 @@ schemars = { version = "0.8" }
 # so the integration test binaries can build guest modules regardless of feature
 # resolution.
 wat = "1"
+# Token-based scan of `src/` for the chaos-catalogue drift guard
+# (`tests/integration/chaos_catalogue_drift.rs`, issue #940): lexing each source
+# into a `TokenStream` drops comments and correctly delimits string / raw-string
+# / char literals, so a commented-out or stringified `chaos_point!(NAME)` is not
+# miscounted as live wiring. Already in the lockfile (the proc-macro crate depends
+# on it) at the workspace version, so `{ workspace = true }` unifies rather than
+# widening the graph — same rationale as the `tokio-util` dev-dep above.
+proc-macro2 = { workspace = true }
 
 # testcontainers pulls bollard -> hyper-util, which uses `tokio::net`. Under a
 # global `RUSTFLAGS="--cfg loom"` build tokio's `net` module is compiled out

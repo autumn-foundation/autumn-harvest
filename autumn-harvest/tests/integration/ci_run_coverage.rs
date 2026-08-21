@@ -182,6 +182,10 @@ const ALLOWLIST_KAFKA_BROKER_REASON: &str = "kafka-feature-gated: DOES run in CI
      vendored librdkafka on macOS/Windows). Not a coverage gap — see the `Run plugin Kafka broker connector tests` step.";
 const ALLOWLIST_WEBHOOKS_IGNORED_REASON: &str = "webhooks-feature-gated — not run in CI (no manifest row) — AND all tests are #[ignore]d \
      (TestDb/run_pending paved-path DB harness); tracked";
+const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): DOES run in CI, via a dedicated \
+     workflow_dispatch + nightly job (.github/workflows/chaos.yml) that runs the suite with >=5 distinct \
+     seeds — NOT the manifest's `test` job (chaos is `#[cfg(feature = \"chaos\")]`, off by default and \
+     seed-driven/slower, so it is deliberately not part of every PR run). Not a coverage gap.";
 
 const ALLOWLIST: &[(&str, &str)] = &[
     // ── core (autumn-harvest/tests/integration) ──
@@ -189,6 +193,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:build_routing_tests", ALLOWLIST_DEBT_REASON),
     ("core:cache_delta_load_tests", ALLOWLIST_DEBT_REASON),
     ("core:cancellation_tests", ALLOWLIST_DEBT_REASON),
+    ("core:chaos_tests", ALLOWLIST_CHAOS_REASON),
     ("core:child_policy_tests", ALLOWLIST_DEBT_REASON),
     ("core:cross_workflow_cancel_tests", ALLOWLIST_DEBT_REASON),
     ("core:cross_workflow_signal_tests", ALLOWLIST_DEBT_REASON),
@@ -284,7 +289,10 @@ const ALLOWLIST: &[(&str, &str)] = &[
 /// a whole-module row), `core:completion_callback_tests`, and
 /// `core:event_batch_tests`. 73 = minus `plugin:workflow_reachability_integration`,
 /// now wired to a covering `linux` manifest row (issue #700).
-const ALLOWLIST_MAX_LEN: usize = 74;
+/// 75 = plus `core:chaos_tests` (issue #940): a chaos-feature-gated suite that
+/// runs via a dedicated `.github/workflows/chaos.yml` seed-driven job, not the
+/// manifest `test` job — deliberate, not a coverage gap (see the reason above).
+const ALLOWLIST_MAX_LEN: usize = 75;
 
 fn allowlisted(key: &str) -> bool {
     ALLOWLIST.iter().any(|&(k, _)| k == key)

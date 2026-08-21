@@ -587,6 +587,11 @@ mod scanner {
         // nor the chrono::Duration re-check (in `worker_still_dead`) can ever
         // overflow on an out-of-range caller value.
         let worker_stale_secs = worker_stale_secs.clamp(0, super::MAX_WORKER_STALE_SECS);
+        // Chaos: inject a transient DB/connection error before the orphan scan
+        // (issue #940 AC1(b)). The reclaim is idempotent and the poll loop
+        // retries it on the next tick, so a transient error must not strand an
+        // orphaned RUNNING task with a dead worker.
+        crate::chaos_fallible!(POISON_RECLAIM_BEFORE_LOAD);
         let orphans: Vec<TaskQueueItem> = diesel::sql_query(orphaned_running_tasks_query())
             .bind::<diesel::sql_types::BigInt, _>(worker_stale_secs)
             .load(conn)

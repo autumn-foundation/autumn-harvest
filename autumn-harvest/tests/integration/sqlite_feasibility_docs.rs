@@ -199,17 +199,38 @@ const MECHANISMS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Re-derives the Postgres-coupling inventory from the core crate's sources.
+/// Modules deliberately excluded from the core Postgres-coupling audit.
 ///
-/// Returns `module name -> sorted set of mechanisms`, for every module that
-/// exhibits at least one. This is the ground truth the report is checked
-/// against; it is computed fresh on every run so the audit cannot go stale.
-fn detect_coupled_modules() -> BTreeMap<String, BTreeSet<&'static str>> {
+/// This report sizes the cost of porting the *engine* to an embedded `SQLite`
+/// backend, so "core module" means a production engine surface a port would
+/// have to carry. `chaos` is the issue-#940 deterministic fault-injection
+/// **test harness**: its `points` half is a zero-cost const catalogue with no
+/// Postgres coupling, and its only `diesel::`/`pg_notify` tokens live entirely
+/// in the `#[cfg(feature = "chaos")]` controller — a `From<ChaosError> for
+/// diesel::result::Error` conversion that *simulates* DB errors at injection
+/// points — plus one doc comment. It is never compiled into a production or
+/// default build, is never ported to `SQLite`, and is not an engine surface this
+/// report exists to judge. Auditing it would list a test scaffold among the
+/// modules leadership must decide to port — the opposite of the report's
+/// signal. So it is skipped here, exactly like the `bin` directory below, as an
+/// *explicit, documented* decision rather than a silent hole (the property
+/// `excluded_modules_all_exist` keeps the list from rotting past a rename).
+const AUDIT_EXCLUDED_MODULES: &[&str] = &["chaos"];
+
+/// Every auditable core `.rs` module directly under `autumn-harvest/src`, as
+/// `(module name, path)`.
+///
+/// The single source of truth for "core module", shared by the coupling
+/// detector and the derived-totals denominator so the two can never disagree
+/// about what is in scope. It asserts the tree is still flat (a nested module
+/// could carry coupling the inventory never sees) and applies the documented
+/// test-only exclusions above.
+fn core_module_files() -> Vec<(String, PathBuf)> {
     let src = repo_root().join("autumn-harvest/src");
     let entries = std::fs::read_dir(&src)
         .unwrap_or_else(|err| panic!("cannot read {}: {err}", src.display()));
 
-    let mut found: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
     let mut subdirs: Vec<String> = Vec::new();
     for entry in entries {
         let path = entry.expect("readable dir entry").path();
@@ -238,6 +259,32 @@ fn detect_coupled_modules() -> BTreeMap<String, BTreeSet<&'static str>> {
             .and_then(|s| s.to_str())
             .expect("module file stem")
             .to_string();
+        // Documented test-only exclusions — see AUDIT_EXCLUDED_MODULES.
+        if AUDIT_EXCLUDED_MODULES.contains(&module.as_str()) {
+            continue;
+        }
+        files.push((module, path));
+    }
+    assert!(
+        subdirs.is_empty(),
+        "`autumn-harvest/src` gained subdirectory module(s) {subdirs:?}, which this \
+         flat scan does not descend into. A nested module could carry Postgres \
+         coupling the inventory never sees — exactly the rot these guards exist to \
+         catch. Either make the scan recursive (and decide how nested modules are \
+         named in the inventory) or add the directory to the skip list with a \
+         reason."
+    );
+    files
+}
+
+/// Re-derives the Postgres-coupling inventory from the core crate's sources.
+///
+/// Returns `module name -> sorted set of mechanisms`, for every module that
+/// exhibits at least one. This is the ground truth the report is checked
+/// against; it is computed fresh on every run so the audit cannot go stale.
+fn detect_coupled_modules() -> BTreeMap<String, BTreeSet<&'static str>> {
+    let mut found: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
+    for (module, path) in core_module_files() {
         let body = read_normalized(&path);
 
         let mut mechanisms = BTreeSet::new();
@@ -254,15 +301,6 @@ fn detect_coupled_modules() -> BTreeMap<String, BTreeSet<&'static str>> {
         !found.is_empty(),
         "detector found no Postgres-coupled modules at all — the detector is \
          broken (or the source layout moved), not the report"
-    );
-    assert!(
-        subdirs.is_empty(),
-        "`autumn-harvest/src` gained subdirectory module(s) {subdirs:?}, which this \
-         flat scan does not descend into. A nested module could carry Postgres \
-         coupling the inventory never sees — exactly the rot these guards exist to \
-         catch. Either make the scan recursive (and decide how nested modules are \
-         named in the inventory) or add the directory to the skip list with a \
-         reason."
     );
     found
 }
@@ -400,6 +438,28 @@ fn report_exists_and_is_decision_ready() {
                 .filter(|l| l.starts_with('#'))
                 .collect::<Vec<_>>()
                 .join("\n")
+        );
+    }
+}
+
+/// The audit's own exceptions must be falsifiable.
+///
+/// A skip list is only honest while every entry names a module that actually
+/// exists — otherwise a rename or deletion leaves a stale exclusion that could
+/// silently swallow a *different*, real module later given the same file name.
+/// This mirrors `inventory_lists_no_module_that_is_not_actually_coupled`, which
+/// forbids the report itself from carrying phantom rows.
+#[test]
+fn excluded_modules_all_exist() {
+    let src = repo_root().join("autumn-harvest/src");
+    for excluded in AUDIT_EXCLUDED_MODULES {
+        let path = src.join(format!("{excluded}.rs"));
+        assert!(
+            path.exists(),
+            "`AUDIT_EXCLUDED_MODULES` skips `{excluded}`, but {} does not exist. \
+             A stale exclusion is a silent hole — remove the entry, or the audit \
+             could later miss a real module that reuses the name.",
+            path.display()
         );
     }
 }
@@ -660,13 +720,10 @@ fn derived_totals_agree_with_the_table_and_the_tree() {
         rows.len()
     );
 
-    // Denominator: total core modules, counted live.
-    let src = repo_root().join("autumn-harvest/src");
-    let total_modules = std::fs::read_dir(&src)
-        .unwrap_or_else(|err| panic!("cannot read {}: {err}", src.display()))
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rs"))
-        .count();
+    // Denominator: total core modules, counted live from the *same* source of
+    // truth as the coupling detector, so the two can never disagree about scope
+    // and the documented test-only exclusions are applied consistently.
+    let total_modules = core_module_files().len();
     let headline = format!("**{} of the {total_modules} core modules**", rows.len());
     assert!(
         report.contains(&headline),

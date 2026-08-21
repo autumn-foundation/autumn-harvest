@@ -31,6 +31,9 @@ mod cancellation_tests;
 mod capability_miss_tests;
 #[cfg(feature = "db")]
 mod chain_timeout_tests;
+mod chaos_catalogue_drift;
+#[cfg(feature = "chaos")]
+mod chaos_tests;
 mod child_fanout_tests;
 mod child_policy_tests;
 #[cfg(feature = "db")]

@@ -2390,6 +2390,24 @@ async fn persist_external_signal_inline(
                             continue;
                         }
 
+                        // Chaos: pause/kill after the *Requested event is durable
+                        // but before the inline terminal, still inside the txn —
+                        // the #492 window where a concurrent outbox sweep can
+                        // observe a half-written external signal (AC4). Fire only
+                        // for a same-shard *fresh* signal: the half-write window
+                        // exists only because *this* txn just appended the
+                        // `ExternalSignalRequested` event above. On a
+                        // crash-recovery re-delivery (`already_requested`) that
+                        // event is durable from a prior, crashed attempt and
+                        // this txn appends nothing before the inline terminal, so
+                        // there is no new half-write to observe — skip the point,
+                        // matching its name and the #492 reproducer's intent.
+                        // (Cross-shard signals `continue`d to the outbox above,
+                        // so this is reached only for same-shard delivery.)
+                        if !run.already_requested {
+                            crate::chaos_point!(OUTBOX_INLINE_AFTER_REQUESTED);
+                        }
+
                         // Same-shard delivery attempt. A deduped insert
                         // (`Ok(false)`, idempotency-key collision) means the
                         // signal already landed once — that is success, so
@@ -16086,6 +16104,12 @@ async fn process_workflow_task(
                     .await?;
                     (retry_scheduled, deferred_checks, Vec::new())
                 };
+            // Chaos: kill/delay inside the persist transaction, after the
+            // outcome is written but before the outer commit — the #367 window
+            // (worker dies after claim, before the terminal is durable). A kill
+            // (owned conn in the reproducer's spawned task) rolls the persist
+            // back, leaving the task RUNNING with a dead worker (AC4).
+            crate::chaos_point!(WORKER_PERSIST_BEFORE_COMMIT);
             Ok(WorkflowPersistFlow::Persisted {
                 retry_scheduled,
                 deferred_checks,
@@ -16105,6 +16129,11 @@ async fn process_workflow_task(
             deferred_checks,
             race_deferred_triggers,
         }) => {
+            // Chaos: kill/delay after the outer persist commit but before the
+            // deferred-trigger fan-out — committed work whose in-process
+            // follow-up side effects have not fired yet. Convergence must still
+            // hold: the completion-trigger outbox recovers un-fired triggers.
+            crate::chaos_point!(WORKER_AFTER_OUTER_COMMIT);
             // Only spawned now that the transaction above has committed (see
             // apply_race_loser_cancellations's doc comment) — spawning inside
             // the transaction closure could start a trigger workflow for a
@@ -21964,6 +21993,81 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Chaos drive helpers (issue #940) — test-only, `chaos` feature.
+// ---------------------------------------------------------------------------
+
+/// Drive exactly one already-claimed workflow task through the production
+/// [`process_workflow_task`] decision cycle on its own dedicated connection.
+///
+/// The connection is **non-pooled** and the cycle runs inside a spawned task —
+/// so a chaos `Kill` at a wired injection point crashes *this* task (surfacing
+/// as a `JoinError`) and drops the owned connection mid-flight, which rolls
+/// back any uncommitted work server-side exactly as a crashed worker process
+/// would. The claim (`RUNNING` + `worker_id`), committed by `claim_task` before
+/// this runs, survives the crash, leaving the row stranded `RUNNING` with a
+/// now-dead worker — the #367 poison-pill orphan condition (issue #940
+/// `AC1a`/AC4).
+///
+/// Non-`Kill` faults (`Hold`, `Delay`) drive the cycle to completion; the
+/// `Ok(HarvestResult<()>)` mirrors what the poll loop would observe.
+///
+/// The connection is established fresh from `db_url` rather than borrowed from
+/// a pool precisely so its drop closes a real socket: a pooled connection
+/// returned to the pool on unwind may be recycled rather than closed, which
+/// would not reproduce the server-side rollback of a crashed process.
+///
+/// All defaults mirror the poll-loop call site: `build_id = ""`,
+/// `sticky_timeout = 5s`, `max_local_activity_start_to_close = 60s`, a fresh
+/// 16-slot [`crate::cache::WorkflowCache`], `dispatched_at = Instant::now()`,
+/// a fresh per-run panic-strike map, `workflow_panic_max_attempts = 3`,
+/// `workflow_task_deadline = None`, and a fresh frontier-reset flag.
+///
+/// # Errors
+///
+/// Returns the [`tokio::task::JoinError`] when the driven cycle panics — the
+/// chaos `Kill` path. The inner `HarvestResult<()>` is `process_workflow_task`'s
+/// own result on every non-panic path.
+#[cfg(feature = "chaos")]
+pub async fn chaos_drive_one_workflow_task(
+    db_url: &str,
+    registry: Arc<HandlerRegistry>,
+    task: TaskQueueItem,
+    worker_id: String,
+) -> Result<HarvestResult<()>, tokio::task::JoinError> {
+    let db_url = db_url.to_string();
+    tokio::spawn(async move {
+        let mut conn = AsyncPgConnection::establish(&db_url)
+            .await
+            .expect("chaos: establish owned workflow-task connection");
+        let workflow_cache = Arc::new(tokio::sync::Mutex::new(crate::cache::WorkflowCache::new(
+            16,
+        )));
+        let workflow_panic_strikes = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            uuid::Uuid,
+            u32,
+        >::new()));
+        let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
+        process_workflow_task(
+            &mut conn,
+            registry.as_ref(),
+            &task,
+            &worker_id,
+            "",
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            workflow_cache,
+            std::time::Instant::now(),
+            &workflow_panic_strikes,
+            3,
+            None,
+            &frontier_reset_committed,
+        )
+        .await
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
