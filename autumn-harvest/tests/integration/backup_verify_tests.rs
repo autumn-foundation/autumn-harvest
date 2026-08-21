@@ -738,3 +738,396 @@ async fn an_unmigrated_restore_is_undetermined_never_a_pass() {
         FindingSeverity::Undetermined
     );
 }
+
+// ---------------------------------------------------------------------------
+// Codex round 1 regressions
+// ---------------------------------------------------------------------------
+
+/// Codex round 1, P1. A caller that recorded `ExternalCancelDelivered` asserts
+/// the target is terminal. If the target's shard was restored to a point where
+/// it is still RUNNING, resuming silently loses an effect the caller believes
+/// already happened — the external-request analogue of a rolled-back child
+/// terminal. Before the fix a *resolved* request was dropped from adjudication
+/// entirely and the drill exited 0.
+#[tokio::test]
+async fn detects_delivered_external_cancel_rolled_back_on_the_target_shard() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let cancel_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "supervisor", "sup-1", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalCancelRequested",
+        json!({ "cancel_id": cancel_id.to_string(), "target": target.to_string() }),
+    )
+    .await;
+    // The caller believes the cancel LANDED.
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalCancelDelivered",
+        json!({ "cancel_id": cancel_id.to_string() }),
+    )
+    .await;
+
+    // ...but shard 1 was restored to before the cancellation.
+    seed_execution(&mut b, target, "fulfillment", "ff-1", "RUNNING", 1).await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::ExternalEffectRolledBack),
+        "expected a lost external cancel effect: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Incoherent);
+}
+
+/// The mirror of the test above: the same delivered cancel against a target
+/// that IS terminal is coherent and must produce no finding. Without this
+/// control, "flag every delivered request" would pass the test above.
+#[tokio::test]
+async fn a_delivered_external_cancel_whose_target_is_terminal_is_clean() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let cancel_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "supervisor", "sup-2", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalCancelRequested",
+        json!({ "cancel_id": cancel_id.to_string(), "target": target.to_string() }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalCancelDelivered",
+        json!({ "cancel_id": cancel_id.to_string() }),
+    )
+    .await;
+
+    seed_execution(&mut b, target, "fulfillment", "ff-2", "CANCELLED", 1).await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::ExternalEffectRolledBack),
+        "a delivered cancel against a terminal target is coherent: {report:#?}"
+    );
+}
+
+/// A *failed* external terminal applied no effect, so there is nothing to
+/// adjudicate on the target shard and no finding may be raised — the fix must
+/// not turn every resolved request into a check.
+#[tokio::test]
+async fn a_failed_external_request_asserts_no_effect_on_the_target() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let cancel_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "supervisor", "sup-3", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalCancelRequested",
+        json!({ "cancel_id": cancel_id.to_string(), "target": target.to_string() }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalCancelFailed",
+        json!({ "cancel_id": cancel_id.to_string(), "reason_code": "target_unknown" }),
+    )
+    .await;
+
+    // Target still RUNNING -- which for a FAILED cancel is entirely expected.
+    seed_execution(&mut b, target, "fulfillment", "ff-3", "RUNNING", 1).await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::ExternalEffectRolledBack),
+        "a failed request applied no effect: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::PendingExternalRequest),
+        "a failed request is not pending either: {report:#?}"
+    );
+}
+
+/// A delivered SIGNAL asserts a `harvest_signals` row or a `SignalReceived`
+/// event on the target. Neither present means the target was restored to
+/// before the delivery.
+#[tokio::test]
+async fn detects_delivered_external_signal_rolled_back_on_the_target_shard() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let signal_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "supervisor", "sup-4", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalSignalRequested",
+        json!({
+            "signal_id": signal_id.to_string(),
+            "target": target.to_string(),
+            "signal_name": "approve",
+            "payload": {}
+        }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalSignalDelivered",
+        json!({ "signal_id": signal_id.to_string() }),
+    )
+    .await;
+
+    // Target exists but carries no trace of the signal.
+    seed_execution(&mut b, target, "review", "rv-1", "RUNNING", 1).await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::ExternalEffectRolledBack),
+        "expected a lost external signal effect: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Incoherent);
+}
+
+/// The control for the signal case: a queued `harvest_signals` row on the
+/// target is exactly the durable trace the delivery asserts, so it is clean.
+#[tokio::test]
+async fn a_delivered_external_signal_with_a_queued_row_is_clean() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let signal_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "supervisor", "sup-5", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalSignalRequested",
+        json!({
+            "signal_id": signal_id.to_string(),
+            "target": target.to_string(),
+            "signal_name": "approve",
+            "payload": {}
+        }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalSignalDelivered",
+        json!({ "signal_id": signal_id.to_string() }),
+    )
+    .await;
+
+    seed_execution(&mut b, target, "review", "rv-2", "RUNNING", 1).await;
+    exec_sql(
+        &mut b,
+        &format!(
+            "INSERT INTO harvest_signals \
+             (id, workflow_exec_id, signal_name, payload, received_at, consumed) \
+             VALUES (gen_random_uuid(), '{target}', 'approve', '{{}}'::jsonb, NOW(), false)"
+        ),
+    )
+    .await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::ExternalEffectRolledBack),
+        "a queued signal row is the trace the delivery asserts: {report:#?}"
+    );
+}
+
+/// Codex round 1, P2. An undecodable child/external `event_data` row may be the
+/// very reference that would have exposed a missing target, so dropping it can
+/// turn an incoherent restore into a resumable verdict. Fail closed: the whole
+/// cross-shard check becomes Undetermined.
+#[tokio::test]
+async fn an_undecodable_reference_event_is_undetermined_not_silently_dropped() {
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+
+    let owner = ExecutionId::new_for_shard(ShardId::new(0));
+    seed_execution(&mut conn, owner, "parent_flow", "pf-x", "RUNNING", 0).await;
+    append_event(
+        &mut conn,
+        owner,
+        1,
+        "WorkflowStarted",
+        json!({ "input": {} }),
+    )
+    .await;
+    // Selected by the reference scan (matching `event_type`) but structurally
+    // undecodable into a `WorkflowEvent`.
+    append_event(
+        &mut conn,
+        owner,
+        2,
+        "ChildWorkflowStarted",
+        json!({ "not_a_child_id": 42 }),
+    )
+    .await;
+
+    let targets = vec![ShardTarget::new(0, &url)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::ProbeFailed),
+        "an undecodable reference event must fail closed: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Unavailable);
+}
+
+/// Codex round 1, P1 — the *mapping*, driven end to end.
+///
+/// A registered handler that returns `Err` against a NON-terminal recorded
+/// history is not a clean replay: the history carries no terminal failure, so
+/// the deployed code is erroring where the live run had not, and resuming
+/// fails the run immediately. Before the fix the status was collapsed to a
+/// divergent/clean bool, so this counted as `clean` and the drill exited 0.
+#[tokio::test]
+async fn a_replayed_workflow_failure_is_not_counted_clean() {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    fn always_errors<'a>(
+        _ctx: &'a autumn_harvest::WorkflowContext,
+        _input: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+        Box::pin(async move { Err("the redeployed handler rejects this input".to_string()) })
+    }
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+
+    let exec = ExecutionId::new_for_shard(ShardId::new(0));
+    seed_execution(&mut conn, exec, "redeployed_flow", "rf-1", "RUNNING", 0).await;
+    // `timestamp` is REQUIRED by the real `WorkflowStarted` variant. The other
+    // tests in this file omit it because they register no handler and so never
+    // decode; these two actually replay, so the event must be genuine or the
+    // assertions below pass vacuously on an `unreadable` history.
+    append_event(
+        &mut conn,
+        exec,
+        1,
+        "WorkflowStarted",
+        json!({ "input": {}, "timestamp": chrono::Utc::now().to_rfc3339() }),
+    )
+    .await;
+
+    let replayer = WorkflowReplayer::new().register_fn("redeployed_flow", always_errors);
+    let report = verify_restore(&one_shard(&url), &opts(), &replayer).await;
+
+    assert!(
+        report.replay_verified,
+        "the handler IS registered, so replay really ran: {report:#?}"
+    );
+    assert_eq!(
+        report.replay.failed, 1,
+        "a workflow error must be counted as a replay FAILURE: {report:#?}"
+    );
+    assert_eq!(
+        report.replay.clean, 0,
+        "and must NOT be folded into `clean`: {report:#?}"
+    );
+    assert!(
+        report.detected(FindingClass::ReplayWorkflowFailed),
+        "expected a ReplayWorkflowFailed finding: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Incoherent);
+    assert_eq!(report.exit_code(), 1, "must not exit 0");
+}
+
+/// The control: the same registered handler succeeding is genuinely clean, so
+/// "always report a failure" would not pass the test above.
+#[tokio::test]
+async fn a_replayed_workflow_that_succeeds_is_still_clean() {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    fn always_ok<'a>(
+        _ctx: &'a autumn_harvest::WorkflowContext,
+        _input: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+        Box::pin(async move { Ok(serde_json::Value::Null) })
+    }
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+
+    let exec = ExecutionId::new_for_shard(ShardId::new(0));
+    seed_execution(&mut conn, exec, "healthy_flow", "hf-1", "RUNNING", 0).await;
+    append_event(
+        &mut conn,
+        exec,
+        1,
+        "WorkflowStarted",
+        json!({ "input": {}, "timestamp": chrono::Utc::now().to_rfc3339() }),
+    )
+    .await;
+
+    let replayer = WorkflowReplayer::new().register_fn("healthy_flow", always_ok);
+    let report = verify_restore(&one_shard(&url), &opts(), &replayer).await;
+
+    assert_eq!(report.replay.failed, 0, "{report:#?}");
+    assert!(
+        !report.detected(FindingClass::ReplayWorkflowFailed),
+        "{report:#?}"
+    );
+}

@@ -185,9 +185,21 @@ pub enum FindingClass {
     /// that child still non-terminal — the signature of a skewed multi-shard
     /// restore.
     ChildTerminalRolledBack,
+    /// A caller recorded an external signal/cancel/await as *successfully*
+    /// delivered, but the target's own shard shows no trace of the effect —
+    /// the external-request analogue of `ChildTerminalRolledBack`, and the
+    /// signature of a target shard restored to a point before the effect
+    /// landed. Resuming would silently lose an effect the caller believes
+    /// already happened.
+    ExternalEffectRolledBack,
     /// A sampled history no longer replays cleanly against the deployed
     /// workflow code.
     ReplayDivergence,
+    /// A sampled non-terminal history replayed to a workflow *failure* under
+    /// the deployed code. The recorded history contains no terminal failure,
+    /// so this is the newly deployed handler erroring where the live run had
+    /// not — resuming it fails the run immediately.
+    ReplayWorkflowFailed,
 
     // ── Advisory: operator judgement ────────────────────────────────────────
     /// Shards were restored to materially different points in time.
@@ -216,7 +228,7 @@ pub enum FindingClass {
 
 impl FindingClass {
     /// Every class, in a stable order. Used by tests and by the runbook table.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 23] = [
         Self::DeadWorkerRunningTask,
         Self::TimedOutTask,
         Self::WorkflowDeadlineExpired,
@@ -231,7 +243,9 @@ impl FindingClass {
         Self::ChildExecutionMissing,
         Self::WedgedScheduleClaim,
         Self::ChildTerminalRolledBack,
+        Self::ExternalEffectRolledBack,
         Self::ReplayDivergence,
+        Self::ReplayWorkflowFailed,
         Self::RestorePointSkew,
         Self::ReplaySkippedNoHandler,
         Self::HistoryUnreadable,
@@ -263,7 +277,9 @@ impl FindingClass {
             | Self::ChildExecutionMissing
             | Self::WedgedScheduleClaim
             | Self::ChildTerminalRolledBack
-            | Self::ReplayDivergence => FindingSeverity::Incoherent,
+            | Self::ExternalEffectRolledBack
+            | Self::ReplayDivergence
+            | Self::ReplayWorkflowFailed => FindingSeverity::Incoherent,
 
             Self::RestorePointSkew
             | Self::ReplaySkippedNoHandler
@@ -293,7 +309,9 @@ impl FindingClass {
             Self::ExternalTargetMissing => "external_target_missing",
             Self::ChildExecutionMissing => "child_execution_missing",
             Self::ChildTerminalRolledBack => "child_terminal_rolled_back",
+            Self::ExternalEffectRolledBack => "external_effect_rolled_back",
             Self::ReplayDivergence => "replay_divergence",
+            Self::ReplayWorkflowFailed => "replay_workflow_failed",
             Self::RestorePointSkew => "restore_point_skew",
             Self::ReplaySkippedNoHandler => "replay_skipped_no_handler",
             Self::HistoryUnreadable => "history_unreadable",
@@ -351,8 +369,16 @@ impl FindingClass {
                 "the parent recorded the child's terminal but the child's shard rolled \
                  it back — skewed multi-shard restore points"
             }
+            Self::ExternalEffectRolledBack => {
+                "the caller recorded this external request as delivered but the target's \
+                 shard shows no trace of the effect — skewed multi-shard restore points"
+            }
             Self::ReplayDivergence => {
                 "this history no longer replays against the deployed workflow code"
+            }
+            Self::ReplayWorkflowFailed => {
+                "this non-terminal history replays to a workflow error under the deployed \
+                 code — resuming it would fail the run immediately"
             }
             Self::RestorePointSkew => "shards carry materially different newest-event timestamps",
             Self::ReplaySkippedNoHandler => {
@@ -468,6 +494,13 @@ pub struct ReplaySummary {
     pub clean: u64,
     /// Replayed and diverged.
     pub divergent: u64,
+    /// Replayed and the workflow function returned an error.
+    ///
+    /// Distinct from `divergent`: the history is faithfully reproduced, but the
+    /// deployed handler errors where the (non-terminal) recorded run had not.
+    /// Resuming such a run fails it immediately, so this is a failed
+    /// verification, not a clean one.
+    pub failed: u64,
     /// Not replayed: the workflow type has no registered handler.
     pub skipped_no_handler: u64,
     /// Not replayed: the history could not be read back.
@@ -481,7 +514,7 @@ impl ReplaySummary {
     /// replay-safety, and the report says so rather than implying a pass.
     #[must_use]
     pub const fn verified(&self) -> bool {
-        self.clean > 0 || self.divergent > 0
+        self.clean > 0 || self.divergent > 0 || self.failed > 0
     }
 
     /// Folds another summary into this one.
@@ -489,6 +522,7 @@ impl ReplaySummary {
         self.sampled += other.sampled;
         self.clean += other.clean;
         self.divergent += other.divergent;
+        self.failed += other.failed;
         self.skipped_no_handler += other.skipped_no_handler;
         self.unreadable += other.unreadable;
     }
@@ -737,10 +771,15 @@ pub fn compute_skew(latest: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> 
 
 /// True when `candidate` and `live` address the same Postgres database.
 ///
-/// Compares host, port and database name only — user, password and query
-/// parameters are deliberately ignored, because pointing a "read-only replica
-/// user" at the production database is exactly the mistake this guard exists
-/// to catch. Ports are normalised so `:5432` and an omitted port compare equal.
+/// Compares host/`hostaddr`, port and database name only — user, password and
+/// query parameters are deliberately ignored, because pointing a "read-only
+/// replica user" at the production database is exactly the mistake this guard
+/// exists to catch. Ports are normalised so `:5432` and an omitted port
+/// compare equal.
+///
+/// Host and port matching use **overlap**, not set equality, so a multi-host
+/// failover DSN that merely lists production among its candidates still trips
+/// the guard.
 ///
 /// An unparseable DSN on either side compares **equal**: a guard that cannot
 /// read the DSN must fail closed, never wave the drill through.
@@ -750,7 +789,39 @@ pub fn dsn_targets_same_database(candidate: &str, live: &str) -> bool {
     let (Some(a), Some(b)) = (parse_dsn_identity(candidate), parse_dsn_identity(live)) else {
         return true;
     };
-    a == b
+    if a.database != b.database || !overlaps(&a.ports, &b.ports) {
+        return false;
+    }
+    // `hostaddr` is the TCP destination when present, so a shared address is a
+    // match no matter what hostname alias each DSN spells. Only when neither
+    // side pins an address do we fall back to comparing hostnames.
+    overlaps(&a.hostaddrs, &b.hostaddrs) || overlaps(&a.hosts, &b.hosts)
+}
+
+/// True when two sorted, deduped sets share at least one element.
+///
+/// Overlap rather than equality: a multi-host failover DSN that lists
+/// production among its candidates reaches production, so one shared endpoint
+/// is enough to trip the guard. Erring toward *more* matches is the safe
+/// direction -- a false match costs the operator an explicit acknowledgement,
+/// a false miss costs them their production database.
+#[cfg(feature = "db")]
+fn overlaps<T: PartialEq>(a: &[T], b: &[T]) -> bool {
+    a.iter().any(|x| b.contains(x))
+}
+
+/// Host, address, port and database identity of a Postgres DSN.
+#[cfg(feature = "db")]
+#[derive(Debug, PartialEq, Eq)]
+struct DsnIdentity {
+    /// Lowercased hostnames (and Unix socket paths).
+    hosts: Vec<String>,
+    /// Literal `hostaddr` values, which override `hosts` at connect time.
+    hostaddrs: Vec<String>,
+    /// Ports, normalised so an omitted port compares as 5432.
+    ports: Vec<u16>,
+    /// Database name.
+    database: String,
 }
 
 /// `(hosts, ports, database)` identity of a Postgres DSN, or `None` when it
@@ -767,11 +838,19 @@ pub fn dsn_targets_same_database(candidate: &str, live: &str) -> bool {
 /// that lands on production. Sharing the connector's parser makes that class
 /// of disagreement impossible by construction.
 ///
-/// `hostaddr` is folded into the host set because tokio-postgres prefers it
-/// for the TCP connection, falling back to `host`; ignoring it would let
-/// `?hostaddr=<prod-ip>` slip past.
+/// `hostaddr` is kept **separate** from `hosts` rather than folded into one
+/// set: tokio-postgres prefers it for the TCP connection, so two DSNs sharing
+/// an address are the same database however differently they spell the
+/// hostname. Folding them together would make identity require matching
+/// hostname *text* as well, and `host=scratch-alias&hostaddr=<prod-ip>` would
+/// slip past a live `host=prod-alias&hostaddr=<prod-ip>`.
+///
+/// Known limit: when one side pins only `hostaddr` and the other only `host`,
+/// no comparison is possible without resolving DNS -- which this guard
+/// deliberately does not do (a name can resolve differently between the check
+/// and the connect). Spell both DSNs the same way, or pass the acknowledgement.
 #[cfg(feature = "db")]
-fn parse_dsn_identity(dsn: &str) -> Option<(Vec<String>, Vec<u16>, String)> {
+fn parse_dsn_identity(dsn: &str) -> Option<DsnIdentity> {
     use std::str::FromStr as _;
 
     let config = tokio_postgres::Config::from_str(dsn.trim()).ok()?;
@@ -785,12 +864,18 @@ fn parse_dsn_identity(dsn: &str) -> Option<(Vec<String>, Vec<u16>, String)> {
             tokio_postgres::config::Host::Unix(path) => path.to_string_lossy().to_lowercase(),
         })
         .collect();
-    hosts.extend(config.get_hostaddrs().iter().map(ToString::to_string));
-    if hosts.is_empty() {
+    let mut hostaddrs: Vec<String> = config
+        .get_hostaddrs()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    if hosts.is_empty() && hostaddrs.is_empty() {
         return None;
     }
     hosts.sort_unstable();
     hosts.dedup();
+    hostaddrs.sort_unstable();
+    hostaddrs.dedup();
 
     // tokio-postgres emits either one port for all hosts or one per host.
     let mut ports: Vec<u16> = config.get_ports().to_vec();
@@ -801,7 +886,12 @@ fn parse_dsn_identity(dsn: &str) -> Option<(Vec<String>, Vec<u16>, String)> {
     ports.dedup();
 
     let database = config.get_dbname().unwrap_or_default().to_string();
-    Some((hosts, ports, database))
+    Some(DsnIdentity {
+        hosts,
+        hostaddrs,
+        ports,
+        database,
+    })
 }
 
 /// Returns the DSN with every password-bearing element replaced by `***`, for
@@ -992,6 +1082,12 @@ mod probes {
         state: String,
     }
 
+    #[derive(diesel::QueryableByName)]
+    struct ExistsRow {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        present: bool,
+    }
+
     /// Wrap a caller-supplied selection predicate in a bounded, counted probe.
     ///
     /// The inner query is *only ever* one of the engine's own read-only
@@ -1093,7 +1189,7 @@ mod probes {
         pub source_shard: i32,
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub(super) enum RefKind {
         /// Parent recorded `ChildWorkflowStarted` with no terminal yet.
         AwaitedChild,
@@ -1101,6 +1197,33 @@ mod probes {
         ChildTerminalRecorded,
         /// An external signal/cancel/await request with no terminal.
         ExternalTarget,
+        /// The caller recorded a *successful* external terminal, so the target
+        /// shard must show the corresponding durable effect. A target restored
+        /// to a point before the effect landed is a silent lost-effect break,
+        /// which is exactly what the caller's own history says cannot happen.
+        ExternalEffectDelivered(ExternalEffect),
+    }
+
+    /// Which durable effect a delivered external request asserts on the target.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum ExternalEffect {
+        /// The named signal must be queued or already recorded on the target.
+        Signal(String),
+        /// The target must be terminal.
+        Cancel,
+        /// The target must be terminal.
+        Await,
+    }
+
+    impl ExternalEffect {
+        /// Short label for report samples.
+        const fn label(&self) -> &'static str {
+            match self {
+                Self::Signal(_) => "signal",
+                Self::Cancel => "cancel",
+                Self::Await => "await",
+            }
+        }
     }
 
     /// Probe every shard-local condition, sample + replay histories, and collect
@@ -1315,6 +1438,9 @@ mod probes {
                 if let Some(note) = scan.truncation {
                     soft_errors.push(note);
                 }
+                if let Some(note) = scan.undecodable {
+                    soft_errors.push(note);
+                }
                 if let Some(advisory) = scan.workflow_id_targets {
                     findings.push(advisory);
                 }
@@ -1372,10 +1498,18 @@ mod probes {
     ) -> Result<CollectedRefs, String> {
         let (scan, truncation) = scan_reference_events(conn, limit).await?;
         let workflow_id_targets = scan.workflow_id_targets.clone();
+        let undecodable = (scan.undecodable_count > 0).then(|| {
+            format!(
+                "cross-shard reference scan could not decode {} child/external event(s);                  those references were NOT adjudicated: {}",
+                scan.undecodable_count,
+                scan.undecodable_samples.join(", ")
+            )
+        });
         Ok(CollectedRefs {
             refs: build_refs(scan, shard_id),
             truncation,
             workflow_id_targets,
+            undecodable,
         })
     }
 
@@ -1386,6 +1520,8 @@ mod probes {
         refs: Vec<PendingRef>,
         truncation: Option<String>,
         workflow_id_targets: Option<Finding>,
+        /// Fail-closed note when any child/external row could not be decoded.
+        undecodable: Option<String>,
     }
 
     /// The per-owning-execution reference bookkeeping one shard's history
@@ -1396,13 +1532,25 @@ mod probes {
         awaited: BTreeMap<Uuid, Vec<Uuid>>,
         /// owner -> children whose terminal the owner recorded.
         child_terminal: BTreeMap<Uuid, Vec<Uuid>>,
-        /// owner -> (correlation id, target execution id) for external requests.
-        requested: BTreeMap<Uuid, Vec<(Uuid, Uuid)>>,
-        /// owner -> correlation ids whose terminal the owner recorded.
-        resolved: BTreeMap<Uuid, Vec<Uuid>>,
+        /// owner -> external requests, each carrying the correlation id, the
+        /// target execution id, and the effect a successful terminal asserts.
+        requested: BTreeMap<Uuid, Vec<(Uuid, Uuid, ExternalEffect)>>,
+        /// owner -> correlation ids the owner recorded as *successfully*
+        /// delivered/resolved. These assert durable state on the target shard.
+        delivered: BTreeMap<Uuid, Vec<Uuid>>,
+        /// owner -> correlation ids the owner recorded as *failed*. A failed
+        /// request applied no effect, so there is nothing to adjudicate.
+        failed: BTreeMap<Uuid, Vec<Uuid>>,
         /// Advisory for business-key-addressed external requests, which carry
         /// no execution id to adjudicate.
         workflow_id_targets: Option<Finding>,
+        /// Rows whose `event_data` this build could not decode. Fail-closed:
+        /// an undecodable child/external event may be hiding a genuine
+        /// cross-shard break, so the whole check is reported Undetermined
+        /// rather than silently narrowed.
+        undecodable_samples: Vec<String>,
+        /// Exact count of undecodable rows (samples above are bounded).
+        undecodable_count: u64,
     }
 
     /// Read this shard's child/external history events and fold them into a
@@ -1473,6 +1621,112 @@ mod probes {
         Ok((fold_reference_events(rows), truncation))
     }
 
+    /// Fold one decoded child/external event into the running [`RefScan`].
+    ///
+    /// Split out of `fold_reference_events` so the row loop / decode-failure
+    /// handling and the per-variant bookkeeping stay separately readable.
+    fn fold_reference_event(
+        scan: &mut RefScan,
+        owner: Uuid,
+        event: WorkflowEvent,
+        workflow_id_targets: &mut Vec<String>,
+    ) {
+        match event {
+            WorkflowEvent::ChildWorkflowStarted { child_id, .. } => {
+                scan.awaited
+                    .entry(owner)
+                    .or_default()
+                    .push(child_id.as_uuid());
+            }
+            WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
+            | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
+                scan.child_terminal
+                    .entry(owner)
+                    .or_default()
+                    .push(child_id.as_uuid());
+            }
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name,
+                ..
+            } => match target {
+                ExternalTarget::ExecutionId(t) => {
+                    scan.requested.entry(owner).or_default().push((
+                        signal_id.as_uuid(),
+                        t.as_uuid(),
+                        ExternalEffect::Signal(signal_name),
+                    ));
+                }
+                ExternalTarget::WorkflowId {
+                    workflow_name,
+                    workflow_id,
+                } => workflow_id_targets.push(format!(
+                    "signal -> {workflow_name}/{workflow_id} (from {owner})"
+                )),
+            },
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target } => match target {
+                ExternalTarget::ExecutionId(t) => scan.requested.entry(owner).or_default().push((
+                    cancel_id.as_uuid(),
+                    t.as_uuid(),
+                    ExternalEffect::Cancel,
+                )),
+                ExternalTarget::WorkflowId {
+                    workflow_name,
+                    workflow_id,
+                } => workflow_id_targets.push(format!(
+                    "cancel -> {workflow_name}/{workflow_id} (from {owner})"
+                )),
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                scan.requested.entry(owner).or_default().push((
+                    await_id.as_uuid(),
+                    target.as_uuid(),
+                    ExternalEffect::Await,
+                ));
+            }
+            // Success terminals assert durable state on the target shard.
+            WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                scan.delivered
+                    .entry(owner)
+                    .or_default()
+                    .push(signal_id.as_uuid());
+            }
+            WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
+                scan.delivered
+                    .entry(owner)
+                    .or_default()
+                    .push(cancel_id.as_uuid());
+            }
+            WorkflowEvent::ExternalAwaitResolved { await_id, .. } => {
+                scan.delivered
+                    .entry(owner)
+                    .or_default()
+                    .push(await_id.as_uuid());
+            }
+            // Failure terminals applied no effect: nothing to adjudicate.
+            WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+                scan.failed
+                    .entry(owner)
+                    .or_default()
+                    .push(signal_id.as_uuid());
+            }
+            WorkflowEvent::ExternalCancelFailed { cancel_id, .. } => {
+                scan.failed
+                    .entry(owner)
+                    .or_default()
+                    .push(cancel_id.as_uuid());
+            }
+            WorkflowEvent::ExternalAwaitFailed { await_id, .. } => {
+                scan.failed
+                    .entry(owner)
+                    .or_default()
+                    .push(await_id.as_uuid());
+            }
+            _ => {}
+        }
+    }
+
     /// Fold decoded child/external events into a [`RefScan`].
     ///
     /// Split out of `scan_reference_events` so the SQL/truncation half and the
@@ -1485,83 +1739,26 @@ mod probes {
         let mut workflow_id_targets: Vec<String> = Vec::new();
 
         for row in rows {
-            let Ok(event) = serde_json::from_value::<WorkflowEvent>(row.event_data) else {
-                // A payload this build cannot decode is not a coherence break;
-                // it is surfaced separately by the replay sample.
-                continue;
+            let event = match serde_json::from_value::<WorkflowEvent>(row.event_data) {
+                Ok(event) => event,
+                Err(e) => {
+                    // FAIL CLOSED. A malformed, legacy or newer-version payload
+                    // on a child/external row may be the very reference that
+                    // would have exposed a missing target, so dropping it can
+                    // turn an incoherent restore into a resumable verdict. The
+                    // replay sample is not a backstop here: the shipped CLI
+                    // links no handlers (so it replays nothing) and an embedded
+                    // replayer samples only a bounded subset.
+                    if scan.undecodable_samples.len() < MAX_FINDING_SAMPLES {
+                        scan.undecodable_samples
+                            .push(format!("{}: {e}", row.workflow_exec_id));
+                    }
+                    scan.undecodable_count += 1;
+                    continue;
+                }
             };
             let owner = row.workflow_exec_id;
-            match event {
-                WorkflowEvent::ChildWorkflowStarted { child_id, .. } => {
-                    scan.awaited
-                        .entry(owner)
-                        .or_default()
-                        .push(child_id.as_uuid());
-                }
-                WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
-                | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
-                    scan.child_terminal
-                        .entry(owner)
-                        .or_default()
-                        .push(child_id.as_uuid());
-                }
-                WorkflowEvent::ExternalSignalRequested {
-                    signal_id, target, ..
-                } => match target {
-                    ExternalTarget::ExecutionId(t) => scan
-                        .requested
-                        .entry(owner)
-                        .or_default()
-                        .push((signal_id.as_uuid(), t.as_uuid())),
-                    ExternalTarget::WorkflowId {
-                        workflow_name,
-                        workflow_id,
-                    } => workflow_id_targets.push(format!(
-                        "signal -> {workflow_name}/{workflow_id} (from {owner})"
-                    )),
-                },
-                WorkflowEvent::ExternalCancelRequested { cancel_id, target } => match target {
-                    ExternalTarget::ExecutionId(t) => scan
-                        .requested
-                        .entry(owner)
-                        .or_default()
-                        .push((cancel_id.as_uuid(), t.as_uuid())),
-                    ExternalTarget::WorkflowId {
-                        workflow_name,
-                        workflow_id,
-                    } => workflow_id_targets.push(format!(
-                        "cancel -> {workflow_name}/{workflow_id} (from {owner})"
-                    )),
-                },
-                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
-                    scan.requested
-                        .entry(owner)
-                        .or_default()
-                        .push((await_id.as_uuid(), target.as_uuid()));
-                }
-                WorkflowEvent::ExternalSignalDelivered { signal_id }
-                | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
-                    scan.resolved
-                        .entry(owner)
-                        .or_default()
-                        .push(signal_id.as_uuid());
-                }
-                WorkflowEvent::ExternalCancelDelivered { cancel_id }
-                | WorkflowEvent::ExternalCancelFailed { cancel_id, .. } => {
-                    scan.resolved
-                        .entry(owner)
-                        .or_default()
-                        .push(cancel_id.as_uuid());
-                }
-                WorkflowEvent::ExternalAwaitResolved { await_id, .. }
-                | WorkflowEvent::ExternalAwaitFailed { await_id, .. } => {
-                    scan.resolved
-                        .entry(owner)
-                        .or_default()
-                        .push(await_id.as_uuid());
-                }
-                _ => {}
-            }
+            fold_reference_event(&mut scan, owner, event, &mut workflow_id_targets);
         }
         // A business-key-addressed request (#751) resolves at delivery time, so
         // there is no fixed execution id to look up and we cannot adjudicate it.
@@ -1588,8 +1785,11 @@ mod probes {
             awaited,
             child_terminal,
             requested,
-            resolved,
+            delivered,
+            failed,
             workflow_id_targets: _,
+            undecodable_samples: _,
+            undecodable_count: _,
         } = scan;
 
         let mut out = Vec::new();
@@ -1611,13 +1811,25 @@ mod probes {
             }
         }
         for (owner, reqs) in &requested {
-            let done = resolved.get(owner).cloned().unwrap_or_default();
-            for (corr, target) in reqs {
-                if done.contains(corr) {
+            let ok = delivered.get(owner).cloned().unwrap_or_default();
+            let bad = failed.get(owner).cloned().unwrap_or_default();
+            for (corr, target, effect) in reqs {
+                // A *failed* terminal applied nothing to the target, so there
+                // is no effect to verify and no live request to chase.
+                if bad.contains(corr) {
                     continue;
                 }
+                // A *delivered* terminal is not "done with" -- it is an
+                // assertion about the target shard's durable state, and a
+                // target restored to an earlier point can silently contradict
+                // it. Adjudicate it rather than dropping it.
+                let kind = if ok.contains(corr) {
+                    RefKind::ExternalEffectDelivered(effect.clone())
+                } else {
+                    RefKind::ExternalTarget
+                };
                 out.push(PendingRef {
-                    kind: RefKind::ExternalTarget,
+                    kind,
                     owner_shard: owning_shard(*target, shard_id),
                     target: *target,
                     source_exec: *owner,
@@ -1640,6 +1852,59 @@ mod probes {
     }
 
     /// Replay a bounded sample of this shard's non-terminal histories.
+    /// The bounded per-class sample ids collected during a replay sweep.
+    struct ReplaySamples {
+        divergent: Vec<String>,
+        failed: Vec<String>,
+        skipped: Vec<String>,
+        unreadable: Vec<String>,
+    }
+
+    /// Turn a completed [`ReplaySummary`] plus its samples into findings.
+    ///
+    /// Split out of `replay_sample` so the sampling/classification half and the
+    /// finding-construction half stay separately readable.
+    fn replay_findings(
+        summary: &ReplaySummary,
+        shard_id: i32,
+        samples: ReplaySamples,
+    ) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        if summary.divergent > 0 {
+            findings.push(Finding::new(
+                FindingClass::ReplayDivergence,
+                Some(shard_id),
+                summary.divergent,
+                samples.divergent,
+            ));
+        }
+        if summary.failed > 0 {
+            findings.push(Finding::new(
+                FindingClass::ReplayWorkflowFailed,
+                Some(shard_id),
+                summary.failed,
+                samples.failed,
+            ));
+        }
+        if summary.skipped_no_handler > 0 {
+            findings.push(Finding::new(
+                FindingClass::ReplaySkippedNoHandler,
+                Some(shard_id),
+                summary.skipped_no_handler,
+                samples.skipped,
+            ));
+        }
+        if summary.unreadable > 0 {
+            findings.push(Finding::new(
+                FindingClass::HistoryUnreadable,
+                Some(shard_id),
+                summary.unreadable,
+                samples.unreadable,
+            ));
+        }
+        findings
+    }
+
     async fn replay_sample(
         conn: &mut AsyncPgConnection,
         options: &VerifyOptions,
@@ -1663,6 +1928,7 @@ mod probes {
         let mut divergent_samples = Vec::new();
         let mut skipped_samples = Vec::new();
         let mut unreadable_samples = Vec::new();
+        let mut failed_samples = Vec::new();
 
         for row in rows {
             summary.sampled += 1;
@@ -1699,59 +1965,51 @@ mod probes {
             // suspends before consuming its whole recorded history, which strict
             // mode would report as a false `EarlyCompletion` divergence.
             //
-            // `WorkflowFailed` is counted CLEAN: a recorded terminal failure is
-            // the run's own outcome, faithfully reproduced -- not a replay defect.
-            let outcome = replayer
-                .replay_canary_from_db(conn, exec_id)
-                .await
-                .map(|report| {
-                    matches!(
-                        report.status,
-                        crate::testing::ReplayStatus::NonDeterminismDetected { .. }
-                    )
-                });
-            match outcome {
-                Ok(false) => summary.clean += 1,
-                Ok(true) => {
-                    summary.divergent += 1;
-                    if divergent_samples.len() < MAX_FINDING_SAMPLES {
-                        divergent_samples.push(exec_id.to_string());
+            // The FULL status is preserved. Collapsing it to a divergent/clean
+            // bool would count `WorkflowFailed` as clean, but these samples are
+            // *non-terminal* runs: their recorded history contains no terminal
+            // failure, so a replay failure means the deployed handler now errors
+            // where the live run had not. The engine's own replay canary
+            // (`run_canary`) counts that as `replay_failed`; so do we.
+            match replayer.replay_canary_from_db(conn, exec_id).await {
+                Ok(report) => match report.status {
+                    crate::testing::ReplayStatus::ReplaySucceeded => summary.clean += 1,
+                    crate::testing::ReplayStatus::NonDeterminismDetected { .. } => {
+                        summary.divergent += 1;
+                        if divergent_samples.len() < MAX_FINDING_SAMPLES {
+                            divergent_samples.push(exec_id.to_string());
+                        }
                     }
-                }
-                Err(_) => {
+                    crate::testing::ReplayStatus::WorkflowFailed { error, .. } => {
+                        summary.failed += 1;
+                        if failed_samples.len() < MAX_FINDING_SAMPLES {
+                            failed_samples.push(format!("{exec_id}: {error}"));
+                        }
+                    }
+                },
+                Err(e) => {
                     summary.unreadable += 1;
                     if unreadable_samples.len() < MAX_FINDING_SAMPLES {
-                        unreadable_samples.push(exec_id.to_string());
+                        // Carry the reason: "unreadable" alone leaves an
+                        // operator with nothing to act on, and the cause
+                        // (undecodable payload vs missing row vs codec) decides
+                        // whether the restore or the deployed build is at fault.
+                        unreadable_samples.push(format!("{exec_id}: {e}"));
                     }
                 }
             }
         }
 
-        let mut findings = Vec::new();
-        if summary.divergent > 0 {
-            findings.push(Finding::new(
-                FindingClass::ReplayDivergence,
-                Some(shard_id),
-                summary.divergent,
-                divergent_samples,
-            ));
-        }
-        if summary.skipped_no_handler > 0 {
-            findings.push(Finding::new(
-                FindingClass::ReplaySkippedNoHandler,
-                Some(shard_id),
-                summary.skipped_no_handler,
-                skipped_samples,
-            ));
-        }
-        if summary.unreadable > 0 {
-            findings.push(Finding::new(
-                FindingClass::HistoryUnreadable,
-                Some(shard_id),
-                summary.unreadable,
-                unreadable_samples,
-            ));
-        }
+        let findings = replay_findings(
+            &summary,
+            shard_id,
+            ReplaySamples {
+                divergent: divergent_samples,
+                failed: failed_samples,
+                skipped: skipped_samples,
+                unreadable: unreadable_samples,
+            },
+        );
         Ok((summary, findings))
     }
 
@@ -1768,6 +2026,7 @@ mod probes {
         missing_external: Vec<String>,
         pending_external: Vec<String>,
         lookup_errors: Vec<String>,
+        lost_effect: Vec<String>,
     }
 
     /// Look up each reference's target on its owning shard and bucket the
@@ -1799,7 +2058,7 @@ mod probes {
                 }
             };
 
-            match (r.kind, state) {
+            match (&r.kind, state) {
                 (RefKind::AwaitedChild, None) => {
                     out.missing_child.push(format!(
                         "{} (awaited by {} on shard {})",
@@ -1814,9 +2073,12 @@ mod probes {
                         r.target, r.owner_shard, r.source_exec, r.source_shard
                     ));
                 }
-                // A recorded child terminal whose execution row is gone is
-                // ordinary retention, not incoherence.
-                (RefKind::ChildTerminalRecorded, _) | (RefKind::AwaitedChild, Some(_)) => {}
+                // A recorded child terminal (or a delivered external effect)
+                // whose execution row is gone is ordinary retention, not
+                // incoherence.
+                (RefKind::ChildTerminalRecorded, _)
+                | (RefKind::AwaitedChild, Some(_))
+                | (RefKind::ExternalEffectDelivered(_), None) => {}
                 (RefKind::ExternalTarget, None) => {
                     out.missing_external.push(format!(
                         "{} (requested by {} on shard {})",
@@ -1829,9 +2091,66 @@ mod probes {
                         r.target, r.source_exec, r.source_shard
                     ));
                 }
+                (RefKind::ExternalEffectDelivered(effect), Some(s)) => {
+                    match effect_survived(conn, r.target, effect, &s).await {
+                        Ok(true) => {}
+                        Ok(false) => out.lost_effect.push(format!(
+                            "{} {} delivered by {} on shard {} left no trace on shard {} \
+                             (target is {s})",
+                            effect.label(),
+                            r.target,
+                            r.source_exec,
+                            r.source_shard,
+                            r.owner_shard
+                        )),
+                        Err(e) => out
+                            .lookup_errors
+                            .push(format!("{} effect check failed: {e}", r.target)),
+                    }
+                }
             }
         }
         out
+    }
+
+    /// Does the target shard still show the effect the caller recorded as
+    /// delivered?
+    ///
+    /// * `Cancel` / `Await` — the caller only records success once the target
+    ///   is terminal, so a non-terminal target means the effect was rolled back.
+    /// * `Signal` — the delivery inserts a `harvest_signals` row, which the
+    ///   worker later promotes to a `SignalReceived` event. The row persists
+    ///   after consumption (`consumed` is a flag, not a delete), so *neither*
+    ///   present means the target was restored to before the delivery.
+    async fn effect_survived(
+        conn: &mut AsyncPgConnection,
+        target: Uuid,
+        effect: &ExternalEffect,
+        state: &str,
+    ) -> Result<bool, diesel::result::Error> {
+        match effect {
+            ExternalEffect::Cancel | ExternalEffect::Await => {
+                Ok(crate::erase::is_terminal_state(state))
+            }
+            ExternalEffect::Signal(name) => {
+                let row: ExistsRow = diesel::sql_query(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM harvest_signals \
+                         WHERE workflow_exec_id = $1 AND signal_name = $2 \
+                       ) OR EXISTS ( \
+                         SELECT 1 FROM harvest_events \
+                         WHERE workflow_exec_id = $1 \
+                           AND event_type = 'SignalReceived' \
+                           AND event_data->'data'->>'signal_name' = $2 \
+                       ) AS present",
+                )
+                .bind::<diesel::sql_types::Uuid, _>(target)
+                .bind::<diesel::sql_types::Text, _>(name)
+                .get_result(conn)
+                .await?;
+                Ok(row.present)
+            }
+        }
     }
 
     pub(super) async fn resolve_refs(refs: &[PendingRef], targets: &[ShardTarget]) -> Vec<Finding> {
@@ -1893,6 +2212,7 @@ mod probes {
                 missing_external,
                 pending_external,
                 lookup_errors,
+                lost_effect,
             } = buckets;
 
             for (class, samples) in [
@@ -1900,6 +2220,7 @@ mod probes {
                 (FindingClass::ChildTerminalRolledBack, rolled_back),
                 (FindingClass::ExternalTargetMissing, missing_external),
                 (FindingClass::PendingExternalRequest, pending_external),
+                (FindingClass::ExternalEffectRolledBack, lost_effect),
                 // A reference we could not adjudicate is Undetermined, never a
                 // pass: the row may be missing, or the query may simply have
                 // failed, and we must not guess which.
@@ -1980,6 +2301,79 @@ mod tests {
         Finding::new(class, Some(0), 1, vec!["x".into()])
     }
 
+    /// Codex round 1, P2. `host=alias-a&hostaddr=X` and `host=alias-b&hostaddr=X`
+    /// reach the SAME database; folding hostaddr into the hostname set made
+    /// identity require matching hostname *text*, so the guard waved the run
+    /// through against production.
+    #[test]
+    #[cfg(feature = "db")]
+    fn dsn_guard_matches_on_a_shared_hostaddr_despite_different_hostnames() {
+        assert!(dsn_targets_same_database(
+            "postgres://u@scratch-alias/harvest?hostaddr=10.0.0.5",
+            "postgres://u@prod-alias/harvest?hostaddr=10.0.0.5",
+        ));
+        // A shared address is only a match when port and database agree too.
+        assert!(!dsn_targets_same_database(
+            "postgres://u@scratch-alias/scratch?hostaddr=10.0.0.5",
+            "postgres://u@prod-alias/harvest?hostaddr=10.0.0.5",
+        ));
+        assert!(!dsn_targets_same_database(
+            "postgres://u@a/harvest?hostaddr=10.0.0.6",
+            "postgres://u@b/harvest?hostaddr=10.0.0.5",
+        ));
+    }
+
+    /// A multi-host failover DSN that merely LISTS production still reaches it,
+    /// so one shared endpoint is enough to trip the guard.
+    #[test]
+    #[cfg(feature = "db")]
+    fn dsn_guard_matches_when_a_multi_host_dsn_lists_the_live_host() {
+        assert!(dsn_targets_same_database(
+            "postgres://u@scratch.internal,prod.internal/harvest",
+            "postgres://u@prod.internal/harvest",
+        ));
+    }
+
+    /// A replayed history that ends in a workflow ERROR is not clean: these
+    /// samples are non-terminal runs, so the recorded history contains no
+    /// terminal failure and the deployed handler is erroring where the live run
+    /// had not. The engine's own canary counts this as `replay_failed`.
+    #[test]
+    fn replay_workflow_failure_is_incoherent_never_clean() {
+        assert_eq!(
+            FindingClass::ReplayWorkflowFailed.severity(),
+            FindingSeverity::Incoherent
+        );
+        let summary = ReplaySummary {
+            sampled: 1,
+            failed: 1,
+            ..ReplaySummary::default()
+        };
+        // It counts as verification actually having happened...
+        assert!(summary.verified());
+        // ...and it must not be silently folded into `clean`.
+        assert_eq!(summary.clean, 0);
+        assert_eq!(
+            classify_status(&[finding(FindingClass::ReplayWorkflowFailed)], false),
+            VerifyStatus::Incoherent
+        );
+    }
+
+    /// A caller that recorded an external request as DELIVERED asserts durable
+    /// state on the target shard; a target restored before the effect landed
+    /// contradicts it. Same severity as its child-workflow analogue.
+    #[test]
+    fn a_lost_external_effect_is_incoherent_like_a_rolled_back_child_terminal() {
+        assert_eq!(
+            FindingClass::ExternalEffectRolledBack.severity(),
+            FindingClass::ChildTerminalRolledBack.severity()
+        );
+        assert_eq!(
+            classify_status(&[finding(FindingClass::ExternalEffectRolledBack)], false),
+            VerifyStatus::Incoherent
+        );
+    }
+
     #[test]
     fn severity_truth_table_is_pinned_for_every_class() {
         // EXHAUSTIVE by construction: the expected table is matched against
@@ -2007,7 +2401,9 @@ mod tests {
             (FindingClass::ChildExecutionMissing, Incoherent),
             (FindingClass::WedgedScheduleClaim, Incoherent),
             (FindingClass::ChildTerminalRolledBack, Incoherent),
+            (FindingClass::ExternalEffectRolledBack, Incoherent),
             (FindingClass::ReplayDivergence, Incoherent),
+            (FindingClass::ReplayWorkflowFailed, Incoherent),
             // Worth an operator's eye; does not fail the gate.
             (FindingClass::RestorePointSkew, Advisory),
             (FindingClass::ReplaySkippedNoHandler, Advisory),

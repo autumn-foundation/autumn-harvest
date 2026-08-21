@@ -3776,11 +3776,12 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
     if replay.verified() {
         let _ = writeln!(
             out,
-            "  replay: {} sampled, {} clean, {} divergent, {} skipped (no handler), \
-             {} unreadable",
+            "  replay: {} sampled, {} clean, {} divergent, {} workflow-failed, \
+             {} skipped (no handler), {} unreadable",
             replay.sampled,
             replay.clean,
             replay.divergent,
+            replay.failed,
             replay.skipped_no_handler,
             replay.unreadable
         );

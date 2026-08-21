@@ -117,6 +117,8 @@ resume, not because anything is wrong.
 | `child_terminal_rolled_back` | The parent recorded the child's terminal, but the child's shard was restored to an *earlier* point where the child is still running. See §6 — this is the signature multi-shard skew failure. |
 | `wedged_schedule_claim` | A schedule with a claim token but a **NULL** `fire_claimed_until` — a torn claim pair. The scheduler claims on `fire_claim_token IS NULL OR fire_claimed_until < NOW()`, which such a row matches neither half of, so the schedule never fires again. Un-claim it by hand (`UPDATE harvest_schedules SET fire_claim_token = NULL, fire_claimed_until = NULL WHERE id = …`) before starting workers. Contrast `expired_schedule_claim`, which self-heals. |
 | `replay_divergence` | A sampled history no longer replays against the deployed workflow code. Not caused by the restore; caused by a code/history mismatch. Fix by rolling *back* the workflow code, then resume (see `nondeterminism-block.md`). |
+| `external_effect_rolled_back` | The caller recorded a signal/cancel/await as **delivered**, but the target's shard shows no trace of the effect — the cross-shard analogue of `child_terminal_rolled_back`. Adjudicated per effect: a delivered *cancel* or resolved *await* requires the target to be terminal; a delivered *signal* requires either a `harvest_signals` row (the row persists after delivery — `consumed` is a flag, not a delete) or a recorded `SignalReceived` event. Repair by restoring the target shard to a point at or after the caller's, per §6. Nothing retries this: the caller has already recorded the terminal and will never re-request. |
+| `replay_workflow_failed` | A sampled **non-terminal** history replays to a workflow *error* under the deployed code. Because the sample is drawn only from runs with no recorded terminal failure, this means the deployed handler now errors where the live run had not. Same remedy as `replay_divergence`: roll the workflow code *back*, then resume. |
 
 A report containing any of these exits **1**. Do not start workers.
 
@@ -303,6 +305,14 @@ a missing table, every condition reads as absent, and a naive tool reports a
 beautiful clean bill of health on an empty database. That is the single most
 dangerous output this tool could produce, so "we could not tell" is never
 allowed to render as a pass.
+
+The same rule applies at row granularity. If a child/external reference event
+carries a payload the deployed build cannot decode (a malformed, legacy, or
+newer-version `event_data`), that row is reported as `undetermined` rather than
+skipped — it may be the very reference that would have exposed a missing target,
+and the replay sample is not a backstop for it (the shipped CLI links no
+workflow handlers, so it replays nothing, and an embedded replayer samples only
+a bounded subset).
 
 ---
 

@@ -28,6 +28,7 @@ fn shard(findings: Vec<Finding>) -> ShardVerifyReport {
             sampled: 3,
             clean: 3,
             divergent: 0,
+            failed: 0,
             skipped_no_handler: 0,
             unreadable: 0,
         },
@@ -243,6 +244,7 @@ fn json_output_says_whether_replay_actually_ran() {
         sampled: 4,
         clean: 0,
         divergent: 0,
+        failed: 0,
         skipped_no_handler: 4,
         unreadable: 0,
     };
@@ -309,6 +311,7 @@ fn text_output_reports_replay_coverage_honestly() {
         sampled: 5,
         clean: 0,
         divergent: 0,
+        failed: 0,
         skipped_no_handler: 5,
         unreadable: 0,
     };
@@ -334,6 +337,7 @@ fn text_output_does_not_claim_not_verified_when_replay_really_ran() {
         sampled: 5,
         clean: 5,
         divergent: 0,
+        failed: 0,
         skipped_no_handler: 0,
         unreadable: 0,
     };

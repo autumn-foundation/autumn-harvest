@@ -25,7 +25,7 @@ plus a read-only DB half (`db`-gated):
   `undetermined_outranks_incoherent_and_reclaimable`,
   `advisory_classes_never_escalate_the_verdict`) and the DB test
   `an_unmigrated_restore_is_undetermined_never_a_pass`.
-- **21 `FindingClass` variants** (8 reclaimable / 7 incoherent / 5 advisory / 1
+- **23 `FindingClass` variants** (8 reclaimable / 9 incoherent / 5 advisory / 1
   undetermined), each carrying a `const fn explanation()` that names the healing
   mechanism and its issue number, so the report teaches rather than just alarms.
   The severity table is pinned exhaustively against `FindingClass::ALL`
@@ -140,3 +140,49 @@ unmigrated-database false-clean regression; 22 CLI tests in
 unit tests. DB suites ran green against a real local Postgres 16 and are
 registered in `.github/ci/integration-suites.txt` for the Docker-backed Linux
 run.
+
+**Post-review hardening, round 2** (automated review of the opened PR, two
+genuine P1s plus two correctness gaps, each verified against real code before
+being fixed and each RED-probe verified by reverting the fix):
+
+1. **P1 — a replayed workflow error was counted clean.** `replay_sample`
+   collapsed `ReplayStatus` to a divergent/clean bool, so
+   `ReplayStatus::WorkflowFailed` fell into the clean bucket. But the sample is
+   drawn exclusively from **non-terminal** runs, whose recorded history contains
+   no terminal failure — a replay failure there means the deployed handler now
+   errors where the live run had not, which is exactly what a post-restore
+   verification exists to catch. The engine's own replay canary (`run_canary`
+   in `testing.rs`) already counts that as `replay_failed`; verify now matches
+   it. New Incoherent class `ReplayWorkflowFailed`, new `ReplaySummary.failed`
+   counter (folded into `verified()`/`merge()` and the CLI's text renderer).
+2. **P1 — a resolved external request asserted nothing about its target.** The
+   reference scan dropped every request that had a recorded terminal, so a
+   restore that rolled the *target* shard back past a delivered signal/cancel
+   read clean — the exact asymmetry the design already avoids for children via
+   `ChildTerminalRolledBack`. Terminals are now split by outcome: a **failure**
+   terminal (`External*Failed`) applied no effect and is still droppable, while
+   a **success** terminal (`ExternalSignalDelivered` / `ExternalCancelDelivered`
+   / `ExternalAwaitResolved`) asserts durable state on the target shard —
+   per-effect, mirroring how the engine applies it. Cancel and await require the
+   target to be terminal; a signal requires either a `harvest_signals` row (the
+   `consumed` flag means rows persist after delivery) or a recorded
+   `SignalReceived` event. New Incoherent class `ExternalEffectRolledBack`.
+3. **Undecodable reference events now fail closed.** A malformed, legacy or
+   newer-version payload on a child/external row was silently skipped, yet that
+   row may be the very reference that would have exposed a missing target. It is
+   now reported as `Undetermined` (the replay sample is not a backstop: the
+   shipped CLI links no handlers, and an embedded replayer samples only a
+   bounded subset).
+4. **`dsn_targets_same_database` no longer misses a multi-host or `hostaddr`
+   DSN.** The live-DSN guard parsed a single host/port; libpq accepts
+   comma-separated `host=`/`hostaddr=`/`port=` lists, so a failover DSN could
+   slip the guard. It now parses full identity lists (`DsnIdentity`) and matches
+   on any overlap, with `hostaddr` taking precedence over `host` — a widening,
+   so the guard can only become more conservative, never less.
+
+Tests: 8 new DB integration tests (22 total) covering both P1s with their
+matching clean controls — a delivered cancel whose target is terminal, a
+delivered signal with a queued row, a *failed* request asserting nothing — plus
+the undecodable-event case and a real registered-handler replay failure/success
+pair; 4 new unit tests. Both P1 fixes were confirmed falsifiable by reverting
+them and observing the corresponding test fail.
