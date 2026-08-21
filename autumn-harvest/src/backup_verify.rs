@@ -202,6 +202,16 @@ pub enum FindingClass {
     ReplayWorkflowFailed,
 
     // ── Advisory: operator judgement ────────────────────────────────────────
+    /// A caller recorded an external *signal* as delivered and the target's
+    /// shard does carry a signal of that name, but the delivery carried no
+    /// `idempotency_key`, so the exact delivery cannot be proven to have
+    /// survived. The engine persists no per-delivery identity for an unkeyed
+    /// signal (`SignalReceived` carries only name + payload, and
+    /// `harvest_signals` carries a key only when the caller supplied one), so
+    /// this is a permanent precision limit of the data model, not a probe
+    /// failure — hence Advisory rather than Undetermined. A signal whose name
+    /// has *no* trace at all is still reported as `ExternalEffectRolledBack`.
+    ExternalEffectUnverifiable,
     /// Shards were restored to materially different points in time.
     RestorePointSkew,
     /// A sampled history could not be replayed because its workflow type is
@@ -228,7 +238,7 @@ pub enum FindingClass {
 
 impl FindingClass {
     /// Every class, in a stable order. Used by tests and by the runbook table.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::DeadWorkerRunningTask,
         Self::TimedOutTask,
         Self::WorkflowDeadlineExpired,
@@ -246,6 +256,7 @@ impl FindingClass {
         Self::ExternalEffectRolledBack,
         Self::ReplayDivergence,
         Self::ReplayWorkflowFailed,
+        Self::ExternalEffectUnverifiable,
         Self::RestorePointSkew,
         Self::ReplaySkippedNoHandler,
         Self::HistoryUnreadable,
@@ -281,7 +292,8 @@ impl FindingClass {
             | Self::ReplayDivergence
             | Self::ReplayWorkflowFailed => FindingSeverity::Incoherent,
 
-            Self::RestorePointSkew
+            Self::ExternalEffectUnverifiable
+            | Self::RestorePointSkew
             | Self::ReplaySkippedNoHandler
             | Self::HistoryUnreadable
             | Self::UninspectedShardReference
@@ -312,6 +324,7 @@ impl FindingClass {
             Self::ExternalEffectRolledBack => "external_effect_rolled_back",
             Self::ReplayDivergence => "replay_divergence",
             Self::ReplayWorkflowFailed => "replay_workflow_failed",
+            Self::ExternalEffectUnverifiable => "external_effect_unverifiable",
             Self::RestorePointSkew => "restore_point_skew",
             Self::ReplaySkippedNoHandler => "replay_skipped_no_handler",
             Self::HistoryUnreadable => "history_unreadable",
@@ -379,6 +392,11 @@ impl FindingClass {
             Self::ReplayWorkflowFailed => {
                 "this non-terminal history replays to a workflow error under the deployed \
                  code — resuming it would fail the run immediately"
+            }
+            Self::ExternalEffectUnverifiable => {
+                "an unkeyed external signal of this name exists on the target, but the \
+                 engine records no per-delivery identity for it, so this specific \
+                 delivery cannot be proven to have survived"
             }
             Self::RestorePointSkew => "shards carry materially different newest-event timestamps",
             Self::ReplaySkippedNoHandler => {
@@ -1208,18 +1226,46 @@ mod probes {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(super) enum ExternalEffect {
         /// The named signal must be queued or already recorded on the target.
-        Signal(String),
+        ///
+        /// `idempotency_key` is the ONLY per-delivery identity the engine
+        /// persists on the target side (issue #521): `SignalReceived` carries
+        /// just name + payload, and `harvest_signals.idempotency_key` is set
+        /// only when the caller supplied one. With a key the check is exact;
+        /// without one it can only ask whether *any* signal of that name
+        /// survives, which is why an unkeyed hit is reported as
+        /// `ExternalEffectUnverifiable` rather than clean.
+        Signal {
+            name: String,
+            idempotency_key: Option<String>,
+        },
         /// The target must be terminal.
         Cancel,
         /// The target must be terminal.
         Await,
     }
 
+    /// Whether the target shard still shows a recorded-as-delivered effect.
+    ///
+    /// Tri-state rather than a bool: for an UNKEYED signal the engine persists
+    /// no per-delivery identity, so "a signal of this name is present" is not
+    /// proof that *this* delivery survived. Collapsing that to `true` reopens
+    /// the false-clean the whole class exists to prevent; collapsing it to
+    /// `false` would report a false rollback on every repeated channel name.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum EffectVerdict {
+        /// The effect is durably present on the target's shard.
+        Survived,
+        /// No trace of the effect at all -- definitive rollback.
+        Lost,
+        /// Same-named evidence exists but this delivery cannot be identified.
+        Unverifiable,
+    }
+
     impl ExternalEffect {
         /// Short label for report samples.
         const fn label(&self) -> &'static str {
             match self {
-                Self::Signal(_) => "signal",
+                Self::Signal { .. } => "signal",
                 Self::Cancel => "cancel",
                 Self::Await => "await",
             }
@@ -1649,13 +1695,22 @@ mod probes {
                 signal_id,
                 target,
                 signal_name,
+                idempotency_key,
                 ..
             } => match target {
                 ExternalTarget::ExecutionId(t) => {
                     scan.requested.entry(owner).or_default().push((
                         signal_id.as_uuid(),
                         t.as_uuid(),
-                        ExternalEffect::Signal(signal_name),
+                        ExternalEffect::Signal {
+                            name: signal_name,
+                            // Mirror the engine's own normalisation: an empty
+                            // key is excluded from the partial unique index, so
+                            // `send_signal_idempotent` treats it as no key.
+                            // Matching on it would look up a value that was
+                            // never stored and report a false rollback.
+                            idempotency_key: idempotency_key.filter(|k| !k.is_empty()),
+                        },
                     ));
                 }
                 ExternalTarget::WorkflowId {
@@ -2027,6 +2082,7 @@ mod probes {
         pending_external: Vec<String>,
         lookup_errors: Vec<String>,
         lost_effect: Vec<String>,
+        unverifiable_effect: Vec<String>,
     }
 
     /// Look up each reference's target on its owning shard and bucket the
@@ -2092,9 +2148,17 @@ mod probes {
                     ));
                 }
                 (RefKind::ExternalEffectDelivered(effect), Some(s)) => {
-                    match effect_survived(conn, r.target, effect, &s).await {
-                        Ok(true) => {}
-                        Ok(false) => out.lost_effect.push(format!(
+                    match effect_verdict(conn, r.target, effect, &s).await {
+                        Ok(EffectVerdict::Survived) => {}
+                        Ok(EffectVerdict::Unverifiable) => {
+                            out.unverifiable_effect.push(format!(
+                                "{} unkeyed signal delivered by {} on shard {} cannot be \
+                                 identified on shard {} (a signal of that name is present, \
+                                 but the engine records no per-delivery identity)",
+                                r.target, r.source_exec, r.source_shard, r.owner_shard
+                            ));
+                        }
+                        Ok(EffectVerdict::Lost) => out.lost_effect.push(format!(
                             "{} {} delivered by {} on shard {} left no trace on shard {} \
                              (target is {s})",
                             effect.label(),
@@ -2122,33 +2186,98 @@ mod probes {
     ///   worker later promotes to a `SignalReceived` event. The row persists
     ///   after consumption (`consumed` is a flag, not a delete), so *neither*
     ///   present means the target was restored to before the delivery.
-    async fn effect_survived(
+    async fn effect_verdict(
         conn: &mut AsyncPgConnection,
         target: Uuid,
         effect: &ExternalEffect,
         state: &str,
-    ) -> Result<bool, diesel::result::Error> {
+    ) -> Result<EffectVerdict, diesel::result::Error> {
         match effect {
+            // A target that continued-as-new is CONTINUED_AS_NEW and a retried
+            // one is FAILED -- both terminal -- so the chain walk below is not
+            // needed here.
             ExternalEffect::Cancel | ExternalEffect::Await => {
-                Ok(crate::erase::is_terminal_state(state))
+                Ok(if crate::erase::is_terminal_state(state) {
+                    EffectVerdict::Survived
+                } else {
+                    EffectVerdict::Lost
+                })
             }
-            ExternalEffect::Signal(name) => {
-                let row: ExistsRow = diesel::sql_query(
-                    "SELECT EXISTS ( \
-                         SELECT 1 FROM harvest_signals \
-                         WHERE workflow_exec_id = $1 AND signal_name = $2 \
+            ExternalEffect::Signal {
+                name,
+                idempotency_key,
+            } => {
+                // Walk the target's SUCCESSOR CHAIN, not just the target row.
+                //
+                // Both continue-as-new (`worker.rs`, unconsumed rows only) and
+                // workflow-level retry (`signal::forward_signals_to_retry_attempt`,
+                // issue #843 -- the WHOLE mailbox, re-arming `consumed`)
+                // REASSIGN `harvest_signals.workflow_exec_id` to the successor.
+                // An unconsumed signal produces no `SignalReceived` event, so
+                // after either transition the original target carries no row
+                // AND no event -- checking it alone would report a healthy
+                // restore as rolled back and exit 1.
+                //
+                // `UNION` (not `UNION ALL`) makes the recursion terminate even
+                // if a chain link were ever cyclic.
+                const CHAIN: &str = "WITH RECURSIVE chain(id) AS ( \
+                         SELECT $1::uuid \
+                       UNION \
+                         SELECT w.id FROM harvest_workflow_executions w \
+                           JOIN chain c \
+                             ON w.continued_from_exec_id = c.id \
+                             OR w.retry_of_exec_id = c.id \
+                     ) ";
+
+                if let Some(key) = idempotency_key {
+                    // Exact: the key is per-delivery and travels with the row
+                    // through every reassignment (only `workflow_exec_id` and
+                    // `consumed` are rewritten).
+                    let row: ExistsRow = diesel::sql_query(format!(
+                        "{CHAIN}SELECT EXISTS ( \
+                             SELECT 1 FROM harvest_signals s \
+                               JOIN chain c ON s.workflow_exec_id = c.id \
+                             WHERE s.idempotency_key = $2 \
+                           ) AS present"
+                    ))
+                    .bind::<diesel::sql_types::Uuid, _>(target)
+                    .bind::<diesel::sql_types::Text, _>(key)
+                    .get_result(conn)
+                    .await?;
+                    return Ok(if row.present {
+                        EffectVerdict::Survived
+                    } else {
+                        EffectVerdict::Lost
+                    });
+                }
+
+                // Unkeyed: the engine persists no per-delivery identity, so the
+                // most that can be asked is whether ANY signal of this name
+                // survives on the chain. Absence is still definitive (nothing
+                // of this name survived); presence is not proof that THIS
+                // delivery did -- a repeated channel name would match an older
+                // one -- so it is reported as unverifiable, never clean.
+                let row: ExistsRow = diesel::sql_query(format!(
+                    "{CHAIN}SELECT EXISTS ( \
+                         SELECT 1 FROM harvest_signals s \
+                           JOIN chain c ON s.workflow_exec_id = c.id \
+                         WHERE s.signal_name = $2 \
                        ) OR EXISTS ( \
-                         SELECT 1 FROM harvest_events \
-                         WHERE workflow_exec_id = $1 \
-                           AND event_type = 'SignalReceived' \
-                           AND event_data->'data'->>'signal_name' = $2 \
-                       ) AS present",
-                )
+                         SELECT 1 FROM harvest_events e \
+                           JOIN chain c ON e.workflow_exec_id = c.id \
+                         WHERE e.event_type = 'SignalReceived' \
+                           AND e.event_data->'data'->>'signal_name' = $2 \
+                       ) AS present"
+                ))
                 .bind::<diesel::sql_types::Uuid, _>(target)
                 .bind::<diesel::sql_types::Text, _>(name)
                 .get_result(conn)
                 .await?;
-                Ok(row.present)
+                Ok(if row.present {
+                    EffectVerdict::Unverifiable
+                } else {
+                    EffectVerdict::Lost
+                })
             }
         }
     }
@@ -2213,6 +2342,7 @@ mod probes {
                 pending_external,
                 lookup_errors,
                 lost_effect,
+                unverifiable_effect,
             } = buckets;
 
             for (class, samples) in [
@@ -2221,6 +2351,10 @@ mod probes {
                 (FindingClass::ExternalTargetMissing, missing_external),
                 (FindingClass::PendingExternalRequest, pending_external),
                 (FindingClass::ExternalEffectRolledBack, lost_effect),
+                (
+                    FindingClass::ExternalEffectUnverifiable,
+                    unverifiable_effect,
+                ),
                 // A reference we could not adjudicate is Undetermined, never a
                 // pass: the row may be missing, or the query may simply have
                 // failed, and we must not guess which.
@@ -2404,6 +2538,7 @@ mod tests {
             (FindingClass::ExternalEffectRolledBack, Incoherent),
             (FindingClass::ReplayDivergence, Incoherent),
             (FindingClass::ReplayWorkflowFailed, Incoherent),
+            (FindingClass::ExternalEffectUnverifiable, Advisory),
             // Worth an operator's eye; does not fail the gate.
             (FindingClass::RestorePointSkew, Advisory),
             (FindingClass::ReplaySkippedNoHandler, Advisory),

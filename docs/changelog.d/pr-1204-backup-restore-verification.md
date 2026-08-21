@@ -25,7 +25,7 @@ plus a read-only DB half (`db`-gated):
   `undetermined_outranks_incoherent_and_reclaimable`,
   `advisory_classes_never_escalate_the_verdict`) and the DB test
   `an_unmigrated_restore_is_undetermined_never_a_pass`.
-- **23 `FindingClass` variants** (8 reclaimable / 9 incoherent / 5 advisory / 1
+- **24 `FindingClass` variants** (8 reclaimable / 9 incoherent / 6 advisory / 1
   undetermined), each carrying a `const fn explanation()` that names the healing
   mechanism and its issue number, so the report teaches rather than just alarms.
   The severity table is pinned exhaustively against `FindingClass::ALL`
@@ -186,3 +186,41 @@ delivered signal with a queued row, a *failed* request asserting nothing — plu
 the undecodable-event case and a real registered-handler replay failure/success
 pair; 4 new unit tests. Both P1 fixes were confirmed falsifiable by reverting
 them and observing the corresponding test fail.
+
+**Post-review hardening, round 2** (automated review of the round-1 fixes; two
+genuine P1s, both in the new `ExternalEffectRolledBack` signal check, each
+confirmed against engine source before being fixed and each RED-probe verified):
+
+1. **P1 — a healthy restore was reported rolled back.** The signal check looked
+   only at the target's own execution row, but BOTH continue-as-new
+   (`worker.rs`) and workflow-level retry
+   (`signal::forward_signals_to_retry_attempt`, issue #843) **reassign**
+   `harvest_signals.workflow_exec_id` to the successor — the retry path moves
+   the whole mailbox and re-arms `consumed`. An unconsumed signal produces no
+   `SignalReceived` event, so after either transition the original target
+   carries no row *and* no event, and the check reported `Incoherent` ("do not
+   start workers") on a perfectly good restore. The lookup now walks the
+   target's successor chain (`continued_from_exec_id` / `retry_of_exec_id`) via
+   a recursive CTE. Cancel and await are unaffected — a continued-as-new target
+   is `CONTINUED_AS_NEW` and a retried one is `FAILED`, both already terminal.
+2. **P1 — a repeated channel name masked a rollback.** The check matched on
+   `(workflow_exec_id, signal_name)`, so a target that had received *any* signal
+   of that name read clean even when the specific delivery had been rolled back
+   — reopening the false-clean the class exists to prevent. A delivered signal
+   is now matched **exactly by its `idempotency_key`** (issue #521), the only
+   per-delivery identity the engine persists on the target side, carried into
+   the reference from `ExternalSignalRequested` and normalised the same way
+   `send_signal_idempotent` does (an empty key is no key). `effect_verdict`
+   became tri-state: with a key the answer is definitive either way; without
+   one, absence is still a definitive `ExternalEffectRolledBack` but presence
+   is reported as the new **advisory** `ExternalEffectUnverifiable`. Advisory
+   rather than `Undetermined` because this is a permanent precision limit of the
+   data model, not a probe that failed to run — escalating it would mean the
+   tool could never return clean for any fleet using unkeyed external signals,
+   which would push operators to ignore it.
+
+Tests: 5 new DB integration tests (**27** total) — continue-as-new forwarding,
+retry forwarding, keyed-exact rollback detection, its exact-key-present clean
+control, and the unkeyed advisory (asserting it does *not* escalate the
+verdict). All four behavioural tests were confirmed RED against a reverted
+check; the fifth is a control that passes both ways by design.

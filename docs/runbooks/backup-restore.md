@@ -117,7 +117,7 @@ resume, not because anything is wrong.
 | `child_terminal_rolled_back` | The parent recorded the child's terminal, but the child's shard was restored to an *earlier* point where the child is still running. See §6 — this is the signature multi-shard skew failure. |
 | `wedged_schedule_claim` | A schedule with a claim token but a **NULL** `fire_claimed_until` — a torn claim pair. The scheduler claims on `fire_claim_token IS NULL OR fire_claimed_until < NOW()`, which such a row matches neither half of, so the schedule never fires again. Un-claim it by hand (`UPDATE harvest_schedules SET fire_claim_token = NULL, fire_claimed_until = NULL WHERE id = …`) before starting workers. Contrast `expired_schedule_claim`, which self-heals. |
 | `replay_divergence` | A sampled history no longer replays against the deployed workflow code. Not caused by the restore; caused by a code/history mismatch. Fix by rolling *back* the workflow code, then resume (see `nondeterminism-block.md`). |
-| `external_effect_rolled_back` | The caller recorded a signal/cancel/await as **delivered**, but the target's shard shows no trace of the effect — the cross-shard analogue of `child_terminal_rolled_back`. Adjudicated per effect: a delivered *cancel* or resolved *await* requires the target to be terminal; a delivered *signal* requires either a `harvest_signals` row (the row persists after delivery — `consumed` is a flag, not a delete) or a recorded `SignalReceived` event. Repair by restoring the target shard to a point at or after the caller's, per §6. Nothing retries this: the caller has already recorded the terminal and will never re-request. |
+| `external_effect_rolled_back` | The caller recorded a signal/cancel/await as **delivered**, but the target's shard shows no trace of the effect — the cross-shard analogue of `child_terminal_rolled_back`. Adjudicated per effect: a delivered *cancel* or resolved *await* requires the target to be terminal; a delivered *signal* is matched **exactly by its `idempotency_key`** when the caller supplied one, else by channel name. The lookup walks the target's **successor chain** (`continued_from_exec_id` / `retry_of_exec_id`), because both continue-as-new and workflow-level retry reassign `harvest_signals` rows to the successor. Repair by restoring the target shard to a point at or after the caller's, per §6. Nothing retries this: the caller has already recorded the terminal and will never re-request. |
 | `replay_workflow_failed` | A sampled **non-terminal** history replays to a workflow *error* under the deployed code. Because the sample is drawn only from runs with no recorded terminal failure, this means the deployed handler now errors where the live run had not. Same remedy as `replay_divergence`: roll the workflow code *back*, then resume. |
 
 A report containing any of these exits **1**. Do not start workers.
@@ -373,6 +373,16 @@ resolves its target at *delivery* time, so the recorded event carries no
 execution id to look up. Verify reports these as `workflow_id_target_unchecked`
 (advisory) with the target keys, rather than silently passing over them — check
 by hand that the named `(workflow_name, workflow_id)` pairs have a live run.
+
+A second class is unadjudicable only when the caller did not supply an
+idempotency key. A delivered **signal** is matched exactly by its
+`idempotency_key` when one is present — that is the only per-delivery identity
+the engine persists on the target side. Without one, verify can ask only whether
+*any* signal of that channel name survives: absence is still a definitive
+`external_effect_rolled_back`, but presence could be an older delivery on the
+same channel, so it is reported as `external_effect_unverifiable` (advisory)
+rather than clean. Pass an idempotency key on external signals (issue #521) if
+you want post-restore verification of them to be exact.
 
 Do **not** verify shards one at a time in separate invocations. A single-shard
 run cannot see the other side of a cross-shard reference; it reports

@@ -1131,3 +1131,345 @@ async fn a_replayed_workflow_that_succeeds_is_still_clean() {
         "{report:#?}"
     );
 }
+
+// ─────────────── Codex round 2: signal effect identity + chain ───────────────
+
+/// Codex round 2, P1. Continue-as-new REASSIGNS unconsumed `harvest_signals`
+/// rows to the successor (`worker.rs`), and an unconsumed signal produces no
+/// `SignalReceived` event — so after the transition the ORIGINAL target row
+/// carries no row and no event. Checking the target alone reports a perfectly
+/// healthy restore as rolled back and exits 1, telling an operator not to start
+/// workers. Follow the successor chain.
+#[tokio::test]
+async fn a_signal_forwarded_by_continue_as_new_is_found_on_the_successor() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let successor = ExecutionId::new_for_shard(ShardId::new(1));
+    let signal_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "supervisor", "sup-can", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalSignalRequested",
+        json!({
+            "signal_id": signal_id.to_string(),
+            "target": target.to_string(),
+            "signal_name": "approve",
+            "payload": {}
+        }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalSignalDelivered",
+        json!({ "signal_id": signal_id.to_string() }),
+    )
+    .await;
+
+    // The target continued-as-new and the engine moved the still-unconsumed
+    // signal row onto the successor. The target itself is left with nothing.
+    seed_execution(&mut b, target, "review", "rv-can", "CONTINUED_AS_NEW", 1).await;
+    seed_execution(&mut b, successor, "review", "rv-can-2", "RUNNING", 1).await;
+    exec_sql(
+        &mut b,
+        &format!(
+            "UPDATE harvest_workflow_executions \
+             SET continued_from_exec_id = '{target}' WHERE id = '{successor}'"
+        ),
+    )
+    .await;
+    exec_sql(
+        &mut b,
+        &format!(
+            "INSERT INTO harvest_signals \
+             (id, workflow_exec_id, signal_name, payload, received_at, consumed) \
+             VALUES (gen_random_uuid(), '{successor}', 'approve', '{{}}'::jsonb, NOW(), false)"
+        ),
+    )
+    .await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::ExternalEffectRolledBack),
+        "the signal was forwarded to the continue-as-new successor, not lost: {report:#?}"
+    );
+    assert_ne!(
+        report.status,
+        VerifyStatus::Incoherent,
+        "a healthy restore must not be reported incoherent: {report:#?}"
+    );
+}
+
+/// The retry path is BROADER than continue-as-new: `forward_signals_to_retry_attempt`
+/// (issue #843) moves the WHOLE mailbox and re-arms `consumed`, so the original
+/// target is left with zero rows even for signals it had already consumed.
+#[tokio::test]
+async fn a_signal_forwarded_to_a_retry_attempt_is_found_on_the_successor() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let attempt2 = ExecutionId::new_for_shard(ShardId::new(1));
+    let signal_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "supervisor", "sup-retry", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalSignalRequested",
+        json!({
+            "signal_id": signal_id.to_string(),
+            "target": target.to_string(),
+            "signal_name": "approve",
+            "payload": {}
+        }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalSignalDelivered",
+        json!({ "signal_id": signal_id.to_string() }),
+    )
+    .await;
+
+    seed_execution(&mut b, target, "review", "rv-retry", "FAILED", 1).await;
+    seed_execution(&mut b, attempt2, "review", "rv-retry-2", "RUNNING", 1).await;
+    exec_sql(
+        &mut b,
+        &format!(
+            "UPDATE harvest_workflow_executions \
+             SET retry_of_exec_id = '{target}' WHERE id = '{attempt2}'"
+        ),
+    )
+    .await;
+    exec_sql(
+        &mut b,
+        &format!(
+            "INSERT INTO harvest_signals \
+             (id, workflow_exec_id, signal_name, payload, received_at, consumed) \
+             VALUES (gen_random_uuid(), '{attempt2}', 'approve', '{{}}'::jsonb, NOW(), false)"
+        ),
+    )
+    .await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::ExternalEffectRolledBack),
+        "the mailbox was forwarded to the retry attempt, not lost: {report:#?}"
+    );
+    assert_ne!(report.status, VerifyStatus::Incoherent);
+}
+
+/// Codex round 2, P1. A repeated channel name made the name-level EXISTS match
+/// an OLDER delivery, so a rollback that dropped only the newer one read clean.
+/// With an `idempotency_key` the delivery has a real identity, so the check is
+/// exact: a target carrying only the earlier key is definitively rolled back.
+#[tokio::test]
+async fn a_keyed_signal_is_matched_exactly_not_by_channel_name() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let signal_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "supervisor", "sup-key", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalSignalRequested",
+        json!({
+            "signal_id": signal_id.to_string(),
+            "target": target.to_string(),
+            "signal_name": "tick",
+            "payload": {},
+            "idempotency_key": "tick-2"
+        }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalSignalDelivered",
+        json!({ "signal_id": signal_id.to_string() }),
+    )
+    .await;
+
+    // The target kept the FIRST "tick" but the restore dropped the second.
+    // A name-level check would match `tick-1` and wrongly report clean.
+    seed_execution(&mut b, target, "review", "rv-key", "RUNNING", 1).await;
+    exec_sql(
+        &mut b,
+        &format!(
+            "INSERT INTO harvest_signals \
+             (id, workflow_exec_id, signal_name, payload, received_at, consumed, idempotency_key) \
+             VALUES (gen_random_uuid(), '{target}', 'tick', '{{}}'::jsonb, NOW(), true, 'tick-1')"
+        ),
+    )
+    .await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::ExternalEffectRolledBack),
+        "the keyed delivery tick-2 is absent; matching tick-1 by name is a false clean: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Incoherent);
+}
+
+/// The control for the keyed case: the exact key is present, so the check is
+/// definitive and the report is clean — no advisory, no finding.
+#[tokio::test]
+async fn a_keyed_signal_whose_exact_key_is_present_is_definitively_clean() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let signal_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "supervisor", "sup-key-ok", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalSignalRequested",
+        json!({
+            "signal_id": signal_id.to_string(),
+            "target": target.to_string(),
+            "signal_name": "tick",
+            "payload": {},
+            "idempotency_key": "tick-2"
+        }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalSignalDelivered",
+        json!({ "signal_id": signal_id.to_string() }),
+    )
+    .await;
+
+    seed_execution(&mut b, target, "review", "rv-key-ok", "RUNNING", 1).await;
+    exec_sql(
+        &mut b,
+        &format!(
+            "INSERT INTO harvest_signals \
+             (id, workflow_exec_id, signal_name, payload, received_at, consumed, idempotency_key) \
+             VALUES (gen_random_uuid(), '{target}', 'tick', '{{}}'::jsonb, NOW(), true, 'tick-2')"
+        ),
+    )
+    .await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::ExternalEffectRolledBack),
+        "the exact key is present: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::ExternalEffectUnverifiable),
+        "a keyed delivery is exactly checkable, never merely unverifiable: {report:#?}"
+    );
+}
+
+/// An UNKEYED delivery whose channel name is present cannot be proven to be
+/// THIS delivery — the engine persists no per-delivery identity for it. That is
+/// a permanent precision limit of the data model, so it is surfaced as an
+/// advisory: honest, but never escalating a healthy restore to exit 1.
+#[tokio::test]
+async fn an_unkeyed_signal_with_name_evidence_is_advisory_not_clean_and_not_incoherent() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let signal_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "supervisor", "sup-unkeyed", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalSignalRequested",
+        json!({
+            "signal_id": signal_id.to_string(),
+            "target": target.to_string(),
+            "signal_name": "approve",
+            "payload": {}
+        }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalSignalDelivered",
+        json!({ "signal_id": signal_id.to_string() }),
+    )
+    .await;
+
+    seed_execution(&mut b, target, "review", "rv-unkeyed", "RUNNING", 1).await;
+    exec_sql(
+        &mut b,
+        &format!(
+            "INSERT INTO harvest_signals \
+             (id, workflow_exec_id, signal_name, payload, received_at, consumed) \
+             VALUES (gen_random_uuid(), '{target}', 'approve', '{{}}'::jsonb, NOW(), false)"
+        ),
+    )
+    .await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::ExternalEffectUnverifiable),
+        "an unkeyed delivery is not provable from a name match: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::ExternalEffectRolledBack),
+        "name evidence exists, so this is not a definitive rollback: {report:#?}"
+    );
+    assert_ne!(
+        report.status,
+        VerifyStatus::Incoherent,
+        "an advisory must never escalate the verdict: {report:#?}"
+    );
+}
