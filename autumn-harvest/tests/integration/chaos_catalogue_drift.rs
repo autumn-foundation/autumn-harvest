@@ -6,8 +6,16 @@
 //! (compiled into every build), so this test runs in the normal test build and
 //! can never silently pass while a catalogue entry has lost its wiring — the
 //! failure mode that would otherwise make an injection point a dead no-op.
+//!
+//! The scan lexes each source into a `proc_macro2::TokenStream` and matches the
+//! `<macro> ! ( IDENT )` token pattern, rather than scanning raw text. Lexing
+//! drops comments and delimits string / raw-string / char literals, so a
+//! commented-out or stringified `chaos_point!(NAME)` is **not** miscounted as
+//! live wiring — the precise drift this guard exists to catch.
 
 use std::path::{Path, PathBuf};
+
+use proc_macro2::{Delimiter, TokenStream, TokenTree};
 
 /// Expected `(point ident, wiring macro)` for every catalogue entry. Kept in
 /// lockstep with `points::ALL` by the assertions below.
@@ -22,17 +30,24 @@ const EXPECTED: &[(&str, &str)] = &[
     ("NOTIFY_TASK_ENQUEUED", "chaos_drop_notify"),
 ];
 
+/// The wiring macros a production call site may use.
+const CHAOS_MACROS: &[&str] = &["chaos_point", "chaos_fallible", "chaos_drop_notify"];
+
+fn is_chaos_macro(name: &str) -> bool {
+    CHAOS_MACROS.contains(&name)
+}
+
 fn src_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
-/// Recursively collect the contents of every `.rs` file under `src/`, EXCEPT
-/// the two files where the chaos vocabulary is *defined* rather than *used*:
+/// Recursively lex every `.rs` file under `src/` into a token stream, EXCEPT the
+/// two files where the chaos vocabulary is *defined* rather than *used*:
 /// `chaos.rs` (the point consts + catalogue) and `lib.rs` (the
 /// `chaos_point!` / `chaos_fallible!` / `chaos_drop_notify!` `macro_rules`
 /// definitions, whose bodies and doc examples reference the macro names and a
 /// `NAME` placeholder). Neither is production wiring.
-fn production_sources() -> Vec<(String, String)> {
+fn production_sources() -> Vec<(String, TokenStream)> {
     let mut out = Vec::new();
     let mut stack = vec![src_dir()];
     while let Some(dir) = stack.pop() {
@@ -45,28 +60,85 @@ fn production_sources() -> Vec<(String, String)> {
                 if name == "chaos.rs" || name == "lib.rs" {
                     continue;
                 }
+                let display = path.display().to_string();
                 let body = std::fs::read_to_string(&path).expect("read source");
-                out.push((path.display().to_string(), body));
+                let tokens: TokenStream = body
+                    .parse()
+                    .unwrap_or_else(|e| panic!("failed to lex {display}: {e}"));
+                out.push((display, tokens));
             }
         }
     }
     out
 }
 
-/// Count wiring invocations `<macro>!(<ident>)` across the production sources.
-fn wiring_count(sources: &[(String, String)], macro_name: &str, ident: &str) -> usize {
-    let needle = format!("{macro_name}!({ident})");
-    sources
+/// Collect every chaos-macro call site as `(source, macro, ident)`.
+///
+/// Walks the token tree, matching the `Ident(<chaos macro>) Punct('!')
+/// Group('(' … ')')` sequence and extracting the single ident argument. A call
+/// whose parenthesised argument is not exactly one ident is recorded with a
+/// `<non-ident:N>` sentinel so [`no_orphan_chaos_macro_call_sites`] flags it
+/// (production wiring always passes a bare catalogue ident). Recurses into every
+/// group (blocks, `if` bodies, …) so a wrapped call — e.g.
+/// `if cond { crate::chaos_point!(NAME); }` — is still found.
+fn all_chaos_calls(sources: &[(String, TokenStream)]) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for (path, tokens) in sources {
+        let mut calls = Vec::new();
+        scan_stream(tokens.clone(), &mut calls);
+        for (macro_name, ident) in calls {
+            out.push((path.clone(), macro_name, ident));
+        }
+    }
+    out
+}
+
+/// Push every `<chaos macro> ! ( arg )` call in `ts` as `(macro, ident)` into
+/// `out`, recursing into nested groups.
+fn scan_stream(ts: TokenStream, out: &mut Vec<(String, String)>) {
+    let trees: Vec<TokenTree> = ts.into_iter().collect();
+    let mut i = 0;
+    while i < trees.len() {
+        if let TokenTree::Ident(id) = &trees[i] {
+            let name = id.to_string();
+            let bang = matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!');
+            if is_chaos_macro(&name)
+                && bang
+                && let Some(TokenTree::Group(g)) = trees.get(i + 2)
+                && g.delimiter() == Delimiter::Parenthesis
+            {
+                let inner: Vec<TokenTree> = g.stream().into_iter().collect();
+                let arg = match inner.as_slice() {
+                    [TokenTree::Ident(arg)] => arg.to_string(),
+                    _ => format!("<non-ident:{}>", inner.len()),
+                };
+                out.push((name, arg));
+                // Skip ident + '!' + arg group; the arg holds no nested chaos
+                // macro, so there is nothing to recurse into there.
+                i += 3;
+                continue;
+            }
+        }
+        if let TokenTree::Group(g) = &trees[i] {
+            scan_stream(g.stream(), out);
+        }
+        i += 1;
+    }
+}
+
+fn wiring_count(calls: &[(String, String, String)], macro_name: &str, ident: &str) -> usize {
+    calls
         .iter()
-        .map(|(_, body)| body.matches(&needle).count())
-        .sum()
+        .filter(|(_, m, id)| m == macro_name && id == ident)
+        .count()
 }
 
 #[test]
 fn every_catalogue_point_is_wired_exactly_once() {
     let sources = production_sources();
+    let calls = all_chaos_calls(&sources);
     for (ident, macro_name) in EXPECTED {
-        let count = wiring_count(&sources, macro_name, ident);
+        let count = wiring_count(&calls, macro_name, ident);
         assert_eq!(
             count, 1,
             "chaos point {ident} must be wired at exactly one production call site \
@@ -104,24 +176,47 @@ fn expected_list_matches_catalogue_all() {
 #[test]
 fn no_orphan_chaos_macro_call_sites() {
     let sources = production_sources();
+    let calls = all_chaos_calls(&sources);
     let known: Vec<&str> = EXPECTED.iter().map(|(ident, _)| *ident).collect();
-    for (path, body) in &sources {
-        for macro_name in ["chaos_point", "chaos_fallible", "chaos_drop_notify"] {
-            let open = format!("{macro_name}!(");
-            let mut search = body.as_str();
-            while let Some(pos) = search.find(&open) {
-                let after = &search[pos + open.len()..];
-                let end = after
-                    .find(')')
-                    .expect("chaos macro call must close its paren");
-                let ident = after[..end].trim();
-                assert!(
-                    known.contains(&ident),
-                    "orphan chaos macro call {macro_name}!({ident}) in {path}: \
-                     ident is not in the catalogue drift list"
-                );
-                search = &after[end..];
-            }
-        }
+    for (path, macro_name, ident) in &calls {
+        assert!(
+            known.contains(&ident.as_str()),
+            "orphan chaos macro call {macro_name}!({ident}) in {path}: \
+             ident is not in the catalogue drift list"
+        );
     }
+}
+
+/// The token scan must ignore a `chaos_point!(NAME)` that appears only in a
+/// comment or a string literal — the exact drift (a commented-out call still
+/// leaving one textual match) a raw-text scan cannot catch.
+#[test]
+fn token_scan_ignores_comments_and_strings() {
+    let src = r##"
+        fn wired() {
+            // A live call — the only one that must count.
+            crate::chaos_point!(QUEUE_PARK_BEFORE_UPDATE);
+        }
+        // A commented-out call must NOT count:
+        // crate::chaos_point!(QUEUE_PARK_BEFORE_UPDATE);
+        fn strings() {
+            let _sql = "chaos_point!(QUEUE_PARK_BEFORE_UPDATE) in a string";
+            let _url = "http://example.com/not-a-comment";
+            let _raw = r#"chaos_point!(QUEUE_PARK_BEFORE_UPDATE) in a raw string"#;
+            let _c = '"'; // a char literal holding a quote must not open a string
+            /* block // comment with chaos_point!(QUEUE_PARK_BEFORE_UPDATE) */
+        }
+    "##;
+    let tokens: TokenStream = src.parse().expect("lex synthetic source");
+    let mut calls = Vec::new();
+    scan_stream(tokens, &mut calls);
+    let count = calls
+        .iter()
+        .filter(|(m, id)| m == "chaos_point" && id == "QUEUE_PARK_BEFORE_UPDATE")
+        .count();
+    assert_eq!(
+        count, 1,
+        "only the live call site must count; comments and string/raw/char \
+         literals must be ignored (found {count})"
+    );
 }

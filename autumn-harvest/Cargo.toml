@@ -203,6 +203,14 @@ schemars = { version = "0.8" }
 # so the integration test binaries can build guest modules regardless of feature
 # resolution.
 wat = "1"
+# Token-based scan of `src/` for the chaos-catalogue drift guard
+# (`tests/integration/chaos_catalogue_drift.rs`, issue #940): lexing each source
+# into a `TokenStream` drops comments and correctly delimits string / raw-string
+# / char literals, so a commented-out or stringified `chaos_point!(NAME)` is not
+# miscounted as live wiring. Already in the lockfile (the proc-macro crate depends
+# on it) at the workspace version, so `{ workspace = true }` unifies rather than
+# widening the graph — same rationale as the `tokio-util` dev-dep above.
+proc-macro2 = { workspace = true }
 
 # testcontainers pulls bollard -> hyper-util, which uses `tokio::net`. Under a
 # global `RUSTFLAGS="--cfg loom"` build tokio's `net` module is compiled out

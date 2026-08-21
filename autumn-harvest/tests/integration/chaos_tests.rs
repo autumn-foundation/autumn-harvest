@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use autumn_harvest::chaos::points::{
     ChaosPoint, OUTBOX_INLINE_AFTER_REQUESTED, QUEUE_PARK_BEFORE_UPDATE, SCHED_AFTER_CLAIM,
-    WORKER_PERSIST_BEFORE_COMMIT,
+    SCHED_AFTER_START_BEFORE_ADVANCE, WORKER_PERSIST_BEFORE_COMMIT,
 };
 use autumn_harvest::chaos::{ChaosPlan, arm};
 use autumn_harvest::prelude::*;
@@ -93,19 +93,48 @@ async fn chaos_signal_external(
 
 // ── DB setup ────────────────────────────────────────────────────────────────
 
-/// A live DB URL plus (when spun locally) the container keeping it alive.
+/// Serialises entire chaos-test bodies against each other on a *shared*
+/// database. Acquired at the top of every chaos test (inside [`chaos_db`],
+/// before the scrub) and held — via the returned guard — for the test's whole
+/// lifetime.
+///
+/// Without this, the `HARVEST_TEST_DATABASE_URL` path run with the integration
+/// binary's default (parallel) test threads is nondeterministic: [`scrub`]'s
+/// global `TRUNCATE` happens *before* the harness's own `SERIAL` mutex is
+/// acquired (that lock only guards armed plans, from `arm()` onward), and the
+/// session-lease test never arms at all — so one test's scrub could erase
+/// another test's live workflows mid-run. This lock is a strict superset of the
+/// harness `SERIAL`: it also covers the pre-arm scrub and the non-arming tests,
+/// so the documented shared-DB invocation is deterministic regardless of
+/// `--test-threads`. On the testcontainers path each test owns its database, so
+/// the only effect there is a harmless whole-suite serialisation (and CI already
+/// runs `--test-threads=1`). Acquisition order is always this lock first, then
+/// the harness `SERIAL` inside `arm()`, so the two can never deadlock.
+static DB_BODY_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A whole-test-body isolation guard, a live DB URL, and (when spun locally) the
+/// container keeping it alive.
 ///
 /// Honours `HARVEST_TEST_DATABASE_URL` (assumed already migrated) for fast
 /// local RED/GREEN iteration; otherwise spins a fresh migrated Postgres 16
-/// container (the CI path). The env DB is scrubbed at the start of each test so
-/// the process-serialised chaos runs stay isolated.
-async fn chaos_db() -> (String, Option<ContainerAsync<Postgres>>) {
+/// container (the CI path). Acquires [`DB_BODY_SERIAL`] *first* so the scrub —
+/// and the whole test body, via the returned `_body` guard — runs with exclusive
+/// access to a shared DB; the env DB is then scrubbed so each run starts clean.
+async fn chaos_db() -> (
+    tokio::sync::MutexGuard<'static, ()>,
+    String,
+    Option<ContainerAsync<Postgres>>,
+) {
+    // Held for the caller's whole body (bound as `_body`): serialises shared-DB
+    // access across chaos tests, so a concurrent test's scrub can't erase this
+    // test's live workflows. Must be acquired before the scrub below.
+    let body = DB_BODY_SERIAL.lock().await;
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         let mut conn = AsyncPgConnection::establish(&url)
             .await
             .expect("connect to HARVEST_TEST_DATABASE_URL");
         scrub(&mut conn).await;
-        (url, None)
+        (body, url, None)
     } else {
         use testcontainers::ImageExt;
         use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -121,7 +150,7 @@ async fn chaos_db() -> (String, Option<ContainerAsync<Postgres>>) {
         conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("migration");
-        (url, Some(container))
+        (body, url, Some(container))
     }
 }
 
@@ -351,7 +380,7 @@ async fn signals_for(conn: &mut AsyncPgConnection, target: ExecutionId) -> i64 {
 // its `diagnostics()`/`hits()` are read by the trailing asserts.
 #[allow(clippy::significant_drop_tightening)]
 async fn chaos_repro_601_lost_wake_is_recovered_via_wake_requested() {
-    let (url, _c) = chaos_db().await;
+    let (_body, url, _c) = chaos_db().await;
     let mut conn = connect(&url).await;
 
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
@@ -460,8 +489,11 @@ async fn chaos_repro_601_lost_wake_is_recovered_via_wake_requested() {
 /// test-side: comment out the `reclaim_orphaned_tasks` call below *and its two
 /// `summary` asserts* — same failing shape, no production edit.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
+// end-of-scope; see `DB_BODY_SERIAL`.
+#[allow(clippy::significant_drop_tightening)]
 async fn chaos_repro_367_crash_orphan_is_reclaimed() {
-    let (url, _c) = chaos_db().await;
+    let (_body, url, _c) = chaos_db().await;
     let mut conn = connect(&url).await;
 
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
@@ -564,8 +596,11 @@ async fn chaos_repro_367_crash_orphan_is_reclaimed() {
 /// `ExternalSignalDelivered` — and the `== 1` / `outbox == 0` asserts fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)] // linear reproducer: setup, hold, outbox probe, release, exactly-once asserts.
+// `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
+// end-of-scope; see `DB_BODY_SERIAL`.
+#[allow(clippy::significant_drop_tightening)]
 async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
-    let (url, _c) = chaos_db().await;
+    let (_body, url, _c) = chaos_db().await;
     let mut conn = connect(&url).await;
 
     // Target (same shard 0) — a live RUNNING execution to receive the signal.
@@ -723,8 +758,11 @@ async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
 /// a SECOND time while the first fire is still in flight — the `exec_count == 0`
 /// (live-claim) or final `== 1` (single fire) assertion fails with 2 executions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
+// end-of-scope; see `DB_BODY_SERIAL`.
+#[allow(clippy::significant_drop_tightening)]
 async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
-    let (url, _c) = chaos_db().await;
+    let (_body, url, _c) = chaos_db().await;
     let wf = "chaos_sched_350";
     let sched_id = {
         let mut conn = connect(&url).await;
@@ -824,6 +862,133 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
     );
 }
 
+// ── Reproducer 4b — issue #350 post-start crash (SCHED_AFTER_START_BEFORE_ADVANCE) ──
+
+/// The #350 double-fire window *after* the start commits. A replica that crashes
+/// after firing this tick's scheduled start — but before advancing
+/// `next_run_at`/`last_run_at` — leaves the slot still "due" with an execution
+/// already created. Recovery must NOT create a *second* execution: the dedupe
+/// (the deterministic `sched:{id}:{name}:{slot}` workflow id) attaches the
+/// peer's re-fire to the run the crashed replica already started, so the slot
+/// yields **exactly one** execution (AC4).
+///
+/// This complements `chaos_repro_350_crashed_fire_claim_is_refired_exactly_once`
+/// (which KILLs at `SCHED_AFTER_CLAIM`, *before* any start, so its crash fires
+/// nothing) by arming the sibling `SCHED_AFTER_START_BEFORE_ADVANCE` point: the
+/// crash lands *after* one start committed (`exec_count == 1` right after the
+/// `JoinError`), directly exercising the post-start window that point exists to
+/// model — and, by construction, only reachable because a start committed
+/// (`dispatched > 0`).
+///
+/// RED procedure: break the per-slot dedupe so the expired-claim peer re-fire
+/// creates a fresh run — e.g. change the scheduled start's reuse policy away from
+/// the sched-id idempotent path (return `outcome.created() == true` on the
+/// re-fire). The final `exec_count == 1` assertion then fails with 2 executions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
+// end-of-scope; see `DB_BODY_SERIAL`.
+#[allow(clippy::significant_drop_tightening)]
+async fn chaos_repro_350_post_start_crash_dedupes_to_exactly_one() {
+    let (_body, url, _c) = chaos_db().await;
+    let wf = "chaos_sched_350_post_start";
+    let sched_id = {
+        let mut conn = connect(&url).await;
+        insert_due_schedule(&mut conn, wf).await
+    };
+    let registry = Arc::new(HandlerRegistry::new(vec![chaos_noop_info()], vec![]));
+
+    // Crash AFTER the start commits, BEFORE next_run_at advances. Only reachable
+    // because a start committed this tick (the `dispatched > 0` gate); the tick is
+    // spawned so the panic surfaces as a JoinError instead of aborting the test.
+    let guard = arm(ChaosPlan::scripted().kill_at(SCHED_AFTER_START_BEFORE_ADVANCE)).await;
+    let crash = tokio::spawn(tick_once(
+        make_pool(&url),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    ))
+    .await;
+    assert!(
+        crash.is_err(),
+        "the KILL must crash the tick after the start (JoinError); {}",
+        guard.diagnostics()
+    );
+    assert!(
+        guard.actions_fired() >= 1,
+        "the KILL must have fired (anti-vacuity); {}",
+        guard.diagnostics()
+    );
+    let diag = guard.diagnostics();
+    drop(guard);
+
+    // The crash committed exactly one start (the point fires AFTER the start), but
+    // did NOT advance the schedule — so the claim is still held and the slot is
+    // still due. This is the post-start window `SCHED_AFTER_CLAIM` cannot reach.
+    {
+        let mut conn = connect(&url).await;
+        assert_eq!(
+            exec_count(&mut conn, wf).await,
+            1,
+            "the crash must have committed exactly one start before the kill; {diag}"
+        );
+        let (token, live) = schedule_claim(&mut conn, sched_id).await;
+        assert!(
+            token.is_some() && live,
+            "the HA claim must still be held+live right after the post-start crash; {diag}"
+        );
+    }
+
+    // A healthy peer tick while the claim is live must NOT fire again.
+    tick_once(
+        make_pool(&url),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("peer tick (live claim)");
+    {
+        let mut conn = connect(&url).await;
+        assert_eq!(
+            exec_count(&mut conn, wf).await,
+            1,
+            "a live claim must block the peer from firing again; {diag}"
+        );
+    }
+
+    // Expire the claim → a peer re-fires the still-due slot. The per-slot dedupe
+    // must attach to the already-started run, NOT create a second execution.
+    {
+        let mut conn = connect(&url).await;
+        diesel::sql_query(
+            "UPDATE harvest_schedules SET fire_claimed_until = NOW() - INTERVAL '1 minute' \
+             WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(sched_id)
+        .execute(&mut conn)
+        .await
+        .expect("expire claim");
+    }
+    tick_once(
+        make_pool(&url),
+        registry,
+        Arc::new(DagCatalog::default()),
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("peer tick (expired claim)");
+
+    let mut conn = connect(&url).await;
+    assert_eq!(
+        exec_count(&mut conn, wf).await,
+        1,
+        "a post-start crash must yield exactly one execution through recovery (no double-fire); {diag}"
+    );
+}
+
 // ── AC1(d) — expire a lease/heartbeat early ──────────────────────────────────
 
 /// AC1(d) names four lease/heartbeat surfaces to expire early:
@@ -865,8 +1030,11 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
 /// `sessions::broken_session_candidates_query()` (or `lease_expired` in
 /// `resolve_broken_reason`) and the session stays `ACTIVE` — the assert fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
+// end-of-scope; see `DB_BODY_SERIAL`.
+#[allow(clippy::significant_drop_tightening)]
 async fn chaos_ac1d_session_lease_expiry_marks_broken() {
-    let (url, _c) = chaos_db().await;
+    let (_body, url, _c) = chaos_db().await;
     let mut conn = connect(&url).await;
 
     // A non-terminal (RUNNING) owning workflow — so the break is not attributed
@@ -1080,10 +1248,13 @@ fn default_sweep_seeds_are_at_least_five_and_strand_an_orphan() {
 /// invariant — every workflow terminal, no task stranded `RUNNING` with a dead
 /// worker, no dangling `ExternalSignalRequested`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
+// end-of-scope; see `DB_BODY_SERIAL`.
+#[allow(clippy::significant_drop_tightening)]
 async fn chaos_seeded_convergence_sweep() {
     const WORKLOAD: usize = 6;
 
-    let (url, _c) = chaos_db().await;
+    let (_body, url, _c) = chaos_db().await;
     let registry = Arc::new(HandlerRegistry::new(vec![chaos_noop_info()], vec![]));
 
     for seed in sweep_seeds() {
