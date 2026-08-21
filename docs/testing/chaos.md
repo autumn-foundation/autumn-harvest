@@ -160,6 +160,16 @@ invariant** after the harness is disarmed and the recovery loop (reclaim orphans
 - **no** task is stranded `RUNNING` with a dead worker;
 - **no** `ExternalSignalRequested` event lacks an eventual terminal.
 
+**Anti-vacuity.** The sweep additionally asserts, per seed, that at least one
+honored fault actually fired (`guard.actions_fired() >= 1`). `ChaosPlan::seeded`
+is a pure function of the seed, so this is deterministic — a seed that injects
+zero faults would let the convergence invariant pass for a healthy, un-faulted
+run ("passes for the wrong reason"). A vacuous seed therefore fails loudly,
+naming itself for replay, rather than passing silently. The documented default
+set is verified non-vacuous; a hand-picked `CHAOS_SEEDS` override must likewise
+drive a fault per seed. `sweep_seeds()` also asserts the resolved set has ≥ 5
+seeds (AC5), so a too-small `CHAOS_SEEDS` override fails immediately.
+
 The CI job (`.github/workflows/chaos.yml`) runs the suite on `workflow_dispatch`
 and on a nightly `cron`, exporting `CHAOS_SEEDS` so the sweep exercises ≥ 5
 distinct seeds per run.

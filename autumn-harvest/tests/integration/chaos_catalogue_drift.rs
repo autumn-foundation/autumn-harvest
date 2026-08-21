@@ -87,17 +87,15 @@ fn expected_list_matches_catalogue_all() {
         EXPECTED.len(),
         ALL.len()
     );
-    let catalogue: Vec<&str> = ALL.iter().map(|p| p.name()).collect();
-    // Each EXPECTED ident maps to a catalogue const whose `name()` uses dotted
-    // namespacing; assert every catalogue name is a known point and vice versa
-    // by count + membership. We match by the ident->name convention indirectly:
-    // the wiring assertion already binds idents to call sites, and here we bind
-    // ident count to catalogue count so neither list can drift alone.
-    assert_eq!(
-        catalogue.len(),
-        EXPECTED.len(),
-        "catalogue and EXPECTED must stay the same length"
-    );
+    // Every catalogue point's `name()` uses dotted namespacing and is unique;
+    // the count assertion above binds `ALL` and `EXPECTED` to the same length,
+    // and `every_catalogue_point_is_wired_exactly_once` binds each `EXPECTED`
+    // ident to a real wired call site — so neither list can drift alone.
+    let mut names: Vec<&str> = ALL.iter().map(|p| p.name()).collect();
+    let before = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(before, names.len(), "two catalogue points share a name()");
 }
 
 /// No production wiring may reference an ident that is not in the catalogue —

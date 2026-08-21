@@ -117,8 +117,11 @@ pub mod points {
     // deliberately, never silently.
 
     /// Top of `queue::park_workflow_task_inner`, before the park CTE runs.
+    ///
     /// Race window for issue #601 (a wake landing between the pre-park check
-    /// and the park's atomic `UPDATE`).
+    /// and the park's atomic `UPDATE`). Shared by both park callers
+    /// (`park_workflow_task` and `park_workflow_task_preserving_capability_misses`),
+    /// so a `hits()`-count reproducer must isolate the path it drives.
     pub const QUEUE_PARK_BEFORE_UPDATE: ChaosPoint = ChaosPoint {
         name: "queue.park.before_update",
         caps: CAP_KILL | CAP_DELAY,
@@ -140,10 +143,14 @@ pub mod points {
         caps: CAP_KILL | CAP_DELAY,
     };
 
-    /// Inside `worker::persist_external_signal_inline`, after the `*Requested`
-    /// event is appended but before the terminal delivery/failure event, still
-    /// inside the transaction. Race window for issue #492 (an outbox sweep
-    /// observing a half-written external-signal/cancel).
+    /// Inside `worker::persist_external_signal_inline`, on the fresh-request
+    /// (`!already_requested`) `Signal` arm.
+    ///
+    /// Fires after the `ExternalSignalRequested` event is appended but before
+    /// the terminal delivery/failure event — still inside the (uncommitted)
+    /// transaction. Race window for issue #492
+    /// (an outbox sweep observing a half-written external-signal). Only the
+    /// same-shard signal path is instrumented; the cancel/await arms are not.
     pub const OUTBOX_INLINE_AFTER_REQUESTED: ChaosPoint = ChaosPoint {
         name: "outbox.inline.after_requested",
         caps: CAP_KILL | CAP_DELAY,
@@ -166,6 +173,7 @@ pub mod points {
     };
 
     /// Top of `poison_pill::reclaim_orphaned_tasks`, before the orphan SELECT.
+    ///
     /// A `chaos_fallible!` site: an injected Diesel/connection error surfaces
     /// here (AC1(b)) exactly like a real DB failure and is returned to the poll
     /// loop, which retries on its next tick. The reclaim is idempotent, so the
@@ -175,8 +183,9 @@ pub mod points {
         caps: CAP_ERROR,
     };
 
-    /// In `notify::notify_task_enqueued`, guarding the `pg_notify` send. A
-    /// dropped wake (AC1(c)) means a listening worker never receives the
+    /// In `notify::notify_task_enqueued`, guarding the `pg_notify` send.
+    ///
+    /// A dropped wake (AC1(c)) means a listening worker never receives the
     /// `LISTEN`/`NOTIFY` and must fall back to its poll loop to claim the task.
     /// The invariant it stresses: dispatch converges even when every wake is
     /// lost, because the poll loop is the source of truth and NOTIFY is only a
@@ -240,14 +249,12 @@ pub mod points {
 
 #[cfg(feature = "chaos")]
 pub use controller::{
-    arm, hit, hit_fallible, should_drop_notify, ChaosError, ChaosGuard, ChaosPlan, HoldHandle,
+    ChaosError, ChaosGuard, ChaosPlan, HoldHandle, arm, hit, hit_fallible, should_drop_notify,
 };
 
 #[cfg(feature = "chaos")]
 mod controller {
-    use super::points::{
-        ChaosPoint, ALL, CAP_DELAY, CAP_DROP_NOTIFY, CAP_ERROR, CAP_KILL,
-    };
+    use super::points::{ALL, CAP_DELAY, CAP_DROP_NOTIFY, CAP_ERROR, CAP_KILL, ChaosPoint};
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
     use std::panic::PanicHookInfo;
@@ -263,8 +270,7 @@ mod controller {
 
     static ARMED: AtomicBool = AtomicBool::new(false);
     static STATE: RwLock<Option<Arc<ChaosState>>> = RwLock::new(None);
-    static SERIAL: LazyLock<tokio::sync::Mutex<()>> =
-        LazyLock::new(|| tokio::sync::Mutex::new(()));
+    static SERIAL: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
     static HOOK_INSTALLED: Once = Once::new();
 
     /// An injected fault error. Surfaces at a [`chaos_fallible!`] site as
@@ -427,7 +433,7 @@ mod controller {
     impl ChaosPlan {
         /// An empty plan; add directives with the `*_at` builders.
         #[must_use]
-        pub fn scripted() -> Self {
+        pub const fn scripted() -> Self {
             Self {
                 seed: None,
                 directives: BTreeMap::new(),
@@ -488,8 +494,7 @@ mod controller {
         /// [`ChaosGuard::hold`].
         #[must_use]
         pub fn hold_at(mut self, point: ChaosPoint) -> Self {
-            self.holds
-                .insert(point.name(), Arc::new(HoldGate::new()));
+            self.holds.insert(point.name(), Arc::new(HoldGate::new()));
             self.directives.insert(
                 point.name(),
                 Directive {
@@ -586,6 +591,20 @@ mod controller {
         Delay(u64),
     }
 
+    impl Resolved {
+        /// A short action name for a site-mismatch `debug_assert!` message.
+        const fn kind(&self) -> &'static str {
+            match self {
+                Self::Continue => "Continue",
+                Self::Kill => "Kill",
+                Self::Hold(_) => "Hold",
+                Self::Error(_) => "Error",
+                Self::DropNotify => "DropNotify",
+                Self::Delay(_) => "Delay",
+            }
+        }
+    }
+
     impl ChaosState {
         fn from_plan(plan: ChaosPlan) -> Self {
             Self {
@@ -624,16 +643,28 @@ mod controller {
             if !fire {
                 return Resolved::Continue;
             }
-            self.actions_fired.fetch_add(1, Ordering::Relaxed);
+            // NB: `actions_fired` is NOT bumped here. It is bumped by the entry
+            // point (`hit`/`hit_fallible`/`should_drop_notify`) only when that
+            // site can actually *honor* the resolved action — so a caps/site
+            // mismatch (e.g. an `Error` scripted at an infallible `chaos_point!`
+            // site) is caught by a `debug_assert!` there and does not silently
+            // inflate the anti-vacuity counter.
             match &directive.action {
                 Action::Kill => Resolved::Kill,
-                Action::Hold => self.holds.get(name).map_or(Resolved::Continue, |g| {
-                    Resolved::Hold(Arc::clone(g))
-                }),
+                Action::Hold => self
+                    .holds
+                    .get(name)
+                    .map_or(Resolved::Continue, |g| Resolved::Hold(Arc::clone(g))),
                 Action::Error(e) => Resolved::Error(e.clone()),
                 Action::DropNotify => Resolved::DropNotify,
                 Action::Delay(ms) => Resolved::Delay(*ms),
             }
+        }
+
+        /// Record that a resolved directive was actually honored at its site
+        /// (feeds the anti-vacuity `actions_fired` guard).
+        fn mark_fired(&self) {
+            self.actions_fired.fetch_add(1, Ordering::Relaxed);
         }
 
         fn hits_of(&self, point: ChaosPoint) -> u64 {
@@ -672,10 +703,7 @@ mod controller {
     }
 
     fn current_state() -> Option<Arc<ChaosState>> {
-        STATE
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        STATE.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// Install a chaining panic hook (once, idempotently) that prints a compact
@@ -700,14 +728,15 @@ mod controller {
     }
 
     fn panic_message(info: &PanicHookInfo<'_>) -> String {
+        // Mirrors the shared `crate::error::panic_message` idiom, but for the
+        // borrowed `&(dyn Any + Send)` a panic hook exposes (that helper takes an
+        // owned `Box<dyn Any>` from `catch_unwind`, so it cannot be reused here).
         let payload = info.payload();
-        if let Some(s) = payload.downcast_ref::<&str>() {
-            (*s).to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            String::from("<non-string panic payload>")
-        }
+        payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| String::from("<non-string panic payload>"))
     }
 
     /// Install `plan` and arm the harness. Returns a [`ChaosGuard`] that
@@ -812,10 +841,32 @@ mod controller {
             return;
         };
         match state.resolve(point) {
-            Resolved::Continue | Resolved::DropNotify | Resolved::Error(_) => {}
-            Resolved::Kill => panic!("harvest-chaos-kill: {}", point.name()),
-            Resolved::Hold(gate) => gate.rendezvous().await,
-            Resolved::Delay(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
+            Resolved::Continue => {}
+            Resolved::Kill => {
+                state.mark_fired();
+                panic!("harvest-chaos-kill: {}", point.name());
+            }
+            Resolved::Hold(gate) => {
+                state.mark_fired();
+                gate.rendezvous().await;
+            }
+            Resolved::Delay(ms) => {
+                state.mark_fired();
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+            // An infallible `chaos_point!` site cannot honor Error (needs a
+            // `chaos_fallible!` site) or DropNotify (needs `chaos_drop_notify!`).
+            // Catch such a caps/site mismatch loudly instead of silently
+            // swallowing it and inflating the anti-vacuity counter.
+            other @ (Resolved::Error(_) | Resolved::DropNotify) => {
+                debug_assert!(
+                    false,
+                    "chaos: a {} directive is armed at `{}`, an infallible chaos_point!() site \
+                     that cannot honor it — check the point's declared caps",
+                    other.kind(),
+                    point.name()
+                );
+            }
         }
     }
 
@@ -842,15 +893,35 @@ mod controller {
             return Ok(());
         };
         match state.resolve(point) {
-            Resolved::Continue | Resolved::DropNotify => Ok(()),
-            Resolved::Kill => panic!("harvest-chaos-kill: {}", point.name()),
+            Resolved::Continue => Ok(()),
+            Resolved::Kill => {
+                state.mark_fired();
+                panic!("harvest-chaos-kill: {}", point.name());
+            }
             Resolved::Hold(gate) => {
+                state.mark_fired();
                 gate.rendezvous().await;
                 Ok(())
             }
-            Resolved::Error(e) => Err(e),
+            Resolved::Error(e) => {
+                state.mark_fired();
+                Err(e)
+            }
             Resolved::Delay(ms) => {
+                state.mark_fired();
                 tokio::time::sleep(Duration::from_millis(ms)).await;
+                Ok(())
+            }
+            // A `chaos_fallible!` site cannot honor DropNotify (needs a
+            // `chaos_drop_notify!` site) — catch the caps/site mismatch.
+            other @ Resolved::DropNotify => {
+                debug_assert!(
+                    false,
+                    "chaos: a {} directive is armed at `{}`, a fallible chaos_fallible!() site \
+                     that cannot honor it — check the point's declared caps",
+                    other.kind(),
+                    point.name()
+                );
                 Ok(())
             }
         }
@@ -869,7 +940,27 @@ mod controller {
         let Some(state) = current_state() else {
             return false;
         };
-        matches!(state.resolve(point), Resolved::DropNotify)
+        match state.resolve(point) {
+            Resolved::DropNotify => {
+                state.mark_fired();
+                true
+            }
+            Resolved::Continue => false,
+            // A synchronous drop-notify site can only honor DropNotify; it cannot
+            // await a Hold rendezvous, panic a Kill, sleep a Delay, or return an
+            // Error. Catch the caps/site mismatch loudly (a scripted Hold here
+            // would otherwise hang the test's `reached().await` forever).
+            other => {
+                debug_assert!(
+                    false,
+                    "chaos: a {} directive is armed at `{}`, a synchronous chaos_drop_notify!() \
+                     site that can only honor DropNotify — check the point's declared caps",
+                    other.kind(),
+                    point.name()
+                );
+                false
+            }
+        }
     }
 
     /// splitmix64 — a fast, value-stable 64-bit mixer. Deliberately hand-rolled
@@ -1020,8 +1111,9 @@ mod controller {
 
         #[test]
         fn scripted_kill_at_fires_on_the_nth_hit_only() {
-            let state =
-                ChaosState::from_plan(ChaosPlan::scripted().kill_at_hit(QUEUE_PARK_BEFORE_UPDATE, 2));
+            let state = ChaosState::from_plan(
+                ChaosPlan::scripted().kill_at_hit(QUEUE_PARK_BEFORE_UPDATE, 2),
+            );
             assert!(matches!(
                 state.resolve(QUEUE_PARK_BEFORE_UPDATE),
                 Resolved::Continue
@@ -1041,7 +1133,8 @@ mod controller {
         #[test]
         fn scripted_error_at_fires_every_hit() {
             let state = ChaosState::from_plan(
-                ChaosPlan::scripted().error_at(POISON_RECLAIM_BEFORE_LOAD, ChaosError::EventIdUnique),
+                ChaosPlan::scripted()
+                    .error_at(POISON_RECLAIM_BEFORE_LOAD, ChaosError::EventIdUnique),
             );
             for _ in 0..3 {
                 assert!(matches!(
@@ -1054,7 +1147,8 @@ mod controller {
 
         #[test]
         fn scripted_drop_notify_and_delay_resolve_expected() {
-            let s1 = ChaosState::from_plan(ChaosPlan::scripted().drop_notify_at(NOTIFY_TASK_ENQUEUED));
+            let s1 =
+                ChaosState::from_plan(ChaosPlan::scripted().drop_notify_at(NOTIFY_TASK_ENQUEUED));
             assert!(matches!(
                 s1.resolve(NOTIFY_TASK_ENQUEUED),
                 Resolved::DropNotify

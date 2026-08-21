@@ -53,18 +53,21 @@ use testcontainers_modules::postgres::Postgres;
 #[workflow]
 async fn chaos_wait_signal(
     ctx: &WorkflowContext,
-    _input: serde_json::Value,
+    input: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    let _ = input;
     let sig = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
     Ok(sig)
 }
 
 /// Completes in a single decision cycle — the convergence-sweep workload unit.
 #[workflow]
+#[allow(clippy::unused_async)] // the #[workflow] macro requires an `async fn` handler.
 async fn chaos_noop(
     _ctx: &WorkflowContext,
-    _input: serde_json::Value,
+    input: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    let _ = input;
     Ok(serde_json::json!("ok"))
 }
 
@@ -287,14 +290,18 @@ async fn exec_count(conn: &mut AsyncPgConnection, wf_name: &str) -> i64 {
 
 /// Read a schedule's `(fire_claim_token, live)` where `live` is true iff the
 /// claim is held and unexpired.
-async fn schedule_claim(conn: &mut AsyncPgConnection, id: uuid::Uuid) -> (Option<uuid::Uuid>, bool) {
+async fn schedule_claim(
+    conn: &mut AsyncPgConnection,
+    id: uuid::Uuid,
+) -> (Option<uuid::Uuid>, bool) {
     use autumn_harvest::schema::harvest_schedules::dsl;
-    let (token, until): (Option<uuid::Uuid>, Option<chrono::DateTime<Utc>>) = dsl::harvest_schedules
-        .find(id)
-        .select((dsl::fire_claim_token, dsl::fire_claimed_until))
-        .first(conn)
-        .await
-        .expect("load schedule claim");
+    let (token, until): (Option<uuid::Uuid>, Option<chrono::DateTime<Utc>>) =
+        dsl::harvest_schedules
+            .find(id)
+            .select((dsl::fire_claim_token, dsl::fire_claimed_until))
+            .first(conn)
+            .await
+            .expect("load schedule claim");
     let live = token.is_some() && until.is_some_and(|u| u > Utc::now());
     (token, live)
 }
@@ -329,7 +336,7 @@ async fn signals_for(conn: &mut AsyncPgConnection, target: ExecutionId) -> i64 {
 
 /// A wake that lands while the task is still claimed (mid-cycle) must not be
 /// lost. HOLD the park at `QUEUE_PARK_BEFORE_UPDATE` (the row is still `RUNNING`
-/// with its worker_id), fire a concurrent `wake_workflow_task` — whose primary
+/// with its `worker_id`), fire a concurrent `wake_workflow_task` — whose primary
 /// re-pend matches zero rows and must fall back to `wake_requested = TRUE` —
 /// then release: the park atomically reads-and-clears `wake_requested` and
 /// reports it, so the caller re-pends instead of stranding the task parked.
@@ -339,6 +346,10 @@ async fn signals_for(conn: &mut AsyncPgConnection, target: ExecutionId) -> i64 {
 /// `wake_workflow_task`'s fallback UPDATE — the assert `had_wake_requested`
 /// then fails, and the task stays parked with the wake lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// `guard` intentionally lives to end-of-scope: it keeps the harness armed and
+// holds the process-wide chaos serialization lock for the whole test body, and
+// its `diagnostics()`/`hits()` are read by the trailing asserts.
+#[allow(clippy::significant_drop_tightening)]
 async fn chaos_repro_601_lost_wake_is_recovered_via_wake_requested() {
     let (url, _c) = chaos_db().await;
     let mut conn = connect(&url).await;
@@ -391,10 +402,7 @@ async fn chaos_repro_601_lost_wake_is_recovered_via_wake_requested() {
         .expect("concurrent wake");
 
     hold.release();
-    let had_wake_requested = park
-        .await
-        .expect("park task join")
-        .expect("park succeeds");
+    let had_wake_requested = park.await.expect("park task join").expect("park succeeds");
 
     assert!(
         had_wake_requested,
@@ -419,8 +427,17 @@ async fn chaos_repro_601_lost_wake_is_recovered_via_wake_requested() {
         .await
         .expect("re-pend after wake_requested");
     let (state, worker) = task_state(&mut conn, task.id).await;
-    assert_eq!(state, "PENDING", "task must be re-pended, not stranded");
-    assert!(worker.is_none(), "re-pended task must have no worker_id");
+    assert_eq!(
+        state,
+        "PENDING",
+        "task must be re-pended, not stranded; {}",
+        guard.diagnostics()
+    );
+    assert!(
+        worker.is_none(),
+        "re-pended task must have no worker_id; {}",
+        guard.diagnostics()
+    );
 }
 
 // ── Reproducer 2 — issue #367 poison-pill orphan reclaim ─────────────────────
@@ -428,11 +445,13 @@ async fn chaos_repro_601_lost_wake_is_recovered_via_wake_requested() {
 /// A KILL mid-decision-cycle (before the persist commit) leaves the task
 /// stranded `RUNNING` with a now-dead worker. The poison-pill reclaimer must
 /// recover it: increment `crash_strikes` and re-queue it `PENDING` (under the
-/// threshold). This exercises the KILL capability (AC1a) and the #367 fix.
+/// threshold). This exercises the KILL capability (AC1(a)) and the #367 fix.
 ///
-/// RED procedure: comment out the `reclaim_orphaned_tasks` call below — the
-/// orphan then stays `RUNNING` with a dead worker forever (the pre-#367 shape),
-/// and the `PENDING` assertion fails.
+/// RED procedure (test-side, unlike the other three's production-shape reverts):
+/// comment out the `reclaim_orphaned_tasks` call below *and its two `summary`
+/// asserts* — the orphan then stays `RUNNING` with a dead worker forever (the
+/// pre-#367 shape), and the `PENDING` assertion fails. Reverting the production
+/// reclaimer to a no-op would be a more faithful, symmetric alternative.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chaos_repro_367_crash_orphan_is_reclaimed() {
     let (url, _c) = chaos_db().await;
@@ -485,29 +504,38 @@ async fn chaos_repro_367_crash_orphan_is_reclaimed() {
         "the KILL must have fired (anti-vacuity); {}",
         guard.diagnostics()
     );
+    let diag = guard.diagnostics();
     drop(guard);
 
     // The orphan condition: RUNNING, still owned by the dead worker, no forward
     // progress (the persist rolled back).
     let (state, worker) = task_state(&mut conn, task.id).await;
-    assert_eq!(state, "RUNNING", "crash must strand the task RUNNING");
-    assert_eq!(worker.as_deref(), Some("c367-crash-worker"));
+    assert_eq!(
+        state, "RUNNING",
+        "crash must strand the task RUNNING; {diag}"
+    );
+    assert_eq!(worker.as_deref(), Some("c367-crash-worker"), "{diag}");
 
     // The dead worker was never registered → no live heartbeat → orphaned.
-    let summary = autumn_harvest::poison_pill::reclaim_orphaned_tasks(
-        &mut conn,
-        3,
-        0,
-        &NoOpMetrics,
-    )
-    .await
-    .expect("reclaim");
-    assert_eq!(summary.requeued, 1, "the orphan must be re-queued once");
-    assert_eq!(summary.quarantined, 0);
+    let summary =
+        autumn_harvest::poison_pill::reclaim_orphaned_tasks(&mut conn, 3, 0, &NoOpMetrics)
+            .await
+            .expect("reclaim");
+    assert_eq!(
+        summary.requeued, 1,
+        "the orphan must be re-queued once; {diag}"
+    );
+    assert_eq!(summary.quarantined, 0, "{diag}");
 
     let (state, worker) = task_state(&mut conn, task.id).await;
-    assert_eq!(state, "PENDING", "the orphan must be recovered to PENDING");
-    assert!(worker.is_none(), "recovered task must have no worker_id");
+    assert_eq!(
+        state, "PENDING",
+        "the orphan must be recovered to PENDING; {diag}"
+    );
+    assert!(
+        worker.is_none(),
+        "recovered task must have no worker_id; {diag}"
+    );
 }
 
 // ── Reproducer 3 — issue #492 outbox vs inline external-signal persist ───────
@@ -519,7 +547,7 @@ async fn chaos_repro_367_crash_orphan_is_reclaimed() {
 /// txn is uncommitted — and run the background outbox on a separate connection:
 /// under READ COMMITTED it cannot observe the half-written request, so it
 /// delivers nothing (returns 0) and the signal lands exactly once. Exercises the
-/// ERROR-free HOLD/DELAY window (AC1b/AC1d shape) and the #492 fix (AC4).
+/// ERROR-free HOLD/DELAY window (AC1(b)/AC1(d) shape) and the #492 fix (AC4).
 ///
 /// RED procedure: remove the `conn.transaction(...)` wrapper in
 /// `persist_external_signal_inline` so `ExternalSignalRequested` commits in its
@@ -528,6 +556,7 @@ async fn chaos_repro_367_crash_orphan_is_reclaimed() {
 /// it a SECOND time — two `harvest_signals` rows for the target and a second
 /// `ExternalSignalDelivered` — and the `== 1` / `outbox == 0` asserts fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // linear reproducer: setup, hold, outbox probe, release, exactly-once asserts.
 async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
     let (url, _c) = chaos_db().await;
     let mut conn = connect(&url).await;
@@ -536,8 +565,12 @@ async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
     // Parked on its own queue so the `default` claim below can only pick the
     // caller (the target's task is never polled here).
     let target_id = ExecutionId::new_for_shard(ShardId::new(0));
-    let mut target_params =
-        base_params("chaos_wait_signal", "c492-target", target_id, serde_json::json!(null));
+    let mut target_params = base_params(
+        "chaos_wait_signal",
+        "c492-target",
+        target_id,
+        serde_json::json!(null),
+    );
     target_params.queue_name = "chaos-target-q";
     autumn_harvest::execution::start_or_load_workflow_execution(&mut conn, target_params, None)
         .await
@@ -548,7 +581,12 @@ async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
     let caller_input = serde_json::json!({ "target": target_id.to_string() });
     autumn_harvest::execution::start_or_load_workflow_execution(
         &mut conn,
-        base_params("chaos_signal_external", "c492-caller", caller_id, caller_input),
+        base_params(
+            "chaos_signal_external",
+            "c492-caller",
+            caller_id,
+            caller_input,
+        ),
         None,
     )
     .await
@@ -608,7 +646,8 @@ async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
     .await
     .expect("outbox sweep");
     assert_eq!(
-        delivered, 0,
+        delivered,
+        0,
         "the outbox must not observe (or double-deliver) the half-written inline \
          signal; {}",
         guard.diagnostics()
@@ -635,6 +674,7 @@ async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
         "the HOLD must have fired (anti-vacuity); {}",
         guard.diagnostics()
     );
+    let diag = guard.diagnostics();
     drop(guard);
 
     // Exactly-once: one Requested + one Delivered on the caller, one queued
@@ -642,22 +682,22 @@ async fn chaos_repro_492_outbox_cannot_double_deliver_inline_external_signal() {
     assert_eq!(
         event_count(&mut conn, caller_id, "ExternalSignalRequested").await,
         1,
-        "exactly one ExternalSignalRequested"
+        "exactly one ExternalSignalRequested; {diag}"
     );
     assert_eq!(
         event_count(&mut conn, caller_id, "ExternalSignalDelivered").await,
         1,
-        "exactly one ExternalSignalDelivered"
+        "exactly one ExternalSignalDelivered; {diag}"
     );
     assert_eq!(
         signals_for(&mut conn, target_id).await,
         1,
-        "the signal must land on the target exactly once"
+        "the signal must land on the target exactly once; {diag}"
     );
     assert_eq!(
         dangling_external_requests(&mut conn).await,
         0,
-        "no ExternalSignalRequested without a terminal"
+        "no ExternalSignalRequested without a terminal; {diag}"
     );
 }
 
@@ -706,18 +746,25 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
         "the KILL must have fired (anti-vacuity); {}",
         guard.diagnostics()
     );
+    let diag = guard.diagnostics();
     drop(guard);
 
     // The crash left the claim held (committed in autocommit) with no fire.
     {
         let mut conn = connect(&url).await;
         let (token, live) = schedule_claim(&mut conn, sched_id).await;
-        assert!(token.is_some(), "the HA claim must be committed by the crash");
-        assert!(live, "the claim TTL must still be live right after the crash");
+        assert!(
+            token.is_some(),
+            "the HA claim must be committed by the crash; {diag}"
+        );
+        assert!(
+            live,
+            "the claim TTL must still be live right after the crash; {diag}"
+        );
         assert_eq!(
             exec_count(&mut conn, wf).await,
             0,
-            "the crash must have fired nothing"
+            "the crash must have fired nothing; {diag}"
         );
     }
 
@@ -736,7 +783,7 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
         assert_eq!(
             exec_count(&mut conn, wf).await,
             0,
-            "a live claim must block the peer from firing"
+            "a live claim must block the peer from firing; {diag}"
         );
     }
 
@@ -766,16 +813,20 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
     assert_eq!(
         exec_count(&mut conn, wf).await,
         1,
-        "the crashed slot must be re-fired by a peer exactly once after the claim expires"
+        "the crashed slot must be re-fired by a peer exactly once after the claim expires; {diag}"
     );
 }
 
 // ── AC5 — seeded convergence sweep ───────────────────────────────────────────
 
 /// Documented default seed set for the sweep (AC5: N ≥ 5 distinct seeds). CI
-/// overrides via `CHAOS_SEEDS="1 2 3 ..."`.
+/// overrides via `CHAOS_SEEDS="1 2 3 ..."`. Every seed in the set — default or
+/// override — must drive at least one honored fault against the workload; the
+/// sweep asserts this per seed so a vacuous seed fails loudly rather than
+/// passing convergence for a healthy run. The default set below is verified
+/// non-vacuous.
 fn sweep_seeds() -> Vec<u64> {
-    std::env::var("CHAOS_SEEDS")
+    let seeds = std::env::var("CHAOS_SEEDS")
         .ok()
         .map(|s| {
             s.split_whitespace()
@@ -783,7 +834,13 @@ fn sweep_seeds() -> Vec<u64> {
                 .collect::<Vec<_>>()
         })
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| vec![1, 2, 3, 5, 8, 13, 21])
+        .unwrap_or_else(|| vec![1, 2, 3, 5, 8, 13, 21]);
+    assert!(
+        seeds.len() >= 5,
+        "AC5 requires N >= 5 distinct seeds; CHAOS_SEEDS resolved to {} ({seeds:?})",
+        seeds.len(),
+    );
+    seeds
 }
 
 /// For each seed: arm a randomised plan, drive a bounded workload of
@@ -793,9 +850,10 @@ fn sweep_seeds() -> Vec<u64> {
 /// worker, no dangling `ExternalSignalRequested`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chaos_seeded_convergence_sweep() {
+    const WORKLOAD: usize = 6;
+
     let (url, _c) = chaos_db().await;
     let registry = Arc::new(HandlerRegistry::new(vec![chaos_noop_info()], vec![]));
-    const WORKLOAD: usize = 6;
 
     for seed in sweep_seeds() {
         // Fresh DB slate per seed so the invariant probe is unambiguous.
@@ -811,11 +869,12 @@ async fn chaos_seeded_convergence_sweep() {
             for i in 0..WORKLOAD {
                 let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
                 let wid: &'static str = Box::leak(format!("sweep-{seed}-{i}").into_boxed_str());
-                let params =
-                    base_params("chaos_noop", wid, exec_id, serde_json::json!(null));
-                autumn_harvest::execution::start_or_load_workflow_execution(&mut conn, params, None)
-                    .await
-                    .expect("start sweep workflow");
+                let params = base_params("chaos_noop", wid, exec_id, serde_json::json!(null));
+                autumn_harvest::execution::start_or_load_workflow_execution(
+                    &mut conn, params, None,
+                )
+                .await
+                .expect("start sweep workflow");
                 execs.push(exec_id);
             }
         }
@@ -847,8 +906,20 @@ async fn chaos_seeded_convergence_sweep() {
                 .await;
             }
         }
+        let fired = guard.actions_fired();
         let diag = guard.diagnostics();
         drop(guard);
+
+        // Anti-vacuity (P2): `ChaosPlan::seeded` is a pure function of the seed,
+        // so `fired` is deterministic per seed — this can never flake. A seed
+        // that drives zero honored faults would let the convergence invariant
+        // below pass for a healthy, un-faulted run ("passes for the wrong
+        // reason"). Fail loudly instead, naming the seed for replay.
+        assert!(
+            fired >= 1,
+            "seed {seed}: injected zero honored faults against the workload — the \
+             convergence invariant would pass vacuously; {diag}"
+        );
 
         // Recovery loop (chaos disarmed): reclaim crash orphans and re-drive any
         // remaining claimable tasks until quiescent.
@@ -901,9 +972,12 @@ async fn chaos_seeded_convergence_sweep() {
 }
 
 /// Count `RUNNING` tasks whose `worker_id` has no live `harvest_workers`
-/// heartbeat — the stranded-orphan invariant probe. Mirrors the poison-pill
-/// reclaimer's own liveness definition (`orphaned_running_tasks_query`): a
-/// worker is dead when no row carries its `worker_id` with a fresh heartbeat.
+/// heartbeat — the stranded-orphan invariant probe. Same *shape* as the
+/// poison-pill reclaimer's `NOT EXISTS`-a-live-heartbeat liveness test
+/// (`orphaned_running_tasks_query`), but with a fixed 30 s window here rather
+/// than the reclaimer's configurable stale threshold. Sweep workers are never
+/// registered in `harvest_workers`, so any non-null `worker_id` on a `RUNNING`
+/// row counts as stranded regardless of the exact window.
 async fn stranded_running_with_dead_worker(conn: &mut AsyncPgConnection) -> i64 {
     diesel::sql_query(
         "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue t \

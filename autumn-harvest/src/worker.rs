@@ -21962,14 +21962,16 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
 // ---------------------------------------------------------------------------
 
 /// Drive exactly one already-claimed workflow task through the production
-/// [`process_workflow_task`] decision cycle, on its **own dedicated,
-/// non-pooled** connection, inside a spawned task — so a chaos `Kill` at a
-/// wired injection point crashes *this* task (surfacing as a `JoinError`) and
-/// drops the owned connection mid-flight, which rolls back any uncommitted
-/// work server-side exactly as a crashed worker process would. The claim
-/// (`RUNNING` + `worker_id`), committed by `claim_task` before this runs,
-/// survives the crash, leaving the row stranded `RUNNING` with a now-dead
-/// worker — the #367 poison-pill orphan condition (issue #940 AC1a / AC4).
+/// [`process_workflow_task`] decision cycle on its own dedicated connection.
+///
+/// The connection is **non-pooled** and the cycle runs inside a spawned task —
+/// so a chaos `Kill` at a wired injection point crashes *this* task (surfacing
+/// as a `JoinError`) and drops the owned connection mid-flight, which rolls
+/// back any uncommitted work server-side exactly as a crashed worker process
+/// would. The claim (`RUNNING` + `worker_id`), committed by `claim_task` before
+/// this runs, survives the crash, leaving the row stranded `RUNNING` with a
+/// now-dead worker — the #367 poison-pill orphan condition (issue #940
+/// `AC1a`/AC4).
 ///
 /// Non-`Kill` faults (`Hold`, `Delay`) drive the cycle to completion; the
 /// `Ok(HarvestResult<()>)` mirrors what the poll loop would observe.
@@ -22002,11 +22004,13 @@ pub async fn chaos_drive_one_workflow_task(
         let mut conn = AsyncPgConnection::establish(&db_url)
             .await
             .expect("chaos: establish owned workflow-task connection");
-        let workflow_cache =
-            Arc::new(tokio::sync::Mutex::new(crate::cache::WorkflowCache::new(16)));
-        let workflow_panic_strikes = Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::<uuid::Uuid, u32>::new(),
-        ));
+        let workflow_cache = Arc::new(tokio::sync::Mutex::new(crate::cache::WorkflowCache::new(
+            16,
+        )));
+        let workflow_panic_strikes = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            uuid::Uuid,
+            u32,
+        >::new()));
         let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
         process_workflow_task(
             &mut conn,
