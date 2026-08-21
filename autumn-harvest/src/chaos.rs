@@ -1127,7 +1127,13 @@ mod controller {
                 Resolved::Continue
             ));
             assert_eq!(state.hits_of(QUEUE_PARK_BEFORE_UPDATE), 3);
-            assert_eq!(state.actions_fired.load(Ordering::Relaxed), 1);
+            // `resolve` is side-effect-free w.r.t. the anti-vacuity counter: only
+            // an entry point (`hit`/`hit_fallible`/`should_drop_notify`) that can
+            // actually *honor* the resolved action bumps `actions_fired`. Resolving
+            // to `Kill` here (never reaching a spawned `hit` site) fires nothing.
+            // Honored-arm accounting is exercised in
+            // `honored_entry_points_bump_actions_fired_but_resolve_alone_does_not`.
+            assert_eq!(state.actions_fired.load(Ordering::Relaxed), 0);
         }
 
         #[test]
@@ -1142,7 +1148,49 @@ mod controller {
                     Resolved::Error(ChaosError::EventIdUnique)
                 ));
             }
-            assert_eq!(state.actions_fired.load(Ordering::Relaxed), 3);
+            // See `scripted_kill_at_fires_on_the_nth_hit_only`: `resolve` alone
+            // never bumps the counter; the honoring `hit_fallible` site does.
+            assert_eq!(state.actions_fired.load(Ordering::Relaxed), 0);
+        }
+
+        /// The P2 fix (`mark_fired` is bumped by the entry point only when it can
+        /// honor the resolved action) locked in at the real entry points: a
+        /// honored directive bumps the anti-vacuity counter, a resolve that does
+        /// not fire (wrong ordinal) does not, and each honoring site increments
+        /// exactly once per honored hit.
+        #[tokio::test]
+        async fn honored_entry_points_bump_actions_fired_but_resolve_alone_does_not() {
+            // DropNotify at a synchronous drop-notify site: `OnHit(1)`, so the
+            // first call is honored (returns true, bumps to 1) and the second
+            // resolves `Continue` (returns false, no bump).
+            {
+                let guard = arm(ChaosPlan::scripted().drop_notify_at(NOTIFY_TASK_ENQUEUED)).await;
+                assert!(should_drop_notify(NOTIFY_TASK_ENQUEUED));
+                assert_eq!(guard.actions_fired(), 1);
+                assert!(!should_drop_notify(NOTIFY_TASK_ENQUEUED));
+                assert_eq!(
+                    guard.actions_fired(),
+                    1,
+                    "a non-firing hit must not inflate the anti-vacuity counter"
+                );
+                assert_eq!(guard.hits(NOTIFY_TASK_ENQUEUED), 2);
+            }
+
+            // Error at a `?`-returning site: `Every`, so each hit is honored.
+            {
+                let guard = arm(ChaosPlan::scripted()
+                    .error_at(POISON_RECLAIM_BEFORE_LOAD, ChaosError::EventIdUnique))
+                .await;
+                assert!(matches!(
+                    hit_fallible(POISON_RECLAIM_BEFORE_LOAD).await,
+                    Err(ChaosError::EventIdUnique)
+                ));
+                assert!(matches!(
+                    hit_fallible(POISON_RECLAIM_BEFORE_LOAD).await,
+                    Err(ChaosError::EventIdUnique)
+                ));
+                assert_eq!(guard.actions_fired(), 2);
+            }
         }
 
         #[test]
