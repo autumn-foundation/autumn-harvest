@@ -595,7 +595,8 @@ async fn chaos_repro_367_crash_orphan_is_reclaimed() {
 /// it a SECOND time — two `harvest_signals` rows for the target and a second
 /// `ExternalSignalDelivered` — and the `== 1` / `outbox == 0` asserts fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::too_many_lines)] // linear reproducer: setup, hold, outbox probe, release, exactly-once asserts.
+#[allow(clippy::too_many_lines)]
+// linear reproducer: setup, hold, outbox probe, release, exactly-once asserts.
 // `_body` (the shared-DB isolation guard from `chaos_db`) intentionally lives to
 // end-of-scope; see `DB_BODY_SERIAL`.
 #[allow(clippy::significant_drop_tightening)]
