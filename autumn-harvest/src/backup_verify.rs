@@ -903,7 +903,20 @@ fn parse_dsn_identity(dsn: &str) -> Option<DsnIdentity> {
     ports.sort_unstable();
     ports.dedup();
 
-    let database = config.get_dbname().unwrap_or_default().to_string();
+    // An omitted `dbname` is NOT an empty database name. tokio-postgres simply
+    // leaves `database` out of the startup packet, and the server then applies
+    // the libpq default: the CONNECTION USER. Comparing `""` against the other
+    // side's real name made two DSNs that reach the same database look
+    // different, so the guard waved a production target through.
+    //
+    // With neither `dbname` nor `user` the default is the OS username of
+    // whoever connects -- not knowable here, and different on the operator's
+    // machine than in the deployed config -- so we fail closed by refusing to
+    // produce an identity at all (`None` makes the guard return `true`).
+    let database = match config.get_dbname().or_else(|| config.get_user()) {
+        Some(db) => db.to_string(),
+        None => return None,
+    };
     Some(DsnIdentity {
         hosts,
         hostaddrs,
@@ -1036,7 +1049,7 @@ impl VerifyOptions {
 
 #[cfg(all(feature = "db", feature = "testing"))]
 mod probes {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use chrono::{DateTime, Utc};
     use diesel::OptionalExtension as _;
@@ -1088,6 +1101,10 @@ mod probes {
         workflow_exec_id: Uuid,
         #[diesel(sql_type = diesel::sql_types::Jsonb)]
         event_data: serde_json::Value,
+        /// State of the OWNING execution, so the fold can tell a live
+        /// dependency from a retained terminal caller's assertion.
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        owner_state: String,
         /// Exact matching-row count, computed by a window function *before*
         /// `LIMIT`, so truncation is detectable rather than silent.
         #[diesel(sql_type = BigInt)]
@@ -1597,6 +1614,10 @@ mod probes {
         undecodable_samples: Vec<String>,
         /// Exact count of undecodable rows (samples above are bounded).
         undecodable_count: u64,
+        /// Owners whose own execution is already terminal. Their DELIVERED
+        /// effects still assert target-shard state and are adjudicated; their
+        /// unresolved requests are not live dependencies and are dropped.
+        terminal_owners: BTreeSet<Uuid>,
     }
 
     /// Read this shard's child/external history events and fold them into a
@@ -1608,19 +1629,40 @@ mod probes {
         conn: &mut AsyncPgConnection,
         limit: i64,
     ) -> Result<(RefScan, Option<String>), String> {
-        // Only non-terminal owning executions matter — a terminal parent's
+        // The owner-state filter is split by event class, because the two
+        // classes answer different questions.
+        //
+        // CHILD events: only a NON-TERMINAL owner matters. A terminal parent's
         // recorded child terminal is history, not a live dependency, and
-        // retention may legitimately have collected the child.
+        // retention may legitimately have collected the child -- scanning
+        // those would report `child_execution_missing` (Incoherent, exit 1)
+        // on a healthy restore.
+        //
+        // EXTERNAL events: EVERY owner matters, terminal included. A caller
+        // that recorded `ExternalSignalDelivered` asserted durable state on the
+        // TARGET shard, and that assertion does not expire when the caller
+        // completes. If anything a terminal caller is worse: there is no live
+        // caller left to re-drive the delivery, so a target restored to before
+        // it waits forever. Filtering them out made that a silent exit 0.
+        //
+        // Terminal owners' *unresolved* requests are dropped in `build_refs`
+        // (see `terminal_owners`) -- only DELIVERED effects are adjudicated
+        // from them.
         let sql = format!(
-            "SELECT ev.workflow_exec_id, ev.event_data, COUNT(*) OVER () AS total \
+            "SELECT ev.workflow_exec_id, ev.event_data, e.state AS owner_state, \
+                    COUNT(*) OVER () AS total \
              FROM harvest_events ev \
              JOIN harvest_workflow_executions e ON e.id = ev.workflow_exec_id \
-             WHERE e.state IN ('RUNNING', 'PAUSED', 'SUSPENDED') \
-               AND ev.event_type IN ( \
-                 'ChildWorkflowStarted', 'ChildWorkflowCompleted', 'ChildWorkflowFailed', \
-                 'ExternalSignalRequested', 'ExternalSignalDelivered', 'ExternalSignalFailed', \
-                 'ExternalCancelRequested', 'ExternalCancelDelivered', 'ExternalCancelFailed', \
-                 'ExternalAwaitRequested', 'ExternalAwaitResolved', 'ExternalAwaitFailed') \
+             WHERE ( \
+                 ev.event_type IN ( \
+                   'ExternalSignalRequested', 'ExternalSignalDelivered', 'ExternalSignalFailed', \
+                   'ExternalCancelRequested', 'ExternalCancelDelivered', 'ExternalCancelFailed', \
+                   'ExternalAwaitRequested', 'ExternalAwaitResolved', 'ExternalAwaitFailed') \
+                 OR ( \
+                   e.state IN ('RUNNING', 'PAUSED', 'SUSPENDED') \
+                   AND ev.event_type IN ( \
+                     'ChildWorkflowStarted', 'ChildWorkflowCompleted', 'ChildWorkflowFailed')) \
+               ) \
              ORDER BY ev.workflow_exec_id, ev.event_id \
              LIMIT {limit}"
         );
@@ -1813,6 +1855,9 @@ mod probes {
                 }
             };
             let owner = row.workflow_exec_id;
+            if crate::erase::is_terminal_state(&row.owner_state) {
+                scan.terminal_owners.insert(owner);
+            }
             fold_reference_event(&mut scan, owner, event, &mut workflow_id_targets);
         }
         // A business-key-addressed request (#751) resolves at delivery time, so
@@ -1845,6 +1890,7 @@ mod probes {
             workflow_id_targets: _,
             undecodable_samples: _,
             undecodable_count: _,
+            terminal_owners,
         } = scan;
 
         let mut out = Vec::new();
@@ -1880,6 +1926,14 @@ mod probes {
                 // it. Adjudicate it rather than dropping it.
                 let kind = if ok.contains(corr) {
                     RefKind::ExternalEffectDelivered(effect.clone())
+                } else if terminal_owners.contains(owner) {
+                    // The owner is already terminal, so an UNRESOLVED request
+                    // is not a live dependency -- nothing is still waiting on
+                    // it, and the target may since have been collected by
+                    // retention. Reporting it as `external_target_missing`
+                    // would be a false Incoherent on a healthy restore. Its
+                    // DELIVERED siblings above are still adjudicated.
+                    continue;
                 } else {
                     RefKind::ExternalTarget
                 };
@@ -2882,6 +2936,61 @@ mod tests {
         assert!(dsn_targets_same_database(
             "mysql://db/harvest",
             "postgres://db/harvest"
+        ));
+    }
+
+    /// Codex round 3, P2. libpq (and therefore the server, since
+    /// tokio-postgres simply omits `database` from the startup packet when
+    /// `dbname` is unset) defaults the database name to the CONNECTION USER.
+    /// Storing `""` for an omitted `dbname` made `postgres://harvest@prod-host`
+    /// compare unequal to `postgres://ops@prod-host/harvest` even though both
+    /// land on database `harvest` -- so the guard waved a production target
+    /// through without the acknowledgement.
+    // `tokio-postgres` (the guard's parser) is a `db`-feature dependency, so
+    // the guard itself only exists in a `db` build.
+    #[test]
+    #[cfg(feature = "db")]
+    fn dsn_guard_defaults_an_omitted_database_to_the_connection_user() {
+        // The mistake this exists to catch: user `harvest` with no dbname IS
+        // database `harvest`.
+        assert!(dsn_targets_same_database(
+            "postgres://harvest@prod-host",
+            "postgres://ops@prod-host/harvest"
+        ));
+        // Symmetric -- the omission may be on either side.
+        assert!(dsn_targets_same_database(
+            "postgres://ops@prod-host/harvest",
+            "postgres://harvest@prod-host"
+        ));
+        // Both omitted, same user: same database.
+        assert!(dsn_targets_same_database(
+            "postgres://harvest@prod-host",
+            "postgres://harvest@prod-host"
+        ));
+        // Still discriminating: a different user with no dbname is a
+        // different database, so a genuine scratch target is not blocked.
+        assert!(!dsn_targets_same_database(
+            "postgres://scratch@prod-host",
+            "postgres://ops@prod-host/harvest"
+        ));
+    }
+
+    /// With neither `dbname` nor `user` present the database name is the OS
+    /// username of whoever connects -- not knowable here, and different on the
+    /// operator's machine than in the deployed config. A guard that cannot
+    /// determine the identity must refuse, not guess.
+    // `tokio-postgres` (the guard's parser) is a `db`-feature dependency, so
+    // the guard itself only exists in a `db` build.
+    #[test]
+    #[cfg(feature = "db")]
+    fn dsn_guard_fails_closed_when_the_database_name_is_unknowable() {
+        assert!(dsn_targets_same_database(
+            "postgres://prod-host",
+            "postgres://ops@prod-host/scratch"
+        ));
+        assert!(dsn_targets_same_database(
+            "postgres://ops@prod-host/scratch",
+            "postgres://prod-host"
         ));
     }
 

@@ -112,12 +112,12 @@ resume, not because anything is wrong.
 | Verify class | Meaning |
 |---|---|
 | `dangling_task_execution` / `dangling_event_execution` | A row references an execution that is not in the restore. Torn restore. No scanner repairs this. |
-| `external_target_missing` | A `*Requested` event names a target execution absent from the shard that owns it. |
+| `external_target_missing` | A `*Requested` event from a **non-terminal** caller names a target execution absent from the shard that owns it. (An unresolved request from an already-terminal caller is not reported: nothing is waiting on it, and its target may legitimately have been collected by retention.) |
 | `child_execution_missing` | A parent awaits a child whose execution row is absent from its shard. The parent will park forever. |
 | `child_terminal_rolled_back` | The parent recorded the child's terminal, but the child's shard was restored to an *earlier* point where the child is still running. See §6 — this is the signature multi-shard skew failure. |
 | `wedged_schedule_claim` | A schedule with a claim token but a **NULL** `fire_claimed_until` — a torn claim pair. The scheduler claims on `fire_claim_token IS NULL OR fire_claimed_until < NOW()`, which such a row matches neither half of, so the schedule never fires again. Un-claim it by hand (`UPDATE harvest_schedules SET fire_claim_token = NULL, fire_claimed_until = NULL WHERE id = …`) before starting workers. Contrast `expired_schedule_claim`, which self-heals. |
 | `replay_divergence` | A sampled history no longer replays against the deployed workflow code. Not caused by the restore; caused by a code/history mismatch. Fix by rolling *back* the workflow code, then resume (see `nondeterminism-block.md`). |
-| `external_effect_rolled_back` | The caller recorded a signal/cancel/await as **delivered**, but the target's shard shows no trace of the effect — the cross-shard analogue of `child_terminal_rolled_back`. Adjudicated per effect: a delivered *cancel* or resolved *await* requires the target to be terminal; a delivered *signal* is matched **exactly by its `idempotency_key`** when the caller supplied one, else by channel name. The lookup walks the target's **successor chain** (`continued_from_exec_id` / `retry_of_exec_id`), because both continue-as-new and workflow-level retry reassign `harvest_signals` rows to the successor. Repair by restoring the target shard to a point at or after the caller's, per §6. Nothing retries this: the caller has already recorded the terminal and will never re-request. |
+| `external_effect_rolled_back` | The caller recorded a signal/cancel/await as **delivered**, but the target's shard shows no trace of the effect — the cross-shard analogue of `child_terminal_rolled_back`. Adjudicated per effect: a delivered *cancel* or resolved *await* requires the target to be terminal; a delivered *signal* is matched **exactly by its `idempotency_key`** when the caller supplied one, else by channel name. The lookup walks the target's **successor chain** (`continued_from_exec_id` / `retry_of_exec_id`), because both continue-as-new and workflow-level retry reassign `harvest_signals` rows to the successor. Adjudicated whether or not the **caller** is itself terminal — the assertion does not expire when the caller completes. Repair by restoring the target shard to a point at or after the caller's, per §6. Nothing retries this: the caller has already recorded the terminal and will never re-request. |
 | `replay_workflow_failed` | A sampled **non-terminal** history replays to a workflow *error* under the deployed code. Because the sample is drawn only from runs with no recorded terminal failure, this means the deployed handler now errors where the live run had not. Same remedy as `replay_divergence`: roll the workflow code *back*, then resume. |
 
 A report containing any of these exits **1**. Do not start workers.
@@ -192,6 +192,15 @@ When no live DSN is supplied at all, or when `--i-know-this-is-scratch` is
 passed, the guard does not run and the command prints a `WARNING:` line on
 stderr saying so. Silence means the guard genuinely ran.
 
+Two DSNs count as the same database when their **host** (or `hostaddr`), **port**
+and **database name** overlap — user and password are ignored, because the same
+database reached as a different user is still the same database. An omitted
+`dbname` resolves to the **connection user**, matching libpq: `postgres://harvest@db`
+and `postgres://ops@db/harvest` both land on database `harvest`, and the guard
+treats them as identical. A DSN the guard cannot read at all — including one with
+neither `dbname` nor `user`, where the real database name is the connecting OS
+username — is treated as a **match**, so the guard refuses rather than guesses.
+
 ### 4.1 It is read-only, mechanically
 
 This is enforced three ways, not by convention:
@@ -236,6 +245,14 @@ ack, it refuses; with the ack, it still only reads.
   row's execution exists; every non-terminal external `*Requested` has a live
   target (or a documented outbox path); every awaited child exists on its shard
   and has not been rolled back behind its parent's recorded terminal.
+  Delivered external effects are adjudicated from **every** retained caller,
+  terminal ones included: a caller that recorded `ExternalSignalDelivered` and
+  then completed still asserted durable state on the target shard, and a
+  terminal caller is the worse case because none is left alive to re-drive the
+  delivery. (Child checks keep the non-terminal filter — a terminal parent's
+  awaited child may legitimately have been collected by retention. Likewise an
+  *unresolved* request from a terminal caller is not a live dependency and is
+  not reported.)
 - **(d) A machine-readable report** (`--format json`) with a nonzero exit on any
   failed check.
 

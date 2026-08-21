@@ -937,6 +937,121 @@ async fn detects_delivered_external_signal_rolled_back_on_the_target_shard() {
     assert_eq!(report.status, VerifyStatus::Incoherent);
 }
 
+/// Codex round 3, P1. The reference scan filtered owning executions to
+/// non-terminal states -- a rule that belongs to the CHILD checks (a terminal
+/// parent's awaited child may legitimately have been collected by retention)
+/// but was wrongly applied to external effects too.
+///
+/// A caller that recorded `ExternalSignalDelivered` asserted durable state on
+/// the TARGET shard. That assertion does not expire when the caller completes;
+/// if anything a terminal caller is worse, because there is no live caller left
+/// to re-drive the delivery. The target below resumes waiting forever for a
+/// signal the (now COMPLETED) caller believes it delivered, and verification
+/// used to exit 0 on it.
+#[tokio::test]
+async fn a_delivered_effect_from_a_terminal_caller_is_still_adjudicated() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let signal_id = uuid::Uuid::new_v4();
+
+    // The caller has since COMPLETED -- terminal, but its history is retained.
+    seed_execution(&mut a, caller, "supervisor", "sup-term-1", "COMPLETED", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalSignalRequested",
+        json!({
+            "signal_id": signal_id.to_string(),
+            "target": target.to_string(),
+            "signal_name": "approve",
+            "payload": {}
+        }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalSignalDelivered",
+        json!({ "signal_id": signal_id.to_string() }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        4,
+        "WorkflowCompleted",
+        json!({ "output": {} }),
+    )
+    .await;
+
+    // Target was restored to before the delivery: no row, no event.
+    seed_execution(&mut b, target, "review", "rv-term-1", "RUNNING", 1).await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::ExternalEffectRolledBack),
+        "a terminal caller's delivered effect must still be adjudicated: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Incoherent);
+}
+
+/// The other half of the split: widening the scan to terminal callers must NOT
+/// drag their *unresolved* requests along. A caller terminated mid-flight can
+/// leave an `ExternalSignalRequested` with no terminal, and its target may since
+/// have been collected by retention -- reporting that as `external_target_missing`
+/// would be a false Incoherent (exit 1, "do not start workers") on a healthy
+/// restore. Only DELIVERED effects are adjudicated from terminal callers.
+#[tokio::test]
+async fn an_unresolved_request_from_a_terminal_caller_is_not_reported_missing() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let signal_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "supervisor", "sup-term-2", "TERMINATED", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    // Requested, never delivered -- the caller was killed mid-flight.
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalSignalRequested",
+        json!({
+            "signal_id": signal_id.to_string(),
+            "target": target.to_string(),
+            "signal_name": "approve",
+            "payload": {}
+        }),
+    )
+    .await;
+
+    // Target row is gone (retention). Shard 1 is empty.
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::ExternalTargetMissing),
+        "an unresolved request from a terminal caller is not a live dependency: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::ExternalEffectRolledBack),
+        "nothing was delivered, so there is no effect to lose: {report:#?}"
+    );
+}
+
 /// The control for the signal case: a queued `harvest_signals` row on the
 /// target is exactly the durable trace the delivery asserts, so it is clean.
 #[tokio::test]

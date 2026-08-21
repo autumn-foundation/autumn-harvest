@@ -224,3 +224,49 @@ retry forwarding, keyed-exact rollback detection, its exact-key-present clean
 control, and the unkeyed advisory (asserting it does *not* escalate the
 verdict). All four behavioural tests were confirmed RED against a reverted
 check; the fifth is a control that passes both ways by design.
+
+**Post-review hardening, round 3** — two more findings, both false-cleans on
+the guarantees the tool exists to provide, both fixed TDD red→green:
+
+1. **P1 — delivered external effects from a *terminal* caller went unchecked.**
+   The cross-shard reference scan filtered owning executions to
+   `RUNNING`/`PAUSED`/`SUSPENDED`. That rule belongs to the **child** checks (a
+   terminal parent's awaited child may legitimately have been collected by
+   retention, so scanning it would report `child_execution_missing` on a healthy
+   restore) but was wrongly applied to external effects too. A caller that
+   recorded `ExternalSignalDelivered` and then completed still asserted durable
+   state on the *target* shard, and that assertion does not expire — if
+   anything a terminal caller is the worse case, because no live caller remains
+   to re-drive the delivery, so the target waits forever for a signal that
+   nothing will resend. Verification exited 0 on it. The owner-state filter is
+   now split by event class: external events are scanned from every retained
+   caller, child events keep the narrow filter. The widening is paired with a
+   `terminal_owners` guard in `build_refs` so a terminal caller's *unresolved*
+   request is dropped rather than reported `external_target_missing` — nothing
+   is waiting on it and its target may since have been collected, which would
+   have traded one false clean for a false `Incoherent`.
+2. **P2 — an omitted `dbname` compared as the empty string.** libpq (and so the
+   server, since tokio-postgres simply omits `database` from the startup packet
+   when unset) defaults the database name to the **connection user**. Storing
+   `""` made `postgres://harvest@prod-host` compare unequal to
+   `postgres://ops@prod-host/harvest` even though both reach database
+   `harvest`, so the live-DSN guard waved a production target through without
+   the `--i-know-this-is-scratch` acknowledgement. The identity now resolves a
+   missing `dbname` to `get_user()`. With neither present the real name is the
+   connecting OS username — not knowable here and different on the operator's
+   machine than in the deployed config — so the identity is refused entirely,
+   which makes the guard fail closed rather than guess.
+
+Tests: 2 new DB integration tests (**29** total) — a delivered effect from a
+`COMPLETED` caller is adjudicated, and an unresolved request from a
+`TERMINATED` caller is *not* reported missing — plus 2 new DSN-guard unit
+tests. Each half was independently falsified: the widening was confirmed RED
+before the SQL split, and neutering the `terminal_owners` guard alone makes the
+second test fail, so both halves are load-bearing rather than decoration.
+
+Also fixes a CI break from round 2: three `dsn_guard_*` unit tests called a
+`#[cfg(feature = "db")]` function without carrying the gate, so
+`cargo test --no-default-features` failed to compile. The guard parses with
+`tokio_postgres::Config` — deliberately the same parser `diesel_async` uses at
+connect time — and `tokio-postgres` is enabled only by `db`, so the tests take
+the gate too.
