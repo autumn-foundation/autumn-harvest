@@ -104,6 +104,11 @@ pub enum FindingSeverity {
     /// A broken invariant. Starting workers against this database risks
     /// wedged or silently-wrong executions. Fails the drill.
     Incoherent,
+    /// The check itself could not run, so this condition is **unknown** — not
+    /// absent. Distinct from `Incoherent`: we did not determine that the
+    /// restore is broken, we determined that we cannot tell. Never reported as
+    /// a pass, because "we could not look" must never read as "nothing found".
+    Undetermined,
 }
 
 impl std::fmt::Display for FindingSeverity {
@@ -120,6 +125,7 @@ impl FindingSeverity {
             Self::Reclaimable => "reclaimable",
             Self::Advisory => "advisory",
             Self::Incoherent => "incoherent",
+            Self::Undetermined => "undetermined",
         }
     }
 }
@@ -185,11 +191,20 @@ pub enum FindingClass {
     /// A cross-shard reference points at a shard whose DSN was not supplied to
     /// this run, so its coherence could not be checked either way.
     UninspectedShardReference,
+
+    // ── Undetermined: the check could not run ───────────────────────────────
+    /// A probe could not execute at all — most commonly a missing table,
+    /// i.e. the "restore" produced an unmigrated or empty database.
+    ///
+    /// This is deliberately NOT advisory: a probe that never ran found nothing
+    /// *because it did not look*, and reporting that as a pass is the single
+    /// most dangerous false-clean a restore drill can emit.
+    ProbeFailed,
 }
 
 impl FindingClass {
     /// Every class, in a stable order. Used by tests and by the runbook table.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::DeadWorkerRunningTask,
         Self::TimedOutTask,
         Self::WorkflowDeadlineExpired,
@@ -208,6 +223,7 @@ impl FindingClass {
         Self::ReplaySkippedNoHandler,
         Self::HistoryUnreadable,
         Self::UninspectedShardReference,
+        Self::ProbeFailed,
     ];
 
     /// The fixed severity of this class.
@@ -238,6 +254,8 @@ impl FindingClass {
             | Self::ReplaySkippedNoHandler
             | Self::HistoryUnreadable
             | Self::UninspectedShardReference => FindingSeverity::Advisory,
+
+            Self::ProbeFailed => FindingSeverity::Undetermined,
         }
     }
 
@@ -263,6 +281,7 @@ impl FindingClass {
             Self::ReplaySkippedNoHandler => "replay_skipped_no_handler",
             Self::HistoryUnreadable => "history_unreadable",
             Self::UninspectedShardReference => "uninspected_shard_reference",
+            Self::ProbeFailed => "probe_failed",
         }
     }
 
@@ -320,6 +339,10 @@ impl FindingClass {
             Self::UninspectedShardReference => {
                 "references a shard whose DSN was not supplied; supply every shard to \
                  check cross-shard coherence"
+            }
+            Self::ProbeFailed => {
+                "the check could not run (a missing table usually means the restore \
+                 produced an unmigrated or empty database)"
             }
         }
     }
@@ -488,15 +511,24 @@ pub fn classify_status<'a>(
     findings: impl IntoIterator<Item = &'a Finding>,
     any_shard_unreachable: bool,
 ) -> VerifyStatus {
+    // "Could not determine" always wins, from either source: an unreachable
+    // shard, or a probe that failed to run. Both mean the drill did not
+    // actually look, and a pass verdict would be a lie.
+    let mut incoherent = false;
+    let mut any = false;
+    for finding in findings {
+        match finding.severity {
+            FindingSeverity::Undetermined => return VerifyStatus::Unavailable,
+            FindingSeverity::Incoherent => incoherent = true,
+            FindingSeverity::Reclaimable | FindingSeverity::Advisory => {}
+        }
+        any = true;
+    }
     if any_shard_unreachable {
         return VerifyStatus::Unavailable;
     }
-    let mut any = false;
-    for finding in findings {
-        if finding.severity == FindingSeverity::Incoherent {
-            return VerifyStatus::Incoherent;
-        }
-        any = true;
+    if incoherent {
+        return VerifyStatus::Incoherent;
     }
     if any {
         VerifyStatus::ResumableWithReclaim
@@ -1106,15 +1138,17 @@ mod probes {
         };
 
         if !soft_errors.is_empty() {
-            findings.push(
-                Finding::new(
-                    FindingClass::HistoryUnreadable,
-                    Some(shard_id),
-                    soft_errors.len() as u64,
-                    soft_errors.clone(),
-                )
-                .with_detail(soft_errors.join("; ")),
-            );
+            // Undetermined, NOT advisory: a probe that could not run found
+            // nothing because it did not look. The canonical case is a
+            // "restore" that produced an unmigrated database -- every probe
+            // errors on a missing table, and every condition reads as absent.
+            let n = soft_errors.len() as u64;
+            findings.push(Finding::new(
+                FindingClass::ProbeFailed,
+                Some(shard_id),
+                n,
+                soft_errors,
+            ));
         }
 
         (
@@ -1664,6 +1698,53 @@ mod tests {
             assert_eq!(
                 Finding::new(class, None, 0, vec![]).severity,
                 class.severity()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrunnable_probe_is_undetermined_never_a_pass() {
+        // The regression this guards: a "restore" that produced an unmigrated
+        // (empty) database makes every probe error on a missing table. Folding
+        // that into an advisory made the report read `resumable_with_reclaim`
+        // and exit 0 -- telling an operator to start workers against a database
+        // with no harvest schema at all.
+        assert_eq!(
+            FindingClass::ProbeFailed.severity(),
+            FindingSeverity::Undetermined
+        );
+        let f = finding(FindingClass::ProbeFailed);
+        assert_eq!(classify_status([&f], false), VerifyStatus::Unavailable);
+    }
+
+    #[test]
+    fn undetermined_outranks_incoherent_and_reclaimable() {
+        let probe = finding(FindingClass::ProbeFailed);
+        let broken = finding(FindingClass::DanglingTaskExecution);
+        let reclaim = finding(FindingClass::DeadWorkerRunningTask);
+        assert_eq!(
+            classify_status([&reclaim, &broken, &probe], false),
+            VerifyStatus::Unavailable,
+            "a run that could not look must never claim to have found the whole picture"
+        );
+    }
+
+    #[test]
+    fn advisory_classes_never_escalate_the_verdict() {
+        // The mirror of the above: a genuinely-advisory class (a single
+        // unreadable history among many replayed) must NOT be undetermined, or
+        // every partially-readable restore would fail the drill.
+        for class in [
+            FindingClass::HistoryUnreadable,
+            FindingClass::ReplaySkippedNoHandler,
+            FindingClass::RestorePointSkew,
+            FindingClass::UninspectedShardReference,
+        ] {
+            let f = finding(class);
+            assert_eq!(
+                classify_status([&f], false),
+                VerifyStatus::ResumableWithReclaim,
+                "{class} must stay advisory"
             );
         }
     }

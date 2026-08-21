@@ -19,7 +19,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use autumn_harvest::backup_verify::{
-    FindingClass, ShardTarget, VerifyOptions, VerifyStatus, verify_restore,
+    FindingClass, FindingSeverity, ShardTarget, VerifyOptions, VerifyStatus, verify_restore,
 };
 use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::types::{ExecutionId, ShardId};
@@ -452,4 +452,57 @@ async fn an_unreachable_shard_is_undetermined_not_clean() {
     let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
     assert_eq!(report.status, VerifyStatus::Unavailable, "{report:#?}");
     assert_eq!(report.exit_code(), 2);
+}
+
+/// The most dangerous possible false-clean: a "restore" that produced an
+/// **unmigrated** (empty) database. Every probe errors on a missing table, so a
+/// naive report finds nothing wrong — and would tell an operator to start
+/// workers against a database with no harvest schema at all.
+///
+/// Must report `Unavailable` (exit 2), never a pass.
+#[tokio::test]
+async fn an_unmigrated_restore_is_undetermined_never_a_pass() {
+    // Deliberately does NOT run `full_migrations_sql()`.
+    let admin = std::env::var("HARVEST_TEST_DATABASE_URL").ok();
+    let (url, _c) = if let Some(admin_url) = admin {
+        let mut admin_conn = AsyncPgConnection::establish(&admin_url)
+            .await
+            .expect("connect admin");
+        let n = DB_SEQ.fetch_add(1, Ordering::SeqCst);
+        let db = format!("bkverify_bare_{}_{}", std::process::id(), n);
+        diesel::sql_query(format!("CREATE DATABASE {db}"))
+            .execute(&mut admin_conn)
+            .await
+            .expect("create bare database");
+        (with_db_name(&admin_url, &db), None)
+    } else {
+        let container = Postgres::default()
+            .with_tag("16")
+            .start()
+            .await
+            .expect("postgres start");
+        let host = container.get_host().await.expect("host");
+        let port = container.get_host_port_ipv4(5432).await.expect("port");
+        (
+            format!("postgres://postgres:postgres@{host}:{port}/postgres"),
+            Some(container),
+        )
+    };
+
+    let report = verify_restore(&one_shard(&url), &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::ProbeFailed),
+        "an unmigrated database must be reported as un-probeable: {report:#?}"
+    );
+    assert_eq!(
+        report.status,
+        VerifyStatus::Unavailable,
+        "a database with no harvest schema must NEVER read as a pass"
+    );
+    assert_eq!(report.exit_code(), 2, "undetermined must exit 2, not 0");
+    assert_eq!(
+        FindingClass::ProbeFailed.severity(),
+        FindingSeverity::Undetermined
+    );
 }

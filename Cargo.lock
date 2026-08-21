@@ -315,6 +315,7 @@ name = "autumn-harvest-cli"
 version = "0.5.0"
 dependencies = [
  "autumn-harvest",
+ "chrono",
  "clap",
  "crossterm",
  "percent-encoding",
