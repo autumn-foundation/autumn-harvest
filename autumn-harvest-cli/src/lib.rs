@@ -143,6 +143,15 @@ pub enum BackupCommand {
         /// dead-worker and broken-session probes.
         #[arg(long, default_value_t = 60)]
         worker_stale_secs: i64,
+
+        /// Rows read per coherence probe.
+        ///
+        /// For the cross-shard reference scan this is a *page* size, not a
+        /// ceiling: that scan pages through complete owner groups until the
+        /// shard is exhausted. Raise it only if the report says a single
+        /// execution carries more reference events than one page.
+        #[arg(long, default_value_t = 1000)]
+        probe_limit: i64,
     },
 }
 
@@ -2803,6 +2812,7 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                 format,
                 replay_sample,
                 worker_stale_secs,
+                probe_limit,
             },
     } = &cli.command
     {
@@ -2813,6 +2823,7 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
             *format,
             *replay_sample,
             *worker_stale_secs,
+            *probe_limit,
         )
         .await;
     }
@@ -3909,6 +3920,7 @@ pub async fn run_backup_verify(
     format: BackupVerifyFormat,
     replay_sample: usize,
     worker_stale_secs: i64,
+    probe_limit: i64,
 ) -> Result<(), CliError> {
     scratch_guard(shards, live_dsn, ack)?;
     // Say out loud when the guard could not protect anything -- an operator
@@ -3922,6 +3934,7 @@ pub async fn run_backup_verify(
     let options = VerifyOptions::default()
         .with_replay_sample(replay_sample)
         .with_worker_stale_secs(worker_stale_secs)
+        .with_probe_limit(probe_limit)
         .with_scratch_ack(ack);
 
     // The CLI ships no application workflow handlers, so replay coverage is
@@ -12812,6 +12825,8 @@ mod det_check_cli_tests {
             "7",
             "--worker-stale-secs",
             "120",
+            "--probe-limit",
+            "250",
             "--i-know-this-is-scratch",
         ]);
         match cli.command {
@@ -12823,6 +12838,7 @@ mod det_check_cli_tests {
                         format,
                         replay_sample,
                         worker_stale_secs,
+                        probe_limit,
                         ..
                     },
             } => {
@@ -12832,6 +12848,7 @@ mod det_check_cli_tests {
                 assert_eq!(format, BackupVerifyFormat::Json);
                 assert_eq!(replay_sample, 7);
                 assert_eq!(worker_stale_secs, 120);
+                assert_eq!(probe_limit, 250);
             }
             other => panic!("expected Backup::Verify, got {other:?}"),
         }
@@ -12847,6 +12864,7 @@ mod det_check_cli_tests {
                         i_know_this_is_scratch,
                         format,
                         replay_sample,
+                        probe_limit,
                         ..
                     },
             } => {
@@ -12856,6 +12874,11 @@ mod det_check_cli_tests {
                 );
                 assert_eq!(format, BackupVerifyFormat::Text);
                 assert_eq!(replay_sample, 50);
+                assert_eq!(
+                    probe_limit,
+                    autumn_harvest::backup_verify::DEFAULT_PROBE_LIMIT,
+                    "the CLI default must track the library default"
+                );
             }
             other => panic!("expected Backup::Verify, got {other:?}"),
         }

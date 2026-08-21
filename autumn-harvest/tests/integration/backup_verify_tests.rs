@@ -1662,3 +1662,401 @@ async fn an_unkeyed_signal_with_name_evidence_is_advisory_not_clean_and_not_inco
         "an advisory must never escalate the verdict: {report:#?}"
     );
 }
+
+/// A non-`COMPLETED` terminal resolves an await through `ExternalAwaitFailed`,
+/// not `ExternalAwaitResolved` (`execution.rs::read_external_await_outcome` ->
+/// `ExternalAwaitOutcome::Terminal` -> `timeout.rs:3149` / `worker.rs:2702`).
+/// The caller therefore ASSERTED that the target reached a terminal state, so a
+/// target restored to before that terminal is a genuine rollback. Bucketing the
+/// whole `*Failed` class as "applied no effect" silently misses it.
+#[tokio::test]
+async fn a_terminal_outcome_await_failure_is_adjudicated_not_discarded() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let await_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "coordinator", "coord-tf", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalAwaitRequested",
+        json!({ "await_id": await_id.to_string(), "target": target.to_string() }),
+    )
+    .await;
+    // The caller OBSERVED the target reach FAILED -- a resolution, not a
+    // transport failure.
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalAwaitFailed",
+        json!({
+            "await_id": await_id.to_string(),
+            "reason_code": "target_failed",
+            "message": "leg C exploded",
+        }),
+    )
+    .await;
+
+    // ...but shard 1 was restored to before the target failed.
+    seed_execution(&mut b, target, "leg", "leg-tf", "RUNNING", 1).await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::ExternalEffectRolledBack),
+        "a resolved-terminal await against a non-terminal target is a rollback: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Incoherent);
+}
+
+/// The control for the test above: `target_unknown` is the ONE
+/// `ExternalAwaitFailed` reason code that is a genuine TRANSPORT failure -- the
+/// grace window elapsed with no target row (`timeout.rs:3161`). It asserts no
+/// target-shard state, so it must stay in the "applied no effect" bucket. Without
+/// this control, "adjudicate every ExternalAwaitFailed" would pass the test above.
+#[tokio::test]
+async fn a_target_unknown_await_failure_asserts_no_effect_on_the_target() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let await_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "coordinator", "coord-tu", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalAwaitRequested",
+        json!({ "await_id": await_id.to_string(), "target": target.to_string() }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalAwaitFailed",
+        json!({ "await_id": await_id.to_string(), "reason_code": "target_unknown" }),
+    )
+    .await;
+
+    // The target row is absent -- exactly what `target_unknown` asserts.
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+    let _ = &mut b;
+
+    assert!(
+        !report.detected(FindingClass::ExternalEffectRolledBack),
+        "target_unknown applied no effect: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::PendingExternalRequest),
+        "target_unknown is not a pending request either: {report:#?}"
+    );
+    assert!(
+        !report.detected(FindingClass::ExternalTargetMissing),
+        "target_unknown already resolved -- an absent target is expected: {report:#?}"
+    );
+}
+
+/// `read_external_await_outcome` FOLLOWS a `CONTINUED_AS_NEW` target through its
+/// successor chain and resolves only when the chain HEAD is terminal
+/// (`execution.rs:7350-7375`). So the original target row reading
+/// `CONTINUED_AS_NEW` is NOT by itself proof the await resolved: if the
+/// successor is still running, the target shard was restored to before the
+/// resolution the caller recorded. `is_terminal_state("CONTINUED_AS_NEW")` is
+/// true, so a bare terminal check reads this as coherent.
+#[tokio::test]
+async fn a_resolved_await_whose_successor_is_still_running_is_rolled_back() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let successor = ExecutionId::new_for_shard(ShardId::new(1));
+    let await_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "coordinator", "coord-can", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalAwaitRequested",
+        json!({ "await_id": await_id.to_string(), "target": target.to_string() }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalAwaitResolved",
+        json!({ "await_id": await_id.to_string(), "output": {"ok": true} }),
+    )
+    .await;
+
+    // Shard 1: the target continued-as-new, but its SUCCESSOR -- the run whose
+    // terminal the caller actually observed -- is back to RUNNING.
+    seed_execution(&mut b, target, "entity", "ent-can", "CONTINUED_AS_NEW", 1).await;
+    append_event(&mut b, target, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut b,
+        target,
+        2,
+        "WorkflowContinuedAsNew",
+        json!({ "new_exec_id": successor.to_string(), "input": {} }),
+    )
+    .await;
+    seed_execution(&mut b, successor, "entity", "ent-can-2", "RUNNING", 1).await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        report.detected(FindingClass::ExternalEffectRolledBack),
+        "a resolved await whose chain head is still running is a rollback: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Incoherent);
+}
+
+/// The control: the same continued-as-new target whose SUCCESSOR is terminal is
+/// exactly what the caller observed, so it must produce no finding. Without this,
+/// "treat CONTINUED_AS_NEW as always-lost" would pass the test above.
+#[tokio::test]
+async fn a_resolved_await_whose_successor_is_terminal_is_clean() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    let caller = ExecutionId::new_for_shard(ShardId::new(0));
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+    let successor = ExecutionId::new_for_shard(ShardId::new(1));
+    let await_id = uuid::Uuid::new_v4();
+
+    seed_execution(&mut a, caller, "coordinator", "coord-can2", "RUNNING", 0).await;
+    append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut a,
+        caller,
+        2,
+        "ExternalAwaitRequested",
+        json!({ "await_id": await_id.to_string(), "target": target.to_string() }),
+    )
+    .await;
+    append_event(
+        &mut a,
+        caller,
+        3,
+        "ExternalAwaitResolved",
+        json!({ "await_id": await_id.to_string(), "output": {"ok": true} }),
+    )
+    .await;
+
+    seed_execution(&mut b, target, "entity", "ent-ok", "CONTINUED_AS_NEW", 1).await;
+    append_event(&mut b, target, 1, "WorkflowStarted", json!({ "input": {} })).await;
+    append_event(
+        &mut b,
+        target,
+        2,
+        "WorkflowContinuedAsNew",
+        json!({ "new_exec_id": successor.to_string(), "input": {} }),
+    )
+    .await;
+    seed_execution(&mut b, successor, "entity", "ent-ok-2", "COMPLETED", 1).await;
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(&targets, &opts(), &WorkflowReplayer::new()).await;
+
+    assert!(
+        !report.detected(FindingClass::ExternalEffectRolledBack),
+        "a resolved await whose chain head is terminal is coherent: {report:#?}"
+    );
+}
+
+/// The cross-shard reference scan must PAGINATE, not truncate. A hard
+/// `LIMIT probe_limit` makes any fleet with more reference events than the
+/// probe limit report `ProbeFailed` -> `Undetermined` -> exit 2, which is a
+/// false "cannot verify" on a perfectly healthy restore. Seed more complete
+/// owner groups than a deliberately tiny probe limit and require a clean pass.
+#[tokio::test]
+async fn a_reference_scan_larger_than_the_probe_limit_is_paginated_not_truncated() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    // 12 callers x 3 events = 36 reference events, against a probe limit of 5.
+    for i in 0..12 {
+        let caller = ExecutionId::new_for_shard(ShardId::new(0));
+        let target = ExecutionId::new_for_shard(ShardId::new(1));
+        let cancel_id = uuid::Uuid::new_v4();
+
+        seed_execution(
+            &mut a,
+            caller,
+            "supervisor",
+            &format!("page-{i}"),
+            "RUNNING",
+            0,
+        )
+        .await;
+        append_event(&mut a, caller, 1, "WorkflowStarted", json!({ "input": {} })).await;
+        append_event(
+            &mut a,
+            caller,
+            2,
+            "ExternalCancelRequested",
+            json!({ "cancel_id": cancel_id.to_string(), "target": target.to_string() }),
+        )
+        .await;
+        append_event(
+            &mut a,
+            caller,
+            3,
+            "ExternalCancelDelivered",
+            json!({ "cancel_id": cancel_id.to_string() }),
+        )
+        .await;
+
+        // Every target is coherently terminal, so a fully-scanned shard is clean.
+        seed_execution(
+            &mut b,
+            target,
+            "fulfillment",
+            &format!("page-t-{i}"),
+            "CANCELLED",
+            1,
+        )
+        .await;
+    }
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(
+        &targets,
+        &opts().with_probe_limit(5),
+        &WorkflowReplayer::new(),
+    )
+    .await;
+
+    assert!(
+        !report.detected(FindingClass::ProbeFailed),
+        "the scan must paginate rather than report truncation: {report:#?}"
+    );
+    assert_ne!(
+        report.status,
+        VerifyStatus::Unavailable,
+        "truncation used to force exit 2 on a healthy fleet larger than one page: {report:#?}"
+    );
+    // Every target is coherently terminal, so a fully-paginated scan finds
+    // nothing to report. (The run is not `Clean` only because the CLI-style
+    // empty replayer raises the honest `replay_skipped_no_handler` advisory --
+    // see docs/runbooks/backup-restore.md 4.3.)
+    assert!(
+        !report.detected(FindingClass::ExternalEffectRolledBack),
+        "every delivered cancel was adjudicated and coherent: {report:#?}"
+    );
+}
+
+/// Pagination must not silently narrow the check: a rollback in the LAST owner
+/// group -- one a single-page `LIMIT` would never have reached -- must still be
+/// detected. Without this, "page once and stop" would pass the test above.
+#[tokio::test]
+async fn pagination_still_detects_a_rollback_beyond_the_first_page() {
+    let (url_a, _ca) = setup().await;
+    let (url_b, _cb) = setup().await;
+    let mut a = connect(&url_a).await;
+    let mut b = connect(&url_b).await;
+
+    // The scan is ordered by `workflow_exec_id`, so seed every caller first and
+    // make the LARGEST id the broken one -- it is unambiguously last.
+    let mut callers: Vec<ExecutionId> = (0..12)
+        .map(|_| ExecutionId::new_for_shard(ShardId::new(0)))
+        .collect();
+    callers.sort_by_key(autumn_harvest::ExecutionId::as_uuid);
+    let broken = *callers.last().expect("12 callers");
+
+    for (i, caller) in callers.iter().enumerate() {
+        let target = ExecutionId::new_for_shard(ShardId::new(1));
+        let cancel_id = uuid::Uuid::new_v4();
+
+        seed_execution(
+            &mut a,
+            *caller,
+            "supervisor",
+            &format!("last-{i}"),
+            "RUNNING",
+            0,
+        )
+        .await;
+        append_event(
+            &mut a,
+            *caller,
+            1,
+            "WorkflowStarted",
+            json!({ "input": {} }),
+        )
+        .await;
+        append_event(
+            &mut a,
+            *caller,
+            2,
+            "ExternalCancelRequested",
+            json!({ "cancel_id": cancel_id.to_string(), "target": target.to_string() }),
+        )
+        .await;
+        append_event(
+            &mut a,
+            *caller,
+            3,
+            "ExternalCancelDelivered",
+            json!({ "cancel_id": cancel_id.to_string() }),
+        )
+        .await;
+
+        // Only the last owner group's target was rolled back.
+        let state = if *caller == broken {
+            "RUNNING"
+        } else {
+            "CANCELLED"
+        };
+        seed_execution(
+            &mut b,
+            target,
+            "fulfillment",
+            &format!("last-t-{i}"),
+            state,
+            1,
+        )
+        .await;
+    }
+
+    let targets = vec![ShardTarget::new(0, &url_a), ShardTarget::new(1, &url_b)];
+    let report = verify_restore(
+        &targets,
+        &opts().with_probe_limit(5),
+        &WorkflowReplayer::new(),
+    )
+    .await;
+
+    assert!(
+        report.detected(FindingClass::ExternalEffectRolledBack),
+        "pagination must reach the final owner group: {report:#?}"
+    );
+    assert_eq!(report.status, VerifyStatus::Incoherent);
+}

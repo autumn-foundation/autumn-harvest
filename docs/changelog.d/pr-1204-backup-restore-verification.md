@@ -281,3 +281,65 @@ backdated an hour, asserting both the finding *and* the reported
 positive test would pass even if the check fired unconditionally — which would
 make every healthy multi-shard drill report a finding. Falsified by neutering
 the threshold comparison. **31** DB integration tests.
+
+**Post-review hardening, round 4** (Codex, two P1s and a P2 — each verified
+against real engine source before any code changed).
+
+1. **P1 — a non-`COMPLETED` await terminal is a resolution, not a transport
+   failure.** `execution::read_external_await_outcome` returns
+   `ExternalAwaitOutcome::Terminal { reason_code, .. }` for a target that
+   reached `FAILED`/`TIMED_OUT`/`CANCELLED`/`TERMINATED`, and both the worker
+   (`worker.rs`) and the outbox (`timeout.rs`) record that as
+   **`ExternalAwaitFailed`** — the same variant used for the genuine transport
+   failure `target_unknown`. The scan bucketed the whole `*Failed` class as
+   "applied no effect", so `build_refs` dropped it and a target shard restored
+   to *before* the terminal the caller had observed was silently missed.
+   Fixed by splitting on the reason code: the four terminal-outcome codes are
+   adjudicated exactly like `ExternalAwaitResolved`; only `target_unknown` and
+   `self_await` stay in the no-effect bucket. The match is deliberately an
+   **allowlist of transport codes**, so an unrecognised future reason code
+   falls into the adjudicated bucket — worst case a finding an operator can
+   dismiss, never a silently skipped check.
+
+2. **P1 — `CONTINUED_AS_NEW` is not proof an await resolved.**
+   `read_external_await_outcome` *follows* a `CONTINUED_AS_NEW` target through
+   its successor chain and resolves only once the chain **head** is terminal.
+   `effect_verdict` shared one arm for `Cancel | Await` that accepted any
+   `is_terminal_state()` — which includes `CONTINUED_AS_NEW` — so a resolved
+   await whose successor had been restored back to `RUNNING` read as coherent.
+   `Await` now has its own `await_verdict` walking the same chain the engine
+   walks (the predecessor's own `WorkflowContinuedAsNew` event, not the
+   `continued_from_exec_id` back-link, which is absent on pre-#701 rows). An
+   absent successor row counts as ordinary retention — the predecessor's seal
+   and the successor's insert are one transaction, so an absent successor was
+   terminal. `Cancel` keeps the simple terminal check, which is correct for it:
+   a delivered cancel against an already-terminal target is a documented no-op
+   success (issue #492), so any terminal state is consistent.
+
+3. **P2 — the cross-shard reference scan truncated instead of paginating.** A
+   hard `LIMIT probe_limit` (default 1000) meant any fleet with more reference
+   events than one probe reported `probe_failed` → `undetermined` → exit 2: a
+   false "cannot verify" on a healthy restore, with no operator override (the
+   CLI exposed `--replay-sample` and `--worker-stale-secs` but not
+   `--probe-limit`). The scan now **pages** by keyset on the owner id, keeping
+   the existing boundary-drop so no owner group is ever split, and re-fetching
+   the dropped tail group from the start of the next page. Two bounded exits
+   still raise a truncation note rather than reporting a clean prefix: a single
+   execution carrying more reference events than one page (which cannot advance
+   the cursor, and would otherwise either loop forever or skip that group
+   silently), and an internal page ceiling. `--probe-limit` is now exposed and
+   is a **page size**, not a ceiling. The per-page `COUNT(*) OVER ()` window
+   function is gone, since completeness is now decided by a short page.
+
+Tests: 6 new DB integration tests (**37** total), each paired with the control
+that would pass a naive fix — `a_terminal_outcome_await_failure_is_adjudicated_not_discarded`
+vs `a_target_unknown_await_failure_asserts_no_effect_on_the_target` (without
+which "adjudicate every `ExternalAwaitFailed`" would pass);
+`a_resolved_await_whose_successor_is_still_running_is_rolled_back` vs
+`a_resolved_await_whose_successor_is_terminal_is_clean` (without which "treat
+`CONTINUED_AS_NEW` as always-lost" would pass); and
+`a_reference_scan_larger_than_the_probe_limit_is_paginated_not_truncated` vs
+`pagination_still_detects_a_rollback_beyond_the_first_page` (without which
+"page once and stop" would pass, silently narrowing the check). Plus CLI
+parse coverage asserting the new flag and that its default tracks
+`DEFAULT_PROBE_LIMIT` rather than a drifting literal.

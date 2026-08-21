@@ -62,7 +62,17 @@ pub const DEFAULT_REPLAY_SAMPLE: usize = 50;
 pub const MAX_REPLAY_SAMPLE: usize = 2_000;
 
 /// Default cap on rows scanned per coherence probe, per shard.
+///
+/// For the cross-shard reference scan this is a *page* size, not a ceiling:
+/// that scan pages through complete owner groups until the shard is exhausted.
 pub const DEFAULT_PROBE_LIMIT: i64 = 1_000;
+
+/// Upper bound on pages the cross-shard reference scan will read per shard.
+///
+/// A runaway guard, not a tuning knob: at the default `probe_limit` it admits
+/// a million reference events, and exceeding it raises a truncation note
+/// (`Undetermined`) rather than reporting a clean prefix.
+pub const MAX_REFERENCE_SCAN_PAGES: usize = 1_000;
 
 /// Default restore-point skew (seconds) above which a multi-shard restore is
 /// flagged as [`FindingClass::RestorePointSkew`].
@@ -1045,6 +1055,18 @@ impl VerifyOptions {
         self.worker_stale_secs = secs;
         self
     }
+
+    /// Set the per-probe row cap.
+    ///
+    /// For the cross-shard reference scan this is a *page* size, not a hard
+    /// ceiling -- the scan pages through complete owner groups until the shard
+    /// is exhausted (see `scan_reference_events`). Raising it trades memory for
+    /// fewer round trips.
+    #[must_use]
+    pub const fn with_probe_limit(mut self, limit: i64) -> Self {
+        self.probe_limit = limit;
+        self
+    }
 }
 
 #[cfg(all(feature = "db", feature = "testing"))]
@@ -1058,9 +1080,9 @@ mod probes {
     use uuid::Uuid;
 
     use super::{
-        Finding, FindingClass, MAX_FINDING_SAMPLES, READ_ONLY_SESSION_SQL, ReplaySummary,
-        RestoreVerifyReport, ShardTarget, ShardVerifyReport, VerifyOptions, compute_skew,
-        redact_dsn,
+        Finding, FindingClass, MAX_FINDING_SAMPLES, MAX_REFERENCE_SCAN_PAGES,
+        READ_ONLY_SESSION_SQL, ReplaySummary, RestoreVerifyReport, ShardTarget, ShardVerifyReport,
+        VerifyOptions, compute_skew, redact_dsn,
     };
     use crate::event::WorkflowEvent;
     use crate::testing::WorkflowReplayer;
@@ -1105,10 +1127,6 @@ mod probes {
         /// dependency from a retained terminal caller's assertion.
         #[diesel(sql_type = diesel::sql_types::Text)]
         owner_state: String,
-        /// Exact matching-row count, computed by a window function *before*
-        /// `LIMIT`, so truncation is detectable rather than silent.
-        #[diesel(sql_type = BigInt)]
-        total: i64,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -1121,6 +1139,14 @@ mod probes {
     struct ExistsRow {
         #[diesel(sql_type = diesel::sql_types::Bool)]
         present: bool,
+    }
+
+    /// The `new_exec_id` a `WorkflowContinuedAsNew` event names, read as text so
+    /// a malformed value degrades to `None` rather than failing the query.
+    #[derive(diesel::QueryableByName)]
+    struct SuccessorRow {
+        #[diesel(sql_type = Nullable<Text>)]
+        new_exec_id: Option<String>,
     }
 
     /// Wrap a caller-supplied selection predicate in a bounded, counted probe.
@@ -1648,32 +1674,15 @@ mod probes {
         // Terminal owners' *unresolved* requests are dropped in `build_refs`
         // (see `terminal_owners`) -- only DELIVERED effects are adjudicated
         // from them.
-        let sql = format!(
-            "SELECT ev.workflow_exec_id, ev.event_data, e.state AS owner_state, \
-                    COUNT(*) OVER () AS total \
-             FROM harvest_events ev \
-             JOIN harvest_workflow_executions e ON e.id = ev.workflow_exec_id \
-             WHERE ( \
-                 ev.event_type IN ( \
-                   'ExternalSignalRequested', 'ExternalSignalDelivered', 'ExternalSignalFailed', \
-                   'ExternalCancelRequested', 'ExternalCancelDelivered', 'ExternalCancelFailed', \
-                   'ExternalAwaitRequested', 'ExternalAwaitResolved', 'ExternalAwaitFailed') \
-                 OR ( \
-                   e.state IN ('RUNNING', 'PAUSED', 'SUSPENDED') \
-                   AND ev.event_type IN ( \
-                     'ChildWorkflowStarted', 'ChildWorkflowCompleted', 'ChildWorkflowFailed')) \
-               ) \
-             ORDER BY ev.workflow_exec_id, ev.event_id \
-             LIMIT {limit}"
-        );
-        let rows: Vec<EventRow> = diesel::sql_query(sql)
-            .load(conn)
-            .await
-            .map_err(|e| format!("cross-shard reference scan failed: {e}"))?;
-
-        // Truncation handling, in two parts.
+        // The scan PAGES through complete owner groups rather than taking a
+        // single `LIMIT probe_limit` slice. A hard limit made any fleet with
+        // more reference events than the probe limit report `ProbeFailed` ->
+        // `Undetermined` -> exit 2: a false "cannot verify" on a healthy
+        // restore, with no operator override.
         //
-        // (1) The cut must land on an execution BOUNDARY. The scan is ordered
+        // Two invariants hold every page:
+        //
+        // (1) The cut lands on an execution BOUNDARY. The scan is ordered
         //     `(workflow_exec_id, event_id)`, so a raw `LIMIT` slices through
         //     the middle of the last execution -- keeping its
         //     `ChildWorkflowStarted` but dropping the matching
@@ -1682,31 +1691,162 @@ mod probes {
         //     `resolve_refs` would report `ChildExecutionMissing` --
         //     Incoherent, exit 1, "do not start workers" -- on a healthy
         //     restore whose child had simply been collected by retention.
-        //     Dropping the partial tail makes that false positive impossible.
+        //     Dropping the partial tail and RE-FETCHING that owner from the
+        //     start of the next page makes that false positive impossible
+        //     without losing the group.
         //
-        // (2) Whatever we dropped was NOT adjudicated, so it is Undetermined.
-        //     Reporting a clean verdict over an arbitrary 1000-event prefix of
-        //     a real fleet is exactly the false-clean this module exists to
-        //     refuse.
-        let total = rows.as_slice().first().map_or(0, |r| r.total);
-        let truncated = total > i64::try_from(rows.len()).unwrap_or(i64::MAX);
-        let rows: Vec<EventRow> = if truncated {
-            let boundary = rows.as_slice().last().map(|r| r.workflow_exec_id);
-            rows.into_iter()
-                .filter(|r| Some(r.workflow_exec_id) != boundary)
-                .collect()
-        } else {
-            rows
-        };
-        let truncation = truncated.then(|| {
-            format!(
-                "cross-shard reference scan truncated: {} of {total} matching events \
-                 inspected (probe_limit={limit}); the remainder was NOT adjudicated",
+        // (2) Anything genuinely NOT reached is still Undetermined. Reporting a
+        //     clean verdict over an arbitrary prefix of a real fleet is exactly
+        //     the false-clean this module exists to refuse, so both bounded
+        //     exits below raise a truncation note.
+        let page = limit.max(1);
+        let mut rows: Vec<EventRow> = Vec::new();
+        let mut cursor: Option<Uuid> = None;
+        let mut truncation: Option<String> = None;
+        let mut exhausted = false;
+
+        for _ in 0..MAX_REFERENCE_SCAN_PAGES {
+            // Keyset on the owner id alone: every page starts at an owner
+            // boundary, so no group is ever split across two pages.
+            let after = match cursor {
+                Some(_) => "AND ev.workflow_exec_id > $1 ",
+                None => "",
+            };
+            let sql = format!(
+                "SELECT ev.workflow_exec_id, ev.event_data, e.state AS owner_state \
+                 FROM harvest_events ev \
+                 JOIN harvest_workflow_executions e ON e.id = ev.workflow_exec_id \
+                 WHERE ( \
+                     ev.event_type IN ( \
+                       'ExternalSignalRequested', 'ExternalSignalDelivered', \
+                       'ExternalSignalFailed', \
+                       'ExternalCancelRequested', 'ExternalCancelDelivered', \
+                       'ExternalCancelFailed', \
+                       'ExternalAwaitRequested', 'ExternalAwaitResolved', \
+                       'ExternalAwaitFailed') \
+                     OR ( \
+                       e.state IN ('RUNNING', 'PAUSED', 'SUSPENDED') \
+                       AND ev.event_type IN ( \
+                         'ChildWorkflowStarted', 'ChildWorkflowCompleted', \
+                         'ChildWorkflowFailed')) \
+                   ) \
+                 {after}\
+                 ORDER BY ev.workflow_exec_id, ev.event_id \
+                 LIMIT {page}"
+            );
+            let query = diesel::sql_query(sql);
+            let loaded: Vec<EventRow> = match cursor {
+                Some(c) => query.bind::<diesel::sql_types::Uuid, _>(c).load(conn).await,
+                None => query.load(conn).await,
+            }
+            .map_err(|e| format!("cross-shard reference scan failed: {e}"))?;
+
+            if loaded.is_empty() {
+                exhausted = true;
+                break;
+            }
+
+            // A short page proves the shard is exhausted, so its tail group is
+            // whole and must be kept.
+            let last_page = i64::try_from(loaded.len()).unwrap_or(i64::MAX) < page;
+            let boundary = loaded.last().map(|r| r.workflow_exec_id);
+            let kept: Vec<EventRow> = if last_page {
+                loaded
+            } else {
+                loaded
+                    .into_iter()
+                    .filter(|r| Some(r.workflow_exec_id) != boundary)
+                    .collect()
+            };
+
+            let kept = if kept.is_empty() {
+                // One owner group filled the whole page, so no COMPLETE group
+                // could be taken and the cursor cannot advance. That does not
+                // yet prove the group is oversized: a group whose size is
+                // exactly `page` fills the page while still being whole.
+                // Re-read it alone with one extra row to tell the two apart --
+                // otherwise every such group would raise a false stall
+                // (`probe_failed` -> Undetermined) on a healthy shard.
+                let Some(owner) = boundary else { break };
+                let Some(group) = read_owner_group(conn, owner, page).await? else {
+                    // Genuinely larger than a page. Stopping without a note
+                    // would silently skip it; looping would never terminate,
+                    // since the cursor still cannot advance.
+                    truncation = Some(format!(
+                        "cross-shard reference scan stalled: execution {owner} has more \
+                         than probe_limit={page} reference events, so its group could \
+                         not be read whole; it and everything after it were NOT \
+                         adjudicated (raise --probe-limit)"
+                    ));
+                    break;
+                };
+                group
+            } else {
+                kept
+            };
+
+            cursor = kept.last().map(|r| r.workflow_exec_id);
+            rows.extend(kept);
+
+            if last_page {
+                exhausted = true;
+                break;
+            }
+        }
+
+        if !exhausted && truncation.is_none() {
+            truncation = Some(format!(
+                "cross-shard reference scan hit its page ceiling after {} events \
+                 ({MAX_REFERENCE_SCAN_PAGES} pages of probe_limit={page}); the \
+                 remainder was NOT adjudicated (raise --probe-limit)",
                 rows.len()
-            )
-        });
+            ));
+        }
 
         Ok((fold_reference_events(rows), truncation))
+    }
+
+    /// Read ONE owner's reference events whole, or report that it does not fit.
+    ///
+    /// Used only when a page was filled entirely by a single owner: reading
+    /// `page + 1` rows distinguishes a group of exactly `page` events (whole --
+    /// returned) from a genuinely oversized one (`None`, which the caller turns
+    /// into a truncation note). Without it, a group whose size happens to equal
+    /// the page would raise a false stall on a healthy shard.
+    async fn read_owner_group(
+        conn: &mut AsyncPgConnection,
+        owner: Uuid,
+        page: i64,
+    ) -> Result<Option<Vec<EventRow>>, String> {
+        let probe = page.saturating_add(1);
+        let loaded: Vec<EventRow> = diesel::sql_query(format!(
+            "SELECT ev.workflow_exec_id, ev.event_data, e.state AS owner_state \
+             FROM harvest_events ev \
+             JOIN harvest_workflow_executions e ON e.id = ev.workflow_exec_id \
+             WHERE ev.workflow_exec_id = $1 \
+               AND ( \
+                 ev.event_type IN ( \
+                   'ExternalSignalRequested', 'ExternalSignalDelivered', \
+                   'ExternalSignalFailed', \
+                   'ExternalCancelRequested', 'ExternalCancelDelivered', \
+                   'ExternalCancelFailed', \
+                   'ExternalAwaitRequested', 'ExternalAwaitResolved', \
+                   'ExternalAwaitFailed') \
+                 OR ( \
+                   e.state IN ('RUNNING', 'PAUSED', 'SUSPENDED') \
+                   AND ev.event_type IN ( \
+                     'ChildWorkflowStarted', 'ChildWorkflowCompleted', \
+                     'ChildWorkflowFailed')) \
+               ) \
+             ORDER BY ev.event_id \
+             LIMIT {probe}"
+        ))
+        .bind::<diesel::sql_types::Uuid, _>(owner)
+        .load(conn)
+        .await
+        .map_err(|e| format!("cross-shard reference scan failed: {e}"))?;
+
+        Ok((i64::try_from(loaded.len()).unwrap_or(i64::MAX) <= page).then_some(loaded))
     }
 
     /// Fold one decoded child/external event into the running [`RefScan`].
@@ -1733,6 +1873,28 @@ mod probes {
                     .or_default()
                     .push(child_id.as_uuid());
             }
+            WorkflowEvent::ExternalSignalRequested { .. }
+            | WorkflowEvent::ExternalCancelRequested { .. }
+            | WorkflowEvent::ExternalAwaitRequested { .. } => {
+                fold_reference_request(scan, owner, event, workflow_id_targets);
+            }
+            _ => fold_reference_terminal(scan, owner, event),
+        }
+    }
+
+    /// Fold a `*Requested` event -- the record of an effect this shard's caller
+    /// asked for against a target that may live on another shard.
+    ///
+    /// A `WorkflowId`-addressed target (issue #751) is resolved at delivery time
+    /// against whichever run is current, so it is not adjudicable from a
+    /// restored snapshot: it is collected for an advisory note instead.
+    fn fold_reference_request(
+        scan: &mut RefScan,
+        owner: Uuid,
+        event: WorkflowEvent,
+        workflow_id_targets: &mut Vec<String>,
+    ) {
+        match event {
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
                 target,
@@ -1782,6 +1944,14 @@ mod probes {
                     ExternalEffect::Await,
                 ));
             }
+            _ => {}
+        }
+    }
+
+    /// Fold a terminal (`*Delivered` / `*Resolved` / `*Failed`) event -- the
+    /// record of what the caller believes actually happened on the target.
+    fn fold_reference_terminal(scan: &mut RefScan, owner: Uuid, event: WorkflowEvent) {
+        match event {
             // Success terminals assert durable state on the target shard.
             WorkflowEvent::ExternalSignalDelivered { signal_id } => {
                 scan.delivered
@@ -1814,14 +1984,47 @@ mod probes {
                     .or_default()
                     .push(cancel_id.as_uuid());
             }
-            WorkflowEvent::ExternalAwaitFailed { await_id, .. } => {
-                scan.failed
-                    .entry(owner)
-                    .or_default()
-                    .push(await_id.as_uuid());
+            // `ExternalAwaitFailed` is NOT uniformly a failure terminal: it is
+            // also the channel through which a NON-`COMPLETED` terminal outcome
+            // is RESOLVED (`execution.rs::read_external_await_outcome` ->
+            // `ExternalAwaitOutcome::Terminal` -> `worker.rs`/`timeout.rs`). Those
+            // reason codes assert that the target reached a chain-head terminal,
+            // exactly like `ExternalAwaitResolved`, so a target restored to
+            // before that terminal is a genuine rollback. Only the TRANSPORT
+            // codes assert nothing about the target's state.
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id,
+                reason_code,
+                ..
+            } => {
+                let bucket = if is_await_transport_failure(&reason_code) {
+                    &mut scan.failed
+                } else {
+                    &mut scan.delivered
+                };
+                bucket.entry(owner).or_default().push(await_id.as_uuid());
             }
             _ => {}
         }
+    }
+
+    /// Is this `ExternalAwaitFailed` reason code a TRANSPORT failure (the await
+    /// never observed a target terminal), rather than a resolved non-`COMPLETED`
+    /// terminal outcome?
+    ///
+    /// The engine emits exactly two transport codes: `target_unknown` (the grace
+    /// window elapsed with no target row -- `timeout.rs`) and `self_await`
+    /// (rejected inline, and never persisted, but matched here so a future
+    /// persisted form cannot be mis-adjudicated). Everything else --
+    /// `target_failed` / `target_cancelled` / `target_timed_out` /
+    /// `target_terminated` -- carries an assertion about the target shard.
+    ///
+    /// The match is deliberately an ALLOWLIST of transport codes rather than of
+    /// outcome codes: an unrecognised future reason code then falls into the
+    /// adjudicated bucket, where the worst case is a reported finding an
+    /// operator can dismiss -- never a silently skipped check.
+    pub(super) fn is_await_transport_failure(reason_code: &str) -> bool {
+        matches!(reason_code, "target_unknown" | "self_await")
     }
 
     /// Fold decoded child/external events into a [`RefScan`].
@@ -2234,8 +2437,13 @@ mod probes {
     /// Does the target shard still show the effect the caller recorded as
     /// delivered?
     ///
-    /// * `Cancel` / `Await` — the caller only records success once the target
-    ///   is terminal, so a non-terminal target means the effect was rolled back.
+    /// * `Cancel` — delivered either by cancelling the target or as a
+    ///   documented no-op against an ALREADY-terminal one (issue #492), so any
+    ///   terminal state on the restored shard is consistent with the delivery
+    ///   and a non-terminal one means it was rolled back.
+    /// * `Await` — resolved only once the target's `CONTINUED_AS_NEW` CHAIN HEAD
+    ///   is terminal, so a bare terminal check is not enough (see
+    ///   [`await_verdict`]).
     /// * `Signal` — the delivery inserts a `harvest_signals` row, which the
     ///   worker later promotes to a `SignalReceived` event. The row persists
     ///   after consumption (`consumed` is a flag, not a delete), so *neither*
@@ -2247,16 +2455,12 @@ mod probes {
         state: &str,
     ) -> Result<EffectVerdict, diesel::result::Error> {
         match effect {
-            // A target that continued-as-new is CONTINUED_AS_NEW and a retried
-            // one is FAILED -- both terminal -- so the chain walk below is not
-            // needed here.
-            ExternalEffect::Cancel | ExternalEffect::Await => {
-                Ok(if crate::erase::is_terminal_state(state) {
-                    EffectVerdict::Survived
-                } else {
-                    EffectVerdict::Lost
-                })
-            }
+            ExternalEffect::Cancel => Ok(if crate::erase::is_terminal_state(state) {
+                EffectVerdict::Survived
+            } else {
+                EffectVerdict::Lost
+            }),
+            ExternalEffect::Await => await_verdict(conn, target, state).await,
             ExternalEffect::Signal {
                 name,
                 idempotency_key,
@@ -2334,6 +2538,89 @@ mod probes {
                 })
             }
         }
+    }
+
+    /// Bound on `CONTINUED_AS_NEW` hops the await chain walk follows -- mirrors
+    /// `execution::read_external_await_outcome`'s own bound.
+    const AWAIT_CHAIN_MAX_HOPS: usize = 128;
+
+    /// Does the target shard still hold the terminal an `ExternalAwait*` terminal
+    /// asserted?
+    ///
+    /// `read_external_await_outcome` FOLLOWS a `CONTINUED_AS_NEW` target through
+    /// its successor chain and resolves only once the chain HEAD is terminal, so
+    /// the ORIGINAL row reading `CONTINUED_AS_NEW` is not by itself proof the
+    /// await resolved -- the successor may be back to `RUNNING`. Because
+    /// `is_terminal_state("CONTINUED_AS_NEW")` is true, a bare terminal check
+    /// reads exactly that rollback as coherent.
+    async fn await_verdict(
+        conn: &mut AsyncPgConnection,
+        target: Uuid,
+        state: &str,
+    ) -> Result<EffectVerdict, diesel::result::Error> {
+        let mut current = target;
+        let mut current_state = state.to_string();
+
+        for _ in 0..AWAIT_CHAIN_MAX_HOPS {
+            if current_state != "CONTINUED_AS_NEW" {
+                return Ok(if crate::erase::is_terminal_state(&current_state) {
+                    EffectVerdict::Survived
+                } else {
+                    EffectVerdict::Lost
+                });
+            }
+
+            // Follow the link the engine reader itself follows: the
+            // predecessor's own `WorkflowContinuedAsNew` event. The successor's
+            // `continued_from_exec_id` back-link is the newer (issue #701)
+            // encoding of the same edge and is absent on pre-#701 rows, so the
+            // event is the safer source.
+            let successor: Option<SuccessorRow> = diesel::sql_query(
+                "SELECT e.event_data->'data'->>'new_exec_id' AS new_exec_id \
+                 FROM harvest_events e \
+                 WHERE e.workflow_exec_id = $1 \
+                   AND e.event_type = 'WorkflowContinuedAsNew' \
+                 ORDER BY e.event_id DESC LIMIT 1",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(current)
+            .get_result(conn)
+            .await
+            .optional()?;
+
+            let Some(next) = successor
+                .and_then(|row| row.new_exec_id)
+                .and_then(|raw| Uuid::parse_str(&raw).ok())
+            else {
+                // A `CONTINUED_AS_NEW` row naming no readable successor is what
+                // the engine reader reports as still-in-flight, so the caller
+                // could not have resolved against this shard's current state.
+                return Ok(EffectVerdict::Lost);
+            };
+
+            let row: Option<StateRow> =
+                diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
+                    .bind::<diesel::sql_types::Uuid, _>(next)
+                    .get_result(conn)
+                    .await
+                    .optional()?;
+
+            let Some(row) = row else {
+                // The successor row is gone. The predecessor's seal and the
+                // successor's insert are one transaction, so an absent successor
+                // is retention collecting a TERMINAL run -- not a restore point
+                // that predates it. Treated as ordinary retention, exactly like
+                // an absent target row upstream.
+                return Ok(EffectVerdict::Survived);
+            };
+
+            current = next;
+            current_state = row.state;
+        }
+
+        // A chain longer than the engine's own reader follows. Neither verdict
+        // is supportable from what we can see, so prefer the one that cannot
+        // fail a healthy restore.
+        Ok(EffectVerdict::Survived)
     }
 
     pub(super) async fn resolve_refs(refs: &[PendingRef], targets: &[ShardTarget]) -> Vec<Finding> {
@@ -2487,6 +2774,39 @@ mod tests {
 
     fn finding(class: FindingClass) -> Finding {
         Finding::new(class, Some(0), 1, vec!["x".into()])
+    }
+
+    /// Codex round 4, P1. `ExternalAwaitFailed` is the channel for BOTH a
+    /// transport failure and a resolved non-`COMPLETED` terminal outcome
+    /// (`execution::read_external_await_outcome`). Only the transport codes may
+    /// be skipped; the outcome codes assert target-shard state.
+    ///
+    /// The `unknown_future_code` case pins the allowlist direction: an
+    /// unrecognised code must be ADJUDICATED, so the worst case is a finding an
+    /// operator can dismiss rather than a silently skipped check.
+    #[test]
+    #[cfg(all(feature = "db", feature = "testing"))]
+    fn await_transport_failures_are_an_allowlist_not_a_denylist() {
+        use super::probes::is_await_transport_failure;
+
+        for transport in ["target_unknown", "self_await"] {
+            assert!(
+                is_await_transport_failure(transport),
+                "{transport} asserts nothing about the target shard"
+            );
+        }
+        for outcome in [
+            "target_failed",
+            "target_cancelled",
+            "target_timed_out",
+            "target_terminated",
+            "unknown_future_code",
+        ] {
+            assert!(
+                !is_await_transport_failure(outcome),
+                "{outcome} must be adjudicated, not skipped"
+            );
+        }
     }
 
     /// Codex round 1, P2. `host=alias-a&hostaddr=X` and `host=alias-b&hostaddr=X`

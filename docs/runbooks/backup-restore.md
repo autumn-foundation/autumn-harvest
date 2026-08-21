@@ -117,7 +117,7 @@ resume, not because anything is wrong.
 | `child_terminal_rolled_back` | The parent recorded the child's terminal, but the child's shard was restored to an *earlier* point where the child is still running. See §6 — this is the signature multi-shard skew failure. |
 | `wedged_schedule_claim` | A schedule with a claim token but a **NULL** `fire_claimed_until` — a torn claim pair. The scheduler claims on `fire_claim_token IS NULL OR fire_claimed_until < NOW()`, which such a row matches neither half of, so the schedule never fires again. Un-claim it by hand (`UPDATE harvest_schedules SET fire_claim_token = NULL, fire_claimed_until = NULL WHERE id = …`) before starting workers. Contrast `expired_schedule_claim`, which self-heals. |
 | `replay_divergence` | A sampled history no longer replays against the deployed workflow code. Not caused by the restore; caused by a code/history mismatch. Fix by rolling *back* the workflow code, then resume (see `nondeterminism-block.md`). |
-| `external_effect_rolled_back` | The caller recorded a signal/cancel/await as **delivered**, but the target's shard shows no trace of the effect — the cross-shard analogue of `child_terminal_rolled_back`. Adjudicated per effect: a delivered *cancel* or resolved *await* requires the target to be terminal; a delivered *signal* is matched **exactly by its `idempotency_key`** when the caller supplied one, else by channel name. The lookup walks the target's **successor chain** (`continued_from_exec_id` / `retry_of_exec_id`), because both continue-as-new and workflow-level retry reassign `harvest_signals` rows to the successor. Adjudicated whether or not the **caller** is itself terminal — the assertion does not expire when the caller completes. Repair by restoring the target shard to a point at or after the caller's, per §6. Nothing retries this: the caller has already recorded the terminal and will never re-request. |
+| `external_effect_rolled_back` | The caller recorded a signal/cancel/await as **delivered**, but the target's shard shows no trace of the effect — the cross-shard analogue of `child_terminal_rolled_back`. Adjudicated per effect: a delivered *cancel* requires the target to be terminal; a resolved *await* requires the target's continue-as-new **chain head** to be terminal (a `CONTINUED_AS_NEW` target alone is not proof — see §4.2(c)); a delivered *signal* is matched **exactly by its `idempotency_key`** when the caller supplied one, else by channel name. The *signal* lookup walks the target's **successor chain** (`continued_from_exec_id` / `retry_of_exec_id`), because both continue-as-new and workflow-level retry reassign `harvest_signals` rows to the successor; the *await* check walks the continue-as-new chain via each predecessor's own `WorkflowContinuedAsNew` event, matching the engine's `read_external_await_outcome`. Adjudicated whether or not the **caller** is itself terminal — the assertion does not expire when the caller completes. Repair by restoring the target shard to a point at or after the caller's, per §6. Nothing retries this: the caller has already recorded the terminal and will never re-request. |
 | `replay_workflow_failed` | A sampled **non-terminal** history replays to a workflow *error* under the deployed code. Because the sample is drawn only from runs with no recorded terminal failure, this means the deployed handler now errors where the live run had not. Same remedy as `replay_divergence`: roll the workflow code *back*, then resume. |
 
 A report containing any of these exits **1**. Do not start workers.
@@ -186,6 +186,7 @@ harvest backup verify --shard <[SHARD_ID=]DSN> [--shard …] [flags]
 | `--format text\|json` | `text` | `json` is the machine-readable report (AC2d). |
 | `--replay-sample <N>` | `50` | How many non-terminal histories to replay per shard. `0` disables replay. |
 | `--worker-stale-secs <N>` | `60` | Heartbeat age past which a worker counts as dead. |
+| `--probe-limit <N>` | `1000` | Rows read per coherence probe. For the cross-shard reference scan this is a **page** size, not a ceiling — that scan pages until the shard is exhausted. Raise it only if the report says one execution carries more reference events than a page. |
 
 The live DSN for the guard comes from `HARVEST_DATABASE_URL` (or `--live-dsn`).
 When no live DSN is supplied at all, or when `--i-know-this-is-scratch` is
@@ -253,6 +254,30 @@ ack, it refuses; with the ack, it still only reads.
   awaited child may legitimately have been collected by retention. Likewise an
   *unresolved* request from a terminal caller is not a live dependency and is
   not reported.)
+
+  Two subtleties in how a delivered *await* is adjudicated, both matching the
+  engine's own `read_external_await_outcome`:
+
+  - A **non-`COMPLETED`** terminal resolves an await through
+    `ExternalAwaitFailed`, not `ExternalAwaitResolved`. Those reason codes
+    (`target_failed`, `target_cancelled`, `target_timed_out`,
+    `target_terminated`) assert that the target reached a terminal state, so
+    they are adjudicated exactly like a resolution. Only the *transport* codes
+    (`target_unknown`, `self_await`) assert nothing about the target and are
+    skipped.
+  - A **`CONTINUED_AS_NEW`** target is not by itself proof the await resolved:
+    the engine follows the successor chain and resolves only once the chain
+    **head** is terminal. The check walks the same chain. A successor row that
+    is absent counts as ordinary retention (the predecessor's seal and the
+    successor's insert are one transaction, so an absent successor was
+    terminal); a successor that is still `RUNNING` is a genuine rollback.
+
+  This scan **pages** through complete owner groups rather than truncating at
+  `--probe-limit`, so a fleet larger than one page still gets a definitive
+  verdict. `--probe-limit` is the page size. Two bounded exits still raise
+  `probe_failed` (→ `undetermined`, exit 2) rather than reporting a clean
+  prefix: a single execution carrying more reference events than one page
+  (raise `--probe-limit`), and hitting the internal page ceiling.
 - **(d) A machine-readable report** (`--format json`) with a nonzero exit on any
   failed check.
 
