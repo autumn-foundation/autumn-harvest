@@ -817,6 +817,137 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
     );
 }
 
+// ── AC1(d) — expire a lease/heartbeat early ──────────────────────────────────
+
+/// AC1(d) names four lease/heartbeat surfaces to expire early:
+///
+/// - **schedule fire claim** — [`chaos_repro_350_crashed_fire_claim_is_refired_exactly_once`]
+///   crashes the claiming replica mid-fire, then deterministically expires the
+///   dead claim (a test-side `UPDATE harvest_schedules SET fire_claimed_until`
+///   into the past) and asserts a healthy peer re-fires exactly once.
+/// - **worker liveness heartbeat** — [`chaos_repro_367_crash_orphan_is_reclaimed`]
+///   leaves a `RUNNING` task owned by a worker with no live `harvest_workers`
+///   heartbeat, and asserts `reclaim_orphaned_tasks` reclaims it.
+/// - **session lease** — *this test* (below).
+/// - **delivery in-flight lease** — the identical technique: a `harvest_completion_deliveries`
+///   row left `INFLIGHT` with `next_attempt_at` in the past is re-claimed by the
+///   delivery scanner's `state IN ('PENDING','INFLIGHT') AND next_attempt_at <= NOW()`
+///   candidate CTE (`completion_callback::claim_due_deliveries`). It is not
+///   reproduced as a dedicated chaos test here because the delivery scanner
+///   performs real HTTP POSTs (a network dependency out of scope for a
+///   deterministic, offline chaos reproducer).
+///
+/// This test demonstrates the early-lease-expiry capability for the **session
+/// lease** deterministically and offline: an `ACTIVE` `harvest_sessions` row
+/// whose host worker is provably live (fresh heartbeat, `Active` status) and
+/// whose owning workflow is non-terminal, but whose `expires_at` is in the past,
+/// is reclaimed by `enforce_broken_sessions` as `BROKEN` with the `LeaseExpired`
+/// reason — isolating the lease-expiry path from the (higher-priority)
+/// dead-host / draining / terminal-workflow reasons.
+///
+/// RED procedure: revert the `s.expires_at < NOW()` disjunct in
+/// `sessions::broken_session_candidates_query()` (or `lease_expired` in
+/// `resolve_broken_reason`) and the session stays `ACTIVE` — the assert fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chaos_ac1d_session_lease_expiry_marks_broken() {
+    let (url, _c) = chaos_db().await;
+    let mut conn = connect(&url).await;
+
+    // A non-terminal (RUNNING) owning workflow — so the break is not attributed
+    // to `OwningWorkflowTerminal`.
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let params = base_params(
+        "chaos_noop",
+        "ac1d-session",
+        exec_id,
+        serde_json::json!(null),
+    );
+    autumn_harvest::execution::start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect("start owning workflow");
+
+    // A provably-live host worker: fresh `last_heartbeat_at`, `Active` status —
+    // so the break is not attributed to a dead/draining host.
+    let host = "ac1d-session-host";
+    autumn_harvest::workers::register_worker(
+        &mut conn,
+        host,
+        &["default".to_string()],
+        &[0],
+        4,
+        "localhost",
+        None,
+        "",
+        None,
+        &std::collections::HashMap::new(),
+        1,
+    )
+    .await
+    .expect("register live host worker");
+
+    // An `ACTIVE` session whose lease is already in the past — the AC1(d)
+    // early-lease-expiry we are exercising.
+    let session_id = autumn_harvest::types::SessionId::new();
+    let expired_at = Utc::now() - chrono::Duration::seconds(60);
+    let outcome = autumn_harvest::sessions::record_session_acquired(
+        &mut conn, session_id, exec_id, host, "default", expired_at,
+    )
+    .await
+    .expect("record session with an expired lease");
+    // The row inserts `ACTIVE` regardless of the lease (the scanner, not the
+    // insert, breaks it) — sanity-check that precondition.
+    assert!(
+        matches!(
+            outcome,
+            autumn_harvest::sessions::SessionAcquireRecordOutcome::Active { .. }
+        ),
+        "session must insert ACTIVE before the scanner runs; got {outcome:?}"
+    );
+
+    // Run the broken-session scanner with a generous worker-staleness window
+    // (120 s) so the fresh host heartbeat is NOT stale — the only broken reason
+    // that can apply is the expired lease.
+    let member_tasks_failed = autumn_harvest::sessions::enforce_broken_sessions(&mut conn, 120)
+        .await
+        .expect("enforce_broken_sessions");
+    // `enforce_broken_sessions` returns the count of member *tasks* failed, not
+    // the count of sessions reclaimed. This session is intentionally memberless
+    // (it seeds no `harvest_task_queue` rows) to isolate the pure lease-expiry
+    // path, so the correct return is 0 even though the session row IS
+    // transitioned to `BROKEN` below. Asserting the documented member-task
+    // semantics here is itself a regression guard against that contract drifting.
+    assert_eq!(
+        member_tasks_failed, 0,
+        "a memberless reclaimed session fails zero member tasks",
+    );
+
+    // The AC1(d) evidence: the ACTIVE→BROKEN transition attributed to the
+    // expired lease. The row was proven ACTIVE above (the `record_session_acquired`
+    // outcome), and the scanner is the only thing that ran since, so this
+    // transition is caused solely by the early lease expiry.
+    let (state, reason): (String, Option<String>) =
+        diesel::sql_query("SELECT state, broken_reason FROM harvest_sessions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(session_id.as_uuid())
+            .get_result::<SessionStateRow>(&mut conn)
+            .await
+            .map(|r| (r.state, r.broken_reason))
+            .expect("read session state");
+    assert_eq!(state, "BROKEN", "the expired-lease session must be BROKEN");
+    assert_eq!(
+        reason.as_deref(),
+        Some("session lease expired"),
+        "the break must be attributed to the expired lease, not a dead/draining host",
+    );
+}
+
+#[derive(diesel::QueryableByName)]
+struct SessionStateRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    broken_reason: Option<String>,
+}
+
 // ── AC5 — seeded convergence sweep ───────────────────────────────────────────
 
 /// The catalogue points the sweep's workload actually reaches. The workload
