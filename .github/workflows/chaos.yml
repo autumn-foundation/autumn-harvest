@@ -2,8 +2,8 @@
 #
 # Runs the `chaos` feature test suite — the four historical-race reproducers plus
 # the seeded convergence sweep — against a real Postgres (testcontainers/Docker).
-# The sweep exercises N ≥ 5 distinct seeds per run via CHAOS_SEEDS; every failure
-# prints its seed for one-command local replay (see docs/testing/chaos.md).
+# The sweep exercises N ≥ 5 distinct seeds per run; every failure prints its seed
+# for one-command local replay (see docs/testing/chaos.md).
 #
 # Not part of the required CI matrix: it runs on-demand (workflow_dispatch) and on
 # a nightly cron, so iterative PR pushes don't pay for it. The `chaos` feature is
@@ -14,9 +14,12 @@ on:
   workflow_dispatch:
     inputs:
       seeds:
-        description: "Space-separated u64 seeds for the convergence sweep (≥ 5 distinct)."
+        description: >-
+          Optional space-separated u64 seeds for the convergence sweep (for
+          targeted replay of a printed failure). Leave empty to use the suite's
+          computed, non-vacuous default set (≥ 5 seeds).
         required: false
-        default: "1 2 3 5 8 13 21"
+        default: ""
   schedule:
     # Nightly at 04:17 UTC (off the top of the hour to avoid scheduler pileups).
     - cron: "17 4 * * *"
@@ -28,13 +31,15 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Default seed set for the nightly cron; the manual dispatch input overrides it.
-  # Seven distinct seeds satisfies AC5's "N ≥ 5 documented seeds per run".
-  CHAOS_SEEDS: ${{ github.event.inputs.seeds || '1 2 3 5 8 13 21' }}
+  # Empty for the nightly cron → the sweep computes its own default seed set (the
+  # first N ≥ 5 seeds that drive a fault against the workload — non-vacuous *by
+  # construction*, so no magic list to keep in sync here). A manual dispatch can
+  # supply explicit seeds to replay a printed failure verbatim.
+  CHAOS_SEEDS: ${{ github.event.inputs.seeds || '' }}
 
 jobs:
   chaos:
-    name: Chaos suite (seeds ${{ github.event.inputs.seeds || '1 2 3 5 8 13 21' }})
+    name: Chaos suite
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest::chaos::points::{
-    OUTBOX_INLINE_AFTER_REQUESTED, QUEUE_PARK_BEFORE_UPDATE, SCHED_AFTER_CLAIM,
-    WORKER_PERSIST_BEFORE_COMMIT,
+    ChaosPoint, OUTBOX_INLINE_AFTER_REQUESTED, QUEUE_PARK_BEFORE_UPDATE, SCHED_AFTER_CLAIM,
+    WORKER_AFTER_OUTER_COMMIT, WORKER_PERSIST_BEFORE_COMMIT,
 };
 use autumn_harvest::chaos::{ChaosPlan, arm};
 use autumn_harvest::prelude::*;
@@ -819,28 +819,106 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
 
 // ── AC5 — seeded convergence sweep ───────────────────────────────────────────
 
-/// Documented default seed set for the sweep (AC5: N ≥ 5 distinct seeds). CI
-/// overrides via `CHAOS_SEEDS="1 2 3 ..."`. Every seed in the set — default or
-/// override — must drive at least one honored fault against the workload; the
-/// sweep asserts this per seed so a vacuous seed fails loudly rather than
-/// passing convergence for a healthy run. The default set below is verified
-/// non-vacuous.
+/// The catalogue points the sweep's workload actually reaches. The workload
+/// drives single-cycle `chaos_noop` workflows, so it exercises the worker
+/// decision-cycle persist path: `WORKER_PERSIST_BEFORE_COMMIT` (hit before every
+/// commit) and `WORKER_AFTER_OUTER_COMMIT` (hit after every commit). Both carry
+/// KILL|DELAY caps — a KILL here orphans the persist (the #367 recovery path the
+/// convergence invariant exercises), a DELAY perturbs its timing. The other five
+/// catalogue points are each covered precisely by a dedicated reproducer above;
+/// a parking/external-signal/scheduler workload cannot be folded into this sweep
+/// because a seeded plan never selects `Hold` and delivers no signals, so a
+/// parked workflow would never reach `COMPLETED`.
+const WORKLOAD_REACHABLE: &[ChaosPoint] =
+    &[WORKER_PERSIST_BEFORE_COMMIT, WORKER_AFTER_OUTER_COMMIT];
+
+/// How many default seeds to run (AC5 requires N ≥ 5).
+const DEFAULT_SWEEP_SEED_COUNT: usize = 7;
+
+/// A seed is non-vacuous for this sweep iff its seeded plan arms a directive at a
+/// workload-reachable point. Seeded triggers are always `OnHit(1..=3)` and the
+/// workload produces ≥ 4 hits on each reachable point, so any such activation is
+/// guaranteed to fire — making this a sound predicate for the anti-vacuity
+/// contract asserted per seed in the sweep.
+fn seed_drives_a_fault(seed: u64) -> bool {
+    let plan = ChaosPlan::seeded(seed);
+    WORKLOAD_REACHABLE.iter().any(|&p| plan.activates(p))
+}
+
+/// The seed set for the sweep. Every seed — default or override — must drive at
+/// least one honored fault against the workload; the sweep asserts this per seed
+/// so a vacuous seed fails loudly rather than passing convergence for a healthy
+/// run.
+///
+/// - **Default (the CI path):** the first [`DEFAULT_SWEEP_SEED_COUNT`] seeds
+///   (from 1 upward) that [`seed_drives_a_fault`] against the workload —
+///   **computed**, not hardcoded, so it is non-vacuous *by construction* (no
+///   magic numbers that could silently go vacuous if the seeded logic or the
+///   catalogue changes) and ≥ 5 by construction (AC5). Fully deterministic and
+///   reproducible (AC3).
+/// - **Explicit override (`CHAOS_SEEDS="8"`, replay):** trusted verbatim, any
+///   count. AC3 wants one-command single-seed replay, so the ≥ 5 floor is *not*
+///   imposed on an operator-chosen override — the per-seed anti-vacuity assert in
+///   the sweep still protects correctness, and a single failing seed printed by a
+///   CI failure can be replayed directly.
 fn sweep_seeds() -> Vec<u64> {
-    let seeds = std::env::var("CHAOS_SEEDS")
-        .ok()
-        .map(|s| {
-            s.split_whitespace()
-                .filter_map(|t| t.parse::<u64>().ok())
-                .collect::<Vec<_>>()
-        })
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| vec![1, 2, 3, 5, 8, 13, 21]);
+    if let Some(seeds) = env_override_seeds() {
+        return seeds;
+    }
+    let seeds = default_sweep_seeds();
     assert!(
         seeds.len() >= 5,
-        "AC5 requires N >= 5 distinct seeds; CHAOS_SEEDS resolved to {} ({seeds:?})",
+        "AC5 requires N >= 5 distinct seeds; the computed default is {} ({seeds:?})",
         seeds.len(),
     );
     seeds
+}
+
+/// Parse an explicit `CHAOS_SEEDS="1 2 3 ..."` override, or `None` when unset or
+/// empty (fall back to the computed default).
+fn env_override_seeds() -> Option<Vec<u64>> {
+    let raw = std::env::var("CHAOS_SEEDS").ok()?;
+    let seeds: Vec<u64> = raw
+        .split_whitespace()
+        .filter_map(|t| t.parse::<u64>().ok())
+        .collect();
+    (!seeds.is_empty()).then_some(seeds)
+}
+
+/// The computed default seed set: the first [`DEFAULT_SWEEP_SEED_COUNT`]
+/// non-vacuous seeds from 1 upward.
+fn default_sweep_seeds() -> Vec<u64> {
+    (1u64..)
+        .filter(|&s| seed_drives_a_fault(s))
+        .take(DEFAULT_SWEEP_SEED_COUNT)
+        .collect()
+}
+
+/// AC5 (default path) is guaranteed *by construction*, not by a magic list: the
+/// computed default is at least 5 distinct seeds, and each drives a fault against
+/// the sweep's workload (so the per-seed anti-vacuity assert in
+/// [`chaos_seeded_convergence_sweep`] can never fail for the default set). No DB
+/// needed — this is a pure property of the deterministic seeded logic.
+#[test]
+fn default_sweep_seeds_are_at_least_five_and_non_vacuous() {
+    let seeds = default_sweep_seeds();
+    assert!(
+        seeds.len() >= 5,
+        "AC5 requires >= 5 default seeds; computed {} ({seeds:?})",
+        seeds.len(),
+    );
+    let distinct: std::collections::BTreeSet<u64> = seeds.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        seeds.len(),
+        "default seeds must be distinct"
+    );
+    for &s in &seeds {
+        assert!(
+            seed_drives_a_fault(s),
+            "default seed {s} is vacuous against the workload",
+        );
+    }
 }
 
 /// For each seed: arm a randomised plan, drive a bounded workload of

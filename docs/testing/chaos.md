@@ -133,7 +133,9 @@ reproducer seed.
 
 Every reproducer embeds `guard.diagnostics()` (which contains the seed and the
 fired-action trace) in its assert messages, so a CI failure prints exactly what
-to replay:
+to replay. A `CHAOS_SEEDS` override is trusted verbatim (any count), so a single
+printed seed replays in one command — the AC5 "≥ 5" floor is only imposed on the
+*computed default*, never on an operator-chosen replay set:
 
 ```bash
 # Replay a single failing seed locally:
@@ -151,28 +153,46 @@ container per test (the CI path).
 ## The convergence sweep (AC5)
 
 `chaos_seeded_convergence_sweep` runs a bounded workload under
-`ChaosPlan::seeded(seed)` for each seed in `CHAOS_SEEDS` (default
-`1 2 3 5 8 13 21` — seven distinct seeds, ≥ 5) and asserts the **convergence
-invariant** after the harness is disarmed and the recovery loop (reclaim orphans
-+ re-drive) has run:
+`ChaosPlan::seeded(seed)` for each seed in the resolved seed set and asserts the
+**convergence invariant** after the harness is disarmed and the recovery loop
+(reclaim orphans + re-drive) has run:
 
 - every workflow reaches a terminal state (`COMPLETED`) — terminal-or-parked;
 - **no** task is stranded `RUNNING` with a dead worker;
 - **no** `ExternalSignalRequested` event lacks an eventual terminal.
+
+**Workload → reachable points.** The sweep drives single-cycle `chaos_noop`
+workflows, so it exercises the worker decision-cycle *persist* path:
+`worker.persist.before_commit` (a KILL here orphans the persist — the #367
+recovery path the invariant checks — a DELAY perturbs its timing) and
+`worker.persist.after_outer_commit`. The other five catalogue points are each
+covered precisely by their own dedicated reproducer above; a parking /
+external-signal / scheduler workload can't be folded into this one sweep because
+a *seeded* plan never selects `Hold` and delivers no signals, so a parked
+workflow would never reach `COMPLETED`.
+
+**Computed, non-vacuous default seed set.** The default set is **computed**, not
+a hardcoded list: it is the first *N* (currently 7, ≥ 5 for AC5) seeds from 1
+upward whose seeded plan arms a fault at a workload-reachable point
+(`default_sweep_seeds()`). This keeps the default non-vacuous *by construction* —
+no magic numbers that could silently go vacuous if the seeded logic or the
+catalogue changes — while staying fully deterministic. A no-DB unit test
+(`default_sweep_seeds_are_at_least_five_and_non_vacuous`) pins the ≥ 5 /
+distinct / non-vacuous properties. (With today's catalogue the computed set is
+`[3, 5, 6, 8, 11, 13, 14]`.)
 
 **Anti-vacuity.** The sweep additionally asserts, per seed, that at least one
 honored fault actually fired (`guard.actions_fired() >= 1`). `ChaosPlan::seeded`
 is a pure function of the seed, so this is deterministic — a seed that injects
 zero faults would let the convergence invariant pass for a healthy, un-faulted
 run ("passes for the wrong reason"). A vacuous seed therefore fails loudly,
-naming itself for replay, rather than passing silently. The documented default
-set is verified non-vacuous; a hand-picked `CHAOS_SEEDS` override must likewise
-drive a fault per seed. `sweep_seeds()` also asserts the resolved set has ≥ 5
-seeds (AC5), so a too-small `CHAOS_SEEDS` override fails immediately.
+naming itself for replay, rather than passing silently. A hand-picked
+`CHAOS_SEEDS` override must likewise drive a fault per seed.
 
 The CI job (`.github/workflows/chaos.yml`) runs the suite on `workflow_dispatch`
-and on a nightly `cron`, exporting `CHAOS_SEEDS` so the sweep exercises ≥ 5
-distinct seeds per run.
+and on a nightly `cron`. The cron leaves `CHAOS_SEEDS` empty so the sweep uses
+its computed default (≥ 5 seeds per run, AC5); a manual dispatch can supply
+explicit seeds to replay a printed failure.
 
 ## Out of scope
 

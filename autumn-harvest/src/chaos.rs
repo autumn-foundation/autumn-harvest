@@ -470,6 +470,16 @@ mod controller {
             }
         }
 
+        /// Whether this plan has a directive armed at `point` (regardless of its
+        /// trigger ordinal). Lets a test compute a non-vacuous seed set against
+        /// the points its workload actually reaches, rather than hardcoding
+        /// magic seeds that could silently go vacuous if the seeded logic or the
+        /// catalogue changes.
+        #[must_use]
+        pub fn activates(&self, point: ChaosPoint) -> bool {
+            self.directives.contains_key(point.name())
+        }
+
         /// Fire a [`Kill`](Action::Kill) on the first hit of `point`.
         #[must_use]
         pub fn kill_at(self, point: ChaosPoint) -> Self {
