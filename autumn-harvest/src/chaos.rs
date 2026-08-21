@@ -55,9 +55,14 @@ pub mod points {
 
     use core::fmt;
 
-    /// Primitive classes a [`ChaosPoint`] supports when a *seeded* plan picks an
-    /// action for it. Explicit (scripted) plans ignore these caps — a
-    /// `hold_at`/`kill_at` on any point is honoured regardless.
+    /// Primitive classes a [`ChaosPoint`] supports.
+    ///
+    /// A *seeded* plan picks an action for a point only from its declared caps.
+    /// A *scripted* plan (`kill_at`/`error_at`/`hold_at`/...) is likewise
+    /// validated against them at plan-build time: a directive whose action a
+    /// point's caps do not allow panics inside the `*_at` builder, right next to
+    /// the mistake — never a silent caps/site mismatch that only surfaces far
+    /// away at the entry point when the point is first hit.
     type Caps = u8;
 
     /// The point runs inside a spawned task, so a panic there simulates a task
@@ -272,6 +277,15 @@ mod controller {
     static STATE: RwLock<Option<Arc<ChaosState>>> = RwLock::new(None);
     static SERIAL: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
     static HOOK_INSTALLED: Once = Once::new();
+    /// Monotonic source of per-arm generation ids. Starts at 1 so `0` is a
+    /// never-armed sentinel (see [`ARMED_GEN`]).
+    static NEXT_GEN: AtomicU64 = AtomicU64::new(1);
+    /// The generation of the currently-armed plan, or `0` when disarmed. A
+    /// resolved action only fires when the state it was resolved from still
+    /// carries this generation — so a fault resolved by a spawned task that
+    /// outlived its plan can never leak into a later test (issue #940, Codex
+    /// review round 1).
+    static ARMED_GEN: AtomicU64 = AtomicU64::new(0);
 
     /// An injected fault error. Surfaces at a [`chaos_fallible!`] site as
     /// whatever error type the enclosing function returns, via `From`, so the
@@ -339,6 +353,49 @@ mod controller {
         DropNotify,
         /// Sleep for `n` milliseconds.
         Delay(u64),
+    }
+
+    impl Action {
+        /// A short action name for a scripted caps-mismatch assert message.
+        const fn kind(&self) -> &'static str {
+            match self {
+                Self::Kill => "Kill",
+                Self::Hold => "Hold",
+                Self::Error(_) => "Error",
+                Self::DropNotify => "DropNotify",
+                Self::Delay(_) => "Delay",
+            }
+        }
+    }
+
+    /// Assert `point`'s declared caps allow a scripted `action`, panicking at
+    /// plan-build time otherwise.
+    ///
+    /// Scripted plans used to ignore caps, so a `kill_at` on a DROP_NOTIFY-only
+    /// point was accepted silently and only blew up far away at the entry point
+    /// (the caps/site-mismatch `panic!` in [`hit`]/[`should_drop_notify`]). This
+    /// surfaces the mistake next to the offending `*_at` call instead.
+    fn assert_scripted_cap(point: ChaosPoint, action: &Action) {
+        let caps = point.caps();
+        let ok = match action {
+            Action::Kill => caps & CAP_KILL != 0,
+            Action::Error(_) => caps & CAP_ERROR != 0,
+            Action::DropNotify => caps & CAP_DROP_NOTIFY != 0,
+            Action::Delay(_) => caps & CAP_DELAY != 0,
+            // A `Hold` rendezvous parks the point on an `.await`, so it needs a
+            // site that can pause: any of KILL/ERROR/DELAY marks an async point.
+            // A DROP_NOTIFY-only site is synchronous and cannot host a Hold (its
+            // `should_drop_notify` is not `async` — a scripted Hold there would
+            // hang the test's `reached().await` forever).
+            Action::Hold => caps & (CAP_KILL | CAP_ERROR | CAP_DELAY) != 0,
+        };
+        assert!(
+            ok,
+            "chaos: a {} directive is scripted at `{}`, whose declared caps do \
+             not allow it — check the point's caps in the catalogue",
+            action.kind(),
+            point.name(),
+        );
     }
 
     #[derive(Debug, Clone)]
@@ -500,13 +557,19 @@ mod controller {
         }
 
         /// Fire a [`Kill`](Action::Kill) on the `n`th hit of `point`.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `point`'s declared caps do not include `CAP_KILL`.
         #[must_use]
         pub fn kill_at_hit(mut self, point: ChaosPoint, n: u64) -> Self {
+            let action = Action::Kill;
+            assert_scripted_cap(point, &action);
             self.directives.insert(
                 point.name(),
                 Directive {
                     trigger: Trigger::OnHit(n),
-                    action: Action::Kill,
+                    action,
                 },
             );
             self
@@ -515,8 +578,14 @@ mod controller {
         /// Install a [`Hold`](Action::Hold) rendezvous on the first hit of
         /// `point`. Retrieve the test-side handle from the guard with
         /// [`ChaosGuard::hold`].
+        ///
+        /// # Panics
+        ///
+        /// Panics if `point` is a synchronous site (no `CAP_KILL`/`CAP_ERROR`/
+        /// `CAP_DELAY` cap) that cannot host an `.await` rendezvous.
         #[must_use]
         pub fn hold_at(mut self, point: ChaosPoint) -> Self {
+            assert_scripted_cap(point, &Action::Hold);
             self.holds.insert(point.name(), Arc::new(HoldGate::new()));
             self.directives.insert(
                 point.name(),
@@ -530,21 +599,32 @@ mod controller {
 
         /// Inject `err` on every hit of `point` (only meaningful at a
         /// `chaos_fallible!` site).
+        ///
+        /// # Panics
+        ///
+        /// Panics if `point`'s declared caps do not include `CAP_ERROR`.
         #[must_use]
         pub fn error_at(mut self, point: ChaosPoint, err: ChaosError) -> Self {
+            let action = Action::Error(err);
+            assert_scripted_cap(point, &action);
             self.directives.insert(
                 point.name(),
                 Directive {
                     trigger: Trigger::Every,
-                    action: Action::Error(err),
+                    action,
                 },
             );
             self
         }
 
         /// Drop the `LISTEN`/`NOTIFY` wake on the first hit of `point`.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `point`'s declared caps do not include `CAP_DROP_NOTIFY`.
         #[must_use]
         pub fn drop_notify_at(mut self, point: ChaosPoint) -> Self {
+            assert_scripted_cap(point, &Action::DropNotify);
             self.directives.insert(
                 point.name(),
                 Directive {
@@ -556,13 +636,19 @@ mod controller {
         }
 
         /// Delay `ms` milliseconds on the first hit of `point`.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `point`'s declared caps do not include `CAP_DELAY`.
         #[must_use]
         pub fn delay_at(mut self, point: ChaosPoint, ms: u64) -> Self {
+            let action = Action::Delay(ms);
+            assert_scripted_cap(point, &action);
             self.directives.insert(
                 point.name(),
                 Directive {
                     trigger: Trigger::OnHit(1),
-                    action: Action::Delay(ms),
+                    action,
                 },
             );
             self
@@ -597,6 +683,10 @@ mod controller {
     /// [`SERIAL`]).
     struct ChaosState {
         seed: Option<u64>,
+        /// The per-arm generation this state belongs to; compared against
+        /// [`ARMED_GEN`] in [`ChaosState::fire_if_current`] to fence a stale
+        /// resolved action.
+        generation: u64,
         directives: BTreeMap<&'static str, Directive>,
         holds: BTreeMap<&'static str, Arc<HoldGate>>,
         hits: Mutex<BTreeMap<&'static str, u64>>,
@@ -629,9 +719,10 @@ mod controller {
     }
 
     impl ChaosState {
-        fn from_plan(plan: ChaosPlan) -> Self {
+        fn from_plan(plan: ChaosPlan, generation: u64) -> Self {
             Self {
                 seed: plan.seed,
+                generation,
                 directives: plan.directives,
                 holds: plan.holds,
                 hits: Mutex::new(BTreeMap::new()),
@@ -666,12 +757,14 @@ mod controller {
             if !fire {
                 return Resolved::Continue;
             }
-            // NB: `actions_fired` is NOT bumped here. It is bumped by the entry
-            // point (`hit`/`hit_fallible`/`should_drop_notify`) only when that
-            // site can actually *honor* the resolved action — so a caps/site
-            // mismatch (e.g. an `Error` scripted at an infallible `chaos_point!`
-            // site) hard-`panic!`s there and does not silently inflate the
-            // anti-vacuity counter.
+            // NB: `actions_fired` is NOT bumped here. It is bumped via
+            // `fire_if_current` at the entry point (`hit`/`hit_fallible`/
+            // `should_drop_notify`) only when that site can actually *honor* the
+            // resolved action AND this state's generation is still armed — so a
+            // caps/site mismatch (e.g. an `Error` scripted at an infallible
+            // `chaos_point!` site) hard-`panic!`s there, and a stale action
+            // resolved after the plan was disarmed fires nothing. Neither
+            // silently inflates the anti-vacuity counter.
             match &directive.action {
                 Action::Kill => Resolved::Kill,
                 Action::Hold => self
@@ -685,7 +778,9 @@ mod controller {
         }
 
         /// Record that a resolved directive was actually honored at its site
-        /// (feeds the anti-vacuity `actions_fired` guard).
+        /// (feeds the anti-vacuity `actions_fired` guard). Called only via
+        /// [`ChaosState::fire_if_current`], so the counter and the side effect
+        /// are gated by the same generation check.
         ///
         /// `Relaxed` is sufficient: the counter is a per-plan monotonic tally
         /// read only after the armed plan is dropped (the `SERIAL` mutex is
@@ -694,6 +789,25 @@ mod controller {
         /// acquire/release fence is needed.
         fn mark_fired(&self) {
             self.actions_fired.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Whether a directive resolved from *this* state may still fire, and —
+        /// when it may — count it toward the anti-vacuity guard.
+        ///
+        /// Returns `true` (and bumps [`mark_fired`](Self::mark_fired)) only when
+        /// this state's [`generation`](Self::generation) is still the armed one
+        /// ([`ARMED_GEN`]). A stale state — its plan disarmed by a guard drop,
+        /// possibly with a newer plan armed since — returns `false` and fires
+        /// nothing: an action a spawned task resolved while armed can no longer
+        /// leak a fault into a later test after its plan is gone. `SeqCst`
+        /// pairs with the store in [`arm`]/`Drop` so the fence orders against
+        /// the disarm.
+        fn fire_if_current(&self) -> bool {
+            if self.generation != ARMED_GEN.load(Ordering::SeqCst) {
+                return false;
+            }
+            self.mark_fired();
+            true
         }
 
         fn hits_of(&self, point: ChaosPoint) -> u64 {
@@ -777,8 +891,12 @@ mod controller {
     pub async fn arm(plan: ChaosPlan) -> ChaosGuard {
         install_quiet_hook_once();
         let serial = SERIAL.lock().await;
-        let state = Arc::new(ChaosState::from_plan(plan));
+        let generation = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
+        let state = Arc::new(ChaosState::from_plan(plan, generation));
         *STATE.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&state));
+        // Publish the generation before flipping ARMED, so any hit that observes
+        // ARMED=true also observes the matching ARMED_GEN.
+        ARMED_GEN.store(generation, Ordering::SeqCst);
         ARMED.store(true, Ordering::SeqCst);
         ChaosGuard {
             _serial: serial,
@@ -850,8 +968,10 @@ mod controller {
         fn drop(&mut self) {
             // Clear armed state first, *then* let `_serial` drop (after this
             // body) so another `arm()` can never observe a half-torn-down
-            // state.
+            // state. Disarm the generation too, so any resolved action still
+            // in flight against this state is fenced by `fire_if_current`.
             ARMED.store(false, Ordering::SeqCst);
+            ARMED_GEN.store(0, Ordering::SeqCst);
             *STATE.write().unwrap_or_else(PoisonError::into_inner) = None;
             self.state.release_all_holds();
         }
@@ -878,16 +998,25 @@ mod controller {
         match state.resolve(point) {
             Resolved::Continue => {}
             Resolved::Kill => {
-                state.mark_fired();
-                panic!("harvest-chaos-kill: {}", point.name());
+                // A simulated task crash: panic with the chaos-kill marker the
+                // quiet panic hook recognizes — but only while this state's
+                // generation is still armed (`fire_if_current`), so a stale
+                // resolved Kill can never crash a later test.
+                assert!(
+                    !state.fire_if_current(),
+                    "harvest-chaos-kill: {}",
+                    point.name(),
+                );
             }
             Resolved::Hold(gate) => {
-                state.mark_fired();
-                gate.rendezvous().await;
+                if state.fire_if_current() {
+                    gate.rendezvous().await;
+                }
             }
             Resolved::Delay(ms) => {
-                state.mark_fired();
-                tokio::time::sleep(Duration::from_millis(ms)).await;
+                if state.fire_if_current() {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
             }
             // An infallible `chaos_point!` site cannot honor Error (needs a
             // `chaos_fallible!` site) or DropNotify (needs `chaos_drop_notify!`).
@@ -930,21 +1059,31 @@ mod controller {
         match state.resolve(point) {
             Resolved::Continue => Ok(()),
             Resolved::Kill => {
-                state.mark_fired();
-                panic!("harvest-chaos-kill: {}", point.name());
+                // A simulated task crash (see `hit`): fire only while armed.
+                assert!(
+                    !state.fire_if_current(),
+                    "harvest-chaos-kill: {}",
+                    point.name(),
+                );
+                Ok(())
             }
             Resolved::Hold(gate) => {
-                state.mark_fired();
-                gate.rendezvous().await;
+                if state.fire_if_current() {
+                    gate.rendezvous().await;
+                }
                 Ok(())
             }
             Resolved::Error(e) => {
-                state.mark_fired();
-                Err(e)
+                if state.fire_if_current() {
+                    Err(e)
+                } else {
+                    Ok(())
+                }
             }
             Resolved::Delay(ms) => {
-                state.mark_fired();
-                tokio::time::sleep(Duration::from_millis(ms)).await;
+                if state.fire_if_current() {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
                 Ok(())
             }
             // A `chaos_fallible!` site cannot honor DropNotify (needs a
@@ -975,10 +1114,10 @@ mod controller {
             return false;
         };
         match state.resolve(point) {
-            Resolved::DropNotify => {
-                state.mark_fired();
-                true
-            }
+            // `fire_if_current` returns `true` (drop the wake, counted) only
+            // while this state's generation is still armed; a stale state
+            // returns `false`, so no wake is dropped after disarm.
+            Resolved::DropNotify => state.fire_if_current(),
             Resolved::Continue => false,
             // A synchronous drop-notify site can only honor DropNotify; it cannot
             // await a Hold rendezvous, panic a Kill, sleep a Delay, or return an
@@ -1028,6 +1167,7 @@ mod controller {
         use super::*;
         use crate::chaos::points::{
             NOTIFY_TASK_ENQUEUED, POISON_RECLAIM_BEFORE_LOAD, QUEUE_PARK_BEFORE_UPDATE,
+            WORKER_PERSIST_BEFORE_COMMIT,
         };
 
         // ---- deterministic mixers (AC3) ------------------------------------
@@ -1146,6 +1286,7 @@ mod controller {
         fn scripted_kill_at_fires_on_the_nth_hit_only() {
             let state = ChaosState::from_plan(
                 ChaosPlan::scripted().kill_at_hit(QUEUE_PARK_BEFORE_UPDATE, 2),
+                1,
             );
             assert!(matches!(
                 state.resolve(QUEUE_PARK_BEFORE_UPDATE),
@@ -1174,6 +1315,7 @@ mod controller {
             let state = ChaosState::from_plan(
                 ChaosPlan::scripted()
                     .error_at(POISON_RECLAIM_BEFORE_LOAD, ChaosError::EventIdUnique),
+                1,
             );
             for _ in 0..3 {
                 assert!(matches!(
@@ -1226,17 +1368,101 @@ mod controller {
             }
         }
 
+        // ---- Fix 2 (Codex review round 1): scripted directives are validated
+        //      against the point's declared caps at plan-build time -----------
+
+        #[test]
+        #[should_panic(expected = "declared caps do not allow it")]
+        fn scripting_a_kill_at_a_drop_notify_only_point_panics() {
+            // NOTIFY_TASK_ENQUEUED declares only CAP_DROP_NOTIFY.
+            let _ = ChaosPlan::scripted().kill_at(NOTIFY_TASK_ENQUEUED);
+        }
+
+        #[test]
+        #[should_panic(expected = "declared caps do not allow it")]
+        fn scripting_a_drop_notify_at_a_kill_only_point_panics() {
+            // WORKER_PERSIST_BEFORE_COMMIT declares CAP_KILL | CAP_DELAY, no DROP_NOTIFY.
+            let _ = ChaosPlan::scripted().drop_notify_at(WORKER_PERSIST_BEFORE_COMMIT);
+        }
+
+        #[test]
+        #[should_panic(expected = "declared caps do not allow it")]
+        fn scripting_an_error_at_a_non_fallible_point_panics() {
+            // QUEUE_PARK_BEFORE_UPDATE declares no CAP_ERROR.
+            let _ = ChaosPlan::scripted().error_at(QUEUE_PARK_BEFORE_UPDATE, ChaosError::Generic);
+        }
+
+        #[test]
+        #[should_panic(expected = "declared caps do not allow it")]
+        fn scripting_a_hold_at_a_synchronous_drop_notify_point_panics() {
+            // A DROP_NOTIFY-only site is synchronous and cannot host a Hold await.
+            let _ = ChaosPlan::scripted().hold_at(NOTIFY_TASK_ENQUEUED);
+        }
+
+        #[test]
+        fn scripting_a_cap_compatible_directive_is_accepted() {
+            // Each directive matches its point's declared caps — none panics.
+            let _ = ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT);
+            let _ = ChaosPlan::scripted().delay_at(QUEUE_PARK_BEFORE_UPDATE, 3);
+            let _ = ChaosPlan::scripted().error_at(POISON_RECLAIM_BEFORE_LOAD, ChaosError::Generic);
+            let _ = ChaosPlan::scripted().drop_notify_at(NOTIFY_TASK_ENQUEUED);
+            // Hold needs an async-capable site (KILL/ERROR/DELAY); this point has KILL+DELAY.
+            let _ = ChaosPlan::scripted().hold_at(QUEUE_PARK_BEFORE_UPDATE);
+        }
+
+        // ---- Fix 1 (Codex review round 1): a resolved action is fenced by the
+        //      armed generation, so a stale state cannot fire into a later plan -
+
+        #[tokio::test]
+        async fn a_stale_state_is_fenced_after_its_plan_is_disarmed() {
+            // Capture a live state's Arc and resolve a directive while armed (as
+            // a slow spawned task would), then drop the guard and arm a *newer*
+            // plan. The stale state must refuse to fire and must not bump its
+            // anti-vacuity counter.
+            let stale: Arc<ChaosState> = {
+                let _guard = arm(ChaosPlan::scripted().drop_notify_at(NOTIFY_TASK_ENQUEUED)).await;
+                let s = current_state().expect("armed state present");
+                assert!(matches!(
+                    s.resolve(NOTIFY_TASK_ENQUEUED),
+                    Resolved::DropNotify
+                ));
+                s
+            }; // guard dropped -> this generation disarmed (ARMED_GEN -> 0)
+
+            // A newer plan is armed; the stale state's generation no longer
+            // matches ARMED_GEN, so its resolved action is fenced.
+            let newer = arm(ChaosPlan::scripted()).await;
+            assert!(
+                !stale.fire_if_current(),
+                "a stale state must not fire after its generation is disarmed",
+            );
+            assert_eq!(
+                stale.actions_fired.load(Ordering::Relaxed),
+                0,
+                "a fenced action must not inflate the anti-vacuity counter",
+            );
+            // The newer state, in contrast, is current and fires.
+            let current = current_state().expect("newer state present");
+            assert!(current.fire_if_current());
+            assert_eq!(current.actions_fired.load(Ordering::Relaxed), 1);
+            drop(newer);
+        }
+
         #[test]
         fn scripted_drop_notify_and_delay_resolve_expected() {
-            let s1 =
-                ChaosState::from_plan(ChaosPlan::scripted().drop_notify_at(NOTIFY_TASK_ENQUEUED));
+            let s1 = ChaosState::from_plan(
+                ChaosPlan::scripted().drop_notify_at(NOTIFY_TASK_ENQUEUED),
+                1,
+            );
             assert!(matches!(
                 s1.resolve(NOTIFY_TASK_ENQUEUED),
                 Resolved::DropNotify
             ));
 
-            let s2 =
-                ChaosState::from_plan(ChaosPlan::scripted().delay_at(QUEUE_PARK_BEFORE_UPDATE, 7));
+            let s2 = ChaosState::from_plan(
+                ChaosPlan::scripted().delay_at(QUEUE_PARK_BEFORE_UPDATE, 7),
+                1,
+            );
             assert!(matches!(
                 s2.resolve(QUEUE_PARK_BEFORE_UPDATE),
                 Resolved::Delay(7)
@@ -1245,7 +1471,7 @@ mod controller {
 
         #[test]
         fn unarmed_point_resolves_continue() {
-            let state = ChaosState::from_plan(ChaosPlan::scripted());
+            let state = ChaosState::from_plan(ChaosPlan::scripted(), 1);
             assert!(matches!(
                 state.resolve(NOTIFY_TASK_ENQUEUED),
                 Resolved::Continue
@@ -1275,7 +1501,7 @@ mod controller {
         #[test]
         fn describe_embeds_seed_and_fired_count() {
             let state =
-                ChaosState::from_plan(ChaosPlan::seeded(99).kill_at(QUEUE_PARK_BEFORE_UPDATE));
+                ChaosState::from_plan(ChaosPlan::seeded(99).kill_at(QUEUE_PARK_BEFORE_UPDATE), 1);
             let _ = state.resolve(QUEUE_PARK_BEFORE_UPDATE);
             let d = state.describe();
             assert!(d.contains("seed=Some(99)"), "describe: {d}");
