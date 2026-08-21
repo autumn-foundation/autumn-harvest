@@ -480,6 +480,19 @@ mod controller {
             self.directives.contains_key(point.name())
         }
 
+        /// Whether this plan arms a [`Kill`](Action::Kill) at `point`. Unlike
+        /// [`activates`](Self::activates), this ignores convergence-benign
+        /// actions (a `Delay`, or a `DropNotify`): the seeded convergence sweep
+        /// uses it so its non-vacuity guard demands a *disruptive* fault — a
+        /// pre-commit crash that actually strands an orphan — rather than being
+        /// satisfiable by a 5&nbsp;ms sleep that leaves the run healthy.
+        #[must_use]
+        pub fn kills_at(&self, point: ChaosPoint) -> bool {
+            self.directives
+                .get(point.name())
+                .is_some_and(|d| matches!(d.action, Action::Kill))
+        }
+
         /// Fire a [`Kill`](Action::Kill) on the first hit of `point`.
         #[must_use]
         pub fn kill_at(self, point: ChaosPoint) -> Self {
@@ -657,8 +670,8 @@ mod controller {
             // point (`hit`/`hit_fallible`/`should_drop_notify`) only when that
             // site can actually *honor* the resolved action — so a caps/site
             // mismatch (e.g. an `Error` scripted at an infallible `chaos_point!`
-            // site) is caught by a `debug_assert!` there and does not silently
-            // inflate the anti-vacuity counter.
+            // site) hard-`panic!`s there and does not silently inflate the
+            // anti-vacuity counter.
             match &directive.action {
                 Action::Kill => Resolved::Kill,
                 Action::Hold => self
@@ -673,6 +686,12 @@ mod controller {
 
         /// Record that a resolved directive was actually honored at its site
         /// (feeds the anti-vacuity `actions_fired` guard).
+        ///
+        /// `Relaxed` is sufficient: the counter is a per-plan monotonic tally
+        /// read only after the armed plan is dropped (the `SERIAL` mutex is
+        /// released, establishing a happens-before edge). No test observes it
+        /// concurrently with a firing to order it against other memory, so no
+        /// acquire/release fence is needed.
         fn mark_fired(&self) {
             self.actions_fired.fetch_add(1, Ordering::Relaxed);
         }
@@ -812,9 +831,15 @@ mod controller {
             self.state.seed
         }
 
-        /// A compact, deterministic description of the plan and what has fired —
-        /// embed it in a reproducer's assert message so a failure prints the
-        /// seed and hit trace for one-command local replay (issue #940 AC3).
+        /// A compact description of the plan and what has fired — embed it in a
+        /// reproducer's assert message so a failure prints the seed for
+        /// one-command local replay (issue #940 AC3).
+        ///
+        /// The *plan* (seed → directives) is fully deterministic and is what
+        /// makes a failure reproducible. The observed `hits`/`trace` reflect the
+        /// actual runtime hit *order*, which under concurrent workers can vary
+        /// run-to-run; they are a diagnostic of what happened this run, not a
+        /// replay key. Replay off the seed, not the trace.
         #[must_use]
         pub fn diagnostics(&self) -> String {
             self.state.describe()
@@ -866,11 +891,11 @@ mod controller {
             }
             // An infallible `chaos_point!` site cannot honor Error (needs a
             // `chaos_fallible!` site) or DropNotify (needs `chaos_drop_notify!`).
-            // Catch such a caps/site mismatch loudly instead of silently
-            // swallowing it and inflating the anti-vacuity counter.
+            // Panic loudly (in debug AND release test builds) instead of
+            // silently swallowing it and inflating the anti-vacuity counter —
+            // a mis-scripted directive is an author bug, not a fault to hide.
             other @ (Resolved::Error(_) | Resolved::DropNotify) => {
-                debug_assert!(
-                    false,
+                panic!(
                     "chaos: a {} directive is armed at `{}`, an infallible chaos_point!() site \
                      that cannot honor it — check the point's declared caps",
                     other.kind(),
@@ -923,16 +948,15 @@ mod controller {
                 Ok(())
             }
             // A `chaos_fallible!` site cannot honor DropNotify (needs a
-            // `chaos_drop_notify!` site) — catch the caps/site mismatch.
+            // `chaos_drop_notify!` site) — panic loudly on the caps/site
+            // mismatch rather than silently swallowing a mis-scripted directive.
             other @ Resolved::DropNotify => {
-                debug_assert!(
-                    false,
+                panic!(
                     "chaos: a {} directive is armed at `{}`, a fallible chaos_fallible!() site \
                      that cannot honor it — check the point's declared caps",
                     other.kind(),
                     point.name()
                 );
-                Ok(())
             }
         }
     }
@@ -958,17 +982,16 @@ mod controller {
             Resolved::Continue => false,
             // A synchronous drop-notify site can only honor DropNotify; it cannot
             // await a Hold rendezvous, panic a Kill, sleep a Delay, or return an
-            // Error. Catch the caps/site mismatch loudly (a scripted Hold here
-            // would otherwise hang the test's `reached().await` forever).
+            // Error. Panic loudly on the caps/site mismatch (a scripted Hold here
+            // would otherwise hang the test's `reached().await` forever), in
+            // release test builds too — not just under `debug_assertions`.
             other => {
-                debug_assert!(
-                    false,
+                panic!(
                     "chaos: a {} directive is armed at `{}`, a synchronous chaos_drop_notify!() \
                      site that can only honor DropNotify — check the point's declared caps",
                     other.kind(),
                     point.name()
                 );
-                false
             }
         }
     }

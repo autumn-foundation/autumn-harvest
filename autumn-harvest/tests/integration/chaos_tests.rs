@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use autumn_harvest::chaos::points::{
     ChaosPoint, OUTBOX_INLINE_AFTER_REQUESTED, QUEUE_PARK_BEFORE_UPDATE, SCHED_AFTER_CLAIM,
-    WORKER_AFTER_OUTER_COMMIT, WORKER_PERSIST_BEFORE_COMMIT,
+    WORKER_PERSIST_BEFORE_COMMIT,
 };
 use autumn_harvest::chaos::{ChaosPlan, arm};
 use autumn_harvest::prelude::*;
@@ -421,11 +421,16 @@ async fn chaos_repro_601_lost_wake_is_recovered_via_wake_requested() {
         guard.diagnostics()
     );
 
-    // Convergence: after the caller acts on had_wake_requested (re-pend), the
-    // task is claimable again — not stranded parked.
-    autumn_harvest::queue::wake_workflow_task(&mut conn, exec_id)
-        .await
-        .expect("re-pend after wake_requested");
+    // Convergence: the caller re-pends *because* `had_wake_requested` came back
+    // true — faithfully modelling the worker's park path, which ORs the returned
+    // flag into its re-wake decision rather than re-pending unconditionally. On
+    // the pre-fix shape the flag would be false and this branch would be skipped,
+    // leaving the task stranded parked (the RED shape).
+    if had_wake_requested {
+        autumn_harvest::queue::wake_workflow_task(&mut conn, exec_id)
+            .await
+            .expect("re-pend after wake_requested");
+    }
     let (state, worker) = task_state(&mut conn, task.id).await;
     assert_eq!(
         state,
@@ -447,11 +452,13 @@ async fn chaos_repro_601_lost_wake_is_recovered_via_wake_requested() {
 /// recover it: increment `crash_strikes` and re-queue it `PENDING` (under the
 /// threshold). This exercises the KILL capability (AC1(a)) and the #367 fix.
 ///
-/// RED procedure (test-side, unlike the other three's production-shape reverts):
-/// comment out the `reclaim_orphaned_tasks` call below *and its two `summary`
-/// asserts* — the orphan then stays `RUNNING` with a dead worker forever (the
-/// pre-#367 shape), and the `PENDING` assertion fails. Reverting the production
-/// reclaimer to a no-op would be a more faithful, symmetric alternative.
+/// RED procedure (production-shape revert, symmetric with the other three):
+/// short-circuit `poison_pill::reclaim_orphaned_tasks` to an early
+/// `return Ok(ReclaimSummary::default())` (the pre-#367 shape, before the
+/// reclaimer existed). The KILL-orphaned task then stays `RUNNING` with a dead
+/// worker forever and the `PENDING` convergence assertion fails. (Equivalently,
+/// test-side: comment out the `reclaim_orphaned_tasks` call below *and its two
+/// `summary` asserts* — same failing shape, no production edit.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chaos_repro_367_crash_orphan_is_reclaimed() {
     let (url, _c) = chaos_db().await;
@@ -845,6 +852,15 @@ async fn chaos_repro_350_crashed_fire_claim_is_refired_exactly_once() {
 /// reason — isolating the lease-expiry path from the (higher-priority)
 /// dead-host / draining / terminal-workflow reasons.
 ///
+/// By design this lease-expiry surface is exercised *without* the point-injection
+/// framework (`chaos::points` / `arm` / `ChaosPlan`): "expire a lease early" is a
+/// durable DB-column edit (`expires_at` into the past), not a mid-execution
+/// interception, so a direct row `UPDATE` is the faithful, deterministic way to
+/// model it — the same approach the schedule-fire-claim reproducer takes for its
+/// `fire_claimed_until` lease. The injection framework covers the `KILL` /
+/// `ERROR` / `DROP_NOTIFY` / `DELAY` surfaces (AC1 a–c); the lease surfaces
+/// (AC1 d) are modelled by expiring the durable lease column directly.
+///
 /// RED procedure: revert the `s.expires_at < NOW()` disjunct in
 /// `sessions::broken_session_candidates_query()` (or `lease_expired` in
 /// `resolve_broken_reason`) and the session stays `ACTIVE` — the assert fails.
@@ -950,39 +966,44 @@ struct SessionStateRow {
 
 // ── AC5 — seeded convergence sweep ───────────────────────────────────────────
 
-/// The catalogue points the sweep's workload actually reaches. The workload
-/// drives single-cycle `chaos_noop` workflows, so it exercises the worker
-/// decision-cycle persist path: `WORKER_PERSIST_BEFORE_COMMIT` (hit before every
-/// commit) and `WORKER_AFTER_OUTER_COMMIT` (hit after every commit). Both carry
-/// KILL|DELAY caps — a KILL here orphans the persist (the #367 recovery path the
-/// convergence invariant exercises), a DELAY perturbs its timing. The other five
-/// catalogue points are each covered precisely by a dedicated reproducer above;
-/// a parking/external-signal/scheduler workload cannot be folded into this sweep
-/// because a seeded plan never selects `Hold` and delivers no signals, so a
-/// parked workflow would never reach `COMPLETED`.
-const WORKLOAD_REACHABLE: &[ChaosPoint] =
-    &[WORKER_PERSIST_BEFORE_COMMIT, WORKER_AFTER_OUTER_COMMIT];
+/// The point whose KILL actually *strands an orphan* the recovery loop must
+/// clean up. The sweep drives single-cycle `chaos_noop` workflows, so both
+/// worker persist points are hit — but only a KILL at
+/// `WORKER_PERSIST_BEFORE_COMMIT` (before the decision-cycle commit, while the
+/// claim's `state='RUNNING'` is already durable) leaves a `RUNNING` row with a
+/// dead worker: exactly the #367 recovery path the convergence invariant
+/// exercises. A KILL at `WORKER_AFTER_OUTER_COMMIT` is post-commit (the
+/// execution is already `COMPLETED`), and a `Delay` merely perturbs timing —
+/// both are *convergence-benign* and would let the sweep assert convergence for
+/// an effectively un-faulted run. So the non-vacuity predicate demands this
+/// disruptive fault specifically, not just "any activation" (issue #940, review
+/// P2-1). The other five catalogue points are each covered precisely by a
+/// dedicated reproducer above; a parking/external-signal/scheduler workload
+/// cannot be folded into this sweep because a seeded plan never selects `Hold`
+/// and delivers no signals, so a parked workflow would never reach `COMPLETED`.
+const WORKLOAD_ORPHAN_POINT: ChaosPoint = WORKER_PERSIST_BEFORE_COMMIT;
 
 /// How many default seeds to run (AC5 requires N ≥ 5).
 const DEFAULT_SWEEP_SEED_COUNT: usize = 7;
 
-/// A seed is non-vacuous for this sweep iff its seeded plan arms a directive at a
-/// workload-reachable point. Seeded triggers are always `OnHit(1..=3)` and the
-/// workload produces ≥ 4 hits on each reachable point, so any such activation is
-/// guaranteed to fire — making this a sound predicate for the anti-vacuity
-/// contract asserted per seed in the sweep.
-fn seed_drives_a_fault(seed: u64) -> bool {
-    let plan = ChaosPlan::seeded(seed);
-    WORKLOAD_REACHABLE.iter().any(|&p| plan.activates(p))
+/// A seed is non-vacuous for this sweep iff its seeded plan arms a **KILL** at
+/// [`WORKLOAD_ORPHAN_POINT`] — a disruptive pre-commit crash, not a
+/// convergence-benign `Delay` or a post-commit kill. Seeded triggers are always
+/// `OnHit(1..=3)` and the 6-workflow workload produces one hit on that point per
+/// drive (≥ 6 hits total), so the armed KILL is guaranteed to fire exactly once
+/// and strand exactly one orphan — making this a sound, guaranteed predicate for
+/// the pre-recovery orphan assertion in the sweep.
+fn seed_strands_an_orphan(seed: u64) -> bool {
+    ChaosPlan::seeded(seed).kills_at(WORKLOAD_ORPHAN_POINT)
 }
 
-/// The seed set for the sweep. Every seed — default or override — must drive at
-/// least one honored fault against the workload; the sweep asserts this per seed
-/// so a vacuous seed fails loudly rather than passing convergence for a healthy
-/// run.
+/// The seed set for the sweep. Every default seed strands an orphan against the
+/// workload; the sweep asserts a real orphan exists pre-recovery (and that a
+/// fault fired) per seed, so a convergence-benign seed fails loudly rather than
+/// passing convergence for a healthy run.
 ///
 /// - **Default (the CI path):** the first [`DEFAULT_SWEEP_SEED_COUNT`] seeds
-///   (from 1 upward) that [`seed_drives_a_fault`] against the workload —
+///   (from 1 upward) that [`seed_strands_an_orphan`] against the workload —
 ///   **computed**, not hardcoded, so it is non-vacuous *by construction* (no
 ///   magic numbers that could silently go vacuous if the seeded logic or the
 ///   catalogue changes) and ≥ 5 by construction (AC5). Fully deterministic and
@@ -1020,18 +1041,19 @@ fn env_override_seeds() -> Option<Vec<u64>> {
 /// non-vacuous seeds from 1 upward.
 fn default_sweep_seeds() -> Vec<u64> {
     (1u64..)
-        .filter(|&s| seed_drives_a_fault(s))
+        .filter(|&s| seed_strands_an_orphan(s))
         .take(DEFAULT_SWEEP_SEED_COUNT)
         .collect()
 }
 
 /// AC5 (default path) is guaranteed *by construction*, not by a magic list: the
-/// computed default is at least 5 distinct seeds, and each drives a fault against
-/// the sweep's workload (so the per-seed anti-vacuity assert in
-/// [`chaos_seeded_convergence_sweep`] can never fail for the default set). No DB
-/// needed — this is a pure property of the deterministic seeded logic.
+/// computed default is at least 5 distinct seeds, and each strands an orphan
+/// against the sweep's workload (so the per-seed pre-recovery orphan assert in
+/// [`chaos_seeded_convergence_sweep`] can never fail vacuously for the default
+/// set). No DB needed — this is a pure property of the deterministic seeded
+/// logic.
 #[test]
-fn default_sweep_seeds_are_at_least_five_and_non_vacuous() {
+fn default_sweep_seeds_are_at_least_five_and_strand_an_orphan() {
     let seeds = default_sweep_seeds();
     assert!(
         seeds.len() >= 5,
@@ -1046,8 +1068,8 @@ fn default_sweep_seeds_are_at_least_five_and_non_vacuous() {
     );
     for &s in &seeds {
         assert!(
-            seed_drives_a_fault(s),
-            "default seed {s} is vacuous against the workload",
+            seed_strands_an_orphan(s),
+            "default seed {s} is convergence-benign against the workload (no pre-commit KILL)",
         );
     }
 }
@@ -1065,6 +1087,13 @@ async fn chaos_seeded_convergence_sweep() {
     let registry = Arc::new(HandlerRegistry::new(vec![chaos_noop_info()], vec![]));
 
     for seed in sweep_seeds() {
+        // Whether this seed is *guaranteed* to strand a pre-commit orphan (true
+        // for every computed default seed; possibly false for an arbitrary
+        // operator override). When true we additionally assert an orphan really
+        // existed pre-recovery — the direct proof that the recovery loop had
+        // real work, not just that a directive fired (review P2-1).
+        let expects_orphan = seed_strands_an_orphan(seed);
+
         // Fresh DB slate per seed so the invariant probe is unambiguous.
         {
             let mut conn = connect(&url).await;
@@ -1130,6 +1159,23 @@ async fn chaos_seeded_convergence_sweep() {
              convergence invariant would pass vacuously; {diag}"
         );
 
+        // Stronger, direct anti-vacuity for an orphan-stranding seed: a
+        // pre-commit KILL must have left a `RUNNING` row owned by a
+        // never-registered (dead) worker *before* the recovery loop runs. This
+        // proves the recovery loop below has real work — not just that some
+        // (possibly convergence-benign) directive fired — so the final
+        // `stranded == 0` post-recovery assert genuinely exercises reclaim.
+        if expects_orphan {
+            let mut conn = connect(&url).await;
+            let stranded_pre = stranded_running_with_dead_worker(&mut conn).await;
+            assert!(
+                stranded_pre >= 1,
+                "seed {seed}: an orphan-stranding seed must leave >= 1 task RUNNING with a dead \
+                 worker before recovery, but found {stranded_pre} — the recovery loop would have \
+                 nothing to reclaim and convergence would pass vacuously; {diag}"
+            );
+        }
+
         // Recovery loop (chaos disarmed): reclaim crash orphans and re-drive any
         // remaining claimable tasks until quiescent.
         for _round in 0..(WORKLOAD + 4) {
@@ -1159,25 +1205,32 @@ async fn chaos_seeded_convergence_sweep() {
         }
 
         // Convergence invariant.
-        let mut conn = connect(&url).await;
-        for exec_id in &execs {
-            let state = exec_state(&mut conn, *exec_id).await;
-            assert_eq!(
-                state, "COMPLETED",
-                "seed {seed}: workflow {exec_id:?} must converge to terminal; got {state}; {diag}"
-            );
-        }
-        let stranded = stranded_running_with_dead_worker(&mut conn).await;
+        assert_converged(&url, seed, &execs, &diag).await;
+    }
+}
+
+/// Assert the post-recovery convergence invariant for one sweep seed: every
+/// workflow terminal (`COMPLETED`), no task stranded `RUNNING` with a dead
+/// worker, and no `ExternalSignalRequested` without an eventual terminal.
+async fn assert_converged(url: &str, seed: u64, execs: &[ExecutionId], diag: &str) {
+    let mut conn = connect(url).await;
+    for exec_id in execs {
+        let state = exec_state(&mut conn, *exec_id).await;
         assert_eq!(
-            stranded, 0,
-            "seed {seed}: no task may be stranded RUNNING with a dead worker; {diag}"
-        );
-        let dangling = dangling_external_requests(&mut conn).await;
-        assert_eq!(
-            dangling, 0,
-            "seed {seed}: no ExternalSignalRequested without a terminal; {diag}"
+            state, "COMPLETED",
+            "seed {seed}: workflow {exec_id:?} must converge to terminal; got {state}; {diag}"
         );
     }
+    let stranded = stranded_running_with_dead_worker(&mut conn).await;
+    assert_eq!(
+        stranded, 0,
+        "seed {seed}: no task may be stranded RUNNING with a dead worker; {diag}"
+    );
+    let dangling = dangling_external_requests(&mut conn).await;
+    assert_eq!(
+        dangling, 0,
+        "seed {seed}: no ExternalSignalRequested without a terminal; {diag}"
+    );
 }
 
 /// Count `RUNNING` tasks whose `worker_id` has no live `harvest_workers`

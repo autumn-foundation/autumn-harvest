@@ -161,33 +161,43 @@ container per test (the CI path).
 - **no** task is stranded `RUNNING` with a dead worker;
 - **no** `ExternalSignalRequested` event lacks an eventual terminal.
 
-**Workload → reachable points.** The sweep drives single-cycle `chaos_noop`
-workflows, so it exercises the worker decision-cycle *persist* path:
-`worker.persist.before_commit` (a KILL here orphans the persist — the #367
-recovery path the invariant checks — a DELAY perturbs its timing) and
-`worker.persist.after_outer_commit`. The other five catalogue points are each
-covered precisely by their own dedicated reproducer above; a parking /
-external-signal / scheduler workload can't be folded into this one sweep because
-a *seeded* plan never selects `Hold` and delivers no signals, so a parked
-workflow would never reach `COMPLETED`.
+**Workload → the disruptive point.** The sweep drives single-cycle `chaos_noop`
+workflows, so it exercises the worker decision-cycle *persist* path. Only a KILL
+at `worker.persist.before_commit` actually *strands an orphan* the recovery loop
+must clean up: it crashes the cycle *before* the commit, while the claim's
+`state = 'RUNNING'` is already durable, so it leaves a `RUNNING` row owned by a
+never-registered (dead) worker — exactly the #367 recovery path the invariant
+checks. A KILL at `worker.persist.after_outer_commit` is post-commit (the
+execution is already `COMPLETED`) and a `Delay` merely perturbs timing — both are
+*convergence-benign*. The other five catalogue points are each covered precisely
+by their own dedicated reproducer above; a parking / external-signal / scheduler
+workload can't be folded into this one sweep because a *seeded* plan never
+selects `Hold` and delivers no signals, so a parked workflow would never reach
+`COMPLETED`.
 
-**Computed, non-vacuous default seed set.** The default set is **computed**, not
-a hardcoded list: it is the first *N* (currently 7, ≥ 5 for AC5) seeds from 1
-upward whose seeded plan arms a fault at a workload-reachable point
-(`default_sweep_seeds()`). This keeps the default non-vacuous *by construction* —
-no magic numbers that could silently go vacuous if the seeded logic or the
-catalogue changes — while staying fully deterministic. A no-DB unit test
-(`default_sweep_seeds_are_at_least_five_and_non_vacuous`) pins the ≥ 5 /
-distinct / non-vacuous properties. (With today's catalogue the computed set is
-`[3, 5, 6, 8, 11, 13, 14]`.)
+**Computed, orphan-stranding default seed set.** The default set is **computed**,
+not a hardcoded list: it is the first *N* (currently 7, ≥ 5 for AC5) seeds from 1
+upward whose seeded plan arms a **KILL** at `worker.persist.before_commit`
+(`default_sweep_seeds()` / `seed_strands_an_orphan()`). Requiring a *disruptive*
+pre-commit crash — not merely "any activation at a reachable point," which a
+convergence-benign `Delay` or a post-commit kill would satisfy — keeps the default
+non-vacuous *by construction* (review P2-1), while staying fully deterministic. A
+no-DB unit test (`default_sweep_seeds_are_at_least_five_and_strand_an_orphan`)
+pins the ≥ 5 / distinct / orphan-stranding properties. (With today's catalogue
+and seeded logic the computed set is `[8, 13, 14, 15, 20, 25, 33]`.)
 
-**Anti-vacuity.** The sweep additionally asserts, per seed, that at least one
-honored fault actually fired (`guard.actions_fired() >= 1`). `ChaosPlan::seeded`
-is a pure function of the seed, so this is deterministic — a seed that injects
-zero faults would let the convergence invariant pass for a healthy, un-faulted
-run ("passes for the wrong reason"). A vacuous seed therefore fails loudly,
-naming itself for replay, rather than passing silently. A hand-picked
-`CHAOS_SEEDS` override must likewise drive a fault per seed.
+**Anti-vacuity (two layers).** Per seed the sweep asserts (1) at least one honored
+fault fired (`guard.actions_fired() >= 1`), and (2) for an orphan-stranding seed —
+every default seed, and any override that strands one — that a task really was left
+`RUNNING` with a dead worker **before** the recovery loop ran. Layer (2) is the
+direct proof: it shows the recovery loop had real work to reclaim (which the final
+post-recovery `stranded == 0` assert then exercises), not just that some
+possibly-benign directive fired. `ChaosPlan::seeded` is a pure function of the seed,
+so both are deterministic — a vacuous seed fails loudly, naming itself for replay,
+rather than passing convergence for a healthy, un-faulted run. A hand-picked
+`CHAOS_SEEDS` override still must fire a fault (layer 1); it is additionally held to
+the orphan proof (layer 2) only when it happens to arm the disruptive KILL, so
+single-seed replay of any operator-chosen seed (AC3) is never blocked.
 
 The CI job (`.github/workflows/chaos.yml`) runs the suite on `workflow_dispatch`
 and on a nightly `cron`. The cron leaves `CHAOS_SEEDS` empty so the sweep uses
