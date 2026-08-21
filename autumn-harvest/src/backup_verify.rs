@@ -2822,6 +2822,9 @@ mod tests {
     }
 
     #[test]
+    // `tokio-postgres` (the guard's parser) is a `db`-feature dependency, so
+    // the guard itself only exists in a `db` build.
+    #[cfg(feature = "db")]
     fn dsn_guard_matches_on_host_port_database_only() {
         // Same database reached with a different user/password is STILL the
         // same database — that is the mistake the guard exists to catch.
@@ -2847,6 +2850,9 @@ mod tests {
     }
 
     #[test]
+    // `tokio-postgres` (the guard's parser) is a `db`-feature dependency, so
+    // the guard itself only exists in a `db` build.
+    #[cfg(feature = "db")]
     fn dsn_guard_distinguishes_a_genuine_scratch_target() {
         assert!(!dsn_targets_same_database(
             "postgres://db.prod:5432/harvest_scratch",
@@ -2863,6 +2869,9 @@ mod tests {
     }
 
     #[test]
+    // `tokio-postgres` (the guard's parser) is a `db`-feature dependency, so
+    // the guard itself only exists in a `db` build.
+    #[cfg(feature = "db")]
     fn dsn_guard_fails_closed_on_an_unreadable_dsn() {
         // A guard that cannot parse the DSN must refuse, not wave through.
         assert!(dsn_targets_same_database(
