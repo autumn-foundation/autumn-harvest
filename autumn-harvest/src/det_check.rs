@@ -1224,7 +1224,7 @@ fn is_ident_preceded_by_fn(bytes: &[u8], start: usize) -> bool {
 /// returns the byte index just past the matching balanced `>` (accounting for
 /// nested generics like `::<Vec<u8>>`), or `None` if unbalanced. Used to skip an
 /// optional turbofish between an ident and its call `(` (#778, Codex P2).
-fn skip_balanced_angles(bytes: &[u8], open_lt: usize) -> Option<usize> {
+const fn skip_balanced_angles(bytes: &[u8], open_lt: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut k = open_lt;
     while k < bytes.len() {
@@ -1359,7 +1359,7 @@ fn collect_body_let_binding_lines(
 /// is the point at which the binding enters scope, so a same-line call before it
 /// (the `let`'s own RHS, incl. a self-referencing `let x = x();`) is not
 /// suppressed, while a same-line call after it is.
-fn let_stmt_terminator_col(code: &str, let_pos: usize) -> usize {
+const fn let_stmt_terminator_col(code: &str, let_pos: usize) -> usize {
     let bytes = code.as_bytes();
     let mut depth: i32 = 0;
     let mut k = let_pos;
@@ -2090,7 +2090,7 @@ fn extract_qualified_path(code: &str, name_start: usize, name_end: usize) -> Opt
 /// Recognized shapes (all → `true`):
 /// `name(`, `name (`, `name::<T>(`, `name::<_, _> (`, `name::<Vec<Box<T>>>(`.
 /// Anything else after the name (`.`, `::foo`, `,`, end of segment) → `false`.
-fn call_paren_follows(bytes: &[u8], after_name: usize) -> bool {
+const fn call_paren_follows(bytes: &[u8], after_name: usize) -> bool {
     let mut i = after_name;
     // Optional whitespace before an (optional) turbofish.
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
@@ -2627,7 +2627,7 @@ fn det010_loop_body_has_command(
 /// comment, scanning from `start` (the position right after the opening `/*`).
 /// Returns `line.len()` if the comment is not closed on this line.
 /// Nested block comments are not supported.
-fn block_comment_end(line: &str, start: usize) -> usize {
+const fn block_comment_end(line: &str, start: usize) -> usize {
     let bytes = line.as_bytes();
     let mut pos = start;
     while pos < bytes.len() {

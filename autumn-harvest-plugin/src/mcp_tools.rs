@@ -974,6 +974,7 @@ fn method_for(method: &str) -> axum::http::Method {
 /// verify it belongs to `workflow`. A mismatching handle returns the same 404
 /// an unknown handle does, so one workflow's tools cannot be used as an
 /// existence oracle for another's executions.
+#[allow(clippy::result_large_err)]
 async fn load_owned_execution(
     api_state: &crate::api::HarvestApiState,
     workflow: &str,
@@ -1130,6 +1131,7 @@ async fn status_tool(
 /// (`FAILED` or `CONTINUED_AS_NEW`) row; returns `execution` unchanged
 /// otherwise, avoiding a redundant reload for the common terminal/running
 /// case (`load_owned_execution` already loaded it once).
+#[allow(clippy::result_large_err)]
 async fn resolve_if_chained(
     api_state: &crate::api::HarvestApiState,
     execution: autumn_harvest::models::WorkflowExecution,

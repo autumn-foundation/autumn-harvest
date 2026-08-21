@@ -7819,6 +7819,7 @@ fn parse_schedule_bulk_filters(params: &ScheduleBulkParams) -> ScheduleUiFilters
 
 /// Find a schedule by id across all shards. Returns the row, the shard it lives
 /// on, and a conn to that shard on success.
+#[allow(clippy::result_large_err)]
 async fn find_schedule_row(
     api_state: &HarvestApiState,
     id_str: &str,

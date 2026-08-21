@@ -2356,7 +2356,7 @@ pub async fn enforce_external_signals_outbox(
 
                 let age = Utc::now() - row.timestamp;
                 let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
-                    .map_or(chrono::Duration::MAX, |d| d);
+                    .unwrap_or(chrono::Duration::MAX);
                 let grace_expired = age > grace_chrono;
 
                 // A NotFound delivery attempt only becomes a permanent
@@ -2713,7 +2713,7 @@ pub async fn enforce_external_cancels_outbox(
 
                 let age = Utc::now() - row.timestamp;
                 let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
-                    .map_or(chrono::Duration::MAX, |d| d);
+                    .unwrap_or(chrono::Duration::MAX);
                 let grace_expired = age > grace_chrono;
 
                 // A NotFound delivery attempt only becomes a permanent
@@ -3105,7 +3105,7 @@ pub async fn enforce_external_awaits_outbox(
 
                 let age = Utc::now() - row.timestamp;
                 let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
-                    .map_or(chrono::Duration::MAX, |d| d);
+                    .unwrap_or(chrono::Duration::MAX);
                 let grace_expired = age > grace_chrono;
 
                 let active_sharded_pool = sharded_pool

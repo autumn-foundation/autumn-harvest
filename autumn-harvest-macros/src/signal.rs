@@ -172,24 +172,33 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let method_defs = quote! {
         /// Send a type-safe signal to this workflow execution.
+        ///
+        /// The handle names the *logical* run, so the signal is routed to the
+        /// live attempt of the workflow-level retry chain (issue #843).
         pub async fn #method_name(
             conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
             handle: &::autumn_harvest::WorkflowHandle,
             #(#params),*
         ) -> ::autumn_harvest::HarvestResult<()> {
             #cap_check
-            ::autumn_harvest::signal::send_signal(
+            ::autumn_harvest::signal::send_signal_to_live_attempt(
                 conn,
                 handle.exec_id(),
                 #fn_name_str,
                 payload,
+                None,
             )
             .await
+            .map(|_| ())
         }
 
         /// Send a type-safe signal with an opt-in exactly-once delivery key.
         ///
         /// Returns `true` when freshly queued, `false` when the key deduped.
+        ///
+        /// Routed to the live retry attempt (issue #843); the exactly-once key
+        /// keeps its `(execution_id, idempotency_key)` scope against whichever
+        /// attempt the signal lands on.
         pub async fn #idem_method_name(
             conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
             handle: &::autumn_harvest::WorkflowHandle,
@@ -198,7 +207,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         ) -> ::autumn_harvest::HarvestResult<bool> {
             #cap_check
             let __idem_key = __autumn_idempotency_key.into();
-            ::autumn_harvest::signal::send_signal_idempotent(
+            ::autumn_harvest::signal::send_signal_to_live_attempt(
                 conn,
                 handle.exec_id(),
                 #fn_name_str,
@@ -206,6 +215,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __idem_key.as_deref(),
             )
             .await
+            .map(|__d| __d.delivered)
         }
     };
 
