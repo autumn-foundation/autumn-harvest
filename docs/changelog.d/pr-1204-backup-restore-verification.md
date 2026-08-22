@@ -370,3 +370,44 @@ asserting the error names the offending id) paired with the boundary control
 `the_largest_encodable_shard_id_is_accepted` (`65534` still parses), so the
 guard rejects only what genuinely cannot round-trip. RED confirmed before the
 fix: the rejection test failed at `65535` while the control already passed.
+
+**Post-review hardening, round 7** (two of four Codex findings fixed here; the
+other two filed as #1205, see below):
+
+1. **A numeric `host` bypassed the production-DSN guard.** `parse_dsn_identity`
+   put every `Host::Tcp` value in the hostname set, so candidate
+   `postgres://u@10.0.0.5/harvest` and live
+   `postgres://u@prod-alias/harvest?hostaddr=10.0.0.5` — the same TCP
+   destination and database — overlapped in neither the hostname set nor the
+   address set, and the guard permitted a verification run against production
+   without the acknowledgement flag. A numeric host *is* an address: comparing
+   it needs no DNS, so it now parses with `IpAddr::from_str` and joins the
+   address set. That also normalises IPv6 spellings on both sides (`[0:0:…:1]`
+   vs `::1`), since `get_hostaddrs()` already yields `IpAddr`. This is **not**
+   the limitation the function documents — that one is a `host` *name* against a
+   bare `hostaddr`, which genuinely requires resolving DNS and is still refused
+   by design. The change only ever produces *more* matches, which the guard's own
+   doc names as the safe direction, and the `hosts.is_empty() &&
+   hostaddrs.is_empty() → None` fail-closed path is unchanged.
+2. **The embedder recipe called `exit_code` on the wrong receiver.** Round 5
+   fixed the missing feature stanza but left `report.status.exit_code()`;
+   `exit_code` is implemented on `RestoreVerifyReport`, not `VerifyStatus`, so
+   the snippet still did not compile. Now `report.exit_code()`.
+
+Test: `dsn_guard_matches_a_numeric_host_against_a_hostaddr` covers both
+directions (numeric candidate vs pinned live, and the reverse), the IPv6
+normalisation, and a numeric-vs-numeric regression — paired with the control
+that a *different* address (`10.0.0.6` vs `10.0.0.5`) is still correctly treated
+as a genuine scratch target, so the widening does not simply match everything.
+RED confirmed before the fix on the first assertion; all 7 pre-existing
+`dsn_guard_*` tests still pass.
+
+The remaining two findings — retention being indistinguishable from a
+pre-creation rollback when a cross-shard target row is absent (P1), and
+`Finding::new` reporting `truncated: false` while clipping the sample list (P2)
+— are filed as **#1205** rather than fixed here, since this round is past the
+review-round budget agreed for this PR. Both were verified against source before
+filing. The two fixed above were treated as deliberate, narrow exceptions: a
+guard that stops a drill running against a live database is a hard constraint
+rather than a review-iteration preference, and the runbook snippet was a factual
+error in something round 5 had claimed to verify.

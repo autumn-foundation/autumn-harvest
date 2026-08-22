@@ -325,7 +325,7 @@ let replayer = WorkflowReplayer::new()
 
 let targets = vec![ShardTarget::new(0, std::env::var("SCRATCH_DSN")?)];
 let report = verify_restore(&targets, &VerifyOptions::default(), &replayer).await;
-std::process::exit(report.status.exit_code());
+std::process::exit(report.exit_code());
 ```
 
 A workflow type with no registered handler is still skipped, never called a

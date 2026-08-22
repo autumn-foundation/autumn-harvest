@@ -873,30 +873,48 @@ struct DsnIdentity {
 /// hostname *text* as well, and `host=scratch-alias&hostaddr=<prod-ip>` would
 /// slip past a live `host=prod-alias&hostaddr=<prod-ip>`.
 ///
-/// Known limit: when one side pins only `hostaddr` and the other only `host`,
-/// no comparison is possible without resolving DNS -- which this guard
-/// deliberately does not do (a name can resolve differently between the check
-/// and the connect). Spell both DSNs the same way, or pass the acknowledgement.
+/// A NUMERIC `host` is folded into the address set: it IS an address, so it
+/// compares against the other side's `hostaddr` with no DNS involved.
+///
+/// Known limit: when one side pins only `hostaddr` and the other only a
+/// `host` NAME, no comparison is possible without resolving DNS -- which this
+/// guard deliberately does not do (a name can resolve differently between the
+/// check and the connect). Spell both DSNs the same way, or pass the
+/// acknowledgement.
 #[cfg(feature = "db")]
 fn parse_dsn_identity(dsn: &str) -> Option<DsnIdentity> {
     use std::str::FromStr as _;
 
     let config = tokio_postgres::Config::from_str(dsn.trim()).ok()?;
 
-    let mut hosts: Vec<String> = config
-        .get_hosts()
-        .iter()
-        .map(|h| match h {
-            tokio_postgres::config::Host::Tcp(name) => name.to_ascii_lowercase(),
-            #[cfg(unix)]
-            tokio_postgres::config::Host::Unix(path) => path.to_string_lossy().to_lowercase(),
-        })
-        .collect();
     let mut hostaddrs: Vec<String> = config
         .get_hostaddrs()
         .iter()
         .map(ToString::to_string)
         .collect();
+    // A NUMERIC `host` is already an address -- comparing it needs no DNS, so
+    // it belongs in the address set, not the hostname set. Leaving it in
+    // `hosts` meant `host=10.0.0.5` and `host=prod-alias&hostaddr=10.0.0.5`
+    // -- the same TCP destination -- overlapped in neither set and the guard
+    // waved a production target through. Parsing also normalises IPv6
+    // spellings (`[0:0:...:1]` and `::1`) on both sides, since `get_hostaddrs`
+    // yields `IpAddr` and we render it the same way.
+    let mut hosts: Vec<String> = Vec::new();
+    for h in config.get_hosts() {
+        match h {
+            tokio_postgres::config::Host::Tcp(name) => {
+                if let Ok(addr) = std::net::IpAddr::from_str(name) {
+                    hostaddrs.push(addr.to_string());
+                } else {
+                    hosts.push(name.to_ascii_lowercase());
+                }
+            }
+            #[cfg(unix)]
+            tokio_postgres::config::Host::Unix(path) => {
+                hosts.push(path.to_string_lossy().to_lowercase());
+            }
+        }
+    }
     if hosts.is_empty() && hostaddrs.is_empty() {
         return None;
     }
@@ -2828,6 +2846,50 @@ mod tests {
         assert!(!dsn_targets_same_database(
             "postgres://u@a/harvest?hostaddr=10.0.0.6",
             "postgres://u@b/harvest?hostaddr=10.0.0.5",
+        ));
+    }
+
+    /// Codex round 7, P2. A NUMERIC `host` is an address, not a name: it needs
+    /// no DNS to compare against the other side's `hostaddr`. Keeping it in the
+    /// hostname set meant `host=10.0.0.5` and `host=prod-alias&hostaddr=10.0.0.5`
+    /// -- the same TCP destination -- overlapped in neither set, so the guard
+    /// waved a production target through.
+    ///
+    /// This is NOT the documented name-vs-address limit: that one genuinely
+    /// requires resolving a name, which the guard deliberately will not do.
+    #[test]
+    #[cfg(feature = "db")]
+    fn dsn_guard_matches_a_numeric_host_against_a_hostaddr() {
+        assert!(
+            dsn_targets_same_database(
+                "postgres://u@10.0.0.5/harvest",
+                "postgres://u@prod-alias/harvest?hostaddr=10.0.0.5",
+            ),
+            "a numeric host IS the address the other side pins"
+        );
+        // Symmetric: the pinned side may be the candidate.
+        assert!(dsn_targets_same_database(
+            "postgres://u@scratch-alias/harvest?hostaddr=10.0.0.5",
+            "postgres://u@10.0.0.5/harvest",
+        ));
+        // IPv6 spellings of one address must not be compared as raw text.
+        assert!(
+            dsn_targets_same_database(
+                "postgres://u@[0:0:0:0:0:0:0:1]/harvest",
+                "postgres://u@prod-alias/harvest?hostaddr=::1",
+            ),
+            "IPv6 forms of the same address must normalise"
+        );
+        // The control: a DIFFERENT address must still be a genuine scratch
+        // target, so the fix widens matching only where the address is shared.
+        assert!(!dsn_targets_same_database(
+            "postgres://u@10.0.0.6/harvest",
+            "postgres://u@prod-alias/harvest?hostaddr=10.0.0.5",
+        ));
+        // And two numeric hosts still compare to each other as before.
+        assert!(dsn_targets_same_database(
+            "postgres://u@10.0.0.5/harvest",
+            "postgres://u@10.0.0.5/harvest",
         ));
     }
 
