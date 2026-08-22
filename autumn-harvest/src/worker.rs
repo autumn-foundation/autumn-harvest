@@ -19333,6 +19333,30 @@ fn build_dispatch_semaphore(
     )
 }
 
+/// Resolve the LISTEN/NOTIFY URL for one shard on the multi-shard poll path.
+///
+/// Takes **only** the per-shard map by design: the global
+/// `notification_database_url` is configured independently of `sharded_pool`,
+/// so it cannot be shown to target any particular shard's database — a pool
+/// override (`HarvestRunnerResources::with_sharded_pool`) can leave it aimed at
+/// the original `harvest_pool` entirely. Not accepting it as an argument makes
+/// a wrong-database listener unrepresentable here rather than guarded by a
+/// heuristic (issue #522 review; re-affirmed by the issue #961 review).
+///
+/// `None` means poll-only for this shard — a latency cost, never a correctness
+/// one, since claiming always runs against the shard's own pool.
+#[cfg(feature = "db")]
+#[must_use]
+fn multi_shard_listener_url(
+    per_shard: &[(crate::types::ShardId, String)],
+    shard: crate::types::ShardId,
+) -> Option<&str> {
+    per_shard
+        .iter()
+        .find(|(s, _)| *s == shard)
+        .map(|(_, url)| url.as_str())
+}
+
 impl Worker {
     /// Create a new worker from validated config and a handler registry.
     ///
@@ -19729,46 +19753,42 @@ impl Worker {
     /// wakes us, so a listener is only ever built from a URL that provably
     /// points at that shard's own database.
     ///
-    /// The global `notification_database_url` pairs with the pool's **default**
-    /// shard, so it is a safe fallback for exactly that one shard and no other
-    /// — the same reasoning as the single-shard path's `global_safe` gate.
-    /// Without it, a deployment auto-widened onto the multi-shard path (issue
-    /// #961) would silently lose the NOTIFY wake-up it previously had on
-    /// shard 0.
+    /// The global `notification_database_url` is **never** consulted here.
+    /// It is configured independently of `sharded_pool`, so nothing proves it
+    /// targets the database backing any particular shard — and a pool override
+    /// (`HarvestRunnerResources::with_sharded_pool`) can leave it pointing at
+    /// the *original* `harvest_pool` entirely. Matching on the numeric default
+    /// shard id would not establish that identity. This is the same call the
+    /// single-shard `global_safe` gate already documents for real multi-shard
+    /// routing: an absent per-shard URL means **poll-only** for that shard
+    /// rather than risking a listener on the wrong database (issue #522
+    /// review; re-affirmed by the issue #961 review).
+    ///
+    /// Consequence: a deployment that auto-widens onto the multi-shard path
+    /// (issue #961) and has no `shard_notification_database_urls` falls back to
+    /// poll-interval dispatch latency on **every** shard. That is a latency
+    /// cost, never a correctness one — claiming always runs against the shard's
+    /// own pool — and the warning below names the one-call fix.
     async fn build_shard_listeners(
         &self,
         shard_targets: &[(crate::types::ShardId, DbPool)],
     ) -> Vec<Option<crate::notify::QueueListener>> {
-        let default_shard = self
-            .config
-            .sharded_pool
-            .as_ref()
-            .map(crate::shard::ShardedDbPool::default_shard);
         if self.config.shard_notification_database_urls.is_empty() {
             tracing::warn!(
                 worker_id = %self.config.worker_id,
                 "harvest: multi-shard worker has no shard_notification_database_urls; \
-                 every shard other than the default falls back to poll-interval \
-                 dispatch latency. Set WorkerConfig::with_shard_notification_database_urls \
-                 to restore LISTEN/NOTIFY wake-ups per shard."
+                 every shard falls back to poll-interval dispatch latency. The global \
+                 notification_database_url is deliberately not used as a fallback here \
+                 because nothing proves it targets a given shard's database. Set \
+                 WorkerConfig::with_shard_notification_database_urls to restore \
+                 LISTEN/NOTIFY wake-ups per shard."
             );
         }
 
         let mut shard_listeners: Vec<Option<crate::notify::QueueListener>> = Vec::new();
         for (shard_id, _) in shard_targets {
-            let listener_url = self
-                .config
-                .shard_notification_database_urls
-                .iter()
-                .find(|(s, _)| s == shard_id)
-                .map(|(_, url)| url.as_str())
-                .or_else(|| {
-                    if default_shard == Some(*shard_id) {
-                        self.config.notification_database_url.as_deref()
-                    } else {
-                        None
-                    }
-                });
+            let listener_url =
+                multi_shard_listener_url(&self.config.shard_notification_database_urls, *shard_id);
             let listener = match listener_url {
                 Some(url) => {
                     match crate::notify::QueueListener::connect(url, &self.config.queues).await {
@@ -23959,6 +23979,66 @@ mod tests {
     /// multi-shard worker to shard 0, i.e. exactly the silent single-shard
     /// drain #961 exists to close. So the conversion must leave the list empty
     /// and `Worker::new` must be what widens it.
+    /// The multi-shard listener resolver returns a shard's own URL when the
+    /// per-shard map carries one.
+    #[test]
+    fn multi_shard_listener_url_returns_the_per_shard_entry() {
+        let per_shard = vec![
+            (
+                crate::types::ShardId::new(0),
+                "postgres://host/shard0".to_string(),
+            ),
+            (
+                crate::types::ShardId::new(1),
+                "postgres://host/shard1".to_string(),
+            ),
+        ];
+        assert_eq!(
+            multi_shard_listener_url(&per_shard, crate::types::ShardId::new(1)),
+            Some("postgres://host/shard1"),
+        );
+    }
+
+    /// **Issue #961 review (Codex P2).** A shard with no per-shard URL resolves
+    /// to `None` — poll-only — and there is deliberately no global-URL fallback
+    /// to reach for.
+    ///
+    /// The global `notification_database_url` is configured independently of
+    /// `sharded_pool`, so nothing proves it targets the database backing the
+    /// pool's default shard; a pool override
+    /// (`HarvestRunnerResources::with_sharded_pool`) can leave it aimed at the
+    /// original `harvest_pool`. An earlier cut of #961 fell back to it for the
+    /// numerically-matching default shard, which would have opened a listener
+    /// on the **wrong database**: real NOTIFYs from the polled shard would be
+    /// missed and unrelated ones would trigger needless claim attempts.
+    ///
+    /// This is the call the single-shard `global_safe` gate already documents
+    /// for real multi-shard routing (issue #522 review). The helper takes only
+    /// the per-shard map, so the hazard is unrepresentable rather than guarded.
+    #[test]
+    fn multi_shard_listener_url_has_no_global_fallback_for_the_default_shard() {
+        // Shard 0 is the pool's default shard and has no per-shard entry.
+        let per_shard = vec![(
+            crate::types::ShardId::new(1),
+            "postgres://host/shard1".to_string(),
+        )];
+        assert_eq!(
+            multi_shard_listener_url(&per_shard, crate::types::ShardId::new(0)),
+            None,
+            "the default shard must be poll-only without a per-shard URL; \
+             falling back to the global URL risks a wrong-database listener",
+        );
+        // And an empty map is poll-only for every shard.
+        assert_eq!(
+            multi_shard_listener_url(&[], crate::types::ShardId::new(0)),
+            None
+        );
+        assert_eq!(
+            multi_shard_listener_url(&[], crate::types::ShardId::new(2)),
+            None
+        );
+    }
+
     #[test]
     fn auto_shard_assignments_resolve_after_the_runner_assigns_the_pool() {
         let unreachable = |url: &str| -> DbPool {
