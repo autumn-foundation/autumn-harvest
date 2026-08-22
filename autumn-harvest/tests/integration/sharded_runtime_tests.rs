@@ -876,11 +876,18 @@ async fn killing_the_only_covering_worker_surfaces_stranded_pending() {
 
 // ── AC7 ───────────────────────────────────────────────────────────────────
 
-/// **AC7.** A single-shard deployment is byte-for-byte unchanged.
+/// **AC7.** A single-shard deployment dispatches exactly as before.
 ///
-/// With no sharded pool at all — the legacy shape — auto resolution must yield
-/// exactly `[ShardId::new(0)]`, the pre-#961 default, and the worker must take
-/// the single-shard fast path rather than the multi-shard loop.
+/// With no sharded pool at all — the legacy shape — auto resolution PRESERVES
+/// the empty assignment list (issue #961 review, Codex P2) rather than
+/// fabricating a shard identity the plain `DbPool` does not carry, and the
+/// worker takes the single-shard fast path rather than the multi-shard loop.
+///
+/// Empty is the legacy representation the rest of the engine already expects
+/// here: it yields an empty `shard_targets`, whose `[] => pool` arms resolve to
+/// the caller's default pool on the claim, listener and WASM-seed paths, and
+/// `shard_fanout::worker_covers_shard` normalizes the registered `[]` as
+/// "covers whatever shard this database is" (issue #1150).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_shard_deployment_is_unchanged() {
     let (urls, _container) = setup_shard_databases(&[0]).await;
@@ -907,8 +914,10 @@ async fn single_shard_deployment_is_unchanged() {
 
     assert_eq!(
         worker.config.shard_assignments,
-        vec![ShardId::new(0)],
-        "a pool-less worker must resolve to exactly the pre-#961 [0] default",
+        Vec::<ShardId>::new(),
+        "a pool-less worker has no shard identity to resolve, so the empty \
+         legacy list must be preserved — fabricating [0] would falsely claim \
+         shard 0 on a deployment whose single shard is numbered otherwise",
     );
 
     let run_pool = pool.clone();
@@ -936,16 +945,22 @@ async fn single_shard_deployment_is_unchanged() {
     worker.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
 
-    let shard0 = metrics.dispatched_for(0);
-    assert!(
-        shard0 > 0,
-        "the single-shard path must still emit harvest.shard.dispatched{{shard=\"0\"}} \
-         — a zero here would make the equality below vacuously true",
-    );
+    // Issue #961 review (Codex P2): a pool-less worker has no shard identity,
+    // so it attributes NO per-shard dispatch rather than fabricating
+    // `{shard="0"}` — which would be wrong for any deployment whose single
+    // shard is numbered otherwise. Such a deployment has exactly one shard and
+    // therefore no split to observe; its dispatch stays visible on
+    // `harvest.queue.dispatched{queue}` (issue #515).
+    //
+    // The workflow reaching COMPLETED above is what proves dispatch happened,
+    // so this assertion is not vacuous: it pins that the metric was suppressed
+    // on a path that demonstrably DID dispatch.
     assert_eq!(
-        shard0,
         metrics.dispatched.lock().unwrap().values().sum::<u64>(),
-        "a single-shard deployment must only ever report the shard-0 series",
+        0,
+        "a worker with no shard identity must attribute no per-shard dispatch; \
+         emitting {{shard=\"0\"}} would fabricate an identity its plain DbPool \
+         does not carry",
     );
 }
 

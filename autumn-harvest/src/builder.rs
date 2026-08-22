@@ -3391,7 +3391,28 @@ pub(crate) fn resolve_shard_assignments(
         return explicit;
     }
     if pool_shards.is_empty() {
-        return vec![ShardId::new(0)];
+        // No pool => no shard identity to resolve. PRESERVE the empty list
+        // rather than fabricating `[ShardId::new(0)]` (issue #961 review,
+        // Codex P2).
+        //
+        // A plain `DbPool` carries no shard number, so a worker here genuinely
+        // does not know which logical shard its database is. Registering `[0]`
+        // would *claim* shard 0 specifically, which is false whenever the
+        // deployment's single/default shard is numbered anything else --
+        // `ShardRouter::new` accepts an arbitrary `default_shard`. Shard health
+        // and queue coverage would then report no worker for the shard this
+        // process is actually draining. That is the write-side twin of the
+        // read-side bug issue #1150 fixed, and
+        // `shard_fanout::worker_covers_shard` already normalizes an empty
+        // registration as "covers whatever shard this database is" precisely so
+        // this case reads correctly.
+        //
+        // Empty is also the shape the rest of the worker already expects for a
+        // legacy single-shard worker: it yields an empty `shard_targets`, whose
+        // `[] => pool` arms in the claim path, the listener path and the WASM
+        // seed path (issue #965 review, Finding 24) all resolve to the caller's
+        // default pool.
+        return Vec::new();
     }
     let mut auto: Vec<ShardId> = pool_shards.to_vec();
     auto.sort_unstable();
@@ -3987,14 +4008,26 @@ mod tests {
         assert_eq!(resolved, vec![ShardId::new(2), ShardId::new(0)]);
     }
 
-    /// AC7: with no sharded pool the resolver must return exactly
-    /// `[ShardId::new(0)]`, so a single-shard deployment is byte-for-byte
-    /// unchanged.
+    /// **Issue #961 review (Codex P2).** With no sharded pool the resolver
+    /// must PRESERVE the empty list, never fabricate `[ShardId::new(0)]`.
+    ///
+    /// A plain `DbPool` carries no shard number, so this worker genuinely does
+    /// not know which logical shard its database is. Claiming `[0]` is false
+    /// whenever the deployment's single/default shard is numbered anything else
+    /// (`ShardRouter::new` accepts an arbitrary `default_shard`), and shard
+    /// health / queue coverage would then report no worker for the shard the
+    /// process is actually draining -- the write-side twin of the read-side bug
+    /// issue #1150 fixed. Empty is the legacy representation
+    /// `shard_fanout::worker_covers_shard` normalizes as "covers whatever shard
+    /// this database is".
     #[test]
-    fn resolve_shard_assignments_no_pool_is_single_shard() {
+    fn resolve_shard_assignments_no_pool_preserves_the_empty_legacy_shape() {
         assert_eq!(
             resolve_shard_assignments(Vec::new(), &[]),
-            vec![ShardId::new(0)],
+            Vec::<ShardId>::new(),
+            "no pool means no shard identity; fabricating [0] would falsely \
+             claim shard 0 on a deployment whose single shard is numbered \
+             otherwise",
         );
     }
 

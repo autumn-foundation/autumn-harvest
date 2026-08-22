@@ -242,22 +242,24 @@ impl WorkerRuntimeConfig {
     /// Empty means *auto*: cover every shard the configured
     /// [`sharded_pool`](Self::sharded_pool) exposes, so an operator who adds a
     /// shard without also editing `shard_assignments` still gets it drained
-    /// instead of silently stranding every workflow routed there. With no
-    /// sharded pool this resolves to `[ShardId::new(0)]`, byte-for-byte the
-    /// pre-#961 single-shard default (AC7).
+    /// instead of silently stranding every workflow routed there. With **no**
+    /// sharded pool the list is left **empty**: there is no shard identity to
+    /// resolve, and fabricating `[ShardId::new(0)]` would assert a shard number
+    /// this process never established (issue #961 review, Codex round 2). Empty
+    /// is also the shape every read-side consumer already normalises as
+    /// "covers whatever shard the row was read from" — see
+    /// `shard_fanout::worker_covers_shard` and issue #1150.
     ///
     /// **Idempotent by construction** — a non-empty list (whether explicitly
     /// configured or already auto-resolved) is left untouched, so
     /// [`Worker::new`] and `runner.rs` may both call it without drifting or
     /// double-applying.
     ///
-    /// That idempotence is also why `From<WorkerConfig>` must **not** call it:
-    /// a runner assigns [`sharded_pool`](Self::sharded_pool) onto the runtime
-    /// config *after* the conversion, so resolving during the conversion would
-    /// see no pool, collapse "auto" to `[ShardId::new(0)]`, and then be a no-op
-    /// at every later call — permanently pinning a multi-shard worker to shard
-    /// 0, which is the exact bug issue #961 closes. Resolve only where the pool
-    /// is final.
+    /// It is also why `From<WorkerConfig>` must **not** call it: a runner
+    /// assigns [`sharded_pool`](Self::sharded_pool) onto the runtime config
+    /// *after* the conversion, so resolving during the conversion would see no
+    /// pool and accomplish nothing. Resolve only where the pool is final —
+    /// `Worker::new` and the runner, both of which run after assignment.
     ///
     /// [`shard_assignments`]: Self::shard_assignments
     #[cfg(feature = "db")]
@@ -273,8 +275,8 @@ impl WorkerRuntimeConfig {
         );
     }
 
-    /// Non-`db` builds have no sharded pool, so auto always resolves to the
-    /// single-shard default.
+    /// Non-`db` builds have no sharded pool, so an auto (empty) list stays
+    /// empty and an explicit list is deduplicated.
     #[cfg(not(feature = "db"))]
     pub fn resolve_shard_assignments(&mut self) {
         self.shard_assignments = crate::builder::resolve_shard_assignments(
@@ -20158,9 +20160,11 @@ impl Worker {
         // query-DSL prelude is in scope and `.first()` on a `Vec` sends the
         // trait solver into overflow (the same footgun documented at the
         // shard-target resolution in `run`).
+        // `None` when the worker has no shard identity at all (no assignments
+        // and no sharded pool) — see the emission site in `run_poll_loop`.
         let poll_shard = match self.config.shard_assignments.as_slice() {
-            [shard, ..] => *shard,
-            [] => crate::types::ShardId::new(0),
+            [shard, ..] => Some(*shard),
+            [] => None,
         };
         self.run_poll_loop(pool, poll_shard, listener, &registration_pending)
             .await;
@@ -20697,7 +20701,7 @@ impl Worker {
     async fn run_poll_loop(
         &self,
         pool: &DbPool,
-        shard: crate::types::ShardId,
+        shard: Option<crate::types::ShardId>,
         mut listener: Option<crate::notify::QueueListener>,
         registration_pending: &AtomicBool,
     ) {
@@ -20717,13 +20721,26 @@ impl Worker {
 
             if self.poll_once(pool).await {
                 // Per-shard dispatch counter (issue #961, AC5). Emitted on the
-                // single-shard path too so `harvest.shard.dispatched` is a
-                // uniform series across deployment shapes — a single-shard
-                // deployment simply reports one series, `{shard="0"}`.
-                self.registry
-                    .telemetry()
-                    .metrics
-                    .record_shard_dispatched(shard_metric_label(shard));
+                // single-shard path too, so `harvest.shard.dispatched` is a
+                // uniform series across deployment shapes whenever the worker
+                // knows which shard it is draining.
+                //
+                // `None` = a legacy worker with no shard assignments and no
+                // sharded pool: its plain `DbPool` carries no shard number, so
+                // there is nothing to attribute the dispatch to. Emitting
+                // `{shard="0"}` there would fabricate an identity that is wrong
+                // for any deployment whose single shard is numbered otherwise
+                // (issue #961 review, Codex P2) — the same reason the worker
+                // now registers an empty `shard_assignments` on that path. Such
+                // a deployment has exactly one shard and therefore no split to
+                // observe; its dispatch remains visible on
+                // `harvest.queue.dispatched{queue}` (issue #515).
+                if let Some(shard) = shard {
+                    self.registry
+                        .telemetry()
+                        .metrics
+                        .record_shard_dispatched(shard_metric_label(shard));
+                }
                 continue;
             }
 

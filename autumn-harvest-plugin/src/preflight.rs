@@ -1354,16 +1354,21 @@ fn worker_can_cover(worker: &WorkerRow, queue: &str, shard_id: i32) -> bool {
         .queues
         .as_array()
         .is_some_and(|queues| queues.iter().any(|value| value.as_str() == Some(queue)));
-    let has_shard = worker
-        .worker
-        .shard_assignments
-        .as_array()
-        .is_some_and(|shards| {
-            shards
-                .iter()
-                .any(|value| value.as_i64() == Some(i64::from(shard_id)))
-        });
-    has_queue && has_shard
+    // Delegate the shard-membership half to the single shared predicate rather
+    // than keeping a third hand-rolled copy (issue #961 review, Codex P2).
+    //
+    // This copy lacked the empty-array normalization the other two already
+    // carry, so a legacy worker registering `[]` -- "no shard identity; covers
+    // whatever database this is" -- was reported as covering nothing, falsely
+    // flagging every queue it actually polls. That is issue #1150's bug, third
+    // instance: `shard_fanout::worker_covers_shard`'s doc names
+    // `queue_coverage.rs` and `shard_health.rs` as its callers "so the two
+    // shard-membership predicates cannot drift again", but this one was never
+    // routed through it. Both this function and `worker_covers_shard`'s other
+    // callers are fed by a connection already scoped to one shard's own
+    // database (`list_shard_workers` here, `observe_shard` there), so the
+    // premise the normalization relies on holds identically.
+    has_queue && crate::shard_fanout::worker_covers_shard(worker, shard_id)
 }
 
 async fn check_dlq_read_access(api_state: &HarvestApiState) -> PreflightCheckResult {
@@ -1696,6 +1701,72 @@ mod tests {
     use autumn_harvest::scanner_health::Scanner;
 
     use super::*;
+
+    /// Build a `WorkerRow` with the given registered `shard_assignments`.
+    fn worker_row_with_shard_assignments(shard_assignments: &[i64], queues: &[&str]) -> WorkerRow {
+        use autumn_harvest::models::HarvestWorker;
+        let now = chrono::Utc::now();
+        WorkerRow {
+            worker: HarvestWorker {
+                worker_id: "legacy-worker".to_string(),
+                started_at: now,
+                last_heartbeat_at: now,
+                queues: serde_json::json!(queues),
+                shard_assignments: serde_json::json!(shard_assignments),
+                max_concurrency: 10,
+                in_flight_count: 0,
+                host: "localhost".to_string(),
+                version: None,
+                status: WorkerStatus::Active.as_str().to_string(),
+                drain_deadline_at: None,
+                build_id: String::new(),
+                deployment_name: None,
+                labels: serde_json::json!({}),
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
+            },
+            health: WorkerHealth::Healthy,
+            active_task_ids: Vec::new(),
+        }
+    }
+
+    /// **Issue #961 review (Codex P2).** Preflight's shard-membership check is
+    /// routed through the shared `shard_fanout::worker_covers_shard`, so a
+    /// legacy worker registering an empty `shard_assignments` is treated as
+    /// covering the shard whose database produced the row.
+    ///
+    /// This was a third, drifted copy of the predicate: it lacked the
+    /// empty-array normalization `queue_coverage.rs` and `shard_health.rs`
+    /// already carry (issue #1150), so a healthy legacy worker was reported as
+    /// covering nothing and every queue it actually polls was falsely flagged.
+    #[test]
+    fn worker_can_cover_treats_an_empty_shard_assignment_as_covering() {
+        let worker = worker_row_with_shard_assignments(&[], &["default"]);
+        assert!(
+            worker_can_cover(&worker, "default", 0),
+            "an empty registration covers the shard this row was read from",
+        );
+    }
+
+    /// The empty-array normalization must not be hardcoded to shard 0: a
+    /// deployment's single/default shard can be numbered anything
+    /// (`ShardRouter::new` accepts an arbitrary `default_shard`).
+    #[test]
+    fn worker_can_cover_empty_shard_assignment_covers_a_nonzero_shard_too() {
+        let worker = worker_row_with_shard_assignments(&[], &["default"]);
+        assert!(worker_can_cover(&worker, "default", 7));
+    }
+
+    /// A NON-empty registration still gates on exact membership, so routing
+    /// through the shared predicate did not weaken the check.
+    #[test]
+    fn worker_can_cover_still_requires_membership_for_a_nonempty_assignment() {
+        let worker = worker_row_with_shard_assignments(&[1], &["default"]);
+        assert!(worker_can_cover(&worker, "default", 1));
+        assert!(!worker_can_cover(&worker, "default", 2));
+        // The queue half is unchanged and still ANDed in.
+        assert!(!worker_can_cover(&worker, "other_queue", 1));
+    }
 
     fn privilege_row(table_name: &str, privilege: &str, granted: bool) -> TablePrivilegeRow {
         TablePrivilegeRow {
