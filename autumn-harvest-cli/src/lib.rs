@@ -3677,6 +3677,21 @@ pub fn parse_shard_targets(raw: &[String]) -> Result<Vec<ShardTarget>, CliError>
             }
             _ => (i32::try_from(idx).unwrap_or(0), spec),
         };
+        // An `ExecutionId` carries its shard as `shard & 0xFFFF`, and `0xFFFF`
+        // is the reserved `ShardId::UNENCODED` sentinel -- so a value outside
+        // `0..=0xFFFE` does not survive the round trip. `65536` truncates to
+        // `0`, which would make every target id read out of THIS database
+        // decode as shard 0, miss the supplied map, and be written off as
+        // "on an uninspected shard": an advisory, exit 0, and the shard the
+        // operator supplied never actually checked. Validate with the same
+        // rule the shard router uses so the two cannot drift.
+        if !autumn_harvest::shard::is_encodable_shard(autumn_harvest::ShardId::new(shard_id)) {
+            return Err(CliError::InvalidInput(format!(
+                "--shard: shard id `{shard_id}` cannot be encoded into an execution id \
+                 (valid range is 0..={})",
+                autumn_harvest::shard::MAX_ENCODABLE_SHARD
+            )));
+        }
         if dsn.trim().is_empty() {
             return Err(CliError::InvalidInput(format!(
                 "--shard: shard {shard_id} has an empty DSN"

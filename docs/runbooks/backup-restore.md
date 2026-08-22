@@ -180,7 +180,7 @@ harvest backup verify --shard <[SHARD_ID=]DSN> [--shard …] [flags]
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--shard <[N=]DSN>` | *(required, repeatable)* | A scratch DSN. Optionally prefixed `N=` to declare its shard id (e.g. `--shard '1=postgres://…'`). Unprefixed takes its **positional** index (first `--shard` is `0`, second is `1`, …), so prefix explicitly whenever your shard ids are not `0..n`. |
+| `--shard <[N=]DSN>` | *(required, repeatable)* | A scratch DSN. Optionally prefixed `N=` to declare its shard id (e.g. `--shard '1=postgres://…'`). Unprefixed takes its **positional** index (first `--shard` is `0`, second is `1`, …), so prefix explicitly whenever your shard ids are not `0..n`. An explicit id must be in `0..=65534` — `65535` is the reserved unencoded sentinel and anything larger truncates to 16 bits, so neither survives the round trip through an execution id and both are rejected at parse time. |
 | `--live-dsn <DSN>` | `$HARVEST_DATABASE_URL` | A live DSN to guard against. **Repeatable — supply one per live shard.** A live shard you do not name here is not guarded against. |
 | `--i-know-this-is-scratch` | off | **Disables** the live-DSN guard entirely. Use it only when you have already confirmed by other means that every `--shard` target is a throwaway. |
 | `--format text\|json` | `text` | `json` is the machine-readable report (AC2d). |
@@ -299,7 +299,21 @@ CLI means *"the data is coherent and every stuck artifact has a scanner that
 heals it"* — it does **not** mean *"your deployed workflow code still replays
 this history"*.
 
-To get check (a), call the library from a binary that links your handlers:
+To get check (a), call the library from a binary that links your handlers.
+
+The verification API is gated behind **both** the `db` and `testing` features,
+and `testing` is **off by default** — it is what gates `WorkflowReplayer`, which
+this recipe needs. A default-feature dependency will not compile the imports
+below, so the verifying binary must ask for the feature explicitly:
+
+```toml
+# Cargo.toml of the binary that runs the drill
+[dependencies]
+autumn-harvest = { version = "0.5", features = ["db", "testing"] }
+```
+
+`testing` pulls in no extra runtime dependency and is safe in a drill binary;
+keep it off in the production service, which does not need it.
 
 ```rust
 use autumn_harvest::backup_verify::{ShardTarget, VerifyOptions, verify_restore};

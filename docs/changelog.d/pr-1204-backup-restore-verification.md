@@ -343,3 +343,30 @@ which "adjudicate every `ExternalAwaitFailed`" would pass);
 "page once and stop" would pass, silently narrowing the check). Plus CLI
 parse coverage asserting the new flag and that its default tracks
 `DEFAULT_PROBE_LIMIT` rather than a drifting literal.
+
+**Post-review hardening, round 5** (two Codex P2s, both fixed):
+
+1. **`--shard` accepted shard ids that cannot round-trip.** The parser rejected
+   only an `i32` parse failure, so `65535` (the reserved `ShardId::UNENCODED`
+   sentinel) and anything above it were accepted — but an `ExecutionId` carries
+   its shard as `shard & 0xFFFF`, so `65536` truncates to `0`. Every target id
+   read out of the database the operator supplied under `65536=` then decoded as
+   shard 0, missed the supplied map, and was written off as "on an uninspected
+   shard": an advisory, exit 0, and the shard the operator actually handed over
+   never checked. `parse_shard_targets` now validates with
+   `autumn_harvest::shard::is_encodable_shard` — the same rule the shard router
+   uses, so the two cannot drift — and names the valid range in the error.
+2. **The embedder recipe did not compile from a default-feature dependency.**
+   `ShardTarget` / `VerifyOptions` / `verify_restore` and `WorkflowReplayer` are
+   gated on `db` + `testing`, and `testing` is off by default, so an application
+   following runbook §4 could not import either line until it independently
+   discovered the feature. The section now leads with the required
+   `Cargo.toml` stanza and notes that `testing = []` pulls in no extra runtime
+   dependency (so it is safe in a drill binary and can stay off in the
+   production service). The `--shard` flag row also states the encodable range.
+
+Tests: `unencodable_shard_ids_are_rejected` (`65535` / `65536` / `70000`, each
+asserting the error names the offending id) paired with the boundary control
+`the_largest_encodable_shard_id_is_accepted` (`65534` still parses), so the
+guard rejects only what genuinely cannot round-trip. RED confirmed before the
+fix: the rejection test failed at `65535` while the control already passed.

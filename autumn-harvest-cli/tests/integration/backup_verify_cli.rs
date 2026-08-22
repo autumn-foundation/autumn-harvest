@@ -174,6 +174,40 @@ fn an_empty_shard_list_is_rejected() {
     parse_shard_targets(&[]).expect_err("at least one shard DSN is required");
 }
 
+/// An `ExecutionId` carries its shard in the UUID's first two bytes as
+/// `shard & 0xFFFF`, and `0xFFFF` is the reserved `ShardId::UNENCODED`
+/// sentinel. A shard id outside `0..=0xFFFE` therefore does NOT survive the
+/// round trip: `65536` truncates to `0`, so every target id read out of the
+/// database the operator supplied under `65536=` decodes as shard `0`, is not
+/// found in the supplied map, and is written off as "on an uninspected shard"
+/// -- an advisory, exit 0, with the shard silently never checked.
+///
+/// Reject it at parse time with the same rule the shard router uses.
+#[test]
+fn unencodable_shard_ids_are_rejected() {
+    for bad in ["65535", "65536", "70000"] {
+        let spec = format!("{bad}=postgres://h/a");
+        match parse_shard_targets(std::slice::from_ref(&spec)) {
+            Ok(_) => {
+                panic!("shard {bad} must be rejected: it cannot round-trip through an ExecutionId")
+            }
+            Err(e) => assert!(
+                e.to_string().contains(bad),
+                "the error must name the offending id: {e}"
+            ),
+        }
+    }
+}
+
+/// The control: the boundary value is still accepted, so the guard rejects
+/// only what genuinely cannot round-trip.
+#[test]
+fn the_largest_encodable_shard_id_is_accepted() {
+    let targets = parse_shard_targets(&["65534=postgres://h/a".to_string()])
+        .expect("0xFFFE is the largest encodable shard and must parse");
+    assert_eq!(targets[0].shard_id, 65534);
+}
+
 // ── AC2(d): exit-code mapping ──────────────────────────────────────────────
 
 #[test]
