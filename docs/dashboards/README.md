@@ -125,6 +125,7 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_schedule_missed_runs` | Schedules & triggers | Schedule runs vs skipped | [runbook](../runbooks/harvest-alerts.md#harvest_schedule_missed_runs) |
 | `harvest_retention_lag` | Cache, retention & shards | Retention deletions by shard | [runbook](../runbooks/harvest-alerts.md#harvest_retention_lag) |
 | `harvest_shard_unready` | Readiness checks | Readiness: Shard readiness (text) | [runbook](../runbooks/harvest-alerts.md#harvest_shard_unready) |
+| `harvest_shard_undrained` | Cache, retention & shards | Stranded pending tasks by shard (companion: Dispatch rate by shard) | [runbook](../runbooks/harvest-alerts.md#harvest_shard_undrained) |
 | `harvest_no_compatible_worker` | Readiness checks | Readiness: Build-routing compatibility (text) | [runbook](../runbooks/harvest-alerts.md#harvest_no_compatible_worker) |
 | `harvest_schedule_ha_domination` | Schedules & triggers | Schedule HA fire attempts | [runbook](../runbooks/harvest-alerts.md#harvest_schedule_ha_domination) |
 | `harvest_workflow_failure_rate` | Overview | Workflow failure ratio | [runbook](../runbooks/harvest-alerts.md#harvest_workflow_failure_rate) |
@@ -163,7 +164,7 @@ the API result through your own probe with bounded labels) —
 | `$datasource` | datasource | your Prometheus datasources | every panel |
 | `$workflow` | query, multi + All | `label_values(harvest_workflow_started_total, workflow)` | series carrying a `workflow` label, including `harvest_retention_deleted` (issue #737); series labelled `workflow_type` (history size, continue-as-new, payload metrics) use `workflow_type=~"$workflow"` |
 | `$queue` | query, multi + All | `label_values(harvest_queue_depth, queue)` | series carrying a `queue` label |
-| `$shard` | query, multi + All | `label_values(harvest_dlq_entries, shard)` | **only** the two shard-labelled series: `harvest_dlq_entries`, `harvest_shard_stranded_pending` |
+| `$shard` | query, multi + All | `label_values(harvest_dlq_entries, shard)` | **only** series that carry a `shard` label (e.g. `harvest_dlq_entries`, `harvest_shard_stranded_pending`, `harvest_shard_dispatched_total`, and the canary series) |
 
 Variables are applied per-panel only where the series actually carries the
 label — applying `shard=~"$shard"` to an unlabelled series would silently

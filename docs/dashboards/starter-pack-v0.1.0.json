@@ -3330,7 +3330,7 @@
               }
             }
           ],
-          "description": "Eligible pending tasks with no live worker able to claim them, per shard. max by (shard) avoids replica double-counting of the shared per-shard sample."
+          "description": "Eligible pending tasks with no live worker able to claim them, per shard. max by (shard) avoids replica double-counting of the shared per-shard sample. Alert: harvest_shard_undrained."
         },
         {
           "id": 89,
@@ -3380,6 +3380,55 @@
             }
           ],
           "description": "Execution summaries GC'd by the tiered-retention summary pass (issue #752). Distinct from the history-row retention deletions above; a sustained zero while eligible summaries exist means the summary GC is lagging."
+        },
+        {
+          "id": 931,
+          "type": "timeseries",
+          "title": "Dispatch rate by shard",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 76
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (shard) (rate(harvest_shard_dispatched_total{shard=~\"$shard\"}[$__rate_interval]))",
+              "legendFormat": "shard {{shard}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Per-shard task dispatch rate (issue #961). The shard-dimension twin of the per-queue dispatch panel: a multi-shard worker round-robins across its assigned shards, so a shard flatlining at 0 while siblings are busy means it is being starved or has no covering poller. Cross-check with 'Stranded pending tasks by shard'."
         }
       ]
     },

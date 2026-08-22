@@ -203,6 +203,39 @@ pub struct WorkerConfigView {
     pub sharded_pool_shard_count: usize,
 }
 
+/// Shard ids of the pool the runtime actually uses (issue #961).
+///
+/// A resolved-runtime override wins over the raw [`WorkerConfig::sharded_pool`]
+/// knob, because a runner can supply a sharded pool the `WorkerConfig` never
+/// saw. This is what makes `GET /admin/config` report the *effective*
+/// `shard_assignments` an auto-configured worker resolves to.
+fn resolved_pool_shards(
+    worker: &WorkerConfig,
+    resolved: Option<&ShardedInfo>,
+) -> Vec<crate::types::ShardId> {
+    if let Some(info) = resolved {
+        return info
+            .shard_ids
+            .iter()
+            .copied()
+            .map(crate::types::ShardId::new)
+            .collect();
+    }
+    #[cfg(feature = "db")]
+    {
+        worker
+            .sharded_pool
+            .as_ref()
+            .map(crate::shard::ShardedDbPool::shard_ids)
+            .unwrap_or_default()
+    }
+    #[cfg(not(feature = "db"))]
+    {
+        let _ = worker;
+        Vec::new()
+    }
+}
+
 impl WorkerConfigView {
     /// Project a [`WorkerConfig`] into its secret-free view, sourcing the two
     /// sharded-pool fields solely from the `WorkerConfig::sharded_pool` knob.
@@ -251,6 +284,7 @@ impl WorkerConfigView {
             .map_or((false, 0), |p| (true, p.iter_shards().count()));
         #[cfg(not(feature = "db"))]
         let wc_sharding = (false, 0usize);
+        let pool_shards = resolved_pool_shards(worker, resolved.as_ref());
         let (sharded_pool_configured, sharded_pool_shard_count) =
             resolved.map_or(wc_sharding, |info| (info.configured, info.shard_count));
 
@@ -307,7 +341,18 @@ impl WorkerConfigView {
             sticky_routing_enabled: !sticky_timeout.is_zero(),
             sticky_timeout_ms: dur_ms(*sticky_timeout),
             cancellation_grace_period_ms: dur_ms(*cancellation_grace_period),
-            shard_assignments: shard_assignments.iter().map(|s| s.as_i32()).collect(),
+            // The **effective** assignments, not the raw knob: an empty
+            // `shard_assignments` means "auto: cover every pool shard"
+            // (issue #961). `GET /admin/config` must report what the worker
+            // actually polls, because the add-a-shard runbook's coverage
+            // verification reads exactly this field (AC8).
+            shard_assignments: crate::builder::resolve_shard_assignments(
+                shard_assignments.clone(),
+                &pool_shards,
+            )
+            .into_iter()
+            .map(crate::types::ShardId::as_i32)
+            .collect(),
             max_local_activity_start_to_close_ms: dur_ms(*max_local_activity_start_to_close),
             default_activity_retry_max_attempts: default_activity_retry_policy
                 .as_ref()
@@ -535,12 +580,23 @@ pub struct PoolSizing {
 /// hands the result here, so the reported values describe the resolved runtime
 /// pool rather than solely the `WorkerConfig` knob — and the pure decision stays
 /// testable without ever constructing a real pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardedInfo {
     /// Whether the resolved runtime storage pool is a sharded pool.
     pub configured: bool,
     /// Number of shards in the resolved sharded pool (0 when not sharded).
     pub shard_count: usize,
+    /// Shard ids present in the **resolved runtime pool**, ascending.
+    ///
+    /// Carried so the snapshot can report the worker's *effective* shard
+    /// assignments (issue #961, AC1/AC8): an empty
+    /// [`WorkerConfig::shard_assignments`] means "auto: cover every pool
+    /// shard", and only the resolved runtime pool knows which shards those
+    /// are. This is always populated from the resolved pool — including the
+    /// single-shard fallback wrapper — so `GET /admin/config` reports the same
+    /// list the worker actually polls, which is what the add-a-shard runbook's
+    /// coverage check reads.
+    pub shard_ids: Vec<i32>,
 }
 
 /// Resolve the reported [`PoolConfigView`], mirroring the pool-selection
@@ -961,6 +1017,7 @@ mod tests {
             Some(ShardedInfo {
                 configured: true,
                 shard_count: 3,
+                shard_ids: vec![0, 1, 2],
             }),
         );
         assert!(overridden.sharded_pool_configured);
@@ -973,6 +1030,7 @@ mod tests {
             Some(ShardedInfo {
                 configured: false,
                 shard_count: 0,
+                shard_ids: vec![0],
             }),
         );
         assert!(!single.sharded_pool_configured);
@@ -983,6 +1041,59 @@ mod tests {
         let fallback = WorkerConfigView::from_worker_config(&worker, Duration::from_millis(500));
         assert!(!fallback.sharded_pool_configured);
         assert_eq!(fallback.sharded_pool_shard_count, 0);
+    }
+
+    #[test]
+    fn worker_view_reports_effective_shard_assignments_not_the_auto_sentinel() {
+        // AC8: `docs/sharding.md` step 4 tells an operator to verify coverage
+        // with `GET /admin/config` -> `worker.shard_assignments`. That check is
+        // only meaningful if the view reports the *resolved* list, so a worker
+        // left on auto (empty `shard_assignments`) shows the concrete shards it
+        // will poll rather than an empty array the operator cannot act on.
+        let auto = WorkerConfig::default();
+        assert!(
+            auto.shard_assignments.is_empty(),
+            "the default must be the auto sentinel, else this test is vacuous"
+        );
+
+        let view = WorkerConfigView::from_worker_config_with_resolved_sharding(
+            &auto,
+            Duration::from_millis(500),
+            Some(ShardedInfo {
+                configured: true,
+                shard_count: 3,
+                shard_ids: vec![0, 1, 2],
+            }),
+        );
+        assert_eq!(
+            view.shard_assignments,
+            vec![0, 1, 2],
+            "auto must resolve to every shard of the pool the runtime actually uses"
+        );
+    }
+
+    #[test]
+    fn worker_view_never_widens_an_explicit_shard_assignment() {
+        // The mirror of the test above: a deliberately narrowed worker (the
+        // one-worker-process-per-shard shape) must be reported as narrowed, so
+        // an operator flipping a shard writable can *see* the missing id.
+        let explicit =
+            WorkerConfig::default().with_shard_assignments([crate::types::ShardId::new(1)]);
+
+        let view = WorkerConfigView::from_worker_config_with_resolved_sharding(
+            &explicit,
+            Duration::from_millis(500),
+            Some(ShardedInfo {
+                configured: true,
+                shard_count: 3,
+                shard_ids: vec![0, 1, 2],
+            }),
+        );
+        assert_eq!(
+            view.shard_assignments,
+            vec![1],
+            "an explicit assignment must never be widened to the pool"
+        );
     }
 
     #[test]

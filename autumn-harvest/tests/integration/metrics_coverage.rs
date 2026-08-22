@@ -16,12 +16,12 @@ use autumn_harvest::telemetry::{
     METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_PAUSED, METRIC_RETENTION_DELETED,
     METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED, METRIC_SCANNER_TICK,
     METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
-    METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED, METRIC_TASK_CAPABILITY_MISS,
-    METRIC_TIMER_STARTED, METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION,
-    METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED, METRIC_WORKFLOW_ACTIVE,
-    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
-    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, MetricsRecorder, NoOpMetrics,
-    WorkflowStatus,
+    METRIC_SHARD_DISPATCHED, METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED,
+    METRIC_TASK_CAPABILITY_MISS, METRIC_TIMER_STARTED, METRIC_UPDATE_ADMITTED,
+    METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION, METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED,
+    METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION,
+    METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
+    MetricsRecorder, NoOpMetrics, WorkflowStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -254,6 +254,13 @@ impl MetricsRecorder for RecordingMetrics {
         });
     }
 
+    fn record_shard_dispatched(&self, shard: u16) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_SHARD_DISPATCHED,
+            labels: vec![("shard", shard.to_string())],
+        });
+    }
+
     fn record_concurrency_superseded(&self, workflow: &str) {
         self.samples.lock().unwrap().push(MetricSample {
             name: METRIC_CONCURRENCY_SUPERSEDED,
@@ -399,6 +406,7 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
     rec.record_retention_deleted("my_workflow", 50);
     rec.record_workflow_task_timeout("my_workflow", "default");
     rec.record_task_dispatched("default");
+    rec.record_shard_dispatched(0);
     rec.record_signal_received("my_workflow", "default");
     rec.record_signal_unhandled("my_workflow", "default");
     rec.record_update_admitted("my_workflow", "default");
@@ -482,6 +490,10 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
     assert!(
         names.contains(&METRIC_QUEUE_DISPATCHED),
         "harvest.queue.dispatched not sampled"
+    );
+    assert!(
+        names.contains(&METRIC_SHARD_DISPATCHED),
+        "harvest.shard.dispatched not sampled"
     );
     for (metric, label) in [
         (METRIC_SIGNAL_RECEIVED, "harvest.signal.received"),

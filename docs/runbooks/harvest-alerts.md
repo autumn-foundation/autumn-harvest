@@ -823,6 +823,90 @@ move existing executions across shards; Harvest does not rebalance them.
 Escalate if a writable shard is unavailable, if multiple shards are partial, or
 if readiness cannot be proven during a rollout.
 
+## harvest_shard_undrained
+
+A writable shard has claimable pending work but **no live worker is polling it**,
+so every workflow rendezvous-hashed onto that shard is permanently undispatched.
+
+This is the **shard-dimension** analogue of
+[`harvest_queue_uncovered`](#harvest_queue_uncovered), which detects the same
+condition per *queue*. Both can be true at once (a queue with no poller on a
+shard with no poller), and each names a different fix: widen a worker's
+**queues** vs. widen a worker's **shards**.
+
+### Triage steps
+
+1. Run `harvest shard health --output json` and note which shard ids are
+   affected and whether they are writable.
+2. Ask whether the shard has **no poller at all** or a poller that is merely
+   behind:
+
+   ```promql
+   # stranded work with NO dispatch on that shard  →  genuinely no poller
+   max by (shard) (harvest_shard_stranded_pending) > 0
+     unless (sum by (shard) (rate(harvest_shard_dispatched_total[5m])) > 0)
+   ```
+
+   `unless`, not `and ... == 0`: a shard that has **never** had a covering
+   poller has no `harvest_shard_dispatched_total{shard}` series at all, so an
+   `== 0` comparison produces no element for it and the vector match would
+   return empty — sending you down the "poller present but behind" branch for a
+   shard with no poller whatsoever. `unless` keeps the left-hand element when
+   the right-hand side has none.
+
+   A non-zero dispatch rate alongside stranded work means a worker *is*
+   covering the shard but cannot claim the specific pending rows — fall through
+   to `harvest queue coverage --json` (queue mismatch) or
+   `harvest workflow stack <execution_id>` (build-id/capability mismatch).
+3. Read the worker's **effective** shard coverage:
+
+   ```bash
+   curl -s .../api/harvest/admin/config | jq '.worker.shard_assignments'
+   ```
+
+   Since issue #961 an **empty** `shard_assignments` means *auto*: the worker
+   covers every shard in its pool. `GET /admin/config` reports the *resolved*
+   list, so the shard ids printed here are exactly the ones the worker polls.
+4. Confirm at least one live worker reports the shard:
+   `harvest worker health --output json`.
+
+### Likely causes
+
+A shard was added to `writable_shards` without starting (or widening) a worker
+that covers it; the only worker covering a shard died or was drained; a worker
+was explicitly narrowed with `WorkerConfig::with_shard_assignments([...])` and
+never widened when the shard set grew; or that shard is in the router but has no
+`ShardedDbPool` entry in the process at all — in which case startup is refused;
+check the logs for `ShardRouter references shards ... that have no pool entry`.
+(The sibling `shard_assignments are missing from the sharded_pool` rejection can
+only fire for an **explicitly narrowed** worker: auto-derived assignments come
+*from* the pool, so they can never name a shard the pool lacks.)
+
+### False positives
+
+A brief spike during a **rolling worker restart** is expected: the sampler can
+observe a shard between the old worker's deregistration and the new worker's
+registration. Size the alert's `for` window above your restart window; 2m is a
+conservative starting point. The starter pack ships PromQL expressions only, so
+the `for` window is yours to set. A shard being deliberately
+drained (readable-but-not-writable) may also hold pending work legitimately
+while it finishes — cross-check `harvest shard health` for its writable flag.
+
+### Safe actions
+
+Start or widen a worker that covers the shard — either remove the explicit
+`with_shard_assignments` narrowing so auto-coverage applies, or add the shard to
+the list. Both take effect on worker restart. Do **not** move existing
+executions across shards; Harvest does not rebalance them, and their execution
+ids encode the original shard.
+
+### Escalation criteria
+
+Escalate if a writable shard stays undrained beyond one restart window, if
+multiple shards are simultaneously undrained (suggesting a pool/router
+misconfiguration rather than a single dead worker), or if `GET /admin/config`
+shows a shard the router considers writable but no worker resolves.
+
 ## harvest_no_compatible_worker
 
 ### Triage steps

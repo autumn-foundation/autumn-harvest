@@ -472,6 +472,51 @@
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_shard_unready"
     },
     {
+      "id": "harvest_shard_undrained",
+      "status": "enforceable",
+      "signal_source": "The harvest.shard.stranded_pending gauge, sampled per shard by the worker's stranded-work sampler (issue #522), cross-checked against the harvest.shard.dispatched counter (issue #961).",
+      "default_threshold": "Page when any shard reports stranded_pending > 0 sustained for longer than 2 x worker poll_interval (default 2 x 500 ms; a 2m `for` is a conservative starter value that also rides out a rolling worker restart). This pack ships expressions only, not `for` windows \u2014 set one in your own rule and tune it to your restart window.",
+      "severity": "page",
+      "owner_persona": "platform on-call",
+      "description": "A writable shard has claimable pending work but no live worker is polling it, so every workflow rendezvous-hashed onto that shard is permanently undispatched. This is the SHARD-dimension analogue of harvest_queue_uncovered (#774), which detects the same condition per QUEUE. It fires most often after adding a shard to writable_shards without starting (or widening) a worker that covers it, or after the only worker covering a shard dies. Since issue #961 a worker with EMPTY shard_assignments auto-covers every shard in its pool, so a persistent alert here usually means a worker was explicitly narrowed with with_shard_assignments and never widened, or that shard has no pool entry in this process at all.",
+      "first_action": "harvest shard health --output json",
+      "dependencies": [
+        {
+          "ref": "#522",
+          "status": "shipped",
+          "surface": "harvest.shard.stranded_pending gauge and the per-shard stranded-work sampler"
+        },
+        {
+          "ref": "#961",
+          "status": "shipped",
+          "surface": "harvest.shard.dispatched counter and auto shard assignments"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "harvest.shard.stranded_pending is exposed as the gauge harvest_shard_stranded_pending{shard}. Use max by (shard) so multiple worker replicas sampling the same shard are not double-counted. The companion harvest_shard_dispatched_total{shard} counter distinguishes 'no poller at all' from 'poller present but backlogged' (dispatch rate non-zero). The narrow variant uses `unless`, not `and ... == 0`: a shard that has NEVER had a covering poller has no harvest_shard_dispatched_total{shard} series at all, so an `== 0` comparison yields no element for it and the vector match would silently drop the alert in exactly the case it is written to detect. `unless` keeps the left-hand element when the right-hand side has none.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "max by (shard) (harvest_shard_stranded_pending) > 0"
+          },
+          {
+            "kind": "promql",
+            "expr": "max by (shard) (harvest_shard_stranded_pending) > 0 unless (sum by (shard) (rate(harvest_shard_dispatched_total[5m])) > 0)",
+            "note": "Narrower variant: stranded work with NO dispatch series on that shard, i.e. genuinely no covering poller rather than a poller that is merely behind."
+          }
+        ]
+      },
+      "management_checks": [
+        "harvest shard health --output json",
+        "GET /api/harvest/admin/shards/health",
+        "GET /api/harvest/admin/config",
+        "harvest queue coverage --json",
+        "harvest worker health --output json"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_shard_undrained"
+    },
+    {
       "id": "harvest_no_compatible_worker",
       "status": "pending-management-signal",
       "signal_source": "Build-id routing state from #171. Native alerting is pending a management API field that reports no_compatible_worker directly.",

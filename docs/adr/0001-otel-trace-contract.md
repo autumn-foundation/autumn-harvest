@@ -252,6 +252,9 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_QUEUE_DEPTH`       | `harvest.queue.depth`         | Gauge        | `queue` (bounded)                             | `execution.id`        |
 | `METRIC_WORKFLOW_ACTIVE`   | `harvest.workflow.active`     | Gauge        | `workflow` (bounded), `state` (2 values: running/paused) | `execution.id` |
 | `METRIC_DLQ_ENTRIES`       | `harvest.dlq.entries`         | Gauge        | `shard` (≤ 256)                               |                       |
+| `METRIC_SHARD_STRANDED_PENDING` | `harvest.shard.stranded_pending` | Gauge | `shard` (≤ 256)                       | `execution.id` — claimable pending tasks on a shard with no covering live worker (issue #522) |
+| `METRIC_SHARD_DISPATCHED`  | `harvest.shard.dispatched`    | Counter      | `shard` (≤ 256)                               | `execution.id` — per-shard dispatch split; the shard-dimension twin of `harvest.queue.dispatched` (issue #961) |
+| `METRIC_QUEUE_DISPATCHED`  | `harvest.queue.dispatched`    | Counter      | `queue` (bounded)                             | `execution.id` — per-queue dispatch split for weighted-drain verification (issue #515) |
 | `METRIC_TASK_CAPABILITY_MISS` | `harvest.task.capability_miss` | Counter | `queue` (bounded), `task_type` (2 values: workflow/activity), `outcome` (3 values: released/escalated/escalated_never_offered) | `execution.id`, workflow/activity name |
 | `METRIC_QUEUE_PAUSED`      | `harvest.queue.paused`        | Gauge        | `queue` (bounded)                             | 1 = operator hold in effect (issue #619) |
 | `METRIC_SCHEDULE_RUNS`     | `harvest.schedule.runs`       | Counter      | `kind` (2 values), `name` (bounded)           |                       |

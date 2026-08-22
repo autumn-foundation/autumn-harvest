@@ -245,6 +245,22 @@ pub const METRIC_QUEUE_DISPATCHED: &str = "harvest.queue.dispatched";
 /// A healthy steady state is `0` on every shard.
 pub const METRIC_SHARD_STRANDED_PENDING: &str = "harvest.shard.stranded_pending";
 
+/// Counter: a task was dispatched from a given shard (issue #961).
+///
+/// The **shard-dimension twin** of [`METRIC_QUEUE_DISPATCHED`]: where #515's
+/// per-queue counter lets an operator confirm the live dispatch split matches
+/// `WorkerConfig::queue_weights`, this one lets them confirm the split across
+/// a multi-shard worker's assigned shards — i.e. that a deep backlog on one
+/// shard is not starving its siblings (AC5). The two compose: queue weights
+/// pick *which queue* within a shard, the round-robin poll order picks *which
+/// shard*.
+///
+/// Labels:
+///   - `"shard"` — the shard id (bounded cardinality, ADR-0001 §7).
+///
+/// `execution.id` is span-only and MUST NOT appear as a label.
+pub const METRIC_SHARD_DISPATCHED: &str = "harvest.shard.dispatched";
+
 /// Gauge: number of a worker's dispatch slots currently in use for one slot
 /// type (issue #531).
 ///
@@ -2453,6 +2469,18 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (shard, count);
     }
 
+    /// A task was dispatched from the given shard (issue #961).
+    ///
+    /// Recorded once per dispatched task by the worker's poll loop, which is
+    /// the only place that knows which shard the claim came from (a task row
+    /// carries no `shard_id` column — "which shard" *is* "which pool").
+    /// Lets operators confirm no assigned shard is being starved (AC5).
+    ///
+    /// Maps to the counter [`METRIC_SHARD_DISPATCHED`].
+    fn record_shard_dispatched(&self, shard: u16) {
+        let _ = shard;
+    }
+
     /// A scheduled run was dispatched (either a DAG run or a workflow start).
     ///
     /// `kind` is `"dag"` or `"workflow"`. `name` is the DAG or workflow name.
@@ -4004,6 +4032,18 @@ mod tests {
             METRIC_SHARD_STRANDED_PENDING,
             "harvest.shard.stranded_pending"
         );
+    }
+
+    #[test]
+    fn shard_dispatched_counter_has_default_noop_impl() {
+        // AC5 (issue #961): the shard-dimension twin of #515's
+        // `harvest.queue.dispatched{queue}`, so an operator can confirm the
+        // live dispatch split ACROSS shards and prove no assigned shard is
+        // being starved by a deep backlog on a sibling.
+        let rec = NoOpMetrics;
+        rec.record_shard_dispatched(0);
+        rec.record_shard_dispatched(2);
+        assert_eq!(METRIC_SHARD_DISPATCHED, "harvest.shard.dispatched");
     }
 
     #[test]

@@ -373,6 +373,14 @@ impl MetricsRecorder for MetricsRsRecorder {
         .set(count as f64);
     }
 
+    fn record_shard_dispatched(&self, shard: u16) {
+        counter!(
+            crate::telemetry::METRIC_SHARD_DISPATCHED,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .increment(1);
+    }
+
     fn record_schedule_run(&self, kind: &str, name: &str) {
         counter!(
             METRIC_SCHEDULE_RUNS,
@@ -2109,6 +2117,96 @@ mod tests {
             "the capability-miss bridge must register harvest.task.capability_miss \
              with exactly the queue/task_type/outcome label constants, values \
              un-swapped, for BOTH bounded outcomes"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // inline CapturingRecorder boilerplate
+    fn bridges_shard_dispatched_counter_with_bounded_shard_label() {
+        // AC5 (issue #961): a local `metrics::Recorder` captures the registered
+        // counter key, so a swapped/dropped `shard` label in the bridge is
+        // caught here rather than only surfacing as a silently-missing series
+        // on the per-shard fairness dashboard.
+        type CounterKey = (String, Vec<(String, String)>);
+
+        #[derive(Default)]
+        struct CapturingRecorder {
+            counters: std::sync::Mutex<Vec<CounterKey>>,
+        }
+
+        impl metrics::Recorder for &CapturingRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                self.counters.lock().unwrap().push((
+                    key.name().to_owned(),
+                    key.labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                ));
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_shard_dispatched(0);
+            rec.record_shard_dispatched(2);
+        });
+
+        let counters = capture.counters.lock().unwrap().clone();
+        assert_eq!(
+            counters.as_slice(),
+            &[
+                (
+                    crate::telemetry::METRIC_SHARD_DISPATCHED.to_owned(),
+                    vec![(METRIC_LABEL_SHARD.to_owned(), "0".to_owned())],
+                ),
+                (
+                    crate::telemetry::METRIC_SHARD_DISPATCHED.to_owned(),
+                    vec![(METRIC_LABEL_SHARD.to_owned(), "2".to_owned())],
+                ),
+            ],
+            "the shard-dispatch bridge must register harvest.shard.dispatched \
+             with exactly the bounded `shard` label constant",
         );
     }
 

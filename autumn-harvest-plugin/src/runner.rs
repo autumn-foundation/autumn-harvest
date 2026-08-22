@@ -364,6 +364,15 @@ impl PreparedHarvestRuntime {
         // configured `WorkerConfig::with_sharded_pool` to a single shard.
         worker_runtime_config.sharded_pool = Some(storage_pool.sharded_pool().clone());
 
+        // Resolve auto (empty) shard assignments now that `sharded_pool` is
+        // final (issue #961, AC1). `Worker::new` runs the same idempotent pass,
+        // but doing it here first means the warning below — and anything else
+        // reading `worker_runtime_config.shard_assignments` — sees the
+        // *effective* coverage rather than the raw "auto" sentinel.
+        worker_runtime_config.resolve_shard_assignments();
+
+        warn_uncovered_writable_shards(&shard_router, &worker_runtime_config.shard_assignments);
+
         Ok(Self {
             registry: Arc::new(registry),
             dag_catalog,
@@ -715,6 +724,16 @@ fn capture_effective_config(
         } else {
             0
         },
+        // Always the resolved pool's real shard ids — including the
+        // single-shard fallback wrapper — so the snapshot can report the
+        // worker's *effective* shard assignments (issue #961, AC1/AC8).
+        // Unlike `shard_count`, this is not zeroed for the non-sharded case:
+        // resolving "auto" needs the concrete shard list either way, and for
+        // the fallback wrapper it is exactly `[0]`.
+        shard_ids: storage_pool
+            .iter_shards()
+            .map(|(shard, _)| shard.as_i32())
+            .collect(),
     };
     EffectiveConfigView::capture(
         built.worker_config(),
@@ -724,6 +743,50 @@ fn capture_effective_config(
         DEFAULT_WORKER_POLL_INTERVAL,
         Some(resolved_sharding),
     )
+}
+
+/// The writable shards `assignments` does **not** cover, ascending (issue #961).
+///
+/// Pure so the boot-time coverage warning is testable without a runtime. Under
+/// auto-assignment this is always empty by construction — `ShardRouter::new`
+/// asserts `writable ⊆ readable`, `missing_router_shards` fails startup when a
+/// readable shard has no pool, and auto-derived assignments are exactly the
+/// pool's shards — so a non-empty result means the worker was **explicitly**
+/// narrowed.
+fn uncovered_writable_shards(router: &ShardRouter, assignments: &[ShardId]) -> Vec<i32> {
+    let covered: std::collections::BTreeSet<ShardId> = assignments.iter().copied().collect();
+    let mut uncovered: Vec<i32> = router
+        .writable_shards()
+        .iter()
+        .filter(|shard| !covered.contains(shard))
+        .map(|shard| shard.as_i32())
+        .collect();
+    uncovered.sort_unstable();
+    uncovered
+}
+
+/// Warn loudly about writable shards this worker will not poll (issue #961, AC6).
+///
+/// This is the boot-time half of shard-coverage detection; the runtime half is
+/// the `harvest.shard.stranded_pending` gauge and the `harvest_shard_undrained`
+/// alert. It is a warning, not a hard failure: a one-worker-process-per-shard
+/// deployment deliberately narrows each process, so uncovered-here is only a
+/// problem when *no* process in the fleet covers the shard — which this process
+/// cannot know. The fleet-wide question is answered by
+/// `GET /admin/shards/health` (`no_live_worker`) and the stranded-work gauge.
+fn warn_uncovered_writable_shards(router: &ShardRouter, assignments: &[ShardId]) {
+    let uncovered = uncovered_writable_shards(router, assignments);
+    if !uncovered.is_empty() {
+        let covered: Vec<i32> = assignments.iter().map(|s| s.as_i32()).collect();
+        tracing::warn!(
+            uncovered_writable_shards = ?uncovered,
+            covered_shards = ?covered,
+            "this worker does not poll every writable shard; work routed to the \
+             uncovered shards will be stranded unless another worker process in the \
+             fleet covers them — verify with GET /api/harvest/admin/shards/health and \
+             the harvest.shard.stranded_pending gauge (issue #961)"
+        );
+    }
 }
 
 fn missing_router_shards(router: &ShardRouter, pool: &ShardedDbPool) -> Vec<ShardId> {
@@ -767,8 +830,12 @@ pub(crate) fn injected_runtime_state(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_runtime_storage_pool, select_runtime_shard0_pool};
+    use super::{
+        resolve_runtime_storage_pool, select_runtime_shard0_pool, uncovered_writable_shards,
+    };
+    use autumn_harvest::shard::ShardRouter;
     use autumn_harvest::shard::ShardedDbPool;
+    use autumn_harvest::types::ShardId;
     use autumn_harvest::worker::DbPool;
     use diesel_async::AsyncPgConnection;
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -865,6 +932,61 @@ mod tests {
                 .max_size,
             3,
             "select: with no sharded pool must return harvest_pool directly",
+        );
+    }
+
+    fn three_shard_router() -> ShardRouter {
+        let ids = vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)];
+        ShardRouter::new(ids.clone(), ids, ShardId::new(0))
+    }
+
+    #[test]
+    fn uncovered_writable_shards_names_every_writable_shard_the_worker_skips() {
+        let router = three_shard_router();
+        assert_eq!(
+            uncovered_writable_shards(&router, &[ShardId::new(0)]),
+            vec![1, 2],
+            "an explicitly narrowed worker must name every writable shard it drops",
+        );
+        assert_eq!(
+            uncovered_writable_shards(&router, &[ShardId::new(2), ShardId::new(0)]),
+            vec![1],
+            "the result is ascending regardless of assignment order",
+        );
+    }
+
+    #[test]
+    fn uncovered_writable_shards_is_empty_for_full_coverage() {
+        let router = three_shard_router();
+        let all = [ShardId::new(0), ShardId::new(1), ShardId::new(2)];
+        assert!(
+            uncovered_writable_shards(&router, &all).is_empty(),
+            "full coverage — the boot warning must stay silent",
+        );
+        // Auto-assignment derives from the pool, which is a superset of the
+        // writable set in any startable deployment, so it never warns.
+        let superset = [
+            ShardId::new(0),
+            ShardId::new(1),
+            ShardId::new(2),
+            ShardId::new(3),
+        ];
+        assert!(
+            uncovered_writable_shards(&router, &superset).is_empty(),
+            "covering more than the writable set must not warn",
+        );
+    }
+
+    #[test]
+    fn uncovered_writable_shards_ignores_readable_only_shards() {
+        // Shard 2 is readable (draining) but not writable: a worker that skips
+        // it must NOT be warned about, because no new work routes there.
+        let readable = vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)];
+        let writable = vec![ShardId::new(0), ShardId::new(1)];
+        let router = ShardRouter::new(readable, writable, ShardId::new(0));
+        assert!(
+            uncovered_writable_shards(&router, &[ShardId::new(0), ShardId::new(1)]).is_empty(),
+            "a drained readable-only shard is not an uncovered *writable* shard",
         );
     }
 }

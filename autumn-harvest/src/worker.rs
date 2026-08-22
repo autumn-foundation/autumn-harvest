@@ -236,6 +236,53 @@ pub struct WorkerRuntimeConfig {
 }
 
 impl WorkerRuntimeConfig {
+    /// Resolve an **empty** (auto) [`shard_assignments`] into the concrete set
+    /// of shards this worker will poll (issue #961, AC1).
+    ///
+    /// Empty means *auto*: cover every shard the configured
+    /// [`sharded_pool`](Self::sharded_pool) exposes, so an operator who adds a
+    /// shard without also editing `shard_assignments` still gets it drained
+    /// instead of silently stranding every workflow routed there. With no
+    /// sharded pool this resolves to `[ShardId::new(0)]`, byte-for-byte the
+    /// pre-#961 single-shard default (AC7).
+    ///
+    /// **Idempotent by construction** — a non-empty list (whether explicitly
+    /// configured or already auto-resolved) is left untouched, so
+    /// [`Worker::new`] and `runner.rs` may both call it without drifting or
+    /// double-applying.
+    ///
+    /// That idempotence is also why `From<WorkerConfig>` must **not** call it:
+    /// a runner assigns [`sharded_pool`](Self::sharded_pool) onto the runtime
+    /// config *after* the conversion, so resolving during the conversion would
+    /// see no pool, collapse "auto" to `[ShardId::new(0)]`, and then be a no-op
+    /// at every later call — permanently pinning a multi-shard worker to shard
+    /// 0, which is the exact bug issue #961 closes. Resolve only where the pool
+    /// is final.
+    ///
+    /// [`shard_assignments`]: Self::shard_assignments
+    #[cfg(feature = "db")]
+    pub fn resolve_shard_assignments(&mut self) {
+        let pool_shards: Vec<crate::types::ShardId> = self
+            .sharded_pool
+            .as_ref()
+            .map(super::shard::ShardedDbPool::shard_ids)
+            .unwrap_or_default();
+        self.shard_assignments = crate::builder::resolve_shard_assignments(
+            std::mem::take(&mut self.shard_assignments),
+            &pool_shards,
+        );
+    }
+
+    /// Non-`db` builds have no sharded pool, so auto always resolves to the
+    /// single-shard default.
+    #[cfg(not(feature = "db"))]
+    pub fn resolve_shard_assignments(&mut self) {
+        self.shard_assignments = crate::builder::resolve_shard_assignments(
+            std::mem::take(&mut self.shard_assignments),
+            &[],
+        );
+    }
+
     /// Validate this configuration.
     ///
     /// # Errors
@@ -345,6 +392,17 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             // directly. This `From` is the single choke point every worker's
             // config passes through on its way to the per-shard monitor
             // fan-out (issue #797).
+            //
+            // An **empty** list means "auto: cover every pool shard" (issue
+            // #961) and is deliberately left EMPTY here. Resolving at this
+            // point would be actively wrong: a runner assigns `sharded_pool`
+            // onto the *runtime* config **after** this conversion, so an early
+            // resolution would see `None`, collapse the "auto" sentinel to
+            // `[ShardId::new(0)]`, and — because resolution is idempotent on a
+            // non-empty list — permanently pin a multi-shard worker to shard 0.
+            // Resolution therefore happens only where the pool is final:
+            // `Worker::new` (and `runner.rs`, which resolves first so its
+            // coverage warning sees the effective set).
             shard_assignments: crate::builder::dedup_shard_assignments(cfg.shard_assignments),
             worker_heartbeat_interval: cfg.worker_heartbeat_interval,
             build_id: cfg.build_id,
@@ -4176,6 +4234,28 @@ pub const CAPABILITY_MISS_MIN_FLEET_STALE_SECS: i64 = 120;
 #[must_use]
 pub fn capability_miss_fleet_stale_secs(heartbeat_interval: Duration) -> i64 {
     worker_stale_secs(heartbeat_interval).max(CAPABILITY_MISS_MIN_FLEET_STALE_SECS)
+}
+
+/// Narrow a [`ShardId`](crate::types::ShardId) to the bounded `u16` used as the
+/// `shard` metric label (issue #961).
+///
+/// Every valid shard id fits: encodable ids are `0..=0xFFFE` and the
+/// `UNENCODED` sentinel is `0xFFFF`. An out-of-contract id — only reachable by
+/// constructing `ShardId::new(-1)` / `ShardId::new(70_000)` by hand and handing
+/// it to `ShardedDbPool::from_map`, which does not range-check its keys — would
+/// otherwise be silently merged into shard 0's series, inflating it while the
+/// real shard reads as flatlined (which the dashboard panel shows as
+/// *starvation*). Debug builds assert; release builds keep the pre-existing
+/// `unwrap_or(0)` convention rather than panicking a live poll loop.
+#[must_use]
+fn shard_metric_label(shard: crate::types::ShardId) -> u16 {
+    let raw = shard.as_i32();
+    debug_assert!(
+        u16::try_from(raw).is_ok(),
+        "shard id is outside the encodable range and would be reported as \
+         shard 0 on the harvest.shard.dispatched metric",
+    );
+    u16::try_from(raw).unwrap_or(0)
 }
 
 /// Whether a shard's poll loop may claim tasks, given that shard's pending
@@ -19260,6 +19340,17 @@ impl Worker {
     ///
     /// Returns [`HarvestError::Config`] if the config fails validation.
     pub fn new(config: WorkerRuntimeConfig, registry: Arc<HandlerRegistry>) -> HarvestResult<Self> {
+        // Resolve auto (empty) shard assignments against the pool that is now
+        // final (issue #961, AC1). `From<WorkerConfig>` deliberately does NOT
+        // run this — a runner assigns `sharded_pool` onto the runtime config
+        // *after* that conversion, so resolving there would permanently collapse
+        // the "auto" sentinel to `[ShardId(0)]`. This pass is idempotent, so a
+        // caller that already resolved (e.g. `HarvestRunner`) is unaffected, and
+        // a direct `Worker::new` caller that never went through the runner is
+        // still widened here. A non-empty list — whether operator-configured or
+        // already auto-resolved — is left untouched.
+        let mut config = config;
+        config.resolve_shard_assignments();
         config.validate()?;
 
         // Validate the history ceiling against the soft threshold from the registry.
@@ -19631,6 +19722,82 @@ impl Worker {
     /// Fleet presence (register + heartbeat + status) is written to **each**
     /// assigned shard's pool so that the shard-health readiness gate (Slice B)
     /// can see a covering live worker per shard.
+    /// Build one LISTEN/NOTIFY listener per assigned shard.
+    ///
+    /// A shard with no listener falls back to poll-interval dispatch latency,
+    /// which is correct but slower — a `NOTIFY` on the wrong database never
+    /// wakes us, so a listener is only ever built from a URL that provably
+    /// points at that shard's own database.
+    ///
+    /// The global `notification_database_url` pairs with the pool's **default**
+    /// shard, so it is a safe fallback for exactly that one shard and no other
+    /// — the same reasoning as the single-shard path's `global_safe` gate.
+    /// Without it, a deployment auto-widened onto the multi-shard path (issue
+    /// #961) would silently lose the NOTIFY wake-up it previously had on
+    /// shard 0.
+    async fn build_shard_listeners(
+        &self,
+        shard_targets: &[(crate::types::ShardId, DbPool)],
+    ) -> Vec<Option<crate::notify::QueueListener>> {
+        let default_shard = self
+            .config
+            .sharded_pool
+            .as_ref()
+            .map(crate::shard::ShardedDbPool::default_shard);
+        if self.config.shard_notification_database_urls.is_empty() {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                "harvest: multi-shard worker has no shard_notification_database_urls; \
+                 every shard other than the default falls back to poll-interval \
+                 dispatch latency. Set WorkerConfig::with_shard_notification_database_urls \
+                 to restore LISTEN/NOTIFY wake-ups per shard."
+            );
+        }
+
+        let mut shard_listeners: Vec<Option<crate::notify::QueueListener>> = Vec::new();
+        for (shard_id, _) in shard_targets {
+            let listener_url = self
+                .config
+                .shard_notification_database_urls
+                .iter()
+                .find(|(s, _)| s == shard_id)
+                .map(|(_, url)| url.as_str())
+                .or_else(|| {
+                    if default_shard == Some(*shard_id) {
+                        self.config.notification_database_url.as_deref()
+                    } else {
+                        None
+                    }
+                });
+            let listener = match listener_url {
+                Some(url) => {
+                    match crate::notify::QueueListener::connect(url, &self.config.queues).await {
+                        Ok(l) => {
+                            tracing::info!(
+                                worker_id = %self.config.worker_id,
+                                shard_id = %shard_id.as_i32(),
+                                "per-shard LISTEN/NOTIFY listener connected"
+                            );
+                            Some(l)
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                worker_id = %self.config.worker_id,
+                                shard_id = %shard_id.as_i32(),
+                                error = %error,
+                                "per-shard LISTEN/NOTIFY failed; shard will fall back to polling"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            shard_listeners.push(listener);
+        }
+        shard_listeners
+    }
+
     async fn run_multi_shard(
         &self,
         shard_targets: Vec<(crate::types::ShardId, DbPool)>,
@@ -19690,40 +19857,7 @@ impl Worker {
             })
             .collect();
 
-        // Build per-shard listeners from shard_notification_database_urls.
-        let mut shard_listeners: Vec<Option<crate::notify::QueueListener>> = Vec::new();
-        for (shard_id, _) in &shard_targets {
-            let listener_url = self
-                .config
-                .shard_notification_database_urls
-                .iter()
-                .find(|(s, _)| s == shard_id)
-                .map(|(_, url)| url.as_str());
-            let listener = if let Some(url) = listener_url {
-                match crate::notify::QueueListener::connect(url, &self.config.queues).await {
-                    Ok(l) => {
-                        tracing::info!(
-                            worker_id = %self.config.worker_id,
-                            shard_id = %shard_id.as_i32(),
-                            "per-shard LISTEN/NOTIFY listener connected"
-                        );
-                        Some(l)
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            worker_id = %self.config.worker_id,
-                            shard_id = %shard_id.as_i32(),
-                            error = %error,
-                            "per-shard LISTEN/NOTIFY failed; shard will fall back to polling"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            shard_listeners.push(listener);
-        }
+        let shard_listeners = self.build_shard_listeners(&shard_targets).await;
 
         self.run_poll_loop_multi(
             shard_targets.clone(),
@@ -19802,6 +19936,17 @@ impl Worker {
                 }
                 if self.poll_once(&shard_targets[idx].1).await {
                     any_claimed = true;
+                    // Per-shard dispatch counter (issue #961, AC5). Emitted
+                    // here rather than inside `poll_once`/`dispatch_task`
+                    // because a task row carries no `shard_id` column — "which
+                    // shard" *is* "which pool", and only the poll loop knows
+                    // which pool it just claimed from. `poll_once` returns
+                    // `true` exactly when it dispatched, so this counts
+                    // dispatches, not poll attempts.
+                    self.registry
+                        .telemetry()
+                        .metrics
+                        .record_shard_dispatched(shard_metric_label(shard_targets[idx].0));
                     // Advance start past the shard that just claimed so the
                     // next hot iteration tries the next shard first.
                     start_idx = (idx + 1) % n;
@@ -19982,7 +20127,22 @@ impl Worker {
             Arc::clone(&registration_pending),
         );
 
-        self.run_poll_loop(pool, listener, &registration_pending)
+        // The single-shard path resolves at most one shard target, and that
+        // target is always `shard_assignments[0]` (see the shard-target
+        // resolution in `run`). `shard_assignments` is non-empty by
+        // construction after `resolve_shard_assignments` (issue #961), so the
+        // fallback is unreachable in practice and only guards a hand-built
+        // `WorkerRuntimeConfig` that bypassed `Worker::new`.
+        //
+        // Match on the slice rather than calling `.first()`: diesel's
+        // query-DSL prelude is in scope and `.first()` on a `Vec` sends the
+        // trait solver into overflow (the same footgun documented at the
+        // shard-target resolution in `run`).
+        let poll_shard = match self.config.shard_assignments.as_slice() {
+            [shard, ..] => *shard,
+            [] => crate::types::ShardId::new(0),
+        };
+        self.run_poll_loop(pool, poll_shard, listener, &registration_pending)
             .await;
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
@@ -20517,6 +20677,7 @@ impl Worker {
     async fn run_poll_loop(
         &self,
         pool: &DbPool,
+        shard: crate::types::ShardId,
         mut listener: Option<crate::notify::QueueListener>,
         registration_pending: &AtomicBool,
     ) {
@@ -20535,6 +20696,14 @@ impl Worker {
             }
 
             if self.poll_once(pool).await {
+                // Per-shard dispatch counter (issue #961, AC5). Emitted on the
+                // single-shard path too so `harvest.shard.dispatched` is a
+                // uniform series across deployment shapes — a single-shard
+                // deployment simply reports one series, `{shard="0"}`.
+                self.registry
+                    .telemetry()
+                    .metrics
+                    .record_shard_dispatched(shard_metric_label(shard));
                 continue;
             }
 
@@ -23776,6 +23945,68 @@ mod tests {
             worker.register_in_fleet(&pool).await,
             "an unattempted registration must still arm the retry -- otherwise a \
              surviving row under a reused worker_id advertises the old build forever"
+        );
+    }
+
+    /// Issue #961 (AC1), regression guard for the ordering trap that made the
+    /// first cut of this feature a no-op.
+    ///
+    /// A runner assigns `sharded_pool` onto the **runtime** config *after*
+    /// `From<WorkerConfig>` has run. Because auto-resolution is idempotent on a
+    /// non-empty list, resolving during that conversion would collapse the
+    /// "auto" sentinel to `[ShardId::new(0)]` while the pool was still `None`,
+    /// and every later resolution would then be a no-op — permanently pinning a
+    /// multi-shard worker to shard 0, i.e. exactly the silent single-shard
+    /// drain #961 exists to close. So the conversion must leave the list empty
+    /// and `Worker::new` must be what widens it.
+    #[test]
+    fn auto_shard_assignments_resolve_after_the_runner_assigns_the_pool() {
+        let unreachable = |url: &str| -> DbPool {
+            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+                diesel_async::AsyncPgConnection,
+            >::new(url);
+            deadpool::managed::Pool::builder(manager)
+                .max_size(1)
+                .build()
+                .expect("pool builds without connecting")
+        };
+
+        // No explicit assignments -> "auto".
+        let mut cfg: WorkerRuntimeConfig = crate::builder::WorkerConfig::default().into();
+        assert!(
+            cfg.shard_assignments.is_empty(),
+            "`From<WorkerConfig>` must preserve the empty 'auto' sentinel; resolving there would see no pool and pin the worker to shard 0",
+        );
+
+        // The runner supplies the real pool only now.
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(
+            crate::types::ShardId::new(0),
+            unreachable("postgres://127.0.0.1:1/s0"),
+        );
+        pools.insert(
+            crate::types::ShardId::new(1),
+            unreachable("postgres://127.0.0.1:1/s1"),
+        );
+        pools.insert(
+            crate::types::ShardId::new(2),
+            unreachable("postgres://127.0.0.1:1/s2"),
+        );
+        cfg.sharded_pool = Some(crate::shard::ShardedDbPool::from_map(
+            pools,
+            crate::types::ShardId::new(0),
+        ));
+
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+        assert_eq!(
+            worker.config.shard_assignments,
+            vec![
+                crate::types::ShardId::new(0),
+                crate::types::ShardId::new(1),
+                crate::types::ShardId::new(2)
+            ],
+            "`Worker::new` must widen an auto assignment to every pool shard",
         );
     }
 
