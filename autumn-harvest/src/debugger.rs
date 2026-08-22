@@ -1947,8 +1947,12 @@ mod tests {
     /// in round 2.
     #[test]
     fn engine_minted_id_fields_match_the_event_enum() {
+        // Normalized to LF: a Windows checkout terminates the enum with
+        // `\r\n}\r\n`, so the `"\n}\n"` scan below would find nothing and the
+        // test would panic on every non-Unix runner rather than assert.
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/event.rs"))
-            .expect("event.rs is in this crate");
+            .expect("event.rs is in this crate")
+            .replace("\r\n", "\n");
         let start = source
             .find("pub enum WorkflowEvent")
             .expect("the event enum is declared");
