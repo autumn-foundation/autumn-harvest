@@ -293,9 +293,29 @@ commands to show, so naming `open_awaitables` without printing them would leave
 the operator no better off.
 
 Because a handler-free trace emits no commands, this arm compares the
-*history-derived* facts: event type, signal name, resolved payload, awaitable
-kind/name/opening index, version and patch gates, marker names and details, and
-the values of `Custom` side effects.
+*history-derived* facts. It does so in two layers:
+
+1. **Curated projections**, checked first because they produce the legible
+   field name you see in the report: event type, signal name, awaitable
+   kind/name/opening index, version and patch gates, marker names and details,
+   and the values of `Custom` side effects.
+2. **`event_facts`**, the completeness backstop: the *whole* recorded event,
+   serialized, with only per-run identity normalized away (below). A curated
+   list silently rots as the event enum grows, and a missed field means two
+   genuinely different histories compare **equal** — a false clean, the worst
+   thing a divergence-finding tool can do. `event_facts` is exhaustive by
+   construction, so anything layer 1 does not name is still caught:
+
+   ```
+   first divergence at step 1
+     the recorded histories differ (event_facts)
+
+     left  (before.json) event TimerStarted [not_replayed]
+         event_facts: {"data":{"duration_secs":30,"timer_id":"escalate"},"type":"TimerStarted"}
+
+     right (after.json) event TimerStarted [not_replayed]
+         event_facts: {"data":{"duration_secs":60,"timer_id":"escalate"},"type":"TimerStarted"}
+   ```
 
 **Per-run identity is normalized out.** Two independent recordings of the same
 scenario necessarily differ on freshly-minted values — activity and child

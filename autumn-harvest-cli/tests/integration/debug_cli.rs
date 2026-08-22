@@ -723,3 +723,35 @@ fn a_history_fact_divergence_shows_the_values_that_differ_not_just_the_field_nam
         "both sides' actual values must render, not just the field name:\n{out}"
     );
 }
+
+#[test]
+fn an_event_facts_divergence_renders_both_normalized_events() {
+    // `event_facts` is the completeness backstop: it fires for a semantic
+    // difference no curated projection names (here, a timer's duration). If the
+    // CLI did not render it, the operator would be told the histories differ
+    // and shown nothing — the exact failure mode the field vocabulary exists to
+    // avoid. Codex round 1 found this class as a *false clean*; this pins both
+    // the detection and the rendering.
+    let timer = |secs: u64| {
+        vec![
+            started(),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("escalate"),
+                duration_secs: secs,
+            },
+        ]
+    };
+    let left = trace_of(&timer(30));
+    let right = trace_of(&timer(60));
+    let diff = autumn_harvest::debugger::diff_traces(&left, &right);
+
+    let out = render_diff(&diff, "before.json", "after.json");
+    assert!(
+        out.contains("event_facts"),
+        "the backstop field must be named:\n{out}"
+    );
+    assert!(
+        out.contains("30") && out.contains("60"),
+        "both durations must render so the operator can see what moved:\n{out}"
+    );
+}

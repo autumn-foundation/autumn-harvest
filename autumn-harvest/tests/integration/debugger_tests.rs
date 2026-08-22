@@ -464,6 +464,220 @@ async fn diff_identifies_the_first_divergent_command_step() {
     assert!(right_step.commands[0].summary.contains("step_b"));
 }
 
+// ── Codex round 1 regressions: dispatch options are part of a command's identity
+//
+// A `CommandSnapshot` is the diff key. If it carries only a command's *name*
+// and *input*, two builds that dispatch the same activity with different
+// scheduling options compare EQUAL and the debugger reports a false clean —
+// the single worst outcome for a divergence-finding tool. These pin the
+// classes Codex found (`ScheduleExternalActivity` queue/deadline,
+// `ScheduleActivity` per-call retry/timeout overrides), which the summary
+// label alone does not distinguish.
+
+fn external_on_queue_a<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_external("hand_off", json!({}), "queue-a", 3600)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+fn external_on_queue_b<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Same activity, same input, same deadline — only the queue moved.
+        ctx.execute_activity_external("hand_off", json!({}), "queue-b", 3600)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+fn external_with_short_deadline<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Same activity, same input, same queue — only the deadline moved.
+        ctx.execute_activity_external("hand_off", json!({}), "queue-a", 60)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+async fn diff_two_builds(
+    name: &str,
+    events: Vec<WorkflowEvent>,
+    left: WorkflowHandlerFn,
+    right: WorkflowHandlerFn,
+) -> Option<autumn_harvest::debugger::TraceDivergence> {
+    let snap = snapshot(name, events);
+    let l = debugger(name, left)
+        .trace_snapshot(snap.clone())
+        .await
+        .expect("registered");
+    let r = debugger(name, right)
+        .trace_snapshot(snap)
+        .await
+        .expect("registered");
+    diff_traces(&l, &r).divergence
+}
+
+#[tokio::test]
+async fn a_queue_only_change_on_an_external_activity_is_a_divergence() {
+    let div = diff_two_builds(
+        "ext",
+        vec![started()],
+        external_on_queue_a,
+        external_on_queue_b,
+    )
+    .await
+    .expect("routing the same external activity to a different queue must diverge");
+
+    assert_eq!(div.step_index, 0);
+    assert!(
+        matches!(div.kind, DiffKind::CommandMismatch { command_index: 0 }),
+        "expected a command mismatch at command 0, got {:?}",
+        div.kind
+    );
+}
+
+#[tokio::test]
+async fn a_deadline_only_change_on_an_external_activity_is_a_divergence() {
+    let div = diff_two_builds(
+        "ext",
+        vec![started()],
+        external_on_queue_a,
+        external_with_short_deadline,
+    )
+    .await
+    .expect("changing an external activity's schedule-to-close deadline must diverge");
+
+    assert!(
+        matches!(div.kind, DiffKind::CommandMismatch { command_index: 0 }),
+        "expected a command mismatch at command 0, got {:?}",
+        div.kind
+    );
+}
+
+fn activity_with_long_timeout<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw_with_opts(
+            "step_a",
+            json!({}),
+            "default",
+            None,
+            Some(std::time::Duration::from_secs(300)),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+fn activity_with_short_timeout<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Same name, same queue, same input — only start-to-close moved, so the
+        // summary label (`step_a -> default`) is identical on both sides.
+        ctx.execute_activity_raw_with_opts(
+            "step_a",
+            json!({}),
+            "default",
+            None,
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+#[tokio::test]
+async fn a_start_to_close_only_change_on_an_activity_is_a_divergence() {
+    let left = debugger("two_step", activity_with_long_timeout)
+        .trace_snapshot(snapshot_of(vec![started()]))
+        .await
+        .expect("registered");
+    let right = debugger("two_step", activity_with_short_timeout)
+        .trace_snapshot(snapshot_of(vec![started()]))
+        .await
+        .expect("registered");
+
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("changing a per-call start-to-close override must diverge");
+    assert!(
+        matches!(div.kind, DiffKind::CommandMismatch { command_index: 0 }),
+        "expected a command mismatch at command 0, got {:?}",
+        div.kind
+    );
+    // The summary alone cannot tell these apart — the payload is what carries
+    // the difference, so a summary-only snapshot would report a false clean.
+    let l = div.left.expect("both sides present");
+    let r = div.right.expect("both sides present");
+    assert_eq!(
+        l.commands[0].summary, r.commands[0].summary,
+        "this regression is only meaningful while the summaries are identical"
+    );
+    assert_ne!(l.commands[0].payload, r.commands[0].payload);
+}
+
+// ── Codex round 1 regression: a mutex park is an open awaitable ─────────────
+
+fn mutex_park<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _guard = ctx
+            .mutex("ledger:acct-1")
+            .acquire()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+#[tokio::test]
+async fn a_mutex_park_is_reported_as_an_open_awaitable() {
+    // A parked `ctx.mutex(k).acquire()` has no opening *event* — the waiter row
+    // lives in `harvest_mutex_waiters` and only the grant records
+    // `MutexGranted` — so it is visible solely as a frontier `AcquireMutex`
+    // command. Without synthesis the debugger would show a mutex-blocked run as
+    // waiting on nothing at all.
+    let trace = debugger("mutex_wf", mutex_park)
+        .trace_snapshot(snapshot("mutex_wf", vec![started()]))
+        .await
+        .expect("registered");
+
+    let step = &trace.steps[0];
+    assert!(
+        step.commands.iter().any(|c| c.kind == "AcquireMutex"),
+        "the run must park on AcquireMutex, got {:?}",
+        step.commands
+    );
+    let mutex = step
+        .open_awaitables
+        .iter()
+        .find(|a| a.kind == AwaitableKind::Mutex)
+        .expect("a parked mutex acquire must appear among the open awaitables");
+    assert_eq!(mutex.name.as_deref(), Some("ledger:acct-1"));
+    assert_eq!(mutex.opened_at, 0);
+}
+
 // ── Success metric: the ≥10-scenario divergence corpus ──────────────────────
 //
 // Issue #949's success metric: "On a seeded corpus of ≥10 divergence scenarios
@@ -974,8 +1188,11 @@ fn a_renamed_activity_diverges_at_the_scheduling_step() {
 
 #[test]
 fn a_changed_activity_input_diverges_at_the_scheduling_step() {
-    // The input rides `resolved_payload`, which is application data and is
-    // therefore compared verbatim (never normalized away).
+    // The input is application data — a semantic field of `ActivityScheduled`
+    // that is compared verbatim (never normalized away). It is caught by
+    // `event_facts`, the exhaustive whole-event backstop, rather than by one of
+    // the curated projections, which is exactly the point: no curated list has
+    // to remember `input`.
     let left = handler_free_trace(&fixture_pair_events("charge"));
     let mut right_events = fixture_pair_events("charge");
     if let WorkflowEvent::ActivityScheduled { input, .. } = &mut right_events[1] {
@@ -987,8 +1204,8 @@ fn a_changed_activity_input_diverges_at_the_scheduling_step() {
         .expect("a changed input is a real difference");
     assert_eq!(div.step_index, 1);
     assert!(
-        matches!(div.kind, DiffKind::HistoryFacts { field } if field == "resolved_payload"),
-        "expected a resolved_payload difference, got {:?}",
+        matches!(div.kind, DiffKind::HistoryFacts { field } if field == "event_facts"),
+        "expected an event_facts difference, got {:?}",
         div.kind
     );
 }
@@ -1055,10 +1272,11 @@ fn a_custom_side_effect_value_is_compared_verbatim() {
     let div = diff_traces(&left, &right)
         .divergence
         .expect("a changed custom side effect is a real difference");
-    // `resolved_payload` surfaces the same value one field earlier, so that is
-    // the field reported — either way it is the custom value, not normalized.
+    // Reported as `side_effects`: that curated projection compares a `Custom`
+    // value verbatim and runs before the `event_facts` backstop, so the more
+    // legible field name wins. Either way the custom value is compared.
     assert!(
-        matches!(div.kind, DiffKind::HistoryFacts { field } if field == "resolved_payload"),
+        matches!(div.kind, DiffKind::HistoryFacts { field } if field == "side_effects"),
         "expected the custom value to be compared, got {:?}",
         div.kind
     );
@@ -1283,6 +1501,7 @@ const fn bare_step(
         side_effects: Vec::new(),
         markers: Vec::new(),
         resolved_payload: None,
+        event_facts: serde_json::Value::Null,
         signal_name: None,
         divergence: None,
     }

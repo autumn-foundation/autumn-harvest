@@ -122,11 +122,26 @@ pub fn run(trace: &ReplayTrace, cursor: usize) -> Result<(), CliError> {
         return Ok(());
     }
 
+    // Setup is rolled back step by step on failure. A `?` straight out of any
+    // of these would return *past* the restore block at the bottom and leave
+    // the user's shell in raw mode (and possibly on the alternate screen) —
+    // on a partially-supported terminal, a debugger that wrecks the shell it
+    // was launched from is worse than the bug being chased.
     enable_raw_mode().map_err(terminal_error("enable raw mode"))?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).map_err(terminal_error("enter alternate screen"))?;
+    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+        disable_raw_mode().unwrap_or_default();
+        return Err(terminal_error("enter alternate screen")(e));
+    }
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).map_err(terminal_error("create terminal"))?;
+    let mut terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(e) => {
+            disable_raw_mode().unwrap_or_default();
+            execute!(io::stdout(), LeaveAlternateScreen).unwrap_or_default();
+            return Err(terminal_error("create terminal")(e));
+        }
+    };
 
     // A panic inside the loop would unwind past the restore below and leave the
     // user's shell in raw mode — so restore from the panic hook as well.

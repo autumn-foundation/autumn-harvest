@@ -292,6 +292,14 @@ pub struct DebugStep {
     /// envelope; the debugger never decodes and never errors on one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_payload: Option<Value>,
+    /// The event's complete semantic content with per-run identity normalized
+    /// out — the key two fixture histories are diffed on.
+    ///
+    /// `resolved_payload` above is a *display* projection; this is the
+    /// comparison key, and it is exhaustive by construction (it is the
+    /// serialized event), so a `WorkflowEvent` field this debugger has never
+    /// heard of still participates in the diff. See [`normalized_event_facts`].
+    pub event_facts: Value,
     /// The signal name, when this step consumed a `SignalReceived` event.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal_name: Option<String>,
@@ -357,6 +365,7 @@ impl ReplayTrace {
                 side_effects: acc.side_effects.clone(),
                 markers: acc.markers.clone(),
                 resolved_payload: resolved_payload(event),
+                event_facts: normalized_event_facts(event),
                 signal_name: signal_name_of(event),
                 divergence: None,
             });
@@ -724,8 +733,9 @@ fn history_fact_diff(l: &DebugStep, r: &DebugStep) -> Option<&'static str> {
         patch_gates: l_patches,
         side_effects: l_side_effects,
         markers: l_markers,
-        // Read via `comparable_payload` below, which suppresses per-run draws.
+        // A display projection; `event_facts` is the comparison key.
         resolved_payload: _,
+        event_facts: l_facts,
         signal_name: l_signal,
         // Code-derived: a divergence is a code-vs-history mismatch, not a
         // property of the recording. `step_diff_kind` owns it.
@@ -737,9 +747,6 @@ fn history_fact_diff(l: &DebugStep, r: &DebugStep) -> Option<&'static str> {
     }
     if l_signal != &r.signal_name {
         return Some("signal_name");
-    }
-    if comparable_payload(l) != comparable_payload(r) {
-        return Some("resolved_payload");
     }
     if awaitable_shapes(l_open) != awaitable_shapes(&r.open_awaitables) {
         return Some("open_awaitables");
@@ -756,26 +763,19 @@ fn history_fact_diff(l: &DebugStep, r: &DebugStep) -> Option<&'static str> {
     if l_markers != &r.markers {
         return Some("markers");
     }
-    None
-}
-
-/// The step's resolved payload, unless the step *is* a non-deterministic
-/// side-effect draw.
-///
-/// A `SideEffectRecorded{Now|Uuid|Random}` surfaces its freshly-drawn value as
-/// the step's `resolved_payload`, so comparing it verbatim would reintroduce
-/// exactly the per-run noise [`side_effect_shapes`] normalizes away — stating
-/// the rule in one place keeps the two from drifting apart. A `Custom` side
-/// effect is application data and is still compared.
-fn comparable_payload(step: &DebugStep) -> Option<&Value> {
-    let is_nondeterministic_draw = step
-        .side_effects
-        .iter()
-        .any(|e| e.event_index == step.index && e.kind != "custom");
-    if is_nondeterministic_draw {
-        return None;
+    // Last, as the completeness backstop. The projections above are *curated*:
+    // each names a specific field, which is what makes the report legible to a
+    // human ("open_awaitables differ" beats "the events differ"). But a curated
+    // list is exactly the thing that silently rots as `WorkflowEvent` grows —
+    // the hole Codex found, where a semantic field nobody projected made two
+    // genuinely different histories compare EQUAL. `event_facts` is the whole
+    // serialized event with only per-run identity normalized away, so it is
+    // exhaustive by construction and catches anything the curated checks miss.
+    // Ordering it last keeps the good diagnostics and closes the hole.
+    if l_facts != &r.event_facts {
+        return Some("event_facts");
     }
-    step.resolved_payload.as_ref()
+    None
 }
 
 /// Project open awaitables onto their comparable shape, dropping the per-run
@@ -783,12 +783,13 @@ fn comparable_payload(step: &DebugStep) -> Option<&Value> {
 fn awaitable_shapes(awaitables: &[OpenAwaitable]) -> Vec<(AwaitableKind, Option<&str>, usize)> {
     awaitables
         .iter()
-        // `AwaitableKind::Signal` is synthesized from a frontier
-        // `WaitForSignal` command, so it is *code*-derived, not a recorded
-        // history fact. Comparing it here would report a code difference as
-        // "the recorded histories differ"; `step_diff_kind`'s command
-        // comparison owns it and sees the same signal name.
-        .filter(|a| a.kind != AwaitableKind::Signal)
+        // `AwaitableKind::Signal` and `AwaitableKind::Mutex` are synthesized
+        // from frontier `WaitForSignal`/`AcquireMutex` commands, so they are
+        // *code*-derived, not recorded history facts. Comparing them here
+        // would report a code difference as "the recorded histories differ";
+        // `step_diff_kind`'s command comparison owns them and sees the same
+        // signal name / mutex key.
+        .filter(|a| !matches!(a.kind, AwaitableKind::Signal | AwaitableKind::Mutex))
         .map(|a| (a.kind, a.name.as_deref(), a.opened_at))
         .collect()
 }
@@ -1020,21 +1021,29 @@ impl ReplayDebugger {
                 .await;
             step.outcome = replayed.outcome;
             step.divergence = replayed.divergence;
-            // AC1 requires signal waits among the open awaitables, but a signal
-            // wait has no *opening event* — it exists only as a frontier
-            // `WaitForSignal` command. Synthesize it here, where the commands
-            // are known, so "why is this run parked?" is answerable for a
-            // signal park and `history_fact_diff`'s `open_awaitables`
-            // comparison can see a changed signal name.
+            // AC1 requires signal waits among the open awaitables, but some
+            // parks have no *opening event* — they exist only as a frontier
+            // command. A `wait_for_signal` park emits `WaitForSignal`, and a
+            // `ctx.mutex(k).acquire()` park emits `AcquireMutex` (its waiter
+            // row lives in `harvest_mutex_waiters`; only the *grant* records a
+            // `MutexGranted` event, issue #691). Synthesize both here, where
+            // the commands are known, so "why is this run parked?" is
+            // answerable for either and `history_fact_diff`'s
+            // `open_awaitables` comparison can see a changed name. The
+            // command → kind mapping mirrors `awaitables::…` so the debugger
+            // and the operator-facing open-awaitables report agree.
             for command in &replayed.commands {
-                if command.kind == "WaitForSignal" {
-                    step.open_awaitables.push(OpenAwaitable {
-                        kind: AwaitableKind::Signal,
-                        name: Some(command.summary.clone()),
-                        id: None,
-                        opened_at: step.index,
-                    });
-                }
+                let kind = match command.kind {
+                    "WaitForSignal" => AwaitableKind::Signal,
+                    "AcquireMutex" => AwaitableKind::Mutex,
+                    _ => continue,
+                };
+                step.open_awaitables.push(OpenAwaitable {
+                    kind,
+                    name: Some(command.summary.clone()),
+                    id: None,
+                    opened_at: step.index,
+                });
             }
             step.commands = replayed.commands;
         }
@@ -1391,6 +1400,70 @@ fn resolved_payload(event: &WorkflowEvent) -> Option<Value> {
     }
 }
 
+/// The event's **complete semantic content**, with per-run identity normalized
+/// out — the key `history_fact_diff` compares two fixture histories on.
+///
+/// # Why the whole event rather than a projection
+///
+/// The first cut compared a hand-written [`resolved_payload`] projection, whose
+/// `_ => None` arm silently swallowed every variant it did not enumerate. Two
+/// histories differing only in a `TimerStarted { duration_secs }` (30 vs 60) or
+/// an `ActivityFailed { error }` therefore compared **equal**, and
+/// `harvest debug diff` exited `0` — a false green on a documented CI gate, and
+/// on a divergence-finding tool the worst possible failure. Serializing the
+/// event makes the comparison exhaustive **by construction**: a `WorkflowEvent`
+/// variant added later carries its fields into the diff with no edit here, so
+/// the hole cannot reopen.
+///
+/// # What is normalized away, and why only at the top level
+///
+/// Two *independent recordings* of the same scenario necessarily differ on
+/// values minted per run. Those are stripped from the top level of the event's
+/// `data` object only:
+///
+/// * any UUID-valued field — `activity_id`, `child_id`, `new_exec_id`, and
+///   every `*_id` the engine mints;
+/// * `timestamp`;
+/// * the recorded `value` of a non-deterministic side-effect draw
+///   (`Now`/`Uuid`/`Random`, issue #384) — its `kind` and `name` still compare.
+///
+/// Top-level *only* is load-bearing: engine identity lives there, while
+/// application data lives nested under `input`/`output`/`payload`/`details`,
+/// where a UUID is real business data a diff must not discard.
+fn normalized_event_facts(event: &WorkflowEvent) -> Value {
+    /// Stand-in for a stripped per-run value. A single shared marker keeps two
+    /// recordings comparing equal on the field while leaving it visibly
+    /// present, rather than deleting the key (which would make "absent" and
+    /// "normalized" indistinguishable).
+    const NORMALIZED: &str = "<per-run>";
+
+    let Ok(mut value) = serde_json::to_value(event) else {
+        // `WorkflowEvent` is the persisted wire type, so this is unreachable in
+        // practice; degrade to "no facts" rather than panicking a debugger.
+        return Value::Null;
+    };
+    let Some(data) = value.get_mut("data").and_then(Value::as_object_mut) else {
+        return value;
+    };
+
+    let nondeterministic_draw = data
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind != "Custom");
+
+    for (key, slot) in data.iter_mut() {
+        let is_per_run = key == "timestamp"
+            || (nondeterministic_draw && key == "value")
+            || slot
+                .as_str()
+                .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok());
+        if is_per_run {
+            *slot = Value::String(NORMALIZED.to_string());
+        }
+    }
+    value
+}
+
 /// The workflow's input, read from the recorded `WorkflowStarted` event.
 fn workflow_input(events: &[WorkflowEvent]) -> Value {
     events
@@ -1507,22 +1580,92 @@ fn render_command(command: &WorkflowCommand) -> CommandSnapshot {
     }
 }
 
-/// The command's exact input/payload value, where it carries one.
+/// The command's exact semantic content, where it carries any.
 ///
 /// This is the **identity** half of a [`CommandSnapshot`]: it is never
 /// truncated, so a divergence deep inside a large payload is caught exactly.
+///
+/// # Every semantic field, not just the input
+///
+/// A dispatch command carries more intent than its input: the queue it routes
+/// to, its timeout and retry overrides, a detached child's close policy, a
+/// signal's idempotency key. Projecting only `input` made two builds that
+/// differ *only* in routing or timeout compare **equal**, so `diff_traces`
+/// reported them clean — a false "no divergence" on the exact class of change
+/// (a re-queued or re-timed activity) this tool exists to catch.
+///
+/// What is deliberately **excluded** is per-run identity that carries no code
+/// intent and would differ between any two runs: freshly-minted
+/// `activity_id` / `child_id` / `signal_id` / `cancel_id` / `await_id`
+/// execution ids, the external-activity `token`, a mutex `lock_seq` fencing
+/// token, and the replay-bookkeeping flags (`already_scheduled`,
+/// `already_requested`, `failed_attempts`, `last_error`) that are recovered
+/// from history rather than chosen by the code.
 fn command_payload(command: &WorkflowCommand) -> Option<Value> {
     match command {
-        WorkflowCommand::ScheduleActivity { input, .. }
-        | WorkflowCommand::RunLocalActivity { input, .. }
-        | WorkflowCommand::ScheduleExternalActivity { input, .. }
-        | WorkflowCommand::StartChildWorkflow { input, .. }
-        | WorkflowCommand::SpawnDetachedChildWorkflow { input, .. }
+        // Every semantic dispatch field; ids and channels excluded (see above).
+        WorkflowCommand::ScheduleActivity {
+            input,
+            queue,
+            retry_policy_override,
+            start_to_close_override,
+            schedule_to_start_override,
+            session_id,
+            session_worker_id,
+            ..
+        } => Some(serde_json::json!({
+            "input": input,
+            "queue": queue,
+            "retry_policy": retry_policy_override,
+            "start_to_close_secs": start_to_close_override.map(|d| d.as_secs()),
+            "schedule_to_start_secs": schedule_to_start_override.map(|d| d.as_secs()),
+            "session_id": session_id.as_ref().map(ToString::to_string),
+            "session_worker_id": session_worker_id.as_ref().map(ToString::to_string),
+        })),
+        WorkflowCommand::ScheduleExternalActivity {
+            input,
+            queue,
+            schedule_to_close_secs,
+            ..
+        } => Some(serde_json::json!({
+            "input": input,
+            "queue": queue,
+            "schedule_to_close_secs": schedule_to_close_secs,
+        })),
+        WorkflowCommand::RunLocalActivity {
+            input,
+            start_to_close,
+            retry_policy,
+            ..
+        } => Some(serde_json::json!({
+            "input": input,
+            "start_to_close_secs": start_to_close.map(|d| d.as_secs()),
+            "retry_policy": retry_policy,
+        })),
+        WorkflowCommand::SpawnDetachedChildWorkflow {
+            input,
+            parent_close_policy,
+            ..
+        } => Some(serde_json::json!({
+            "input": input,
+            "parent_close_policy": parent_close_policy,
+        })),
+        WorkflowCommand::SignalExternalWorkflow {
+            payload,
+            idempotency_key,
+            ..
+        } => Some(serde_json::json!({
+            "payload": payload,
+            "idempotency_key": idempotency_key,
+        })),
+        WorkflowCommand::ArmTimer { for_await, .. } => {
+            Some(serde_json::json!({ "for_await": for_await }))
+        }
+        WorkflowCommand::StartChildWorkflow { input, .. }
         | WorkflowCommand::ContinueAsNew { input, .. } => Some(input.clone()),
         WorkflowCommand::RecordMarker { details, .. } => Some(details.clone()),
         WorkflowCommand::RecordSideEffect { value, .. } => Some(value.clone()),
-        WorkflowCommand::SignalExternalWorkflow { payload, .. }
-        | WorkflowCommand::PublishProgress { chunk: payload, .. }
+        WorkflowCommand::PublishProgress { chunk: payload, .. }
         | WorkflowCommand::Complete { output: payload } => Some(payload.clone()),
         WorkflowCommand::UpsertSearchAttributes { patch, .. } => serde_json::to_value(patch).ok(),
         WorkflowCommand::SetCurrentDetails {
@@ -1550,7 +1693,6 @@ fn command_payload(command: &WorkflowCommand) -> Option<Value> {
         // differ on, so `None` here cannot hide a divergence.
         WorkflowCommand::WaitForActivity { .. }
         | WorkflowCommand::StartTimer { .. }
-        | WorkflowCommand::ArmTimer { .. }
         | WorkflowCommand::CancelTimer { .. }
         | WorkflowCommand::WaitForSignal { .. }
         | WorkflowCommand::AcquireMutex { .. }

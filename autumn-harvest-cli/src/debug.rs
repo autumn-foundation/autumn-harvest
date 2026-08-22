@@ -414,10 +414,6 @@ fn history_fact_line(step: &DebugStep, field: &str) -> String {
     let value = match field {
         "event_type" => step.event_type.to_string(),
         "signal_name" => step.signal_name.clone().unwrap_or_else(|| "<none>".into()),
-        "resolved_payload" => step
-            .resolved_payload
-            .as_ref()
-            .map_or_else(|| "<none>".into(), compact),
         "open_awaitables" => {
             if step.open_awaitables.is_empty() {
                 "<none>".into()
@@ -467,6 +463,12 @@ fn history_fact_line(step: &DebugStep, field: &str) -> String {
             .map(|m| format!("{}={}", m.name, compact(&m.details)))
             .collect::<Vec<_>>()
             .join(", "),
+        // The whole recorded event with per-run identity (uuids, timestamps,
+        // non-deterministic draws) normalized to `<per-run>`. This is the
+        // backstop field, so it fires for any semantic difference no curated
+        // projection names — printing it is what lets the operator SEE which
+        // part of the event moved.
+        "event_facts" => compact(&step.event_facts),
         // `history_fact_diff` owns the field vocabulary; a new field name added
         // there renders as "unavailable" rather than silently as "<none>",
         // which would read as a real (empty) value.
