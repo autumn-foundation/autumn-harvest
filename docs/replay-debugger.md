@@ -113,15 +113,24 @@ harvest debug replay order_flow.json --break-at-activity charge_card
 ```
 
 ```
+… the overview table above, then:
+
 breakpoint hit at step 3
 
 step 3/8  event ActivityScheduled  [not_replayed]
+  pending commands: <unavailable — no workflow handler registered; use the library API, see docs/replay-debugger.md>
 
   open awaitables:
-    activity         charge_card                   opened at event 3
+    activity         charge_card                  opened at event 3
 
   resolved payload: {"amount_cents":4999,"currency":"USD"}
 ```
+
+A breakpoint hit prints the **whole overview first**, so you keep the shape of
+the run in view while looking at one step of it. And note the `pending commands`
+line: this is the handler-free arm (see [the two arms](#the-two-arms)) — the
+step's *history-derived* facts are all there, but "what does the code do next"
+needs your workflow code, which is what step 5 moves to.
 
 `--break-at-event-type`, `--break-at-index` and `--break-at-signal` are the other
 three forms. They are alternatives, not a conjunction — passing two is rejected
@@ -263,8 +272,25 @@ The CLI's `diff` compares two **recordings** rather than two builds:
 harvest debug diff before.json after.json
 ```
 
+```
+first divergence at step 3
+  left  (before.json): 9 steps
+  right (after.json): 9 steps
+
+  the recorded histories differ (open_awaitables)
+
+  left  (before.json) event ActivityScheduled [not_replayed]
+      open_awaitables: activity charge_card (opened at 3)
+
+  right (after.json) event ActivityScheduled [not_replayed]
+      open_awaitables: activity fraud_check (opened at 3)
+```
+
 It exits `1` when a divergence is found, mirroring `diff(1)`'s "differences
-found", so it drops straight into a CI pipeline.
+found", so it drops straight into a CI pipeline. Both sides render the **value**
+of the field that differs, not just its name — a handler-free trace has no
+commands to show, so naming `open_awaitables` without printing them would leave
+the operator no better off.
 
 Because a handler-free trace emits no commands, this arm compares the
 *history-derived* facts: event type, signal name, resolved payload, awaitable

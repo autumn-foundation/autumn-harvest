@@ -393,13 +393,95 @@ pub fn render_diff(diff: &TraceDiff, left_label: &str, right_label: &str) -> Str
     };
     out.push_str(&kind_line);
 
-    out.push_str(&side("left ", left_label, div.left.as_ref()));
-    out.push_str(&side("right", right_label, div.right.as_ref()));
+    // When the divergence is a *history fact*, name the field AND show it. The
+    // handler-free CLI arm emits no commands at all, so rendering only
+    // commands would print "the recorded histories differ (open_awaitables)"
+    // followed by two identical `<no pending commands>` lines — naming a
+    // difference the operator cannot see is worse than useless on a
+    // divergence-finding tool.
+    let field = match &div.kind {
+        DiffKind::HistoryFacts { field } => Some(*field),
+        _ => None,
+    };
+    out.push_str(&side("left ", left_label, div.left.as_ref(), field));
+    out.push_str(&side("right", right_label, div.right.as_ref(), field));
     out
 }
 
+/// Render the one history-derived field a [`DiffKind::HistoryFacts`]
+/// divergence named, for a single side.
+fn history_fact_line(step: &DebugStep, field: &str) -> String {
+    let value = match field {
+        "event_type" => step.event_type.to_string(),
+        "signal_name" => step.signal_name.clone().unwrap_or_else(|| "<none>".into()),
+        "resolved_payload" => step
+            .resolved_payload
+            .as_ref()
+            .map_or_else(|| "<none>".into(), compact),
+        "open_awaitables" => {
+            if step.open_awaitables.is_empty() {
+                "<none>".into()
+            } else {
+                step.open_awaitables
+                    .iter()
+                    .map(|a| {
+                        format!(
+                            "{} {} (opened at {})",
+                            a.kind.as_str(),
+                            a.name.as_deref().or(a.id.as_deref()).unwrap_or("<unnamed>"),
+                            a.opened_at
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        }
+        "version_gates" => step
+            .version_gates
+            .iter()
+            .map(|(id, v)| format!("{id}={v}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        "patch_gates" => step
+            .patch_gates
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", "),
+        "side_effects" => step
+            .side_effects
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}:{}={}",
+                    e.kind,
+                    e.name.as_deref().unwrap_or("-"),
+                    compact(&e.value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        "markers" => step
+            .markers
+            .iter()
+            .map(|m| format!("{}={}", m.name, compact(&m.details)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        // `history_fact_diff` owns the field vocabulary; a new field name added
+        // there renders as "unavailable" rather than silently as "<none>",
+        // which would read as a real (empty) value.
+        _ => "<not rendered by this CLI version>".to_string(),
+    };
+    let value = if value.is_empty() {
+        "<none>".to_string()
+    } else {
+        value
+    };
+    format!("      {field}: {value}\n")
+}
+
 /// Render one side of a divergence.
-fn side(prefix: &str, label: &str, step: Option<&DebugStep>) -> String {
+fn side(prefix: &str, label: &str, step: Option<&DebugStep>, field: Option<&str>) -> String {
     let Some(step) = step else {
         return format!("\n  {prefix} ({label}): <no step at this index>\n");
     };
@@ -408,6 +490,12 @@ fn side(prefix: &str, label: &str, step: Option<&DebugStep>) -> String {
         step.event_type,
         step.outcome.as_str()
     );
+    if let Some(field) = field {
+        out.push_str(&history_fact_line(step, field));
+        // The named field is the whole story for a history-fact divergence;
+        // a handler-free trace has no commands to add.
+        return out;
+    }
     if step.commands.is_empty() {
         out.push_str("      <no pending commands>\n");
     }

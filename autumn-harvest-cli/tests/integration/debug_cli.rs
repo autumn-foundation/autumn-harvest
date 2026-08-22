@@ -701,3 +701,25 @@ fn step_detail_renders_the_resolved_payload() {
         "the scheduled activity's input must render as the resolved payload:\n{out}"
     );
 }
+
+#[test]
+fn a_history_fact_divergence_shows_the_values_that_differ_not_just_the_field_name() {
+    // The handler-free CLI arm emits no commands, so a diff that rendered only
+    // commands would print "the recorded histories differ (open_awaitables)"
+    // followed by two identical `<no pending commands>` lines — naming a
+    // difference the operator cannot see. On a divergence-finding tool that is
+    // worse than useless.
+    let left = trace_of(&base_events());
+    let right = trace_of(&renamed_events());
+    let diff = autumn_harvest::debugger::diff_traces(&left, &right);
+
+    let out = render_diff(&diff, "before.json", "after.json");
+    assert!(
+        out.contains("open_awaitables"),
+        "the differing field must be named:\n{out}"
+    );
+    assert!(
+        out.contains("charge") && out.contains("charge_v2"),
+        "both sides' actual values must render, not just the field name:\n{out}"
+    );
+}
