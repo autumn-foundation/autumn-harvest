@@ -290,6 +290,9 @@ jobs:
       - name: Run child_with_timeout example tests (issue #779)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example child_with_timeout
+      - name: Run replay_debugger example tests (issue #949)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features debugger --example replay_debugger
       - name: Run long_lived_entity_deadline example tests (issue #772)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example long_lived_entity_deadline

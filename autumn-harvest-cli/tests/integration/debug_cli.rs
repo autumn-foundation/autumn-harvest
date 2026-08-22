@@ -1,0 +1,703 @@
+//! Integration tests for the `harvest debug` subcommand (issue #949).
+//!
+//! Black-box tests over the crate's public debug surface: they write
+//! `HistorySnapshot` JSON fixtures to disk and drive the pure
+//! breakpoint/focus/render helpers plus `run_replay` / `run_diff` end to end.
+//!
+//! These exercise the **handler-free** arm of the debugger (everything except
+//! per-step pending commands). Per-step commands need registered workflow code
+//! and are covered by `autumn-harvest`'s `debugger_tests`.
+
+use std::path::{Path, PathBuf};
+
+use autumn_harvest::debugger::{Breakpoint, ReplayTrace};
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId};
+use autumn_harvest_cli::debug::{
+    DebugFormat, FocusResolution, render_diff, render_step_detail, render_trace_overview,
+    resolve_breakpoint, resolve_focus, run_diff, run_replay,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fixtures
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn started() -> WorkflowEvent {
+    WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now())
+}
+
+/// `[started, ActivityScheduled(charge), ActivityCompleted, SignalReceived(go)]`
+///
+/// The scheduled and completed events share one `activity_id` so the awaitable
+/// actually closes — a fixture whose ids differed would leave it open forever
+/// and quietly weaken every open-awaitable assertion below.
+fn base_events() -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    vec![
+        started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "charge".to_string(),
+            input: serde_json::json!({"amount": 100}),
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!("ok"),
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "go".to_string(),
+            payload: serde_json::json!({"approved": true}),
+        },
+    ]
+}
+
+/// Same shape, but the activity is renamed — the "new build" recording.
+fn renamed_events() -> Vec<WorkflowEvent> {
+    let mut events = base_events();
+    if let WorkflowEvent::ActivityScheduled { name, .. } = &mut events[1] {
+        *name = "charge_v2".to_string();
+    }
+    events
+}
+
+fn trace_of(events: &[WorkflowEvent]) -> ReplayTrace {
+    ReplayTrace::from_history("order_flow".to_string(), ExecutionId::new(), events)
+}
+
+/// Write a `HistorySnapshot` JSON fixture and return its path (plus the owning
+/// tempdir, which must stay alive for the duration of the test).
+fn snapshot_file(dir: &Path, name: &str, events: &[WorkflowEvent]) -> PathBuf {
+    let snapshot = serde_json::json!({
+        "workflow_name": "order_flow",
+        "execution_id": ExecutionId::new(),
+        "events": events,
+    });
+    let path = dir.join(name);
+    std::fs::write(&path, serde_json::to_string_pretty(&snapshot).unwrap()).unwrap();
+    path
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// resolve_breakpoint — precedence and absence
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn resolve_breakpoint_returns_none_without_any_flag() {
+    assert!(resolve_breakpoint(None, None, None, None).is_none());
+}
+
+#[test]
+fn resolve_breakpoint_maps_each_flag_to_its_variant() {
+    assert!(matches!(
+        resolve_breakpoint(Some("TimerStarted"), None, None, None),
+        Some(Breakpoint::EventType(t)) if t == "TimerStarted"
+    ));
+    assert!(matches!(
+        resolve_breakpoint(None, Some(3), None, None),
+        Some(Breakpoint::EventIndex(3))
+    ));
+    assert!(matches!(
+        resolve_breakpoint(None, None, Some("charge"), None),
+        Some(Breakpoint::ActivityName(a)) if a == "charge"
+    ));
+    assert!(matches!(
+        resolve_breakpoint(None, None, None, Some("go")),
+        Some(Breakpoint::SignalName(s)) if s == "go"
+    ));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// resolve_focus — the session-landing decision
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn resolve_focus_defaults_to_the_whole_trace() {
+    let trace = trace_of(&base_events());
+    assert_eq!(resolve_focus(&trace, None, None), FocusResolution::Whole);
+}
+
+#[test]
+fn resolve_focus_reports_a_breakpoint_hit_with_its_index() {
+    let trace = trace_of(&base_events());
+    let bp = Breakpoint::ActivityName("charge".to_string());
+    assert_eq!(
+        resolve_focus(&trace, Some(&bp), None),
+        FocusResolution::BreakpointHit { index: 1 }
+    );
+}
+
+#[test]
+fn resolve_focus_reports_a_missed_breakpoint_rather_than_silently_falling_back() {
+    // A breakpoint that never matches must be loud: silently rendering the
+    // whole trace would look like "ran to completion, nothing to see".
+    let trace = trace_of(&base_events());
+    let bp = Breakpoint::ActivityName("nonexistent".to_string());
+    assert_eq!(
+        resolve_focus(&trace, Some(&bp), None),
+        FocusResolution::BreakpointMissed
+    );
+}
+
+#[test]
+fn resolve_focus_honours_an_in_range_step() {
+    let trace = trace_of(&base_events());
+    assert_eq!(
+        resolve_focus(&trace, None, Some(2)),
+        FocusResolution::Step { index: 2 }
+    );
+}
+
+#[test]
+fn resolve_focus_reports_an_out_of_range_step_with_the_real_length() {
+    let trace = trace_of(&base_events());
+    assert_eq!(
+        resolve_focus(&trace, None, Some(99)),
+        FocusResolution::OutOfRange { index: 99, len: 4 }
+    );
+}
+
+#[test]
+fn resolve_focus_prefers_a_breakpoint_over_a_step() {
+    // clap already rejects the combination, but the resolver must not depend
+    // on that to be well-defined.
+    let trace = trace_of(&base_events());
+    let bp = Breakpoint::EventIndex(3);
+    assert_eq!(
+        resolve_focus(&trace, Some(&bp), Some(0)),
+        FocusResolution::BreakpointHit { index: 3 }
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rendering
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn overview_lists_every_step_with_its_event_type() {
+    let trace = trace_of(&base_events());
+    let out = render_trace_overview(&trace);
+    assert!(out.contains("workflow: order_flow"));
+    assert!(out.contains("events: 4"));
+    for event_type in [
+        "WorkflowStarted",
+        "ActivityScheduled",
+        "ActivityCompleted",
+        "SignalReceived",
+    ] {
+        assert!(
+            out.contains(event_type),
+            "overview must list {event_type}:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn step_detail_shows_open_awaitables_with_their_opening_event_index() {
+    // AC1: the open-awaitable projection carries the index of the event that
+    // opened it, which is what makes "why is this still open?" answerable.
+    let trace = trace_of(&base_events());
+    let out = render_step_detail(&trace, 1);
+    assert!(out.contains("open awaitables"), "{out}");
+    assert!(out.contains("charge"), "{out}");
+    assert!(out.contains("opened at event 1"), "{out}");
+}
+
+#[test]
+fn step_detail_reports_an_out_of_range_index_instead_of_panicking() {
+    let trace = trace_of(&base_events());
+    let out = render_step_detail(&trace, 42);
+    assert!(out.contains("out of range"), "{out}");
+    assert!(out.contains("4 steps"), "{out}");
+}
+
+#[test]
+fn step_detail_surfaces_a_resolved_signal_payload() {
+    let trace = trace_of(&base_events());
+    let out = render_step_detail(&trace, 3);
+    assert!(out.contains("resolved payload"), "{out}");
+    assert!(out.contains("approved"), "{out}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// run_replay / run_diff — end to end
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn run_replay_reads_an_exported_snapshot_from_disk() {
+    // AC4: a production history is debugged locally with zero DB access.
+    let dir = tempfile::tempdir().unwrap();
+    let path = snapshot_file(dir.path(), "history.json", &base_events());
+    run_replay(
+        &path,
+        DebugFormat::Text,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .expect("a well-formed snapshot must replay");
+}
+
+#[test]
+fn run_replay_emits_valid_json_in_json_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = snapshot_file(dir.path(), "history.json", &base_events());
+    run_replay(
+        &path,
+        DebugFormat::Json,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .expect("json mode must succeed");
+}
+
+#[test]
+fn run_replay_fails_when_a_breakpoint_is_never_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = snapshot_file(dir.path(), "history.json", &base_events());
+    let err = run_replay(
+        &path,
+        DebugFormat::Text,
+        None,
+        None,
+        None,
+        Some("nonexistent"),
+        None,
+        None,
+        false,
+    )
+    .expect_err("a missed breakpoint must not exit 0");
+    assert_eq!(err.exit_code(), 1);
+}
+
+#[test]
+fn run_replay_fails_on_an_out_of_range_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = snapshot_file(dir.path(), "history.json", &base_events());
+    let err = run_replay(
+        &path,
+        DebugFormat::Text,
+        Some(99),
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .expect_err("an out-of-range step must not exit 0");
+    assert_eq!(err.exit_code(), 1);
+}
+
+#[test]
+fn run_replay_rejects_a_missing_history_file() {
+    let err = run_replay(
+        Path::new("/definitely/does/not/exist.json"),
+        DebugFormat::Text,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .expect_err("a missing file must be an error, not an empty trace");
+    assert_eq!(err.exit_code(), 1);
+}
+
+#[test]
+fn run_replay_rejects_malformed_history_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad.json");
+    std::fs::write(&path, "{ not json").unwrap();
+    let err = run_replay(
+        &path,
+        DebugFormat::Text,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .expect_err("malformed JSON must be an error");
+    assert_eq!(err.exit_code(), 1);
+}
+
+#[test]
+fn run_diff_succeeds_when_two_histories_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = base_events();
+    let left = snapshot_file(dir.path(), "left.json", &events);
+    let right = snapshot_file(dir.path(), "right.json", &events);
+    run_diff(&left, &right, DebugFormat::Text).expect("identical histories must not diverge");
+}
+
+#[test]
+fn run_diff_exits_nonzero_on_divergence() {
+    // AC3 as a CI gate: `diff(1)`-style "differences found" exit code.
+    let dir = tempfile::tempdir().unwrap();
+    let left = snapshot_file(dir.path(), "left.json", &base_events());
+    let right = snapshot_file(dir.path(), "right.json", &renamed_events());
+    let err = run_diff(&left, &right, DebugFormat::Text).expect_err("a divergence must not exit 0");
+    assert_eq!(err.exit_code(), 1);
+}
+
+#[test]
+fn diff_render_names_the_first_divergent_step() {
+    let left = trace_of(&base_events());
+    let right = trace_of(&renamed_events());
+    let diff = autumn_harvest::debugger::diff_traces(&left, &right);
+    let out = render_diff(&diff, "old build", "new build");
+    assert!(out.contains("first divergence"), "{out}");
+    assert!(out.contains("old build"), "{out}");
+    assert!(out.contains("new build"), "{out}");
+}
+
+#[test]
+fn diff_render_reports_agreement_explicitly() {
+    // Two *independent* recordings of the same scenario: their activity UUIDs
+    // and start timestamps differ, but the diff normalizes per-run identity out
+    // and must therefore report agreement rather than UUID noise.
+    let left = trace_of(&base_events());
+    let right = trace_of(&base_events());
+    let diff = autumn_harvest::debugger::diff_traces(&left, &right);
+    let out = render_diff(&diff, "a", "b");
+    assert!(out.contains("no divergence"), "{out}");
+}
+
+#[test]
+fn timer_history_opens_and_closes_its_awaitable() {
+    let events = vec![
+        started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("cooldown"),
+            duration_secs: 60,
+        },
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("cooldown"),
+        },
+    ];
+    let trace = trace_of(&events);
+    assert_eq!(trace.steps[1].open_awaitables.len(), 1);
+    assert!(trace.steps[2].open_awaitables.is_empty());
+    let out = render_step_detail(&trace, 1);
+    assert!(out.contains("cooldown"), "{out}");
+}
+
+#[test]
+fn base_fixture_actually_closes_its_awaitable() {
+    // Guards the fixture itself: if the scheduled/completed pair ever stops
+    // sharing an `activity_id`, every open-awaitable assertion above would
+    // still pass while measuring nothing.
+    let trace = trace_of(&base_events());
+    assert_eq!(
+        trace.steps[1].open_awaitables.len(),
+        1,
+        "scheduled opens it"
+    );
+    assert!(
+        trace.steps[2].open_awaitables.is_empty(),
+        "completed must close it"
+    );
+}
+
+#[test]
+fn diff_reports_a_renamed_activity_as_a_history_difference() {
+    // The two-fixture-histories arm of AC3: a handler-free trace emits no
+    // commands, so the *only* available signal is the history-derived facts.
+    let left = trace_of(&base_events());
+    let right = trace_of(&renamed_events());
+    let diff = autumn_harvest::debugger::diff_traces(&left, &right);
+    let div = diff.divergence.expect("a renamed activity must diverge");
+    assert_eq!(div.step_index, 1, "the rename is at the scheduling step");
+    assert!(
+        matches!(
+            div.kind,
+            autumn_harvest::debugger::DiffKind::HistoryFacts { .. }
+        ),
+        "expected a history-facts divergence, got {:?}",
+        div.kind
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JSON mode — the document is actually parsed, and the breakpoint still gates
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `--format json` must emit a parseable `ReplayTrace` covering the whole
+/// history, not merely return `Ok`.
+#[test]
+fn json_mode_emits_a_parseable_whole_trace() {
+    let trace = trace_of(&base_events());
+    let json = serde_json::to_string(&trace).expect("ReplayTrace serializes");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+    let steps = parsed["steps"].as_array().expect("steps is an array");
+    assert_eq!(
+        steps.len(),
+        base_events().len(),
+        "JSON mode must emit the WHOLE trace, one step per event"
+    );
+    assert_eq!(parsed["workflow_name"], "order_flow");
+    assert_eq!(parsed["total_events"], base_events().len());
+    // Each step carries the AC1 fields a `jq` consumer would key on.
+    for (i, step) in steps.iter().enumerate() {
+        assert_eq!(step["index"], i);
+        assert!(
+            step["event_type"].is_string(),
+            "step {i} needs an event_type"
+        );
+        assert!(step["open_awaitables"].is_array());
+    }
+}
+
+/// A missed breakpoint must set the exit code even in JSON mode — otherwise
+/// `--format json --break-at-activity X` is a false green in a pipeline.
+#[test]
+fn json_mode_still_fails_on_a_missed_breakpoint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = snapshot_file(dir.path(), "history.json", &base_events());
+    let err = run_replay(
+        &path,
+        DebugFormat::Json,
+        None,
+        None,
+        None,
+        Some("nonexistent"),
+        None,
+        None,
+        false,
+    )
+    .expect_err("a missed breakpoint must fail even in JSON mode");
+    assert!(
+        matches!(err, autumn_harvest_cli::CliError::DebugBreakpointMissed),
+        "got {err:?}"
+    );
+}
+
+/// The hit path is exercised end-to-end (previously only the miss path was).
+#[test]
+fn run_replay_renders_a_hit_breakpoint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = snapshot_file(dir.path(), "history.json", &base_events());
+    run_replay(
+        &path,
+        DebugFormat::Text,
+        None,
+        None,
+        None,
+        Some("charge"),
+        None,
+        None,
+        false,
+    )
+    .expect("the activity is in this history, so the breakpoint must hit");
+}
+
+/// `--max-steps` must reach `from_history_capped`, and the capped trace must
+/// announce itself rather than reading as a complete one.
+#[test]
+fn capped_step_view_announces_the_cap() {
+    let events = base_events();
+    let capped =
+        ReplayTrace::from_history_capped("order_flow".to_string(), ExecutionId::new(), &events, 2);
+    assert!(capped.truncated);
+    let detail = render_step_detail(&capped, 1);
+    assert!(
+        detail.contains("capped"),
+        "a capped trace must say so in the step view, got:\n{detail}"
+    );
+    assert!(
+        detail.contains(&format!("of {} events", events.len())),
+        "the step view must name the real event count, got:\n{detail}"
+    );
+}
+
+/// The handler-free CLI trace has no commands. Absence of the section would
+/// otherwise read as "this step has no pending commands".
+#[test]
+fn handler_free_step_view_says_commands_are_unavailable() {
+    let trace = trace_of(&base_events());
+    let detail = render_step_detail(&trace, 0);
+    assert!(
+        detail.contains("no workflow handler registered"),
+        "a handler-free trace must say why it shows no commands, got:\n{detail}"
+    );
+}
+
+/// A redacted export degrades displayed payloads; the CLI must say so.
+#[test]
+fn a_redacted_export_is_detected() {
+    let redacted = serde_json::json!({
+        "workflow_name": "order_flow",
+        "execution_id": ExecutionId::new(),
+        "payload_policy": "redacted",
+        "events": base_events(),
+    })
+    .to_string();
+    assert!(autumn_harvest::debugger::is_redacted_export(&redacted));
+
+    let full = serde_json::json!({
+        "workflow_name": "order_flow",
+        "execution_id": ExecutionId::new(),
+        "payload_policy": "full",
+        "events": base_events(),
+    })
+    .to_string();
+    assert!(!autumn_harvest::debugger::is_redacted_export(&full));
+}
+
+/// `summary_names`' documented prefix-collision guard: `step_a` must not match
+/// `step_ab`. A regression to `contains()` would otherwise go unnoticed.
+#[test]
+fn activity_breakpoint_does_not_match_a_name_prefix() {
+    let activity_id = ActivityExecId::new();
+    let trace = ReplayTrace::from_history(
+        "wf".to_string(),
+        ExecutionId::new(),
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "step_ab".to_string(),
+                input: serde_json::json!({}),
+                queue: "default".to_string(),
+            },
+        ],
+    );
+    assert!(
+        trace
+            .find_breakpoint(&Breakpoint::ActivityName("step_a".to_string()), 0)
+            .is_none(),
+        "`step_a` must not match the activity `step_ab`"
+    );
+    assert!(
+        trace
+            .find_breakpoint(&Breakpoint::ActivityName("step_ab".to_string()), 0)
+            .is_some()
+    );
+}
+
+/// `ActivityName` must name the *activity*, never its queue — otherwise a
+/// breakpoint on a queue name halts on every activity routed there.
+#[test]
+fn activity_breakpoint_does_not_match_the_queue_name() {
+    let trace = trace_of(&base_events());
+    assert!(
+        trace
+            .find_breakpoint(&Breakpoint::ActivityName("payments".to_string()), 0)
+            .is_none(),
+        "the queue name must not satisfy an activity-name breakpoint"
+    );
+}
+
+// ── `render_step_detail`'s remaining sections ───────────────────────────────
+//
+// The overview table and the commands/cap/handler-free notices are covered
+// above. These pin the four sections that are only reachable from a history
+// carrying the corresponding event kinds — without them a rendering regression
+// (a swapped column, a dropped section) would ship silently.
+
+/// A history exercising every remaining detail section in one trace:
+/// a version gate, a patch gate, a plain marker, a side effect, and an open
+/// timer awaitable.
+fn rich_events() -> Vec<WorkflowEvent> {
+    vec![
+        started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "version:billing".to_string(),
+            details: serde_json::json!(2),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "patch:fraud-check-v1".to_string(),
+            details: serde_json::json!(1),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "checkpoint".to_string(),
+            details: serde_json::json!({"rows": 42}),
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::event::SideEffectKind::Custom,
+            name: Some("region".to_string()),
+            value: serde_json::json!("eu-west"),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("settle_delay"),
+            duration_secs: 30,
+        },
+    ]
+}
+
+#[test]
+fn step_detail_renders_version_and_patch_gates() {
+    let trace = ReplayTrace::from_history("rich", ExecutionId::new(), &rich_events());
+    // Step 2 has consumed both gate markers.
+    let out = render_step_detail(&trace, 2);
+
+    assert!(
+        out.contains("version gates:") && out.contains("billing = 2"),
+        "the version gate and its resolved value must render:\n{out}"
+    );
+    assert!(
+        out.contains("patch gates:") && out.contains("fraud-check-v1"),
+        "the patch gate must render by its id, not its raw marker name:\n{out}"
+    );
+    assert!(
+        !out.contains("version:billing"),
+        "the `version:` prefix is engine bookkeeping and must be stripped:\n{out}"
+    );
+}
+
+#[test]
+fn step_detail_renders_plain_markers_and_side_effects() {
+    let trace = ReplayTrace::from_history("rich", ExecutionId::new(), &rich_events());
+    let out = render_step_detail(&trace, 4);
+
+    assert!(
+        out.contains("markers:") && out.contains("checkpoint") && out.contains("42"),
+        "a non-gate marker must render with its details:\n{out}"
+    );
+    assert!(
+        out.contains("side effects:") && out.contains("region") && out.contains("eu-west"),
+        "a Custom side effect must render name and value:\n{out}"
+    );
+}
+
+#[test]
+fn step_detail_renders_open_awaitables_with_their_opening_index() {
+    let trace = ReplayTrace::from_history("rich", ExecutionId::new(), &rich_events());
+    let out = render_step_detail(&trace, 5);
+
+    assert!(
+        out.contains("open awaitables:") && out.contains("settle_delay"),
+        "the open timer must render:\n{out}"
+    );
+    assert!(
+        out.contains("opened at event 5"),
+        "AC1 requires the *opening event index*, not just the id:\n{out}"
+    );
+}
+
+#[test]
+fn step_detail_renders_the_resolved_payload() {
+    let trace = ReplayTrace::from_history("base", ExecutionId::new(), &base_events());
+    // Step 1 is the ActivityScheduled, whose input is the resolved payload.
+    let out = render_step_detail(&trace, 1);
+
+    assert!(
+        out.contains("resolved payload:") && out.contains("100"),
+        "the scheduled activity's input must render as the resolved payload:\n{out}"
+    );
+}

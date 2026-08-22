@@ -39,6 +39,7 @@
 #
 # osclass      crate                    target                           features                   filter
 allos        autumn-harvest         integration                      testing                    -
+allos        autumn-harvest         integration                      testing,debugger           debugger_tests
 allos        autumn-harvest         integration                      testing,metrics-rs         metrics_rs_adapter
 allos        autumn-harvest         property                         db                         -
 allos        autumn-harvest-plugin  connector_dependency_graph       -                          -

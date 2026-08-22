@@ -17,7 +17,7 @@ categories = ["command-line-utilities", "asynchronous"]
 # and diesel-async/tokio-postgres are pure Rust, so the Windows/macOS CI legs
 # build it without a system libpq/OpenSSL, and the workspace already compiles
 # diesel for the core crate.
-autumn-harvest = { version = "0.5.0", path = "../autumn-harvest", default-features = false, features = ["db", "testing"] }
+autumn-harvest = { version = "0.5.0", path = "../autumn-harvest", default-features = false, features = ["db", "testing", "debugger"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 crossterm = "0.29.0"
 percent-encoding = "2"
