@@ -550,10 +550,17 @@ pub fn run_replay(
 
     if tui {
         // `--step` / `--break-*` seed the opening cursor rather than being
-        // silently discarded; a resolution that names no step opens at 0.
+        // silently discarded — and an *unsatisfiable* focus is an error here
+        // exactly as it is on the text and JSON paths. Opening at step 0
+        // instead would make `--tui --break-at-activity nonexistent` look like
+        // a hit and exit 0, which is the one thing a breakpoint must never do.
         let cursor = match focus {
             FocusResolution::BreakpointHit { index } | FocusResolution::Step { index } => index,
-            _ => 0,
+            FocusResolution::Whole => 0,
+            FocusResolution::BreakpointMissed => return Err(CliError::DebugBreakpointMissed),
+            FocusResolution::OutOfRange { index, len } => {
+                return Err(CliError::DebugStepOutOfRange { index, len });
+            }
         };
         return crate::debug_tui::run(&trace, cursor);
     }

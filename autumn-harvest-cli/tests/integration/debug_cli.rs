@@ -299,6 +299,46 @@ fn run_replay_fails_on_an_out_of_range_step() {
 }
 
 #[test]
+fn tui_rejects_an_unsatisfiable_focus_rather_than_opening_step_zero() {
+    // The `--tui` arm previously fell through to cursor 0 for both error
+    // resolutions, so `--tui --break-at-activity nonexistent` looked like a hit
+    // and exited 0 once the user quit — the one thing a breakpoint must never
+    // do, and inconsistent with the text and JSON paths. Both must error
+    // BEFORE the terminal is put into raw mode, which is also why this test can
+    // run headless: it never reaches `debug_tui::run`.
+    let dir = tempfile::tempdir().unwrap();
+    let path = snapshot_file(dir.path(), "history.json", &base_events());
+
+    let missed = run_replay(
+        &path,
+        DebugFormat::Text,
+        None,
+        None,
+        None,
+        Some("nonexistent"),
+        None,
+        None,
+        true,
+    )
+    .expect_err("a missed breakpoint must not exit 0 under --tui either");
+    assert_eq!(missed.exit_code(), 1);
+
+    let out_of_range = run_replay(
+        &path,
+        DebugFormat::Text,
+        Some(99),
+        None,
+        None,
+        None,
+        None,
+        None,
+        true,
+    )
+    .expect_err("an out-of-range step must not exit 0 under --tui either");
+    assert_eq!(out_of_range.exit_code(), 1);
+}
+
+#[test]
 fn run_replay_rejects_a_missing_history_file() {
     let err = run_replay(
         Path::new("/definitely/does/not/exist.json"),

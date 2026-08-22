@@ -778,9 +778,36 @@ fn history_fact_diff(l: &DebugStep, r: &DebugStep) -> Option<&'static str> {
     None
 }
 
+/// Replace every UUID-shaped token in a display label with the per-run marker.
+///
+/// An awaitable's `name` is a *display* string that can embed engine identity —
+/// `ExternalSignalRequested` renders `"{signal_name} -> {target}"`, and an
+/// `ExternalTarget::ExecutionId` target is a per-run UUID. Dropping the
+/// separate `id` field is therefore not enough: without this, two independent
+/// recordings of one "signal a sibling workflow" scenario diff as different.
+/// That is noise rather than a false clean, but noise on a divergence-finding
+/// tool buries the signal it exists to surface.
+///
+/// A business-id target (`ExternalTarget::WorkflowId`) contains no UUID and so
+/// still compares verbatim.
+fn normalize_label_ids(label: &str) -> String {
+    label
+        .split(' ')
+        .map(|token| {
+            if uuid::Uuid::parse_str(token).is_ok() {
+                "<per-run>"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Project open awaitables onto their comparable shape, dropping the per-run
-/// execution UUID (see [`history_fact_diff`]).
-fn awaitable_shapes(awaitables: &[OpenAwaitable]) -> Vec<(AwaitableKind, Option<&str>, usize)> {
+/// execution UUID — both the separate `id` field and any UUID embedded in the
+/// display `name` (see [`history_fact_diff`] and [`normalize_label_ids`]).
+fn awaitable_shapes(awaitables: &[OpenAwaitable]) -> Vec<(AwaitableKind, Option<String>, usize)> {
     awaitables
         .iter()
         // `AwaitableKind::Signal` and `AwaitableKind::Mutex` are synthesized
@@ -790,7 +817,13 @@ fn awaitable_shapes(awaitables: &[OpenAwaitable]) -> Vec<(AwaitableKind, Option<
         // `step_diff_kind`'s command comparison owns them and sees the same
         // signal name / mutex key.
         .filter(|a| !matches!(a.kind, AwaitableKind::Signal | AwaitableKind::Mutex))
-        .map(|a| (a.kind, a.name.as_deref(), a.opened_at))
+        .map(|a| {
+            (
+                a.kind,
+                a.name.as_deref().map(normalize_label_ids),
+                a.opened_at,
+            )
+        })
         .collect()
 }
 
@@ -1070,7 +1103,23 @@ impl ReplayDebugger {
             self.state.clone(),
         )
         .with_workflow_name(snapshot.workflow_name.clone())
-        .with_build_id(self.build_id.clone());
+        .with_build_id(self.build_id.clone())
+        // Every replay input the snapshot carries. `HistorySnapshot` documents
+        // these as replay inputs precisely because they are *row* columns that
+        // live in no `WorkflowEvent`, so a replay path that drops them makes a
+        // workflow branching on `ctx.info().parent_execution_id`, reading its
+        // execution deadline, or calling the deadline-sensitive
+        // `should_continue_as_new()` emit commands from defaults — a fabricated
+        // divergence on an otherwise valid production export. Threading them
+        // here keeps this new replay path aligned with the worker, the
+        // replayer, and the query-hydration paths (issues #698, #772).
+        .with_parent_execution_id(snapshot.parent_execution_id)
+        .with_execution_timeout(snapshot.execution_timeout)
+        .with_deadline(snapshot.deadline_at)
+        // Configured via `ReplayDebugger::history_policy`; without this the
+        // setter is dead and `should_continue_as_new()` always sees the
+        // default threshold and deadline fraction.
+        .with_history_policy(self.history_policy);
 
         if let Some(workflow_id) = snapshot.workflow_id.clone() {
             ctx = ctx.with_workflow_id(workflow_id);
@@ -1405,6 +1454,38 @@ fn resolved_payload(event: &WorkflowEvent) -> Option<Value> {
 ///
 /// # Why the whole event rather than a projection
 ///
+/// Top-level `data` field names the engine mints fresh on every run.
+///
+/// Derived mechanically from `WorkflowEvent`'s own declared field types: a
+/// field belongs here exactly when its type is a UUID newtype
+/// (`ActivityExecId`, `ExecutionId`, `UpdateId`, `ExternalSignalId`,
+/// `ExternalAwaitId`, `ExternalCancelId`, `ExternalActivityToken`, `Uuid`).
+///
+/// Deliberately **not** here, despite being UUID-shaped in practice:
+///
+/// * `idempotency_key` — a caller-chosen exactly-once key (#521). Semantic.
+/// * `timer_id`, `worker_id` — `String` newtypes, and a timer id is
+///   author-chosen (`"escalate"`), so it must compare verbatim.
+///
+/// `debugger_tests::engine_minted_id_fields_match_the_event_enum` re-derives
+/// this set from `event.rs` at test time, so a UUID-typed field added to
+/// `WorkflowEvent` later fails until it is classified here.
+const ENGINE_MINTED_ID_FIELDS: &[&str] = &[
+    "activity_id",
+    "await_id",
+    "cancel_id",
+    "child_id",
+    "dead_letter_id",
+    "new_exec_id",
+    "reset_from_exec_id",
+    "reset_to_exec_id",
+    "retry_exec_id",
+    "signal_id",
+    "target",
+    "token",
+    "update_id",
+];
+
 /// The first cut compared a hand-written [`resolved_payload`] projection, whose
 /// `_ => None` arm silently swallowed every variant it did not enumerate. Two
 /// histories differing only in a `TimerStarted { duration_secs }` (30 vs 60) or
@@ -1421,15 +1502,23 @@ fn resolved_payload(event: &WorkflowEvent) -> Option<Value> {
 /// values minted per run. Those are stripped from the top level of the event's
 /// `data` object only:
 ///
-/// * any UUID-valued field — `activity_id`, `child_id`, `new_exec_id`, and
-///   every `*_id` the engine mints;
+/// * a UUID value in one of the [`ENGINE_MINTED_ID_FIELDS`] — matched by
+///   **field name**, not by "looks like a UUID";
 /// * `timestamp`;
 /// * the recorded `value` of a non-deterministic side-effect draw
 ///   (`Now`/`Uuid`/`Random`, issue #384) — its `kind` and `name` still compare.
 ///
-/// Top-level *only* is load-bearing: engine identity lives there, while
-/// application data lives nested under `input`/`output`/`payload`/`details`,
-/// where a UUID is real business data a diff must not discard.
+/// Field-name matching is load-bearing. A purely value-based test ("normalize
+/// anything that parses as a UUID") also eats
+/// `ExternalSignalRequested { idempotency_key }`, which is a caller-chosen
+/// exactly-once key (#521) — very commonly a UUID, and *semantic*: two
+/// histories differing only in it are genuinely different, and normalizing it
+/// would report them as equal.
+///
+/// Top-level *only* is load-bearing for the same reason: engine identity lives
+/// there, while application data lives nested under
+/// `input`/`output`/`payload`/`details`, where a UUID is real business data a
+/// diff must not discard.
 fn normalized_event_facts(event: &WorkflowEvent) -> Value {
     /// Stand-in for a stripped per-run value. A single shared marker keeps two
     /// recordings comparing equal on the field while leaving it visibly
@@ -1452,11 +1541,16 @@ fn normalized_event_facts(event: &WorkflowEvent) -> Value {
         .is_some_and(|kind| kind != "Custom");
 
     for (key, slot) in data.iter_mut() {
+        // The UUID parse is kept *in addition to* the name match, not instead
+        // of it: `target` is `ExecutionId` on some variants and
+        // `ExternalTarget` on others, and the latter's business-id form
+        // serializes as an object that must compare verbatim.
         let is_per_run = key == "timestamp"
             || (nondeterministic_draw && key == "value")
-            || slot
-                .as_str()
-                .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok());
+            || (ENGINE_MINTED_ID_FIELDS.contains(&key.as_str())
+                && slot
+                    .as_str()
+                    .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok()));
         if is_per_run {
             *slot = Value::String(NORMALIZED.to_string());
         }
@@ -1617,8 +1711,12 @@ fn command_payload(command: &WorkflowCommand) -> Option<Value> {
             "input": input,
             "queue": queue,
             "retry_policy": retry_policy_override,
-            "start_to_close_secs": start_to_close_override.map(|d| d.as_secs()),
-            "schedule_to_start_secs": schedule_to_start_override.map(|d| d.as_secs()),
+            // Full precision, NOT `as_secs()`: a caller passes a raw
+            // `Duration`, so 100ms and 900ms would both collapse to 0 and two
+            // genuinely different builds would compare equal. `Duration` is
+            // `Serialize` (`{secs, nanos}`), so this is exact.
+            "start_to_close": start_to_close_override,
+            "schedule_to_start": schedule_to_start_override,
             "session_id": session_id.as_ref().map(ToString::to_string),
             "session_worker_id": session_worker_id.as_ref().map(ToString::to_string),
         })),
@@ -1639,7 +1737,9 @@ fn command_payload(command: &WorkflowCommand) -> Option<Value> {
             ..
         } => Some(serde_json::json!({
             "input": input,
-            "start_to_close_secs": start_to_close.map(|d| d.as_secs()),
+            // Full precision — a local activity legitimately carries a
+            // sub-second timeout (see `ScheduleActivity` above).
+            "start_to_close": start_to_close,
             "retry_policy": retry_policy,
         })),
         WorkflowCommand::SpawnDetachedChildWorkflow {
@@ -1718,8 +1818,78 @@ fn external_target_label(target: &crate::types::ExternalTarget) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PATCH_MARKER_PREFIX, VERSION_MARKER_PREFIX};
+    use super::{ENGINE_MINTED_ID_FIELDS, PATCH_MARKER_PREFIX, VERSION_MARKER_PREFIX};
     use crate::replay::{patch_marker_name, version_marker_name};
+
+    /// The UUID newtypes `WorkflowEvent` uses for engine-minted identity.
+    const UUID_FIELD_TYPES: &[&str] = &[
+        "ActivityExecId",
+        "ExecutionId",
+        "ExternalActivityToken",
+        "ExternalAwaitId",
+        "ExternalCancelId",
+        "ExternalSignalId",
+        "UpdateId",
+        "Uuid",
+    ];
+
+    /// `normalized_event_facts` strips per-run identity by **field name**, and
+    /// that list is hand-written — so a UUID-typed field added to
+    /// `WorkflowEvent` later would silently start being compared verbatim,
+    /// making two independent recordings of one scenario diff as different
+    /// (noise that buries the signal). Re-derive the set from `event.rs` itself
+    /// so the omission fails here instead.
+    ///
+    /// The inverse direction matters just as much: a *non*-UUID-typed field
+    /// must never be in the list, because normalizing a semantic field is a
+    /// false clean — the `idempotency_key` (#521) case Codex found.
+    #[test]
+    fn engine_minted_id_fields_match_the_event_enum() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/event.rs"))
+            .expect("event.rs is in this crate");
+        let start = source
+            .find("pub enum WorkflowEvent")
+            .expect("the event enum is declared");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("the enum body terminates");
+        let body = &body[..end];
+
+        let mut derived: Vec<&str> = Vec::new();
+        for line in body.lines() {
+            let trimmed = line.trim();
+            // Struct-variant fields are `name: Type,` — skip doc comments,
+            // attributes, and variant headers.
+            let Some((name, ty)) = trimmed.strip_suffix(',').and_then(|f| f.split_once(": "))
+            else {
+                continue;
+            };
+            if !name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                continue;
+            }
+            // `Option<T>` never holds engine identity in this enum, so the bare
+            // type is the whole test.
+            if UUID_FIELD_TYPES.contains(&ty.trim()) && !derived.contains(&name) {
+                derived.push(name);
+            }
+        }
+        derived.sort_unstable();
+        assert!(
+            !derived.is_empty(),
+            "the field scan found nothing — event.rs's shape changed and this \
+             guard is no longer guarding anything"
+        );
+
+        let mut declared: Vec<&str> = ENGINE_MINTED_ID_FIELDS.to_vec();
+        declared.sort_unstable();
+        assert_eq!(
+            derived, declared,
+            "ENGINE_MINTED_ID_FIELDS drifted from WorkflowEvent's UUID-typed \
+             fields. A field only in `derived` is being compared verbatim (two \
+             recordings of one scenario will diff as different); a field only \
+             in `declared` is being normalized away (a semantic difference \
+             will report a false clean)."
+        );
+    }
 
     /// The debugger classifies a `MarkerRecorded` as a version or patch gate by
     /// `strip_prefix`, but the engine *builds* those names with the helpers in

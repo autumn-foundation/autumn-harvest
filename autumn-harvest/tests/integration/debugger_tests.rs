@@ -19,6 +19,7 @@ use autumn_harvest::debugger::{
 };
 use autumn_harvest::event::{SideEffectKind, WorkflowEvent};
 use autumn_harvest::info::WorkflowHandlerFn;
+use autumn_harvest::prelude::activity;
 use autumn_harvest::testing::HistorySnapshot;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, TimerId};
 use serde_json::{Value, json};
@@ -633,6 +634,183 @@ async fn a_start_to_close_only_change_on_an_activity_is_a_divergence() {
         "this regression is only meaningful while the summaries are identical"
     );
     assert_ne!(l.commands[0].payload, r.commands[0].payload);
+}
+
+// ── Codex round 2 regressions ───────────────────────────────────────────────
+
+/// A local activity whose per-call timeout is sub-second. Only the typed
+/// `_with_opts` path carries a full `Duration` — the public `_raw` escape
+/// hatch takes whole seconds — so the test drives the typed API, which is also
+/// the one an application uses.
+#[allow(clippy::unused_async)] // the #[activity] macro requires an `async fn`.
+#[activity(local = true, start_to_close = "5s")]
+async fn checksum(_ctx: &autumn_harvest::context::ActivityContext) -> Result<Value, String> {
+    Ok(json!("sum"))
+}
+
+fn local_activity_100ms<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _: Value = ctx
+            .execute_local_activity_with_opts(
+                &checksum_info(),
+                json!({}),
+                None,
+                Some(std::time::Duration::from_millis(100)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+fn local_activity_900ms<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Identical to the 100ms build in every way the summary label can see.
+        let _: Value = ctx
+            .execute_local_activity_with_opts(
+                &checksum_info(),
+                json!({}),
+                None,
+                Some(std::time::Duration::from_millis(900)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+#[tokio::test]
+async fn a_subsecond_local_activity_timeout_change_is_a_divergence() {
+    // A caller passes a raw `Duration`, so a local activity legitimately
+    // carries a sub-second timeout. Rendering it through `as_secs()` collapses
+    // 100ms and 900ms to the same `0` and the two builds compare EQUAL — the
+    // same false-clean class as the queue/deadline drops, reintroduced by the
+    // fix for them.
+    let div = diff_two_builds(
+        "local_wf",
+        vec![started()],
+        local_activity_100ms,
+        local_activity_900ms,
+    )
+    .await
+    .expect("a sub-second timeout change must diverge");
+
+    assert!(
+        matches!(div.kind, DiffKind::CommandMismatch { command_index: 0 }),
+        "expected a command mismatch at command 0, got {:?}",
+        div.kind
+    );
+    let l = div.left.expect("both sides present");
+    let r = div.right.expect("both sides present");
+    assert_eq!(
+        l.commands[0].summary, r.commands[0].summary,
+        "this regression is only meaningful while the summaries are identical"
+    );
+    assert_ne!(l.commands[0].payload, r.commands[0].payload);
+}
+
+#[test]
+fn a_uuid_shaped_idempotency_key_is_compared_not_normalized() {
+    // `idempotency_key` (#521) is a CALLER-chosen exactly-once key, very
+    // commonly a UUID. Normalizing it because it *looks* like an engine id
+    // would make two genuinely different histories compare equal — so
+    // per-run normalization keys on the field NAME, never on the value shape.
+    let request = |key: &str| {
+        vec![
+            started(),
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id: autumn_harvest::types::ExternalSignalId::new(),
+                target: autumn_harvest::types::ExternalTarget::ExecutionId(ExecutionId::new()),
+                signal_name: "go".to_string(),
+                payload: json!({}),
+                idempotency_key: Some(key.to_string()),
+            },
+        ]
+    };
+    let left = handler_free_trace(&request("018f0000-0000-7000-8000-000000000001"));
+    let right = handler_free_trace(&request("018f0000-0000-7000-8000-000000000002"));
+
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("a changed idempotency key is a real difference");
+    assert_eq!(div.step_index, 1);
+    assert!(
+        matches!(div.kind, DiffKind::HistoryFacts { field } if field == "event_facts"),
+        "expected an event_facts difference, got {:?}",
+        div.kind
+    );
+}
+
+#[test]
+fn engine_minted_ids_in_the_same_event_are_still_normalized() {
+    // The other half of the contract: `signal_id` and an `ExecutionId` target
+    // ARE engine-minted, so two independent recordings of the same scenario
+    // must still diff clean. Without this the field allowlist could be
+    // "fixed" by normalizing nothing at all.
+    let request = || {
+        vec![
+            started(),
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id: autumn_harvest::types::ExternalSignalId::new(),
+                target: autumn_harvest::types::ExternalTarget::ExecutionId(ExecutionId::new()),
+                signal_name: "go".to_string(),
+                payload: json!({}),
+                idempotency_key: Some("stable-key".to_string()),
+            },
+        ]
+    };
+    let left = handler_free_trace(&request());
+    let right = handler_free_trace(&request());
+    assert!(
+        diff_traces(&left, &right).divergence.is_none(),
+        "freshly-minted signal/target ids are not a divergence"
+    );
+}
+
+fn reads_parent<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Branch on a replay input that lives on the execution ROW, not in any
+        // event. A replay path that drops it makes this schedule the wrong
+        // activity and fabricates a divergence on a valid production export.
+        let name = if ctx.info().parent_execution_id.is_some() {
+            "child_path"
+        } else {
+            "root_path"
+        };
+        ctx.execute_activity_raw(name, json!({}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+#[tokio::test]
+async fn snapshot_replay_metadata_reaches_the_prefix_context() {
+    let parent = ExecutionId::new();
+    let snap = HistorySnapshot {
+        parent_execution_id: Some(parent),
+        ..snapshot("parent_wf", vec![started()])
+    };
+    let trace = debugger("parent_wf", reads_parent)
+        .trace_snapshot(snap)
+        .await
+        .expect("registered");
+
+    let command = &trace.steps[0].commands[0];
+    assert!(
+        command.summary.contains("child_path"),
+        "the snapshot's parent_execution_id must reach the replay context; got {:?}",
+        command.summary
+    );
 }
 
 // ── Codex round 1 regression: a mutex park is an open awaitable ─────────────
