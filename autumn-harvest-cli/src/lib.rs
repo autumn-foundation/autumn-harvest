@@ -602,6 +602,24 @@ pub enum CliError {
         step_index: usize,
     },
 
+    /// `debug diff` compared only a **prefix** of the two traces because at
+    /// least one was capped by `max_steps`, and found no difference in it
+    /// (issue #949).
+    ///
+    /// This is deliberately *not* exit `0`. "No difference in the part we
+    /// looked at" is not "these agree", and a CI gate that treats it as a pass
+    /// is silently trusting an unexamined suffix. Exit code is `2`, joining
+    /// the other "could not determine" gates (`WorkflowReachabilityGate`,
+    /// `QueueCoverageGate`, `RestoreUndetermined`) so a script can tell it
+    /// apart from `1` = "differences found".
+    #[error(
+        "debug diff: inconclusive — only {examined} steps were compared before the --max-steps cap"
+    )]
+    DebugDiffInconclusive {
+        /// How many steps were actually compared.
+        examined: usize,
+    },
+
     /// A terminal operation failed while running the interactive stepper
     /// (issue #949). Exit code is `1`.
     #[error("debug replay: terminal {op} failed: {reason}")]
@@ -629,9 +647,15 @@ impl CliError {
             // "determined broken" (exit 1), so an operator drill script can
             // retry a transient shard outage rather than declare the restore
             // unusable.
+            //
+            // Issue #949's `debug diff` joins them on the same reasoning: a
+            // capped comparison examined only a prefix, so "inconclusive" must
+            // be distinguishable from `1` = "differences found" and from
+            // `0` = "compared in full and agree".
             Self::WorkflowReachabilityGate { .. }
             | Self::QueueCoverageGate { .. }
-            | Self::RestoreUndetermined { .. } => 2,
+            | Self::RestoreUndetermined { .. }
+            | Self::DebugDiffInconclusive { .. } => 2,
             _ => 1,
         }
     }

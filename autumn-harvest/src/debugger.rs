@@ -469,7 +469,15 @@ fn step_names_signal(step: &DebugStep, name: &str) -> bool {
     let waiting = step
         .commands
         .iter()
-        .any(|c| c.kind == "WaitForSignal" && summary_names(&c.summary, name));
+        // Exact, not segment-wise: a `WaitForSignal` summary *is* the signal
+        // name with no qualifier appended (unlike `ScheduleActivity`'s
+        // `"{name} -> {queue}"`), and a signal name may legitimately contain
+        // spaces — nothing in the engine or the `POST .../signal/{name}` route
+        // restricts it to one token. Splitting on whitespace made
+        // `SignalName("order approved")` unmatchable at exactly the step a
+        // breakpoint is for: a waiting frontier, where no `SignalReceived`
+        // exists yet to match instead.
+        .any(|c| c.kind == "WaitForSignal" && c.summary == name);
     received_here || waiting
 }
 
@@ -488,13 +496,6 @@ fn first_segment(summary: &str) -> &str {
         .split([' ', ',', '(', ')', '='])
         .next()
         .unwrap_or(summary)
-}
-
-/// Whether a rendered command summary names `needle` as a whole segment.
-fn summary_names(summary: &str, needle: &str) -> bool {
-    summary
-        .split([' ', ',', '(', ')', '='])
-        .any(|segment| segment == needle)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -553,6 +554,25 @@ pub enum DiffKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         right: Option<StepDivergence>,
     },
+    /// The two traces belong to **different workflow types**.
+    ///
+    /// `workflow_name` is an execution-*row* column — it appears in no
+    /// `WorkflowEvent` (not even `WorkflowStarted`), so `event_facts` cannot
+    /// see it. It also selects the handler that owns and interprets the
+    /// history, which makes it the one piece of metadata that must agree
+    /// before comparing anything else: two recordings of *different workflows*
+    /// are not "in agreement" no matter how similar their event arrays look.
+    ///
+    /// `execution_id` is deliberately **not** compared alongside it. Two
+    /// independent recordings always carry different execution ids, so
+    /// comparing it would fabricate a divergence on every fixture-vs-fixture
+    /// diff — the same reason it is normalized out of `event_facts`.
+    WorkflowName {
+        /// The left trace's workflow type.
+        left: String,
+        /// The right trace's workflow type.
+        right: String,
+    },
     /// One trace ran out of steps before the other.
     TraceLength {
         /// The left trace's step count.
@@ -595,6 +615,33 @@ pub struct TraceDiff {
     pub left_steps: usize,
     /// How many steps the right trace produced.
     pub right_steps: usize,
+    /// `true` when either input trace was capped by
+    /// [`ReplayDebugger::max_steps`], so the comparison examined only a
+    /// **prefix** of the two histories.
+    ///
+    /// This is why callers must ask [`TraceDiff::is_clean`] rather than
+    /// testing `divergence.is_none()`: on a capped trace a `None` divergence
+    /// means "no difference in the part we looked at", which is emphatically
+    /// not the same claim.
+    pub truncated: bool,
+}
+
+impl TraceDiff {
+    /// `true` only when the two traces were compared **in full** and agree.
+    ///
+    /// `divergence.is_none()` alone is **not** the clean signal. When both
+    /// traces hit the same `max_steps` cap their step counts are equal, so the
+    /// [`DiffKind::TraceLength`] check — the only one carrying a `capped`
+    /// flag — never fires, and a difference living past the cap is reported as
+    /// silence. A CI gate reading `divergence.is_none()` would treat an
+    /// unexamined suffix as a pass; this method refuses to.
+    ///
+    /// Raise `max_steps` (or drop the cap) to turn an inconclusive result into
+    /// a conclusive one.
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.divergence.is_none() && !self.truncated
+    }
 }
 
 /// Diff two traces of the same history and report the **first** divergent
@@ -603,8 +650,44 @@ pub struct TraceDiff {
 /// The comparison walks steps in order and stops at the first difference, so a
 /// divergence cascade (one root cause producing dozens of downstream
 /// differences) reports exactly one actionable result.
+///
+/// Read the verdict with [`TraceDiff::is_clean`], **not** with
+/// `divergence.is_none()`: when both traces were capped by `max_steps` only a
+/// prefix was compared, and a difference past the cap is indistinguishable
+/// from agreement.
 #[must_use]
 pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
+    let truncated = left.truncated || right.truncated;
+    let finish = |divergence| TraceDiff {
+        divergence,
+        left_steps: left.steps.len(),
+        right_steps: right.steps.len(),
+        truncated,
+    };
+
+    // Before any step: the two recordings must belong to the same workflow
+    // type. `workflow_name` lives on the execution row, not in any
+    // `WorkflowEvent`, so `event_facts` is structurally blind to it — two
+    // recordings of *different* workflows with similarly-shaped event arrays
+    // would otherwise walk every step and report agreement. Same principle as
+    // `step_diff_kind`'s history-facts-first ordering, one level up: if the
+    // recordings are not of the same thing, comparing what the code did next
+    // is apples to oranges.
+    if left.workflow_name != right.workflow_name {
+        return finish(Some(TraceDivergence {
+            step_index: 0,
+            kind: DiffKind::WorkflowName {
+                left: left.workflow_name.clone(),
+                right: right.workflow_name.clone(),
+            },
+            // Trace-level, not step-level: the names are carried by the kind
+            // itself, and pinning a step here would imply the difference lives
+            // in that step's contents when it does not.
+            left: None,
+            right: None,
+        }));
+    }
+
     let shared = left.steps.len().min(right.steps.len());
 
     for i in 0..shared {
@@ -612,35 +695,27 @@ pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
         let r = &right.steps[i];
 
         if let Some(kind) = step_diff_kind(l, r) {
-            return TraceDiff {
-                divergence: Some(TraceDivergence {
-                    step_index: i,
-                    kind,
-                    left: Some(l.clone()),
-                    right: Some(r.clone()),
-                }),
-                left_steps: left.steps.len(),
-                right_steps: right.steps.len(),
-            };
+            return finish(Some(TraceDivergence {
+                step_index: i,
+                kind,
+                left: Some(l.clone()),
+                right: Some(r.clone()),
+            }));
         }
     }
 
-    let divergence = (left.steps.len() != right.steps.len()).then(|| TraceDivergence {
-        step_index: shared,
-        kind: DiffKind::TraceLength {
-            left: left.steps.len(),
-            right: right.steps.len(),
-            capped: left.truncated || right.truncated,
-        },
-        left: left.steps.get(shared).cloned(),
-        right: right.steps.get(shared).cloned(),
-    });
-
-    TraceDiff {
-        divergence,
-        left_steps: left.steps.len(),
-        right_steps: right.steps.len(),
-    }
+    finish(
+        (left.steps.len() != right.steps.len()).then(|| TraceDivergence {
+            step_index: shared,
+            kind: DiffKind::TraceLength {
+                left: left.steps.len(),
+                right: right.steps.len(),
+                capped: truncated,
+            },
+            left: left.steps.get(shared).cloned(),
+            right: right.steps.get(shared).cloned(),
+        }),
+    )
 }
 
 /// How a single pair of steps differs, if at all.
@@ -1456,19 +1531,33 @@ fn resolved_payload(event: &WorkflowEvent) -> Option<Value> {
 ///
 /// Top-level `data` field names the engine mints fresh on every run.
 ///
-/// Derived mechanically from `WorkflowEvent`'s own declared field types: a
-/// field belongs here exactly when its type is a UUID newtype
-/// (`ActivityExecId`, `ExecutionId`, `UpdateId`, `ExternalSignalId`,
-/// `ExternalAwaitId`, `ExternalCancelId`, `ExternalActivityToken`, `Uuid`).
+/// Derived mechanically from `WorkflowEvent`'s own declared field types. A
+/// field belongs here when the engine mints its value fresh on every run:
+///
+/// * a UUID newtype — `ActivityExecId`, `ExecutionId`, `UpdateId`,
+///   `ExternalSignalId`, `ExternalAwaitId`, `ExternalCancelId`,
+///   `ExternalActivityToken`, `Uuid`;
+/// * `WorkerId`, which is `String`-backed but whose value
+///   `WorkerRuntimeConfig::from` always mints as a fresh `Uuid::new_v4()` —
+///   there is no `WorkerConfig::with_worker_id`. Two independent recordings
+///   therefore differ at the *first* `ActivityStarted`, which would bury every
+///   later semantic difference behind a divergence that is pure per-run noise.
+///
+/// `WorkerId` is exactly why the value guard (does it parse as a UUID?) is
+/// retained *alongside* the name match: `WorkerRuntimeConfig::worker_id` is a
+/// `pub` field, so an embedder may set a stable human label
+/// (`WorkerId::new("worker-eu-1")`). A label does not parse as a UUID and so
+/// still compares verbatim — engine-minted identity is normalized, an
+/// operator's chosen name is preserved.
 ///
 /// Deliberately **not** here, despite being UUID-shaped in practice:
 ///
 /// * `idempotency_key` — a caller-chosen exactly-once key (#521). Semantic.
-/// * `timer_id`, `worker_id` — `String` newtypes, and a timer id is
-///   author-chosen (`"escalate"`), so it must compare verbatim.
+/// * `timer_id` — a `String` newtype whose value is author-chosen
+///   (`ctx.timer("escalate", …)`), so it must compare verbatim.
 ///
 /// `debugger_tests::engine_minted_id_fields_match_the_event_enum` re-derives
-/// this set from `event.rs` at test time, so a UUID-typed field added to
+/// this set from `event.rs` at test time, so an engine-minted field added to
 /// `WorkflowEvent` later fails until it is classified here.
 const ENGINE_MINTED_ID_FIELDS: &[&str] = &[
     "activity_id",
@@ -1484,6 +1573,7 @@ const ENGINE_MINTED_ID_FIELDS: &[&str] = &[
     "target",
     "token",
     "update_id",
+    "worker_id",
 ];
 
 /// The first cut compared a hand-written [`resolved_payload`] projection, whose
@@ -1821,8 +1911,17 @@ mod tests {
     use super::{ENGINE_MINTED_ID_FIELDS, PATCH_MARKER_PREFIX, VERSION_MARKER_PREFIX};
     use crate::replay::{patch_marker_name, version_marker_name};
 
-    /// The UUID newtypes `WorkflowEvent` uses for engine-minted identity.
-    const UUID_FIELD_TYPES: &[&str] = &[
+    /// The field types `WorkflowEvent` uses for values the engine mints fresh
+    /// on every run.
+    ///
+    /// Mostly UUID newtypes. `WorkerId` is the exception that proves the rule:
+    /// it wraps a `String`, but `WorkerRuntimeConfig::from` always mints its
+    /// value as a fresh `Uuid::new_v4()` and no builder overrides it, so by
+    /// *value* it is engine identity even though by *type* it is not. Keying
+    /// this list on the declared type is a mechanical proxy for the real
+    /// predicate ("is this minted per run?"), and `WorkerId` is where the
+    /// proxy needs an explicit entry rather than a type-shape inference.
+    const ENGINE_MINTED_FIELD_TYPES: &[&str] = &[
         "ActivityExecId",
         "ExecutionId",
         "ExternalActivityToken",
@@ -1831,18 +1930,21 @@ mod tests {
         "ExternalSignalId",
         "UpdateId",
         "Uuid",
+        "WorkerId",
     ];
 
     /// `normalized_event_facts` strips per-run identity by **field name**, and
-    /// that list is hand-written — so a UUID-typed field added to
+    /// that list is hand-written — so an engine-minted field added to
     /// `WorkflowEvent` later would silently start being compared verbatim,
     /// making two independent recordings of one scenario diff as different
-    /// (noise that buries the signal). Re-derive the set from `event.rs` itself
-    /// so the omission fails here instead.
+    /// (noise that buries the signal — the `worker_id` case Codex found in
+    /// round 3). Re-derive the set from `event.rs` itself so the omission
+    /// fails here instead.
     ///
-    /// The inverse direction matters just as much: a *non*-UUID-typed field
-    /// must never be in the list, because normalizing a semantic field is a
-    /// false clean — the `idempotency_key` (#521) case Codex found.
+    /// The inverse direction matters just as much: a field the engine does
+    /// *not* mint must never be in the list, because normalizing a semantic
+    /// field is a false clean — the `idempotency_key` (#521) case Codex found
+    /// in round 2.
     #[test]
     fn engine_minted_id_fields_match_the_event_enum() {
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/event.rs"))
@@ -1868,7 +1970,7 @@ mod tests {
             }
             // `Option<T>` never holds engine identity in this enum, so the bare
             // type is the whole test.
-            if UUID_FIELD_TYPES.contains(&ty.trim()) && !derived.contains(&name) {
+            if ENGINE_MINTED_FIELD_TYPES.contains(&ty.trim()) && !derived.contains(&name) {
                 derived.push(name);
             }
         }
@@ -1883,7 +1985,7 @@ mod tests {
         declared.sort_unstable();
         assert_eq!(
             derived, declared,
-            "ENGINE_MINTED_ID_FIELDS drifted from WorkflowEvent's UUID-typed \
+            "ENGINE_MINTED_ID_FIELDS drifted from WorkflowEvent's engine-minted \
              fields. A field only in `derived` is being compared verbatim (two \
              recordings of one scenario will diff as different); a field only \
              in `declared` is being normalized away (a semantic difference \

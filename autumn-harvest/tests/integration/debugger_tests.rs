@@ -1785,3 +1785,177 @@ fn a_one_sided_divergence_is_reported_as_its_own_kind_not_a_history_fact() {
         "the diverged side's own event index must survive the diff",
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Codex round 3
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn two_recordings_differing_only_in_worker_id_do_not_diverge() {
+    // `worker_id` is `WorkerId`, a String-backed newtype — but its VALUE is
+    // always a fresh `Uuid::new_v4()` minted by `WorkerRuntimeConfig::from`
+    // (there is no `WorkerConfig::with_worker_id`). Two independent recordings
+    // therefore differ at the FIRST `ActivityStarted`, which would bury every
+    // later semantic difference behind pure per-run noise.
+    let run = || {
+        let id = ActivityExecId::new();
+        vec![
+            started(),
+            scheduled(id, "step_a"),
+            WorkflowEvent::ActivityStarted {
+                activity_id: id,
+                worker_id: autumn_harvest::types::WorkerId::new(uuid::Uuid::new_v4().to_string()),
+            },
+        ]
+    };
+    let left = handler_free_trace(&run());
+    let right = handler_free_trace(&run());
+    assert!(
+        diff_traces(&left, &right).divergence.is_none(),
+        "a freshly-minted worker id is per-run noise, not a divergence"
+    );
+}
+
+#[test]
+fn an_operator_chosen_worker_label_is_compared_not_normalized() {
+    // The inverse control. `WorkerRuntimeConfig::worker_id` is a `pub` field,
+    // so an embedder may set a stable human label. A label does not parse as a
+    // UUID, so the value guard must keep it comparable — otherwise adding
+    // `worker_id` to the allowlist would have silently discarded a real
+    // difference (the round-2 `idempotency_key` mistake, one field over).
+    let run = |label: &str| {
+        let id = ActivityExecId::new();
+        vec![
+            started(),
+            scheduled(id, "step_a"),
+            WorkflowEvent::ActivityStarted {
+                activity_id: id,
+                worker_id: autumn_harvest::types::WorkerId::new(label),
+            },
+        ]
+    };
+    let left = handler_free_trace(&run("worker-eu-1"));
+    let right = handler_free_trace(&run("worker-us-1"));
+
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("an operator-chosen worker label is a real difference");
+    assert_eq!(div.step_index, 2);
+    assert!(
+        matches!(div.kind, DiffKind::HistoryFacts { field } if field == "event_facts"),
+        "expected an event_facts difference, got {:?}",
+        div.kind
+    );
+}
+
+#[test]
+fn two_recordings_of_different_workflow_types_diverge() {
+    // `workflow_name` is an execution-ROW column present in no `WorkflowEvent`
+    // (not even `WorkflowStarted`), so `event_facts` is structurally blind to
+    // it. Without an explicit check, two recordings of DIFFERENT workflows
+    // with identical event arrays report agreement — and `harvest debug diff`
+    // exits 0 on them.
+    let events = || vec![started(), scheduled(ActivityExecId::new(), "step_a")];
+    let left = ReplayTrace::from_history("onboarding", ExecutionId::new(), &events());
+    let right = ReplayTrace::from_history("checkout", ExecutionId::new(), &events());
+
+    let div = diff_traces(&left, &right)
+        .divergence
+        .expect("different workflow types are not 'in agreement'");
+    assert_eq!(div.step_index, 0);
+    assert!(
+        matches!(
+            &div.kind,
+            DiffKind::WorkflowName { left, right } if left == "onboarding" && right == "checkout"
+        ),
+        "expected a WorkflowName difference naming both types, got {:?}",
+        div.kind
+    );
+}
+
+#[test]
+fn differing_execution_ids_alone_are_not_a_divergence() {
+    // The guard on the fix above: `execution_id` differs on EVERY pair of
+    // independent recordings, so comparing it alongside `workflow_name` would
+    // fabricate a divergence on every fixture-vs-fixture diff.
+    let events = || vec![started(), scheduled(ActivityExecId::new(), "step_a")];
+    let left = ReplayTrace::from_history("onboarding", ExecutionId::new(), &events());
+    let right = ReplayTrace::from_history("onboarding", ExecutionId::new(), &events());
+    assert!(
+        diff_traces(&left, &right).divergence.is_none(),
+        "distinct execution ids are inherent to two recordings, not a difference"
+    );
+}
+
+#[test]
+fn equally_capped_traces_are_inconclusive_not_clean() {
+    // Both traces hit the SAME cap, so their step counts are equal and the
+    // `TraceLength` check — the only one carrying a `capped` flag — never
+    // fires. A difference living past the cap is then reported as silence.
+    // `is_clean()` is what refuses to call that a pass.
+    let long = |tail: &str| {
+        vec![
+            started(),
+            scheduled(ActivityExecId::new(), "step_a"),
+            scheduled(ActivityExecId::new(), tail),
+        ]
+    };
+    let left = ReplayTrace::from_history_capped("wf", ExecutionId::new(), &long("step_b"), 2);
+    let right = ReplayTrace::from_history_capped("wf", ExecutionId::new(), &long("step_z"), 2);
+
+    let diff = diff_traces(&left, &right);
+    assert!(
+        diff.divergence.is_none(),
+        "the differing step is past the cap, so no divergence is visible"
+    );
+    assert!(diff.truncated, "both inputs were capped");
+    assert!(
+        !diff.is_clean(),
+        "an unexamined suffix must never report as a clean comparison"
+    );
+}
+
+#[test]
+fn an_uncapped_agreeing_comparison_is_clean() {
+    // The inverse control: `is_clean()` must still be true for a genuine pass,
+    // or the fix would just make every diff inconclusive.
+    let events = || vec![started(), scheduled(ActivityExecId::new(), "step_a")];
+    let left = ReplayTrace::from_history("wf", ExecutionId::new(), &events());
+    let right = ReplayTrace::from_history("wf", ExecutionId::new(), &events());
+
+    let diff = diff_traces(&left, &right);
+    assert!(!diff.truncated);
+    assert!(diff.is_clean(), "a complete, agreeing comparison is clean");
+}
+
+#[test]
+fn a_signal_breakpoint_matches_a_multi_word_name_at_a_waiting_frontier() {
+    // Signal names are not restricted to one token, and a `WaitForSignal`
+    // summary IS the whole name with no qualifier. Splitting it on whitespace
+    // made `SignalName("order approved")` unmatchable at precisely the step a
+    // breakpoint is for: a waiting frontier, where no `SignalReceived` exists
+    // yet to match instead.
+    let step = bare_step(
+        0,
+        vec![cmd("WaitForSignal", "order approved")],
+        StepOutcome::Suspended,
+    );
+    let trace = ReplayTrace {
+        workflow_name: "wf".to_string(),
+        execution_id: ExecutionId::new(),
+        steps: vec![step],
+        total_events: 1,
+        truncated: false,
+    };
+
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::SignalName("order approved".to_string()), 0),
+        Some(0),
+        "a multi-word signal name must match the waiting frontier"
+    );
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::SignalName("order".to_string()), 0),
+        None,
+        "a partial name must NOT match, or the breakpoint is imprecise"
+    );
+}

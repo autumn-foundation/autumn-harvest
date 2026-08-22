@@ -292,6 +292,15 @@ of the field that differs, not just its name — a handler-free trace has no
 commands to show, so naming `open_awaitables` without printing them would leave
 the operator no better off.
 
+Before any step is compared, the two traces must agree on `workflow_name`.
+That field is an execution-**row** column — it appears in no `WorkflowEvent`,
+not even `WorkflowStarted` — so the event-level comparison below is structurally
+blind to it, and two recordings of *different* workflow types with similar event
+shapes would otherwise walk every step and report agreement. `execution_id` is
+deliberately **not** compared alongside it: it differs on every pair of
+independent recordings, so comparing it would fabricate a divergence on every
+fixture-vs-fixture diff.
+
 Because a handler-free trace emits no commands, this arm compares the
 *history-derived* facts. It does so in two layers:
 
@@ -372,8 +381,22 @@ harvest debug diff <LEFT> <RIGHT> [--format text|json]
 In JSON mode the *whole* trace is always emitted — silently emitting a partial
 document would be a trap for a machine consumer.
 
-Exit codes: `0` success, `1` on a missed breakpoint, an out-of-range `--step`,
-an unreadable/malformed history, or a diff that found a divergence.
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success. For `diff`, the two traces were compared **in full** and agree. |
+| `1` | A missed breakpoint, an out-of-range `--step`, an unreadable/malformed history, or a diff that **found a divergence**. |
+| `2` | A diff was **inconclusive**: only a prefix was compared because a trace hit its `max_steps` cap, and no difference was found in it. |
+
+Exit `2` is deliberate, and joins the CLI's other "could not determine" gates
+(`workflow-types reachability`, `queue-coverage`, `restore verify`). "No
+difference in the part we looked at" is not "these agree", so a CI gate must be
+able to tell it apart from both `0` and `1`. Raise the cap to turn an
+inconclusive result into a conclusive one.
+
+In the library the same distinction is `TraceDiff::is_clean()` — use it rather
+than `divergence.is_none()`, which reports an unexamined suffix as a pass.
 
 ### Library
 

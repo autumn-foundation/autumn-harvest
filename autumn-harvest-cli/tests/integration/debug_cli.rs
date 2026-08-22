@@ -68,8 +68,17 @@ fn trace_of(events: &[WorkflowEvent]) -> ReplayTrace {
 /// Write a `HistorySnapshot` JSON fixture and return its path (plus the owning
 /// tempdir, which must stay alive for the duration of the test).
 fn snapshot_file(dir: &Path, name: &str, events: &[WorkflowEvent]) -> PathBuf {
+    snapshot_file_for(dir, name, "order_flow", events)
+}
+
+fn snapshot_file_for(
+    dir: &Path,
+    name: &str,
+    workflow_name: &str,
+    events: &[WorkflowEvent],
+) -> PathBuf {
     let snapshot = serde_json::json!({
-        "workflow_name": "order_flow",
+        "workflow_name": workflow_name,
         "execution_id": ExecutionId::new(),
         "events": events,
     });
@@ -793,5 +802,67 @@ fn an_event_facts_divergence_renders_both_normalized_events() {
     assert!(
         out.contains("30") && out.contains("60"),
         "both durations must render so the operator can see what moved:\n{out}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Codex round 3 — CLI surface
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn diff_of_two_workflow_types_exits_nonzero_and_names_both() {
+    // `workflow_name` lives on the execution row, not in any event, so two
+    // recordings of DIFFERENT workflows with identical event arrays would
+    // otherwise walk every step and exit 0 — the CLI reporting agreement
+    // between recordings that are not even of the same thing.
+    let dir = tempfile::tempdir().unwrap();
+    let events = base_events();
+    let left = snapshot_file_for(dir.path(), "left.json", "onboarding", &events);
+    let right = snapshot_file_for(dir.path(), "right.json", "checkout", &events);
+
+    let err = run_diff(&left, &right, DebugFormat::Text)
+        .expect_err("different workflow types must not exit 0");
+    assert_eq!(err.exit_code(), 1);
+}
+
+#[test]
+fn diff_render_names_both_workflow_types() {
+    let events = base_events();
+    let left = ReplayTrace::from_history("onboarding", ExecutionId::new(), &events);
+    let right = ReplayTrace::from_history("checkout", ExecutionId::new(), &events);
+    let rendered = render_diff(
+        &autumn_harvest::debugger::diff_traces(&left, &right),
+        "old.json",
+        "new.json",
+    );
+
+    assert!(
+        rendered.contains("different workflow types"),
+        "the report must say WHY they are incomparable:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("onboarding") && rendered.contains("checkout"),
+        "both type names must appear:\n{rendered}"
+    );
+}
+
+#[test]
+fn diff_render_reports_a_capped_comparison_as_inconclusive() {
+    // A capped comparison that found nothing must never render like a pass:
+    // the two traces agree only across the prefix that was examined.
+    let events = base_events();
+    let left = ReplayTrace::from_history_capped("order_flow", ExecutionId::new(), &events, 1);
+    let right = ReplayTrace::from_history_capped("order_flow", ExecutionId::new(), &events, 1);
+    let diff = autumn_harvest::debugger::diff_traces(&left, &right);
+    assert!(diff.divergence.is_none() && diff.truncated);
+
+    let rendered = render_diff(&diff, "old.json", "new.json");
+    assert!(
+        rendered.contains("INCONCLUSIVE"),
+        "a capped comparison must not read as agreement:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("no divergence"),
+        "the clean wording must not appear on a capped comparison:\n{rendered}"
     );
 }

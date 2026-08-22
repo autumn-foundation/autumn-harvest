@@ -326,9 +326,17 @@ fn compact(value: &serde_json::Value) -> String {
 #[must_use]
 pub fn render_diff(diff: &TraceDiff, left_label: &str, right_label: &str) -> String {
     let Some(div) = &diff.divergence else {
+        let examined = diff.left_steps.min(diff.right_steps);
+        if diff.truncated {
+            // Not the same claim as agreement, and must never render as one:
+            // both traces stopped at the same cap, so a difference living past
+            // it is indistinguishable from silence.
+            return format!(
+                "INCONCLUSIVE: {left_label} and {right_label} agree across the {examined} steps\n                 that were compared, but at least one trace was capped by --max-steps,\n                 so the remainder was never examined. Raise the cap to get a verdict.\n"
+            );
+        }
         return format!(
-            "no divergence: {left_label} and {right_label} agree across all {} steps\n",
-            diff.left_steps.min(diff.right_steps)
+            "no divergence: {left_label} and {right_label} agree across all {examined} steps\n"
         );
     };
 
@@ -372,6 +380,11 @@ pub fn render_diff(diff: &TraceDiff, left_label: &str, right_label: &str) -> Str
             }
             line
         }
+        DiffKind::WorkflowName { left, right } => {
+            format!(
+                "  the two recordings are of different workflow types: {left} vs {right}\n   (workflow_name selects the handler that owns the history,\n    so nothing below it is comparable)\n"
+            )
+        }
         DiffKind::TraceLength {
             left,
             right,
@@ -403,8 +416,13 @@ pub fn render_diff(diff: &TraceDiff, left_label: &str, right_label: &str) -> Str
         DiffKind::HistoryFacts { field } => Some(*field),
         _ => None,
     };
-    out.push_str(&side("left ", left_label, div.left.as_ref(), field));
-    out.push_str(&side("right", right_label, div.right.as_ref(), field));
+    // `WorkflowName` is trace-level: both sides are `None` by construction, so
+    // rendering them would print two `<no step at this index>` lines that say
+    // nothing. The kind line above already carries both names.
+    if !matches!(div.kind, DiffKind::WorkflowName { .. }) {
+        out.push_str(&side("left ", left_label, div.left.as_ref(), field));
+        out.push_str(&side("right", right_label, div.right.as_ref(), field));
+    }
     out
 }
 
@@ -652,9 +670,19 @@ pub fn run_diff(left: &Path, right: &Path, format: DebugFormat) -> Result<(), Cl
         );
     }
 
-    diff.divergence.as_ref().map_or(Ok(()), |div| {
-        Err(CliError::DebugDivergence {
+    if let Some(div) = diff.divergence.as_ref() {
+        return Err(CliError::DebugDivergence {
             step_index: div.step_index,
+        });
+    }
+    // No divergence found — but only a clean *complete* comparison is exit 0.
+    // `TraceDiff::is_clean` is what distinguishes the two; testing
+    // `divergence.is_none()` here would report an unexamined suffix as a pass.
+    if diff.is_clean() {
+        Ok(())
+    } else {
+        Err(CliError::DebugDiffInconclusive {
+            examined: diff.left_steps.min(diff.right_steps),
         })
-    })
+    }
 }
