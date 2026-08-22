@@ -6,6 +6,11 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use autumn_harvest::backup_verify::{
+    Finding, FindingSeverity, RestoreVerifyReport, ShardTarget, VerifyOptions, VerifyStatus,
+    dsn_targets_same_database, redact_dsn, verify_restore,
+};
+use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::{
     AcknowledgedBreakingChange, DetCheckReport, DetSeverity, SchemaContractDiff, SchemaDelta,
     SchemaRole, WorkflowSchemaContract, check_paths, diff_schema_contracts,
@@ -88,6 +93,66 @@ pub enum OutputFormat {
     PrettyJson,
     /// Compact JSON for scripts.
     Json,
+}
+
+/// `harvest backup` subcommands (issue #943).
+#[derive(Debug, Subcommand)]
+pub enum BackupCommand {
+    /// Verify a restored (scratch) snapshot is resumable.
+    Verify {
+        /// A scratch-database DSN to inspect. Repeat once per shard. Accepts a
+        /// bare DSN or an explicit `<shard_id>=<dsn>` pair. An unprefixed DSN
+        /// takes its POSITIONAL index as its shard id (first `--shard` is
+        /// shard `0`, second is shard `1`, ...) — so prefix explicitly
+        /// whenever your shard ids are not `0..n`.
+        ///
+        /// Supply EVERY shard: a cross-shard reference into a shard that was
+        /// not supplied is reported as an advisory, never silently passed.
+        #[arg(long = "shard", value_name = "DSN", required = true)]
+        shards: Vec<String>,
+
+        /// A live (production) DSN to guard against. When a `--shard` target
+        /// resolves to the same `(host, port, database)`, the run is refused
+        /// unless `--i-know-this-is-scratch` is passed.
+        ///
+        /// Repeat once per live shard: a fleet whose other shards are not
+        /// named here is NOT guarded against, and the run warns saying so.
+        #[arg(
+            long = "live-dsn",
+            value_name = "DSN",
+            env = "HARVEST_DATABASE_URL",
+            hide_env_values = true
+        )]
+        live_dsn: Vec<String>,
+
+        /// Acknowledge that every `--shard` target is a throwaway scratch copy,
+        /// overriding the live-DSN guard.
+        #[arg(long, default_value_t = false)]
+        i_know_this_is_scratch: bool,
+
+        /// Output format: human-readable `text` (default) or machine-readable
+        /// `json`.
+        #[arg(long, value_enum, default_value_t)]
+        format: BackupVerifyFormat,
+
+        /// How many non-terminal histories to sample and replay per shard.
+        #[arg(long, default_value_t = 50)]
+        replay_sample: usize,
+
+        /// Worker-heartbeat staleness threshold, in seconds, for the
+        /// dead-worker and broken-session probes.
+        #[arg(long, default_value_t = 60)]
+        worker_stale_secs: i64,
+
+        /// Rows read per coherence probe.
+        ///
+        /// For the cross-shard reference scan this is a *page* size, not a
+        /// ceiling: that scan pages through complete owner groups until the
+        /// shard is exhausted. Raise it only if the report says a single
+        /// execution carries more reference events than one page.
+        #[arg(long, default_value_t = 1000)]
+        probe_limit: i64,
+    },
 }
 
 /// Output format for the `det-check` subcommand (issue #778).
@@ -418,6 +483,39 @@ pub enum CliError {
         warnings: usize,
     },
 
+    /// `backup verify` found a broken invariant in the restored snapshot
+    /// (issue #943). Exit code is `1`.
+    ///
+    /// The report itself is already printed; this only carries the count so
+    /// `main` can exit with the right code.
+    #[error(
+        "backup verify: {findings} incoherent finding(s) — DO NOT START WORKERS on this \
+         restore. See the report above and docs/runbooks/backup-restore.md."
+    )]
+    RestoreIncoherent {
+        /// Number of `Incoherent`-severity findings.
+        findings: usize,
+    },
+
+    /// `backup verify` could not complete every check, so the restore's
+    /// coherence could not be determined (issue #943). Exit code is `2`,
+    /// distinct from a determined failure, so CI can tell "broken" apart from
+    /// "unknown".
+    ///
+    /// Two causes: a shard that could not be connected to, and a probe that
+    /// could not run (canonically a missing table — an unmigrated database).
+    #[error(
+        "backup verify: UNDETERMINED — {unreachable_shards} shard(s) unreachable, \
+         {failed_probes} probe(s) could not run. Do not start workers on the strength \
+         of this report."
+    )]
+    RestoreUndetermined {
+        /// Number of shards that could not be reached.
+        unreachable_shards: usize,
+        /// Number of `Undetermined`-severity findings (probes that never ran).
+        failed_probes: usize,
+    },
+
     /// `schema check` found a backward-incompatible payload-schema change
     /// (issue #794).
     ///
@@ -487,7 +585,15 @@ impl CliError {
             // queue-coverage gate use exit code 2 specifically so CI can
             // distinguish "an orphaned/partial/uncovered deploy hazard" from
             // a generic transport/usage failure (exit 1).
-            Self::WorkflowReachabilityGate { .. } | Self::QueueCoverageGate { .. } => 2,
+            //
+            // Issue #943 joins them for the same reason: "could not determine"
+            // (a shard was unreachable) must be distinguishable from
+            // "determined broken" (exit 1), so an operator drill script can
+            // retry a transient shard outage rather than declare the restore
+            // unusable.
+            Self::WorkflowReachabilityGate { .. }
+            | Self::QueueCoverageGate { .. }
+            | Self::RestoreUndetermined { .. } => 2,
             _ => 1,
         }
     }
@@ -741,6 +847,21 @@ enum Commands {
         #[command(subcommand)]
         command: BuildRoutingCommand,
     },
+    /// Verify that a restored backup/PITR snapshot is resumable (issue #943).
+    ///
+    /// Read-only against every supplied scratch database: each connection is
+    /// pinned `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`, so
+    /// Postgres itself rejects any write. Never mutates the production
+    /// database, never starts a worker, and never applies a reclaim -- the
+    /// scanners' work is *reported*, not performed.
+    ///
+    /// Exit codes: `0` clean or resumable-with-reclaim; `1` incoherent (do not
+    /// start workers); `2` undetermined (a shard was unreachable).
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
+
     /// Statically check source for non-determinism reachable from `#[workflow]`
     /// bodies, including one first-party helper hop (issue #778).
     ///
@@ -2599,6 +2720,9 @@ impl Cli {
                 queue.as_deref(),
             )),
             Commands::Build { command } => Ok(build_routing_request(command)),
+            Commands::Backup { .. } => {
+                unreachable!("Backup handles its own execution locally")
+            }
             Commands::DetCheck { .. } => {
                 unreachable!("DetCheck handles its own execution locally")
             }
@@ -2677,6 +2801,33 @@ pub mod tui;
 // by the shared execute/render path. Splitting it would only scatter the guards.
 #[allow(clippy::too_many_lines)]
 pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
+    // `backup verify` talks to scratch databases directly (read-only), not to
+    // the management API: no HTTP, handled in-process (mirrors DetCheck).
+    if let Commands::Backup {
+        command:
+            BackupCommand::Verify {
+                shards,
+                live_dsn,
+                i_know_this_is_scratch,
+                format,
+                replay_sample,
+                worker_stale_secs,
+                probe_limit,
+            },
+    } = &cli.command
+    {
+        return run_backup_verify(
+            shards,
+            live_dsn,
+            *i_know_this_is_scratch,
+            *format,
+            *replay_sample,
+            *worker_stale_secs,
+            *probe_limit,
+        )
+        .await;
+    }
+
     // det-check is read-only local source analysis: no HTTP, handled entirely
     // in-process before the API execute path (mirrors the Tui early-return).
     if let Commands::DetCheck {
@@ -3480,6 +3631,340 @@ pub fn run_det_check(
         return Err(err);
     }
     Ok(())
+}
+
+// ── harvest backup verify: post-restore resumability drill (issue #943) ─────
+
+/// Output format for `harvest backup verify`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum BackupVerifyFormat {
+    /// Human-readable operator report (default).
+    #[default]
+    Text,
+    /// Machine-readable `RestoreVerifyReport` JSON for CI consumption.
+    Json,
+}
+
+/// Parse `--shard` values into [`ShardTarget`]s.
+///
+/// Accepts either a bare DSN (implicitly shard `0`, the single-shard default)
+/// or an explicit `<shard_id>=<dsn>` pair. Rejects an empty list and duplicate
+/// shard ids, since either would make the cross-shard verdict meaningless.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] on an empty list, a malformed shard id, an empty
+/// DSN, or a duplicated shard id.
+pub fn parse_shard_targets(raw: &[String]) -> Result<Vec<ShardTarget>, CliError> {
+    if raw.is_empty() {
+        return Err(CliError::InvalidInput(
+            "at least one --shard <DSN> (or --shard <ID>=<DSN>) is required".to_string(),
+        ));
+    }
+    let mut seen: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(raw.len());
+    for (idx, spec) in raw.iter().enumerate() {
+        let spec = spec.trim();
+        // Only split on a `<digits>=` prefix: a DSN can legitimately contain
+        // `=` in its query string (`?sslmode=require`), so an unconditional
+        // `split_once('=')` would mangle a bare DSN.
+        let (shard_id, dsn) = match spec.split_once('=') {
+            Some((head, tail)) if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) => {
+                let id = head.parse::<i32>().map_err(|_| {
+                    CliError::InvalidInput(format!("--shard: shard id `{head}` is out of range"))
+                })?;
+                (id, tail)
+            }
+            _ => (i32::try_from(idx).unwrap_or(0), spec),
+        };
+        // An `ExecutionId` carries its shard as `shard & 0xFFFF`, and `0xFFFF`
+        // is the reserved `ShardId::UNENCODED` sentinel -- so a value outside
+        // `0..=0xFFFE` does not survive the round trip. `65536` truncates to
+        // `0`, which would make every target id read out of THIS database
+        // decode as shard 0, miss the supplied map, and be written off as
+        // "on an uninspected shard": an advisory, exit 0, and the shard the
+        // operator supplied never actually checked. Validate with the same
+        // rule the shard router uses so the two cannot drift.
+        if !autumn_harvest::shard::is_encodable_shard(autumn_harvest::ShardId::new(shard_id)) {
+            return Err(CliError::InvalidInput(format!(
+                "--shard: shard id `{shard_id}` cannot be encoded into an execution id \
+                 (valid range is 0..={})",
+                autumn_harvest::shard::MAX_ENCODABLE_SHARD
+            )));
+        }
+        if dsn.trim().is_empty() {
+            return Err(CliError::InvalidInput(format!(
+                "--shard: shard {shard_id} has an empty DSN"
+            )));
+        }
+        if !seen.insert(shard_id) {
+            return Err(CliError::InvalidInput(format!(
+                "--shard: shard {shard_id} was supplied more than once"
+            )));
+        }
+        out.push(ShardTarget::new(shard_id, dsn.trim()));
+    }
+    Ok(out)
+}
+
+/// AC4: refuse to run against a DSN that resolves to the same database as the
+/// live configuration, unless the operator explicitly acknowledges otherwise.
+///
+/// Comparison is on `(host, port, database)` only, so a different user or
+/// password against the same database is still caught. The guard **fails
+/// closed**: a DSN that cannot be parsed is treated as a match.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] when a target matches `live` and `ack` is false.
+/// The message names the override flag and never echoes a password.
+pub fn scratch_guard(dsns: &[String], live: &[String], ack: bool) -> Result<(), CliError> {
+    if ack || live.is_empty() {
+        return Ok(());
+    }
+    for dsn in dsns {
+        let candidate = strip_shard_prefix(dsn);
+        for l in live {
+            if dsn_targets_same_database(candidate, l) {
+                return Err(CliError::InvalidInput(format!(
+                    "refusing to verify `{}`: it resolves to the same database as the live \
+                     configuration. Restore into a scratch database first, or pass \
+                     --i-know-this-is-scratch if this really is a throwaway copy.",
+                    redact_dsn(candidate)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Strip an optional `<shard_id>=` prefix from a `--shard` value.
+fn strip_shard_prefix(dsn: &str) -> &str {
+    match dsn.split_once('=') {
+        Some((head, tail)) if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) => tail,
+        _ => dsn,
+    }
+}
+
+/// The stderr notice to print when the live-DSN guard could not actually
+/// protect anything.
+///
+/// The guard is silent by design in two cases, and silence is the dangerous
+/// part: an operator who believes a safety net is engaged will point the
+/// command at whatever DSN is to hand. Say so out loud instead.
+///
+/// * No `--live-dsn` was supplied at all — nothing was compared.
+/// * `--i-know-this-is-scratch` was passed — the comparison was skipped.
+///
+/// Returns `None` when the guard genuinely ran against at least one live DSN.
+#[must_use]
+pub fn scratch_guard_warning(live: &[String], ack: bool) -> Option<String> {
+    if ack {
+        return Some(
+            "WARNING: --i-know-this-is-scratch was passed, so the live-database guard did \
+             NOT run. Nothing checked that these DSNs are scratch copies."
+                .to_string(),
+        );
+    }
+    if live.is_empty() {
+        return Some(
+            "WARNING: no --live-dsn was supplied (and HARVEST_DATABASE_URL is unset), so the \
+             live-database guard did NOT run. Pass --live-dsn once per live shard to be \
+             refused if a --shard target resolves to production."
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Serialise a restore-verification report as pretty JSON.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] if serialisation fails (not reachable for the
+/// report's own types; guarded rather than unwrapped).
+pub fn backup_verify_json(report: &RestoreVerifyReport) -> Result<String, CliError> {
+    serde_json::to_string_pretty(report)
+        .map_err(|e| CliError::InvalidInput(format!("failed to serialise report: {e}")))
+}
+
+/// Render a restore-verification report for a human operator.
+#[must_use]
+pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "restore verification: {}", report.status);
+    let _ = writeln!(out, "  generated at: {}", report.generated_at);
+    if let Some(skew) = report.restore_point_skew_secs {
+        let _ = writeln!(out, "  restore-point skew: {skew}s across shards");
+    }
+
+    let replay = &report.replay;
+    if replay.verified() {
+        let _ = writeln!(
+            out,
+            "  replay: {} sampled, {} clean, {} divergent, {} workflow-failed, \
+             {} skipped (no handler), {} unreadable",
+            replay.sampled,
+            replay.clean,
+            replay.divergent,
+            replay.failed,
+            replay.skipped_no_handler,
+            replay.unreadable
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "  replay: NOT VERIFIED — {} sampled, {} skipped (no handler), {} unreadable. \
+             Register the workflow handlers to make this drill meaningful.",
+            replay.sampled, replay.skipped_no_handler, replay.unreadable
+        );
+    }
+
+    for shard in &report.shards {
+        if shard.reachable {
+            let _ = writeln!(
+                out,
+                "\nshard {} ({}) — {} non-terminal execution(s)",
+                shard.shard_id,
+                shard.dsn,
+                shard
+                    .non_terminal_executions
+                    .map_or_else(|| "unknown".to_string(), |n| n.to_string())
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "\nshard {} ({}) — UNREACHABLE: {}",
+                shard.shard_id,
+                shard.dsn,
+                shard.unreachable_reason.as_deref().unwrap_or("unknown")
+            );
+        }
+        write_findings(&mut out, &shard.findings);
+    }
+
+    if !report.cross_shard.is_empty() {
+        let _ = writeln!(out, "\ncross-shard");
+        write_findings(&mut out, &report.cross_shard);
+    }
+
+    if report.all_findings().next().is_none() {
+        let _ = writeln!(out, "\nno findings.");
+    }
+
+    let _ = write!(out, "\nverdict: {}", verdict_advice(report.status));
+    out
+}
+
+fn write_findings(out: &mut String, findings: &[Finding]) {
+    for f in findings {
+        let more = if f.truncated { ", truncated" } else { "" };
+        let _ = writeln!(
+            out,
+            "  [{}] {} x{}{} — {}",
+            f.severity, f.class, f.count, more, f.explanation
+        );
+        for sample in &f.samples {
+            let _ = writeln!(out, "        {sample}");
+        }
+        if let Some(detail) = &f.detail {
+            let _ = writeln!(out, "        note: {detail}");
+        }
+    }
+}
+
+const fn verdict_advice(status: VerifyStatus) -> &'static str {
+    match status {
+        VerifyStatus::Clean => "nothing in flight; safe to start workers.",
+        VerifyStatus::ResumableWithReclaim => {
+            "resumable — the reclaimable findings above heal themselves once workers start."
+        }
+        VerifyStatus::Incoherent => {
+            "DO NOT START WORKERS — the incoherent findings above are broken invariants."
+        }
+        VerifyStatus::Unavailable => {
+            "UNDETERMINED — a shard was unreachable or a probe could not run, so coherence \
+             was not actually checked. Do not start workers on the strength of this report."
+        }
+    }
+}
+
+/// Map a report's verdict onto the CLI's exit-code contract.
+///
+/// `None` means "pass" (exit `0`) for both `Clean` and `ResumableWithReclaim` —
+/// a normal restore always carries reclaimable artifacts and must not fail a
+/// drill. `Incoherent` exits `1`; `Unavailable` exits `2` so CI can tell
+/// "determined broken" apart from "could not determine".
+#[must_use]
+pub fn backup_verify_gate(report: &RestoreVerifyReport) -> Option<CliError> {
+    match report.status {
+        VerifyStatus::Clean | VerifyStatus::ResumableWithReclaim => None,
+        VerifyStatus::Incoherent => Some(CliError::RestoreIncoherent {
+            findings: report
+                .all_findings()
+                .filter(|f| f.severity == FindingSeverity::Incoherent)
+                .count(),
+        }),
+        VerifyStatus::Unavailable => Some(CliError::RestoreUndetermined {
+            unreachable_shards: report.shards.iter().filter(|s| !s.reachable).count(),
+            // Sum each finding's `count`, not the number of findings: one
+            // `ProbeFailed` finding aggregates every probe that could not run
+            // on that shard, so counting findings would under-report by an
+            // order of magnitude and make the message read far less alarming
+            // than the truth.
+            failed_probes: report
+                .all_findings()
+                .filter(|f| f.severity == FindingSeverity::Undetermined)
+                .map(|f| usize::try_from(f.count).unwrap_or(usize::MAX))
+                .sum(),
+        }),
+    }
+}
+
+/// Run `harvest backup verify` end to end.
+///
+/// # Errors
+///
+/// [`CliError::InvalidInput`] on bad arguments or a refused live DSN;
+/// [`CliError::RestoreIncoherent`] / [`CliError::RestoreUndetermined`] when the
+/// report fails the gate. The report itself is always printed first.
+pub async fn run_backup_verify(
+    shards: &[String],
+    live_dsn: &[String],
+    ack: bool,
+    format: BackupVerifyFormat,
+    replay_sample: usize,
+    worker_stale_secs: i64,
+    probe_limit: i64,
+) -> Result<(), CliError> {
+    scratch_guard(shards, live_dsn, ack)?;
+    // Say out loud when the guard could not protect anything -- an operator
+    // who believes a safety net is engaged is the one who points this at
+    // production. On stderr so `-o json` stdout stays parseable.
+    if let Some(w) = scratch_guard_warning(live_dsn, ack) {
+        eprintln!("{w}");
+    }
+    let targets = parse_shard_targets(shards)?;
+
+    let options = VerifyOptions::default()
+        .with_replay_sample(replay_sample)
+        .with_worker_stale_secs(worker_stale_secs)
+        .with_probe_limit(probe_limit)
+        .with_scratch_ack(ack);
+
+    // The CLI ships no application workflow handlers, so replay coverage is
+    // reported as NOT VERIFIED rather than silently claimed. An embedder that
+    // wants replay coverage calls `verify_restore` from its own binary with a
+    // populated `WorkflowReplayer` (see docs/runbooks/backup-restore.md).
+    let replayer = WorkflowReplayer::new();
+    let report = verify_restore(&targets, &options, &replayer).await;
+
+    match format {
+        BackupVerifyFormat::Text => println!("{}", format_backup_verify_text(&report)),
+        BackupVerifyFormat::Json => println!("{}", backup_verify_json(&report)?),
+    }
+
+    backup_verify_gate(&report).map_or(Ok(()), Err)
 }
 
 // ── harvest schema: payload-schema contract gate (issue #794) ───────────────
@@ -12337,6 +12822,88 @@ mod det_check_cli_tests {
     const WF_WARN: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let _ = std::process::id();\n    Ok(())\n}\n";
 
     const WF_SUPPRESSED: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    // harvest-suppress: DET001 \"recorded in signal payload\"\n    let _ = std::time::SystemTime::now();\n    Ok(())\n}\n";
+
+    // ── backup verify (issue #943) ─────────────────────────────────────────
+
+    #[test]
+    fn backup_verify_parses_repeated_shards_and_flags() {
+        let cli = parse(&[
+            "backup",
+            "verify",
+            "--shard",
+            "0=postgres://scratch/a",
+            "--shard",
+            "1=postgres://scratch/b",
+            "--format",
+            "json",
+            "--replay-sample",
+            "7",
+            "--worker-stale-secs",
+            "120",
+            "--probe-limit",
+            "250",
+            "--i-know-this-is-scratch",
+        ]);
+        match cli.command {
+            Commands::Backup {
+                command:
+                    BackupCommand::Verify {
+                        shards,
+                        i_know_this_is_scratch,
+                        format,
+                        replay_sample,
+                        worker_stale_secs,
+                        probe_limit,
+                        ..
+                    },
+            } => {
+                assert_eq!(shards.len(), 2);
+                assert_eq!(shards[1], "1=postgres://scratch/b");
+                assert!(i_know_this_is_scratch);
+                assert_eq!(format, BackupVerifyFormat::Json);
+                assert_eq!(replay_sample, 7);
+                assert_eq!(worker_stale_secs, 120);
+                assert_eq!(probe_limit, 250);
+            }
+            other => panic!("expected Backup::Verify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_verify_defaults_are_text_and_guarded() {
+        let cli = parse(&["backup", "verify", "--shard", "postgres://scratch/a"]);
+        match cli.command {
+            Commands::Backup {
+                command:
+                    BackupCommand::Verify {
+                        i_know_this_is_scratch,
+                        format,
+                        replay_sample,
+                        probe_limit,
+                        ..
+                    },
+            } => {
+                assert!(
+                    !i_know_this_is_scratch,
+                    "the scratch guard must be opt-OUT, never the default"
+                );
+                assert_eq!(format, BackupVerifyFormat::Text);
+                assert_eq!(replay_sample, 50);
+                assert_eq!(
+                    probe_limit,
+                    autumn_harvest::backup_verify::DEFAULT_PROBE_LIMIT,
+                    "the CLI default must track the library default"
+                );
+            }
+            other => panic!("expected Backup::Verify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_verify_requires_at_least_one_shard() {
+        Cli::try_parse_from(["harvest", "backup", "verify"])
+            .expect_err("--shard is required; a verify with no target is meaningless");
+    }
 
     #[test]
     fn det_check_parses_paths_and_flags() {

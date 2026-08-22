@@ -12,7 +12,12 @@ keywords = ["workflow", "durable", "cli", "orchestration", "autumn"]
 categories = ["command-line-utilities", "asynchronous"]
 
 [dependencies]
-autumn-harvest = { version = "0.5.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
+# `db` is enabled UNCONDITIONALLY (not behind a CLI Cargo feature) so every CI
+# lint/test leg covers `backup verify` (issue #943). Diesel's `postgres_backend`
+# and diesel-async/tokio-postgres are pure Rust, so the Windows/macOS CI legs
+# build it without a system libpq/OpenSSL, and the workspace already compiles
+# diesel for the core crate.
+autumn-harvest = { version = "0.5.0", path = "../autumn-harvest", default-features = false, features = ["db", "testing"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 crossterm = "0.29.0"
 percent-encoding = "2"
@@ -31,6 +36,9 @@ name = "harvest-replay"
 path = "src/bin/harvest_replay.rs"
 
 [dev-dependencies]
+# Already in the graph via `autumn-harvest`; a dev-dep so the integration test
+# binaries can stamp a `RestoreVerifyReport::generated_at` directly.
+chrono = { workspace = true }
 tempfile = "3"
 
 [[test]]

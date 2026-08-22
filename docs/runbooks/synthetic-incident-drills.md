@@ -108,3 +108,32 @@ Runbook step: `harvest_shard_unready` -> `### Triage steps`, especially
 
 Resolution target: restore migrations or worker coverage, rerun shard health,
 and only promote the shard when `readiness` is `ready`.
+
+## restore-resumability
+
+Unlike the drills above, this one is not alert-driven — it rehearses a
+**recovery decision** rather than a detection path. Restore a recent backup into
+a scratch database and verify it is safe to resume before you ever need to.
+
+Restore the snapshot into a throwaway database, then:
+
+```
+harvest backup verify --shard '<scratch DSN>' --i-know-this-is-scratch
+```
+
+Expected result: exit `0` with verdict `clean` or `resumable_with_reclaim`. The
+`reclaimable` findings (dead-worker `RUNNING` rows, expired leases, `INFLIGHT`
+completion deliveries) are **expected** in any healthy restore — each names the
+scanner that heals it.
+
+Resolution target: the whole drill — restore, verify, decide — completes in
+under 30 minutes, and the operator can state from the exit code alone whether
+workers may start. Exit `1` (`incoherent`) means restore from a different point;
+exit `2` (`unavailable`) means the drill did not actually check anything and must
+be re-run.
+
+In a multi-shard environment, restore **every** shard, pass every shard to a
+**single** `harvest backup verify` invocation, and start workers only after that
+one run exits `0`.
+
+Runbook: [`backup-restore.md`](backup-restore.md).

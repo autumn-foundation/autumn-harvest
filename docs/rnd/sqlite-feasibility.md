@@ -54,12 +54,12 @@ module counts at the audited revision, recomputed by CI:
 
 | Mechanism | Reach | Portable? |
 |---|---|---|
-| `diesel` query layer | 44 modules | Query construction is mechanical; the *type* layer is not. |
+| `diesel` query layer | 45 modules | Query construction is mechanical; the *type* layer is not. |
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 15 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 15 modules | Subsumed by the single write lock. |
-| `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 9 modules | Yes — integer epoch milliseconds. |
-| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 28 modules | Case by case — the SQL must be read, not inferred from the ORM. |
-| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 20 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
+| `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 10 modules | Yes — integer epoch milliseconds. |
+| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 29 modules | Case by case — the SQL must be read, not inferred from the ORM. |
+| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 21 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
 | `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 10 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 6 modules | Yes — `sqlite_master` lookup. |
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
@@ -70,7 +70,7 @@ Plus **87 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
 which apply to SQLite. The SQLite crate does not translate them; it declares
 its own schema.
 
-**44 of the 98 core modules** exhibit at least one mechanism — a shade under
+**45 of the 99 core modules** exhibit at least one mechanism — a shade under
 half. That ratio is the headline finding, and it cuts *both* ways: the
 determinism core really is clean, and the persistence layer really is
 saturated.
@@ -161,6 +161,7 @@ Classification rule:
 | `activity_pause` | diesel, raw-sql | (b) | Claim-time gate on one activity type. The snapshot-window re-check and the two-pass resume credit exist only for READ COMMITTED; a single writer subsumes both. |
 | `admission_gate` | diesel, advisory-lock, raw-sql | (b) | Advisory lock subsumed by the single write lock. |
 | `audit` | diesel | (a) | Append-only row writes. |
+| `backup_verify` | diesel, interval-sql, raw-pg-sql, raw-sql | (b) | Read-only post-restore probes (issue #943). Every statement is a `SELECT`, but the reused scanner predicates carry `NOW() - ($1 * INTERVAL '1 second')` interval arithmetic — rewrite against integer epoch ms, as `build_routing` does. `COUNT(*) OVER ()` already works (SQLite window functions, 3.25+). |
 | `batch` | diesel, raw-pg-sql, raw-sql | (b) | JSONB `\|\|` concatenation and `search_attrs @> $jsonb` containment. SQLite JSON1 has neither — rewrite with `json_patch`/`json_extract`. |
 | `build_routing` | diesel, interval-sql, raw-sql | (b) | Integer epoch ms for the interval arithmetic. |
 | `calendar` | diesel | (a) | Plain CRUD. |
@@ -203,7 +204,7 @@ Classification rule:
 | `worker` | diesel, skip-locked, row-lock, advisory-lock, listen/notify, raw-pg-sql, raw-sql | (c) | The dispatch loop; wakeups and persistence are interleaved. |
 | `workers` | diesel, interval-sql, raw-pg-sql, raw-sql | (b) | Fleet registry rows, but the sticky-lease filter embeds `NOW()` and the capability-miss fleet lookup adds an `INTERVAL` liveness window plus a `queues @> to_jsonb($2::text)` containment test. SQLite: `CURRENT_TIMESTAMP`/epoch ms; JSON1 `EXISTS (SELECT 1 FROM json_each(queues) …)` for the containment. |
 
-**Totals: (a) 7 · (b) 18 · (c) 19.**
+**Totals: (a) 7 · (b) 19 · (c) 19.**
 
 The shape matters more than the totals. The (a) column is genuinely
 mechanical CRUD. The (b) column is dominated by **pessimistic row locking**:

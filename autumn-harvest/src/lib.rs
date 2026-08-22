@@ -149,6 +149,8 @@ pub mod api_token;
 pub mod audit;
 /// Open-awaitables diagnostic projection (issue #615).
 pub mod awaitables;
+/// Post-restore resumability verification for backup/PITR drills (issue #943).
+pub mod backup_verify;
 /// Batch operations for fleet-wide workflow cancel/terminate/signal (issue #102).
 pub mod batch;
 /// Batch workflow start types: caps and per-item request/result structs (issue #357).

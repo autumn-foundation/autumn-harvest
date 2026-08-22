@@ -1597,6 +1597,96 @@ impl WorkflowReplayer {
         conn: &mut diesel_async::AsyncPgConnection,
         exec_id: crate::types::ExecutionId,
     ) -> crate::error::HarvestResult<ReplayReport> {
+        let (snapshot, meta) = self.snapshot_from_db(conn, exec_id).await?;
+        let workflow_id = snapshot.workflow_id.clone();
+        let queue_name = snapshot.queue_name.clone();
+        Ok(self
+            .replay_from_snapshot_effective(
+                snapshot,
+                meta.execution_timeout,
+                meta.deadline_at,
+                meta.parent_execution_id,
+                workflow_id,
+                queue_name,
+            )
+            .await)
+    }
+
+    /// True when a handler is registered for `workflow_name`.
+    ///
+    /// Lets a caller distinguish "this history diverged" from "this replayer
+    /// was never taught about this workflow type" *before* replaying, rather
+    /// than string-matching the `ReplayStatus::WorkflowFailed` message a
+    /// missing handler produces. Issue #943's restore-drill report leans on
+    /// this so a run that registered no handlers reports `skipped_no_handler`
+    /// instead of a fleet-wide false divergence.
+    #[must_use]
+    pub fn is_workflow_registered(&self, workflow_name: &str) -> bool {
+        self.handlers.contains_key(workflow_name)
+    }
+
+    /// The sorted set of workflow type names this replayer can replay.
+    #[must_use]
+    pub fn registered_workflow_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.handlers.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Replay one recorded history from the store in **frontier-tolerant**
+    /// (canary) mode.
+    ///
+    /// The sibling of [`Self::replay_from_db`], which replays in *strict*
+    /// mode. Strict mode requires the recorded history to be fully consumed,
+    /// so it reports every legitimately **in-flight** execution — one parked on
+    /// a timer, signal, activity or child workflow — as
+    /// `NonDeterminismDetected(EarlyCompletion)`. That is correct for a CI
+    /// fixture gate and catastrophically wrong for anything that samples live
+    /// or restored non-terminal runs, which is exactly what a restore drill
+    /// (issue #943) and the deploy canary (issue #512) do.
+    ///
+    /// Use this whenever the sampled executions are still running; use
+    /// [`Self::replay_from_db`] only for histories that reached a terminal.
+    ///
+    /// Read-only: loads history and the execution row, and replays in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HarvestError` on any database access failure or if the
+    /// execution record is not found.
+    #[cfg(feature = "db")]
+    pub async fn replay_canary_from_db(
+        &self,
+        conn: &mut diesel_async::AsyncPgConnection,
+        exec_id: crate::types::ExecutionId,
+    ) -> crate::error::HarvestResult<ReplayReport> {
+        let (snapshot, meta) = self.snapshot_from_db(conn, exec_id).await?;
+        let workflow_id = snapshot.workflow_id.clone();
+        let queue_name = snapshot.queue_name.clone();
+        Ok(self
+            .replay_canary_snapshot_effective(
+                snapshot,
+                meta.execution_timeout,
+                meta.deadline_at,
+                meta.parent_execution_id,
+                workflow_id,
+                queue_name,
+            )
+            .await)
+    }
+
+    /// Loads a [`HistorySnapshot`] plus the execution-row metadata the
+    /// effective-replay entry points need.
+    ///
+    /// Shared by [`Self::replay_from_db`] and [`Self::replay_canary_from_db`]
+    /// so the two can never disagree about which row fields are threaded into
+    /// the replayed context.
+    #[cfg(feature = "db")]
+    async fn snapshot_from_db(
+        &self,
+        conn: &mut diesel_async::AsyncPgConnection,
+        exec_id: crate::types::ExecutionId,
+    ) -> crate::error::HarvestResult<(HistorySnapshot, DbReplayMeta)> {
         use crate::store::load_history;
 
         // Load event history.
@@ -1611,34 +1701,22 @@ impl WorkflowReplayer {
         // replays cleanly instead of surfacing false non-determinism.
         let meta = load_workflow_name_and_headers(conn, exec_id).await?;
 
-        let workflow_id = Some(meta.workflow_id.clone());
-        // Issue #798: the row's own task queue.
-        let queue_name = Some(meta.queue_name.clone());
         let snapshot = HistorySnapshot {
-            workflow_name: meta.workflow_name,
+            workflow_name: meta.workflow_name.clone(),
             execution_id: exec_id,
             events: history.events,
-            context_headers: Some(meta.headers),
+            context_headers: Some(meta.headers.clone()),
             execution_timeout: meta.execution_timeout,
             deadline_at: meta.deadline_at,
             // Issue #698: the row's own spawning-parent id, so a parent-aware
             // child replays deterministically from the store.
             parent_execution_id: meta.parent_execution_id,
             // Issue #698: the row's own business `workflow_id`.
-            workflow_id: workflow_id.clone(),
+            workflow_id: Some(meta.workflow_id.clone()),
             // Issue #798: the row's own task queue.
-            queue_name: queue_name.clone(),
+            queue_name: Some(meta.queue_name.clone()),
         };
-        Ok(self
-            .replay_from_snapshot_effective(
-                snapshot,
-                meta.execution_timeout,
-                meta.deadline_at,
-                meta.parent_execution_id,
-                workflow_id,
-                queue_name,
-            )
-            .await)
+        Ok((snapshot, meta))
     }
 
     /// Run the replay canary over a sample of running executions.
