@@ -115,19 +115,11 @@ pub fn age_secs(observed_at: DateTime<Utc>, started_at: DateTime<Utc>) -> i64 {
 /// two shard-membership predicates cannot drift again.
 #[must_use]
 pub fn worker_covers_shard(worker: &WorkerRow, shard_id: i32) -> bool {
-    worker
-        .worker
-        .shard_assignments
-        .as_array()
-        .is_some_and(|shards| {
-            if shards.is_empty() {
-                true
-            } else {
-                shards
-                    .iter()
-                    .any(|value| value.as_i64() == Some(i64::from(shard_id)))
-            }
-        })
+    // Delegates to the canonical core predicate (issue #1150 / #961). It lives
+    // in `autumn_harvest::workers` because core has consumers of its own --
+    // `apply_worker_filters` -- that cannot reach into this crate, and every
+    // independent re-implementation of this rule has so far drifted.
+    autumn_harvest::workers::shard_assignments_cover(&worker.worker.shard_assignments, shard_id)
 }
 
 /// Cross-shard completeness of a fanned-out read.

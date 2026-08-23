@@ -43148,7 +43148,20 @@ async fn evaluate_eligibility_for_shard(
             worker_reasons.push("wrong_queue_subscription".to_string());
         }
 
-        if !shard_assignments.contains(&(shard_id.as_i32())) {
+        // Issue #1150 / #961: the canonical predicate, not literal membership.
+        // An empty array is the auto (no sharded pool) / legacy shape and means
+        // "covers whatever shard this row was read from"; treating it as
+        // covering nothing would report a healthy worker polling this very
+        // database as `wrong_shard_assignment`.
+        // Deliberately reads the raw JSON value, not the decoded `Vec<i32>`
+        // above: that decode maps a *malformed* (non-array) value to an empty
+        // vec, which the predicate would then read as the permissive
+        // empty/legacy shape. Passing the value through keeps malformed ==
+        // covers nothing, matching every other consumer.
+        if !autumn_harvest::workers::shard_assignments_cover(
+            &w.worker.shard_assignments,
+            shard_id.as_i32(),
+        ) {
             worker_reasons.push("wrong_shard_assignment".to_string());
         }
 
