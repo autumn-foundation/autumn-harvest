@@ -44,5 +44,18 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 name = "integration"
 path = "tests/integration/mod.rs"
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `SqliteRuntime::run_until_blocked` -- the end-to-end decision-cycle
+# driver (issue #135's replay workload, driven through this backend's
+# reload-and-replay-every-cycle path instead of a single `replay_from_events`
+# pass). `harness = false` + its own `main()`, same shape as
+# `autumn-harvest/benches/replay_profile.rs`, so the compiled artifact is a
+# plain executable meant to be pointed at `valgrind --tool=callgrind` /
+# `valgrind --tool=dhat` directly rather than measured with `cargo bench`'s
+# wall-clock timing loop. See `benches/runtime_drive_profile.rs`.
+[[bench]]
+name = "runtime_drive_profile"
+harness = false
+
 [lints]
 workspace = true
