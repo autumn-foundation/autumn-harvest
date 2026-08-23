@@ -19,15 +19,18 @@
 //! # Workload
 //!
 //! `sequential_workflow(ctx, n)` calls `ctx.execute_activity_raw` `n` times,
-//! sequentially, each carrying a realistic ~230-byte JSON payload (the same
-//! `activity_payload` shape `replay_profile_support.rs` uses) as both the
-//! scheduled input and the completed output. This is the SAME workload issue
-//! #135 budgets for the Postgres replay path, driven through
-//! `SqliteRuntime::run_until_blocked` end-to-end (start -> N decision cycles
-//! -> completion) rather than through a single `replay_from_events` call over
-//! a pre-built history. Each decision cycle re-loads and re-replays the ENTIRE
-//! history accumulated so far (this backend has no warm-cache / delta-load
-//! path), so this is the realistic full-run cost, not a single-cycle slice.
+//! sequentially, each with a distinct `format!("activity_{i}")` name and a
+//! realistic ~230-byte JSON payload (the same `activity_payload` shape
+//! `replay_profile_support.rs` uses) as both the scheduled input and the
+//! completed output. Both the per-iteration name formatting and the payload
+//! shape deliberately mirror `replay_profile_support.rs::sequential_workflow`
+//! exactly, so this is the SAME workload issue #135 budgets for the Postgres
+//! replay path, driven through `SqliteRuntime::run_until_blocked` end-to-end
+//! (start -> N decision cycles -> completion) rather than through a single
+//! `replay_from_events` call over a pre-built history. Each decision cycle
+//! re-loads and re-replays the ENTIRE history accumulated so far (this
+//! backend has no warm-cache / delta-load path), so this is the realistic
+//! full-run cost, not a single-cycle slice.
 //!
 //! `SQLITE_RUNTIME_PROFILE_N` (default `100`) sets the activity count.
 //! `SQLITE_RUNTIME_PROFILE_REPS` (default `1`) repeats the whole
@@ -72,13 +75,22 @@ fn activity_payload(i: usize) -> Value {
 
 // The `#[workflow]` macro references the workflow's input parameter, so a
 // deliberately-loop-only body reads fine here; kept explicit for clarity.
+//
+// The per-iteration `format!("activity_{i}")` name (rather than a constant
+// string) deliberately mirrors
+// `autumn-harvest/benches/replay_profile_support.rs::sequential_workflow`
+// exactly -- a constant name would understate the "author code re-executes
+// on every replay cycle" cost this harness is explicitly compared against
+// (issue #135), since the real comparison workload re-formats a distinct
+// name string on every replay pass too.
 #[workflow]
 async fn sequential_workflow(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
     let n: usize = usize::try_from(n).unwrap_or(0);
     let mut last = Value::Null;
     for i in 0..n {
+        let name = format!("activity_{i}");
         last = ctx
-            .execute_activity_raw("work", activity_payload(i), "default")
+            .execute_activity_raw(&name, activity_payload(i), "default")
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -105,7 +117,15 @@ fn main() {
     for _ in 0..reps {
         let mut engine = SqliteRuntime::open_in_memory().expect("open in-memory sqlite db");
         engine.register_workflow(&sequential_workflow_info());
-        engine.register_activity_raw("work", ActivitySpec::new(1, |input: Value| Ok(input)));
+        // One registration per `activity_{i}` name, matching the workflow's
+        // per-iteration `format!("activity_{i}")` call (see the workflow doc
+        // comment above for why the name varies per iteration).
+        for i in 0..n {
+            engine.register_activity_raw(
+                format!("activity_{i}"),
+                ActivitySpec::new(1, |input: Value| Ok(input)),
+            );
+        }
         let exec = engine
             .start_workflow("sequential_workflow", json!(n as i64))
             .expect("start_workflow");

@@ -8,10 +8,10 @@ to a specific, source-confirmed mechanism: **every decision cycle reloads and
 re-deserializes the entire event history from scratch**, with no warm-cache
 or delta-load path — a gap the Postgres backend already closed (issue #235).
 The mechanism (reload + reparse + the subsequent by-value clone) accounts
-for **81.6% of allocation bytes** and a clear, super-linear (trending toward
+for **83.5% of allocation bytes** and a clear, super-linear (trending toward
 quadratic) instruction-count scaling curve on this workload — but only
-**~53%** of that (the reload + reparse itself) is addressable by a fix; the
-remaining ~29% is a related, architecturally separate clone cost that the
+**~52%** of that (the reload + reparse itself) is addressable by a fix; the
+remaining ~31% is a related, architecturally separate clone cost that the
 same fix does not eliminate (see "Allocation-site attribution" and
 "Recommendation" below for the precise split). No candidate local fix
 (avoiding one intermediate `String` allocation; caching a small
@@ -70,17 +70,17 @@ callgrind_annotate --threshold=100 callgrind.out
 
 | n (activities) | Ir (whole process) | Ir / activity | Per-doubling ratio |
 |---:|---:|---:|---:|
-| 20  | 33,852,949    | 1,692,647 | — |
-| 40  | 98,276,836    | 2,456,921 | 2.903× |
-| 80  | 328,441,045   | 4,105,513 | 3.342× |
-| 160 | 1,194,590,711 | 7,466,192 | 3.637× |
+| 20  | 34,059,018    | 1,702,951 | — |
+| 40  | 98,928,342    | 2,473,209 | 2.905× |
+| 80  | 330,706,853   | 4,133,836 | 3.343× |
+| 160 | 1,202,152,343 | 7,513,452 | 3.635× |
 
 A doubling of `n` under pure linear (O(n)) cost would produce a 2.0× ratio at
 every step; under pure quadratic (O(n²)) cost, a flat 4.0× ratio. The
-measured ratios climb monotonically — 2.903× → 3.342× → 3.637× — trending
+measured ratios climb monotonically — 2.905× → 3.343× → 3.635× — trending
 toward, but not yet at, 4.0×. The "cost per activity" column makes the same
 point directly: it should be *constant* under O(n) total cost, but it grows
-4.4× (1,692,647 → 7,466,192) across an 8× increase in `n`. This is
+4.4× (1,702,951 → 7,513,452) across an 8× increase in `n`. This is
 super-linear scaling with a clearly super-linear trend, corroborated across
 four independent input sizes as required by this agent's evidence rules for
 an asymptotic argument (no wall-clock timing was used to produce any of these
@@ -89,19 +89,22 @@ numbers).
 ### Instruction-count flat profile at n=80 (mechanism attribution)
 
 Grouping `callgrind_annotate --threshold=100`'s flat (self-cost) output by
-mechanism, out of 328,441,045 total instructions:
+mechanism, out of 330,706,853 total instructions:
 
 | Mechanism | Ir | % of total |
 |---|---:|---:|
-| malloc/free (glibc allocator) | 124,810,735 | 38.00% |
-| `serde_json` parse/deserialize | 46,225,717 | 14.07% |
-| `BTreeMap` (`Value::Object` is `BTreeMap`-backed — no `preserve_order`) | 41,452,330 | 12.62% |
-| `libc` `memcpy`/`memcmp` (generic, driven by the above) | 15,894,824 | 4.84% |
-| sqlite3 SQL execution/parsing (`VdbeExec`, `RunParser`, `yy_reduce`) | 15,883,425 | 4.84% |
-| `String::clone` | 3,939,441 | 1.20% |
-| `Value` `drop_in_place` | 3,915,951 | 1.19% |
+| malloc/free (glibc allocator) | 128,905,230 | 38.98% |
+| `serde_json` parse/deserialize | 57,070,631 | 17.26% |
+| `BTreeMap` (`Value::Object` is `BTreeMap`-backed — no `preserve_order`) | 36,763,184 | 11.12% |
+| sqlite3 SQL execution/parsing (`VdbeExec`, `RunParser`, `yy_reduce`) | 21,901,015 | 6.62% |
+| `libc` `memcpy`/`memcmp` (generic, driven by the above) | 16,038,170 | 4.85% |
+| string formatting (`format!`/`Display`/`fmt::Write` glue) | 4,193,922 | 1.27% |
+| `String::clone` | 3,939,441 | 1.19% |
+| `Value` `drop_in_place` | 3,915,951 | 1.18% |
+| `sequential_workflow`'s own re-execution (name/payload `format!` rebuild) | 2,358,617 | 0.71% |
 | `uuid::parser::try_parse` | 1,574,400 | 0.48% |
-| **Sum of the above** | **253,696,823** | **77.24%** |
+| `Vec::clone` | 1,192,305 | 0.36% |
+| **Sum of the above** | **277,852,866** | **84.02%** |
 
 The target mechanism (history reload/reparse/clone; see Hypothesis below) is
 not a minor contributor sitting under this agent's 5% "stop, it's inherent"
@@ -117,9 +120,9 @@ valgrind --tool=dhat --dhat-out-file=dhat.json <runtime_drive_profile binary>
 
 | n | Total bytes | Total blocks | Byte ratio | Block ratio |
 |---:|---:|---:|---:|---:|
-| 20 | 4,845,077  | 29,781  | — | — |
-| 40 | 14,202,633 | 104,741 | 2.932× | 3.517× |
-| 80 | 48,111,881 | 393,931 | 3.387× | 3.761× |
+| 20 | 4,863,196  | 30,033  | — | — |
+| 40 | 14,259,658 | 105,648 | 2.932× | 3.518× |
+| 80 | 48,293,750 | 397,344 | 3.387× | 3.761× |
 
 Same super-linear signature as the instruction counts, trending toward the
 4.0× quadratic ratio, and — because allocation *block count* (not just bytes)
@@ -129,43 +132,66 @@ activity as `n` grows.
 
 ### Allocation-site attribution at n=80 (mechanism breakdown)
 
-Every one of `dhat`'s 393,931 allocated blocks / 48,111,881 bytes was
+Every one of `dhat`'s 397,344 allocated blocks / 48,293,750 bytes was
 categorized by walking its full call-stack (`ftbl`/`pps` in the `dhat.json`
-output) for a small set of mutually-exclusive frame markers:
+output) for a small set of mutually-exclusive frame markers.
+
+**Methodology note — DHAT's default stack-capture depth silently
+misattributes deep recursive-JSON allocations.** `valgrind --tool=dhat`
+records 12 caller frames per allocation site by default
+(`--num-callers=12`). `serde_json::Value::deserialize`'s recursive descent
+through this workload's nested `items` array is deep enough that, at that
+default depth, a large share of `store::load_history`'s own per-event
+deserialize allocations have their `store::load_history` ancestor frame
+truncated off the recorded stack entirely — indistinguishable from a
+`serde_json` deserialize call happening anywhere else in the program. A
+first pass at the default depth put 17.91% (8,647,588 bytes) of all
+allocation bytes in an "elsewhere / unattributed `serde_json` deserialize"
+bucket. Re-running with `--num-callers=30` (deep enough to reach past the
+JSON recursion to the real Rust caller in every case observed) reclassifies
+the overwhelming majority of that bucket into `load_history`'s own
+deserialize cost, collapsing the genuinely-unrelated "elsewhere" total to
+**173,732 bytes (0.36%)** — which matches, byte-for-byte, the sum of two
+separate, independently hand-identified call sites
+(`queue::claim_next_ready_task_tx`: 171,587 bytes; `store::execution_output`:
+2,145 bytes). The table below, and every other allocation-byte figure in
+this document, uses the corrected 30-frame-deep categorization.
 
 | Category | Bytes | % of total | Blocks |
 |---|---:|---:|---:|
-| `BTreeMap`/`Vec` clone (`history.clone()`) | 13,817,911 | 28.72% | 139,461 |
-| `store::load_history`'s own `Vec<WorkflowEvent>` growth | 10,760,469 | 22.37% | 84,930 |
-| `serde_json` deserialize (JSON reparse) | 8,681,029 | 18.04% | 66,686 |
-| `sequential_workflow`'s own re-execution (`activity_payload(i)` rebuild) | 7,204,155 | 14.97% | 83,560 |
-| sqlite3 internals (SQL execution engine) | 6,006,440 | 12.48% | 5,711 |
-| other `autumn_harvest_sqlite` glue (statement-cache bookkeeping etc.) | 1,628,807 | 3.39% | 13,555 |
-| other/uncategorized | 13,070 | 0.03% | 28 |
+| `history.clone()` (`BTreeMap`/`Vec` clone before the by-value executor call) | 14,977,724 | 31.01% | 146,022 |
+| `store::load_history`'s own `serde_json` deserialize (JSON reparse) | 13,955,181 | 28.90% | 142,560 |
+| `sequential_workflow`'s own re-execution (`activity_payload(i)` + name rebuild) | 7,266,546 | 15.05% | 86,901 |
+| sqlite3 internals (SQL execution engine) | 6,053,252 | 12.53% | 6,451 |
+| `store::load_history`'s own `Vec<WorkflowEvent>` growth + query execution | 5,327,482 | 11.03% | 7,199 |
+| `serde_json` deserialize, genuinely elsewhere (2 unrelated call sites, see above) | 173,732 | 0.36% | 1,701 |
+| other/uncategorized | 539,833 | 1.12% | 6,510 |
 
-Four categories sum to **81.6%** of all allocation bytes in this workload,
-but they split into two *architecturally distinct* costs, not one:
+Four categories sum to **83.5%** of all allocation bytes in this workload
+(48,293,750 bytes total), but they split into two *architecturally distinct*
+costs, not one:
 
-- **The reload + reparse itself** — `load_history`'s Vec growth (22.37%) +
-  `serde_json` deserialize (18.04%) + sqlite3 internals executing the reload
-  query (12.48%) = **52.89%**. This is directly caused by, and fully
-  addressable by fixing, the single design choice traced below (every
-  decision cycle re-reads and re-deserializes the full history from
-  scratch).
-- **The `history.clone()`** (28.72%) — a *related but separate* cost. It is
+- **The reload + reparse itself** — `load_history`'s own Vec growth + query
+  execution (11.03%) + its own `serde_json` deserialize (28.90%) + sqlite3
+  internals executing the reload query (12.53%) = **52.46%**. This is
+  directly caused by, and fully addressable by fixing, the single design
+  choice traced below (every decision cycle re-reads and re-deserializes the
+  full history from scratch).
+- **The `history.clone()`** (31.01%) — a *related but separate* cost. It is
   triggered today by the reload producing a fresh `Vec` that must then be
   cloned for the by-value executor call, but the clone itself would still
   happen against a *cached* history too: `drive_one_cycle` needs the
   original `history` value again after the executor call regardless of
   where that `Vec` came from (see the "Recommendation" section below for why
-  this specific 28.72% is **not** eliminated by the proposed cache).
+  this specific 31.01% is **not** eliminated by the proposed cache).
 
-So while today's implementation makes both costs scale together (81.6%
-combined), only the 52.89% reload/reparse share is what the recommended
+So while today's implementation makes both costs scale together (83.5%
+combined), only the 52.46% reload/reparse share is what the recommended
 fix below addresses. The fifth category, `sequential_workflow`'s own
-re-execution, is a **separate, inherent cost of the deterministic-replay
-execution model itself** (present in the Postgres backend too — see "What
-isn't the finding" below), not part of this finding's recommendation.
+re-execution (15.05%), is a **separate, inherent cost of the
+deterministic-replay execution model itself** (present in the Postgres
+backend too — see "What isn't the finding" below), not part of this
+finding's recommendation.
 
 ## Hypothesis (source-confirmed, not inferred from the number alone)
 
@@ -222,16 +248,30 @@ the full history, on every cycle. The SQLite backend has no equivalent
 mechanism at all — every cycle is a guaranteed full reload, with no
 mitigating cache path even in principle today.
 
-Notably, the SQLite backend's single-writer, single-process design makes it
-an **easier** target for this fix than Postgres, not harder: Postgres's cache
-can miss on a genuine cross-worker handoff (sticky routing can route a
-follow-up task to a different worker with a cold cache), but `SqliteRuntime`
-is one process driving one file — every decision cycle for a given execution
-is, by construction, driven by the *same* runtime instance that drove the
-previous one. An in-process cache here could have a 100% hit rate for the
-life of the runtime, with no cross-worker staleness concern to reason about
-at all; it would only need to be cleared on `open()`/reopen (which already
-happens implicitly, since a fresh `SqliteRuntime` has no prior cache state).
+Notably, the SQLite backend's single-writer, single-process design removes
+one entire failure mode Postgres's cache has to reason about: Postgres's
+cache can miss on a genuine cross-worker handoff (sticky routing can route
+a follow-up task to a different worker with a cold cache), but
+`SqliteRuntime` is one process driving one file — every decision cycle for a
+given execution is, by construction, driven by the *same* runtime instance
+that drove the previous one, so **staleness** can never be the cause of a
+miss here, unlike Postgres.
+
+This does **not** imply a 100% hit rate is free, though — the Postgres cache
+being mirrored (`cache.rs::WorkflowCache`) is a **bounded, fixed-capacity
+LRU**, chosen specifically to cap memory: retaining every in-flight
+execution's *full* history unboundedly is a real memory cost, not a free
+lunch. If `SqliteRuntime` interleaves more concurrently-blocked executions
+than a bounded cache's capacity (e.g. under `run_until_idle` driving several
+executions to completion in round-robin), the LRU can evict an execution's
+entry before its next decision cycle — a genuine cache miss, purely from
+capacity pressure, with no cross-worker staleness involved at all. So a
+100% hit rate requires *either* an unbounded cache (trading memory for hit
+rate — plausible for this crate's stated edge/local-first scope, where
+concurrent in-flight execution counts are typically small) *or* a capacity
+sized to the workload's actual concurrency — a capacity/eviction-policy
+decision this recommendation deliberately leaves open, alongside the rest of
+this architectural change, for a maintainer to specify.
 
 ## Why no local fix clears the floor
 
@@ -245,8 +285,8 @@ or ≥10% allocation reduction):
    `serde_json::from_str` directly from the borrowed `&str` returned by
    SQLite rather than an owned copy). Isolated precisely via the `dhat`
    call-stack data: the `rusqlite::row::Row::get <- store::load_history`
-   allocation site is **2,046,829 bytes (4.25% of total) / 6,561 blocks
-   (1.67% of total)** at n=80 — below both the 5%/10% floors on its own, and
+   allocation site is **2,068,754 bytes (4.28% of total) / 6,561 blocks
+   (1.65% of total)** at n=80 — below both the 5%/10% floors on its own, and
    it does nothing for the dominant instruction cost (parsing a borrowed
    `&str` still touches every byte of the JSON; only the allocation, not the
    scan/lex work, would be avoided).
@@ -256,7 +296,7 @@ or ≥10% allocation reduction):
    `workflow_id_of`-style plain `query_row` calls that don't use
    `prepare_cached`). The sqlite3 SQL-parsing subset of the flat profile
    (`sqlite3RunParser` + `yy_reduce.isra.0`) is 3,909,343 + 3,088,300 =
-   6,997,643 Ir at n=80 — 2.13% of total, below the 5% floor. This cost is
+   6,997,643 Ir at n=80 — 2.12% of total, below the 5% floor. This cost is
    also **linear** in the number of decision cycles, while total cost is
    super-linear — so as a fraction of total cost it can only shrink further
    at larger, more realistic `n`, not grow toward the floor.
@@ -269,7 +309,7 @@ artifact, has no production-code footprint to revert).
 
 ## What isn't the finding
 
-The `sequential_workflow` re-execution category (14.97% of allocation bytes
+The `sequential_workflow` re-execution category (15.05% of allocation bytes
 at n=80) is **not** part of this recommendation. It is `activity_payload(i)`
 being rebuilt as a fresh `json!()` value every time the workflow function
 replays from the top and loops past an already-completed `i` — the
@@ -293,10 +333,11 @@ decision cycle's commit rather than reloaded from scratch, plus a
 Postgres backend's `load_history_since` (issue #235) for the (rare, only
 needed for consistency/defensive re-verification) case where a delta reload
 is still wanted. This would turn the per-cycle **SQL query + row parse +
-`serde_json::from_str` deserialize** cost — `load_history`'s Vec growth
-(22.37%) + serde_json deserialize (18.04%) + sqlite3 internals (12.48%) =
-~53% of allocation bytes at n=80, and the corresponding instruction share —
-from `O(k)` (reloading and reparsing the full history every cycle) into
+`serde_json::from_str` deserialize** cost — `load_history`'s own Vec growth
+and query execution (11.03%) + its own serde_json deserialize (28.90%) +
+sqlite3 internals (12.53%) = ~52% of allocation bytes at n=80, and the
+corresponding instruction share — from `O(k)` (reloading and reparsing the
+full history every cycle) into
 `O(1)` amortized (only the new events since the last cycle touch SQL or
 `serde_json` at all).
 
@@ -305,14 +346,14 @@ from `O(k)` (reloading and reparsing the full history every cycle) into
 regardless of caching, and neither is addressed by this recommendation:
 `drive_one_cycle` still `.clone()`s the *entire* accumulated
 `Vec<WorkflowEvent>` before handing it, by value, to the core executor
-(28.72% of allocation bytes at n=80 — a cache holding the full history
+(31.01% of allocation bytes at n=80 — a cache holding the full history
 in-process still has to clone it out for that by-value call); and the
 workflow function itself still replays every prior activity call from the
-top on every cycle (the 14.97% "what isn't the finding" cost above). Both
+top on every cycle (the 15.05% "what isn't the finding" cost above). Both
 are inherent to a from-the-top-replay execution model, independent of where
 the history data lives. So `Σ(k=1..n) O(k)` — the `O(n²)` total-run cost
 this profile demonstrates — remains `O(n²)` after this fix, just with a
-meaningfully smaller per-k constant (the ~53% SQL/parse share removed from
+meaningfully smaller per-k constant (the ~52% SQL/parse share removed from
 each term). Eliminating the clone would need the core-crate signature change
 already ruled out above (shared with Postgres, an architectural ask of its
 own); eliminating the from-the-top replay would mean changing how workflow
@@ -337,7 +378,25 @@ here) before deciding whether the complexity is warranted.
 Nothing in production code. Only:
 
 - `autumn-harvest-sqlite/benches/runtime_drive_profile.rs` (new) — the
-  profiling harness described above.
+  profiling harness described above. Each of the workload's `n` activity
+  calls uses a distinct, per-iteration `format!("activity_{i}")` name (with
+  one `register_activity_raw` call per name), not a constant string — this
+  deliberately mirrors
+  `autumn-harvest/benches/replay_profile_support.rs::sequential_workflow`'s
+  identical per-iteration naming exactly, since that is the comparison
+  workload this document's "same workload issue #135 budgets for" claim
+  rests on. (Caught and fixed during review: an earlier draft used a
+  constant activity name, which understated both the `history.clone()` and
+  `sequential_workflow`'s-own-re-execution allocation-byte costs, since a
+  longer per-iteration name string allocates a larger `String` buffer on
+  every replay pass than a fixed short constant would — `String` has no
+  small-string optimization in Rust, so every heap allocation is sized to
+  content. The fix changed the measured split but not any conclusion: the
+  reload/reparse-addressable share and every scaling-ratio signature are
+  materially unchanged, while the two non-cacheable shares — the clone and
+  the workflow's own re-execution — grew both relatively and in absolute
+  bytes, if anything strengthening the "a cache shrinks the constant, not
+  the complexity class" argument below.)
 - `autumn-harvest-sqlite/Cargo.toml` — registers the new `[[bench]]` target
   (`harness = false`, same convention as every other deterministic profiling
   harness in this repo).
@@ -382,8 +441,8 @@ valgrind --tool=dhat --dhat-out-file=dhat.json "$BIN"
 `SQLITE_RUNTIME_PROFILE_N` (default `100`) and `SQLITE_RUNTIME_PROFILE_REPS`
 (default `1`) are read from the environment; the four-point scaling tables
 above were produced by re-running the same binary at `N=20,40,80,160` with
-`REPS=1`. Instruction counts are deterministic up to ~0.002% run-to-run noise
-(observed: 33,852,949 vs. 33,853,542 Ir across two independent runs at
+`REPS=1`. Instruction counts are deterministic up to ~0.003% run-to-run noise
+(observed: 34,059,018 vs. 34,057,986 Ir across two independent runs at
 `N=20`, both against the identical binary) from environment-dependent
 allocator/runtime-initialization detail unrelated to the measured workload —
 well below anything that would change a conclusion in this document.
