@@ -8,7 +8,7 @@ to a specific, source-confirmed mechanism: **every decision cycle reloads and
 re-deserializes the entire event history from scratch**, with no warm-cache
 or delta-load path — a gap the Postgres backend already closed (issue #235).
 The mechanism (reload + reparse + the subsequent by-value clone) accounts
-for **83.5% of allocation bytes** and a clear, super-linear (trending toward
+for **83.4% of allocation bytes** and a clear, super-linear (trending toward
 quadratic) instruction-count scaling curve on this workload — but only
 **~52%** of that (the reload + reparse itself) is addressable by a fix; the
 remaining ~31% is a related, architecturally separate clone cost that the
@@ -27,7 +27,10 @@ would shrink the per-cycle constant but not the `O(n²)` complexity class.
 Wall-clock timing is not admissible evidence on this (shared-vCPU) machine —
 every number below is a deterministic instruction count
 (`valgrind --tool=callgrind`) or allocation count/byte total
-(`valgrind --tool=dhat`), reproducible bit-for-bit on any machine.
+(`valgrind --tool=dhat`), reproducible run-to-run to within noise well under
+0.01% (see "Reproduce" below for the measured figure) — unlike wall-clock
+timing, which on this machine varies by double-digit percentages between
+otherwise-identical runs.
 
 ## Workload
 
@@ -144,7 +147,12 @@ activity as `n` grows.
 
 Every one of `dhat`'s 397,344 allocated blocks / 48,293,750 bytes was
 categorized by walking its full call-stack (`ftbl`/`pps` in the `dhat.json`
-output) for a small set of mutually-exclusive frame markers.
+output) for a small set of mutually-exclusive frame markers, via the
+committed, auditable
+`autumn-harvest-sqlite/scripts/classify_dhat_allocations.py` — re-running it
+against a freshly captured `dhat.json` (see "Reproduce" below) reproduces
+the table exactly; its module docstring specifies the full precedence order
+and the rationale for each category boundary.
 
 **Methodology note — DHAT's default stack-capture depth silently
 misattributes deep recursive-JSON allocations.** `valgrind --tool=dhat`
@@ -161,29 +169,30 @@ bucket. Re-running with `--num-callers=30` (deep enough to reach past the
 JSON recursion to the real Rust caller in every case observed) reclassifies
 the overwhelming majority of that bucket into `load_history`'s own
 deserialize cost, collapsing the genuinely-unrelated "elsewhere" total to
-**173,732 bytes (0.36%)** — which matches, byte-for-byte, the sum of two
-separate, independently hand-identified call sites
+**173,732 bytes (0.36%)** — which the categorizer script attributes to two
+distinct, genuinely-unrelated call sites
 (`queue::claim_next_ready_task_tx`: 171,587 bytes; `store::execution_output`:
-2,145 bytes). The table below, and every other allocation-byte figure in
-this document, uses the corrected 30-frame-deep categorization.
+2,145 bytes; run the script yourself to see this split, per "Reproduce"
+below). The table below, and every other allocation-byte figure in this
+document, uses the corrected 30-frame-deep categorization.
 
 | Category | Bytes | % of total | Blocks |
 |---|---:|---:|---:|
 | `history.clone()` (`BTreeMap`/`Vec` clone before the by-value executor call) | 14,977,724 | 31.01% | 146,022 |
 | `store::load_history`'s own `serde_json` deserialize (JSON reparse) | 13,955,181 | 28.90% | 142,560 |
-| `sequential_workflow`'s own re-execution (`activity_payload(i)` + name rebuild) | 7,266,546 | 15.05% | 86,901 |
-| sqlite3 internals (SQL execution engine) | 6,053,252 | 12.53% | 6,451 |
+| `sequential_workflow`'s own re-execution (`activity_payload(i)` + name rebuild) | 7,264,465 | 15.04% | 86,880 |
+| sqlite3 internals (SQL execution engine) | 6,014,584 | 12.45% | 5,691 |
 | `store::load_history`'s own `Vec<WorkflowEvent>` growth + query execution | 5,327,482 | 11.03% | 7,199 |
+| other/uncategorized (tokio runtime setup/teardown, rusqlite plumbing not already attributed to `load_history`, UUID-to-string formatting, small `store`/`queue`/`worker`/`context` glue functions, one-time process startup — see the script's docstring for why this is a real bucket, not an under-specified rule) | 580,582 | 1.20% | 7,291 |
 | `serde_json` deserialize, genuinely elsewhere (2 unrelated call sites, see above) | 173,732 | 0.36% | 1,701 |
-| other/uncategorized | 539,833 | 1.12% | 6,510 |
 
-Four categories sum to **83.5%** of all allocation bytes in this workload
+Four categories sum to **83.4%** of all allocation bytes in this workload
 (48,293,750 bytes total), but they split into two *architecturally distinct*
 costs, not one:
 
 - **The reload + reparse itself** — `load_history`'s own Vec growth + query
   execution (11.03%) + its own `serde_json` deserialize (28.90%) + sqlite3
-  internals executing the reload query (12.53%) = **52.46%**. This is
+  internals executing the reload query (12.45%) = **52.38%**. This is
   directly caused by, and fully addressable by fixing, the single design
   choice traced below (every decision cycle re-reads and re-deserializes the
   full history from scratch).
@@ -195,10 +204,10 @@ costs, not one:
   where that `Vec` came from (see the "Recommendation" section below for why
   this specific 31.01% is **not** eliminated by the proposed cache).
 
-So while today's implementation makes both costs scale together (83.5%
-combined), only the 52.46% reload/reparse share is what the recommended
+So while today's implementation makes both costs scale together (83.4%
+combined), only the 52.38% reload/reparse share is what the recommended
 fix below addresses. The fifth category, `sequential_workflow`'s own
-re-execution (15.05%), is a **separate, inherent cost of the
+re-execution (15.04%), is a **separate, inherent cost of the
 deterministic-replay execution model itself** (present in the Postgres
 backend too — see "What isn't the finding" below), not part of this
 finding's recommendation.
@@ -329,7 +338,7 @@ artifact, has no production-code footprint to revert).
 
 ## What isn't the finding
 
-The `sequential_workflow` re-execution category (15.05% of allocation bytes
+The `sequential_workflow` re-execution category (15.04% of allocation bytes
 at n=80) is **not** part of this recommendation. It is `activity_payload(i)`
 being rebuilt as a fresh `json!()` value every time the workflow function
 replays from the top and loops past an already-completed `i` — the
@@ -355,7 +364,7 @@ needed for consistency/defensive re-verification) case where a delta reload
 is still wanted. This would turn the per-cycle **SQL query + row parse +
 `serde_json::from_str` deserialize** cost — `load_history`'s own Vec growth
 and query execution (11.03%) + its own serde_json deserialize (28.90%) +
-sqlite3 internals (12.53%) = ~52% of allocation bytes at n=80, and the
+sqlite3 internals (12.45%) = ~52% of allocation bytes at n=80, and the
 corresponding instruction share — from `O(k)` (reloading and reparsing the
 full history every cycle) into
 `O(1)` amortized (only the new events since the last cycle touch SQL or
@@ -369,7 +378,7 @@ regardless of caching, and neither is addressed by this recommendation:
 (31.01% of allocation bytes at n=80 — a cache holding the full history
 in-process still has to clone it out for that by-value call); and the
 workflow function itself still replays every prior activity call from the
-top on every cycle (the 15.05% "what isn't the finding" cost above). Both
+top on every cycle (the 15.04% "what isn't the finding" cost above). Both
 are inherent to a from-the-top-replay execution model, independent of where
 the history data lives. So `Σ(k=1..n) O(2k - 1) + O(2n + 1)` (see
 "Hypothesis" above for the `n + 1`-cycle derivation) — the `O(n²)` total-run
@@ -461,6 +470,9 @@ callgrind_annotate --threshold=100 callgrind.out | head -40
 # real Rust caller for a large share of allocations (see "Methodology note"
 # under "Allocation-site attribution" above):
 valgrind --tool=dhat --dhat-out-file=dhat.json --num-callers=30 "$BIN"
+
+# Reproduce the "Allocation-site attribution" table above from that capture:
+python3 autumn-harvest-sqlite/scripts/classify_dhat_allocations.py dhat.json
 ```
 
 `SQLITE_RUNTIME_PROFILE_N` (default `100`) and `SQLITE_RUNTIME_PROFILE_REPS`
