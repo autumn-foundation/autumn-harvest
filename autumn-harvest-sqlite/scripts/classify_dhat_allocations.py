@@ -24,17 +24,40 @@ before printing.
 
 # Precedence rationale (checked in this order, first match wins)
 
-1. `history.clone()` -- a `Vec`/`BTreeMap`/`String` `Clone` impl anywhere on
-   the stack. `serde_json::Value` objects are `BTreeMap`-backed (no
-   `preserve_order` feature in this workspace), so cloning the accumulated
-   history `Vec<WorkflowEvent>` on every decision cycle (see
-   `SqliteRuntime::drive_one_cycle`, which clones the freshly reloaded
-   history before consuming it by value) recurses into these Clone impls.
-   Checked FIRST because a clone of an already-deserialized `Value` can
-   itself pass through frames that also appear in the deserialize path
-   (e.g. `BTreeMap::insert` during a Clone's internal rebuild), and this is
-   a *cloning* cost, not a *parsing* cost -- the two are causally distinct
-   fixes.
+1. Clone markers (`Vec`/`BTreeMap`/`String` `Clone` impls anywhere on the
+   stack). `serde_json::Value` objects are `BTreeMap`-backed (no
+   `preserve_order` feature in this workspace), so cloning any JSON value
+   recurses into these Clone impls -- and this workload has THREE distinct,
+   architecturally-separate call sites that all match the same generic
+   markers, split by whether `drive_suspension`/`drain_ready` is ALSO on
+   the stack:
+     - `history.clone()` -- neither `drive_suspension` nor `drain_ready` is
+       on the stack. This is `SqliteRuntime::drive_one_cycle`'s clone of the
+       freshly reloaded, accumulated `Vec<WorkflowEvent>` before consuming
+       it by value -- the ONE clone site this document's whole finding is
+       about, happening once per DECISION CYCLE. `drive_one_cycle` itself
+       never appears as a literal frame (it is fully inlined into
+       `run_until_blocked::{{closure}}`, its sole call site), so its
+       absence -- not its presence -- is what a matching stack looks like.
+     - `activity_input_clone` -- `drive_suspension` or `drain_ready` IS on
+       the stack. These are two smaller, bounded, per-ACTIVITY (not
+       per-cycle) clones of the same `serde_json::Value` payload:
+       `persist_scheduled_activity` clones an activity's input once, at
+       SCHEDULE time, to build the durable `ActivityScheduled` event
+       (inlined through `apply_commands`/`apply_schedule_activity` into
+       `drive_suspension`, its only caller); `worker::drain_ready` clones
+       the same input a second time, at DRAIN time, immediately before
+       invoking the registered activity body closure. Neither is part of
+       the "N decision cycles reload the whole history" story -- each
+       happens exactly once per activity dispatched, not once per cycle --
+       so lumping them into `history.clone()` (an earlier cut of this
+       script did) overstates that bucket and its addressability. See the
+       doc's Methodology note on this split for the numbers.
+   Checked FIRST (both sub-cases) because a clone of an already-deserialized
+   `Value` can itself pass through frames that also appear in the
+   deserialize path (e.g. `BTreeMap::insert` during a Clone's internal
+   rebuild), and this is a *cloning* cost, not a *parsing* cost -- the two
+   are causally distinct fixes.
 2. Deserialize markers (`serde_json::de::`, `serde_json::value::de::`,
    `serde_core::de::`) -- `serde_json::Value::deserialize`'s recursive
    descent. Split into `load_history_deserialize` (the `store::load_history`
@@ -47,14 +70,29 @@ before printing.
    (`activity_payload`) is on the stack: the cost of the AUTHOR's code
    re-running from the top on every replay cycle, as opposed to the
    engine's own bookkeeping.
-4. `load_history_vec_query` -- any other `store::load_history` frame (the
-   `Vec<WorkflowEvent>` growth and the underlying rusqlite query execution,
-   as opposed to the per-event JSON deserialize already carved out above).
-5. `sqlite3_internals` -- any frame is a raw sqlite3 C-engine symbol (parser,
-   VDBE, memory allocator, etc.) with no Rust marker above matching first --
-   the storage engine's own allocations, independent of which Rust call
-   site triggered them.
-6. `other_uncategorized` -- everything else: tokio runtime/thread-pool
+4. sqlite3-C-frame allocations (any frame is a raw sqlite3 C-engine symbol
+   -- parser, VDBE, memory allocator, etc. -- with no Rust marker above
+   matching first), split by whether `store::load_history` is ALSO on the
+   stack -- an earlier cut of this script checked `LOAD_HISTORY_MARKER`
+   BEFORE the sqlite3-C check unconditionally, which meant NO sqlite3-C
+   allocation could ever be attributed to the reload query at all (any
+   stack carrying both markers was claimed by the `load_history` check
+   first) while simultaneously mislabeling the whole, much larger,
+   non-reload `sqlite3_internals` bucket as if it were "sqlite3 internals
+   executing the reload query" in the accompanying doc prose. Precedence
+   here restores the actual causal split:
+     - `sqlite3_internals_reload_query` -- sqlite3-C AND `load_history` both
+       on the stack: the sliver of sqlite3 C-engine work genuinely
+       reachable from the reload query itself.
+     - `load_history_vec_query` -- `load_history` on the stack, no
+       sqlite3-C frame above it matched first (the `Vec<WorkflowEvent>`
+       growth and the underlying rusqlite query execution, as opposed to
+       the per-event JSON deserialize already carved out above).
+     - `sqlite3_internals` -- sqlite3-C on the stack, no `load_history`:
+       the storage engine's own allocations from OTHER call sites (task
+       claiming, activity enqueueing, timer bookkeeping), independent of
+       the history reload.
+5. `other_uncategorized` -- everything else: tokio runtime/thread-pool
    setup and teardown, rusqlite plumbing (statement cache, row access) not
    already attributed to `load_history`, UUID-to-string formatting for
    diagnostics, the various small `store::`/`queue::`/`worker::`/`context::`
@@ -97,6 +135,13 @@ SQLITE_C_PREFIXES = (
     "sqlite3VdbeExec",
     "sqlite3RunParser",
 )
+# The two smaller, per-activity clone sites (see precedence rationale #1
+# above) are only ever reachable through one of these two functions, since
+# `drive_one_cycle`'s own history clone never has either on its stack.
+ACTIVITY_INPUT_CLONE_MARKERS = (
+    "autumn_harvest_sqlite::runtime::SqliteRuntime::drive_suspension",
+    "autumn_harvest_sqlite::worker::drain_ready",
+)
 
 CATEGORY_ORDER = (
     "history.clone()",
@@ -104,8 +149,10 @@ CATEGORY_ORDER = (
     "workflow_reexecution",
     "load_history_vec_query",
     "sqlite3_internals",
-    "serde_json_elsewhere",
     "other_uncategorized",
+    "activity_input_clone",
+    "serde_json_elsewhere",
+    "sqlite3_internals_reload_query",
 )
 
 
@@ -116,6 +163,8 @@ def resolve_stack(pp, ftbl):
 def classify(stack):
     joined = "\n".join(stack)
     if any(m in joined for m in CLONE_MARKERS):
+        if any(m in joined for m in ACTIVITY_INPUT_CLONE_MARKERS):
+            return "activity_input_clone"
         return "history.clone()"
     if any(m in joined for m in SERDE_DESER_MARKERS):
         if LOAD_HISTORY_MARKER in joined:
@@ -123,12 +172,15 @@ def classify(stack):
         return "serde_json_elsewhere"
     if any(m in joined for m in WORKFLOW_REEXEC_MARKERS):
         return "workflow_reexecution"
-    if LOAD_HISTORY_MARKER in joined:
-        return "load_history_vec_query"
     is_sqlite_c = any(
         any(fr.split(":", 1)[-1].strip().startswith(pfx) for pfx in SQLITE_C_PREFIXES)
         for fr in stack
     )
+    has_load_history = LOAD_HISTORY_MARKER in joined
+    if is_sqlite_c and has_load_history:
+        return "sqlite3_internals_reload_query"
+    if has_load_history:
+        return "load_history_vec_query"
     if is_sqlite_c:
         return "sqlite3_internals"
     return "other_uncategorized"

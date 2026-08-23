@@ -48,8 +48,13 @@
 //!   --callgrind-out-file=callgrind.out "$BIN"
 //! callgrind_annotate --threshold=100 callgrind.out
 //!
-//! # Allocation counts/bytes:
-//! valgrind --tool=dhat --dhat-out-file=dhat.json "$BIN"
+//! # Allocation counts/bytes -- `--num-callers=30` is REQUIRED: the default
+//! # depth (12) truncates `serde_json::Value::deserialize`'s recursive
+//! # descent before it reaches the real Rust caller for a large share of
+//! # allocations (see `docs/performance-sqlite-runtime-drive.md`'s
+//! # "Allocation-site attribution" Methodology note for the measured effect
+//! # of getting this wrong):
+//! valgrind --tool=dhat --dhat-out-file=dhat.json --num-callers=30 "$BIN"
 //! ```
 
 use autumn_harvest::prelude::*;
