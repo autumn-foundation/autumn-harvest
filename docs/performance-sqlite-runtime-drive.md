@@ -128,7 +128,14 @@ across allocator, JSON-parse, and `BTreeMap` machinery because a JSON
 ### Allocation-count/byte scaling (`dhat`)
 
 ```
-valgrind --tool=dhat --dhat-out-file=dhat.json <runtime_drive_profile binary>
+# --num-callers=30 is required to reproduce the per-category attribution in
+# the next section from this same capture -- see the "Methodology note"
+# immediately below for why the default depth (12) misattributes a large
+# share of allocations. The four total-byte/total-block figures in the
+# table below are unaffected by capture depth (DHAT's grand totals are
+# invariant to how allocations are grouped by stack; the flag only matters
+# for the categorized breakdown that follows).
+valgrind --tool=dhat --dhat-out-file=dhat.json --num-callers=30 <runtime_drive_profile binary>
 ```
 
 | n | Total bytes | Total blocks | Byte ratio | Block ratio |
