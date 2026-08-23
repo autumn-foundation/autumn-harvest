@@ -4421,9 +4421,32 @@ async fn acquire_shard_conn(
 /// `missing_assigned_shard_pools`: better a loud non-start than silent partial
 /// coverage. Callers that genuinely want multi-shard use `Worker::run`, which
 /// routes to `run_multi_shard` with a per-shard listener each.
+///
+/// # Why a sharded pool is required for the rejection
+///
+/// The loss of coverage is real only when the assignments resolve to *different*
+/// databases, and that can only happen when a `ShardedDbPool` is configured.
+/// With **no** sharded pool the shard-target resolution in `run` maps every
+/// assignment onto the caller's one `pool` (`pool.clone()` per assignment), so a
+/// single poll loop over that pool genuinely drains every assigned logical
+/// shard — the "several logical shards colocated on one physical database"
+/// shape, which is a legitimate deployment (and the pattern the cross-shard
+/// outbox tests use, where the outbox's `execs.shard_id = ANY(..)` filter is the
+/// only thing that needs both ids). Rejecting there would refuse to start a
+/// worker whose coverage is complete.
+///
+/// The residual cost in that shape is fidelity, not stranding: every dispatch is
+/// attributed to `shard_assignments[0]`, so `harvest.shard.dispatched{shard}`
+/// under-reports the other logical shards. `harvest.shard.stranded_pending` is
+/// unaffected — the worker's fleet row does advertise both shards and it does
+/// poll the database holding them — so no coverage alarm is suppressed. This
+/// matches the pre-#961 behaviour for the same configuration.
 #[must_use]
-pub(crate) const fn single_pool_entrypoint_rejects(resolved_assignments: usize) -> bool {
-    resolved_assignments > 1
+pub(crate) const fn single_pool_entrypoint_rejects(
+    resolved_assignments: usize,
+    has_sharded_pool: bool,
+) -> bool {
+    resolved_assignments > 1 && has_sharded_pool
 }
 
 /// Whether a shard's poll loop may claim tasks, given that shard's pending
@@ -20318,7 +20341,15 @@ impl Worker {
         // `run_multi_shard`; its internal call reaches here only when
         // `use_multi_shard` is false, so this guard fires solely for a direct
         // embedder.
-        if single_pool_entrypoint_rejects(self.config.shard_assignments.len()) {
+        //
+        // Gated on a configured `ShardedDbPool`: without one, every assignment
+        // resolves to this same `pool`, so one poll loop drains them all and the
+        // coverage is genuine. See `single_pool_entrypoint_rejects`.
+        #[cfg(feature = "db")]
+        let has_sharded_pool = self.config.sharded_pool.is_some();
+        #[cfg(not(feature = "db"))]
+        let has_sharded_pool = false;
+        if single_pool_entrypoint_rejects(self.config.shard_assignments.len(), has_sharded_pool) {
             tracing::error!(
                 worker_id = %self.config.worker_id,
                 shard_assignments = ?self
@@ -23068,6 +23099,22 @@ mod tests {
         assert!(labels_to_clear(&previous, &current, true).is_empty());
     }
 
+    /// A pool that builds without connecting, aimed at a closed port.
+    ///
+    /// Lets the shard-coverage guards be exercised with no database: the guards
+    /// under test all decide *before* any acquisition, so a pool that can never
+    /// hand out a connection is exactly the right instrument — a call that
+    /// reaches the pool is a call that failed the guard.
+    fn unreachable_pool(url: &str) -> DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(url);
+        deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting")
+    }
+
     fn default_runtime_config() -> WorkerRuntimeConfig {
         WorkerRuntimeConfig {
             worker_id: "test-worker-1".to_string(),
@@ -24281,16 +24328,6 @@ mod tests {
 
     #[test]
     fn auto_shard_assignments_resolve_after_the_runner_assigns_the_pool() {
-        let unreachable = |url: &str| -> DbPool {
-            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
-                diesel_async::AsyncPgConnection,
-            >::new(url);
-            deadpool::managed::Pool::builder(manager)
-                .max_size(1)
-                .build()
-                .expect("pool builds without connecting")
-        };
-
         // No explicit assignments -> "auto".
         let mut cfg: WorkerRuntimeConfig = crate::builder::WorkerConfig::default().into();
         assert!(
@@ -24302,15 +24339,15 @@ mod tests {
         let mut pools = std::collections::BTreeMap::new();
         pools.insert(
             crate::types::ShardId::new(0),
-            unreachable("postgres://127.0.0.1:1/s0"),
+            unreachable_pool("postgres://127.0.0.1:1/s0"),
         );
         pools.insert(
             crate::types::ShardId::new(1),
-            unreachable("postgres://127.0.0.1:1/s1"),
+            unreachable_pool("postgres://127.0.0.1:1/s1"),
         );
         pools.insert(
             crate::types::ShardId::new(2),
-            unreachable("postgres://127.0.0.1:1/s2"),
+            unreachable_pool("postgres://127.0.0.1:1/s2"),
         );
         cfg.sharded_pool = Some(crate::shard::ShardedDbPool::from_map(
             pools,
@@ -24404,43 +24441,59 @@ mod tests {
         }
     }
 
-    /// The single-pool entrypoint refuses a multi-shard config, and only that
-    /// (issue #961 review, Codex P1).
+    /// The single-pool entrypoint refuses a multi-shard config, and only when
+    /// that config actually spans several databases (issue #961 review, Codex
+    /// P1, corrected).
     #[test]
-    fn single_pool_entrypoint_rejects_only_multi_shard_configs() {
-        // No shard identity at all, and a genuinely single-shard worker: both
-        // are exactly what this entrypoint is for.
-        assert!(!single_pool_entrypoint_rejects(0));
-        assert!(!single_pool_entrypoint_rejects(1));
-        // Two or more resolved shards cannot be drained from one pool.
-        assert!(single_pool_entrypoint_rejects(2));
-        assert!(single_pool_entrypoint_rejects(8));
+    fn single_pool_entrypoint_rejects_only_multi_database_configs() {
+        for has_sharded_pool in [false, true] {
+            // No shard identity at all, and a genuinely single-shard worker:
+            // both are exactly what this entrypoint is for.
+            assert!(!single_pool_entrypoint_rejects(0, has_sharded_pool));
+            assert!(!single_pool_entrypoint_rejects(1, has_sharded_pool));
+        }
+
+        // Several logical shards colocated on ONE database: the shard-target
+        // resolution in `run` maps every assignment onto the caller's single
+        // pool, so one poll loop drains them all. Refusing here would refuse a
+        // worker whose coverage is complete.
+        assert!(!single_pool_entrypoint_rejects(2, false));
+        assert!(!single_pool_entrypoint_rejects(8, false));
+
+        // A configured ShardedDbPool means the assignments are meant to reach
+        // different databases, which one pool cannot do.
+        assert!(single_pool_entrypoint_rejects(2, true));
+        assert!(single_pool_entrypoint_rejects(8, true));
     }
 
-    /// `run_with_listener` returns immediately for a multi-shard config rather
-    /// than entering its single-pool loop (issue #961 review, Codex P1).
+    /// `run_with_listener` returns immediately for a multi-*database* config
+    /// rather than entering its single-pool loop (issue #961 review, Codex P1).
     ///
     /// Falsifiable without a database: with the guard the call returns before
     /// touching the pool at all, so it completes promptly. Without it, the
     /// worker registers against the one pool and enters `run_poll_loop`, which
     /// runs until shutdown — so the bounded wait below elapses instead.
     #[tokio::test]
-    async fn run_with_listener_refuses_a_multi_shard_config() {
-        let unreachable = |url: &str| -> DbPool {
-            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
-                diesel_async::AsyncPgConnection,
-            >::new(url);
-            deadpool::managed::Pool::builder(manager)
-                .max_size(1)
-                .build()
-                .expect("pool builds without connecting")
-        };
+    async fn run_with_listener_refuses_a_multi_database_config() {
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(
+            crate::types::ShardId::new(0),
+            unreachable_pool("postgres://127.0.0.1:1/s0"),
+        );
+        pools.insert(
+            crate::types::ShardId::new(1),
+            unreachable_pool("postgres://127.0.0.1:1/s1"),
+        );
 
         let mut cfg = default_runtime_config();
         cfg.shard_assignments = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
+        cfg.sharded_pool = Some(crate::shard::ShardedDbPool::from_map(
+            pools,
+            crate::types::ShardId::new(0),
+        ));
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
         let worker = Worker::new(cfg, registry).expect("valid config");
-        let pool = unreachable("postgres://127.0.0.1:1/s0");
+        let pool = unreachable_pool("postgres://127.0.0.1:1/s0");
 
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -24448,9 +24501,43 @@ mod tests {
         )
         .await
         .expect(
-            "run_with_listener must refuse a multi-shard config and return, not enter its \
+            "run_with_listener must refuse a multi-database config and return, not enter its \
              single-pool loop advertising coverage it never drains",
         );
+    }
+
+    /// The mirror of the guard: several logical shards colocated on ONE
+    /// database is a legitimate configuration and must still start.
+    ///
+    /// `run` maps every assignment onto the caller's single pool when no
+    /// `ShardedDbPool` is configured, so one poll loop genuinely drains them
+    /// all — the shape the cross-shard outbox integration tests use, where the
+    /// outbox's `execs.shard_id = ANY(..)` filter is the only thing that needs
+    /// both ids. Falsifiable: with the over-broad guard this returns promptly
+    /// (refused) instead of entering the loop and elapsing the bounded wait.
+    #[tokio::test]
+    async fn run_with_listener_accepts_colocated_logical_shards() {
+        let mut cfg = default_runtime_config();
+        cfg.shard_assignments = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
+        assert!(
+            cfg.sharded_pool.is_none(),
+            "this test is about the no-sharded-pool shape",
+        );
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+        let pool = unreachable_pool("postgres://127.0.0.1:1/s0");
+
+        let entered = tokio::time::timeout(
+            Duration::from_secs(2),
+            worker.run_with_listener(&pool, None),
+        )
+        .await;
+        assert!(
+            entered.is_err(),
+            "a worker whose logical shards share one database must enter its poll loop, not \
+             refuse to start: one pool covers every assignment",
+        );
+        worker.shutdown();
     }
 
     /// The pending flag is per pool, not per worker (issue #804, Codex
@@ -24468,18 +24555,8 @@ mod tests {
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
         let worker = Worker::new(cfg, registry).expect("valid config");
 
-        let unreachable = |url: &str| -> DbPool {
-            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
-                diesel_async::AsyncPgConnection,
-            >::new(url);
-            deadpool::managed::Pool::builder(manager)
-                .max_size(1)
-                .build()
-                .expect("pool builds without connecting")
-        };
-
-        let a = unreachable("postgres://127.0.0.1:1/shard_a");
-        let b = unreachable("postgres://127.0.0.1:1/shard_b");
+        let a = unreachable_pool("postgres://127.0.0.1:1/shard_a");
+        let b = unreachable_pool("postgres://127.0.0.1:1/shard_b");
 
         // Both fail here, which is enough to prove the shape: each call
         // produces its own answer, so no shard can clear another's retry.
