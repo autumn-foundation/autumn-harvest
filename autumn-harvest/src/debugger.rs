@@ -78,11 +78,16 @@
 //! questions, two checks:
 //!
 //! * "Where do these two builds first behave differently?" —
-//!   [`diff_traces`]`(a, b).divergence`.
-//! * "Does this build replay this history **cleanly**?" — no step has
-//!   `divergence.is_some()`.
+//!   [`diff_traces`]`(a, b)`, read through [`TraceDiff::is_clean`].
+//! * "Does this build replay this history **cleanly**?" —
+//!   [`ReplayTrace::is_clean`].
 //!
-//! Use the second to confirm a fix. See `docs/replay-debugger.md`.
+//! Use the second to confirm a fix. Ask those methods rather than scanning for
+//! `divergence.is_some()`: a step that timed out or panicked, and every step of
+//! a handler-free [`ReplayTrace::from_history`] projection, carries no
+//! divergence because nothing was ever compared — not because the build agreed.
+//! Both methods likewise refuse a trace `truncated` by `max_steps`. See
+//! `docs/replay-debugger.md`.
 //!
 //! [`ctx.patched`]: crate::context::WorkflowContext::patched
 //! [`ctx.version`]: crate::context::WorkflowContext::version

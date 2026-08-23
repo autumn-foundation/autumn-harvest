@@ -866,3 +866,102 @@ fn diff_render_reports_a_capped_comparison_as_inconclusive() {
         "the clean wording must not appear on a capped comparison:\n{rendered}"
     );
 }
+
+#[tokio::test]
+async fn diff_render_never_calls_a_panicked_side_clean() {
+    // `step_diff_kind` compares `divergence` BEFORE `outcome`, so a side that
+    // panicked — and therefore recorded no divergence, because it never got far
+    // enough to disagree with anything — reaches the `DiffKind::Divergence` arm
+    // carrying `None`. Labelling that "replays cleanly" is the same false-clean
+    // this tool exists to refuse: a build that crashes must never be described
+    // as replaying cleanly in the very report a reviewer reads to decide.
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use autumn_harvest::context::WorkflowContext;
+    use autumn_harvest::debugger::{DiffKind, ReplayDebugger};
+    use autumn_harvest::testing::HistorySnapshot;
+
+    /// Returns immediately at step 0, panics from step 1 on.
+    ///
+    /// The branch is on the *prefix* length (each step replays `events[0..=k]`),
+    /// which is what lets both builds agree at step 0 and part company at step
+    /// 1 — the only shape in which a panic can be the FIRST difference without
+    /// the earlier command/outcome checks firing first.
+    fn panics_after_the_first_step<'a>(
+        ctx: &'a WorkflowContext,
+        _input: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            assert!(ctx.history_event_count() <= 1, "boom");
+            Ok(serde_json::json!("done"))
+        })
+    }
+
+    /// Returns immediately at every step. From step 1 on that leaves the
+    /// recorded `ActivityScheduled` unconsumed, which the engine's own
+    /// returned-early check surfaces as a genuine divergence.
+    fn returns_early<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+        Box::pin(async move { Ok(serde_json::json!("done")) })
+    }
+
+    let snapshot = |events: Vec<WorkflowEvent>| HistorySnapshot {
+        workflow_name: "order_flow".to_string(),
+        execution_id: ExecutionId::new(),
+        events,
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
+        queue_name: None,
+    };
+
+    let events = base_events();
+    let left = ReplayDebugger::new()
+        .register_fn("order_flow", panics_after_the_first_step)
+        .max_steps(2)
+        .trace_snapshot(snapshot(events.clone()))
+        .await
+        .expect("trace");
+    let right = ReplayDebugger::new()
+        .register_fn("order_flow", returns_early)
+        .max_steps(2)
+        .trace_snapshot(snapshot(events))
+        .await
+        .expect("trace");
+
+    // Precondition: the test is only meaningful while the two sides reach the
+    // `Divergence` arm with the panicked side carrying `None` — the exact shape
+    // that used to render as "replays cleanly".
+    let diff = autumn_harvest::debugger::diff_traces(&left, &right);
+    let div = diff
+        .divergence
+        .as_ref()
+        .expect("the two builds must differ");
+    let DiffKind::Divergence { left: l, right: r } = &div.kind else {
+        panic!("expected a Divergence kind, got {:?}", div.kind);
+    };
+    assert!(
+        l.is_none() && r.is_some(),
+        "precondition: the panicked side must carry no divergence, got {l:?} / {r:?}"
+    );
+    assert_eq!(
+        div.left.as_ref().map(|s| s.outcome.as_str()),
+        Some("panicked"),
+        "precondition: the left side must actually have panicked"
+    );
+
+    let rendered = render_diff(&diff, "panicking.json", "diverging.json");
+    assert!(
+        !rendered.contains("left : replays cleanly"),
+        "a panicked side must never be described as replaying cleanly:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("panicked"),
+        "the report must say why that side produced no divergence:\n{rendered}"
+    );
+}

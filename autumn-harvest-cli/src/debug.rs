@@ -340,7 +340,7 @@ pub fn render_diff(diff: &TraceDiff, left_label: &str, right_label: &str) -> Str
             // every field — but neither was ever successfully replayed, so
             // "they agree" would be a claim about two non-answers.
             return format!(
-                "INCONCLUSIVE: {left_label} and {right_label} match across the {examined} steps\n                 that were compared, but neither replayed successfully at step {step}\n                 (it timed out, panicked, or was never replayed), so agreement there\n                 says nothing about the code. Fix the spin or panic to get a verdict.\n"
+                "INCONCLUSIVE: {left_label} and {right_label} match across the {examined} steps\n                 that were compared, but neither replayed successfully at step {step}\n                 (it timed out or panicked), so agreement there\n                 says nothing about the code. Fix the spin or panic to get a verdict.\n"
             );
         }
         return format!(
@@ -372,7 +372,10 @@ pub fn render_diff(diff: &TraceDiff, left_label: &str, right_label: &str) -> Str
         }
         DiffKind::Divergence { left, right } => {
             let mut line = String::from("  one side no longer matches the recording\n");
-            for (label, side) in [("left ", left), ("right", right)] {
+            for (label, side, step) in [
+                ("left ", left, div.left.as_ref()),
+                ("right", right, div.right.as_ref()),
+            ] {
                 match side {
                     Some(d) => {
                         let _ = writeln!(
@@ -381,9 +384,24 @@ pub fn render_diff(diff: &TraceDiff, left_label: &str, right_label: &str) -> Str
                             d.event_index, d.expected, d.actual
                         );
                     }
-                    None => {
-                        let _ = writeln!(line, "    {label}: replays cleanly");
-                    }
+                    // No divergence recorded is not the same as a clean replay:
+                    // `divergence` is compared BEFORE `outcome`, so this side may
+                    // have panicked or timed out and simply never got far enough
+                    // to disagree with anything. Naming a non-answer "clean" is
+                    // the same false-clean this tool exists to refuse.
+                    None => match step {
+                        Some(s) if !s.outcome.replay_succeeded() => {
+                            let _ = writeln!(
+                                line,
+                                "    {label}: no divergence observed, but the replay {} \
+                                 (nothing was compared)",
+                                s.outcome.as_str()
+                            );
+                        }
+                        _ => {
+                            let _ = writeln!(line, "    {label}: replays cleanly");
+                        }
+                    },
                 }
             }
             line
