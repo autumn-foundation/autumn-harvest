@@ -3020,10 +3020,14 @@ pub struct WorkerConfig {
     /// Shards this worker is responsible for polling.
     ///
     /// Defaults to **empty**, which means *auto*: the worker covers every
-    /// shard this process has a pool for (issue #961, AC1). With no sharded
-    /// pool that resolves to `[ShardId::new(0)]`, so a single-shard deployment
-    /// is byte-for-byte unchanged. Set an explicit list to narrow a worker to
-    /// a subset — typically the one-worker-process-per-shard shape,
+    /// shard this process has a pool for (issue #961, AC1). With **no** sharded
+    /// pool it stays empty — there is no shard identity to resolve, and every
+    /// read-side consumer already reads the empty array as "covers whatever
+    /// shard this row was read from" (see
+    /// [`crate::workers::shard_assignments_cover`] and issue #1150). Do **not**
+    /// rely on a pool-less worker advertising shard `0`: it advertises no shard
+    /// at all. Set an explicit list to narrow a worker to a subset — typically
+    /// the one-worker-process-per-shard shape,
     /// `shard_assignments = vec![that_shard]`. See
     /// [`resolve_shard_assignments`] for the resolution rules; the effective
     /// (resolved) list is what `GET /admin/config` reports.
@@ -3370,8 +3374,16 @@ pub(crate) fn dedup_shard_assignments(shards: Vec<ShardId>) -> Vec<ShardId> {
 ///   one-worker-process-per-shard shape) and is never widened.
 /// - **Empty + a sharded pool** → every shard id in the pool, ascending, so the
 ///   round-robin poll order is deterministic across restarts.
-/// - **Empty + no pool** → `[ShardId::new(0)]`, byte-for-byte the pre-#961
-///   single-shard default (AC7).
+/// - **Empty + no pool** → **empty**, preserved verbatim. There is no shard
+///   identity to resolve, so fabricating a `[ShardId::new(0)]` would assert a
+///   shard number this process never established — the write-side twin of
+///   issue #1150, whose read-side consumers all normalize the empty array as
+///   "covers whatever shard the row was read from". [`crate::shard::ShardRouter`]
+///   also accepts an arbitrary default shard, so `0` is not a safe stand-in
+///   even for a genuinely single-shard deployment. Single-shard stays
+///   byte-for-byte unchanged (AC7) because the poll loop's shard is an
+///   `Option` and `harvest.shard.dispatched` is emitted only when the worker
+///   has a shard identity.
 ///
 /// Deriving from the **pool** rather than the router's writable set is
 /// deliberate: the pool is what this process can physically reach, so an
