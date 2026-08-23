@@ -127,7 +127,10 @@ fn main() {
             );
         }
         let exec = engine
-            .start_workflow("sequential_workflow", json!(n as i64))
+            .start_workflow(
+                "sequential_workflow",
+                json!(i64::try_from(n).unwrap_or(i64::MAX)),
+            )
             .expect("start_workflow");
 
         let state = rt
