@@ -573,6 +573,64 @@ pub enum CliError {
         /// One line per vanished record.
         detail: String,
     },
+
+    /// `debug replay` was given a breakpoint that never matched (issue #949).
+    ///
+    /// The trace overview is already printed to stdout; this only signals the
+    /// exit code. Exit code is `1`.
+    #[error("debug replay: breakpoint never hit")]
+    DebugBreakpointMissed,
+
+    /// `debug replay --step N` was given an index past the end of the trace
+    /// (issue #949). Exit code is `1`.
+    #[error("debug replay: step {index} is out of range (trace has {len} steps)")]
+    DebugStepOutOfRange {
+        /// The requested step index.
+        index: usize,
+        /// How many steps the trace actually has.
+        len: usize,
+    },
+
+    /// `debug diff` found a divergence (issue #949).
+    ///
+    /// The report itself is already printed to stdout; this only signals the
+    /// exit code. Mirrors `diff(1)`: exit `1` means "differences found", not
+    /// "the tool failed". Exit code is `1`.
+    #[error("debug diff: traces diverge at step {step_index}")]
+    DebugDivergence {
+        /// The step index at which the two traces first differ.
+        step_index: usize,
+    },
+
+    /// `debug diff` compared only a **prefix** of the two traces because at
+    /// least one was capped by `max_steps`, and found no difference in it
+    /// (issue #949).
+    ///
+    /// This is deliberately *not* exit `0`. "No difference in the part we
+    /// looked at" is not "these agree", and a CI gate that treats it as a pass
+    /// is silently trusting an unexamined suffix. Exit code is `2`, joining
+    /// the other "could not determine" gates (`WorkflowReachabilityGate`,
+    /// `QueueCoverageGate`, `RestoreUndetermined`) so a script can tell it
+    /// apart from `1` = "differences found".
+    #[error("debug diff: inconclusive — {reason} (compared {examined} steps)")]
+    DebugDiffInconclusive {
+        /// How many steps were actually compared.
+        examined: usize,
+        /// Why the comparison could not reach a verdict. Distinguishes an
+        /// unexamined suffix (a `--max-steps` cap) from two builds that both
+        /// failed to replay, which agree only because neither answered.
+        reason: &'static str,
+    },
+
+    /// A terminal operation failed while running the interactive stepper
+    /// (issue #949). Exit code is `1`.
+    #[error("debug replay: terminal {op} failed: {reason}")]
+    DebugTerminal {
+        /// The terminal operation that failed.
+        op: &'static str,
+        /// The underlying error, rendered.
+        reason: String,
+    },
 }
 
 impl CliError {
@@ -591,12 +649,70 @@ impl CliError {
             // "determined broken" (exit 1), so an operator drill script can
             // retry a transient shard outage rather than declare the restore
             // unusable.
+            //
+            // Issue #949's `debug diff` joins them on the same reasoning: a
+            // capped comparison examined only a prefix, so "inconclusive" must
+            // be distinguishable from `1` = "differences found" and from
+            // `0` = "compared in full and agree".
             Self::WorkflowReachabilityGate { .. }
             | Self::QueueCoverageGate { .. }
-            | Self::RestoreUndetermined { .. } => 2,
+            | Self::RestoreUndetermined { .. }
+            | Self::DebugDiffInconclusive { .. } => 2,
             _ => 1,
         }
     }
+}
+
+/// `harvest debug` subcommands (issue #949).
+#[derive(Debug, Subcommand)]
+enum DebugCommand {
+    /// Step through a recorded history, with optional breakpoints.
+    Replay {
+        /// Path to an exported `HistorySnapshot` JSON file.
+        #[arg(value_name = "HISTORY")]
+        history: PathBuf,
+        /// Output format: human-readable `text` (default) or machine-readable
+        /// `json` (the full `ReplayTrace`).
+        #[arg(long, value_enum, default_value_t)]
+        format: crate::debug::DebugFormat,
+        /// Jump straight to this step index and inspect it.
+        #[arg(long, value_name = "N", conflicts_with_all = ["break_at_event_type", "break_at_index", "break_at_activity", "break_at_signal"])]
+        step: Option<usize>,
+        /// Run to the first step whose event type matches.
+        #[arg(long, value_name = "TYPE", conflicts_with_all = ["break_at_index", "break_at_activity", "break_at_signal"])]
+        break_at_event_type: Option<String>,
+        /// Run to this exact event index.
+        #[arg(long, value_name = "N", conflicts_with_all = ["break_at_activity", "break_at_signal"])]
+        break_at_index: Option<usize>,
+        /// Run to the first step that schedules this activity.
+        #[arg(long, value_name = "NAME", conflicts_with = "break_at_signal")]
+        break_at_activity: Option<String>,
+        /// Run to the first step that receives (or waits for) this signal.
+        #[arg(long, value_name = "NAME")]
+        break_at_signal: Option<String>,
+        /// Cap the number of steps materialised (guards a pathological history).
+        #[arg(long, value_name = "N")]
+        max_steps: Option<usize>,
+        /// Open the interactive stepper instead of printing.
+        #[arg(long, default_value_t = false, conflicts_with = "format")]
+        tui: bool,
+    },
+    /// Diff two recorded histories and report the first divergence.
+    ///
+    /// Exits `1` when a divergence is found, mirroring `diff(1)`, so this is
+    /// usable directly as a CI gate.
+    Diff {
+        /// The baseline history (the "old build" recording).
+        #[arg(value_name = "LEFT")]
+        left: PathBuf,
+        /// The candidate history (the "new build" recording).
+        #[arg(value_name = "RIGHT")]
+        right: PathBuf,
+        /// Output format: human-readable `text` (default) or machine-readable
+        /// `json` (the full `TraceDiff`).
+        #[arg(long, value_enum, default_value_t)]
+        format: crate::debug::DebugFormat,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -887,6 +1003,23 @@ enum Commands {
         /// location, then exit `0` (audit mode).
         #[arg(long, default_value_t = false)]
         list_suppressions: bool,
+    },
+
+    /// Time-travel replay debugger for a recorded workflow history (issue #949).
+    ///
+    /// Read-only and entirely local: no HTTP, no database, no activity
+    /// execution. Operates on the `HistorySnapshot` JSON written by
+    /// `harvest history export`, so a production history is debugged offline.
+    ///
+    /// The shipped binary cannot link your `#[workflow]` handlers, so this
+    /// command covers the handler-free surface: stepping, breakpoints,
+    /// inspection, and diffing two fixture histories. For per-step pending
+    /// commands and for diffing two workflow-code registrations, use
+    /// `autumn_harvest::debugger::ReplayDebugger` from a test or binary in your
+    /// own crate.
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
     },
 
     /// Gate backward-incompatible workflow payload-schema changes (issue #794).
@@ -2726,6 +2859,9 @@ impl Cli {
             Commands::DetCheck { .. } => {
                 unreachable!("DetCheck handles its own execution locally")
             }
+            Commands::Debug { .. } => {
+                unreachable!("Debug handles its own execution locally")
+            }
             Commands::Schema { .. } => {
                 unreachable!("Schema handles its own execution locally")
             }
@@ -2787,6 +2923,8 @@ impl ApiRequest {
     }
 }
 
+pub mod debug;
+pub mod debug_tui;
 pub mod tui;
 
 /// Run the CLI, print successful response data to stdout, and return errors.
@@ -2796,8 +2934,8 @@ pub mod tui;
 /// Returns an error if request construction, HTTP transport, response parsing,
 /// or response formatting fails.
 // A dispatcher: a sequence of `if let ... return` guards for locally-handled
-// commands (det-check, schema, new, tui, events, worker-drain-wait, token
-// bootstrap) followed
+// commands (det-check, schema, new, tui, debug, events, worker-drain-wait,
+// backup verify, token bootstrap) followed
 // by the shared execute/render path. Splitting it would only scatter the guards.
 #[allow(clippy::too_many_lines)]
 pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
@@ -2838,6 +2976,39 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     } = &cli.command
     {
         return run_det_check(paths, *format, *deny_warnings, *list_suppressions);
+    }
+
+    // `debug` is a read-only local history analysis: no HTTP, no DB, no
+    // activity execution (mirrors DetCheck).
+    if let Commands::Debug { command } = &cli.command {
+        return match command {
+            DebugCommand::Replay {
+                history,
+                format,
+                step,
+                break_at_event_type,
+                break_at_index,
+                break_at_activity,
+                break_at_signal,
+                max_steps,
+                tui,
+            } => crate::debug::run_replay(
+                history,
+                *format,
+                *step,
+                break_at_event_type.as_deref(),
+                *break_at_index,
+                break_at_activity.as_deref(),
+                break_at_signal.as_deref(),
+                *max_steps,
+                *tui,
+            ),
+            DebugCommand::Diff {
+                left,
+                right,
+                format,
+            } => crate::debug::run_diff(left, right, *format),
+        };
     }
 
     // `schema` is read-only local file comparison: no HTTP, no DB (mirrors
@@ -14462,5 +14633,169 @@ mod preflight_findings_tests {
             "detail block must follow the table:\n{rendered}"
         );
         assert!(rendered.contains("send_emial"), "{rendered}");
+    }
+}
+
+// Issue #949: `harvest debug` clap-layer tests. The rendering / focus-resolution
+// / breakpoint behaviour lives in `tests/integration/debug_cli.rs`; these pin
+// only the argument surface (defaults, aliases, mutual exclusion), mirroring
+// `det_check_cli_tests`.
+#[cfg(test)]
+mod debug_cli_tests {
+    use super::*;
+    use crate::debug::DebugFormat;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn debug_replay_parses_with_defaults() {
+        let cli = parse(&["debug", "replay", "history.json"]);
+        let Commands::Debug {
+            command:
+                DebugCommand::Replay {
+                    history,
+                    format,
+                    step,
+                    break_at_event_type,
+                    break_at_index,
+                    break_at_activity,
+                    break_at_signal,
+                    max_steps,
+                    tui,
+                },
+        } = cli.command
+        else {
+            panic!("expected debug replay");
+        };
+        assert_eq!(history, PathBuf::from("history.json"));
+        assert_eq!(format, DebugFormat::Text, "text is the default format");
+        assert!(step.is_none());
+        assert!(break_at_event_type.is_none());
+        assert!(break_at_index.is_none());
+        assert!(break_at_activity.is_none());
+        assert!(break_at_signal.is_none());
+        assert!(max_steps.is_none());
+        assert!(!tui, "the stepper is opt-in");
+    }
+
+    #[test]
+    fn debug_replay_parses_every_flag() {
+        let cli = parse(&[
+            "debug",
+            "replay",
+            "h.json",
+            "--format",
+            "json",
+            "--max-steps",
+            "50",
+        ]);
+        let Commands::Debug {
+            command: DebugCommand::Replay {
+                format, max_steps, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected debug replay");
+        };
+        assert_eq!(format, DebugFormat::Json);
+        assert_eq!(max_steps, Some(50));
+    }
+
+    #[test]
+    fn debug_replay_accepts_each_breakpoint_flag_alone() {
+        for args in [
+            vec![
+                "debug",
+                "replay",
+                "h.json",
+                "--break-at-event-type",
+                "TimerStarted",
+            ],
+            vec!["debug", "replay", "h.json", "--break-at-index", "3"],
+            vec!["debug", "replay", "h.json", "--break-at-activity", "charge"],
+            vec!["debug", "replay", "h.json", "--break-at-signal", "approval"],
+        ] {
+            assert!(
+                try_parse(&args).is_ok(),
+                "a single breakpoint flag must parse: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_replay_rejects_two_breakpoint_flags() {
+        // AC2's breakpoints are alternatives, not a conjunction; clap enforces
+        // it so `resolve_breakpoint` never has to pick a silent winner.
+        assert!(
+            try_parse(&[
+                "debug",
+                "replay",
+                "h.json",
+                "--break-at-index",
+                "1",
+                "--break-at-activity",
+                "charge",
+            ])
+            .is_err(),
+            "two breakpoint flags must be rejected"
+        );
+    }
+
+    #[test]
+    fn debug_replay_rejects_step_with_a_breakpoint() {
+        assert!(
+            try_parse(&[
+                "debug",
+                "replay",
+                "h.json",
+                "--step",
+                "1",
+                "--break-at-index",
+                "2"
+            ])
+            .is_err(),
+            "--step and a breakpoint are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn debug_replay_rejects_tui_with_format() {
+        // `--tui` drives a terminal; a format flag alongside it would silently
+        // do nothing.
+        assert!(
+            try_parse(&["debug", "replay", "h.json", "--tui", "--format", "json"]).is_err(),
+            "--tui and --format are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn debug_diff_parses_both_sides() {
+        let cli = parse(&["debug", "diff", "old.json", "new.json", "--format", "json"]);
+        let Commands::Debug {
+            command:
+                DebugCommand::Diff {
+                    left,
+                    right,
+                    format,
+                },
+        } = cli.command
+        else {
+            panic!("expected debug diff");
+        };
+        assert_eq!(left, PathBuf::from("old.json"));
+        assert_eq!(right, PathBuf::from("new.json"));
+        assert_eq!(format, DebugFormat::Json);
+    }
+
+    #[test]
+    fn debug_diff_requires_two_paths() {
+        assert!(try_parse(&["debug", "diff", "only-one.json"]).is_err());
     }
 }

@@ -28,6 +28,10 @@ against the current codebase and exits non-zero on any regression, blocking the 
 > recorded frontier, which strict replay would report as a divergence. The two
 > gates are complements — pin curated completed histories here, and sample live
 > in-flight work there.
+>
+> When a gate says a history *does* diverge, step through it interactively with
+> `harvest debug` to find the exact command that changed — see
+> [`docs/replay-debugger.md`](replay-debugger.md).
 
 ---
 

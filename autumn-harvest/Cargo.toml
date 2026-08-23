@@ -22,6 +22,11 @@ db = [
     "dep:tokio-postgres",
 ]
 testing = []
+# Time-travel replay debugger (issue #949): a stepping/diff API over the existing
+# replay machinery. Read-only by construction -- no new `WorkflowEvent` variant, no
+# migration, no engine-runtime change. Depends on `testing` for `HistorySnapshot`
+# and the `WorkflowReplayer` handler-registration surface.
+debugger = ["testing"]
 metrics-rs = ["dep:metrics"]
 # Enables `WorkflowInfo::with_schemas::<I, O, E>()` for automatic JSON Schema
 # generation from types that derive `schemars::JsonSchema` (issue #373).
@@ -184,6 +189,10 @@ required-features = ["testing"]
 
 [[example]]
 name = "entity_phase_transition"
+
+[[example]]
+name = "replay_debugger"
+required-features = ["debugger"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

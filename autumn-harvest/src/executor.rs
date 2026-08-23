@@ -843,7 +843,10 @@ pub async fn run_workflow(
 /// everything it touches: the ungated [`ReplayDeclarativeHandlers`] and
 /// [`ReplayPayloadLimits`] structs, and the ungated
 /// `WorkflowContext::register_declarative_{query,update}_handler` it calls.
-fn register_declarative_handlers(ctx: &WorkflowContext, handlers: ReplayDeclarativeHandlers<'_>) {
+pub(crate) fn register_declarative_handlers(
+    ctx: &WorkflowContext,
+    handlers: ReplayDeclarativeHandlers<'_>,
+) {
     let wf_name = ctx.workflow_type();
     for h in handlers.queries.iter().filter(|h| h.workflow == wf_name) {
         ctx.register_declarative_query_handler(h);

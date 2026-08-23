@@ -198,6 +198,13 @@ pub mod dag_profiler;
 pub mod dag_simulator;
 /// Debounced workflow starts — collapse trigger bursts into one run (issue #499).
 pub mod debounce;
+/// Time-travel replay debugger for recorded workflow histories (issue #949).
+///
+/// Read-only by construction: no new [`WorkflowEvent`](crate::event::WorkflowEvent)
+/// variant, no migration, no engine-runtime change. Gated behind the `debugger`
+/// feature (which enables `testing`).
+#[cfg(feature = "debugger")]
+pub mod debugger;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
 pub mod det_check;
 pub mod diagnostic;

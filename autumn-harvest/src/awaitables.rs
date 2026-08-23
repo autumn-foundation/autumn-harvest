@@ -523,7 +523,7 @@ fn close_race_arm_for(index: &mut HistoryIndex, parse: fn(&str) -> Option<&str>,
 
 /// Parses the signal name out of a reserved signal-or-deadline race timer id
 /// (`__signal_timeout:{seq}:{signal_name}`, issue #476).
-fn reserved_signal_race_name(timer_id: &str) -> Option<&str> {
+pub(crate) fn reserved_signal_race_name(timer_id: &str) -> Option<&str> {
     timer_id
         .strip_prefix(SIGNAL_TIMEOUT_TIMER_PREFIX)?
         .split_once(':')
@@ -532,7 +532,7 @@ fn reserved_signal_race_name(timer_id: &str) -> Option<&str> {
 
 /// Parses the child workflow name out of a reserved child-or-deadline race
 /// timer id (`__child_timeout:{seq}:{workflow_name}`, issue #779).
-fn reserved_child_race_name(timer_id: &str) -> Option<&str> {
+pub(crate) fn reserved_child_race_name(timer_id: &str) -> Option<&str> {
     timer_id
         .strip_prefix(crate::context::CHILD_TIMEOUT_TIMER_PREFIX)?
         .split_once(':')

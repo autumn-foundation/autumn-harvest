@@ -687,6 +687,7 @@ you are about to promote*.
 | `replay-verify` (#251), [`docs/replay-verify.md`](replay-verify.md) | A curated fixture directory of **completed** histories, strictly | "Does this change break the histories we chose to pin?" |
 | Replay canary (#512) | Live in-flight executions, server-side, post-deploy | "Is the build that is *already running* diverging?" |
 | `GET /workflows/{id}/replay-diagnosis` (#614) | **One** named execution | "Why is *this* run nd-blocked?" |
+| `harvest debug` (#949), [`docs/replay-debugger.md`](replay-debugger.md) | One history, interactively, step by step | "**Where exactly** did it diverge, and why?" |
 | Schema contract gate (#794), [`docs/workflow-schema-contract-guide.md`](workflow-schema-contract-guide.md) | Nothing — static payload/serde diff | "Did a payload type change shape incompatibly?" |
 
 They are complements, not substitutes. `replay-verify` uses **strict** replay
