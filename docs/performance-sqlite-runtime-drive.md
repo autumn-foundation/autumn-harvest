@@ -7,17 +7,22 @@ profiled a realistic end-to-end workflow drive, and traced the dominant cost
 to a specific, source-confirmed mechanism: **every decision cycle reloads and
 re-deserializes the entire event history from scratch**, with no warm-cache
 or delta-load path — a gap the Postgres backend already closed (issue #235).
-The mechanism accounts for **81.6% of allocation bytes** and a clear,
-super-linear (trending toward quadratic) instruction-count scaling curve on
-this workload. No candidate local fix (avoiding one intermediate `String`
-allocation; caching a small `SELECT MAX(seq)` point query) clears this
-agent's autonomous floor (≥5% instruction reduction / ≥10% allocation
-reduction). The fix that would actually address the dominant cost — an
-in-process warm cache with delta-append, mirroring the Postgres backend's
-shipped `cache.rs` / `store::load_history_since` (issue #235) — is an
-architectural change to `SqliteRuntime`'s internal state and public
-construction shape, and is reported here for a human decision rather than
-implemented unilaterally.
+The mechanism (reload + reparse + the subsequent by-value clone) accounts
+for **81.6% of allocation bytes** and a clear, super-linear (trending toward
+quadratic) instruction-count scaling curve on this workload — but only
+**~53%** of that (the reload + reparse itself) is addressable by a fix; the
+remaining ~29% is a related, architecturally separate clone cost that the
+same fix does not eliminate (see "Allocation-site attribution" and
+"Recommendation" below for the precise split). No candidate local fix
+(avoiding one intermediate `String` allocation; caching a small
+`SELECT MAX(seq)` point query) clears this agent's autonomous floor (≥5%
+instruction reduction / ≥10% allocation reduction). The fix that would
+address the reload/reparse share — an in-process warm cache with
+delta-append, mirroring the Postgres backend's shipped `cache.rs` /
+`store::load_history_since` (issue #235) — is an architectural change to
+`SqliteRuntime`'s internal state and public construction shape, and is
+reported here for a human decision rather than implemented unilaterally; it
+would shrink the per-cycle constant but not the `O(n²)` complexity class.
 
 Wall-clock timing is not admissible evidence on this (shared-vCPU) machine —
 every number below is a deterministic instruction count
@@ -138,14 +143,29 @@ output) for a small set of mutually-exclusive frame markers:
 | other `autumn_harvest_sqlite` glue (statement-cache bookkeeping etc.) | 1,628,807 | 3.39% | 13,555 |
 | other/uncategorized | 13,070 | 0.03% | 28 |
 
-Four categories — `history.clone()`, `load_history`'s Vec growth, the
-`serde_json` reparse itself, and sqlite3 internals executing the reload
-query — sum to **81.6%** of all allocation bytes in this workload. These are
-all directly caused by the single design choice traced below. The fifth
-category, `sequential_workflow`'s own re-execution, is a **separate, inherent
-cost of the deterministic-replay execution model itself** (present in the
-Postgres backend too — see "What isn't the finding" below), not part of this
-finding's recommendation.
+Four categories sum to **81.6%** of all allocation bytes in this workload,
+but they split into two *architecturally distinct* costs, not one:
+
+- **The reload + reparse itself** — `load_history`'s Vec growth (22.37%) +
+  `serde_json` deserialize (18.04%) + sqlite3 internals executing the reload
+  query (12.48%) = **52.89%**. This is directly caused by, and fully
+  addressable by fixing, the single design choice traced below (every
+  decision cycle re-reads and re-deserializes the full history from
+  scratch).
+- **The `history.clone()`** (28.72%) — a *related but separate* cost. It is
+  triggered today by the reload producing a fresh `Vec` that must then be
+  cloned for the by-value executor call, but the clone itself would still
+  happen against a *cached* history too: `drive_one_cycle` needs the
+  original `history` value again after the executor call regardless of
+  where that `Vec` came from (see the "Recommendation" section below for why
+  this specific 28.72% is **not** eliminated by the proposed cache).
+
+So while today's implementation makes both costs scale together (81.6%
+combined), only the 52.89% reload/reparse share is what the recommended
+fix below addresses. The fifth category, `sequential_workflow`'s own
+re-execution, is a **separate, inherent cost of the deterministic-replay
+execution model itself** (present in the Postgres backend too — see "What
+isn't the finding" below), not part of this finding's recommendation.
 
 ## Hypothesis (source-confirmed, not inferred from the number alone)
 
