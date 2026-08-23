@@ -321,10 +321,14 @@ Notably, the SQLite backend's single-writer, single-process design removes
 one entire failure mode Postgres's cache has to reason about: Postgres's
 cache can miss on a genuine cross-worker handoff (sticky routing can route
 a follow-up task to a different worker with a cold cache), but
-`SqliteRuntime` is one process driving one file — every decision cycle for a
-given execution is, by construction, driven by the *same* runtime instance
-that drove the previous one, so **staleness** can never be the cause of a
-miss here, unlike Postgres.
+`SqliteRuntime` is one process driving one file — absent a restart (see
+below), every decision cycle for a given execution is, by construction,
+driven by the *same* runtime instance that drove the previous one, so
+**staleness** — a cache entry that is present but out of date relative to a
+fresher copy held elsewhere — can never be the cause of a miss here, unlike
+Postgres. A restart instead produces a *cold* miss (no cache entry at all,
+in a brand-new instance) — a structurally different failure mode, covered
+next.
 
 This does **not** imply a 100% hit rate is free, though — the Postgres cache
 being mirrored (`cache.rs::WorkflowCache`) is a **bounded, fixed-capacity
@@ -334,13 +338,27 @@ lunch. If `SqliteRuntime` interleaves more concurrently-blocked executions
 than a bounded cache's capacity (e.g. under `run_until_idle` driving several
 executions to completion in round-robin), the LRU can evict an execution's
 entry before its next decision cycle — a genuine cache miss, purely from
-capacity pressure, with no cross-worker staleness involved at all. So a
-100% hit rate requires *either* an unbounded cache (trading memory for hit
-rate — plausible for this crate's stated edge/local-first scope, where
-concurrent in-flight execution counts are typically small) *or* a capacity
-sized to the workload's actual concurrency — a capacity/eviction-policy
-decision this recommendation deliberately leaves open, alongside the rest of
-this architectural change, for a maintainer to specify.
+capacity pressure, with no cross-worker staleness involved at all.
+
+A third condition is structurally distinct from capacity tuning entirely:
+the cache would live inside the `SqliteRuntime` process instance, and this
+backend explicitly supports — and demonstrates, in
+`examples/durability.rs:120-153` — dropping that instance mid-flight (a
+simulated crash/restart) and later reopening the *same* on-disk file to
+resume a workflow parked on a durable signal wait purely by replaying its
+committed history. Registrations and any in-process cache are process
+state, not durable state, so neither survives a restart; the first decision
+cycle after every reopen therefore runs against a fresh, empty cache and
+must cold-load the full history regardless of the cache's capacity or
+eviction policy — no capacity/eviction choice removes this. So a 100% hit
+rate requires *all of*: an unbounded cache (trading memory for hit rate —
+plausible for this crate's stated edge/local-first scope, where concurrent
+in-flight execution counts are typically small) *or* a capacity sized to
+the workload's actual concurrency, *and* no restart occurring between an
+execution's decision cycles — the capacity/eviction-policy choice (left
+open above) plus this additional, unavoidable per-restart cold-load cost
+for restart-heavy or intermittently-resumed workloads, both left for a
+maintainer to weigh alongside the rest of this architectural change.
 
 ## Why no local fix clears the floor
 
