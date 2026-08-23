@@ -272,10 +272,32 @@ decision cycle's commit rather than reloaded from scratch, plus a
 `store::load_history_since(conn, exec, since_seq)` query mirroring the
 Postgres backend's `load_history_since` (issue #235) for the (rare, only
 needed for consistency/defensive re-verification) case where a delta reload
-is still wanted. This would turn the per-cycle history cost from `O(k)`
-(full history) into `O(1)` amortized (just the new events since the last
-cycle), collapsing the `O(n²)` total-run cost this profile demonstrates down
-toward `O(n)`.
+is still wanted. This would turn the per-cycle **SQL query + row parse +
+`serde_json::from_str` deserialize** cost — `load_history`'s Vec growth
+(22.37%) + serde_json deserialize (18.04%) + sqlite3 internals (12.48%) =
+~53% of allocation bytes at n=80, and the corresponding instruction share —
+from `O(k)` (reloading and reparsing the full history every cycle) into
+`O(1)` amortized (only the new events since the last cycle touch SQL or
+`serde_json` at all).
+
+**This substantially shrinks the constant factor but does not change the
+`O(n²)` complexity class.** Two costs are `O(k)` per decision cycle
+regardless of caching, and neither is addressed by this recommendation:
+`drive_one_cycle` still `.clone()`s the *entire* accumulated
+`Vec<WorkflowEvent>` before handing it, by value, to the core executor
+(28.72% of allocation bytes at n=80 — a cache holding the full history
+in-process still has to clone it out for that by-value call); and the
+workflow function itself still replays every prior activity call from the
+top on every cycle (the 14.97% "what isn't the finding" cost above). Both
+are inherent to a from-the-top-replay execution model, independent of where
+the history data lives. So `Σ(k=1..n) O(k)` — the `O(n²)` total-run cost
+this profile demonstrates — remains `O(n²)` after this fix, just with a
+meaningfully smaller per-k constant (the ~53% SQL/parse share removed from
+each term). Eliminating the clone would need the core-crate signature change
+already ruled out above (shared with Postgres, an architectural ask of its
+own); eliminating the from-the-top replay would mean changing how workflow
+functions are invoked during replay, which is a property of the
+determinism engine itself, not a `SqliteRuntime` persistence detail.
 
 This is explicitly **not** implemented in this pass: it changes
 `SqliteRuntime`'s internal state shape (a new cache field/lifetime to
