@@ -4260,6 +4260,172 @@ fn shard_metric_label(shard: crate::types::ShardId) -> u16 {
     u16::try_from(raw).unwrap_or(0)
 }
 
+/// The `shard_assignments` slice a single per-shard monitor should scan
+/// (issue #961 review, Codex P1).
+///
+/// `spawn_monitoring_tasks` starts one timeout checker (and poison-pill
+/// reclaimer, session reconciler, ...) **per assigned shard**. Each pass of
+/// `enforce_timeouts_once` then calls cross-shard helpers —
+/// `fire_due_debounced_starts`, `fire_due_throttled_starts`,
+/// `fire_due_event_batches`, `fire_due_completion_deliveries`,
+/// `sweep_expired_start_idempotency`, and the three external outboxes — that
+/// each iterate the `shard_assignments` they are handed. Passing every checker
+/// the **full** list therefore made an N-shard worker perform N x N pool
+/// acquisitions and table scans every poll interval, and coupled the shards
+/// together: `fire_due_event_batches` propagates a pool-acquisition error with
+/// `?`, so one unreachable shard aborted the remainder of *every* healthy
+/// shard's pass (completion-callback delivery and the idempotency sweep run
+/// after it).
+///
+/// Narrowing each monitor to its own shard makes the union across the N
+/// monitors cover every shard exactly once — O(N) total, and a shard's failure
+/// is contained to its own checker, which is the correct blast radius since
+/// that checker already holds a connection from that same pool. It also
+/// removes the `FOR UPDATE SKIP LOCKED` contention of N checkers racing for
+/// the same rows.
+///
+/// The trade-off is that a wedged per-shard checker no longer has N-1 peers
+/// incidentally covering its shard. That exposure already existed for the
+/// checker's own-database work (`find_timed_out_tasks` has always scanned only
+/// the connection's own database), and issue #797 shipped per-shard
+/// `harvest.scanner.tick` liveness with a bounded `shard` label precisely to
+/// detect it.
+///
+/// `None` is the single-pool fallback (no sharded pool, or no assignments), where
+/// there is no per-shard fan-out to narrow: the full list is passed through and
+/// the helpers take their non-sharded branch, byte-for-byte unchanged.
+#[must_use]
+pub(crate) fn monitor_shard_scope(
+    monitor_shard: Option<crate::types::ShardId>,
+    all_assignments: &[crate::types::ShardId],
+) -> Vec<crate::types::ShardId> {
+    monitor_shard.map_or_else(|| all_assignments.to_vec(), |shard| vec![shard])
+}
+
+/// Floor for [`shard_acquire_bound`].
+///
+/// Generous on purpose. The bound's job is to convert an *indefinite* park into
+/// a skip, so it must be comfortably longer than any healthy acquisition — a
+/// bounded pool whose connections are all busy dispatching legitimately takes
+/// far longer than a poll interval to hand one over, and a bound that fires
+/// there would starve a merely-busy shard rather than protect its peers.
+const MIN_SHARD_ACQUIRE_BOUND: Duration = Duration::from_secs(5);
+
+/// The per-shard pool-acquisition bound (issue #961 review, Codex P1).
+///
+/// Harvest configures no deadpool `Timeouts`, so every `pool.get().await` is an
+/// **unbounded** wait. The multi-shard path visits its shards *sequentially* in
+/// two places, and in both a single exhausted or unreachable pool parks the one
+/// future and strands every peer shard:
+///
+/// * `run_multi_shard`'s startup loop (`register_in_fleet` +
+///   `register_rate_limit_buckets` per shard) - a shard that never yields a
+///   connection means the poll loop is never reached **at all**;
+/// * `run_poll_loop_multi`, which awaits each shard's `poll_once` in turn -
+///   round-robin rotation cannot help, because the loop never reaches the
+///   rotation.
+///
+/// Auto-resolution (this issue) makes that the *default* shape for any
+/// multi-shard pool, which is why it is bounded here.
+///
+/// Bounding converts the head-of-line block into "skip this shard for one
+/// iteration". Both call sites already have a graceful failure branch: a failed
+/// registration arms the per-shard pending flag the heartbeat task retries, and
+/// a failed poll simply returns `false` and rotates on. Under genuine
+/// saturation the shard is retried on the next pass rather than blocking its
+/// peers indefinitely.
+///
+/// The cost is amortized, not free: a shard whose pool stays unavailable is
+/// re-probed once per rotation, so the loop pays the bound each time round.
+/// That is degraded throughput for the remaining shards, never stranding — the
+/// property this fix is for. Skipping a known-bad shard for a cooldown, or
+/// polling shards concurrently, would remove even that cost and is a natural
+/// follow-up; it needs `poll_once` to distinguish "acquisition timed out" from
+/// "no work", which it deliberately does not today.
+///
+/// `false` - the single-shard path - returns `None`, which keeps the original
+/// unbounded `pool.get().await` byte-for-byte (AC7): with one shard there are
+/// no peers to starve, and blocking until a connection frees is the desired
+/// behaviour.
+#[must_use]
+pub(crate) const fn shard_acquire_bound(
+    multi_shard: bool,
+    poll_interval: Duration,
+) -> Option<Duration> {
+    if !multi_shard {
+        return None;
+    }
+    // Never below the floor: the bound exists to stop an *indefinite* block,
+    // not to police normal contention. A short `poll_interval` (tests use 50ms;
+    // a latency-sensitive deployment may too) is far below how long a perfectly
+    // healthy acquisition takes when a bounded pool is busy dispatching, so
+    // using it directly made the bound fire constantly and starve a shard that
+    // merely had a deep backlog.
+    if poll_interval.as_nanos() > MIN_SHARD_ACQUIRE_BOUND.as_nanos() {
+        Some(poll_interval)
+    } else {
+        Some(MIN_SHARD_ACQUIRE_BOUND)
+    }
+}
+
+/// A pooled connection, optionally acquired under a bound.
+///
+/// The single source of truth for [`shard_acquire_bound`]'s two behaviours, so
+/// the multi-shard startup path and the poll loop cannot drift on whether the
+/// wait is capped. `None` is a plain `pool.get().await` — byte-for-byte the
+/// pre-#961 single-shard code path.
+///
+/// Both outcomes collapse to `Err(String)` so each caller's existing
+/// pool-failure branch handles a timeout identically to a pool error: the
+/// shard is skipped, its graceful recovery (pending-flag retry, or the next
+/// poll iteration) takes over, and no peer shard is affected.
+async fn acquire_shard_conn(
+    pool: &DbPool,
+    acquire_bound: Option<Duration>,
+) -> Result<
+    deadpool::managed::Object<
+        diesel_async::pooled_connection::AsyncDieselConnectionManager<
+            diesel_async::AsyncPgConnection,
+        >,
+    >,
+    String,
+> {
+    match acquire_bound {
+        Some(bound) => match tokio::time::timeout(bound, pool.get()).await {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(_elapsed) => Err(format!(
+                "pool acquisition exceeded {bound:?}; skipping this shard for one iteration"
+            )),
+        },
+        None => pool.get().await.map_err(|e| e.to_string()),
+    }
+}
+
+/// Whether the single-pool `run_with_listener` entrypoint must refuse to start
+/// (issue #961 review, Codex P1).
+///
+/// `run_with_listener` registers, heartbeats and polls exactly the one `pool`
+/// it is handed, and attributes every dispatch to `shard_assignments[0]`. That
+/// was consistent while the default assignment was a literal `[ShardId::new(0)]`,
+/// but auto-resolution (this issue) widens an otherwise-unconfigured worker to
+/// **every pool shard** — so a direct embedder calling this public entrypoint
+/// with a multi-shard pool would register a fleet row advertising N shards
+/// while draining exactly one.
+///
+/// That is worse than merely losing throughput: a worker falsely advertising
+/// coverage is precisely what suppresses the stranded-shard signals this issue
+/// shipped (`harvest.shard.stranded_pending`, shard health's `no_live_worker`
+/// readiness gate), so the undrained shards would be invisible as well as idle.
+///
+/// Refusing to start mirrors the fail-closed posture `run()` already takes for
+/// `missing_assigned_shard_pools`: better a loud non-start than silent partial
+/// coverage. Callers that genuinely want multi-shard use `Worker::run`, which
+/// routes to `run_multi_shard` with a per-shard listener each.
+#[must_use]
+pub(crate) const fn single_pool_entrypoint_rejects(resolved_assignments: usize) -> bool {
+    resolved_assignments > 1
+}
+
 /// Whether a shard's poll loop may claim tasks, given that shard's pending
 /// fleet-registration state (issue #804, Codex round-54 P1).
 ///
@@ -19839,13 +20005,22 @@ impl Worker {
         // and that shard's slot in the poll loop: the heartbeat retries and
         // eventually clears it, and the poll loop must observe the clearing to
         // resume claiming on that shard. See `may_claim_tasks`.
+        //
+        // Every per-shard acquisition here is bounded (issue #961 review,
+        // Codex P1): this loop is sequential, so an unreachable or exhausted
+        // pool on ONE shard would otherwise park it forever and the poll loop
+        // below would never start at all — stranding every healthy shard. A
+        // bounded failure instead arms that shard's pending flag, which its own
+        // heartbeat task retries. See `shard_acquire_bound`.
+        let startup_bound = shard_acquire_bound(true, self.config.poll_interval);
         let mut registration_pending_per_shard: Vec<Arc<AtomicBool>> =
             Vec::with_capacity(shard_targets.len());
         for (_, shard_pool) in &shard_targets {
             registration_pending_per_shard.push(Arc::new(AtomicBool::new(
-                self.register_in_fleet(shard_pool).await,
+                self.register_in_fleet(shard_pool, startup_bound).await,
             )));
-            self.register_rate_limit_buckets(shard_pool).await;
+            self.register_rate_limit_buckets(shard_pool, startup_bound)
+                .await;
         }
 
         // Monitoring tasks use the default pool for non-shard-specific monitors;
@@ -19956,7 +20131,13 @@ impl Worker {
                 )) {
                     continue;
                 }
-                if self.poll_once(&shard_targets[idx].1).await {
+                if self
+                    .poll_once(
+                        &shard_targets[idx].1,
+                        shard_acquire_bound(true, self.config.poll_interval),
+                    )
+                    .await
+                {
                     any_claimed = true;
                     // Per-shard dispatch counter (issue #961, AC5). Emitted
                     // here rather than inside `poll_once`/`dispatch_task`
@@ -20127,6 +20308,33 @@ impl Worker {
             "worker starting"
         );
 
+        // Fail closed on a multi-shard config reaching this single-pool
+        // entrypoint (issue #961 review, Codex P1). This registers, heartbeats
+        // and polls exactly `pool`, and attributes every dispatch to
+        // `shard_assignments[0]` -- so with auto-resolved multi-shard
+        // assignments it would advertise fleet coverage for shards it never
+        // drains, which is what suppresses the very stranded-shard signals this
+        // issue shipped. `Worker::run` routes a genuine multi-shard config to
+        // `run_multi_shard`; its internal call reaches here only when
+        // `use_multi_shard` is false, so this guard fires solely for a direct
+        // embedder.
+        if single_pool_entrypoint_rejects(self.config.shard_assignments.len()) {
+            tracing::error!(
+                worker_id = %self.config.worker_id,
+                shard_assignments = ?self
+                    .config
+                    .shard_assignments
+                    .iter()
+                    .map(|s| s.as_i32())
+                    .collect::<Vec<_>>(),
+                "run_with_listener drains a single pool but this worker resolved multiple shard \
+                 assignments; refusing to start rather than advertising coverage for shards it \
+                 would never poll — call Worker::run for multi-shard, or pin this worker with \
+                 WorkerConfig::with_shard_assignments([one_shard])"
+            );
+            return;
+        }
+
         // Register this worker in the fleet table. The returned flag arms this
         // pool's heartbeat retry when the atomic pair did not commit.
         //
@@ -20134,10 +20342,11 @@ impl Worker {
         // its poll loop: the heartbeat is what retries and eventually clears it,
         // and the poll loop must observe that clearing to resume claiming. See
         // `may_claim_tasks` for why an unregistered worker must not claim.
-        let registration_pending = Arc::new(AtomicBool::new(self.register_in_fleet(pool).await));
+        let registration_pending =
+            Arc::new(AtomicBool::new(self.register_in_fleet(pool, None).await));
 
         // Auto-register rate limit buckets for the activities configured on this worker.
-        self.register_rate_limit_buckets(pool).await;
+        self.register_rate_limit_buckets(pool, None).await;
 
         let monitors = self.spawn_monitoring_tasks(pool, std::slice::from_ref(pool));
         let heartbeat_cancel = CancellationToken::new();
@@ -20344,9 +20553,14 @@ impl Worker {
         // timeouts, workflow-execution deadlines, SLA breaches, history
         // ceiling, broken worker sessions), so a single checker on the default
         // pool would leave expired tasks/executions on the other shards stuck
-        // RUNNING/PENDING forever. The cross-shard outbox helpers inside each
-        // pass still receive the full sharded_pool + shard_assignments so
-        // peer-shard delivery is unchanged.
+        // RUNNING/PENDING forever.
+        //
+        // Each checker is handed the full `sharded_pool` (needed to *route* a
+        // started follow-up to its target shard) but only **its own** shard in
+        // the assignment list: the cross-shard helpers inside each pass iterate
+        // that list, so passing the full list to all N checkers made the pass
+        // O(N^2) and let one unreachable shard abort every healthy shard's
+        // remaining work. See `monitor_shard_scope`.
         let timeout_checkers: Vec<_> = shard_pools_for_monitors
             .iter()
             .map(|(shard_pool, shard)| {
@@ -20357,7 +20571,7 @@ impl Worker {
                     self.registry.telemetry().clone(),
                     self.config.unknown_target_grace_window,
                     self.config.sharded_pool.clone(),
-                    self.config.shard_assignments.clone(),
+                    monitor_shard_scope(*shard, &self.config.shard_assignments),
                     self.registry.circuit_breakers(),
                     self.config.max_workflow_history_events,
                     worker_stale_secs,
@@ -20719,7 +20933,10 @@ impl Worker {
                 continue;
             }
 
-            if self.poll_once(pool).await {
+            if self
+                .poll_once(pool, shard_acquire_bound(false, self.config.poll_interval))
+                .await
+            {
                 // Per-shard dispatch counter (issue #961, AC5). Emitted on the
                 // single-shard path too, so `harvest.shard.dispatched` is a
                 // uniform series across deployment shapes whenever the worker
@@ -20926,7 +21143,7 @@ impl Worker {
     /// succeeded clear a flag a *different* shard still needs, leaving that
     /// shard advertising the old build forever. A returned value cannot be
     /// shared by construction.
-    async fn register_in_fleet(&self, pool: &DbPool) -> bool {
+    async fn register_in_fleet(&self, pool: &DbPool, acquire_bound: Option<Duration>) -> bool {
         let shard_ids: Vec<i32> = self
             .config
             .shard_assignments
@@ -20969,7 +21186,7 @@ impl Worker {
             labels: self.config.labels.clone(),
             max_concurrent_sessions: self.config.max_concurrent_sessions,
         };
-        match pool.get().await {
+        match acquire_shard_conn(pool, acquire_bound).await {
             Ok(mut conn) => {
                 match crate::workers::register_worker_and_clear_stale_miss_evidence(
                     &mut conn,
@@ -21025,8 +21242,8 @@ impl Worker {
     }
 
     /// Auto-upsert rate-limiting buckets for activities registered on this worker.
-    async fn register_rate_limit_buckets(&self, pool: &DbPool) {
-        match pool.get().await {
+    async fn register_rate_limit_buckets(&self, pool: &DbPool, acquire_bound: Option<Duration>) {
+        match acquire_shard_conn(pool, acquire_bound).await {
             Ok(mut conn) => {
                 for activity in self.registry.activities.values() {
                     // A dynamic rate_limit(key = ...) with no rps is an invalid
@@ -21156,9 +21373,15 @@ impl Worker {
     ///
     /// Gets a connection from the pool, tries to claim a task, dispatches it
     /// if found, or sleeps for `poll_interval` if the queue was empty.
+    ///
+    /// `acquire_bound` optionally caps the pool acquisition. It is `None` on
+    /// the single-shard path (byte-for-byte the original unbounded
+    /// `pool.get().await`) and `Some(poll_interval)` when one loop drains
+    /// several shards in sequence, so an exhausted pool on one shard cannot
+    /// park the loop and strand its peers -- see `shard_acquire_bound`.
     #[allow(clippy::too_many_lines)]
-    async fn poll_once(&self, pool: &DbPool) -> bool {
-        let mut conn = match pool.get().await {
+    async fn poll_once(&self, pool: &DbPool, acquire_bound: Option<Duration>) -> bool {
+        let mut conn = match acquire_shard_conn(pool, acquire_bound).await {
             Ok(conn) => conn,
             Err(e) => {
                 tracing::error!(error = %e, "failed to get connection from pool");
@@ -23979,7 +24202,7 @@ mod tests {
             .expect("pool builds without connecting");
 
         assert!(
-            worker.register_in_fleet(&pool).await,
+            worker.register_in_fleet(&pool, None).await,
             "an unattempted registration must still arm the retry -- otherwise a \
              surviving row under a reused worker_id advertises the old build forever"
         );
@@ -24107,6 +24330,129 @@ mod tests {
         );
     }
 
+    /// Each per-shard monitor scans only its own shard (issue #961 review,
+    /// Codex P1).
+    ///
+    /// `spawn_monitoring_tasks` starts one timeout checker per assigned shard,
+    /// and every pass fans out over the assignment list it was handed. Handing
+    /// all N checkers the full list made the pass O(N^2) and let one
+    /// unreachable shard abort every healthy shard's remaining work.
+    #[test]
+    fn monitor_shard_scope_narrows_a_per_shard_monitor_to_its_own_shard() {
+        let all = vec![
+            crate::types::ShardId::new(0),
+            crate::types::ShardId::new(1),
+            crate::types::ShardId::new(2),
+        ];
+
+        for shard in &all {
+            assert_eq!(
+                monitor_shard_scope(Some(*shard), &all),
+                vec![*shard],
+                "a per-shard monitor must scan only its own shard; the union across all \
+                 monitors still covers every shard exactly once",
+            );
+        }
+    }
+
+    /// The single-pool fallback has no per-shard fan-out to narrow, so the list
+    /// passes through untouched and the helpers take their non-sharded branch.
+    #[test]
+    fn monitor_shard_scope_passes_the_full_list_through_on_the_single_pool_fallback() {
+        let all = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
+        assert_eq!(monitor_shard_scope(None, &all), all);
+        assert!(monitor_shard_scope(None, &[]).is_empty());
+    }
+
+    /// The multi-shard loop bounds its pool acquisition; the single-shard path
+    /// stays unbounded, byte-for-byte (issue #961 review, Codex P1 / AC7).
+    #[test]
+    fn shard_acquire_bound_is_multi_shard_only() {
+        // Below the floor -> floored. A poll interval is tuned for idle polling
+        // cadence, not for how long a healthy acquisition takes on a busy pool;
+        // using it directly starved a shard that merely had a deep backlog.
+        assert_eq!(
+            shard_acquire_bound(true, Duration::from_millis(50)),
+            Some(MIN_SHARD_ACQUIRE_BOUND),
+            "a short poll interval must not tighten the bound below the floor",
+        );
+        assert_eq!(
+            shard_acquire_bound(true, Duration::from_millis(500)),
+            Some(MIN_SHARD_ACQUIRE_BOUND),
+        );
+
+        // Above the floor -> the operator's own (slower) cadence wins.
+        let slow = Duration::from_secs(60);
+        assert_eq!(
+            shard_acquire_bound(true, slow),
+            Some(slow),
+            "a slow loop should not be bounded tighter than its own cadence",
+        );
+
+        // AC7: the single-shard path keeps the original unbounded acquisition
+        // at every cadence.
+        for interval in [
+            Duration::from_millis(50),
+            Duration::from_millis(500),
+            Duration::from_secs(60),
+        ] {
+            assert_eq!(
+                shard_acquire_bound(false, interval),
+                None,
+                "the single-shard path must keep the original unbounded pool.get().await",
+            );
+        }
+    }
+
+    /// The single-pool entrypoint refuses a multi-shard config, and only that
+    /// (issue #961 review, Codex P1).
+    #[test]
+    fn single_pool_entrypoint_rejects_only_multi_shard_configs() {
+        // No shard identity at all, and a genuinely single-shard worker: both
+        // are exactly what this entrypoint is for.
+        assert!(!single_pool_entrypoint_rejects(0));
+        assert!(!single_pool_entrypoint_rejects(1));
+        // Two or more resolved shards cannot be drained from one pool.
+        assert!(single_pool_entrypoint_rejects(2));
+        assert!(single_pool_entrypoint_rejects(8));
+    }
+
+    /// `run_with_listener` returns immediately for a multi-shard config rather
+    /// than entering its single-pool loop (issue #961 review, Codex P1).
+    ///
+    /// Falsifiable without a database: with the guard the call returns before
+    /// touching the pool at all, so it completes promptly. Without it, the
+    /// worker registers against the one pool and enters `run_poll_loop`, which
+    /// runs until shutdown — so the bounded wait below elapses instead.
+    #[tokio::test]
+    async fn run_with_listener_refuses_a_multi_shard_config() {
+        let unreachable = |url: &str| -> DbPool {
+            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+                diesel_async::AsyncPgConnection,
+            >::new(url);
+            deadpool::managed::Pool::builder(manager)
+                .max_size(1)
+                .build()
+                .expect("pool builds without connecting")
+        };
+
+        let mut cfg = default_runtime_config();
+        cfg.shard_assignments = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+        let pool = unreachable("postgres://127.0.0.1:1/s0");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            worker.run_with_listener(&pool, None),
+        )
+        .await
+        .expect(
+            "run_with_listener must refuse a multi-shard config and return, not enter its \
+             single-pool loop advertising coverage it never drains",
+        );
+    }
+
     /// The pending flag is per pool, not per worker (issue #804, Codex
     /// round-50 P1).
     ///
@@ -24137,8 +24483,8 @@ mod tests {
 
         // Both fail here, which is enough to prove the shape: each call
         // produces its own answer, so no shard can clear another's retry.
-        let pending_a = worker.register_in_fleet(&a).await;
-        let pending_b = worker.register_in_fleet(&b).await;
+        let pending_a = worker.register_in_fleet(&a, None).await;
+        let pending_b = worker.register_in_fleet(&b, None).await;
         assert!(
             pending_a && pending_b,
             "each shard pool must be answered independently; a shared flag would \

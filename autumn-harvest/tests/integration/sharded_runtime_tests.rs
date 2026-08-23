@@ -156,6 +156,31 @@ fn build_sharded_pool(urls: &BTreeMap<ShardId, String>) -> ShardedDbPool {
     ShardedDbPool::from_map(pools, ShardId::new(0))
 }
 
+/// Like [`build_sharded_pool`], but `saturated` gets a one-connection pool so a
+/// test can hold its only connection and make every further acquisition on that
+/// shard block (issue #961 review, Codex P1).
+fn build_sharded_pool_with_saturable_shard(
+    urls: &BTreeMap<ShardId, String>,
+    saturated: ShardId,
+) -> ShardedDbPool {
+    let pools: BTreeMap<ShardId, DbPool> = urls
+        .iter()
+        .map(|(shard, url)| {
+            if *shard == saturated {
+                let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.as_str());
+                let pool = deadpool::managed::Pool::builder(manager)
+                    .max_size(1)
+                    .build()
+                    .expect("failed to build saturable test pool");
+                (*shard, pool)
+            } else {
+                (*shard, build_pool(url))
+            }
+        })
+        .collect();
+    ShardedDbPool::from_map(pools, ShardId::new(0))
+}
+
 fn router_for(shards: &[i32]) -> ShardRouter {
     let ids: Vec<ShardId> = shards.iter().map(|s| ShardId::new(*s)).collect();
     ShardRouter::new(ids.clone(), ids, ShardId::new(0))
@@ -428,6 +453,91 @@ async fn auto_shard_assignments_drain_every_writable_shard() {
         assert!(
             metrics.dispatched_for(shard) > 0,
             "harvest.shard.dispatched must be emitted for shard {shard}",
+        );
+    }
+}
+
+/// **AC1 / AC5 (Codex P1).** One shard whose pool is exhausted must not strand
+/// every other shard's work.
+///
+/// `poll_once` opens with `pool.get().await`, and harvest configures no
+/// deadpool `Timeouts`, so that wait is unbounded. `run_poll_loop_multi` awaits
+/// each shard's `poll_once` in sequence, so before the fix a single saturated
+/// pool parked the one polling future and no peer shard was ever reached —
+/// round-robin rotation cannot help because the loop never gets back to the
+/// rotation. Auto-resolution makes this the *default* shape for any
+/// multi-shard pool, which is why it is fixed here.
+///
+/// The test holds shard 0's only connection for the whole run and asserts that
+/// shards 1 and 2 still complete. Reverting `poll_acquire_bound` to always
+/// return `None` makes this time out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saturated_shard_pool_does_not_strand_its_peers() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let saturated = ShardId::new(0);
+    let sharded = build_sharded_pool_with_saturable_shard(&urls, saturated);
+    let metrics = Arc::new(ShardMetrics::default());
+
+    // Seed work on the two healthy shards *before* saturating shard 0, so the
+    // rows are already claimable when the poll loop starts.
+    let mut execs = Vec::new();
+    for shard in [1, 2] {
+        let shard_id = ShardId::new(shard);
+        let exec_id = ExecutionId::new_for_shard(shard_id);
+        let pool = sharded.exact_pool_for(shard_id).expect("shard pool");
+        let mut conn = pool.get().await.expect("shard conn");
+        start_or_load_workflow_execution(
+            &mut conn,
+            start_params(exec_id, "shard_probe", &format!("saturate-peer-{shard}")),
+            None,
+        )
+        .await
+        .expect("start workflow on healthy shard");
+        execs.push((shard, exec_id));
+    }
+
+    // Take shard 0's ONLY connection and keep it for the duration. Every
+    // `poll_once` against shard 0 now blocks on acquisition.
+    let saturating_conn = sharded
+        .exact_pool_for(saturated)
+        .expect("shard 0 pool")
+        .get()
+        .await
+        .expect("hold shard 0's only connection");
+
+    let worker = build_worker(&sharded, Vec::new(), Arc::clone(&metrics), "w-saturated");
+    assert_eq!(
+        worker.config.shard_assignments.len(),
+        SHARDS.len(),
+        "auto-resolution should have widened this worker to every pool shard",
+    );
+
+    let default_pool = sharded
+        .exact_pool_for(ShardId::new(1))
+        .expect("shard 1 pool")
+        .clone();
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move {
+        runner.run(&default_pool).await;
+    });
+
+    for (shard, exec_id) in &execs {
+        let url = &urls[&ShardId::new(*shard)];
+        assert!(
+            wait_for_state(url, *exec_id, "COMPLETED", Duration::from_secs(120)).await,
+            "shard {shard} was never drained while shard 0's pool was exhausted — one \
+             saturated pool must cost that shard an iteration, not park the whole loop",
+        );
+    }
+
+    drop(saturating_conn);
+    worker.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+
+    for shard in [1, 2] {
+        assert!(
+            metrics.dispatched_for(shard) > 0,
+            "shard {shard} must still report dispatches while a peer pool is saturated",
         );
     }
 }
