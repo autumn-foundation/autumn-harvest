@@ -1154,6 +1154,23 @@ fn scheduled_fire_encodes_shard(wf_name: &str, is_dag: bool) -> bool {
     is_dag || crate::canary::is_canary_workflow(wf_name)
 }
 
+/// Mint the `ExecutionId` for one scheduled fire on `current_shard`.
+///
+/// The **single** decision point for whether a fire's execution id encodes its
+/// home shard (issue #961, AC4). Both the main dispatch loop and the
+/// buffered-overlap drain (`drain_buffered_schedule_runs`) call this, so the two
+/// cannot drift — they previously did: the drain gated on
+/// `schedule.dag_name.is_some()` alone, so a **canary** schedule (a non-DAG
+/// whose fire must land ON the shard it probes) drained a buffered slot onto the
+/// *default* shard, silently un-pinning the shard-coverage signal.
+fn scheduled_fire_exec_id(wf_name: &str, is_dag: bool, current_shard: ShardId) -> ExecutionId {
+    if scheduled_fire_encodes_shard(wf_name, is_dag) {
+        ExecutionId::new_for_shard(current_shard)
+    } else {
+        ExecutionId::new()
+    }
+}
+
 /// Run one scheduler tick: dispatch due workflow-schedule runs.
 ///
 /// The `_dags` parameter is retained for API compatibility; since
@@ -4408,11 +4425,7 @@ async fn tick_one_workflow_schedule(
             break;
         }
         let workflow_id = scheduled_workflow_id(schedule.id, wf_name, *original_slot);
-        let exec_id = if scheduled_fire_encodes_shard(wf_name, schedule.dag_name.is_some()) {
-            ExecutionId::new_for_shard(current_shard)
-        } else {
-            ExecutionId::new()
-        };
+        let exec_id = scheduled_fire_exec_id(wf_name, schedule.dag_name.is_some(), current_shard);
         let input = schedule
             .workflow_input
             .clone()
@@ -6038,11 +6051,8 @@ async fn drain_buffered_schedule_runs(
 
             buffered.remove(0);
             let workflow_id = scheduled_workflow_id(schedule.id, wf_name, scheduled_for);
-            let exec_id = if schedule.dag_name.is_some() {
-                ExecutionId::new_for_shard(current_shard)
-            } else {
-                ExecutionId::new()
-            };
+            let exec_id =
+                scheduled_fire_exec_id(wf_name, schedule.dag_name.is_some(), current_shard);
             let input = schedule
                 .workflow_input
                 .clone()
@@ -8295,6 +8305,105 @@ mod tests {
             false
         ));
         assert!(!scheduled_fire_encodes_shard("nightly_report", false));
+    }
+
+    /// **AC4 anti-drift guard (issue #961).** Both scheduled-fire paths must
+    /// mint their `ExecutionId` through the shared [`scheduled_fire_exec_id`]
+    /// decision. A pure-function test on that helper cannot catch a *call site*
+    /// regressing to an inline `ExecutionId::new*` — which is exactly how the
+    /// two drifted before — so this reads the two function bodies and asserts
+    /// the shared call is the only way either mints an id.
+    ///
+    /// Source-level guard in the same house style as the dashboard/alert doc
+    /// gates, which likewise parse repository files at test time.
+    #[test]
+    fn both_scheduled_fire_paths_mint_ids_through_the_shared_decision() {
+        fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("`{signature}` must exist in scheduler.rs"));
+            let rest = &source[start..];
+            let end = rest
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("`{signature}` must have a closing brace"));
+            &rest[..end]
+        }
+
+        fn check(source: &str) {
+            // Normalize line endings first: a Windows checkout
+            // (`core.autocrlf`) hands this file over with `\r\n`, so the bare
+            // `\n}\n` brace probe finds nothing and the guard panics. Same
+            // convention as `sqlite_feasibility_docs.rs`.
+            let normalized = source.replace('\r', "");
+            let source = normalized.as_str();
+
+            for signature in [
+                "async fn tick_one_workflow_schedule(",
+                "async fn drain_buffered_schedule_runs(",
+            ] {
+                let body = body_of(source, signature);
+                assert!(
+                    body.contains("scheduled_fire_exec_id("),
+                    "`{signature}` must mint its fire's ExecutionId through the \
+                     shared scheduled_fire_exec_id decision (issue #961 AC4)",
+                );
+                assert!(
+                    !body.contains("ExecutionId::new"),
+                    "`{signature}` mints an ExecutionId inline — the two fire \
+                     paths must share scheduled_fire_exec_id or they drift, \
+                     silently un-pinning a canary/DAG fire from its home shard \
+                     (issue #961 AC4)",
+                );
+            }
+        }
+
+        let raw = include_str!("scheduler.rs");
+        check(raw);
+
+        // Run the identical guard over a CRLF copy of the same source. This is
+        // what a Windows checkout hands `include_str!`, so dropping the
+        // normalization above fails here on *every* platform instead of only on
+        // the Windows CI leg — which is exactly how this guard first broke.
+        check(&raw.replace("\r\n", "\n").replace('\n', "\r\n"));
+    }
+
+    /// AC4 (issue #961): the buffered-overlap drain and the main dispatch path
+    /// must mint the fire's `ExecutionId` through **one** shared decision, or
+    /// they drift.
+    ///
+    /// They had: `drain_buffered_schedule_runs` gated on
+    /// `schedule.dag_name.is_some()` while the main path used
+    /// [`scheduled_fire_encodes_shard`], so a **canary** schedule (a non-DAG
+    /// whose fire must land ON its own shard so a write-blocked shard surfaces
+    /// as a failing probe) would drain a buffered slot onto the *default* shard
+    /// instead — silently un-pinning the very signal the shard-coverage check
+    /// relies on.
+    ///
+    /// That drift is not reachable *today*: the built-in canary is registered
+    /// with `OverlapPolicy::Skip`, and the drain only visits rows with a
+    /// non-empty `buffered_runs`, which `Skip` never produces. It becomes live
+    /// the moment an operator `PATCH`es the canary schedule's overlap policy
+    /// (issue #771), so the two sites now share [`scheduled_fire_exec_id`] and
+    /// cannot diverge. For DAG and ordinary schedules the change is a strict
+    /// no-op.
+    #[test]
+    fn scheduled_fire_exec_id_encodes_shard_for_dag_and_canary() {
+        let shard = crate::types::ShardId::new(2);
+        assert_eq!(
+            scheduled_fire_exec_id("any_dag", true, shard).shard(),
+            shard,
+            "a DAG fire must land on its home shard",
+        );
+        assert_eq!(
+            scheduled_fire_exec_id("__harvest_canary_probe__default", false, shard).shard(),
+            shard,
+            "a canary fire must land on the shard it probes, DAG or not",
+        );
+        assert_eq!(
+            scheduled_fire_exec_id("nightly_report", false, shard).shard(),
+            crate::types::ShardId::UNENCODED,
+            "an ordinary schedule keeps the pre-#796 UNENCODED (default-shard) id",
+        );
     }
 
     // ── Schedule-registration reconciler (issue #1157) ──────────────────────

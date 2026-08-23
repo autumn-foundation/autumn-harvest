@@ -82,8 +82,11 @@ pub fn age_secs(observed_at: DateTime<Utc>, started_at: DateTime<Utc>) -> i64 {
 /// Whether `worker`'s registered `shard_assignments` cover `shard_id`.
 ///
 /// An **empty** `shard_assignments` array is a special case, not "assigned to
-/// nothing": `WorkerConfig::shard_assignments` defaults to `[ShardId::new(0)]`,
-/// but a worker started via the raw `Worker::run` legacy single-shard path
+/// nothing". Since issue #961 an empty `WorkerConfig::shard_assignments` is the
+/// *auto* sentinel, resolved by `Worker::new` to every shard in the process's
+/// pool (or `[ShardId::new(0)]` when there is none) -- so a `Worker::new`-built
+/// worker never registers an empty array. Pre-#961 rows can still carry one,
+/// and a worker started via the raw `Worker::run` legacy single-shard path
 /// with no explicit assignment still registers with a literal `[]` -- even
 /// though its poll loop (`claim_pool = match shard_targets.as_slice() { [] =>
 /// pool }` in `autumn-harvest/src/worker.rs`) falls back to the caller's
@@ -112,19 +115,11 @@ pub fn age_secs(observed_at: DateTime<Utc>, started_at: DateTime<Utc>) -> i64 {
 /// two shard-membership predicates cannot drift again.
 #[must_use]
 pub fn worker_covers_shard(worker: &WorkerRow, shard_id: i32) -> bool {
-    worker
-        .worker
-        .shard_assignments
-        .as_array()
-        .is_some_and(|shards| {
-            if shards.is_empty() {
-                true
-            } else {
-                shards
-                    .iter()
-                    .any(|value| value.as_i64() == Some(i64::from(shard_id)))
-            }
-        })
+    // Delegates to the canonical core predicate (issue #1150 / #961). It lives
+    // in `autumn_harvest::workers` because core has consumers of its own --
+    // `apply_worker_filters` -- that cannot reach into this crate, and every
+    // independent re-implementation of this rule has so far drifted.
+    autumn_harvest::workers::shard_assignments_cover(&worker.worker.shard_assignments, shard_id)
 }
 
 /// Cross-shard completeness of a fanned-out read.

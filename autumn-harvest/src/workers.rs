@@ -507,6 +507,41 @@ async fn transition_active_to_draining(
     Ok(())
 }
 
+/// Does a worker advertising `assignments` cover `shard_id`?
+///
+/// **The canonical shard-membership predicate for the whole workspace.** It
+/// lives in core (rather than beside its first plugin caller) because
+/// `autumn-harvest` itself has consumers — `apply_worker_filters` below — that
+/// cannot reach into `autumn-harvest-plugin`, and every independent
+/// re-implementation of this rule has so far drifted.
+///
+/// The rule: an **empty** assignment array means *"covers whatever shard the
+/// row was read from"*, not *"covers nothing"*. A worker registers an empty
+/// array in two situations that are both legitimate coverage:
+///
+/// * it is a legacy row written before per-shard assignments existed, and
+/// * since issue #961 it is a worker with **no sharded pool** — there is no
+///   shard identity to advertise, so the empty list is preserved rather than
+///   fabricating a `0` the process never established.
+///
+/// Hardcoding `shard_id == 0` instead would falsely report such a worker
+/// uncovered on a non-zero-numbered single shard, since [`ShardRouter`] accepts
+/// an arbitrary default shard.
+///
+/// A non-array value (malformed row) covers nothing — it is not a legacy shape,
+/// it is corrupt.
+///
+/// [`ShardRouter`]: crate::shard::ShardRouter
+#[must_use]
+pub fn shard_assignments_cover(assignments: &serde_json::Value, shard_id: i32) -> bool {
+    assignments.as_array().is_some_and(|shards| {
+        shards.is_empty()
+            || shards
+                .iter()
+                .any(|value| value.as_i64() == Some(i64::from(shard_id)))
+    })
+}
+
 /// Apply queue, shard, health, and limit filters to an already-loaded worker list.
 ///
 /// The limit is intentionally applied **after** the in-process `retain` passes so
@@ -522,12 +557,11 @@ fn apply_worker_filters(mut results: Vec<WorkerRow>, filters: &WorkerFilters) ->
         });
     }
     if let Some(shard_val) = filters.shard_id {
-        results.retain(|r| {
-            r.worker
-                .shard_assignments
-                .as_array()
-                .is_some_and(|arr| arr.iter().any(|v| v.as_i64() == Some(i64::from(shard_val))))
-        });
+        // Issue #1150 / #961: route through the canonical predicate so a worker
+        // advertising the empty (auto / legacy) assignment shape is not dropped
+        // from `GET /workers?shard_id=N` while shard health, queue coverage and
+        // preflight all report it as covering that shard.
+        results.retain(|r| shard_assignments_cover(&r.worker.shard_assignments, shard_val));
     }
     if let Some(health_filter) = filters.health {
         results.retain(|r| r.health == health_filter);
@@ -2027,6 +2061,70 @@ mod tests {
         filters.queue = Some("email-workers".to_string());
         let result = apply_worker_filters(rows, &filters);
         assert!(result.is_empty());
+    }
+
+    fn make_shard_row(worker_id: &str, shards: serde_json::Value) -> WorkerRow {
+        let mut row = make_queue_row(worker_id, "default");
+        row.worker.shard_assignments = shards;
+        row
+    }
+
+    #[test]
+    fn shard_assignments_cover_treats_empty_as_covering_any_shard() {
+        // Issue #1150 / #961: an empty array is the auto (no sharded pool) and
+        // legacy shape, meaning "covers whatever shard the row was read from".
+        // Hardcoding 0 would be wrong -- ShardRouter accepts an arbitrary
+        // default shard, so a single-shard deployment may be numbered 7.
+        assert!(shard_assignments_cover(&serde_json::json!([]), 0));
+        assert!(shard_assignments_cover(&serde_json::json!([]), 7));
+    }
+
+    #[test]
+    fn shard_assignments_cover_still_requires_membership_when_narrowed() {
+        assert!(shard_assignments_cover(&serde_json::json!([1, 2]), 2));
+        assert!(!shard_assignments_cover(&serde_json::json!([1, 2]), 3));
+    }
+
+    #[test]
+    fn shard_assignments_cover_rejects_a_malformed_non_array_value() {
+        // A non-array is corrupt, not a legacy shape, so it covers nothing.
+        assert!(!shard_assignments_cover(&serde_json::json!("0"), 0));
+        assert!(!shard_assignments_cover(&serde_json::Value::Null, 0));
+    }
+
+    #[test]
+    fn apply_filters_shard_keeps_a_worker_on_the_empty_auto_assignment() {
+        // Issue #961 (Codex round 3): a default worker built without a
+        // ShardedDbPool registers `shard_assignments: []`. Shard health, queue
+        // coverage and preflight all report it as covering the shard it polls,
+        // so `GET /workers?shard_id=N` must not silently omit it.
+        let rows = vec![
+            make_shard_row("auto", serde_json::json!([])),
+            make_shard_row("narrowed", serde_json::json!([1])),
+        ];
+        let mut filters = WorkerFilters::new();
+        filters.shard_id = Some(0);
+        let result = apply_worker_filters(rows, &filters);
+        let ids: Vec<&str> = result.iter().map(|r| r.worker.worker_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["auto"],
+            "the auto-assignment worker must survive the shard filter and the \
+             explicitly narrowed one must not"
+        );
+    }
+
+    #[test]
+    fn apply_filters_shard_still_narrows_an_explicit_assignment() {
+        let rows = vec![
+            make_shard_row("a", serde_json::json!([0])),
+            make_shard_row("b", serde_json::json!([1])),
+        ];
+        let mut filters = WorkerFilters::new();
+        filters.shard_id = Some(1);
+        let result = apply_worker_filters(rows, &filters);
+        let ids: Vec<&str> = result.iter().map(|r| r.worker.worker_id.as_str()).collect();
+        assert_eq!(ids, vec!["b"]);
     }
 
     // -- WorkerRow active_task_ids --

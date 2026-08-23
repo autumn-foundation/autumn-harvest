@@ -3019,11 +3019,18 @@ pub struct WorkerConfig {
     pub cancellation_grace_period: Duration,
     /// Shards this worker is responsible for polling.
     ///
-    /// Defaults to `[ShardId::new(0)]`, matching the single-shard deployment
-    /// shape. Multi-shard operators typically run one worker process per
-    /// shard with `shard_assignments = vec![that_shard]`, but the field is
-    /// a `Vec` so future per-process multi-shard workers can list all shards
-    /// they should poll without changing the config surface.
+    /// Defaults to **empty**, which means *auto*: the worker covers every
+    /// shard this process has a pool for (issue #961, AC1). With **no** sharded
+    /// pool it stays empty — there is no shard identity to resolve, and every
+    /// read-side consumer already reads the empty array as "covers whatever
+    /// shard this row was read from" (see
+    /// [`crate::workers::shard_assignments_cover`] and issue #1150). Do **not**
+    /// rely on a pool-less worker advertising shard `0`: it advertises no shard
+    /// at all. Set an explicit list to narrow a worker to a subset — typically
+    /// the one-worker-process-per-shard shape,
+    /// `shard_assignments = vec![that_shard]`. See
+    /// [`resolve_shard_assignments`] for the resolution rules; the effective
+    /// (resolved) list is what `GET /admin/config` reports.
     pub shard_assignments: Vec<ShardId>,
     /// Hard cap on `start_to_close` for local activities.
     ///
@@ -3352,6 +3359,79 @@ pub(crate) fn dedup_shard_assignments(shards: Vec<ShardId>) -> Vec<ShardId> {
         .collect()
 }
 
+/// Resolve a worker's **effective** shard assignments (issue #961, AC1).
+///
+/// An **empty** [`WorkerConfig::shard_assignments`] means *auto*: cover every
+/// shard this process actually has a pool for. Before issue #961 the default
+/// was a literal `[ShardId::new(0)]`, so a multi-shard deployment that never
+/// called [`WorkerConfig::with_shard_assignments`] silently drained only shard
+/// 0 while workflows routed to every other shard sat permanently undispatched
+/// — the exact silent failure #961 exists to close.
+///
+/// Resolution rules:
+/// - **Non-empty explicit** → [`dedup_shard_assignments`] of the operator's
+///   list, verbatim order. An explicit assignment is a deliberate decision (the
+///   one-worker-process-per-shard shape) and is never widened.
+/// - **Empty + a sharded pool** → every shard id in the pool, ascending, so the
+///   round-robin poll order is deterministic across restarts.
+/// - **Empty + no pool** → **empty**, preserved verbatim. There is no shard
+///   identity to resolve, so fabricating a `[ShardId::new(0)]` would assert a
+///   shard number this process never established — the write-side twin of
+///   issue #1150, whose read-side consumers all normalize the empty array as
+///   "covers whatever shard the row was read from". [`crate::shard::ShardRouter`]
+///   also accepts an arbitrary default shard, so `0` is not a safe stand-in
+///   even for a genuinely single-shard deployment. Single-shard stays
+///   byte-for-byte unchanged (AC7) because the poll loop's shard is an
+///   `Option` and `harvest.shard.dispatched` is emitted only when the worker
+///   has a shard identity.
+///
+/// Deriving from the **pool** rather than the router's writable set is
+/// deliberate: the pool is what this process can physically reach, so an
+/// auto-resolved assignment can never trip
+/// `worker::missing_assigned_shard_pools`. `runner.rs`'s `missing_router_shards`
+/// check already refuses startup when a router shard has no pool, making the
+/// pool a superset of the writable set in any startable deployment — and the
+/// pool additionally covers *draining* (readable-but-not-writable) shards,
+/// which still hold in-flight work that must be drained.
+#[must_use]
+pub(crate) fn resolve_shard_assignments(
+    explicit: Vec<ShardId>,
+    pool_shards: &[ShardId],
+) -> Vec<ShardId> {
+    let explicit = dedup_shard_assignments(explicit);
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    if pool_shards.is_empty() {
+        // No pool => no shard identity to resolve. PRESERVE the empty list
+        // rather than fabricating `[ShardId::new(0)]` (issue #961 review,
+        // Codex P2).
+        //
+        // A plain `DbPool` carries no shard number, so a worker here genuinely
+        // does not know which logical shard its database is. Registering `[0]`
+        // would *claim* shard 0 specifically, which is false whenever the
+        // deployment's single/default shard is numbered anything else --
+        // `ShardRouter::new` accepts an arbitrary `default_shard`. Shard health
+        // and queue coverage would then report no worker for the shard this
+        // process is actually draining. That is the write-side twin of the
+        // read-side bug issue #1150 fixed, and
+        // `shard_fanout::worker_covers_shard` already normalizes an empty
+        // registration as "covers whatever shard this database is" precisely so
+        // this case reads correctly.
+        //
+        // Empty is also the shape the rest of the worker already expects for a
+        // legacy single-shard worker: it yields an empty `shard_targets`, whose
+        // `[] => pool` arms in the claim path, the listener path and the WASM
+        // seed path (issue #965 review, Finding 24) all resolve to the caller's
+        // default pool.
+        return Vec::new();
+    }
+    let mut auto: Vec<ShardId> = pool_shards.to_vec();
+    auto.sort_unstable();
+    auto.dedup();
+    auto
+}
+
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
@@ -3365,7 +3445,7 @@ impl Default for WorkerConfig {
             workflow_cache_size: 1000,
             sticky_timeout: Duration::ZERO,
             cancellation_grace_period: Duration::from_secs(5),
-            shard_assignments: vec![ShardId::new(0)],
+            shard_assignments: Vec::new(),
             max_local_activity_start_to_close: Duration::from_secs(60),
             default_activity_retry_policy: None,
             default_activity_start_to_close: None,
@@ -3476,17 +3556,14 @@ impl WorkerConfig {
 
     /// Assign which shards this worker is responsible for.
     ///
-    /// Empty assignments default back to `[ShardId::new(0)]` to preserve the
-    /// single-shard behaviour. Duplicates are dropped — see
-    /// [`dedup_shard_assignments`].
+    /// An **empty** list means *auto*: cover every shard this process has a
+    /// pool for (issue #961). It is **not** coerced to `[ShardId::new(0)]` —
+    /// that coercion is what made a multi-shard worker silently single-shard.
+    /// See [`resolve_shard_assignments`] for the full resolution rules.
+    /// Duplicates are dropped — see [`dedup_shard_assignments`].
     #[must_use]
     pub fn with_shard_assignments(mut self, shards: impl IntoIterator<Item = ShardId>) -> Self {
-        let shards = dedup_shard_assignments(shards.into_iter().collect());
-        self.shard_assignments = if shards.is_empty() {
-            vec![ShardId::new(0)]
-        } else {
-            shards
-        };
+        self.shard_assignments = dedup_shard_assignments(shards.into_iter().collect());
         self
     }
 
@@ -3897,6 +3974,112 @@ mod tests {
             deduped,
             vec![ShardId::new(2), ShardId::new(0), ShardId::new(1)],
         );
+    }
+
+    /// AC1 (issue #961): a worker with **no explicit** shard assignments must
+    /// cover every shard the process actually has a pool for, not just shard 0.
+    ///
+    /// Before this, `WorkerConfig::default().shard_assignments` was
+    /// `[ShardId::new(0)]`, so a three-shard deployment that never called
+    /// `with_shard_assignments` silently drained only shard 0 while workflows
+    /// routed to shards 1 and 2 sat permanently undispatched — precisely the
+    /// silent failure issue #961 exists to close.
+    #[test]
+    fn resolve_shard_assignments_empty_covers_every_pool_shard() {
+        let resolved = resolve_shard_assignments(
+            Vec::new(),
+            &[ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+        );
+        assert_eq!(
+            resolved,
+            vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+            "an unconfigured worker must auto-cover every shard it has a pool for",
+        );
+    }
+
+    /// An explicit assignment is an operator decision and always wins — auto
+    /// resolution must never widen a deliberately narrowed worker (the
+    /// one-worker-process-per-shard deployment shape).
+    #[test]
+    fn resolve_shard_assignments_explicit_wins_over_pool() {
+        let resolved = resolve_shard_assignments(
+            vec![ShardId::new(1)],
+            &[ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+        );
+        assert_eq!(resolved, vec![ShardId::new(1)]);
+    }
+
+    /// Explicit assignments still go through dedup — a duplicate would fan the
+    /// per-shard control loops out twice against one database (issue #797).
+    #[test]
+    fn resolve_shard_assignments_dedups_explicit() {
+        let resolved = resolve_shard_assignments(
+            vec![ShardId::new(2), ShardId::new(0), ShardId::new(2)],
+            &[ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+        );
+        assert_eq!(resolved, vec![ShardId::new(2), ShardId::new(0)]);
+    }
+
+    /// **Issue #961 review (Codex P2).** With no sharded pool the resolver
+    /// must PRESERVE the empty list, never fabricate `[ShardId::new(0)]`.
+    ///
+    /// A plain `DbPool` carries no shard number, so this worker genuinely does
+    /// not know which logical shard its database is. Claiming `[0]` is false
+    /// whenever the deployment's single/default shard is numbered anything else
+    /// (`ShardRouter::new` accepts an arbitrary `default_shard`), and shard
+    /// health / queue coverage would then report no worker for the shard the
+    /// process is actually draining -- the write-side twin of the read-side bug
+    /// issue #1150 fixed. Empty is the legacy representation
+    /// `shard_fanout::worker_covers_shard` normalizes as "covers whatever shard
+    /// this database is".
+    #[test]
+    fn resolve_shard_assignments_no_pool_preserves_the_empty_legacy_shape() {
+        assert_eq!(
+            resolve_shard_assignments(Vec::new(), &[]),
+            Vec::<ShardId>::new(),
+            "no pool means no shard identity; fabricating [0] would falsely \
+             claim shard 0 on a deployment whose single shard is numbered \
+             otherwise",
+        );
+    }
+
+    /// AC7: a single-shard `ShardedDbPool` resolves to the same `[0]` a
+    /// pool-less deployment gets, so wiring `ShardedDbPool::single` in changes
+    /// nothing.
+    #[test]
+    fn resolve_shard_assignments_single_shard_pool_is_unchanged() {
+        assert_eq!(
+            resolve_shard_assignments(Vec::new(), &[ShardId::new(0)]),
+            vec![ShardId::new(0)],
+        );
+    }
+
+    /// Pool-derived shards are emitted in ascending shard order so the
+    /// round-robin poll order is deterministic across restarts.
+    #[test]
+    fn resolve_shard_assignments_pool_order_is_ascending() {
+        let resolved = resolve_shard_assignments(Vec::new(), &[ShardId::new(5), ShardId::new(1)]);
+        assert_eq!(resolved, vec![ShardId::new(1), ShardId::new(5)]);
+    }
+
+    /// `with_shard_assignments([])` must record "auto" (empty) rather than
+    /// coercing to `[0]` — coercion is what made a multi-shard worker silently
+    /// single-shard.
+    #[test]
+    fn with_shard_assignments_empty_records_auto_not_shard_zero() {
+        let cfg = WorkerConfig::default().with_shard_assignments(Vec::<ShardId>::new());
+        assert!(
+            cfg.shard_assignments.is_empty(),
+            "an empty assignment list means 'auto: cover every pool shard', \
+             not 'shard 0 only'",
+        );
+    }
+
+    /// The default config must also mean "auto", so an embedder that never
+    /// touches `shard_assignments` gets full coverage.
+    #[test]
+    fn default_worker_config_shard_assignments_are_auto() {
+        assert!(WorkerConfig::default().shard_assignments.is_empty());
     }
 
     /// An all-duplicates list must still leave a usable assignment rather than

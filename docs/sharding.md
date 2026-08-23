@@ -512,7 +512,7 @@ Wait for `readiness: "ready"`. A `degraded` row includes machine-readable `reaso
 
 | `reason_code` | Meaning | Resolution |
 |---|---|---|
-| `no_live_worker` | The shard is `Writable` and has claimable tasks, but **no live worker** lists this shard in its `shard_assignments`. | Add the shard to each worker's `shard_assignments` config and redeploy. |
+| `no_live_worker` | The shard is `Writable` and has claimable tasks, but **no live worker** covers this shard. | Widen a worker's coverage and redeploy — either add the shard to its `shard_assignments`, or remove the explicit `shard_assignments` narrowing entirely so "auto" coverage applies (issue #961). Verify with `GET /admin/config` → `worker.shard_assignments`. |
 | `worker_queue_uncovered` | No healthy worker covers a required queue on this shard. | Same as above — check queue bindings. |
 | `schema_migration_missing` | The shard is missing required migrations. | Re-run `diesel migration run` against the shard. |
 
@@ -520,18 +520,64 @@ The `no_live_worker` gate is the primary pre-flip readiness gate for issue #522:
 
 ### Step 4 — Flip writable and verify
 
-Add the new shard to `writable_shards` and deploy. The fleet **automatically drains the newly-writable shard** — no operator intervention is needed. Workers that list the shard in `shard_assignments` will claim and dispatch tasks from it within one `poll_interval`.
+Add the new shard to `writable_shards` and deploy. The fleet **automatically drains the newly-writable shard** — no operator intervention is needed. Workers that cover the shard will claim and dispatch tasks from it within one `poll_interval`.
 
-```toml
-# Example worker config
-[harvest.worker]
-shard_assignments = [0, 1]   # worker now covers both shards
+Shard coverage is configured in **Rust**, not in `autumn.toml` — there is no
+`[harvest.worker] shard_assignments` key. Multi-shard also runs through
+`HarvestRunner` only: `HarvestPlugin` rejects a multi-shard pool by design, so a
+plugin-hosted app is always single-shard.
+
+```rust
+use autumn_harvest::types::ShardId;
+
+// Explicit coverage — this worker polls exactly shards 0 and 1.
+WorkerConfig::default().with_shard_assignments([ShardId::new(0), ShardId::new(1)])
+
+// ...or omit the call entirely for "auto": cover every shard this process has
+// a pool for. A worker left on auto picks the new shard up on redeploy with no
+// code edit at all (issue #961).
+WorkerConfig::default()
+```
+
+The pool itself is supplied to the runner:
+
+```rust
+HarvestRunnerResources::new(harvest_pool).with_sharded_pool(sharded_pool)
 ```
 
 Once flipped:
 - New workflows begin landing on the shard via rendezvous hash.
 - In-flight workflows on existing shards continue draining through their own worker tasks.
-- Workers assigned to both shards poll each shard's pool independently on every tick, preserving per-shard ACID locality.
+- Workers covering both shards poll each shard's pool independently on every tick (round-robin, so a deep backlog on one shard cannot starve the other), preserving per-shard ACID locality.
+
+#### Verify coverage — don't assume it (issue #961)
+
+"New workflows begin landing on it" is only true if a live worker actually *covers* the shard. Run all three checks after the flip; each is falsifiable, none requires reading source:
+
+**1. The worker's *effective* assignments include the shard.**
+
+```bash
+curl -s .../api/harvest/admin/config | jq '.worker.shard_assignments'
+# => [0, 1]   # must contain the new shard id
+```
+
+`GET /admin/config` reports the **resolved** list, not the raw config value — so a worker left on auto (`shard_assignments` empty or absent) shows the concrete shards it will poll, and an explicit list that forgot the new shard is visible as a missing id rather than as silence. `HarvestRunner` also logs a `tracing::warn!` at boot naming any writable router shard the worker does not cover.
+
+**2. Dispatch is actually happening on the shard.**
+
+```promql
+sum by (shard) (rate(harvest_shard_dispatched_total{shard="1"}[5m])) > 0
+```
+
+`harvest.shard.dispatched{shard}` increments once per dispatched task, per shard — the shard-dimension twin of `harvest.queue.dispatched{queue}`. A flat zero on a shard that has work is the signal that the poll loop is not reaching it. (Zero on an idle shard with no work is expected and benign — pair it with check 3.)
+
+**3. Nothing is stranded.**
+
+```promql
+harvest_shard_stranded_pending{shard="1"} == 0
+```
+
+See *Observing stranded work* below. The `harvest_shard_undrained` starter alert fires on exactly the combination that matters: claimable work on a shard with no live poller.
 
 ### Observing stranded work
 
@@ -541,7 +587,7 @@ The `harvest.shard.stranded_pending` gauge (emitted by the stranded-work sampler
 harvest_shard_stranded_pending{shard="1"} > 0
 ```
 
-A non-zero value means tasks are queued on that shard but no worker is draining them. Healthy steady state is `0` on all shards. Use this as an alerting signal: if it stays non-zero for more than `2 × poll_interval`, check `shard_assignments` on the running worker fleet.
+A non-zero value means tasks are queued on that shard but no worker is draining them. Healthy steady state is `0` on all shards. Use this as an alerting signal: if it stays non-zero for more than `2 × poll_interval`, check the fleet's *effective* coverage with `GET /admin/config` → `worker.shard_assignments` (see [Verify coverage](#verify-coverage--dont-assume-it-issue-961)).
 
 ### Pre-flip checklist
 
@@ -551,5 +597,7 @@ Before adding a shard to `writable_shards`:
 - [ ] No `no_live_worker` reason code present (at least one live worker covers the shard).
 - [ ] `harvest.shard.stranded_pending{shard="<id>"}` is `0` (no backlog from prior test writes).
 - [ ] Schema migrations are applied (`schema_migration_missing` absent).
+- [ ] `GET /admin/config` → `worker.shard_assignments` contains the new shard id (or the worker is on auto and its pool includes the shard).
+- [ ] The `harvest_shard_undrained` starter alert is installed, so a post-flip coverage regression pages rather than silently stranding work.
 
 A `readiness: "degraded"` result with `no_live_worker` in `reason_codes` is the engine's way of saying: "flip cancelled — no worker will claim work on this shard."

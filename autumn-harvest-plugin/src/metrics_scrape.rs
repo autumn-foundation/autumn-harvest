@@ -155,6 +155,13 @@ struct Inner {
     worker_slots_available: Gauge,
     worker_slot_target: Gauge,
     shard_stranded_pending: Gauge,
+    // The #961 companion to the gauge above: the undrained-shard alert that
+    // ships with `harvest.shard.stranded_pending` uses this counter to tell
+    // "no poller at all" from "poller present but backlogged". Without an
+    // override here the gauge would render but its discriminator would fall
+    // through to the trait no-op, leaving the shipped alert unable to make
+    // that distinction on the recommended built-in scrape endpoint.
+    shard_dispatched: Counter,
     // The #696 overdue-schedule sampler runs under the same is_enabled() gate;
     // render its primary gauge here so the recommended built-in scrape path (not
     // just the metrics-rs adapter) exposes `harvest_schedule_overdue`.
@@ -327,6 +334,10 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         self.0
             .shard_stranded_pending
             .set(vec![shard.to_string()], count as f64);
+    }
+
+    fn record_shard_dispatched(&self, shard: u16) {
+        self.0.shard_dispatched.incr(vec![shard.to_string()], 1);
     }
 
     fn record_schedule_overdue(&self, kind: &str, name: &str, overdue: bool) {
@@ -575,6 +586,13 @@ fn push_sampler_adjacent_metrics(families: &mut Vec<MetricFamily>, inner: &Inner
         "Claimable pending task demand per shard with no compatible worker",
         &[METRIC_LABEL_SHARD],
         inner.shard_stranded_pending.snapshot(),
+    );
+    push_counter(
+        families,
+        "harvest_shard_dispatched_total",
+        "Tasks dispatched per shard by this worker's poll loop",
+        &[METRIC_LABEL_SHARD],
+        inner.shard_dispatched.snapshot(),
     );
     push_gauge(
         families,
@@ -860,6 +878,27 @@ mod tests {
         let families = recorder.collect();
         let f = family(&families, "harvest_shard_stranded_pending");
         assert_eq!(sample_value(f, &[("shard", "2")]), 9.0);
+    }
+
+    #[test]
+    fn shard_dispatched_is_a_counter_labeled_by_shard() {
+        // Issue #961 (Codex round 3): the shipped undrained-shard alert reads
+        // `harvest_shard_stranded_pending` (already rendered above) and uses
+        // `harvest_shard_dispatched_total` to tell "no poller at all" from
+        // "poller present but backlogged". The built-in scrape recorder is
+        // per-metric hand-maintained, so without this override the alert's
+        // primary signal would be exported while its discriminator silently
+        // fell through to the trait no-op.
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_shard_dispatched(1);
+        recorder.record_shard_dispatched(1);
+        recorder.record_shard_dispatched(2);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_shard_dispatched_total");
+        assert_eq!(f.kind, MetricKind::Counter);
+        assert_eq!(sample_value(f, &[("shard", "1")]), 2.0);
+        assert_eq!(sample_value(f, &[("shard", "2")]), 1.0);
     }
 
     #[test]
