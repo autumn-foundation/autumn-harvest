@@ -221,6 +221,9 @@ async fn main() {
     println!("\nreplaying the recorded history:");
     println!("  new build   diverges at steps {broken_at:?}");
     println!("  fixed build diverges at steps {fixed_at:?}  <- clean");
+    // The verdict itself. `is_clean()` also refuses a trace that timed out,
+    // panicked, or was capped -- none of which report a divergence.
+    println!("  fixed.is_clean() = {}", fixed.is_clean());
 }
 
 #[cfg(test)]
@@ -262,10 +265,17 @@ mod tests {
             .filter(|s| s.divergence.is_some())
             .map(|s| (s.index, s.divergence.clone()))
             .collect();
+        // `is_clean()` is the verdict, not the divergence scan: it additionally
+        // refuses a trace whose steps timed out, panicked, or were never
+        // replayed — each of which reports no divergence because nothing was
+        // ever compared. The scan above only supplies a readable message.
         assert!(
-            diverged.is_empty(),
-            "a `ctx.patched` gate must keep the pre-change path intact, but \
-             these steps diverged: {diverged:?}"
+            fixed.is_clean(),
+            "a `ctx.patched` gate must keep the pre-change path intact, but this \
+             trace is not clean (diverged: {diverged:?}, first unsuccessful step: \
+             {:?}, truncated: {})",
+            fixed.first_unsuccessful_step(),
+            fixed.truncated,
         );
     }
 
@@ -276,7 +286,7 @@ mod tests {
         let history = snapshot_json();
         let new = trace_with(new_build, &history).await;
         assert!(
-            new.steps.iter().any(|s| s.divergence.is_some()),
+            !new.is_clean() && new.first_divergent_step().is_some(),
             "an ungated inserted activity must break replay of a pre-change history"
         );
     }
@@ -363,7 +373,7 @@ mod tests {
         let history = snapshot_json();
         let trace = trace_with(does_nothing, &history).await;
         assert!(
-            trace.steps.iter().any(|s| s.divergence.is_some()),
+            !trace.is_clean() && trace.first_divergent_step().is_some(),
             "a build that skips every recorded activity must NOT replay cleanly"
         );
     }

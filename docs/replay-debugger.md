@@ -257,10 +257,20 @@ This means the two questions need two different checks:
 | Question | Check |
 |---|---|
 | "Where do these two builds first behave differently?" | `diff_traces(a, b).divergence` |
-| "Does this build replay this recorded history **cleanly**?" | no step has `divergence.is_some()` |
+| "Does this build replay this recorded history **cleanly**?" | `trace.is_clean()` |
 
 Use the second one to confirm a fix. `examples/replay_debugger.rs` asserts both,
 and the walkthrough in step 6 above uses the second.
+
+Ask `ReplayTrace::is_clean()` rather than scanning for `divergence.is_some()`.
+A step reports no divergence when nothing was *compared*, not only when the
+build agreed — a step that timed out (a spinning workflow) or panicked never
+finished replaying, and every step of the handler-free `ReplayTrace::from_history`
+projection ran no workflow code at all. Scanning divergences alone certifies all
+three as clean. `is_clean()` additionally refuses a trace `truncated` by
+`max_steps`, the same unexamined-remainder trap `TraceDiff::is_clean()` refuses.
+When it returns `false`, `first_unsuccessful_step()` and `first_divergent_step()`
+say which of the two reasons applies.
 
 ---
 

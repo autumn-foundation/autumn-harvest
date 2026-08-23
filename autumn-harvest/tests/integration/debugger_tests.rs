@@ -191,6 +191,137 @@ fn from_history_opens_timer_and_child_awaitables() {
 }
 
 #[test]
+fn a_signal_win_closes_its_event_less_reserved_race_timer() {
+    // Codex round 4, P2. A signal-win of a signal-or-deadline race (#476) tears
+    // the reserved deadline timer down through an EVENT-LESS `CancelRaceLosers`
+    // row delete — no `TimerFired`, no `TimerCancelled`. Closing timers only on
+    // those two events leaves the loser open for every later step, rendering a
+    // resolved race as a run still waiting on a timer.
+    let events = vec![
+        started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("__signal_timeout:0:approval"),
+            duration_secs: 3600,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "approval".to_string(),
+            payload: json!(true),
+        },
+    ];
+    let trace = ReplayTrace::from_history("wf", ExecutionId::new(), &events);
+
+    assert_eq!(
+        trace.steps[1].open_awaitables.len(),
+        1,
+        "precondition: the reserved deadline timer opens"
+    );
+    assert!(
+        trace.steps[2]
+            .open_awaitables
+            .iter()
+            .all(|a| a.kind != AwaitableKind::Timer),
+        "a signal-win must close its reserved race timer, got {:?}",
+        trace.steps[2].open_awaitables
+    );
+}
+
+#[test]
+fn a_child_win_closes_its_event_less_reserved_race_timer() {
+    // The child-or-deadline (#779) mirror. The terminal event names only the
+    // `child_id`, so the workflow name the reserved timer encodes has to come
+    // from the awaitable being closed.
+    let child = ExecutionId::new();
+    let events = vec![
+        started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("__child_timeout:0:kid"),
+            duration_secs: 600,
+        },
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id: child,
+            workflow_name: "kid".to_string(),
+            input: json!({}),
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id: child,
+            output: json!("ok"),
+        },
+    ];
+    let trace = ReplayTrace::from_history("wf", ExecutionId::new(), &events);
+
+    assert!(
+        trace.steps[3].open_awaitables.is_empty(),
+        "a child-win must close both the child and its reserved race timer, got {:?}",
+        trace.steps[3].open_awaitables
+    );
+}
+
+#[test]
+fn an_ordinary_timer_survives_an_unrelated_signal() {
+    // The control: race-arm cleanup must close only *reserved* arms whose id
+    // parses to the resolving name. An author's own `ctx.timer("escalate", ..)`
+    // is unaffected by a signal arriving, and so is a reserved arm for a
+    // *different* signal.
+    let events = vec![
+        started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("escalate"),
+            duration_secs: 30,
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("__signal_timeout:0:other"),
+            duration_secs: 30,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "approval".to_string(),
+            payload: json!(true),
+        },
+    ];
+    let trace = ReplayTrace::from_history("wf", ExecutionId::new(), &events);
+
+    let open = &trace.steps[3].open_awaitables;
+    assert_eq!(
+        open.len(),
+        2,
+        "neither an author timer nor another signal's reserved arm may close, got {open:?}"
+    );
+}
+
+#[test]
+fn a_timer_win_leaves_no_double_close_for_a_late_signal() {
+    // A timer-win recorded `TimerFired` first, so the arm is already closed and
+    // a genuinely LATE signal is a no-op — it must not reach past the reserved
+    // arm and close an unrelated open timer.
+    let events = vec![
+        started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("__signal_timeout:0:approval"),
+            duration_secs: 3600,
+        },
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("__signal_timeout:0:approval"),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("escalate"),
+            duration_secs: 30,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "approval".to_string(),
+            payload: json!(true),
+        },
+    ];
+    let trace = ReplayTrace::from_history("wf", ExecutionId::new(), &events);
+
+    let open = &trace.steps[4].open_awaitables;
+    assert_eq!(
+        open.len(),
+        1,
+        "the late signal must not close the unrelated author timer, got {open:?}"
+    );
+    assert_eq!(open[0].id.as_deref(), Some("escalate"));
+}
+
+#[test]
 fn from_history_captures_version_and_patch_gate_values() {
     let events = vec![
         started(),
@@ -1574,6 +1705,302 @@ async fn a_panicking_workflow_is_contained() {
 }
 
 #[tokio::test]
+async fn a_spinning_build_is_not_certified_as_replaying_cleanly() {
+    // Codex round 4, P1. A step that timed out reports `divergence: None`
+    // because the replay never finished, not because the build agreed — so the
+    // old documented check (scan for `divergence.is_some()`) certified a
+    // workflow that spins forever as replaying cleanly. `is_clean()` refuses.
+    fn spins<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+
+    let trace = ReplayDebugger::new()
+        .register_fn("wf", spins)
+        .max_steps(1)
+        .step_timeout(std::time::Duration::from_millis(50))
+        .trace_snapshot(snapshot("wf", two_step_history()))
+        .await
+        .expect("trace");
+
+    // The exact shape the old check was blind to: no divergence anywhere.
+    assert!(
+        trace.steps.iter().all(|s| s.divergence.is_none()),
+        "precondition: a timed-out step reports no divergence"
+    );
+    assert!(!trace.is_clean(), "a spinning build must not read as clean");
+    assert_eq!(trace.first_unsuccessful_step(), Some(0));
+    assert_eq!(trace.first_divergent_step(), None);
+}
+
+#[tokio::test]
+async fn a_panicking_build_is_not_certified_as_replaying_cleanly() {
+    // The sibling of the spin case: a contained panic likewise leaves
+    // `divergence: None` while having verified nothing.
+    fn panics<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move { panic!("boom") })
+    }
+
+    let trace = ReplayDebugger::new()
+        .register_fn("wf", panics)
+        .max_steps(1)
+        .trace_snapshot(snapshot("wf", two_step_history()))
+        .await
+        .expect("trace");
+
+    assert!(trace.steps.iter().all(|s| s.divergence.is_none()));
+    assert!(
+        !trace.is_clean(),
+        "a panicking build must not read as clean"
+    );
+    assert_eq!(trace.first_unsuccessful_step(), Some(0));
+}
+
+#[tokio::test]
+async fn a_genuinely_clean_replay_is_still_clean() {
+    // The control that keeps the fix honest: tightening `is_clean` must not
+    // make every trace unclean. A build that replays the whole history and
+    // suspends/completes at every step still passes.
+    let trace = ReplayDebugger::new()
+        .register_fn("wf", two_step)
+        .trace_snapshot(snapshot("wf", two_step_history()))
+        .await
+        .expect("trace");
+
+    assert!(
+        trace.steps.iter().all(|s| s.outcome.replay_succeeded()),
+        "precondition: every step replayed to a conclusion, got {:?}",
+        trace.steps.iter().map(|s| s.outcome).collect::<Vec<_>>()
+    );
+    assert!(trace.is_clean(), "a faithful replay must read as clean");
+}
+
+#[test]
+fn a_handler_free_projection_is_never_clean() {
+    // `from_history` runs no workflow code, so it cannot answer "does this
+    // build replay cleanly?" — reporting `true` would certify a build that was
+    // never executed. Every step is `NotReplayed`.
+    let trace = ReplayTrace::from_history("wf", ExecutionId::new(), &two_step_history());
+    assert!(trace.steps.iter().all(|s| s.divergence.is_none()));
+    assert!(!trace.is_clean());
+    assert_eq!(trace.first_unsuccessful_step(), Some(0));
+}
+
+#[tokio::test]
+async fn two_builds_that_fail_the_same_way_diff_as_inconclusive_not_equal() {
+    // Codex round 4, P1 (the diff half). Two builds that both spin compare
+    // equal at every field — same outcome, same (empty) commands — so the walk
+    // finds no divergence. But neither was ever successfully replayed, so
+    // "they agree" is a claim about two non-answers.
+    fn spins<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+    fn spins_differently<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+
+    let build = |h: WorkflowHandlerFn| {
+        ReplayDebugger::new()
+            .register_fn("wf", h)
+            .max_steps(1)
+            .step_timeout(std::time::Duration::from_millis(50))
+    };
+    let history = two_step_history();
+    let left = build(spins)
+        .trace_snapshot(snapshot("wf", history.clone()))
+        .await
+        .expect("left");
+    let right = build(spins_differently)
+        .trace_snapshot(snapshot("wf", history))
+        .await
+        .expect("right");
+
+    let diff = diff_traces(&left, &right);
+    assert!(
+        diff.divergence.is_none(),
+        "precondition: two identically-failing builds compare equal"
+    );
+    assert_eq!(diff.inconclusive_step, Some(0));
+    assert!(
+        !diff.is_clean(),
+        "a comparison in which neither side replayed must not read as clean"
+    );
+}
+
+#[tokio::test]
+async fn two_builds_that_fail_differently_still_report_a_real_divergence() {
+    // The complement: only *matching* failures are a doubt. One build panicking
+    // while the other suspends is a genuine behavioural difference and must stay
+    // an ordinary `Outcome` divergence, not be softened into "inconclusive".
+    fn panics<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move { panic!("boom") })
+    }
+
+    let history = two_step_history();
+    let left = ReplayDebugger::new()
+        .register_fn("wf", panics)
+        .max_steps(1)
+        .trace_snapshot(snapshot("wf", history.clone()))
+        .await
+        .expect("left");
+    let right = ReplayDebugger::new()
+        .register_fn("wf", two_step)
+        .max_steps(1)
+        .trace_snapshot(snapshot("wf", history))
+        .await
+        .expect("right");
+
+    let diff = diff_traces(&left, &right);
+    // A real, actionable divergence — the exact `DiffKind` is whichever field
+    // differs first, here the command count, since a panicked build emits none.
+    assert!(
+        diff.divergence.is_some(),
+        "one build panicking and the other suspending is a real difference"
+    );
+    // And *not* a doubt: only the healthy side failing would spoil the verdict,
+    // and here the right build replayed successfully.
+    assert_eq!(diff.inconclusive_step, None);
+    assert!(!diff.is_clean());
+}
+
+#[tokio::test]
+async fn two_healthy_builds_still_diff_clean() {
+    // Control for the diff half: `inconclusive_step` must not fire on traces
+    // that replayed successfully, or every clean comparison would regress.
+    // One recording, replayed by two builds — the real diff scenario. Two
+    // separately-minted histories would differ on per-run activity ids, which a
+    // `WaitForActivity` command summary carries verbatim.
+    let history = two_step_history();
+    let make = || async {
+        ReplayDebugger::new()
+            .register_fn("wf", two_step)
+            .trace_snapshot(snapshot("wf", history.clone()))
+            .await
+            .expect("trace")
+    };
+    let diff = diff_traces(&make().await, &make().await);
+    assert_eq!(diff.inconclusive_step, None);
+    assert!(diff.is_clean());
+}
+
+/// Dispatches one activity carrying an input far larger than a byte or two, so
+/// a configured cap is observable.
+fn dispatches_a_big_input<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let big = json!({ "blob": "x".repeat(512) });
+        ctx.execute_activity_raw("step_a", big, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!("done"))
+    })
+}
+
+#[tokio::test]
+async fn the_candidate_payload_cap_is_applied_during_prefix_replay() {
+    // Codex round 4, P1. Payload caps live in no `WorkflowEvent` — the live
+    // worker supplies its own from `BuiltHarvest` — so a replay left at the
+    // library defaults answers a question about a worker that does not exist.
+    // The cap is consulted at the frontier, which is where every prefix step
+    // lands. `WorkflowReplayer` threads these (#798); so must this path.
+    let history = vec![started()];
+
+    // Default caps (2 MiB): the 512-byte input is accepted and the workflow
+    // parks on the dispatch.
+    let permissive = ReplayDebugger::new()
+        .register_fn("wf", dispatches_a_big_input)
+        .trace_snapshot(snapshot("wf", history.clone()))
+        .await
+        .expect("trace");
+    assert_eq!(
+        permissive.steps[0].outcome,
+        StepOutcome::Suspended,
+        "precondition: under default caps the dispatch is accepted"
+    );
+
+    // A candidate that lowers the cap below the input rejects it with
+    // `PayloadTooLarge`, so the handler returns early instead of parking. Left
+    // unthreaded, this trace would be byte-identical to the permissive one —
+    // the false-GREEN direction, where the debugger accepts a dispatch the
+    // promoted worker will reject.
+    let strict = ReplayDebugger::new()
+        .register_fn("wf", dispatches_a_big_input)
+        .payload_caps(16, 0, 0)
+        .trace_snapshot(snapshot("wf", history.clone()))
+        .await
+        .expect("trace");
+    assert_eq!(
+        strict.steps[0].outcome,
+        StepOutcome::ReachedTerminal,
+        "a lowered activity-input cap must reject the dispatch during replay"
+    );
+
+    // And the traces must genuinely differ, which is the operator-visible half.
+    assert!(diff_traces(&permissive, &strict).divergence.is_some());
+}
+
+#[tokio::test]
+async fn the_candidate_offload_threshold_exempts_an_over_cap_payload() {
+    // The false-RED direction (#524): an over-cap payload is *offloaded*, not
+    // rejected, so a debugger that knows the cap but not the threshold reports
+    // a divergence the promoted worker would never hit.
+    let history = vec![started()];
+
+    let capped_only = ReplayDebugger::new()
+        .register_fn("wf", dispatches_a_big_input)
+        .payload_caps(16, 0, 0)
+        .trace_snapshot(snapshot("wf", history.clone()))
+        .await
+        .expect("trace");
+    assert_eq!(
+        capped_only.steps[0].outcome,
+        StepOutcome::ReachedTerminal,
+        "precondition: the cap alone rejects the dispatch"
+    );
+
+    let with_offload = ReplayDebugger::new()
+        .register_fn("wf", dispatches_a_big_input)
+        .payload_caps(16, 0, 0)
+        .payload_offload_threshold(Some(8))
+        .trace_snapshot(snapshot("wf", history))
+        .await
+        .expect("trace");
+    assert_eq!(
+        with_offload.steps[0].outcome,
+        StepOutcome::Suspended,
+        "an over-threshold payload is offloaded rather than capped"
+    );
+}
+
+#[tokio::test]
 async fn a_redacted_export_is_refused_rather_than_mis_analysed() {
     // A redacted export rewrites every payload field, so replaying it would
     // report a fabricated divergence at the first payload-bearing activity.
@@ -1926,6 +2353,33 @@ fn an_uncapped_agreeing_comparison_is_clean() {
     let diff = diff_traces(&left, &right);
     assert!(!diff.truncated);
     assert!(diff.is_clean(), "a complete, agreeing comparison is clean");
+}
+
+#[test]
+fn a_handler_free_fixture_diff_is_conclusive_not_inconclusive() {
+    // The carve-out that keeps AC3's compare-two-recordings mode working — and
+    // the CLI's primary diff path with it. A handler-free projection is
+    // `NotReplayed` at every step, but that is *by design*, not a failed
+    // replay: the comparison is over history-derived facts, which the two
+    // recordings determine completely. Folding `NotReplayed` in with
+    // timed-out/panicked would make every fixture diff exit 2.
+    let events = vec![started(), scheduled(ActivityExecId::new(), "step_a")];
+    let left = ReplayTrace::from_history("wf", ExecutionId::new(), &events);
+    let right = ReplayTrace::from_history("wf", ExecutionId::new(), &events);
+
+    assert!(
+        left.steps
+            .iter()
+            .all(|s| s.outcome == StepOutcome::NotReplayed),
+        "precondition: a handler-free projection never replays"
+    );
+    let diff = diff_traces(&left, &right);
+    assert_eq!(diff.inconclusive_step, None);
+    assert!(diff.is_clean(), "a fixture-vs-fixture diff is conclusive");
+
+    // ...while the *single-trace* verdict is the opposite: this projection
+    // verified no code, so it cannot claim the build replays cleanly.
+    assert!(!left.is_clean());
 }
 
 #[test]

@@ -248,6 +248,45 @@ impl StepOutcome {
             Self::Panicked => "panicked",
         }
     }
+
+    /// `true` only when the prefix replay actually ran to a conclusion.
+    ///
+    /// [`TimedOut`](Self::TimedOut) and [`Panicked`](Self::Panicked) mean the
+    /// replay **never finished**, so the step's `divergence: None` says nothing
+    /// about whether the build agrees with the recording — it only says nothing
+    /// was observed before the drive gave up. Treating that as a pass would
+    /// certify a build that spins or panics as replaying cleanly, which is the
+    /// same false-clean class as an unexamined suffix past `max_steps`.
+    ///
+    /// [`NotReplayed`](Self::NotReplayed) is likewise not a success: the
+    /// handler-free [`ReplayTrace::from_history`] projection never ran any
+    /// workflow code, so it cannot answer "does this build replay cleanly?" at
+    /// all. It is a history *explanation*, not a verdict.
+    #[must_use]
+    pub const fn replay_succeeded(self) -> bool {
+        matches!(self, Self::Suspended | Self::ReachedTerminal)
+    }
+
+    /// `true` when a replay was **attempted and did not finish**.
+    ///
+    /// The deliberate near-miss of [`replay_succeeded`](Self::replay_succeeded):
+    /// [`NotReplayed`](Self::NotReplayed) is neither a success *nor* a failure,
+    /// and the two predicates are used for different questions.
+    ///
+    /// * "Does this build replay cleanly?" ([`ReplayTrace::is_clean`]) requires
+    ///   *success*, so a never-replayed projection cannot pass — it verified
+    ///   nothing.
+    /// * "Do these two traces agree?" ([`TraceDiff::is_clean`]) is spoiled only
+    ///   by *failure*. A handler-free fixture-vs-fixture diff — AC3's
+    ///   compare-two-recordings mode, and the CLI's primary diff path — is
+    ///   `NotReplayed` on both sides **by design**, and is fully conclusive:
+    ///   it compares history-derived facts, which the two recordings determine
+    ///   completely. Treating it as a doubt would make every fixture diff
+    ///   inconclusive.
+    #[must_use]
+    pub const fn replay_failed(self) -> bool {
+        matches!(self, Self::TimedOut | Self::Panicked)
+    }
 }
 
 /// A non-determinism divergence surfaced while replaying a step's prefix.
@@ -378,6 +417,60 @@ impl ReplayTrace {
             total_events,
             truncated: limit < total_events,
         }
+    }
+
+    /// The first step whose prefix replay did not run to a conclusion, if any.
+    ///
+    /// A [`StepOutcome::TimedOut`] or [`StepOutcome::Panicked`] step — and every
+    /// step of a handler-free [`from_history`](Self::from_history) projection,
+    /// which is [`StepOutcome::NotReplayed`] — carries `divergence: None`
+    /// because nothing was ever compared, not because the build agreed.
+    /// Callers rendering a verdict should name this step rather than reporting
+    /// silence. See [`StepOutcome::replay_succeeded`].
+    #[must_use]
+    pub fn first_unsuccessful_step(&self) -> Option<usize> {
+        self.steps
+            .iter()
+            .find(|s| !s.outcome.replay_succeeded())
+            .map(|s| s.index)
+    }
+
+    /// The first step at which the replay diverged from the recording, if any.
+    #[must_use]
+    pub fn first_divergent_step(&self) -> Option<usize> {
+        self.steps
+            .iter()
+            .find(|s| s.divergence.is_some())
+            .map(|s| s.index)
+    }
+
+    /// `true` only when **every** step of the **whole** history replayed to a
+    /// conclusion and none diverged — the answer to "does this build replay
+    /// this recorded history cleanly?".
+    ///
+    /// Scanning for `divergence.is_some()` alone is **not** the clean signal,
+    /// for two independent reasons, each of which certifies a build that was
+    /// never actually verified:
+    ///
+    /// * a step that [timed out](StepOutcome::TimedOut) or
+    ///   [panicked](StepOutcome::Panicked) reports no divergence because the
+    ///   replay never finished — a workflow that spins forever would otherwise
+    ///   pass at every step;
+    /// * a trace [truncated](Self::truncated) by `max_steps` never looked at
+    ///   the suffix at all, the same unexamined-remainder trap
+    ///   [`TraceDiff::is_clean`] refuses.
+    ///
+    /// A handler-free [`from_history`](Self::from_history) projection is
+    /// therefore never clean: it registered no workflow code, so it has not
+    /// verified anything. Use [`ReplayDebugger::trace`] to get a trace that can
+    /// answer the question, and [`first_unsuccessful_step`](Self::first_unsuccessful_step)
+    /// / [`first_divergent_step`](Self::first_divergent_step) to report *why* a
+    /// trace is not clean.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        !self.truncated
+            && self.first_unsuccessful_step().is_none()
+            && self.first_divergent_step().is_none()
     }
 
     /// Find the first step at or after `from` that satisfies `breakpoint`.
@@ -624,6 +717,25 @@ pub struct TraceDiff {
     /// means "no difference in the part we looked at", which is emphatically
     /// not the same claim.
     pub truncated: bool,
+    /// The first compared step at which **both** traces failed to replay: both
+    /// [timed out](StepOutcome::TimedOut) or both
+    /// [panicked](StepOutcome::Panicked).
+    ///
+    /// [`StepOutcome::NotReplayed`] is deliberately excluded — see
+    /// [`StepOutcome::replay_failed`]. A handler-free fixture-vs-fixture diff is
+    /// `NotReplayed` throughout and is conclusive about what it claims.
+    ///
+    /// Two builds that break the *same way* compare equal at every field, so
+    /// the walk reports no divergence — but neither replay ever finished, so
+    /// "they agree" is a statement about two non-answers. That is
+    /// the same unexamined-remainder trap as [`truncated`](Self::truncated),
+    /// one layer down, and [`is_clean`](Self::is_clean) refuses it too.
+    ///
+    /// When the two sides fail *differently* (one panics, one suspends) the
+    /// walk reports an ordinary [`DiffKind::Outcome`] divergence instead — that
+    /// is a real, actionable behavioural difference, not a doubt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inconclusive_step: Option<usize>,
 }
 
 impl TraceDiff {
@@ -636,11 +748,14 @@ impl TraceDiff {
     /// silence. A CI gate reading `divergence.is_none()` would treat an
     /// unexamined suffix as a pass; this method refuses to.
     ///
+    /// It equally refuses a comparison in which neither side ever replayed
+    /// successfully — see [`inconclusive_step`](Self::inconclusive_step).
+    ///
     /// Raise `max_steps` (or drop the cap) to turn an inconclusive result into
-    /// a conclusive one.
+    /// a conclusive one; fix the spin or panic for the other case.
     #[must_use]
     pub const fn is_clean(&self) -> bool {
-        self.divergence.is_none() && !self.truncated
+        self.divergence.is_none() && !self.truncated && self.inconclusive_step.is_none()
     }
 }
 
@@ -658,11 +773,25 @@ impl TraceDiff {
 #[must_use]
 pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
     let truncated = left.truncated || right.truncated;
+    let shared = left.steps.len().min(right.steps.len());
+    // The first compared index where *neither* side replayed successfully. Both
+    // sides failing the same way compares equal at every field, so the walk
+    // below reports no divergence — but "they agree" would be a claim about two
+    // non-answers. Computed over the compared prefix only: a failure past
+    // `shared` is already covered by `truncated` / `DiffKind::TraceLength`.
+    // `replay_failed`, not `!replay_succeeded`: a handler-free projection is
+    // `NotReplayed` on both sides by design, and comparing two *recordings*
+    // (AC3's fixture-vs-fixture mode) is fully conclusive — the history facts
+    // it compares are determined entirely by the two histories. Only a replay
+    // that was attempted and did not finish makes agreement meaningless.
+    let inconclusive_step = (0..shared)
+        .find(|&i| left.steps[i].outcome.replay_failed() && right.steps[i].outcome.replay_failed());
     let finish = |divergence| TraceDiff {
         divergence,
         left_steps: left.steps.len(),
         right_steps: right.steps.len(),
         truncated,
+        inconclusive_step,
     };
 
     // Before any step: the two recordings must belong to the same workflow
@@ -687,8 +816,6 @@ pub fn diff_traces(left: &ReplayTrace, right: &ReplayTrace) -> TraceDiff {
             right: None,
         }));
     }
-
-    let shared = left.steps.len().min(right.steps.len());
 
     for i in 0..shared {
         let l = &left.steps[i];
@@ -998,6 +1125,7 @@ pub struct ReplayDebugger {
     step_timeout: Duration,
     history_policy: WorkflowHistoryPolicy,
     build_id: Option<String>,
+    payload_limits: crate::executor::ReplayPayloadLimits,
 }
 
 impl fmt::Debug for ReplayDebugger {
@@ -1029,6 +1157,7 @@ impl ReplayDebugger {
             step_timeout: DEFAULT_STEP_TIMEOUT,
             history_policy: WorkflowHistoryPolicy::default(),
             build_id: None,
+            payload_limits: crate::executor::ReplayPayloadLimits::default(),
         }
     }
 
@@ -1075,6 +1204,55 @@ impl ReplayDebugger {
     #[must_use]
     pub const fn history_policy(mut self, policy: WorkflowHistoryPolicy) -> Self {
         self.history_policy = policy;
+        self
+    }
+
+    /// Apply the **candidate** build's payload caps to every prefix replay
+    /// (bytes, in the order the executor threads them:
+    /// `max_activity_input`, `max_signal_payload`, `max_workflow_input`;
+    /// `0` means "no cap").
+    ///
+    /// These live in no `WorkflowEvent`, so a pure-history replay cannot
+    /// recover them — the live worker supplies its own configured caps from
+    /// `BuiltHarvest`. Left at the library defaults, the debugger answers a
+    /// question about a worker that does not exist, and it does so in **both**
+    /// directions: a candidate that *lowers* a cap has an over-cap dispatch
+    /// accepted here and rejected in production, while a candidate that *raises*
+    /// one has a legitimate dispatch rejected here — an early-return divergence
+    /// fabricated against a perfectly good history.
+    ///
+    /// The cap is consulted only where a dispatch is not already in recorded
+    /// history, i.e. at the prefix frontier — which is exactly where every step
+    /// of a trace lands. Pass the values the candidate configures on its
+    /// `HarvestBuilder`; this mirrors
+    /// [`WorkflowReplayer::with_payload_caps`](crate::testing::WorkflowReplayer::with_payload_caps)
+    /// (issue #798).
+    ///
+    /// `max_activity_result` is deliberately absent: the worker enforces it
+    /// *after* an activity returns, never `WorkflowContext`, so it cannot affect
+    /// a replay.
+    #[must_use]
+    pub const fn payload_caps(
+        mut self,
+        max_activity_input: u64,
+        max_signal_payload: u64,
+        max_workflow_input: u64,
+    ) -> Self {
+        self.payload_limits.max_activity_input = max_activity_input;
+        self.payload_limits.max_signal_payload = max_signal_payload;
+        self.payload_limits.max_workflow_input = max_workflow_input;
+        self
+    }
+
+    /// Apply the **candidate** build's large-payload offload threshold (#524).
+    ///
+    /// A payload above the threshold is offloaded rather than capped, so a
+    /// debugger that knows the cap but not the threshold reports a divergence
+    /// the promoted worker would never hit. `None` (the default) models a
+    /// worker with no `PayloadStore` registered.
+    #[must_use]
+    pub const fn payload_offload_threshold(mut self, threshold: Option<u64>) -> Self {
+        self.payload_limits.offload_threshold = threshold;
         self
     }
 
@@ -1194,7 +1372,21 @@ impl ReplayDebugger {
         // Configured via `ReplayDebugger::history_policy`; without this the
         // setter is dead and `should_continue_as_new()` always sees the
         // default threshold and deadline fraction.
-        .with_history_policy(self.history_policy);
+        .with_history_policy(self.history_policy)
+        // The candidate build's payload configuration (#798). Same class as
+        // `build_id` and `history_policy`: candidate configuration that lives in
+        // no `WorkflowEvent`, and that a replay left at library defaults gets
+        // wrong in both directions — see `ReplayDebugger::payload_caps`. The
+        // second argument is `max_activity_result`, which `WorkflowContext`
+        // never enforces, so it is pinned uncapped exactly as `run_workflow_strict`
+        // pins it.
+        .with_payload_caps(
+            self.payload_limits.max_activity_input,
+            0,
+            self.payload_limits.max_signal_payload,
+            self.payload_limits.max_workflow_input,
+        )
+        .with_payload_offload_threshold(self.payload_limits.offload_threshold);
 
         if let Some(workflow_id) = snapshot.workflow_id.clone() {
             ctx = ctx.with_workflow_id(workflow_id);
@@ -1317,12 +1509,37 @@ impl HistoryAccumulator {
         });
     }
 
-    fn close(&mut self, kind: AwaitableKind, id: &str) {
-        if let Some(pos) = self
+    /// Closes the matching open awaitable, returning it so a caller can read
+    /// fields the *closing* event does not carry (a child terminal names only
+    /// the `child_id`, but its reserved race timer encodes the workflow name).
+    fn close(&mut self, kind: AwaitableKind, id: &str) -> Option<OpenAwaitable> {
+        let pos = self
             .open
             .iter()
-            .position(|a| a.kind == kind && a.id.as_deref() == Some(id))
-        {
+            .position(|a| a.kind == kind && a.id.as_deref() == Some(id))?;
+        Some(self.open.remove(pos))
+    }
+
+    /// Closes the oldest open reserved race-deadline timer whose id parses (via
+    /// `parse`) to `name`.
+    ///
+    /// A signal-win of a signal-or-deadline race (#476), or a child-win of a
+    /// child-or-deadline race (#779), tears its reserved deadline timer down
+    /// through an **event-less** `CancelRaceLosers` row delete: no `TimerFired`
+    /// and no `TimerCancelled` is ever recorded for the losing arm. Closing
+    /// only on those two events would therefore leave the loser open for every
+    /// later step, rendering a resolved race as a run still waiting on a timer.
+    ///
+    /// This mirrors `awaitables::close_race_arm_for` (issue #615) — and calls
+    /// the same id parsers, so a change to the reserved prefixes cannot drift
+    /// the two projections apart. Oldest-first in *recorded* order (`self.open`
+    /// is pushed in event order), so the K-th resolution closes the K-th oldest
+    /// reserved arm. A no-op on a timer-win, whose arm the recorded `TimerFired`
+    /// already closed.
+    fn close_race_arm(&mut self, parse: fn(&str) -> Option<&str>, name: &str) {
+        if let Some(pos) = self.open.iter().position(|a| {
+            a.kind == AwaitableKind::Timer && a.id.as_deref().and_then(parse) == Some(name)
+        }) {
             self.open.remove(pos);
         }
     }
@@ -1369,6 +1586,14 @@ impl HistoryAccumulator {
                 self.close(AwaitableKind::Timer, &timer_id.to_string());
             }
 
+            // A signal-win of a signal-or-deadline race (#476) closes the
+            // reserved deadline timer event-lessly — see `close_race_arm`. A
+            // genuinely LATE signal (timer-win) is a no-op: the recorded
+            // `TimerFired` already closed that arm.
+            WorkflowEvent::SignalReceived { signal_name, .. } => {
+                self.close_race_arm(crate::awaitables::reserved_signal_race_name, signal_name);
+            }
+
             WorkflowEvent::ChildWorkflowStarted {
                 child_id,
                 workflow_name,
@@ -1381,7 +1606,15 @@ impl HistoryAccumulator {
             ),
             WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
             | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
-                self.close(AwaitableKind::ChildWorkflow, &child_id.to_string());
+                // Mirror of the `SignalReceived` arm for the child-or-deadline
+                // race (#779). The terminal event names only the `child_id`, so
+                // the workflow name its reserved timer encodes comes from the
+                // awaitable being closed.
+                if let Some(child) = self.close(AwaitableKind::ChildWorkflow, &child_id.to_string())
+                    && let Some(name) = child.name
+                {
+                    self.close_race_arm(crate::awaitables::reserved_child_race_name, &name);
+                }
             }
 
             WorkflowEvent::UpdateAdmitted {

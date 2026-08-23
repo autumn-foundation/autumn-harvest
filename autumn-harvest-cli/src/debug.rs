@@ -335,6 +335,14 @@ pub fn render_diff(diff: &TraceDiff, left_label: &str, right_label: &str) -> Str
                 "INCONCLUSIVE: {left_label} and {right_label} agree across the {examined} steps\n                 that were compared, but at least one trace was capped by --max-steps,\n                 so the remainder was never examined. Raise the cap to get a verdict.\n"
             );
         }
+        if let Some(step) = diff.inconclusive_step {
+            // Both sides failed to replay the same way, so they compare equal at
+            // every field — but neither was ever successfully replayed, so
+            // "they agree" would be a claim about two non-answers.
+            return format!(
+                "INCONCLUSIVE: {left_label} and {right_label} match across the {examined} steps\n                 that were compared, but neither replayed successfully at step {step}\n                 (it timed out, panicked, or was never replayed), so agreement there\n                 says nothing about the code. Fix the spin or panic to get a verdict.\n"
+            );
+        }
         return format!(
             "no divergence: {left_label} and {right_label} agree across all {examined} steps\n"
         );
@@ -677,12 +685,17 @@ pub fn run_diff(left: &Path, right: &Path, format: DebugFormat) -> Result<(), Cl
     }
     // No divergence found — but only a clean *complete* comparison is exit 0.
     // `TraceDiff::is_clean` is what distinguishes the two; testing
-    // `divergence.is_none()` here would report an unexamined suffix as a pass.
+    // `divergence.is_none()` here would report an unexamined suffix, or two
+    // builds that both failed to replay, as a pass.
     if diff.is_clean() {
-        Ok(())
-    } else {
-        Err(CliError::DebugDiffInconclusive {
-            examined: diff.left_steps.min(diff.right_steps),
-        })
+        return Ok(());
     }
+    Err(CliError::DebugDiffInconclusive {
+        examined: diff.left_steps.min(diff.right_steps),
+        reason: if diff.inconclusive_step.is_some() {
+            "neither build replayed successfully at a compared step"
+        } else {
+            "the --max-steps cap left a suffix unexamined"
+        },
+    })
 }

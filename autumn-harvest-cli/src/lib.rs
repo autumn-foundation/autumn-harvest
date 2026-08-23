@@ -612,12 +612,14 @@ pub enum CliError {
     /// the other "could not determine" gates (`WorkflowReachabilityGate`,
     /// `QueueCoverageGate`, `RestoreUndetermined`) so a script can tell it
     /// apart from `1` = "differences found".
-    #[error(
-        "debug diff: inconclusive — only {examined} steps were compared before the --max-steps cap"
-    )]
+    #[error("debug diff: inconclusive — {reason} (compared {examined} steps)")]
     DebugDiffInconclusive {
         /// How many steps were actually compared.
         examined: usize,
+        /// Why the comparison could not reach a verdict. Distinguishes an
+        /// unexamined suffix (a `--max-steps` cap) from two builds that both
+        /// failed to replay, which agree only because neither answered.
+        reason: &'static str,
     },
 
     /// A terminal operation failed while running the interactive stepper
