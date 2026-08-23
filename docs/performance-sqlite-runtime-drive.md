@@ -45,14 +45,24 @@ scheduled input and the completed output.
 
 This is deliberately **not** a single-cycle replay slice. Unlike
 `replay_profile.rs` (which calls `WorkflowReplayer::replay_from_events` once
-over a pre-built history), this harness drives the *whole run* — every one of
-the `n` decision cycles the SQLite backend's single-writer, poll-driven
-architecture actually performs to complete an `n`-activity workflow (confirmed
-by reading `SqliteRuntime::drive_one_cycle`/`drive_suspension`: each cycle
-does exactly one `apply_commands` + `drain_ready` pass, so an `n`-activity
-sequential workflow takes `n` decision cycles, not `2n` or `1`). That is the
-realistic full-run cost a production embedder pays, not an isolated function
-call.
+over a pre-built history), this harness drives the *whole run* — every
+decision cycle the SQLite backend's single-writer, poll-driven architecture
+actually performs to complete an `n`-activity workflow. That is **`n + 1`
+cycles, not `n`** (confirmed both by reading
+`SqliteRuntime::drive_one_cycle`/`drive_suspension` and by empirically
+instrumenting a cycle counter for `n = 1, 2, 3, 5, 10`, which returned
+`2, 3, 4, 6, 11` respectively): cycles `1..n` each do one
+`apply_commands` + `drain_ready` pass that schedules **and** synchronously
+completes one activity inline (this workload's `ActivitySpec` is a
+synchronous `Ok(input)` closure, so scheduling and completion land in the
+*same* cycle), but the workflow function does not observe activity `n`'s
+completion — and therefore cannot fall off the end of its loop and return —
+until it replays *again* on a fresh reload. That extra, `(n + 1)`-th cycle
+reloads the full, now-complete history (the largest reload in the entire
+run — larger than any of the `n` work-performing cycles, none of which ever
+see the full final-size history) purely to discover there is no more work
+and persist `WorkflowCompleted`. That is the realistic full-run cost a
+production embedder pays, not an isolated function call.
 
 `SQLITE_RUNTIME_PROFILE_N` (default `100`) sets the activity count.
 `SQLITE_RUNTIME_PROFILE_REPS` (default `1`) repeats the whole
@@ -215,13 +225,23 @@ let (outcome, pending, _span) = run_workflow_with_state_history_policy_and_caps(
 String>`) before parsing it with `serde_json::from_str` into a
 `WorkflowEvent`, collecting the whole result into a fresh `Vec`.
 
-For an `n`-activity sequential workflow, cycle `k` (of `n` total cycles) has
-accumulated `O(k)` events (`WorkflowStarted` + `ActivityScheduled`/
-`ActivityCompleted` pairs for the `k-1` already-completed activities plus the
-one in flight). `drive_one_cycle` reloads and fully re-parses **all** of them
-on cycle `k`, not just the delta since cycle `k-1` — so total work across the
-run is `Σ(k=1..n) O(k) = O(n²)`, exactly the trend the four-point Ir/dhat
-scaling curves above show empirically. The `.clone()` on top is required
+For an `n`-activity sequential workflow, cycle `k` (of `n + 1` total cycles,
+see "Workload" above) BEGINS with `O(2k - 1)` accumulated events
+(`WorkflowStarted` plus an `ActivityScheduled`/`ActivityCompleted` pair for
+each of the `k - 1` already-completed activities) for `k = 1..n`, and the
+final, `(n + 1)`-th cycle begins with `O(2n + 1)` events — the largest
+reload in the run, since it is the only cycle that ever sees all `n`
+activities' events at once. `drive_one_cycle` reloads and fully re-parses
+**all** of them on every cycle, not just the delta since the previous one —
+so total work across the run is `Σ(k=1..n) O(2k - 1) + O(2n + 1) = O(n²) +
+O(n) = O(n²)`, exactly the trend the four-point Ir/dhat scaling curves above
+show empirically. The extra `+1` cycle is strictly the single largest
+individual reload in the run (`2n + 1` events vs. at most `2n - 1` for any
+of the `n` work cycles), but its contribution to the *total* — one `O(n)`
+term against a `Σ(k=1..n) O(2k - 1) = n²` sum — shrinks as a *fraction* of
+total reload volume as `n` grows (2.45% of the 6,561 total events reloaded
+at `n = 80`): the quadratic sum of the `n` work cycles, not the one extra
+cycle, is what dominates at scale. The `.clone()` on top is required
 because `run_workflow_with_state_history_policy_and_caps`'s signature takes
 `history: Vec<WorkflowEvent>` by value (confirmed in
 `autumn-harvest/src/executor.rs`), while `drive_one_cycle` needs the
@@ -351,10 +371,11 @@ in-process still has to clone it out for that by-value call); and the
 workflow function itself still replays every prior activity call from the
 top on every cycle (the 15.05% "what isn't the finding" cost above). Both
 are inherent to a from-the-top-replay execution model, independent of where
-the history data lives. So `Σ(k=1..n) O(k)` — the `O(n²)` total-run cost
-this profile demonstrates — remains `O(n²)` after this fix, just with a
-meaningfully smaller per-k constant (the ~52% SQL/parse share removed from
-each term). Eliminating the clone would need the core-crate signature change
+the history data lives. So `Σ(k=1..n) O(2k - 1) + O(2n + 1)` (see
+"Hypothesis" above for the `n + 1`-cycle derivation) — the `O(n²)` total-run
+cost this profile demonstrates — remains `O(n²)` after this fix, just with a
+meaningfully smaller per-cycle constant (the ~52% SQL/parse share removed
+from each term). Eliminating the clone would need the core-crate signature change
 already ruled out above (shared with Postgres, an architectural ask of its
 own); eliminating the from-the-top replay would mean changing how workflow
 functions are invoked during replay, which is a property of the
@@ -434,8 +455,12 @@ valgrind --tool=callgrind --branch-sim=no --cache-sim=no \
   --callgrind-out-file=callgrind.out "$BIN"
 callgrind_annotate --threshold=100 callgrind.out | head -40
 
-# Allocation counts/bytes:
-valgrind --tool=dhat --dhat-out-file=dhat.json "$BIN"
+# Allocation counts/bytes -- `--num-callers=30` is REQUIRED to reproduce the
+# allocation-site attribution table above; the default depth (12) truncates
+# `serde_json::Value::deserialize`'s recursive descent before it reaches the
+# real Rust caller for a large share of allocations (see "Methodology note"
+# under "Allocation-site attribution" above):
+valgrind --tool=dhat --dhat-out-file=dhat.json --num-callers=30 "$BIN"
 ```
 
 `SQLITE_RUNTIME_PROFILE_N` (default `100`) and `SQLITE_RUNTIME_PROFILE_REPS`
