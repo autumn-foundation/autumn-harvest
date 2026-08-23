@@ -37,3 +37,65 @@
   **CI portability fix.** `engine_minted_id_fields_match_the_event_enum` — the round-2 drift guard that re-derives the allowlist from `event.rs` at test time — scanned for the enum's closing brace with `find("\n}\n")`, which finds nothing on a checkout with CRLF line endings, so the test *panicked* on the Windows CI runner instead of asserting (3070 passed, 1 failed). The source is now normalized to LF immediately after reading, which fixes both the terminator scan and the per-line field scan on every OS. Verified by converting `event.rs` to CRLF in the working tree: the test passes with the fix and reproduces the exact Windows panic without it.
 
   **Post-review hardening, Codex round 4 (two P1s — a third and fourth false-clean shape — and one P2).** (1) **A build that never replayed successfully was certified as clean.** A step that timed out (a spinning workflow) or panicked reports `divergence: None` because the replay never *finished*, not because the build agreed — and the documented single-build check was a scan for `divergence.is_some()`, so both certified clean. Two builds failing the *same* way likewise compared equal at every field, so `diff_traces` returned no divergence: agreement between two non-answers. Fixed with the round-3 `TraceDiff::is_clean()` pattern applied one level down — `ReplayTrace::is_clean()` (`!truncated && no unsuccessful step && no divergent step`) is now the documented verdict, with `first_unsuccessful_step()` / `first_divergent_step()` reporting *which* reason applies, and `TraceDiff` gained `inconclusive_step` so a both-sides-failed comparison renders `INCONCLUSIVE` and exits **2** rather than `0`. The docs table, the example's three assertions, and the CLI all moved onto it. **The `NotReplayed` carve-out is load-bearing and nearly went the wrong way**: the first cut folded it in with timed-out/panicked, which broke the pre-existing round-3 control — a handler-free `ReplayTrace::from_history` projection is `NotReplayed` at every step, so AC3's compare-two-recordings mode (the CLI's *primary* diff path) would have exited `2` on every fixture diff. The two questions need opposite treatment and now have separate predicates: `is_clean()` on a single trace requires `replay_succeeded()` (a projection that ran no code has verified nothing), while `inconclusive_step` keys on `replay_failed()` only (a fixture-vs-fixture diff compares history-derived facts, which the two recordings determine completely, so it is genuinely conclusive). Both directions are pinned, including a named guard for the carve-out itself. (2) **The candidate build's payload caps were not applied during prefix replay.** `max_activity_input` / `max_signal_payload` / `max_workflow_input` and the #524 offload threshold live in no `WorkflowEvent` — the live worker supplies its own from `BuiltHarvest` — and the cap is consulted exactly at the `NoMatch` frontier, which is where *every* prefix step lands. Left at library defaults the debugger answered a question about a worker that does not exist, in both directions: a candidate that lowers a cap has an over-cap dispatch accepted here and rejected in production (false-GREEN), while a candidate configuring an offload threshold has a legitimate over-cap payload rejected here (false-RED, a fabricated early-return divergence on a valid export). This is the same threading debt rounds 2 and #798 paid down for `parent_execution_id` / `execution_timeout` / `deadline_at` / `history_policy`; `ReplayDebugger` gains `payload_caps()` and `payload_offload_threshold()` mirroring `WorkflowReplayer`'s, applied through already-`pub` `WorkflowContext` builders so AC5 still holds. `max_activity_result` is deliberately absent — the worker enforces it after an activity returns, never `WorkflowContext`, so it cannot affect a replay. (3) **P2 — event-less race-loser timers stayed open forever.** A signal-win of a signal-or-deadline race (#476), or a child-win of a child-or-deadline race (#779), tears its reserved deadline timer down through an **event-less** `CancelRaceLosers` row delete: no `TimerFired`, no `TimerCancelled` is ever recorded. Closing timers only on those two events left the loser in `open_awaitables` for every later step, rendering a resolved race as a run still waiting on a timer — the same bug `awaitables.rs` fixed for the history projection in #615. The accumulator now mirrors that cleanup and calls **the same** id parsers (promoted to `pub(crate)`), so a change to the reserved prefixes cannot drift the two projections apart; `close` returns the removed awaitable because a child terminal names only the `child_id` while its reserved timer encodes the workflow *name*. Regressions, each verified to fail against its own pre-fix code: a spinning and a panicking build are not clean (with a genuinely-clean control, so the tightening cannot have made every trace unclean), a handler-free projection is never clean, two identically-failing builds diff inconclusive (with a differently-failing control that must stay a real divergence, and a healthy-pair control), a signal-win and a child-win close their reserved timers (with two controls: an author's own `ctx.timer` and another signal's reserved arm must survive, and a late signal after a timer-win must not close an unrelated timer), and a lowered cap changes the replay outcome while an offload threshold exempts it. A self-review pass on the same commit closed two stragglers of the same class the round-4 fix itself left behind: the module-level doc still told readers to scan for `divergence.is_some()` — the exact hand-rolled check `is_clean()` replaces, so a reader following it would reintroduce the bug — and the CLI's `DiffKind::Divergence` arm labelled a side carrying no divergence as `replays cleanly` even when that side had **panicked**. The second is reachable because `step_diff_kind` compares `divergence` *before* `outcome`, so a crashed build that never got far enough to disagree with anything reaches that arm with `None` — describing it as clean in the very report a reviewer reads to decide is the worst possible wording on a divergence-finding tool. It now names the outcome instead (`no divergence observed, but the replay panicked (nothing was compared)`), pinned by `diff_render_never_calls_a_panicked_side_clean`, which drives two real registered builds to that exact shape and asserts the precondition (`left` divergence `None`, outcome `panicked`) so it cannot pass for the wrong reason. The `INCONCLUSIVE` wording was also corrected: it claimed a never-replayed step could trigger it, which the deliberate `NotReplayed` carve-out above rules out.
+
+**Codex round 5 — candidate configuration and per-run identity.** Six findings,
+all of the same two families the earlier rounds established: a *row column or
+build configuration that lives in no `WorkflowEvent`*, and *per-run identity
+compared verbatim*. Two P1s and four P2s, each fixed structurally and each
+proven falsifiable by reverting it in isolation.
+
+*Missing replay inputs (P1 ×2).* `ReplayDebugger` never registered the
+candidate's declarative `#[query]`/`#[update]` handlers, so a workflow body
+branching on `ctx.list_query_names()` ran every prefix against an **empty**
+registry and took the other branch — a divergence invented by the debugger on
+code nobody changed (false RED), or, for a candidate that added or removed a
+registration, a branch the promoted worker will take that replay never exercised
+(false GREEN). New `ReplayDebugger::queries` / `::updates` builders thread them
+through the executor's own `register_declarative_handlers`, which filters by
+workflow type off the context, so the debugger and the worker cannot drift and
+another workflow's same-named handler can never leak onto this one. Separately,
+a claim-check reference envelope (#524) was handed to the handler raw: new
+`ReplayDebugger::payload_offloader` inflates envelopes once at the snapshot
+boundary, so the display projection and every prefix replay share one inflated
+list. Optional by design — with no offloader configured an envelope displays as
+an envelope and is never an error, which is AC4's contract for an export
+debugged with no store to hand.
+
+*Per-run session identity (P2 ×2).* `ctx.create_session` (#606) mints a fresh
+`SessionId::new()` at the frontier, and that UUID reached the diff through
+**four** separate carriers: the `RecordMarker` command payload, the
+`ScheduleActivity.session_id` field, the reserved `__harvest_session_acquire` /
+`__harvest_session_release` activity's *input* (surfaced by the regression test,
+not by the review), and the recorded `MarkerSnapshot` in `history_fact_diff`.
+Each is now normalized to the shared `<per-run>` placeholder — discriminated by
+the **marker name** and the **reserved activity name**, never by "the value looks
+like a UUID", so an application marker or activity that legitimately carries a
+caller-chosen UUID still compares verbatim. Presence is preserved (`None` vs
+`Some` still differs), and `MarkerSnapshot::details` stays verbatim for *display*
+— the normalization lives on the comparison side, the same display/identity
+split as `CommandSnapshot`'s `summary` vs `payload`.
+
+*Breakpoint precision (P2).* `Breakpoint::ActivityName` tokenized the rendered
+command summary on `' ,()='`, so an activity named `"charge card"` was
+unmatchable at exactly the step the breakpoint is for — a dispatching frontier,
+where no `ActivityScheduled` event exists yet to match instead. Nothing restricts
+an activity name to one token. It now strips only the one known qualifier
+(`ScheduleActivity`'s `" -> {queue}"`), split from the right so a name that
+itself contains `" -> "` still resolves; `RunLocalActivity` and
+`ScheduleExternalActivity` summaries *are* the bare name. Sibling of the round-3
+signal-name fix, which only covered the signal path.
+
+*Terminal teardown (P2).* The TUI's normal-exit restore discarded
+`disable_raw_mode` / `LeaveAlternateScreen` / `show_cursor` failures, so a shell
+genuinely left in raw mode — the exact failure the panic hook and the setup
+rollback exist to prevent — exited `0` with no diagnostic. Every step is still
+attempted regardless of the previous one's outcome; the first failure is now
+reported as `CliError::DebugTerminal`, and the event loop's own error still wins
+(a teardown failure downstream of it is usually the same root cause).
+
+Tests: seven added to `debugger_tests.rs` (74 total) — a frontier session mint,
+two recordings differing only in their session marker (with an
+application-marker control proving the normalization is not itself a
+false-clean), a multi-word activity breakpoint plus a `" -> "`-containing name,
+a declarative-query branch with its empty-registry control, cross-workflow
+handler filtering, and offload inflation with its verbatim-envelope control.

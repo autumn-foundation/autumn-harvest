@@ -546,17 +546,10 @@ fn step_names_activity(step: &DebugStep, name: &str) -> bool {
             && a.name.as_deref() == Some(name)
     });
     opened_here
-        || step.commands.iter().any(|c| {
-            matches!(
-                c.kind,
-                "ScheduleActivity" | "RunLocalActivity" | "ScheduleExternalActivity"
-            )
-            // Only the *first* segment: `ScheduleActivity`'s summary is
-            // `"{name} -> {queue}"`, so matching any segment would make
-            // `ActivityName("payments")` hit every activity on the `payments`
-            // queue — a false breakpoint on an unrelated step.
-            && first_segment(&c.summary) == name
-        })
+        || step
+            .commands
+            .iter()
+            .any(|c| frontier_activity_name(c) == Some(name))
 }
 
 /// `true` when the step's own event, or its frontier commands, name this signal.
@@ -587,13 +580,31 @@ fn signal_name_of(event: &WorkflowEvent) -> Option<String> {
     }
 }
 
-/// The leading segment of a rendered command summary — the command's own
-/// name, before any ` -> queue` or ` (…)` qualifier.
-fn first_segment(summary: &str) -> &str {
-    summary
-        .split([' ', ',', '(', ')', '='])
-        .next()
-        .unwrap_or(summary)
+/// The activity name a frontier command dispatches, when it dispatches one.
+///
+/// **Strips the one known qualifier rather than tokenizing.** Only
+/// `ScheduleActivity` appends one (`"{name} -> {queue}"`, see
+/// [`render_command`]); `RunLocalActivity` and `ScheduleExternalActivity`
+/// summaries *are* the bare name. Splitting on whitespace (or on `,()=`) instead
+/// made `ActivityName("charge card")` unmatchable at exactly the step a
+/// breakpoint is for — a waiting frontier, where no `ActivityScheduled` event
+/// exists yet to match instead. Nothing in the engine restricts an activity name
+/// to one token: it is the free-form `#[activity]` fn name or a
+/// `execute_activity_raw` string.
+///
+/// Split from the **right** so a name that itself contains `" -> "` still
+/// resolves — the queue qualifier is always appended last.
+fn frontier_activity_name(command: &CommandSnapshot) -> Option<&str> {
+    match command.kind {
+        "ScheduleActivity" => Some(
+            command
+                .summary
+                .rsplit_once(" -> ")
+                .map_or(command.summary.as_str(), |(name, _)| name),
+        ),
+        "RunLocalActivity" | "ScheduleExternalActivity" => Some(&command.summary),
+        _ => None,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -967,7 +978,7 @@ fn history_fact_diff(l: &DebugStep, r: &DebugStep) -> Option<&'static str> {
     if side_effect_shapes(l_side_effects) != side_effect_shapes(&r.side_effects) {
         return Some("side_effects");
     }
-    if l_markers != &r.markers {
+    if normalized_markers(l_markers) != normalized_markers(&r.markers) {
         return Some("markers");
     }
     // Last, as the completeness backstop. The projections above are *curated*:
@@ -1037,6 +1048,31 @@ fn awaitable_shapes(awaitables: &[OpenAwaitable]) -> Vec<(AwaitableKind, Option<
 /// Project side effects onto their comparable shape. The recorded `value` is
 /// compared only for `Custom` side effects — the `Now`/`Uuid`/`Random` kinds
 /// are freshly drawn per run by design (see [`history_fact_diff`]).
+/// Marker snapshots with engine-minted per-run identity stripped, for
+/// comparison only.
+///
+/// [`MarkerSnapshot::details`] stays verbatim for *display* — a debugger showing
+/// `"<per-run>"` where a session id lives would be worse than useless — so the
+/// normalization lives here, on the comparison side. Same display/identity split
+/// as [`CommandSnapshot`]'s `summary` vs `payload`. See
+/// [`is_engine_minted_marker`].
+fn normalized_markers(markers: &[MarkerSnapshot]) -> Vec<MarkerSnapshot> {
+    markers
+        .iter()
+        .map(|m| {
+            if is_engine_minted_marker(&m.name, &m.details) {
+                MarkerSnapshot {
+                    name: m.name.clone(),
+                    details: Value::String(NORMALIZED.to_string()),
+                    event_index: m.event_index,
+                }
+            } else {
+                m.clone()
+            }
+        })
+        .collect()
+}
+
 fn side_effect_shapes(
     effects: &[SideEffectSnapshot],
 ) -> Vec<(&'static str, Option<&str>, usize, Option<&Value>)> {
@@ -1093,6 +1129,17 @@ pub enum DebugError {
          `harvest history export <ID> --payload-policy full`"
     )]
     RedactedHistory,
+
+    /// A claim-check envelope could not be inflated from the configured store.
+    ///
+    /// Refused rather than replayed against the raw envelope: a workflow that
+    /// inspects the payload would take a different branch and report a
+    /// divergence that is an artefact of the missing blob, not of the code.
+    #[error("could not inflate an offloaded payload from the configured store: {reason}")]
+    PayloadInflate {
+        /// The underlying store or checksum failure.
+        reason: String,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1131,6 +1178,9 @@ pub struct ReplayDebugger {
     history_policy: WorkflowHistoryPolicy,
     build_id: Option<String>,
     payload_limits: crate::executor::ReplayPayloadLimits,
+    declarative_queries: Vec<crate::info::QueryHandlerInfo>,
+    declarative_updates: Vec<crate::info::UpdateHandlerInfo>,
+    payload_offloader: Option<std::sync::Arc<crate::payload_store::PayloadOffloader>>,
 }
 
 impl fmt::Debug for ReplayDebugger {
@@ -1163,6 +1213,9 @@ impl ReplayDebugger {
             history_policy: WorkflowHistoryPolicy::default(),
             build_id: None,
             payload_limits: crate::executor::ReplayPayloadLimits::default(),
+            declarative_queries: Vec::new(),
+            declarative_updates: Vec::new(),
+            payload_offloader: None,
         }
     }
 
@@ -1170,6 +1223,65 @@ impl ReplayDebugger {
     #[must_use]
     pub fn register_fn(mut self, name: impl Into<String>, handler: WorkflowHandlerFn) -> Self {
         self.handlers.insert(name.into(), handler);
+        self
+    }
+
+    /// Register the candidate build's declarative `#[query]` handlers.
+    ///
+    /// The live worker registers a workflow's declarative handlers **before any
+    /// workflow code runs**, and [`WorkflowContext::list_query_names`] merges
+    /// them into its result — so a workflow that branches on which handlers
+    /// exist, or that dispatches a query, observes them. They live in no
+    /// `WorkflowEvent`, so a pure-history replay cannot recover them: without
+    /// this the debugger runs every prefix against an *empty* registry.
+    ///
+    /// That is wrong in both directions, and both are false answers from a
+    /// divergence-finding tool. A candidate that **keeps** a registration the
+    /// recorded run had is the false-RED direction: replay takes the other
+    /// branch and reports drift on code nobody changed. A candidate that
+    /// **adds or removes** one is the false-GREEN direction: the branch the
+    /// promoted worker will take was never exercised, so the diff certifies a
+    /// build on evidence it never gathered.
+    ///
+    /// Pass the same `queries![…]` collection the candidate build registers;
+    /// entries for other workflow types are filtered out, exactly as the worker
+    /// filters them.
+    #[must_use]
+    pub fn queries(mut self, queries: Vec<crate::info::QueryHandlerInfo>) -> Self {
+        self.declarative_queries = queries;
+        self
+    }
+
+    /// Register the candidate build's declarative `#[update]` handlers.
+    ///
+    /// See [`queries`](Self::queries) — same reasoning, same failure modes.
+    #[must_use]
+    pub fn updates(mut self, updates: Vec<crate::info::UpdateHandlerInfo>) -> Self {
+        self.declarative_updates = updates;
+        self
+    }
+
+    /// Inflate large-payload claim-check envelopes before replay (issue #524).
+    ///
+    /// A deployment with a registered `PayloadStore` records an over-threshold
+    /// payload as a small reference envelope rather than the value itself. The
+    /// live worker inflates those envelopes back to the real payload before the
+    /// workflow body sees them, so a replay that skips inflation hands the
+    /// handler an envelope where the recorded run had a value — and a workflow
+    /// that inspects the payload takes a different branch, reporting a
+    /// divergence that is an artefact of the debugger rather than of the code.
+    ///
+    /// **Optional by design.** With no offloader configured the envelopes are
+    /// displayed verbatim, which is AC4's contract for an export debugged with
+    /// no store to hand: an envelope displays as an envelope and is never an
+    /// error. Configure this when you have the store and want the workflow body
+    /// to see through it.
+    #[must_use]
+    pub fn payload_offloader(
+        mut self,
+        offloader: std::sync::Arc<crate::payload_store::PayloadOffloader>,
+    ) -> Self {
+        self.payload_offloader = Some(offloader);
         self
     }
 
@@ -1287,13 +1399,19 @@ impl ReplayDebugger {
     /// has no registered handler.
     pub async fn trace_snapshot(
         &self,
-        snapshot: HistorySnapshot,
+        mut snapshot: HistorySnapshot,
     ) -> Result<ReplayTrace, DebugError> {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return Err(DebugError::HandlerNotRegistered {
                 name: snapshot.workflow_name,
             });
         };
+
+        // Before *anything* reads the events — the projection and every prefix
+        // replay share one inflated list, so display and comparison can never
+        // disagree about what a payload is. A no-op when no offloader is
+        // configured, which is the AC4 default (envelopes display as envelopes).
+        self.inflate(&mut snapshot.events).await?;
 
         // The handler-free projection supplies every AC1 field except the
         // per-step pending commands; prefix replay fills those in.
@@ -1340,6 +1458,29 @@ impl ReplayDebugger {
         }
 
         Ok(trace)
+    }
+
+    /// Inflate claim-check envelopes in place, when an offloader is configured.
+    ///
+    /// Mirrors `WorkflowReplayer::maybe_inflate`: round-trip each event through
+    /// `Value`, let [`PayloadOffloader::inflate_event_value`] replace the
+    /// envelopes, and deserialize back. See
+    /// [`payload_offloader`](Self::payload_offloader).
+    async fn inflate(&self, events: &mut [WorkflowEvent]) -> Result<(), DebugError> {
+        let Some(offloader) = &self.payload_offloader else {
+            return Ok(());
+        };
+        for event in events.iter_mut() {
+            let mut value = serde_json::to_value(&*event)?;
+            offloader
+                .inflate_event_value(&mut value)
+                .await
+                .map_err(|source| DebugError::PayloadInflate {
+                    reason: source.to_string(),
+                })?;
+            *event = serde_json::from_value(value)?;
+        }
+        Ok(())
     }
 
     /// Replay one prefix and collect the frontier commands, the stop reason,
@@ -1402,6 +1543,22 @@ impl ReplayDebugger {
         if let Some(headers) = snapshot.context_headers.clone() {
             ctx = ctx.with_context_headers(headers);
         }
+
+        // Before any workflow code runs, exactly as the live worker does — see
+        // `ReplayDebugger::queries`. `register_declarative_handlers` filters by
+        // workflow type off the context, so a whole `queries![…]` collection is
+        // narrowed to this workflow's own handlers at one choke point.
+        let queries: Vec<&crate::info::QueryHandlerInfo> =
+            self.declarative_queries.iter().collect();
+        let updates: Vec<&crate::info::UpdateHandlerInfo> =
+            self.declarative_updates.iter().collect();
+        crate::executor::register_declarative_handlers(
+            &ctx,
+            crate::executor::ReplayDeclarativeHandlers {
+                queries: &queries,
+                updates: &updates,
+            },
+        );
 
         let outcome = drive_query_replay_async(&ctx, handler, input, self.step_timeout).await;
 
@@ -1797,6 +1954,52 @@ fn resolved_payload(event: &WorkflowEvent) -> Option<Value> {
 /// `debugger_tests::engine_minted_id_fields_match_the_event_enum` re-derives
 /// this set from `event.rs` at test time, so an engine-minted field added to
 /// `WorkflowEvent` later fails until it is classified here.
+/// Stand-in for a stripped per-run value. A single shared marker keeps two
+/// recordings comparing equal on the field while leaving it visibly present,
+/// rather than deleting the key (which would make "absent" and "normalized"
+/// indistinguishable).
+const NORMALIZED: &str = "<per-run>";
+
+/// The `MarkerRecorded` name prefix `ctx.create_session` records its session
+/// identity under (issue #606).
+const SESSION_MARKER_PREFIX: &str = "session:";
+
+/// `true` when this marker's `details` is an engine-minted per-run id rather
+/// than an application value.
+///
+/// `WorkflowContext::resolve_session_id` mints a fresh `SessionId::new()` at the
+/// frontier and records it as `MarkerRecorded { name: "session:{seq}", details:
+/// <uuid> }`. Two independent recordings — and the two sides of a diff whose
+/// frontier step *creates* the session — therefore carry different UUIDs for the
+/// same logical session, which without this would report a divergence that is
+/// pure per-run noise.
+///
+/// Discriminated by the **marker name**, not by "the value looks like a UUID":
+/// an application marker (`ctx.side_effect`-adjacent bookkeeping, a
+/// `fan_out:{n}` count) may legitimately carry a caller-chosen UUID as its
+/// details, and that is semantic. The `Uuid::parse_str` guard is retained
+/// *alongside* the name match for the same reason it is in
+/// [`ENGINE_MINTED_ID_FIELDS`]: only an engine-minted value is stripped.
+fn is_engine_minted_marker(name: &str, details: &Value) -> bool {
+    name.starts_with(SESSION_MARKER_PREFIX)
+        && details
+            .as_str()
+            .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
+}
+
+/// Strip a UUID-shaped value, preserving a non-UUID value verbatim.
+///
+/// Callers map over an `Option`, so presence is preserved: `None` stays `None`
+/// and a build that joins a session still differs from one that does not — only
+/// the session's *identity* is normalized away.
+fn normalized_id(value: &str) -> String {
+    if uuid::Uuid::parse_str(value).is_ok() {
+        NORMALIZED.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 const ENGINE_MINTED_ID_FIELDS: &[&str] = &[
     "activity_id",
     "await_id",
@@ -1848,12 +2051,6 @@ const ENGINE_MINTED_ID_FIELDS: &[&str] = &[
 /// `input`/`output`/`payload`/`details`, where a UUID is real business data a
 /// diff must not discard.
 fn normalized_event_facts(event: &WorkflowEvent) -> Value {
-    /// Stand-in for a stripped per-run value. A single shared marker keeps two
-    /// recordings comparing equal on the field while leaving it visibly
-    /// present, rather than deleting the key (which would make "absent" and
-    /// "normalized" indistinguishable).
-    const NORMALIZED: &str = "<per-run>";
-
     let Ok(mut value) = serde_json::to_value(event) else {
         // `WorkflowEvent` is the persisted wire type, so this is unreachable in
         // practice; degrade to "no facts" rather than panicking a debugger.
@@ -1883,6 +2080,21 @@ fn normalized_event_facts(event: &WorkflowEvent) -> Value {
             *slot = Value::String(NORMALIZED.to_string());
         }
     }
+
+    // Cross-field, so it cannot live in the per-key loop above: an engine-minted
+    // session marker is identified by its *name*, and the value to strip is a
+    // sibling key. See `is_engine_minted_marker`.
+    let minted_marker = match (
+        data.get("name").and_then(Value::as_str),
+        data.get("details"),
+    ) {
+        (Some(name), Some(details)) => is_engine_minted_marker(name, details),
+        _ => false,
+    };
+    if minted_marker {
+        data.insert("details".to_string(), Value::String(NORMALIZED.to_string()));
+    }
+
     value
 }
 
@@ -2023,31 +2235,60 @@ fn render_command(command: &WorkflowCommand) -> CommandSnapshot {
 /// token, and the replay-bookkeeping flags (`already_scheduled`,
 /// `already_requested`, `failed_attempts`, `last_error`) that are recovered
 /// from history rather than chosen by the code.
+/// The [`command_payload`] projection for [`WorkflowCommand::ScheduleActivity`].
+///
+/// Split out only to keep `command_payload` under the line cap; it is otherwise
+/// one arm of that match and carries the same exhaustiveness contract.
+fn schedule_activity_payload(command: &WorkflowCommand) -> Option<Value> {
+    let WorkflowCommand::ScheduleActivity {
+        name,
+        input,
+        queue,
+        retry_policy_override,
+        start_to_close_override,
+        schedule_to_start_override,
+        session_id,
+        session_worker_id,
+        ..
+    } = command
+    else {
+        return None;
+    };
+    Some(serde_json::json!({
+        // The two reserved session activities (`__harvest_session_acquire` /
+        // `__harvest_session_release`) carry the session id *as their input* —
+        // the same frontier-minted `SessionId::new()` normalized out of
+        // `session_id` below. Discriminated by the reserved name, so an
+        // application activity that legitimately takes a UUID input still
+        // compares verbatim.
+        "input": if crate::context::is_reserved_session_activity_name(name) {
+            Value::from(input.as_str().map(normalized_id))
+        } else {
+            input.clone()
+        },
+        "queue": queue,
+        "retry_policy": retry_policy_override,
+        // Full precision, NOT `as_secs()`: a caller passes a raw `Duration`, so
+        // 100ms and 900ms would both collapse to 0 and two genuinely different
+        // builds would compare equal. `Duration` is `Serialize`
+        // (`{secs, nanos}`), so this is exact.
+        "start_to_close": start_to_close_override,
+        "schedule_to_start": schedule_to_start_override,
+        // Engine-minted at the frontier (`SessionId::new()`), so it differs per
+        // side while naming the same logical session; `None` vs `Some` is
+        // preserved, so joining a session still differs from not joining one.
+        // `session_worker_id` is *recovered from the recorded acquire activity's
+        // output*, so it is deterministic-from-history and compares verbatim.
+        // See `is_engine_minted_marker`.
+        "session_id": session_id.as_ref().map(|id| normalized_id(&id.to_string())),
+        "session_worker_id": session_worker_id.as_ref().map(ToString::to_string),
+    }))
+}
+
 fn command_payload(command: &WorkflowCommand) -> Option<Value> {
     match command {
         // Every semantic dispatch field; ids and channels excluded (see above).
-        WorkflowCommand::ScheduleActivity {
-            input,
-            queue,
-            retry_policy_override,
-            start_to_close_override,
-            schedule_to_start_override,
-            session_id,
-            session_worker_id,
-            ..
-        } => Some(serde_json::json!({
-            "input": input,
-            "queue": queue,
-            "retry_policy": retry_policy_override,
-            // Full precision, NOT `as_secs()`: a caller passes a raw
-            // `Duration`, so 100ms and 900ms would both collapse to 0 and two
-            // genuinely different builds would compare equal. `Duration` is
-            // `Serialize` (`{secs, nanos}`), so this is exact.
-            "start_to_close": start_to_close_override,
-            "schedule_to_start": schedule_to_start_override,
-            "session_id": session_id.as_ref().map(ToString::to_string),
-            "session_worker_id": session_worker_id.as_ref().map(ToString::to_string),
-        })),
+        WorkflowCommand::ScheduleActivity { .. } => schedule_activity_payload(command),
         WorkflowCommand::ScheduleExternalActivity {
             input,
             queue,
@@ -2091,7 +2332,13 @@ fn command_payload(command: &WorkflowCommand) -> Option<Value> {
         }
         WorkflowCommand::StartChildWorkflow { input, .. }
         | WorkflowCommand::ContinueAsNew { input, .. } => Some(input.clone()),
-        WorkflowCommand::RecordMarker { details, .. } => Some(details.clone()),
+        WorkflowCommand::RecordMarker { name, details } => {
+            Some(if is_engine_minted_marker(name, details) {
+                Value::String(NORMALIZED.to_string())
+            } else {
+                details.clone()
+            })
+        }
         WorkflowCommand::RecordSideEffect { value, .. } => Some(value.clone()),
         WorkflowCommand::PublishProgress { chunk: payload, .. }
         | WorkflowCommand::Complete { output: payload } => Some(payload.clone()),

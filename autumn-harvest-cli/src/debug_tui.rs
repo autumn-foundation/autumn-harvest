@@ -158,16 +158,39 @@ pub fn run(trace: &ReplayTrace, cursor: usize) -> Result<(), CliError> {
 
     // Restore the terminal even if the loop failed — a debugger that leaves the
     // user's shell in raw mode is worse than the bug they were chasing.
-    disable_raw_mode().unwrap_or_default();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).unwrap_or_default();
-    terminal.show_cursor().unwrap_or_default();
+    //
+    // **Every step is attempted, and a failure is reported rather than
+    // swallowed.** Discarding these (the earlier `unwrap_or_default()`) meant a
+    // shell genuinely left in raw mode — the failure the panic hook and the
+    // setup rollback above exist to prevent — exited `0` with no diagnostic, so
+    // the user is left in a broken shell with nothing pointing at why. Each
+    // step still runs regardless of the previous one's outcome; only the
+    // *first* failure is reported, since a later one is usually a consequence.
+    let steps: [(&'static str, Result<(), io::Error>); 3] = [
+        ("disable raw mode", disable_raw_mode()),
+        (
+            "leave alternate screen",
+            execute!(terminal.backend_mut(), LeaveAlternateScreen),
+        ),
+        ("show cursor", terminal.show_cursor()),
+    ];
+    // The array is built eagerly, which is what makes "every step runs" true.
+    let teardown = steps
+        .into_iter()
+        .find_map(|(op, res)| res.err().map(terminal_error(op)));
 
-    result.unwrap_or_else(|_| {
+    let outcome = result.unwrap_or_else(|_| {
         Err(CliError::DebugTerminal {
             op: "run stepper",
             reason: "the interactive stepper panicked (terminal restored)".to_string(),
         })
-    })
+    });
+    // The loop's own error wins: it is what the user was chasing, and a
+    // teardown failure downstream of it is usually the same root cause.
+    match (outcome, teardown) {
+        (Err(e), _) | (Ok(()), Some(e)) => Err(e),
+        (Ok(()), None) => Ok(()),
+    }
 }
 
 /// Map an `io::Error` from a terminal operation onto a `CliError`.

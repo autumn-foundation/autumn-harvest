@@ -2413,3 +2413,408 @@ fn a_signal_breakpoint_matches_a_multi_word_name_at_a_waiting_frontier() {
         "a partial name must NOT match, or the breakpoint is imprecise"
     );
 }
+
+// ── Codex round 5/6: per-run identity and missing replay inputs ──────────────
+
+#[test]
+fn an_activity_breakpoint_matches_a_multi_word_name_at_a_dispatching_frontier() {
+    // The sibling of the signal case above, and the same failure: an activity
+    // name is the free-form `#[activity]` fn name or an
+    // `execute_activity_raw` string, so nothing restricts it to one token.
+    // Tokenizing `ScheduleActivity`'s `"{name} -> {queue}"` summary on
+    // whitespace made `ActivityName("charge card")` unmatchable at exactly the
+    // step the breakpoint is for — a dispatching frontier, where no
+    // `ActivityScheduled` event exists yet to match instead.
+    let trace = ReplayTrace {
+        workflow_name: "wf".to_string(),
+        execution_id: ExecutionId::new(),
+        steps: vec![bare_step(
+            0,
+            vec![cmd("ScheduleActivity", "charge card -> payments")],
+            StepOutcome::Suspended,
+        )],
+        total_events: 1,
+        truncated: false,
+    };
+
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::ActivityName("charge card".to_string()), 0),
+        Some(0),
+        "a multi-word activity name must match the dispatching frontier"
+    );
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::ActivityName("charge".to_string()), 0),
+        None,
+        "a partial name must NOT match, or the breakpoint is imprecise"
+    );
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::ActivityName("payments".to_string()), 0),
+        None,
+        "the queue qualifier must NOT match — that would fire on every activity \
+         on the queue"
+    );
+}
+
+#[test]
+fn an_activity_breakpoint_survives_a_name_containing_the_queue_separator() {
+    // The qualifier is appended last, so the split is from the right.
+    let trace = ReplayTrace {
+        workflow_name: "wf".to_string(),
+        execution_id: ExecutionId::new(),
+        steps: vec![bare_step(
+            0,
+            vec![cmd("ScheduleActivity", "a -> b -> payments")],
+            StepOutcome::Suspended,
+        )],
+        total_events: 1,
+        truncated: false,
+    };
+    assert_eq!(
+        trace.find_breakpoint(&Breakpoint::ActivityName("a -> b".to_string()), 0),
+        Some(0)
+    );
+}
+
+/// A workflow that opens a worker session (issue #606) and then dispatches a
+/// member activity — the shape whose session identity is minted fresh per run.
+fn session_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let session = ctx
+            .create_session(autumn_harvest::context::SessionOptions::new("gpu"))
+            .await
+            .map_err(|e| e.to_string())?;
+        session
+            .execute_activity_raw("transcode", json!({}), "gpu")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[tokio::test]
+async fn two_identical_registrations_agree_across_a_frontier_session_mint() {
+    // `ctx.create_session` mints a fresh `SessionId::new()` at the frontier and
+    // records it as `MarkerRecorded { name: "session:0", details: <uuid> }`.
+    // Comparing that UUID verbatim makes two runs of the *same code* disagree
+    // on the very first frontier step — a fabricated divergence that buries
+    // every real one behind it.
+    let snapshot = snapshot("sessioned", vec![started()]);
+    let dbg = debugger("sessioned", session_workflow);
+
+    let left = dbg.trace_snapshot(snapshot.clone()).await.expect("trace");
+    let right = dbg.trace_snapshot(snapshot).await.expect("trace");
+
+    // Precondition: the frontier really does mint a session marker, or the test
+    // would pass vacuously.
+    let markers: Vec<&str> = left.steps[0]
+        .commands
+        .iter()
+        .filter(|c| c.kind == "RecordMarker")
+        .map(|c| c.summary.as_str())
+        .collect();
+    assert!(
+        markers.iter().any(|m| m.starts_with("session:")),
+        "expected a frontier session marker, got {markers:?}"
+    );
+
+    let diff = diff_traces(&left, &right);
+    assert!(
+        diff.is_clean(),
+        "identical code must agree despite per-run session identity: {diff:?}"
+    );
+}
+
+#[tokio::test]
+async fn two_recordings_agree_when_only_their_session_marker_differs() {
+    // The fixture-vs-fixture arm (AC3's second mode): two independent
+    // recordings of the same logical run carry different session UUIDs, which
+    // `history_fact_diff` compared verbatim through `markers` (and, behind it,
+    // `event_facts`).
+    let recording = |session: &str| {
+        vec![
+            started(),
+            WorkflowEvent::MarkerRecorded {
+                name: "session:0".to_string(),
+                details: json!(session),
+            },
+        ]
+    };
+    let left = ReplayTrace::from_history(
+        "wf",
+        ExecutionId::new(),
+        &recording("018f2b1c-0000-7000-8000-000000000001"),
+    );
+    let right = ReplayTrace::from_history(
+        "wf",
+        ExecutionId::new(),
+        &recording("018f2b1c-0000-7000-8000-000000000002"),
+    );
+
+    let diff = diff_traces(&left, &right);
+    assert!(
+        diff.is_clean(),
+        "an engine-minted session id must not read as a history difference: {diff:?}"
+    );
+
+    // ...but an *application* marker's details are semantic and must still be
+    // compared, or the normalization would be a false-clean of its own.
+    let app = |details: &str| {
+        vec![
+            started(),
+            WorkflowEvent::MarkerRecorded {
+                name: "fan_out:1".to_string(),
+                details: json!(details),
+            },
+        ]
+    };
+    let l = ReplayTrace::from_history(
+        "wf",
+        ExecutionId::new(),
+        &app("018f2b1c-0000-7000-8000-000000000001"),
+    );
+    let r = ReplayTrace::from_history(
+        "wf",
+        ExecutionId::new(),
+        &app("018f2b1c-0000-7000-8000-000000000002"),
+    );
+    assert!(
+        !diff_traces(&l, &r).is_clean(),
+        "an application marker carrying a UUID is semantic and must still differ"
+    );
+}
+
+/// A workflow that branches on which declarative query handlers the candidate
+/// build registers — the shape a replay with an empty registry gets wrong.
+fn query_gated_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let name = if ctx.list_query_names().iter().any(|n| n == "progress") {
+            "with_progress"
+        } else {
+            "without_progress"
+        };
+        ctx.execute_activity_raw(name, json!({}), "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+// The signature is fixed by `QueryHandlerFn`; the `Result` cannot be dropped.
+#[allow(clippy::unnecessary_wraps)]
+fn progress_query(_ctx: &WorkflowContext, _args: Value) -> Result<Value, String> {
+    Ok(json!("ok"))
+}
+
+fn progress_query_info(workflow: &'static str) -> autumn_harvest::info::QueryHandlerInfo {
+    autumn_harvest::info::QueryHandlerInfo {
+        name: "progress",
+        workflow,
+        module: "debugger_tests",
+        input_type_hint: "()",
+        output_type_hint: "String",
+        handler: progress_query,
+        description: None,
+        arg_schema: None,
+        response_schema: None,
+    }
+}
+
+#[tokio::test]
+async fn declarative_query_handlers_are_registered_before_the_body_runs() {
+    // The live worker registers a workflow's declarative handlers before any
+    // workflow code runs, and `list_query_names` merges them in — so a body
+    // that branches on them observes them. They live in no `WorkflowEvent`, so
+    // a replay that never registers them runs every prefix against an empty
+    // registry and takes the *other* branch: a divergence invented by the
+    // debugger on code nobody changed.
+    let snapshot = snapshot("gated", vec![started()]);
+
+    let with = ReplayDebugger::new()
+        .register_fn("gated", query_gated_workflow)
+        .queries(vec![progress_query_info("gated")])
+        .trace_snapshot(snapshot.clone())
+        .await
+        .expect("trace");
+    let scheduled: Vec<&str> = with.steps[0]
+        .commands
+        .iter()
+        .filter(|c| c.kind == "ScheduleActivity")
+        .map(|c| c.summary.as_str())
+        .collect();
+    assert_eq!(
+        scheduled,
+        vec!["with_progress -> default"],
+        "a registered declarative query must be visible to the workflow body"
+    );
+
+    // The control: with none registered the body takes the other branch, so the
+    // assertion above is falsifiable rather than true by accident.
+    let without = debugger("gated", query_gated_workflow)
+        .trace_snapshot(snapshot)
+        .await
+        .expect("trace");
+    let scheduled: Vec<&str> = without.steps[0]
+        .commands
+        .iter()
+        .filter(|c| c.kind == "ScheduleActivity")
+        .map(|c| c.summary.as_str())
+        .collect();
+    assert_eq!(scheduled, vec!["without_progress -> default"]);
+}
+
+#[tokio::test]
+async fn declarative_handlers_are_filtered_to_this_workflow_type() {
+    // Mirrors the worker, which narrows both registries to the dispatched
+    // execution's own type. Registering another workflow's `progress` here
+    // would show this workflow a name its promoted worker will never show it.
+    let trace = ReplayDebugger::new()
+        .register_fn("gated", query_gated_workflow)
+        .queries(vec![progress_query_info("some_other_workflow")])
+        .trace_snapshot(snapshot("gated", vec![started()]))
+        .await
+        .expect("trace");
+    let scheduled: Vec<&str> = trace.steps[0]
+        .commands
+        .iter()
+        .filter(|c| c.kind == "ScheduleActivity")
+        .map(|c| c.summary.as_str())
+        .collect();
+    assert_eq!(
+        scheduled,
+        vec!["without_progress -> default"],
+        "another workflow's handler must not leak onto this one's context"
+    );
+}
+
+// ── Offloaded payload inflation (issue #524 × the debugger) ─────────────────
+
+/// In-memory content-addressed store, mirroring `payload_offload_replay_tests`.
+#[derive(Default)]
+struct MemStore {
+    blobs: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+}
+
+impl autumn_harvest::payload_store::PayloadStore for MemStore {
+    fn store_id(&self) -> &'static str {
+        "debugtest"
+    }
+    fn put(&self, bytes: &[u8]) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, String> {
+        let key = format!("blob/{}", bytes.len());
+        self.blobs
+            .lock()
+            .unwrap()
+            .insert(key.clone(), bytes.to_vec());
+        Box::pin(async move { Ok(key) })
+    }
+    fn get(&self, key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, Vec<u8>> {
+        let found = self.blobs.lock().unwrap().get(key).cloned();
+        let key = key.to_string();
+        Box::pin(async move {
+            found.ok_or_else(|| {
+                autumn_harvest::payload_store::PayloadStoreError(format!("missing {key}"))
+            })
+        })
+    }
+    fn delete(&self, key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, ()> {
+        self.blobs.lock().unwrap().remove(key);
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+/// The large payload the recorded activity produced.
+fn big_output() -> Value {
+    json!({ "document": "X".repeat(300_000) })
+}
+
+/// Branches on whether the activity output is the real payload — a workflow
+/// handed a raw reference envelope takes the other branch.
+fn payload_sensitive_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let out = ctx
+            .execute_activity_raw("produce_blob", json!({}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let next = if out == big_output() {
+            "saw_payload"
+        } else {
+            "saw_envelope"
+        };
+        ctx.execute_activity_raw(next, json!({}), "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[tokio::test]
+async fn a_configured_offloader_inflates_envelopes_before_replay() {
+    use autumn_harvest::payload_store::PayloadOffloader;
+
+    let store = std::sync::Arc::new(MemStore::default());
+    let offloader = std::sync::Arc::new(PayloadOffloader::new(
+        store.clone(),
+        256 * 1024,
+        std::sync::Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+
+    // Persist the history exactly as a worker with a store would: the output is
+    // replaced in place by a small reference envelope.
+    let id = ActivityExecId::new();
+    let mut stored = vec![
+        started(),
+        scheduled(id, "produce_blob"),
+        completed(id, big_output()),
+    ];
+    for event in &mut stored {
+        let mut v = serde_json::to_value(&*event).unwrap();
+        offloader.offload_event_value(&mut v).await.unwrap();
+        *event = serde_json::from_value(v).unwrap();
+    }
+    // Precondition: the stored event really is an envelope, not the payload.
+    let stored_len = serde_json::to_string(&stored[2]).unwrap().len();
+    assert!(
+        stored_len < 4_000,
+        "expected a small reference envelope, got {stored_len} bytes"
+    );
+
+    let snapshot = snapshot("blobby", stored);
+
+    let inflated = ReplayDebugger::new()
+        .register_fn("blobby", payload_sensitive_workflow)
+        .payload_offloader(offloader)
+        .trace_snapshot(snapshot.clone())
+        .await
+        .expect("trace");
+    let scheduled_next: Vec<&str> = inflated.steps[2]
+        .commands
+        .iter()
+        .filter(|c| c.kind == "ScheduleActivity")
+        .map(|c| c.summary.as_str())
+        .collect();
+    assert_eq!(
+        scheduled_next,
+        vec!["saw_payload -> default"],
+        "a configured offloader must hand the body the real payload, not the envelope"
+    );
+
+    // The control (and AC4's default): with no offloader the envelope is passed
+    // through verbatim rather than errored, so the assertion above is
+    // falsifiable.
+    let raw = debugger("blobby", payload_sensitive_workflow)
+        .trace_snapshot(snapshot)
+        .await
+        .expect("an envelope must display, never error");
+    let scheduled_next: Vec<&str> = raw.steps[2]
+        .commands
+        .iter()
+        .filter(|c| c.kind == "ScheduleActivity")
+        .map(|c| c.summary.as_str())
+        .collect();
+    assert_eq!(scheduled_next, vec!["saw_envelope -> default"]);
+}

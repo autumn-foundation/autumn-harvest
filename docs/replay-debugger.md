@@ -425,6 +425,25 @@ autumn-harvest = { version = "0.5", default-features = false, features = ["debug
 | `diff_traces` | First-divergence detection between two traces |
 | `Breakpoint`, `DebugStep`, `TraceDiff`, `DiffKind` | The structured snapshot types |
 
+#### Matching the candidate build's configuration
+
+A prefix replay asks "what would *this build* do here?", so anything the
+promoted worker configures but that lives in **no `WorkflowEvent`** has to be
+supplied — a replay left at library defaults answers a different question, and
+gets it wrong in both directions (a fabricated divergence on code nobody
+changed, or a certified build whose real branch was never exercised).
+
+| Builder | Supplies |
+|---|---|
+| `.queries(...)` / `.updates(...)` | The candidate's declarative `#[query]` / `#[update]` registrations. A body branching on `ctx.list_query_names()` sees an **empty** registry without these. Pass the same `queries![…]` / `updates![…]` collection the build registers; entries for other workflow types are filtered out exactly as the worker filters them. |
+| `.payload_caps(...)` / `.payload_offload_threshold(...)` | The candidate's payload limits (#252, #524). |
+| `.payload_offloader(...)` | A `PayloadOffloader` over the deployment's `PayloadStore`, so claim-check reference envelopes (#524) are inflated back to the real payload before the body sees them. **Optional:** with none configured an envelope displays as an envelope and is never an error, which is the contract for an export debugged with no store to hand. |
+| `.history_policy(...)` / `.build_id(...)` / `.state(...)` | The candidate's history thresholds, build id, and shared application state. |
+
+The `HistorySnapshot`'s own replay inputs — `workflow_id`, `queue_name`,
+`context_headers`, `parent_execution_id`, `execution_timeout`, `deadline_at` —
+are threaded automatically; they are recorded in the export.
+
 ---
 
 ## Out of scope
