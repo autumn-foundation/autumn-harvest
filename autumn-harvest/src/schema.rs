@@ -10,6 +10,20 @@
 diesel::table! {
     use diesel::sql_types::*;
 
+    harvest_pacing_overrides (policy_kind, declared_name) {
+        policy_kind -> Text,
+        declared_name -> Text,
+        refill_per_sec -> Nullable<Double>,
+        burst -> Nullable<Double>,
+        expires_at -> Timestamptz,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     harvest_workflow_executions (id) {
         id -> Uuid,
         workflow_name -> Text,
@@ -981,6 +995,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_calendar_exclusions,
     harvest_schedule_decisions,
     harvest_rate_limit_buckets,
+    harvest_pacing_overrides,
     harvest_completion_triggers,
     harvest_completion_trigger_fires,
     harvest_completion_trigger_outbox,

@@ -804,3 +804,19 @@ for the full walkthrough and the
 [idempotency chapter](getting-started/06-idempotency.md#idempotent-signal-delivery)
 for the surrounding idempotency story (including `signal-with-start` for the
 first-delivery case).
+# Temporary pacing overrides
+
+Declared activity rate limits and workflow start-throttle policies may be
+temporarily adjusted with `POST` or cleared with `DELETE` at
+`/admin/rate-limits/{activity_name}/override` and
+`/admin/start-throttle/{workflow_name}/override`. The POST body is
+`{"refill_per_sec": number?, "burst": number?, "ttl_secs": number}`.
+`ttl_secs` is required, positive, and capped at **86,400 seconds**. Supplied
+values must be finite and positive; omitted values inherit the declared policy.
+
+An override is active only while `now < expires_at`. Every consumption reads
+expiry, so an expired durable row immediately resolves to the declared baseline
+without waiting for cleanup or restarting workers. Arbitrary bucket keys and
+names without the corresponding declared policy are rejected. Mutations are
+replicated to every shard and partial failures are reported; token buckets and
+enforcement remain shard-local, so read responses preserve shard identity.

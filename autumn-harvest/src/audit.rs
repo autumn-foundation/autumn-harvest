@@ -100,7 +100,16 @@ pub const OP_EXTERNAL_ACTIVITY_FAIL: &str = "external_activity.fail";
 /// Audit operation: Initiated draining of a worker fleet.
 pub const OP_WORKER_DRAIN: &str = "worker.drain";
 /// Audit operation: Overrode rate-limiting parameters.
-pub const OP_RATE_LIMIT_OVERRIDE: &str = "rate_limit_override";
+#[deprecated(note = "use the explicit set/clear operation constants")]
+pub const OP_RATE_LIMIT_OVERRIDE: &str = OP_RATE_LIMIT_OVERRIDE_SET;
+/// Audit operation: set a temporary activity rate-limit override.
+pub const OP_RATE_LIMIT_OVERRIDE_SET: &str = "rate_limit.override.set";
+/// Audit operation: clear an activity rate-limit override.
+pub const OP_RATE_LIMIT_OVERRIDE_CLEAR: &str = "rate_limit.override.clear";
+/// Audit operation: set a temporary workflow start-throttle override.
+pub const OP_START_THROTTLE_OVERRIDE_SET: &str = "start_throttle.override.set";
+/// Audit operation: clear a workflow start-throttle override.
+pub const OP_START_THROTTLE_OVERRIDE_CLEAR: &str = "start_throttle.override.clear";
 /// Audit operation: Opened an SSE execution event stream (issue #324).
 pub const OP_EXECUTION_STREAM_OPEN: &str = "execution.stream.open";
 /// Audit operation: Closed an SSE execution event stream (issue #324).
@@ -521,7 +530,22 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         RouteClass::Mutating,
     ),
     ("POST /workers/{worker_id}/drain", RouteClass::Mutating),
-    ("POST /admin/rate-limits/{key}", RouteClass::Mutating),
+    (
+        "POST /admin/rate-limits/{activity_name}/override",
+        RouteClass::Mutating,
+    ),
+    (
+        "DELETE /admin/rate-limits/{activity_name}/override",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /admin/start-throttle/{workflow_name}/override",
+        RouteClass::Mutating,
+    ),
+    (
+        "DELETE /admin/start-throttle/{workflow_name}/override",
+        RouteClass::Mutating,
+    ),
     ("POST /batch-operations", RouteClass::Mutating),
     // Batch workflow start (issue #357)
     ("POST /workflows/batch_start", RouteClass::Mutating),
@@ -712,6 +736,10 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
 /// verifies that every entry in [`ALL_MUTATION_ROUTES`] that declares an
 /// operation references a name in this slice.
 pub const AUDITED_OPERATIONS: &[&str] = &[
+    OP_RATE_LIMIT_OVERRIDE_SET,
+    OP_RATE_LIMIT_OVERRIDE_CLEAR,
+    OP_START_THROTTLE_OVERRIDE_SET,
+    OP_START_THROTTLE_OVERRIDE_CLEAR,
     OP_WORKFLOW_START,
     OP_WORKFLOW_SIGNAL,
     OP_WORKFLOW_SIGNAL_WITH_START,
@@ -741,7 +769,6 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_EXTERNAL_ACTIVITY_COMPLETE,
     OP_EXTERNAL_ACTIVITY_FAIL,
     OP_WORKER_DRAIN,
-    OP_RATE_LIMIT_OVERRIDE,
     OP_BUILD_POLICY_SET,
     OP_BUILD_COMPAT_DECLARE,
     OP_BUILD_COMPAT_REVOKE,
@@ -1067,8 +1094,20 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workers/drain-preview", None),
     ("POST /workers/{worker_id}/drain", Some(OP_WORKER_DRAIN)),
     (
-        "POST /admin/rate-limits/{key}",
-        Some(OP_RATE_LIMIT_OVERRIDE),
+        "POST /admin/rate-limits/{activity_name}/override",
+        Some(OP_RATE_LIMIT_OVERRIDE_SET),
+    ),
+    (
+        "DELETE /admin/rate-limits/{activity_name}/override",
+        Some(OP_RATE_LIMIT_OVERRIDE_CLEAR),
+    ),
+    (
+        "POST /admin/start-throttle/{workflow_name}/override",
+        Some(OP_START_THROTTLE_OVERRIDE_SET),
+    ),
+    (
+        "DELETE /admin/start-throttle/{workflow_name}/override",
+        Some(OP_START_THROTTLE_OVERRIDE_CLEAR),
     ),
     // Batch operations
     ("GET /batch-operations", None),
