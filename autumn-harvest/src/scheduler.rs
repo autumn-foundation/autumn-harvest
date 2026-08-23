@@ -8329,25 +8329,42 @@ mod tests {
             &rest[..end]
         }
 
-        let source = include_str!("scheduler.rs");
+        fn check(source: &str) {
+            // Normalize line endings first: a Windows checkout
+            // (`core.autocrlf`) hands this file over with `\r\n`, so the bare
+            // `\n}\n` brace probe finds nothing and the guard panics. Same
+            // convention as `sqlite_feasibility_docs.rs`.
+            let normalized = source.replace('\r', "");
+            let source = normalized.as_str();
 
-        for signature in [
-            "async fn tick_one_workflow_schedule(",
-            "async fn drain_buffered_schedule_runs(",
-        ] {
-            let body = body_of(source, signature);
-            assert!(
-                body.contains("scheduled_fire_exec_id("),
-                "`{signature}` must mint its fire's ExecutionId through the \
-                 shared scheduled_fire_exec_id decision (issue #961 AC4)",
-            );
-            assert!(
-                !body.contains("ExecutionId::new"),
-                "`{signature}` mints an ExecutionId inline — the two fire paths \
-                 must share scheduled_fire_exec_id or they drift, silently \
-                 un-pinning a canary/DAG fire from its home shard (issue #961 AC4)",
-            );
+            for signature in [
+                "async fn tick_one_workflow_schedule(",
+                "async fn drain_buffered_schedule_runs(",
+            ] {
+                let body = body_of(source, signature);
+                assert!(
+                    body.contains("scheduled_fire_exec_id("),
+                    "`{signature}` must mint its fire's ExecutionId through the \
+                     shared scheduled_fire_exec_id decision (issue #961 AC4)",
+                );
+                assert!(
+                    !body.contains("ExecutionId::new"),
+                    "`{signature}` mints an ExecutionId inline — the two fire \
+                     paths must share scheduled_fire_exec_id or they drift, \
+                     silently un-pinning a canary/DAG fire from its home shard \
+                     (issue #961 AC4)",
+                );
+            }
         }
+
+        let raw = include_str!("scheduler.rs");
+        check(raw);
+
+        // Run the identical guard over a CRLF copy of the same source. This is
+        // what a Windows checkout hands `include_str!`, so dropping the
+        // normalization above fails here on *every* platform instead of only on
+        // the Windows CI leg — which is exactly how this guard first broke.
+        check(&raw.replace("\r\n", "\n").replace('\n', "\r\n"));
     }
 
     /// AC4 (issue #961): the buffered-overlap drain and the main dispatch path
