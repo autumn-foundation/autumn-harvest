@@ -91,6 +91,96 @@ fn strip_comment_lines(block: &str) -> String {
         .join("\n")
 }
 
+/// Split already-comment-stripped command text into distinct commands, where
+/// one or more blank lines separate one command from the next.
+///
+/// A backslash-continued multi-line invocation never contains a blank line
+/// internally (the shell would treat one as ending the command anyway), so
+/// splitting on blank-line runs cleanly separates the fenced block's several
+/// independent `cargo test ...` invocations from one another.
+fn split_into_commands(command_only: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for line in command_only.lines() {
+        if line.trim().is_empty() {
+            if !current.is_empty() {
+                commands.push(current.join("\n"));
+                current.clear();
+            }
+        } else {
+            current.push(line);
+        }
+    }
+    if !current.is_empty() {
+        commands.push(current.join("\n"));
+    }
+    commands
+}
+
+/// The single command (from `split_into_commands`) containing `needle`.
+///
+/// Panics naming what was searched for on zero or more-than-one matches --
+/// either would mean anchoring the check to the wrong (or an ambiguous)
+/// command, silently defeating the whole point of splitting per-command in
+/// the first place.
+fn command_containing<'a>(commands: &'a [String], needle: &str) -> &'a str {
+    let matches: Vec<&str> = commands
+        .iter()
+        .map(String::as_str)
+        .filter(|c| c.contains(needle))
+        .collect();
+    match matches.as_slice() {
+        [one] => one,
+        [] => panic!(
+            "no command (after stripping comments and splitting on blank \
+             lines) contains {needle:?}; commands were:\n{commands:#?}"
+        ),
+        _ => panic!(
+            "expected exactly one command to contain {needle:?}, found {}; \
+             ambiguous which command the check should anchor to. commands \
+             were:\n{commands:#?}",
+            matches.len()
+        ),
+    }
+}
+
+#[test]
+fn split_into_commands_separates_on_blank_lines_and_keeps_continuations_joined() {
+    let text = "FOO=1 cargo test \\\n  --flag a\n\nBAR=2 cargo test \\\n  --flag b\n";
+    let commands = split_into_commands(text);
+
+    assert_eq!(commands.len(), 2, "commands were: {commands:#?}");
+    assert_eq!(commands[0], "FOO=1 cargo test \\\n  --flag a");
+    assert_eq!(commands[1], "BAR=2 cargo test \\\n  --flag b");
+}
+
+#[test]
+fn command_containing_anchors_to_the_specific_command_not_the_aggregate() {
+    // Reproduces the exact regression this helper exists to catch: a doc
+    // block with two commands, where the FIRST (unrelated) command happens
+    // to mention `chaos_tests::` while the SECOND (the one that actually
+    // matters here) does not. A whole-block/aggregated-text check would
+    // wrongly pass; anchoring to the specific command must fail.
+    let commands = split_into_commands(
+        "CHAOS_SEEDS=8 cargo test --test integration \\\n  chaos_tests::chaos_seeded_convergence_sweep\n\n\
+         HARVEST_TEST_DATABASE_URL=postgres://x cargo test --test integration",
+    );
+
+    let local_db_command = command_containing(&commands, "HARVEST_TEST_DATABASE_URL");
+    assert!(
+        !local_db_command.contains("chaos_tests::"),
+        "the HARVEST_TEST_DATABASE_URL command in this fixture deliberately \
+         lacks the filter -- command:\n{local_db_command}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "no command")]
+fn command_containing_panics_when_the_needle_appears_in_no_command() {
+    let commands = split_into_commands("cargo test --test integration\n");
+    command_containing(&commands, "HARVEST_TEST_DATABASE_URL");
+}
+
 #[test]
 fn strip_comment_lines_removes_comments_but_keeps_commands() {
     let block = "# a comment mentioning chaos_tests::\nreal_command --flag\n# another comment\nmore_command\n";
@@ -120,16 +210,27 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
     // literal string `chaos_tests::` as prose, which would otherwise mask
     // exactly the regression this test exists to catch.
     let command_only = strip_comment_lines(block);
+    let commands = split_into_commands(&command_only);
+    // Anchor the check to the SPECIFIC command that runs against a
+    // caller-supplied database, not the whole fenced block's aggregated
+    // text. The block also contains an unrelated single-seed replay command;
+    // checking the aggregate would still pass if THAT command happened to
+    // mention `chaos_tests::` while the HARVEST_TEST_DATABASE_URL command
+    // itself lost its filter -- exactly the unsafe-unscoped-command
+    // regression this guard exists to catch.
+    let local_db_command = command_containing(&commands, "HARVEST_TEST_DATABASE_URL");
 
     assert!(
-        command_only.contains("chaos_tests::"),
-        "docs/testing/chaos.md's HARVEST_TEST_DATABASE_URL example COMMAND \
-         (comments excluded) must scope the run to `chaos_tests::` (the same \
-         filter CI's own chaos.yml uses) -- an unscoped `cargo test ... \
+        local_db_command.contains("chaos_tests::"),
+        "docs/testing/chaos.md's HARVEST_TEST_DATABASE_URL COMMAND \
+         specifically (not just some other command in the same fenced \
+         block) must scope the run to `chaos_tests::` (the same filter \
+         CI's own chaos.yml uses) -- an unscoped `cargo test ... \
          --test integration` invocation risks a chaos test's global TRUNCATE \
          scrub racing a concurrent, unrelated integration-test module \
          against the same shared database.\n\n\
-         command (comments stripped):\n{command_only}\n\nfull block:\n{block}"
+         HARVEST_TEST_DATABASE_URL command:\n{local_db_command}\n\n\
+         full block:\n{block}"
     );
 
     // The whole `integration` binary must never be recommended unscoped
@@ -138,9 +239,10 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
     // invocation's shape untouched (e.g. a rewrite that renames the binary
     // flag but forgets to re-attach the module filter).
     assert!(
-        command_only.contains("--test integration"),
-        "expected the example COMMAND (comments excluded) to invoke the \
-         `integration` test binary; command:\n{command_only}\n\nfull block:\n{block}"
+        local_db_command.contains("--test integration"),
+        "expected the HARVEST_TEST_DATABASE_URL command specifically to \
+         invoke the `integration` test binary; command:\n{local_db_command}\n\n\
+         full block:\n{block}"
     );
 }
 
