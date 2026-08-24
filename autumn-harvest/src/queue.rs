@@ -529,9 +529,13 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 // above closed), and its cost compounds with the size of the RUNNING
 // population sharing that row's key, since `COUNT(*)` cannot short-circuit.
 // `concurrency_pending_keys` below narrows to the `(concurrency_key,
-// task_type)` pairs actually present among this queue set's PENDING rows (so
-// the aggregate below never pays for concurrency keys the current claim
-// attempt cannot possibly select), and `concurrency_running_counts`
+// task_type)` pairs actually present among this queue set's currently-due
+// PENDING rows -- `scheduled_at <= NOW()` mirrors `candidate`'s own filter,
+// so the aggregate below never pays for a key whose only PENDING rows are
+// scheduled in the future, which `candidate` could never select regardless
+// (a queue holding a large future-dated backfill alongside a few due rows
+// must not scan/dedupe the whole backfill on every claim) -- and
+// `concurrency_running_counts`
 // aggregates the RUNNING population for exactly those pairs into one
 // `MATERIALIZED` lookup table, evaluated once per claim rather than once per
 // row. The per-row check becomes a `COALESCE(single-row lookup, 0) < cap`
@@ -616,6 +620,7 @@ pub const fn claim_task_query() -> &'static str {
              FROM harvest_task_queue \
              WHERE queue_name = ANY($2) \
                AND state = 'PENDING' \
+               AND scheduled_at <= NOW() \
                AND concurrency_key IS NOT NULL \
                AND concurrency_cap IS NOT NULL \
          ), \

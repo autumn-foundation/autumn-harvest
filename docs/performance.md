@@ -751,6 +751,83 @@ and
 either `HARVEST_TEST_DATABASE_URL` (an admin connection string) or a reachable
 Docker daemon for its testcontainer fallback — not both.
 
+### Known limitation: cost scales with distinct concurrency-key cardinality
+
+The committed hot-contention fixture above uses 256 distinct concurrency
+keys — the harness's fixed `KEY_CARDINALITY` constant
+(`tests/integration/claim_bench_support.rs`) — and at that cardinality the
+fix is unambiguously a win (733 buffers vs 98 124, -99.25%). That number does
+not generalize to arbitrarily many distinct keys, and this is a real,
+confirmed limit of the fix, not a hypothetical one.
+
+The candidate-side gate is a correlated scalar subquery —
+`COALESCE((SELECT rc.running_count FROM concurrency_running_counts rc
+WHERE rc.concurrency_key = … AND rc.task_type = …), 0) < concurrency_cap` —
+evaluated once per candidate row. `concurrency_running_counts` is a
+`MATERIALIZED` CTE, and a CTE has no index: PostgreSQL always resolves a
+lookup against one with a linear `CTE Scan`, regardless of `MATERIALIZED` or
+the CTE's own size. The committed
+`after-claim-backlog-10000-hot-contention.explain.txt` already shows this
+node — `CTE Scan on concurrency_running_counts rc (loops=10000)`, filtering
+out 255 of 256 rows on every one of the 10 000 loops — it just costs little
+enough at 256 keys (≈1-2 pages, fully cached) to stay invisible in the
+subtree-total table above. Re-running the same shape with 5 000 distinct
+keys instead of 256 (all other parameters held fixed: 10 000-row backlog,
+2 000 `RUNNING` rows, `NON_BLOCKING_CAP`) reproduces a **1 600 ms** single
+claim, worse than the pre-fix baseline's own hot-contention wall-clock
+(1 510.6 ms, see above) — the fix's own per-candidate-row `CTE Scan` becomes
+the dominant cost once distinct-key cardinality is large enough. The
+underlying shape is O(candidate rows × distinct running key/type pairs);
+256 keys keeps that product small, thousands of keys does not.
+
+Three pure query rewrites were evaluated as replacements for the candidate-
+side gate and rejected, each confirmed by `EXPLAIN (ANALYZE, BUFFERS,
+VERBOSE, SETTINGS)` against a from-scratch reproduction of both the idle
+(10 000-row, 256-key, zero `RUNNING`) and high-cardinality (5 000-key)
+scenarios:
+
+- **`LEFT JOIN` to a `GROUP BY`-aggregated running-count subquery.** Turns
+  the per-row `CTE Scan` into a single hash lookup: 5 000-key hot-contention
+  cost drops to 24.1 ms (66x faster than the correlated form, and fewer
+  buffers: 377 vs 713). But it regresses the *idle* case from ~1-4 buffers
+  (the correlated form's lazy `(never executed)` short-circuit) to ~232
+  buffers at a 10 000-row idle backlog, because any `LEFT JOIN`-shaped
+  formulation defeats PostgreSQL's ability to push `ORDER BY … LIMIT`
+  through the ordered `idx_harvest_tq_poll` scan feeding the candidate
+  selection.
+- **`LEFT JOIN LATERAL`** — the same regression, same magnitude (idle-depth
+  buffers move from ~1-4 to ~230, scaling linearly with backlog depth from
+  there).
+- **`LEFT JOIN LATERAL` with `enable_hashjoin`/`enable_mergejoin` disabled**
+  (forcing a Nested Loop), and again with `enable_seqscan`/`enable_bitmapscan`
+  also disabled (forcing the planner onto `idx_harvest_tq_poll` — the same
+  index whose ordering the correlated form exploits) — neither recovers the
+  idle-case short-circuit. Even driven by a plain, ordered `Index Scan` on
+  the outer side, PostgreSQL still inserts an explicit `Sort` and evaluates
+  the full joined result before `LIMIT` applies (buffers actually rose to
+  916, since the plain Index Scan touches every leaf and heap page the
+  Bitmap/Seq Scan alternatives could skip). This is not a planner-tuning
+  gap: PostgreSQL cannot apply `LIMIT`-pushdown-through-ordered-scan to a
+  join whose filter references the joined side, independent of which
+  physical join algorithm is chosen — only a scalar subquery evaluated
+  lazily in the outer `WHERE` clause gets that optimization, and a CTE
+  cannot back one with an index.
+
+The one formulation that would plausibly get both properties — a correlated
+subquery in the same shape as the *authoritative* recheck in the `claimed`
+CTE below (which already scans the base table, not a CTE, and is cheap
+because it runs at most `LIMIT`-many times, not once per candidate) — needs
+a new supporting partial index (e.g. on
+`(concurrency_key, task_type) WHERE state = 'RUNNING' AND worker_id IS NOT
+NULL`) to make each per-candidate-row lookup an indexed probe instead of a
+CTE linear scan. Adding an index is outside what this PR changes
+unilaterally; see the review discussion on this PR for the concrete proposal
+and open question. Until that lands, deployments with concurrency-key
+cardinality in the low hundreds (the tested, committed range) get the full
+measured win above; deployments with concurrency keys numbering in the
+thousands or more should expect the candidate-side gate's cost to grow with
+that cardinality and are not covered by this fix's evidence.
+
 ## Enqueue throughput
 
 8 concurrent writers enqueueing into an already-populated queue:
