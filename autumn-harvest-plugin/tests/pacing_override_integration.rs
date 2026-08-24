@@ -26,6 +26,7 @@
 //! migrated database to run directly with `--test-threads=1`, otherwise a
 //! fresh testcontainers Postgres is booted with the full migration set).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,8 +34,9 @@ use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType, claim_task};
 use autumn_harvest::retention::RetentionConfig;
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
-use autumn_harvest::shard::ShardRouter;
+use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::throttle::ThrottlePolicy;
+use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
@@ -44,8 +46,10 @@ use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
@@ -94,6 +98,65 @@ fn build_pool(url: &str) -> DbPool {
         .max_size(8)
         .build()
         .expect("pool should build")
+}
+
+/// A pool pointed at an unreachable host -- every `get()`/query against it
+/// fails immediately with a connection error. Mirrors the dead-port pattern
+/// already used in `completion_triggers_integration.rs` for simulating one
+/// down shard alongside one live shard (issue #945 review, P2).
+fn dead_pool() -> DbPool {
+    build_pool("postgres://postgres:postgres@localhost:12345/non_existent")
+}
+
+fn shard_url(base_url: &str, dbname: &str) -> String {
+    let (base, query) = match base_url.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (base_url, None),
+    };
+    let prefix = base.rsplit_once('/').map_or(base, |(prefix, _)| prefix);
+    query.map_or_else(
+        || format!("{prefix}/{dbname}"),
+        |q| format!("{prefix}/{dbname}?{q}"),
+    )
+}
+
+/// A single fresh, migrated shard database (guard `None` under
+/// `HARVEST_TEST_DATABASE_URL`, `Some` when backed by a fresh testcontainers
+/// Postgres) -- used as the ONE *live* shard for the shard-outage tests
+/// below, paired with a [`dead_pool`] for the unreachable shard.
+async fn setup_one_shard() -> (String, Option<ContainerAsync<Postgres>>) {
+    let (admin_url, guard) = if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        (url, None)
+    } else {
+        let container = Postgres::default()
+            .with_tag("16")
+            .start()
+            .await
+            .expect("postgres container should start");
+        let host = container.get_host().await.expect("host");
+        let port = container.get_host_port_ipv4(5432).await.expect("port");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+        (url, Some(container))
+    };
+
+    let db = format!("harvest_pacing_{}", Uuid::new_v4().simple());
+    let mut admin = AsyncPgConnection::establish(&admin_url)
+        .await
+        .expect("admin connect");
+    diesel::sql_query(format!("CREATE DATABASE {db}"))
+        .execute(&mut admin)
+        .await
+        .expect("create db");
+
+    let url = shard_url(&admin_url, &db);
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("shard connect");
+    conn.batch_execute(autumn_harvest::full_migrations_sql())
+        .await
+        .expect("migrate shard");
+
+    (url, guard)
 }
 
 /// A statically (non per-key) rate-limited activity that runs inline — no
@@ -173,6 +236,39 @@ fn build_app(
         SchedulerMonitor::offline(),
         HarvestRetentionRuntime::disabled(RetentionConfig::default()),
         ShardRouter::default(),
+    ));
+
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+}
+
+/// Sharded variant of [`build_app`] -- lets a caller install an arbitrary
+/// [`HarvestDbPool`] (e.g. one built with an unreachable pool for a given
+/// shard, via [`ShardedDbPool::from_map`]) instead of always wrapping a
+/// single live pool. Used to exercise `get_start_throttle_pacing_override`'s
+/// partial/total shard-outage handling (issue #945 review, P2): a status
+/// read that silently degrades a real live override into
+/// `{"override_active": false}` on a shard outage is worse than an explicit
+/// failure.
+fn build_sharded_app(
+    harvest_pool: HarvestDbPool,
+    router: ShardRouter,
+    activities: Vec<ActivityInfo>,
+    workflows: Vec<WorkflowInfo>,
+) -> HarvestApiApp {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(harvest_pool);
+
+    let registry = HandlerRegistry::new(workflows, activities);
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(registry),
+        Arc::new(DagCatalog::new()),
+        Arc::new(Vec::new()),
+        Some("pacing-override-sharded-test".to_string()),
+        vec!["default".to_string(), "email-queue".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(RetentionConfig::default()),
+        router,
     ));
 
     harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
@@ -1330,4 +1426,268 @@ async fn throttle_override_set_and_clear_record_audit_rows() {
         clear_record["route_or_command"],
         json!("DELETE /admin/start-throttle/{workflow_name}/override")
     );
+}
+
+// ── issue #945 review, round 2 ──────────────────────────────────────────────
+//
+// Two independent P2 findings on the round-1 fix commit:
+//
+// 1. `declared_*`/`effective_*` in every SET/CLEAR/GET response must reflect
+//    the bucket's PERSISTED baseline, not the live registry declaration —
+//    the separate, pre-existing, PERMANENT `POST /admin/rate-limits/{key}`
+//    route (issue #332) can change a bucket's `refill_rate`/`burst` columns
+//    independently of the registry, and the dispatch/claim path
+//    (`effective_refill_rate_expr`/`effective_burst_expr`) reads those
+//    columns, not the registry.
+// 2. `GET /admin/start-throttle/{workflow_name}/override` must not silently
+//    misreport a shard outage as "no override configured" — a total outage
+//    must fail closed (`503`), and a partial outage must surface `207` with
+//    the unreachable shard(s) named, never a bare `200`.
+
+#[tokio::test]
+async fn rate_limit_override_reports_persisted_baseline_not_registry_after_legacy_permanent_change()
+{
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let name = leaked_name("send_email");
+    // Registered/declared baseline: 5.0/5.0. `rate_limit_key: None` on
+    // `rate_limited_activity_info` means the bucket key IS `name`.
+    let app = build_app(
+        &pool,
+        vec![rate_limited_activity_info(name, 5.0, 5.0)],
+        vec![],
+    );
+
+    // Permanently change the persisted baseline via the pre-existing,
+    // SEPARATE permanent route — never touches the registry's declared
+    // 5.0/5.0.
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/rate-limits/{name}"),
+        json!({ "refill_rate": 999.0, "burst": 999.0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "legacy permanent set: {body}");
+
+    // SET a TTL'd override touching ONLY refill_rate. `declared_*` in the
+    // response must be the PERSISTED 999.0/999.0, never the registry's
+    // 5.0/5.0 — and the omitted burst's effective value must fall back to
+    // the persisted 999.0, not the registry's 5.0.
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/rate-limits/{name}/override"),
+        json!({ "refill_rate": 42.0, "ttl_secs": 300 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "set: {body}");
+    assert_eq!(
+        body["declared_refill_rate"],
+        json!(999.0),
+        "SET declared_refill_rate must be the persisted baseline: {body}"
+    );
+    assert_eq!(
+        body["declared_burst"],
+        json!(999.0),
+        "SET declared_burst must be the persisted baseline: {body}"
+    );
+    assert_eq!(body["override_refill_rate"], json!(42.0));
+    assert_eq!(body["override_burst"], json!(null));
+    assert_eq!(body["effective_refill_rate"], json!(42.0));
+    assert_eq!(
+        body["effective_burst"],
+        json!(999.0),
+        "omitted burst must fall back to the PERSISTED baseline, not the \
+         registry's declared 5.0: {body}"
+    );
+
+    // CLEAR — the reverted `declared_*`/`effective_*` must still be the
+    // persisted 999.0/999.0, never the registry's 5.0/5.0.
+    let (status, body) = delete_json(&app, &format!("/admin/rate-limits/{name}/override")).await;
+    assert_eq!(status, StatusCode::OK, "clear: {body}");
+    assert_eq!(
+        body["declared_refill_rate"],
+        json!(999.0),
+        "CLEAR declared_refill_rate must be the persisted baseline: {body}"
+    );
+    assert_eq!(
+        body["declared_burst"],
+        json!(999.0),
+        "CLEAR declared_burst must be the persisted baseline: {body}"
+    );
+    assert_eq!(body["effective_refill_rate"], json!(999.0));
+    assert_eq!(body["effective_burst"], json!(999.0));
+}
+
+#[tokio::test]
+async fn throttle_override_reports_persisted_baseline_not_registry_after_legacy_permanent_change() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let name = leaked_name("onboard_user");
+    let app = build_app(&pool, vec![], vec![static_throttled_info(name, "5/m", 5.0)]);
+    let key = autumn_harvest::throttle::bucket_key(name, "");
+
+    // Permanently change the persisted baseline via the SAME shared-table
+    // legacy route, addressed by the throttle's own bucket key directly —
+    // never touches the registry's declared `5/m` (5.0/60.0 refill_rate) /
+    // 5.0 burst.
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/rate-limits/{key}"),
+        json!({ "refill_rate": 500.0, "burst": 500.0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "legacy permanent set: {body}");
+
+    let uri = format!("/admin/start-throttle/{name}/override");
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({ "refill_per_sec": 1.0, "ttl_secs": 300 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "set: {body}");
+    assert_eq!(
+        body["declared_refill_rate"],
+        json!(500.0),
+        "SET declared_refill_rate must be the persisted baseline: {body}"
+    );
+    assert_eq!(
+        body["declared_burst"],
+        json!(500.0),
+        "SET declared_burst must be the persisted baseline: {body}"
+    );
+    assert_eq!(
+        body["effective_burst"],
+        json!(500.0),
+        "omitted burst must fall back to the PERSISTED baseline, not the \
+         registry's declared 5.0: {body}"
+    );
+
+    let (status, body) = get_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK, "get: {body}");
+    assert_eq!(
+        body["declared_refill_rate"],
+        json!(500.0),
+        "GET declared_refill_rate must be the persisted baseline: {body}"
+    );
+    assert_eq!(
+        body["declared_burst"],
+        json!(500.0),
+        "GET declared_burst must be the persisted baseline: {body}"
+    );
+
+    let (status, body) = delete_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK, "clear: {body}");
+    assert_eq!(
+        body["declared_refill_rate"],
+        json!(500.0),
+        "CLEAR declared_refill_rate must be the persisted baseline: {body}"
+    );
+    assert_eq!(
+        body["declared_burst"],
+        json!(500.0),
+        "CLEAR declared_burst must be the persisted baseline: {body}"
+    );
+    assert_eq!(body["effective_refill_rate"], json!(500.0));
+    assert_eq!(body["effective_burst"], json!(500.0));
+}
+
+#[tokio::test]
+async fn get_start_throttle_pacing_override_returns_503_on_total_shard_outage() {
+    let name = leaked_name("onboard_user");
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), dead_pool());
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0)],
+        vec![ShardId::new(0)],
+        ShardId::new(0),
+    );
+
+    let app = build_sharded_app(
+        HarvestDbPool::sharded(sharded_pool),
+        router,
+        vec![],
+        vec![static_throttled_info(name, "5/m", 5.0)],
+    );
+
+    let (status, body) = get_json(&app, &format!("/admin/start-throttle/{name}/override")).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a total shard outage must fail closed, not silently report \
+         override_active:false: {body}"
+    );
+    assert!(
+        body.get("errors").is_some(),
+        "503 body should name the unreachable shard(s): {body}"
+    );
+}
+
+#[tokio::test]
+async fn get_start_throttle_pacing_override_returns_207_on_partial_shard_outage_and_reflects_reachable_shard()
+ {
+    let (live_url, _container) = setup_one_shard().await;
+    let live_pool = build_pool(&live_url);
+    let name = leaked_name("onboard_user");
+    let key = autumn_harvest::throttle::bucket_key(name, "");
+
+    // Seed an ACTIVE override directly on the live shard -- bypasses the SET
+    // route so this test isolates the GET route's partial-outage handling
+    // from SET's own (separately covered) partial-write behaviour.
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
+    {
+        let mut conn = live_pool.get().await.expect("live conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_rate_limit_buckets \
+             (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at, \
+              override_refill_rate, override_burst, override_expires_at) \
+             VALUES ($1, $2, $2, $2, NOW(), NOW(), NOW(), $3, $3, $4)",
+        )
+        .bind::<diesel::sql_types::Text, _>(&key)
+        .bind::<diesel::sql_types::Double, _>(5.0 / 60.0)
+        .bind::<diesel::sql_types::Double, _>(1000.0)
+        .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+        .execute(&mut conn)
+        .await
+        .expect("seed row");
+    }
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), live_pool);
+    pools.insert(ShardId::new(1), dead_pool());
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+
+    let app = build_sharded_app(
+        HarvestDbPool::sharded(sharded_pool),
+        router,
+        vec![],
+        vec![static_throttled_info(name, "5/m", 5.0)],
+    );
+
+    let (status, body) = get_json(&app, &format!("/admin/start-throttle/{name}/override")).await;
+    assert_eq!(
+        status,
+        StatusCode::MULTI_STATUS,
+        "one shard down must not silently report all-healthy: {body}"
+    );
+    assert!(
+        body["shard_errors"]
+            .as_array()
+            .is_some_and(|e| !e.is_empty()),
+        "207 body should name the unreachable shard(s): {body}"
+    );
+    let overridden = &body["override"];
+    assert_eq!(
+        overridden["override_active"],
+        json!(true),
+        "must still reflect the reachable shard's live override: {overridden}"
+    );
+    assert_eq!(overridden["override_refill_rate"], json!(1000.0));
+    assert_eq!(overridden["override_burst"], json!(1000.0));
 }
