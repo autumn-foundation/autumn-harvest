@@ -238,6 +238,60 @@ pub fn resolve_quota_key(expr: &str, input: &serde_json::Value) -> Option<String
     crate::concurrency::resolve_concurrency_key(expr, input)
 }
 
+/// Maximum length, in UTF-8 bytes, of a value returned by [`resolve_quota_key`].
+///
+/// This is the size a value must fit before it is safe to store in the
+/// indexed `quota_key` column on `harvest_workflow_executions`/`harvest_dead_letters`
+/// (issue #946, Codex review — "bound resolved quota keys before indexing
+/// them"). `key_expr` is an author-declared, trusted dot-path, but the VALUE
+/// it resolves to comes straight from caller-controlled workflow input, so it
+/// is otherwise unbounded.
+///
+/// Postgres caps a single B-tree index entry at roughly 2704 bytes for an
+/// 8&nbsp;kB page; 256 bytes is comfortably below that even once the
+/// composite `(workflow_name, quota_key, state)` index
+/// (`idx_harvest_we_quota_active`) accounts for the other columns, while
+/// still being far larger than any realistic tenant identifier (a UUID,
+/// email address, or account slug).
+///
+/// An over-cap key is **rejected** at admission time — see
+/// [`quota_key_over_cap`] — rather than truncated or hashed:
+///
+/// - Truncating would risk aliasing two distinct, unrelated tenant
+///   identifiers that merely share a long common prefix onto the SAME quota
+///   bucket. That is a genuine isolation break, and a caller who controls
+///   the resolved field could deliberately craft a key sharing another
+///   tenant's truncated prefix to exhaust that tenant's quota.
+/// - Hashing would make the stored `quota_key` illegible to operators
+///   reading `GET /admin/quotas` or an execution row for the overwhelmingly
+///   common case where the key is already in bounds, for no compensating
+///   correctness benefit over a clean, typed rejection.
+pub const MAX_QUOTA_KEY_BYTES: u64 = 256;
+
+/// Check a value already resolved by [`resolve_quota_key`] against
+/// [`MAX_QUOTA_KEY_BYTES`]. Returns the observed byte length when the key
+/// exceeds the bound, `None` when it is within bounds.
+///
+/// Pure and side-effect-free: the caller (`start_or_load_workflow_execution_collect`)
+/// constructs the actual [`crate::error::HarvestError::PayloadTooLarge`]
+/// rejection, since building one needs the requesting workflow's name — this
+/// module has no such context and stays independent of it.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_harvest::quota::quota_key_over_cap;
+///
+/// assert_eq!(quota_key_over_cap("acme"), None);
+/// let oversized = "x".repeat(300);
+/// assert_eq!(quota_key_over_cap(&oversized), Some(300));
+/// ```
+#[must_use]
+pub fn quota_key_over_cap(key: &str) -> Option<u64> {
+    let observed_bytes = key.len() as u64;
+    (observed_bytes > MAX_QUOTA_KEY_BYTES).then_some(observed_bytes)
+}
+
 // ---------------------------------------------------------------------------
 // QuotaUsage / check_quota — pure comparison, no I/O
 // ---------------------------------------------------------------------------
@@ -721,6 +775,53 @@ mod tests {
                 crate::concurrency::resolve_concurrency_key("tenant_id", &input),
             );
         }
+    }
+
+    // -- quota_key_over_cap --------------------------------------------------
+
+    #[test]
+    fn quota_key_over_cap_within_bound_is_none() {
+        assert_eq!(quota_key_over_cap("acme"), None);
+        assert_eq!(quota_key_over_cap(""), None);
+    }
+
+    #[test]
+    fn quota_key_over_cap_exactly_at_bound_is_none() {
+        // The bound itself must be admissible -- only STRICTLY over rejects.
+        let exact = "x".repeat(usize::try_from(MAX_QUOTA_KEY_BYTES).expect("small"));
+        assert_eq!(exact.len() as u64, MAX_QUOTA_KEY_BYTES);
+        assert_eq!(quota_key_over_cap(&exact), None);
+    }
+
+    #[test]
+    fn quota_key_over_cap_one_byte_over_is_rejected() {
+        let over = "x".repeat(usize::try_from(MAX_QUOTA_KEY_BYTES).expect("small") + 1);
+        assert_eq!(
+            quota_key_over_cap(&over),
+            Some(MAX_QUOTA_KEY_BYTES + 1),
+            "the observed length reported must be the ACTUAL length, not the cap"
+        );
+    }
+
+    #[test]
+    fn quota_key_over_cap_reports_exact_observed_length_for_a_wildly_oversized_key() {
+        let huge = "x".repeat(10_000);
+        assert_eq!(quota_key_over_cap(&huge), Some(10_000));
+    }
+
+    #[test]
+    fn quota_key_over_cap_measures_utf8_bytes_not_chars() {
+        // Multi-byte UTF-8: each 'é' is 2 bytes, so 200 of them is 400 bytes
+        // -- over the 256-byte bound -- even though `.chars().count()` is
+        // only 200. The check MUST bound the same unit Postgres bounds an
+        // index entry by (bytes), not a locale-dependent character count.
+        let multi_byte: String = "é".repeat(200);
+        assert_eq!(multi_byte.chars().count(), 200);
+        assert!(multi_byte.len() > usize::try_from(MAX_QUOTA_KEY_BYTES).expect("small"));
+        assert_eq!(
+            quota_key_over_cap(&multi_byte),
+            Some(multi_byte.len() as u64)
+        );
     }
 
     // -- check_quota --------------------------------------------------------

@@ -676,6 +676,43 @@ pub async fn start_or_load_workflow_execution_collect(
             });
     let quota_key: Option<String> =
         quota_policy.and_then(|p| crate::quota::resolve_quota_key(p.key_expr, &request.input));
+    // A resolved key is stamped onto the row for EVERY admission that has
+    // one -- including a retry-exempt admission below, which still tags its
+    // row for future usage accounting -- so this bound must be checked
+    // unconditionally here, before that exemption is even computed. It must
+    // also run before ANY DB work: an unbounded caller-controlled string
+    // reaching the indexed `quota_key` column can otherwise raise a raw
+    // Postgres "index row size exceeds maximum" error instead of a clean,
+    // typed rejection (issue #946 Codex review, "bound resolved quota keys
+    // before indexing them"). Rejecting rather than truncating/hashing is
+    // deliberate -- see `quota::MAX_QUOTA_KEY_BYTES`'s doc comment for why.
+    if let Some(key) = quota_key.as_deref()
+        && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
+    {
+        return Err(crate::error::HarvestError::PayloadTooLarge {
+            kind: crate::error::PayloadKind::QuotaKey,
+            observed_bytes,
+            cap_bytes: crate::quota::MAX_QUOTA_KEY_BYTES,
+            workflow_type: request.workflow_name.to_string(),
+            activity_name: None,
+        });
+    }
+    // A workflow-level retry (#523) continuation must never be blocked by a
+    // quota that has since filled up (issue #946 Codex round-2 review): it
+    // is in-flight continuation of an already-admitted logical run, not a
+    // fresh admission, exactly like the `gate: None` and
+    // `concurrency_on_conflict: Defer` exemptions this same function already
+    // grants a retry continuation elsewhere. `retry_of_exec_id` is set
+    // `Some` at exactly one call site in the whole codebase -- the retry
+    // continuation in `worker.rs` -- so it is an unambiguous signal here.
+    // `quota_key` itself stays resolved unconditionally above so the new
+    // row is still correctly tagged for FUTURE usage accounting; only the
+    // *enforcement* is skipped for this one admission.
+    let quota_enforcement_policy = if request.retry_of_exec_id.is_some() {
+        None
+    } else {
+        quota_policy
+    };
 
     // For TerminateIfRunning: if there is an existing RUNNING execution, cancel
     // it (Transaction 1) before the start transaction below (Transaction 2). A
@@ -904,9 +941,10 @@ pub async fn start_or_load_workflow_execution_collect(
         let enqueue = enqueue.clone();
         let request = request.clone();
         let quota_key = quota_key.clone();
-        // `gate`, `metrics`, `shard_id_value`, and `quota_policy` (issue
-        // #946) are all `Copy`, so the `async |conn|` closure captures them
-        // directly from the enclosing function's environment.
+        // `gate`, `metrics`, `shard_id_value`, `quota_policy`, and
+        // `quota_enforcement_policy` (issue #946) are all `Copy`, so the
+        // `async |conn|` closure captures them directly from the enclosing
+        // function's environment.
         let mut tx_deferred_checks = Vec::new();
 
         // Authoritative locked gate (issue #618, PR #1014). For every
@@ -1011,10 +1049,13 @@ pub async fn start_or_load_workflow_execution_collect(
             // meant to bound admission. See `enforce_quota_admission` --
             // this is ALSO called from `replace_execution`, the other
             // row-creation branch inside this same transaction, so the two
-            // paths can never enforce the cap differently.
+            // paths can never enforce the cap differently. Pass
+            // `quota_enforcement_policy` (not the bare `quota_policy`) so a
+            // workflow-level retry continuation is exempt (see its
+            // definition above) while a genuinely fresh start is not.
             enforce_quota_admission(
                 conn,
-                quota_policy,
+                quota_enforcement_policy,
                 quota_key.as_deref(),
                 request.workflow_name,
                 metrics,
@@ -1204,7 +1245,7 @@ pub async fn start_or_load_workflow_execution_collect(
                         exec_id,
                         &request,
                         now,
-                        quota_policy,
+                        quota_enforcement_policy,
                         quota_key.as_deref(),
                         metrics,
                     )
@@ -1256,7 +1297,7 @@ pub async fn start_or_load_workflow_execution_collect(
                                 exec_id,
                                 &request,
                                 now,
-                                quota_policy,
+                                quota_enforcement_policy,
                                 quota_key.as_deref(),
                                 metrics,
                             )
@@ -1308,7 +1349,7 @@ pub async fn start_or_load_workflow_execution_collect(
                         exec_id,
                         &request,
                         now,
-                        quota_policy,
+                        quota_enforcement_policy,
                         quota_key.as_deref(),
                         metrics,
                     )

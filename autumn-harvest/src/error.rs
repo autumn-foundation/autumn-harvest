@@ -41,6 +41,11 @@ pub enum PayloadKind {
     ChildWorkflowResult,
     /// Value passed to `WorkflowContext::side_effect` at recording time.
     SideEffectValue,
+    /// A per-tenant [`crate::quota::QuotaPolicy`] key resolved from workflow
+    /// input at admission time (issue #946), rejected before it reaches the
+    /// indexed `quota_key` column because a Postgres B-tree index entry has
+    /// a hard size limit. See [`crate::quota::MAX_QUOTA_KEY_BYTES`].
+    QuotaKey,
 }
 
 impl std::fmt::Display for PayloadKind {
@@ -53,6 +58,7 @@ impl std::fmt::Display for PayloadKind {
             Self::ChildWorkflowInput => write!(f, "ChildWorkflowInput"),
             Self::ChildWorkflowResult => write!(f, "ChildWorkflowResult"),
             Self::SideEffectValue => write!(f, "SideEffectValue"),
+            Self::QuotaKey => write!(f, "QuotaKey"),
         }
     }
 }

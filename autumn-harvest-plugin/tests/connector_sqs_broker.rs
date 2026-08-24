@@ -82,6 +82,7 @@ fn workflow_info(name: &'static str) -> WorkflowInfo {
         debounce: None,
         batch: None,
         throttle: None,
+        quota: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,

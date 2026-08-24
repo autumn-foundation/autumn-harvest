@@ -63,12 +63,12 @@ use std::sync::{Arc, LazyLock};
 
 use autumn_harvest::completion_trigger::{GLOBAL_WORKFLOW_METADATA, WorkflowMetadata};
 use autumn_harvest::dlq::{NewDeadLetterEntry, dead_letter};
-use autumn_harvest::error::{HarvestError, HarvestResult};
+use autumn_harvest::error::{HarvestError, HarvestResult, PayloadKind};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::execution::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest::info::WorkflowHandlerFn;
 use autumn_harvest::models::WorkflowExecution;
-use autumn_harvest::quota::{QuotaPolicy, QuotaResource};
+use autumn_harvest::quota::{MAX_QUOTA_KEY_BYTES, QuotaPolicy, QuotaResource};
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::types::{
     ExecutionId, Priority, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
@@ -1490,4 +1490,182 @@ async fn replace_execution_terminate_if_running_exempts_the_replaced_runs_own_hi
     assert_eq!(row_state(&mut conn, exec_id).await, "CONTINUED_AS_NEW");
     assert_eq!(row_state(&mut conn, exec_id2).await, "RUNNING");
     assert_eq!(active_count(&mut conn, wf, "acme").await, 1);
+}
+
+/// A workflow-level retry (issue #523) continuation must NOT be silently
+/// dropped by a per-tenant quota that has since filled up (issue #946, Codex
+/// round-2 review). `start_or_load_workflow_execution_collect` already
+/// exempts a retry continuation from the admission gate (`gate: None`) and
+/// from concurrency-supersede (`concurrency_on_conflict: Defer`) with an
+/// explicit "in-flight continuation, not a fresh admission" rationale --
+/// quota enforcement must follow the same rule, or a legitimate retry with
+/// attempts remaining can be permanently, silently skipped the moment the
+/// tenant's quota happens to be at cap, defeating the workflow's configured
+/// retry policy with no error surfaced anywhere (`worker.rs`'s retry driver
+/// only `tracing::warn!`s and gives up on any `Err`).
+///
+/// This test also proves the exemption is scoped correctly: a genuinely
+/// FRESH start for the SAME over-cap key is still rejected -- the retry
+/// exemption is not a blanket bypass -- and the retry's row is still
+/// correctly tagged with `quota_key` for future usage accounting, even
+/// though this one admission was not checked against it.
+#[tokio::test]
+async fn active_executions_cap_does_not_block_a_workflow_level_retry_continuation() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let wf = leaked("quota_retry_exemption");
+
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let _guard = MetadataGuard::install_one(wf, policy).await;
+
+    let input = serde_json::json!({"tenant_id": "acme"});
+
+    // Fill the cap: one active execution for tenant "acme".
+    start_ok(&mut conn, wf, input.clone()).await;
+    assert_eq!(active_count(&mut conn, wf, "acme").await, 1);
+
+    // A genuinely FRESH start for the same over-cap key is still rejected --
+    // the retry exemption below must not become a blanket bypass.
+    let (_fresh_id, fresh_outcome) = try_start(
+        &mut conn,
+        wf,
+        &format!("wid-fresh-{}", Uuid::new_v4().simple()),
+        input.clone(),
+    )
+    .await;
+    let fresh_err =
+        fresh_outcome.expect_err("a genuinely fresh start over the cap must still be rejected");
+    assert_quota_exceeded(
+        &fresh_err,
+        wf,
+        "acme",
+        QuotaResource::ActiveExecutions,
+        1,
+        |c| c == 1,
+    );
+
+    // A workflow-level retry continuation for the SAME over-cap tenant key
+    // must succeed despite the cap: `retry_of_exec_id` is `Some` at exactly
+    // one call site in the whole engine -- the retry driver in `worker.rs`
+    // -- so setting it here is a faithful stand-in for a real retry.
+    let retry_exec_id = ExecutionId::new();
+    let retry_workflow_id = format!("wid-retry-{}", Uuid::new_v4().simple());
+    let mut retry_params = params(wf, &retry_workflow_id, retry_exec_id, input);
+    retry_params.retry_of_exec_id = Some(Uuid::new_v4());
+    retry_params.workflow_attempt = 2;
+
+    let retry_outcome = start_or_load_workflow_execution(&mut conn, retry_params, None).await;
+    retry_outcome.unwrap_or_else(|e| {
+        panic!(
+            "a workflow-level retry continuation must not be blocked by a \
+             quota at cap for its tenant key, got {e:?}"
+        )
+    });
+
+    // The retry's own row is still correctly tagged for FUTURE usage
+    // accounting -- only this one admission was exempt from enforcement,
+    // not from the key resolution/tagging itself.
+    let retry_row = load_execution(&mut conn, retry_exec_id).await;
+    assert_eq!(
+        retry_row.quota_key.as_deref(),
+        Some("acme"),
+        "a retry-exempt admission must still stamp quota_key for later accounting"
+    );
+
+    // The key's active population is now 2 (the original + the retry),
+    // genuinely over the declared cap of 1 -- the exemption let the cap be
+    // exceeded for this in-flight continuation, exactly as intended.
+    assert_eq!(active_count(&mut conn, wf, "acme").await, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Resolved quota-key length bound (issue #946, Codex round-2 review:
+// "bound resolved quota keys before indexing them")
+// ---------------------------------------------------------------------------
+//
+// `key_expr` is an author-declared, trusted dot-path, but the VALUE it
+// resolves to comes straight from caller-controlled workflow input, and is
+// otherwise unbounded before it reaches the INDEXED `quota_key` column on
+// `harvest_workflow_executions`. An oversized resolved key must be rejected
+// cleanly at admission time -- before any DB write -- rather than risk a raw
+// Postgres "index row size exceeds maximum for index" error surfacing as an
+// unhandled `500`.
+
+/// The money test: a resolved key longer than [`MAX_QUOTA_KEY_BYTES`] is
+/// rejected with a typed [`HarvestError::PayloadTooLarge`] (never an
+/// uncontrolled database error), and the rejection rolls back atomically --
+/// no phantom execution or task-queue row survives it, exactly like a
+/// resource-cap rejection (AC4).
+#[tokio::test]
+async fn oversized_resolved_quota_key_is_rejected_before_any_db_write() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let wf = leaked("quota_key_length_oversized");
+
+    // A generous resource cap -- the rejection below must be attributable to
+    // the KEY LENGTH bound, not the active-executions count.
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1000);
+    let _guard = MetadataGuard::install_one(wf, policy).await;
+
+    let oversized_tenant_id = "x".repeat(usize::try_from(MAX_QUOTA_KEY_BYTES).expect("small") + 1);
+    let (rejected_id, outcome) = try_start(
+        &mut conn,
+        wf,
+        &format!("wid-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"tenant_id": oversized_tenant_id}),
+    )
+    .await;
+
+    let err = outcome.expect_err(
+        "a resolved quota key over the length bound must be rejected, not silently indexed",
+    );
+    match &err {
+        HarvestError::PayloadTooLarge {
+            kind,
+            observed_bytes,
+            cap_bytes,
+            workflow_type,
+            activity_name,
+        } => {
+            assert_eq!(*kind, PayloadKind::QuotaKey);
+            assert_eq!(*observed_bytes, MAX_QUOTA_KEY_BYTES + 1);
+            assert_eq!(*cap_bytes, MAX_QUOTA_KEY_BYTES);
+            assert_eq!(workflow_type, wf);
+            assert_eq!(*activity_name, None);
+        }
+        other => {
+            panic!("expected HarvestError::PayloadTooLarge{{kind: QuotaKey, ..}}, got {other:?}")
+        }
+    }
+
+    // Never a silent aliasing/truncation -- and never a phantom row either.
+    assert_no_execution_row(&mut conn, rejected_id).await;
+    assert_no_task_row(&mut conn, rejected_id).await;
+}
+
+/// The bound itself must be admissible end to end through the real admission
+/// path (not just the pure `quota_key_over_cap` helper, which `quota.rs`'s
+/// own unit tests already cover in isolation) -- only a key STRICTLY over
+/// [`MAX_QUOTA_KEY_BYTES`] is rejected.
+#[tokio::test]
+async fn quota_key_exactly_at_the_length_bound_is_admitted() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let wf = leaked("quota_key_length_at_bound");
+
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1000);
+    let _guard = MetadataGuard::install_one(wf, policy).await;
+
+    let exact_tenant_id = "x".repeat(usize::try_from(MAX_QUOTA_KEY_BYTES).expect("small"));
+    assert_eq!(exact_tenant_id.len() as u64, MAX_QUOTA_KEY_BYTES);
+
+    let exec_id = start_ok(
+        &mut conn,
+        wf,
+        serde_json::json!({"tenant_id": exact_tenant_id.clone()}),
+    )
+    .await;
+
+    let row = load_execution(&mut conn, exec_id).await;
+    assert_eq!(row.quota_key.as_deref(), Some(exact_tenant_id.as_str()));
 }

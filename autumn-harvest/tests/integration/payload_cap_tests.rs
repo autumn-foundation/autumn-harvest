@@ -75,12 +75,14 @@ fn fake_workflow_info(name: &'static str) -> WorkflowInfo {
 }
 
 // ---------------------------------------------------------------------------
-// AC: PayloadKind enum exists with all 7 variants
+// AC: PayloadKind enum exists with all 7 variants (issue #252) plus
+// `QuotaKey`, added by issue #946's per-tenant resolved-key length bound.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn payload_kind_all_variants_exist() {
-    // All 7 variants must exist and be constructable.
+    // All 7 issue-#252 variants plus issue #946's `QuotaKey` must exist and
+    // be constructable.
     let _ = PayloadKind::ActivityInput;
     let _ = PayloadKind::ActivityResult;
     let _ = PayloadKind::SignalPayload;
@@ -88,6 +90,7 @@ fn payload_kind_all_variants_exist() {
     let _ = PayloadKind::ChildWorkflowInput;
     let _ = PayloadKind::ChildWorkflowResult;
     let _ = PayloadKind::SideEffectValue;
+    let _ = PayloadKind::QuotaKey;
 }
 
 #[test]
