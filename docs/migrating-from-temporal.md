@@ -81,25 +81,27 @@ the claim yourself.
 |---|---|---|
 | Signal handler, `defineSignal` + `setHandler` (fire-and-forget, push) | `ctx.register_signal_handler` / `register_signal_handler_raw` | issue #546 |
 | Blocking wait for one signal, `condition(() => received, timeout?)` | `ctx.wait_for_signal` / `ctx.receive_signal` / `ctx.receive_signal_timeout` | issue #476 (deadline variant); core primitive (plain wait) |
-| Blocking wait on many signals or a custom condition, `condition(predicate, timeout?)` (no direct harvest equivalent) | Signal handlers plus an explicit poll loop | issue #546 |
+| Blocking wait on many signals or a custom condition, `condition(predicate, timeout?)` | `ctx.await_condition` / `ctx.await_condition_timeout` | core primitive |
 | `SignalWithStart` | `signal_with_start_workflow_execution`, `POST /workflows/{name}/signal-with-start` | issue #244 |
 | Non-blocking signal check (no first-class Temporal equivalent) | `ctx.try_receive_signal` / `ctx.drain_signals` | issue #775 |
 | Duplicate-safe signal delivery (Temporal has no first-class dedup key) | `Idempotency-Key` header on standalone signal delivery | issue #521, issue #753 |
 
 `condition()` in Temporal accepts any predicate over workflow state. It is
 not limited to one named signal. A predicate such as `approved ||
-cancelled` needs two independent signals to feed one wait. Harvest's
-signal-wait primitives resolve on one named signal only. Harvest has no
-direct equivalent for a multi-signal `condition()` call.
+cancelled` can read two independent signals in one wait.
 
-Port a multi-signal `condition()` call as an explicit loop. Register a push
-handler for each signal (`ctx.register_signal_handler`, issue #546). Have
-each handler set its own flag. Loop on `ctx.timer` at a fixed interval.
-Check the combined predicate after each wait. Stop the loop when the
-predicate is true. If the original `condition()` call took a timeout, race
-this loop against a deadline the same way. Pick a poll interval that trades
-reaction speed against timer and task-queue churn. This is more code than
-one `condition()` call. It is the closest direct port available today.
+Harvest has a direct equivalent. Use `ctx.await_condition` when the
+original call took no timeout. Use `ctx.await_condition_timeout` when the
+original call took a timeout. Each accepts a closure. The closure reads
+local workflow state and returns a `bool`.
+
+Port a multi-signal `condition(predicate, timeout?)` call this way.
+Register a push handler for each signal (`ctx.register_signal_handler`,
+issue #546). Have each handler set its own flag. Pass a closure that
+checks the combined flags to `ctx.await_condition` or
+`ctx.await_condition_timeout`. `await_condition_timeout` also takes a
+timer ID and a duration in whole seconds. Use the same duration the
+original timeout used.
 
 ### Queries and updates
 
@@ -642,8 +644,9 @@ async fn subscription_renewal(
   *next* history-consulting call the workflow body makes. A signal recorded
   before this run even started needs a flush point before the first
   `cancelled` check, since nothing else has run yet. The port adds
-  `ctx.system_now()` for exactly this. It is a cheap deterministic
-  primitive call, not an activity or a timer. It costs nothing to call. A
+  `ctx.system_now()` for exactly this. It is a deterministic primitive
+  call, not an activity or a timer. It records one event on the first live
+  pass. Every later replay reads that event back, at no extra cost. A
   signal that arrives during the later `ctx.timer(...)` wait needs no such
   extra call. That wait is itself the flush point. It dispatches the
   handler the moment it resolves. See the module documentation in the
