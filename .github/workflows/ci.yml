@@ -175,6 +175,21 @@ jobs:
       - name: Run docs/rnd/sqlite-feasibility.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration sqlite_feasibility_docs::"
 
+      # Issue #1202: same reasoning as the two steps above, for
+      # docs/testing/chaos.md's worked local-iteration example. It lives
+      # under `docs/`, so a PR that edits only that page — e.g. dropping the
+      # `chaos_tests::` scope from the `HARVEST_TEST_DATABASE_URL` example,
+      # which risks a chaos test's global TRUNCATE scrub racing a concurrent,
+      # unrelated integration-test module against the same shared database —
+      # sets `code=false` and skips the entire `test` matrix. That is
+      # precisely the change class these guards exist to catch.
+      #
+      # Guarded by `chaos_docs::chaos_docs_guards_run_on_docs_only_changes`,
+      # which fails if this step is removed or becomes conditional. Quoted
+      # for the same trailing-`::` YAML reason as above.
+      - name: Run docs/testing/chaos.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration chaos_docs::"
+
   test:
     name: Test (${{ matrix.os }})
     needs: [lint, changes]
