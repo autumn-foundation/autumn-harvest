@@ -2052,3 +2052,226 @@ async fn get_start_throttle_pacing_override_reports_disagreement_across_live_sha
         "per-shard breakdown must show shard 1 as inactive: {shards}"
     );
 }
+
+// ── Round 5: cross-shard disagreement holes in the round-4 fix ─────────────
+
+/// Issue #945 review, round 5, finding 1: `GET /admin/rate-limits` (the
+/// LIST endpoint) still merged every key down to whichever shard had the
+/// fewest raw `tokens`, converting ONLY that single row -- so a fully
+/// reachable, genuinely disagreeing fleet (one shard actively overridden,
+/// one not) could report `override_active: false` for a key that is, in
+/// fact, still overridden on another live shard. This is the same class of
+/// bug round 4 fixed for the single-key `get_start_throttle_pacing_override`
+/// read; this test proves the fix now also covers the plain rate-limit
+/// list.
+#[tokio::test]
+async fn list_rate_limits_reports_disagreement_across_live_shards() {
+    let (url_0, _container_0) = setup_one_shard().await;
+    let (url_1, _container_1) = setup_one_shard().await;
+    let pool_0 = build_pool(&url_0);
+    let pool_1 = build_pool(&url_1);
+
+    let name = leaked_name("send_email");
+
+    // Shard 0: a live ACTIVE override, seeded with MORE tokens than shard 1
+    // -- this is what makes the pre-fix "fewest tokens wins" merge pick the
+    // WRONG (inactive) shard as the sole representative.
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
+    {
+        let mut conn = pool_0.get().await.expect("shard 0 conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_rate_limit_buckets \
+             (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at, \
+              override_refill_rate, override_burst, override_expires_at) \
+             VALUES ($1, $2, $2, $3, NOW(), NOW(), NOW(), $4, $4, $5)",
+        )
+        .bind::<diesel::sql_types::Text, _>(name)
+        .bind::<diesel::sql_types::Double, _>(0.001)
+        .bind::<diesel::sql_types::Double, _>(1000.0)
+        .bind::<diesel::sql_types::Double, _>(1000.0)
+        .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+        .execute(&mut conn)
+        .await
+        .expect("seed shard 0 (active)");
+    }
+
+    // Shard 1: no override at all (NULL override columns), seeded with
+    // FEWER tokens than shard 0.
+    {
+        let mut conn = pool_1.get().await.expect("shard 1 conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_rate_limit_buckets \
+             (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at, \
+              override_refill_rate, override_burst, override_expires_at) \
+             VALUES ($1, $2, $2, $3, NOW(), NOW(), NOW(), NULL, NULL, NULL)",
+        )
+        .bind::<diesel::sql_types::Text, _>(name)
+        .bind::<diesel::sql_types::Double, _>(0.001)
+        .bind::<diesel::sql_types::Double, _>(5.0)
+        .execute(&mut conn)
+        .await
+        .expect("seed shard 1 (inactive)");
+    }
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), pool_0);
+    pools.insert(ShardId::new(1), pool_1);
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+
+    let app = build_sharded_app(
+        HarvestDbPool::sharded(sharded_pool),
+        router,
+        vec![rate_limited_activity_info(name, 0.001, 5.0)],
+        vec![],
+    );
+
+    let (status, list) = get_json(&app, "/admin/rate-limits").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the list read itself never fails on a genuine disagreement, only surfaces it: {list}"
+    );
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["key"] == json!(name))
+        .unwrap_or_else(|| panic!("{name} bucket listed: {list:?}"));
+
+    assert_eq!(
+        entry["override_active"],
+        json!(true),
+        "the SAFE answer -- a live override on ANY shard must never be \
+         silently reported as inactive just because another shard has \
+         fewer raw tokens (this is the exact pre-fix bug): {entry}"
+    );
+    assert_eq!(
+        entry["shard_disagreement"],
+        json!(true),
+        "the two shards genuinely disagree on override state and the list \
+         entry must say so: {entry}"
+    );
+}
+
+/// Issue #945 review, round 5, finding 2: the round-4 disagreement check
+/// compared only the RAW `override_refill_rate`/`override_burst` columns.
+/// A partial legacy `POST /admin/rate-limits/{key}` fan-out (issue #332)
+/// can leave shards with divergent persisted BASELINES; a subsequent
+/// one-field override (only `refill_rate` set, `burst` omitted) then
+/// writes byte-IDENTICAL override columns to every shard -- so the raw
+/// comparison reports "no disagreement" even though the *resolved
+/// effective* burst genuinely differs per shard (each omitted-override
+/// field falls back to that shard's own, diverged, baseline burst).
+#[tokio::test]
+async fn get_start_throttle_pacing_override_detects_diverged_baseline_disagreement() {
+    let (url_0, _container_0) = setup_one_shard().await;
+    let (url_1, _container_1) = setup_one_shard().await;
+    let pool_0 = build_pool(&url_0);
+    let pool_1 = build_pool(&url_1);
+
+    let name = leaked_name("onboard_user");
+    let key = autumn_harvest::throttle::bucket_key(name, "");
+
+    // Shard 0: baseline burst = 20.0 (as if a fully successful legacy SET),
+    // override_refill_rate = 5.0, override_burst = NULL (falls back to
+    // this shard's baseline: 20.0).
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
+    {
+        let mut conn = pool_0.get().await.expect("shard 0 conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_rate_limit_buckets \
+             (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at, \
+              override_refill_rate, override_burst, override_expires_at) \
+             VALUES ($1, $2, $3, $3, NOW(), NOW(), NOW(), $4, NULL, $5)",
+        )
+        .bind::<diesel::sql_types::Text, _>(&key)
+        .bind::<diesel::sql_types::Double, _>(50.0)
+        .bind::<diesel::sql_types::Double, _>(20.0)
+        .bind::<diesel::sql_types::Double, _>(5.0)
+        .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+        .execute(&mut conn)
+        .await
+        .expect("seed shard 0");
+    }
+
+    // Shard 1: DIVERGED baseline burst = 30.0 (as if a partial legacy
+    // `POST /admin/rate-limits/{key}` only reached shard 0, or a later
+    // fan-out to shard 1 alone changed it), the SAME
+    // override_refill_rate = 5.0, override_burst = NULL (falls back to
+    // THIS shard's baseline: 30.0). Raw override columns are byte-identical
+    // to shard 0's.
+    {
+        let mut conn = pool_1.get().await.expect("shard 1 conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_rate_limit_buckets \
+             (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at, \
+              override_refill_rate, override_burst, override_expires_at) \
+             VALUES ($1, $2, $3, $3, NOW(), NOW(), NOW(), $4, NULL, $5)",
+        )
+        .bind::<diesel::sql_types::Text, _>(&key)
+        .bind::<diesel::sql_types::Double, _>(100.0)
+        .bind::<diesel::sql_types::Double, _>(30.0)
+        .bind::<diesel::sql_types::Double, _>(5.0)
+        .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+        .execute(&mut conn)
+        .await
+        .expect("seed shard 1");
+    }
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), pool_0);
+    pools.insert(ShardId::new(1), pool_1);
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+
+    let app = build_sharded_app(
+        HarvestDbPool::sharded(sharded_pool),
+        router,
+        vec![],
+        vec![static_throttled_info(name, "5/m", 5.0)],
+    );
+
+    let (status, body) = get_json(&app, &format!("/admin/start-throttle/{name}/override")).await;
+
+    assert!(
+        body["shard_errors"]
+            .as_array()
+            .is_some_and(std::vec::Vec::is_empty),
+        "both shards are fully reachable: {body}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::MULTI_STATUS,
+        "byte-identical override columns must not mask a genuine \
+         effective-value disagreement caused by diverged persisted \
+         baselines: {body}"
+    );
+    assert_eq!(
+        body["shard_disagreement"],
+        json!(true),
+        "resolved effective burst differs (20.0 vs 30.0) even though the \
+         raw override_refill_rate/override_burst columns are identical on \
+         both shards: {body}"
+    );
+
+    let shards = &body["shards"];
+    assert_eq!(
+        shards["0"]["effective_burst"],
+        json!(20.0),
+        "shard 0's omitted override_burst falls back to ITS OWN baseline: {shards}"
+    );
+    assert_eq!(
+        shards["1"]["effective_burst"],
+        json!(30.0),
+        "shard 1's omitted override_burst falls back to ITS OWN (diverged) baseline: {shards}"
+    );
+}

@@ -3698,6 +3698,46 @@ pub fn resolve_effective_rate_limit(
     }
 }
 
+/// Detects cross-shard pacing disagreement among a set of already-resolved
+/// [`EffectiveRateLimit`] snapshots for one key (issue #945 review, rounds
+/// 4-5).
+///
+/// `true` when either (a) shards disagree on whether an override is
+/// currently active, or (b) every reachable shard agrees "active" but their
+/// *resolved effective* `refill_rate`/`burst` differ.
+///
+/// Comparing only the raw `override_refill_rate`/`override_burst` columns
+/// (rounds 1-4's approach) is insufficient: the separate, permanent `POST
+/// /admin/rate-limits/{key}` route (issue #332) can leave shards with
+/// divergent persisted *baselines* after a partial multi-shard fan-out, so
+/// two shards can carry byte-identical override columns yet enforce
+/// genuinely different effective pacing once an omitted override field
+/// falls back to each shard's own (diverged) baseline. Comparing the
+/// resolved [`EffectiveRateLimit`] instead closes that gap by construction
+/// -- it is the exact value each shard's dispatch path actually enforces.
+#[must_use]
+pub fn pacing_shards_disagree(effective: &[EffectiveRateLimit]) -> bool {
+    let any_active = effective.iter().any(|e| e.override_active);
+    let any_inactive = effective.iter().any(|e| !e.override_active);
+    if any_active && any_inactive {
+        return true;
+    }
+    let active: Vec<&EffectiveRateLimit> = effective.iter().filter(|e| e.override_active).collect();
+    // Deterministic exact f64 comparison — both sides are either
+    // byte-identical copies of one resolved DB column or genuinely
+    // different persisted values (no arithmetic happens on either side that
+    // could introduce imprecision), so an epsilon fuzz would be both
+    // unnecessary and wrong: an operator diagnosing cross-shard drift wants
+    // ANY divergence flagged, however small.
+    #[allow(clippy::float_cmp)]
+    let disagrees = |a: &EffectiveRateLimit, b: &EffectiveRateLimit| {
+        a.refill_rate != b.refill_rate || a.burst != b.burst
+    };
+    active
+        .split_first()
+        .is_some_and(|(first, rest)| rest.iter().any(|e| disagrees(first, e)))
+}
+
 /// Check which activities in the specified queues have pending tasks currently
 /// throttled by rate limits.
 ///
@@ -5066,6 +5106,139 @@ mod tests {
                 override_active: false,
             }
         );
+    }
+
+    #[test]
+    fn pacing_shards_disagree_empty_or_single_shard_never_disagrees() {
+        assert!(!pacing_shards_disagree(&[]));
+        assert!(!pacing_shards_disagree(&[EffectiveRateLimit {
+            refill_rate: 5.0,
+            burst: 10.0,
+            override_active: true,
+        }]));
+    }
+
+    #[test]
+    fn pacing_shards_disagree_all_inactive_agrees() {
+        let a = EffectiveRateLimit {
+            refill_rate: 5.0,
+            burst: 10.0,
+            override_active: false,
+        };
+        let b = EffectiveRateLimit {
+            refill_rate: 5.0,
+            burst: 10.0,
+            override_active: false,
+        };
+        assert!(!pacing_shards_disagree(&[a, b]));
+    }
+
+    #[test]
+    fn pacing_shards_disagree_all_active_with_identical_effective_values_agrees() {
+        let a = EffectiveRateLimit {
+            refill_rate: 50.0,
+            burst: 100.0,
+            override_active: true,
+        };
+        let b = EffectiveRateLimit {
+            refill_rate: 50.0,
+            burst: 100.0,
+            override_active: true,
+        };
+        assert!(!pacing_shards_disagree(&[a, b]));
+    }
+
+    #[test]
+    fn pacing_shards_disagree_active_state_mismatch_disagrees() {
+        // One shard's override committed / is still live; another shard's
+        // has already expired or was never written -- exactly the
+        // partial-outage-recovery scenario rounds 4-5 target.
+        let active = EffectiveRateLimit {
+            refill_rate: 50.0,
+            burst: 100.0,
+            override_active: true,
+        };
+        let inactive = EffectiveRateLimit {
+            refill_rate: 5.0,
+            burst: 10.0,
+            override_active: false,
+        };
+        assert!(pacing_shards_disagree(&[active, inactive]));
+        assert!(pacing_shards_disagree(&[inactive, active]));
+    }
+
+    #[test]
+    fn pacing_shards_disagree_active_but_diverged_baseline_disagrees() {
+        // Round-5 P2 (the finding this test locks in): both shards carry
+        // the SAME override -- refill_rate = 5.0 explicitly overridden,
+        // burst left unset (falls back to baseline) -- but a partial
+        // legacy `POST /admin/rate-limits/{key}` fan-out (issue #332) left
+        // shard B's persisted BASELINE burst diverged from shard A's. The
+        // raw override columns are byte-identical on both shards; only the
+        // *resolved effective* burst differs.
+        let shard_a = resolve_effective_rate_limit(
+            50.0,
+            20.0, // baseline burst
+            Some(5.0),
+            None, // burst not overridden -- falls back to 20.0
+            Some(Utc::now() + Duration::seconds(60)),
+            Utc::now(),
+        );
+        let shard_b = resolve_effective_rate_limit(
+            100.0,
+            30.0, // diverged baseline burst
+            Some(5.0),
+            None, // burst not overridden -- falls back to 30.0
+            Some(Utc::now() + Duration::seconds(60)),
+            Utc::now(),
+        );
+        assert_eq!(shard_a.override_active, shard_b.override_active);
+        // Raw override columns agree (both Some(5.0), None) -- a
+        // comparison over raw columns alone would report no disagreement.
+        // Exact f64 comparison is intentional: both sides fall back to a
+        // deliberately-diverged literal baseline burst (20.0 vs 30.0), not
+        // an arithmetic result subject to float imprecision.
+        #[allow(clippy::float_cmp)]
+        {
+            assert_ne!(shard_a.burst, shard_b.burst); // 20.0 vs 30.0
+        }
+        assert!(pacing_shards_disagree(&[shard_a, shard_b]));
+    }
+
+    #[test]
+    fn pacing_shards_disagree_active_but_diverged_refill_rate_disagrees() {
+        let a = EffectiveRateLimit {
+            refill_rate: 5.0,
+            burst: 10.0,
+            override_active: true,
+        };
+        let b = EffectiveRateLimit {
+            refill_rate: 6.0, // genuinely different override value
+            burst: 10.0,
+            override_active: true,
+        };
+        assert!(pacing_shards_disagree(&[a, b]));
+    }
+
+    #[test]
+    fn pacing_shards_disagree_ignores_inactive_rows_effective_values() {
+        // An inactive shard's `EffectiveRateLimit` reports the declared
+        // baseline (not an override), so two inactive shards with
+        // different baselines must NOT be flagged as "override
+        // disagreement" -- that is a pre-existing, out-of-scope legacy-POST
+        // baseline-consistency concern, not what this endpoint's
+        // incident-response "is my override consistent?" check answers.
+        let a = EffectiveRateLimit {
+            refill_rate: 5.0,
+            burst: 10.0,
+            override_active: false,
+        };
+        let b = EffectiveRateLimit {
+            refill_rate: 50.0,
+            burst: 100.0,
+            override_active: false,
+        };
+        assert!(!pacing_shards_disagree(&[a, b]));
     }
 
     #[test]

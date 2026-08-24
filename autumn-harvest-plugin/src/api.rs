@@ -32412,27 +32412,52 @@ async fn get_start_throttle_pacing_override(
     // timestamps match exactly" -- a normal, fully successful multi-shard
     // SET writes each shard's TTL from that shard's own `NOW()`, so
     // millisecond clock skew alone would make virtually every healthy
-    // multi-shard override report a false "disagreement". Instead:
-    // (a) shards disagreeing on the ACTIVE/INACTIVE boolean (the exact
-    //     failure Codex's example describes), or
-    // (b) every reachable shard agreeing "active" but with genuinely
-    //     different `(override_refill_rate, override_burst)` values.
-    let active_flags: Vec<bool> = snapshots.iter().map(|(_, row)| is_active(row)).collect();
-    let any_active = active_flags.iter().any(|&a| a);
-    let any_inactive = active_flags.iter().any(|&a| !a);
-    let active_state_disagrees = any_active && any_inactive;
+    // multi-shard override report a false "disagreement". Instead defer to
+    // `queue::pacing_shards_disagree`, comparing each shard's *resolved
+    // effective* `(refill_rate, burst)` rather than the raw
+    // `override_refill_rate`/`override_burst` columns (issue #945 review,
+    // round 5): a partial legacy `POST /admin/rate-limits/{key}` fan-out
+    // (issue #332) can leave shards with divergent persisted BASELINES, so
+    // two shards can carry byte-identical override columns yet enforce
+    // genuinely different pacing once an omitted override field falls back
+    // to each shard's own (diverged) baseline -- comparing raw columns
+    // alone would miss exactly that case.
     let active_rows: Vec<&RateLimitBucket> = snapshots
         .iter()
         .filter(|(_, row)| is_active(row))
         .filter_map(|(_, row)| row.as_ref())
         .collect();
-    let active_values_disagree = active_rows.split_first().is_some_and(|(first, rest)| {
-        rest.iter().any(|b| {
-            b.override_refill_rate != first.override_refill_rate
-                || b.override_burst != first.override_burst
+    let effective_per_shard: Vec<queue::EffectiveRateLimit> = snapshots
+        .iter()
+        .map(|(_, row)| {
+            row.as_ref().map_or_else(
+                // No row on this reachable shard yet: report the declared
+                // baseline with no override active -- consistent with
+                // `build_response`'s own None-row fallback below.
+                || {
+                    queue::resolve_effective_rate_limit(
+                        declared_refill_rate,
+                        declared_burst,
+                        None,
+                        None,
+                        None,
+                        now,
+                    )
+                },
+                |b| {
+                    queue::resolve_effective_rate_limit(
+                        b.refill_rate,
+                        b.burst,
+                        b.override_refill_rate,
+                        b.override_burst,
+                        b.override_expires_at,
+                        now,
+                    )
+                },
+            )
         })
-    });
-    let disagreement = active_state_disagrees || active_values_disagree;
+        .collect();
+    let disagreement = queue::pacing_shards_disagree(&effective_per_shard);
 
     // Representative row for the top-level (flattened, 200/207-body)
     // response: prefer an ACTIVE row whenever any shard has one -- an
@@ -32937,10 +32962,13 @@ async fn list_rate_limits(
     let pool = api_state.storage_pool().map_err(map_error)?;
 
     // Aggregate across all shards so operators see every configured key.
-    // Rate-limit config is written to all shards by `set_rate_limit`; per-shard
-    // token counters diverge at runtime.  Deduplicate by key, keeping the entry
-    // with the fewest remaining tokens (worst-case view across the fleet).
-    let mut merged: std::collections::BTreeMap<String, RateLimitBucket> =
+    // Rate-limit config is written to all shards by `set_rate_limit`; a TTL'd
+    // pacing override (issue #945) can also diverge across shards after a
+    // partial write or an outage recovery. Collect EVERY shard's row per key
+    // -- not just a single "representative" pick -- so cross-shard override
+    // disagreement can be detected rather than silently hidden behind
+    // whichever shard's row happened to be kept (issue #945 review, round 5).
+    let mut per_key: std::collections::BTreeMap<String, Vec<RateLimitBucket>> =
         std::collections::BTreeMap::new();
 
     for (_shard, shard_pool) in pool.iter_shards() {
@@ -32952,28 +32980,70 @@ async fn list_rate_limits(
             .map_err(database_error)
             .map_err(map_error)?;
         for b in buckets {
-            use std::collections::btree_map::Entry;
-            match merged.entry(b.key.clone()) {
-                Entry::Vacant(e) => {
-                    e.insert(b);
-                }
-                Entry::Occupied(mut e) => {
-                    // Keep the most-depleted view (lowest tokens) so operators see
-                    // the worst-case shard rather than an optimistically full one.
-                    if b.tokens < e.get().tokens {
-                        e.insert(b);
-                    }
-                }
-            }
+            per_key.entry(b.key.clone()).or_default().push(b);
         }
     }
 
+    let now = chrono::Utc::now();
     Ok(Json(
-        merged
+        per_key
             .into_values()
-            .map(RateLimitBucketView::from)
+            .map(|rows| build_rate_limit_bucket_view(&rows, now))
             .collect(),
     ))
+}
+
+/// Merges one key's per-shard `RateLimitBucket` rows into a single
+/// [`RateLimitBucketView`], reporting cross-shard override disagreement
+/// (issue #945 review, round 5) alongside the pre-existing worst-case
+/// (lowest-tokens) representative-row selection.
+///
+/// # Panics
+///
+/// Never in practice: `rows` is always non-empty here, built from the
+/// `BTreeMap<String, Vec<RateLimitBucket>>` entries in [`list_rate_limits`],
+/// which only ever inserts a key alongside at least one row.
+fn build_rate_limit_bucket_view(
+    rows: &[RateLimitBucket],
+    now: chrono::DateTime<chrono::Utc>,
+) -> RateLimitBucketView {
+    let effective_per_shard: Vec<queue::EffectiveRateLimit> = rows
+        .iter()
+        .map(|b| {
+            queue::resolve_effective_rate_limit(
+                b.refill_rate,
+                b.burst,
+                b.override_refill_rate,
+                b.override_burst,
+                b.override_expires_at,
+                now,
+            )
+        })
+        .collect();
+    let disagreement = queue::pacing_shards_disagree(&effective_per_shard);
+
+    // Representative row: prefer an ACTIVE override row whenever any shard
+    // has one -- an operator scanning this list for "which keys are
+    // currently overridden right now?" must never silently miss one just
+    // because a *different*, non-overridden shard happened to have fewer
+    // tokens (issue #945 review, round 5; mirrors
+    // `get_start_throttle_pacing_override`'s round-4 fix). Among a
+    // homogeneous set (all active, or all inactive), keep the pre-existing
+    // worst-case (lowest tokens) heuristic so operators still see the most
+    // depleted shard rather than an optimistically full one.
+    let is_active =
+        |b: &RateLimitBucket| b.override_expires_at.is_some_and(|expires| expires > now);
+    let representative = rows
+        .iter()
+        .filter(|b| is_active(b))
+        .min_by(|a, b| a.tokens.total_cmp(&b.tokens))
+        .or_else(|| rows.iter().min_by(|a, b| a.tokens.total_cmp(&b.tokens)))
+        .expect("rows is always non-empty (see fn docs)");
+
+    RateLimitBucketView {
+        shard_disagreement: disagreement,
+        ..RateLimitBucketView::from(representative.clone())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -33180,9 +33250,11 @@ impl PacingOverrideResponse {
 /// (`key`/`refill_rate`/`burst`/`tokens`/`last_refilled_at`/`created_at`/
 /// `updated_at`/`override_refill_rate`/`override_burst`/
 /// `override_expires_at`) is preserved **unchanged** -- an existing
-/// consumer parsing e.g. `entry["burst"]` keeps working -- plus three new
-/// computed fields resolving what dispatch is actually enforcing right now:
-/// `override_active`, `effective_refill_rate`, `effective_burst`.
+/// consumer parsing e.g. `entry["burst"]` keeps working -- plus four new
+/// computed fields: `override_active`, `effective_refill_rate`,
+/// `effective_burst` resolve what dispatch is actually enforcing right now;
+/// `shard_disagreement` (round 5) reports whether the fleet's shards
+/// disagree on that state.
 ///
 /// This is purely additive on top of the raw `RateLimitBucket` shape;
 /// nothing is renamed or removed.
@@ -33207,6 +33279,15 @@ struct RateLimitBucketView {
     /// The burst actually enforced right now: the override's, when
     /// `override_active`, else the declared baseline `burst`.
     effective_burst: f64,
+    /// Whether the shards backing this key's rows disagree on override
+    /// state or resolved effective pacing (issue #945 review, round 5).
+    /// `false` for a single-shard row on its own -- this field is only ever
+    /// set `true` by [`build_rate_limit_bucket_view`], which has the
+    /// multi-shard context [`From<RateLimitBucket>`] lacks. When `true`,
+    /// the other fields above still reflect a best-effort representative
+    /// shard (preferring an active override), but an operator should not
+    /// treat them as authoritative for every shard.
+    shard_disagreement: bool,
 }
 
 impl From<RateLimitBucket> for RateLimitBucketView {
@@ -33233,6 +33314,7 @@ impl From<RateLimitBucket> for RateLimitBucketView {
             override_active: effective.override_active,
             effective_refill_rate: effective.refill_rate,
             effective_burst: effective.burst,
+            shard_disagreement: false,
         }
     }
 }
