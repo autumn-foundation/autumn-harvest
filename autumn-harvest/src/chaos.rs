@@ -922,16 +922,83 @@ mod controller {
     /// The generation is fenced *again* at fire time via
     /// [`ChaosState::fire_if_current`], so a disarm landing after this snapshot
     /// still fires nothing.
+    ///
+    /// A `#[cfg(test)]`-only rendezvous (see [`maybe_pause_entry_snapshot`])
+    /// sits between the two reads below -- absent from every non-test build,
+    /// including a real `--features chaos` binary, so it costs nothing
+    /// outside `cargo test`. `entry_snapshot_rejects_a_straddled_read_of_the_real_production_path`
+    /// uses it to pause THIS function on a real OS thread and drive a
+    /// genuine concurrent disarm+rearm across the pause, proving this exact
+    /// function -- not a hand-reconstructed stand-in -- rejects a straddled
+    /// read (Codex review round 3, issue #1202: the sibling
+    /// `entry_snapshot_transitions_cleanly_where_the_removed_two_read_shape_straddled`
+    /// test below only replays the REMOVED shape's bug against a clone,
+    /// `vulnerable_two_read_shape`, and so cannot detect a regression that
+    /// reintroduces an equivalent stale-decision defect into this real
+    /// function).
     fn entry_snapshot() -> Option<Arc<ChaosState>> {
         let entry_gen = ARMED_GEN.load(Ordering::SeqCst);
         if entry_gen == 0 {
             return None;
         }
+        #[cfg(test)]
+        maybe_pause_entry_snapshot();
         let state = current_state()?;
         if state.generation != entry_gen {
             return None;
         }
         Some(state)
+    }
+
+    /// Test-only rendezvous consulted by [`entry_snapshot`] between its two
+    /// reads (see [`maybe_pause_entry_snapshot`]). `None` -- the default, and
+    /// the only state outside an explicit [`install_entry_snapshot_test_pause`]
+    /// call -- costs a single mutex lock with nothing to do; only a test that
+    /// has armed the pause pays for the rendezvous itself.
+    #[cfg(test)]
+    static ENTRY_SNAPSHOT_TEST_PAUSE: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    > = Mutex::new(None);
+
+    /// Arm a one-shot pause for the *next* call to [`entry_snapshot`] that
+    /// observes the harness armed (an already-disarmed call returns before
+    /// ever reaching the rendezvous, so it never blocks on this). Returns a
+    /// `(reached, release)` pair: `reached.recv()` blocks the caller until
+    /// the paused call is parked at the rendezvous; sending on (or dropping)
+    /// `release` lets the paused call proceed to its second read.
+    #[cfg(test)]
+    fn install_entry_snapshot_test_pause() -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        *ENTRY_SNAPSHOT_TEST_PAUSE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// Consumed at most once per [`install_entry_snapshot_test_pause`] call
+    /// -- `take()`, not a peek -- so an unrelated concurrent `entry_snapshot`
+    /// call could never also consume this test's rendezvous. In practice
+    /// this is moot: `arm`'s process-wide `SERIAL` lock means only one test
+    /// can be armed at a time, so no other call can reach an armed
+    /// `entry_snapshot` while this rendezvous is installed -- but `take`
+    /// keeps that true by construction rather than by relying on it.
+    #[cfg(test)]
+    fn maybe_pause_entry_snapshot() {
+        let taken = ENTRY_SNAPSHOT_TEST_PAUSE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((reached_tx, release_rx)) = taken {
+            let _ = reached_tx.send(());
+            let _ = release_rx.recv();
+        }
     }
 
     /// Install a chaining panic hook (once, idempotently) that prints a compact
@@ -1677,6 +1744,61 @@ mod controller {
                 vulnerable_result.is_some_and(|s| s.generation == gen2),
                 "documents the bug: the removed two-read shape wrongly adopts \
                  gen2's state for a task whose entry belonged to gen1",
+            );
+
+            drop(guard2);
+        }
+
+        // ---- Codex review round 3 (issue #1202): the test above only proves
+        //      the REMOVED two-read shape was buggy by calling a
+        //      hand-reconstructed clone (`vulnerable_two_read_shape`) -- it
+        //      never exercises the REAL `entry_snapshot` under an actual
+        //      straddle, so it would not catch a regression that
+        //      reintroduces an equivalent stale-decision defect (a separate
+        //      flag or otherwise) into the real function. This test closes
+        //      that gap: it pauses the REAL `entry_snapshot` (via the
+        //      `#[cfg(test)]`-only rendezvous installed next to it) on a
+        //      genuine OS thread, between its own two reads, and drives a
+        //      real concurrent disarm+rearm across the pause. ----
+
+        #[tokio::test]
+        async fn entry_snapshot_rejects_a_straddled_read_of_the_real_production_path() {
+            // `entry_snapshot` itself is synchronous; it is run here on a
+            // real `std::thread` (not a tokio task) because the pause hook
+            // below blocks with `std::sync::mpsc`, not a tokio channel. The
+            // blocking `reached_rx.recv()` a few lines down runs on this
+            // test's own (current-thread) tokio executor, which is fine: the
+            // only thing it is waiting on is the separately-spawned
+            // `std::thread`, not any other tokio task on this runtime.
+            let guard1 = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
+            let gen1 = ARMED_GEN.load(Ordering::SeqCst);
+            assert_ne!(gen1, 0, "gen1 must be armed here");
+
+            let (reached_rx, release_tx) = install_entry_snapshot_test_pause();
+            let handle = std::thread::spawn(entry_snapshot);
+            reached_rx
+                .recv()
+                .expect("the real entry_snapshot must reach the rendezvous while armed");
+
+            // While the spawned call is parked between its own two reads
+            // (having already captured entry_gen == gen1), perform a REAL
+            // disarm + rearm to a different plan -- genuine concurrency, not
+            // a simulated STATE poke like the Fix-3 test above.
+            drop(guard1);
+            let guard2 = arm(ChaosPlan::scripted()).await;
+            let gen2 = ARMED_GEN.load(Ordering::SeqCst);
+            assert_ne!(gen1, gen2, "gen2 must be a genuinely different generation");
+
+            release_tx
+                .send(())
+                .expect("the paused call must still be waiting on release");
+            let result = handle.join().expect("entry_snapshot thread must not panic");
+
+            assert!(
+                result.is_none(),
+                "the real entry_snapshot must reject a read straddled across a \
+                 genuine concurrent disarm+rearm -- it must not silently adopt \
+                 gen2's state for an entry that began while gen1 was armed",
             );
 
             drop(guard2);
