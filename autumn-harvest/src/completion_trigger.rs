@@ -1640,7 +1640,12 @@ pub fn evaluate_triggers_for_execution<'a>(
                         workflow_name: &trigger_db.target_workflow_name,
                         workflow_id: &target_workflow_id,
                         exec_id: target_exec_id,
-                        input: target_input,
+                        // Cloned (not moved) — `target_input` and `concurrency_key`
+                        // must stay available after this call for the new
+                        // `QuotaExceeded` outbox-fallback arm below (issue #946,
+                        // Codex round-3 review), which needs the original values
+                        // to construct a `DeferredTriggerStart` for retry.
+                        input: target_input.clone(),
                         parent_id: None,
                         queue_name: &queue_name,
                         execution_timeout: None,
@@ -1653,7 +1658,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                         chain_execution_timeout: None,
                         max_workflow_chain_timeout_ceiling: None,
                         inherited_chain_deadline_at: None,
-                        concurrency_key,
+                        concurrency_key: concurrency_key.clone(),
                         concurrency_limit,
                         concurrency_on_conflict,
                         priority: Priority::default(),
@@ -1709,6 +1714,117 @@ pub fn evaluate_triggers_for_execution<'a>(
                         if let Some(m) = metrics {
                             m.record_completion_trigger_fired(&trigger_name, "payload_too_large");
                         }
+                        continue;
+                    }
+                    // issue #946 (Codex round-3 review): a same-shard target's
+                    // per-tenant quota is exhausted right now. This branch runs
+                    // INLINE inside the SOURCE execution's own terminal
+                    // transaction (see the fn's callers in worker.rs/timeout.rs/
+                    // execution.rs/poison_pill.rs, all of which commit this
+                    // trigger evaluation as part of sealing the source's terminal
+                    // state) -- unlike the `Blocked`/`QuotaBlocked` handling in
+                    // `relay_gate_checked_start` above, which only ever runs
+                    // AFTER that transaction has already committed. So neither
+                    // of that function's two options apply here as-is:
+                    // propagating the error via `?`/`return Err(e)` (the
+                    // pre-fix behaviour) rolls back the SOURCE's own
+                    // completion/failure right along with the blocked trigger --
+                    // a full tenant quota can therefore wedge every unrelated
+                    // source workflow that happens to fire a trigger at this
+                    // target, forever, until the quota frees up on its own.
+                    // `continue`-ing like the `PayloadTooLarge` arm above is
+                    // also wrong: unlike an oversized payload (which can never
+                    // succeed no matter how many times it's retried), a quota
+                    // is a TEMPORARY condition, so silently dropping the
+                    // trigger here would permanently lose it.
+                    //
+                    // The fix: fall back to the exact same durable outbox +
+                    // `DeferredTriggerStart` retry mechanism the cross-shard
+                    // branch below already uses for every one of its starts,
+                    // with `target_shard == source_shard`. The outbox row is
+                    // inserted on THIS connection, so it commits atomically
+                    // with the source's own terminal transaction (never
+                    // orphaned by a rollback, never leaked by a commit that
+                    // somehow skipped it); `enforce_completion_triggers_outbox`
+                    // already scans by `target_shard.eq_any(shard_assignments)`
+                    // with no same-shard-vs-cross-shard distinction, so it
+                    // requires no change to retry this row on its own shard.
+                    // The trigger's own `harvest.quota.rejected` metric was
+                    // already recorded by `enforce_quota_admission` inside the
+                    // failed start attempt above; only `completion_trigger_fired`
+                    // needs recording here, using the SAME "started" label the
+                    // cross-shard branch uses for "queued for async delivery"
+                    // (as opposed to "delivered") -- see the `else` branch below.
+                    Err(crate::error::HarvestError::QuotaExceeded {
+                        key,
+                        resource,
+                        limit,
+                        current,
+                        ..
+                    }) => {
+                        tracing::info!(
+                            trigger_id = %trigger_db.id,
+                            target_workflow_name = %trigger_db.target_workflow_name,
+                            quota_key = %key,
+                            resource = %resource,
+                            limit,
+                            current,
+                            "same-shard completion-trigger target is at its per-tenant quota; \
+                             deferring the start to the outbox for retry rather than blocking \
+                             the source execution's own completion"
+                        );
+
+                        if let Some(m) = metrics {
+                            m.record_completion_trigger_fired(&trigger_name, "started");
+                        }
+
+                        let outbox_row = diesel::insert_into(
+                            crate::schema::harvest_completion_trigger_outbox::table,
+                        )
+                        .values(&NewCompletionTriggerOutboxDb {
+                            source_exec_id: exec_id.as_uuid(),
+                            trigger_id: trigger_db.id,
+                            target_shard: source_shard.as_i32(),
+                            target_workflow_name: trigger_db.target_workflow_name.clone(),
+                            target_workflow_id: target_workflow_id.clone(),
+                            target_input: target_input.clone(),
+                            queue_name: trigger_db.queue_name.clone(),
+                            concurrency_key: concurrency_key.clone(),
+                            concurrency_limit: concurrency_limit
+                                .map(|l| i32::try_from(l).unwrap_or(i32::MAX)),
+                            priority: serde_json::to_value(Priority::default())
+                                .unwrap_or(Value::Null),
+                            max_workflow_input_bytes: i64::try_from(max_workflow_input_bytes)
+                                .unwrap_or(i64::MAX),
+                        })
+                        .get_result::<crate::models::CompletionTriggerOutboxDb>(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+
+                        deferred_starts.push(DeferredTriggerStart {
+                            outbox_id: outbox_row.id,
+                            source_exec_id: exec_id.as_uuid(),
+                            trigger_id: trigger_db.id,
+                            source_shard,
+                            target_shard: source_shard,
+                            target_workflow_name: trigger_db.target_workflow_name.clone(),
+                            target_workflow_id,
+                            target_input,
+                            queue_name: trigger_db.queue_name.clone(),
+                            concurrency_key,
+                            concurrency_limit,
+                            concurrency_on_conflict,
+                            priority: Priority::default(),
+                            max_workflow_input_bytes,
+                            trigger_name,
+                            owner: target_owner,
+                            runbook_url: target_runbook_url,
+                            severity: target_severity,
+                            sla: target_sla,
+                            retry_policy: target_retry_policy,
+                            max_workflow_attempts_ceiling,
+                        });
+
                         continue;
                     }
                     Err(e) => return Err(e),

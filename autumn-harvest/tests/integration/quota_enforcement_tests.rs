@@ -54,7 +54,12 @@
     clippy::expect_used,
     clippy::too_many_lines,
     clippy::missing_panics_doc,
-    clippy::missing_errors_doc
+    clippy::missing_errors_doc,
+    // Diesel `#[derive(QueryableByName)] struct XxxRow { .. }` helpers are
+    // conventionally defined right where they're used, mid-function, across
+    // every integration-test file in this repo that reads a raw column via
+    // `sql_query` (see e.g. `child_policy_tests.rs`, `pause_tests.rs`).
+    clippy::items_after_statements
 )]
 
 use std::collections::HashMap;
@@ -71,7 +76,8 @@ use autumn_harvest::models::WorkflowExecution;
 use autumn_harvest::quota::{MAX_QUOTA_KEY_BYTES, QuotaPolicy, QuotaResource};
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::types::{
-    ExecutionId, Priority, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+    ExecutionId, ParentClosePolicy, Priority, StartSource, WorkflowIdConflictPolicy,
+    WorkflowIdReusePolicy,
 };
 use autumn_harvest::worker::HandlerRegistry;
 use autumn_harvest::{WorkflowContext, WorkflowInfo};
@@ -961,6 +967,605 @@ async fn continue_as_new_cross_type_to_no_quota_workflow_clears_quota_key() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #946, Codex round-3 review — a `SpawnDetachedChildWorkflow` command
+// (issue #347) resolves and enforces the TARGET workflow type's own declared
+// quota exactly like a fresh admission, worker-driven end to end.
+// `ParentClosePolicy` governs the detached child's *lifecycle*; the target
+// type's tenant-quota footprint is an orthogonal concern this exercises.
+// ---------------------------------------------------------------------------
+
+fn detached_quota_parent<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let child_type = input["child_type"]
+            .as_str()
+            .expect("input.child_type must be present")
+            .to_string();
+        // Leaked once per invocation is fine -- this handler only runs once
+        // per test (a detached spawn is a fire-and-forget command, not a
+        // suspend point the workflow re-enters).
+        let child_type: &'static str = Box::leak(child_type.into_boxed_str());
+        ctx.spawn_child_workflow_detached_raw(
+            child_type,
+            serde_json::json!({"tenant_id": "acme"}),
+            ParentClosePolicy::Abandon,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("parent_done"))
+    })
+}
+
+fn detached_quota_child<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::json!("child_done")) })
+}
+
+/// A detached child spawn (issue #347) whose target type's quota is at cap
+/// must not terminally fail the PARENT -- that would seal a healthy
+/// execution over an UNRELATED tenant's capacity signal. Instead the
+/// parent's own workflow task is parked and woken (`worker.rs`'s
+/// `recover_from_child_quota_exceeded`) so a later poll re-drives the
+/// identical decision cycle; once the blocking execution frees its slot,
+/// the retry succeeds and the detached child is created with the resolved
+/// `quota_key` stamped on its own row -- the exact
+/// `create_detached_child_executions` code path (issue #946, Codex round-3
+/// review).
+#[tokio::test]
+async fn detached_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let parent_wf_name = leaked("quota_detached_parent");
+    let child_wf_name = leaked("quota_detached_child");
+
+    let child_quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let mut child_info = wf_info(child_wf_name, detached_quota_child);
+    child_info.quota = Some(child_quota_policy);
+
+    // Occupy the ONE `max_active_executions` slot for key "acme" with a
+    // blocker execution of the SAME target type, started directly (not via
+    // the parent) so the quota is already saturated before the parent ever
+    // runs. `start_root` drives the BARE admission path
+    // (`start_or_load_workflow_execution`), which resolves its quota policy
+    // from the process-global `GLOBAL_WORKFLOW_METADATA` mirror -- NOT from
+    // any `HandlerRegistry` -- so the blocker's `quota_key` is only stamped
+    // correctly while this guard is installed (mirrors the pre-existing
+    // `concurrent_runaway_tenant_is_capped_...` test's established pattern).
+    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy).await;
+    let blocker = start_root(
+        &mut conn,
+        child_wf_name,
+        &format!("blocker-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+    drop(blocker_guard);
+
+    // The blocker's own `harvest_task_queue` row must never be claimed by the
+    // worker below (which necessarily has `detached_quota_child`'s handler
+    // registered, so it CAN run the blocker to completion) -- that would free
+    // the quota slot almost instantly and defeat the whole test. Delete it so
+    // the blocker stays stuck `RUNNING` until `mark_terminal` explicitly
+    // seals it further down.
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(blocker.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("delete blocker task row");
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf_name,
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"child_type": child_wf_name}),
+    )
+    .await;
+
+    let reg = registry(vec![
+        wf_info(parent_wf_name, detached_quota_parent),
+        child_info,
+    ]);
+    let worker = build_runtime_worker("w-946-detached-quota", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+
+    // While the blocker still holds the quota slot, the parent's spawn
+    // attempt is rejected with `QuotaExceeded`, caught by
+    // `recover_from_child_quota_exceeded`, and the parent's own workflow
+    // task is parked (never terminally failed) so a later poll retries. The
+    // worker polls every 25ms (`runtime_config`'s test default), so a 600ms
+    // window is dozens of retry cycles -- ample time to observe the
+    // negative assertions below without any explicit "parked" detection.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let child_row_count_sql =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+
+    assert_eq!(
+        load_execution(&mut conn, parent).await.state,
+        "RUNNING",
+        "parent must stay RUNNING (parked/retrying) rather than terminally \
+         failing over the child target's quota"
+    );
+    assert_eq!(
+        count_rows(&mut conn, child_row_count_sql, &[child_wf_name]).await,
+        1, // only the blocker
+        "no detached child row should exist while the target quota is at cap"
+    );
+
+    // Free the quota slot: the blocker execution goes terminal, so the next
+    // reclaim of the parent's parked task succeeds.
+    mark_terminal(&mut conn, blocker, "CANCELLED").await;
+
+    wait_for_execution_state(&url, parent, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    // The retried spawn resolved and stamped the tenant key on the child's
+    // own row -- the exact code path this test exercises: `quota_key:
+    // child_quota_key.as_deref()` in `create_detached_child_executions`.
+    #[derive(diesel::QueryableByName)]
+    struct ChildRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        quota_key: Option<String>,
+    }
+    let child_row: ChildRow = diesel::sql_query(
+        "SELECT quota_key FROM harvest_workflow_executions \
+         WHERE workflow_name = $1 AND id != $2",
+    )
+    .bind::<diesel::sql_types::Text, _>(child_wf_name)
+    .bind::<diesel::sql_types::Uuid, _>(blocker.as_uuid())
+    .get_result(&mut conn)
+    .await
+    .expect("detached child row must exist");
+
+    assert_eq!(
+        child_row.quota_key.as_deref(),
+        Some("acme"),
+        "detached child row must carry the tenant key resolved from its OWN \
+         declared policy"
+    );
+    assert_eq!(
+        count_rows(&mut conn, child_row_count_sql, &[child_wf_name]).await,
+        2, // the (now-cancelled) blocker + the newly-created detached child
+        "exactly one detached child should exist once quota capacity freed up"
+    );
+}
+
+fn detached_quota_mixed_parent<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let child_type = input["child_type"]
+            .as_str()
+            .expect("input.child_type must be present")
+            .to_string();
+        let child_type: &'static str = Box::leak(child_type.into_boxed_str());
+        ctx.spawn_child_workflow_detached_raw(
+            child_type,
+            serde_json::json!({"tenant_id": "acme"}),
+            ParentClosePolicy::Abandon,
+        )
+        .map_err(|e| e.to_string())?;
+        // Unlike `detached_quota_parent` above, this handler does NOT return
+        // immediately after the (synchronous, non-suspending) detached-spawn
+        // command -- it also durably suspends on a timer in the SAME decision
+        // cycle. The pending-commands buffer for this cycle therefore carries
+        // BOTH a `SpawnDetachedChildWorkflow` command and a `StartTimer`
+        // command: a MIXED suspension batch, persisted via
+        // `handle_suspended_workflow`'s `persist_started_timer` branch (which
+        // itself calls `DetachedSpawnPersistence::persist` for the co-batched
+        // detached spawn) rather than the terminal-with-commands path the
+        // sibling test above exercises. A `QuotaExceeded` surfacing from
+        // THAT call is caught by `recover_from_child_quota_exceeded`'s OTHER
+        // call site -- `handle_suspended_workflow`'s dispatch tail (issue
+        // #946, Codex round-3 review).
+        ctx.timer("mixed-batch-tick", 1)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("parent_done"))
+    })
+}
+
+/// A detached child spawn that shares a decision cycle with another
+/// suspending command (a mixed batch -- a detached spawn followed by an
+/// awaited durable timer before the workflow itself suspends) is persisted
+/// via `handle_suspended_workflow`'s dispatch tail, a DIFFERENT
+/// `recover_from_child_quota_exceeded` call site from the
+/// terminal-with-commands one
+/// [`detached_child_spawn_honors_target_quota_parks_parent_then_succeeds`]
+/// exercises above. When the detached child's target quota is at cap, this
+/// path must ALSO park + wake the parent rather than terminally failing it
+/// (issue #946, Codex round-3 review).
+#[tokio::test]
+async fn detached_child_spawn_in_mixed_batch_honors_target_quota_parks_parent_then_succeeds() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let parent_wf_name = leaked("quota_detached_mixed_parent");
+    let child_wf_name = leaked("quota_detached_mixed_child");
+
+    let child_quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let mut child_info = wf_info(child_wf_name, detached_quota_child);
+    child_info.quota = Some(child_quota_policy);
+
+    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy).await;
+    let blocker = start_root(
+        &mut conn,
+        child_wf_name,
+        &format!("blocker-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+    drop(blocker_guard);
+
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(blocker.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("delete blocker task row");
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf_name,
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"child_type": child_wf_name}),
+    )
+    .await;
+
+    let reg = registry(vec![
+        wf_info(parent_wf_name, detached_quota_mixed_parent),
+        child_info,
+    ]);
+    let worker = build_runtime_worker("w-946-detached-mixed-quota", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+
+    // While the blocker still holds the quota slot, the parent's mixed-batch
+    // spawn attempt is rejected with `QuotaExceeded`, caught by
+    // `recover_from_child_quota_exceeded`'s `handle_suspended_workflow`
+    // dispatch-tail call site, and the parent's own workflow task is parked
+    // (never terminally failed) so a later poll retries.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let child_row_count_sql =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+
+    assert_eq!(
+        load_execution(&mut conn, parent).await.state,
+        "RUNNING",
+        "parent must stay RUNNING (parked/retrying) rather than terminally \
+         failing over the child target's quota"
+    );
+    assert_eq!(
+        count_rows(&mut conn, child_row_count_sql, &[child_wf_name]).await,
+        1, // only the blocker
+        "no detached child row should exist while the target quota is at cap"
+    );
+
+    // Free the quota slot: the blocker execution goes terminal, so the next
+    // reclaim of the parent's parked task succeeds and re-drives the SAME
+    // mixed-batch decision cycle from the unchanged recorded history.
+    mark_terminal(&mut conn, blocker, "CANCELLED").await;
+
+    wait_for_execution_state(&url, parent, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    assert_eq!(
+        count_rows(&mut conn, child_row_count_sql, &[child_wf_name]).await,
+        2, // the (now-cancelled) blocker + the newly-created detached child
+        "exactly one detached child should exist once quota capacity freed up"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #946, Codex round-3 review — an AWAITED child spawn (`ctx.
+// spawn_child_workflow_raw`, whether a lone spawn or one of a genuine
+// fan-out, both dispatch through the same `persist_all_started_child_workflows`
+// suspension-batch handler) resolves and enforces the TARGET workflow type's
+// own declared quota, exactly like the detached-spawn path above, worker-
+// driven end to end.
+// ---------------------------------------------------------------------------
+
+fn awaited_quota_parent<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let child_type = input["child_type"]
+            .as_str()
+            .expect("input.child_type must be present")
+            .to_string();
+        let output = ctx
+            .spawn_child_workflow_raw(&child_type, serde_json::json!({"tenant_id": "acme"}))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(output)
+    })
+}
+
+fn awaited_quota_child<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::json!("awaited_child_done")) })
+}
+
+/// An awaited child spawn (`persist_all_started_child_workflows`) whose
+/// target type's quota is at cap must not terminally fail the PARENT.
+/// Mirrors [`detached_child_spawn_honors_target_quota_parks_parent_then_succeeds`]
+/// exactly, but exercises the DIFFERENT dispatch function that handles a
+/// `StartChildWorkflow` suspension batch (the local `match` arm inline in
+/// `persist_all_started_child_workflows`, not the shared
+/// `recover_from_child_quota_exceeded` helper).
+#[tokio::test]
+async fn awaited_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let parent_wf_name = leaked("quota_awaited_parent");
+    let child_wf_name = leaked("quota_awaited_child");
+
+    let child_quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let mut child_info = wf_info(child_wf_name, awaited_quota_child);
+    child_info.quota = Some(child_quota_policy);
+
+    // Occupy the ONE `max_active_executions` slot for key "acme" with a
+    // blocker of the SAME target type -- see the detached-spawn test above
+    // for why the `MetadataGuard` install and the task-row deletion are both
+    // required for a correct blocker.
+    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy).await;
+    let blocker = start_root(
+        &mut conn,
+        child_wf_name,
+        &format!("blocker-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+    drop(blocker_guard);
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(blocker.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("delete blocker task row");
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf_name,
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"child_type": child_wf_name}),
+    )
+    .await;
+
+    let reg = registry(vec![
+        wf_info(parent_wf_name, awaited_quota_parent),
+        child_info,
+    ]);
+    let worker = build_runtime_worker("w-946-awaited-quota", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+
+    // While the blocker still holds the quota slot, the parent's spawn
+    // attempt inside `persist_all_started_child_workflows` is rejected with
+    // `QuotaExceeded`, and the WHOLE transaction (including the parent's own
+    // `ChildWorkflowStarted` append) rolls back -- so the parent never even
+    // reaches a parked-on-child-completion state; it stays exactly where it
+    // started, with the decision cycle retried on every subsequent poll.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let child_row_count_sql =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+
+    assert_eq!(
+        load_execution(&mut conn, parent).await.state,
+        "RUNNING",
+        "parent must stay RUNNING (parked/retrying) rather than terminally \
+         failing over the child target's quota"
+    );
+    assert_eq!(
+        count_rows(&mut conn, child_row_count_sql, &[child_wf_name]).await,
+        1, // only the blocker
+        "no child row should exist while the target quota is at cap"
+    );
+
+    // Free the quota slot.
+    mark_terminal(&mut conn, blocker, "CANCELLED").await;
+
+    wait_for_execution_state(&url, parent, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    let final_state = load_execution(&mut conn, parent).await;
+    assert_eq!(
+        final_state.output,
+        Some(serde_json::json!("awaited_child_done")),
+        "parent's spawn_child_workflow_raw().await must resolve to the \
+         child's real completed output once the retry succeeds"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct ChildRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        quota_key: Option<String>,
+    }
+    let child_row: ChildRow = diesel::sql_query(
+        "SELECT quota_key FROM harvest_workflow_executions \
+         WHERE workflow_name = $1 AND id != $2",
+    )
+    .bind::<diesel::sql_types::Text, _>(child_wf_name)
+    .bind::<diesel::sql_types::Uuid, _>(blocker.as_uuid())
+    .get_result(&mut conn)
+    .await
+    .expect("awaited child row must exist");
+
+    assert_eq!(
+        child_row.quota_key.as_deref(),
+        Some("acme"),
+        "awaited child row must carry the tenant key resolved from its OWN \
+         declared policy"
+    );
+    assert_eq!(
+        count_rows(&mut conn, child_row_count_sql, &[child_wf_name]).await,
+        2, // the (now-cancelled) blocker + the newly-created awaited child
+        "exactly one child should exist once quota capacity freed up"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #946, Codex round-3 review — the child-timeout-race primitive
+// (`ctx.spawn_child_workflow_timeout`, issue #779) dispatches through
+// `persist_child_timeout_race` -> `insert_awaited_child_execution`, a THIRD
+// distinct child-spawn code path from the two above (fan-out and detached).
+// Its own local `QuotaExceeded` catch must likewise park rather than fail
+// the parent.
+// ---------------------------------------------------------------------------
+
+fn child_timeout_race_quota_parent<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let child_type = input["child_type"]
+            .as_str()
+            .expect("input.child_type must be present")
+            .to_string();
+        // A generous 600s deadline: this test only needs to prove the CHILD
+        // branch wins once quota capacity frees up, never the timeout branch.
+        let outcome = ctx
+            .spawn_child_workflow_timeout(
+                &child_type,
+                serde_json::json!({"tenant_id": "acme"}),
+                std::time::Duration::from_secs(600),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"child_won": outcome.is_some(), "value": outcome}))
+    })
+}
+
+fn child_timeout_race_quota_child<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::json!("race_child_done")) })
+}
+
+/// A child-timeout-race child spawn (`persist_child_timeout_race` ->
+/// `insert_awaited_child_execution`) whose target type's quota is at cap
+/// must not terminally fail the PARENT. Same shape as the two tests above,
+/// exercising the third and last distinct dispatch function that can create
+/// a child execution row.
+#[tokio::test]
+async fn child_timeout_race_spawn_honors_target_quota_parks_parent_then_succeeds() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let parent_wf_name = leaked("quota_race_parent");
+    let child_wf_name = leaked("quota_race_child");
+
+    let child_quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let mut child_info = wf_info(child_wf_name, child_timeout_race_quota_child);
+    child_info.quota = Some(child_quota_policy);
+
+    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy).await;
+    let blocker = start_root(
+        &mut conn,
+        child_wf_name,
+        &format!("blocker-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+    drop(blocker_guard);
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(blocker.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("delete blocker task row");
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf_name,
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"child_type": child_wf_name}),
+    )
+    .await;
+
+    let reg = registry(vec![
+        wf_info(parent_wf_name, child_timeout_race_quota_parent),
+        child_info,
+    ]);
+    let worker = build_runtime_worker("w-946-race-quota", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+
+    // While the blocker holds the quota slot, `insert_awaited_child_execution`
+    // rejects with `QuotaExceeded` inside `persist_child_timeout_race`'s
+    // transaction; the whole transaction (child row, timer row, parent event
+    // appends) rolls back and the parent's task is parked, never terminally
+    // failed.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let child_row_count_sql =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+
+    assert_eq!(
+        load_execution(&mut conn, parent).await.state,
+        "RUNNING",
+        "parent must stay RUNNING (parked/retrying) rather than terminally \
+         failing over the child target's quota"
+    );
+    assert_eq!(
+        count_rows(&mut conn, child_row_count_sql, &[child_wf_name]).await,
+        1, // only the blocker
+        "no child row should exist while the target quota is at cap"
+    );
+
+    // Free the quota slot.
+    mark_terminal(&mut conn, blocker, "CANCELLED").await;
+
+    wait_for_execution_state(&url, parent, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    let final_state = load_execution(&mut conn, parent).await;
+    assert_eq!(
+        final_state.output,
+        Some(serde_json::json!({"child_won": true, "value": "race_child_done"})),
+        "parent's spawn_child_workflow_timeout().await must resolve on the \
+         CHILD branch (not the 600s deadline) once the retry succeeds"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct ChildRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        quota_key: Option<String>,
+    }
+    let child_row: ChildRow = diesel::sql_query(
+        "SELECT quota_key FROM harvest_workflow_executions \
+         WHERE workflow_name = $1 AND id != $2",
+    )
+    .bind::<diesel::sql_types::Text, _>(child_wf_name)
+    .bind::<diesel::sql_types::Uuid, _>(blocker.as_uuid())
+    .get_result(&mut conn)
+    .await
+    .expect("race child row must exist");
+
+    assert_eq!(
+        child_row.quota_key.as_deref(),
+        Some("acme"),
+        "race child row must carry the tenant key resolved from its OWN \
+         declared policy"
+    );
+    assert_eq!(
+        count_rows(&mut conn, child_row_count_sql, &[child_wf_name]).await,
+        2, // the (now-cancelled) blocker + the newly-created race child
+        "exactly one child should exist once quota capacity freed up"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Success metric — the issue's own runaway-tenant scenario, driven with
 // genuine concurrency (not the sequential admission loop
 // `active_executions_cap_admits_exactly_n_then_rejects_the_next` already
@@ -1668,4 +2273,314 @@ async fn quota_key_exactly_at_the_length_bound_is_admitted() {
 
     let row = load_execution(&mut conn, exec_id).await;
     assert_eq!(row.quota_key.as_deref(), Some(exact_tenant_id.as_str()));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #946, Codex round-3 review (P2) — "Validate cross-type continuation
+// quota keys before insertion". Mirrors
+// `oversized_resolved_quota_key_is_rejected_before_any_db_write` above, but
+// for the CROSS-TYPE `continue_as_new_as_type` path
+// (`persist_workflow_continue_as_new`'s successor-key bound check), which
+// resolves the key against the TARGET type's own declared policy and the
+// FRESH successor input rather than the fresh-admission path this file's
+// other oversized-key test drives directly.
+// ---------------------------------------------------------------------------
+
+fn oversized_key_phase_one<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target = input["next_type"]
+            .as_str()
+            .expect("input.next_type must be present")
+            .to_string();
+        let oversized_tenant_id = input["oversized_tenant_id"]
+            .as_str()
+            .expect("input.oversized_tenant_id must be present")
+            .to_string();
+        let target: &'static str = Box::leak(target.into_boxed_str());
+        ctx.continue_as_new_as_type(
+            target,
+            serde_json::json!({"tenant_id": oversized_tenant_id}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        unreachable!("continue_as_new_as_type suspends the run and never resolves");
+    })
+}
+
+/// A cross-type continuation whose successor quota key -- resolved against
+/// the TARGET type's own declared policy and the FRESH successor input --
+/// exceeds [`MAX_QUOTA_KEY_BYTES`] must be rejected before the successor row
+/// is ever inserted, terminally failing the PREDECESSOR with the exact typed
+/// <code>[HarvestError::PayloadTooLarge]{kind: QuotaKey, ..}</code> shape -- never a
+/// silent truncation/aliasing, and never a raw Postgres index-size error
+/// surfacing as an unhandled worker crash. Worker-driven end to end, mirroring
+/// `continue_as_new_cross_type_re_resolves_quota_key`'s harness pattern.
+#[tokio::test]
+async fn continue_as_new_cross_type_oversized_quota_key_is_rejected() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let phase1 = leaked("quota_can_oversized_from");
+    let phase2 = leaked("quota_can_oversized_to");
+    let workflow_id = format!("sub-{}", Uuid::new_v4().simple());
+
+    let oversized_tenant_id = "x".repeat(usize::try_from(MAX_QUOTA_KEY_BYTES).expect("small") + 1);
+
+    let predecessor = start_root(
+        &mut conn,
+        phase1,
+        &workflow_id,
+        serde_json::json!({
+            "next_type": phase2,
+            "oversized_tenant_id": oversized_tenant_id,
+        }),
+    )
+    .await;
+
+    // A generous resource cap on the TARGET type -- the rejection below must
+    // be attributable to the KEY LENGTH bound, not any active-executions
+    // count (mirrors `oversized_resolved_quota_key_is_rejected_before_any_db_write`).
+    let mut target = wf_info(phase2, phase_two);
+    target.quota = Some(QuotaPolicy::new("tenant_id").with_max_active_executions(1000));
+
+    let reg = registry(vec![wf_info(phase1, oversized_key_phase_one), target]);
+    let worker = build_runtime_worker("w-946-cross-type-oversized", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+    let failed = wait_for_execution_state(&url, predecessor, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    let error = failed
+        .error
+        .expect("a terminal failure must carry an error");
+    assert!(
+        error.contains(phase2) && error.contains("QuotaKey"),
+        "the failure must name the target type and the QuotaKey payload kind, got {error}"
+    );
+
+    // No continue-as-new was ever recorded on the predecessor -- the bound
+    // check runs BEFORE any event/row is persisted.
+    let history = load_history_from_url(&url, predecessor).await;
+    assert!(
+        !history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. })),
+        "a rejected cross-type transition must record no WorkflowContinuedAsNew"
+    );
+
+    // No successor row of the target type exists at all.
+    let successor_count_sql =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+    assert_eq!(
+        count_rows(&mut conn, successor_count_sql, &[phase2]).await,
+        0,
+        "a rejected cross-type transition must create no successor row"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #946, Codex round-3 review — a SAME-SHARD completion trigger whose
+// TARGET's per-tenant quota is exhausted at fire time must defer the start
+// to the durable outbox for retry, NOT propagate `Err` out of
+// `evaluate_triggers_for_execution` and roll back the SOURCE execution's own
+// terminal commit along with it. Worker-driven end to end.
+// ---------------------------------------------------------------------------
+
+fn quota_trigger_source<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::json!({"source": "done"})) })
+}
+
+fn quota_trigger_target<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::json!("target_done")) })
+}
+
+/// A completion trigger firing on the SAME shard as its source, whose TARGET
+/// workflow type's per-tenant quota is exhausted, must not roll back the
+/// source's own terminal commit. `evaluate_triggers_for_execution`'s
+/// `QuotaExceeded` arm falls back to the SAME durable outbox +
+/// `DeferredTriggerStart` retry machinery the cross-shard branch already
+/// uses (`target_shard == source_shard` here), rather than returning `Err`
+/// and letting it propagate out of the whole terminal-sealing transaction.
+#[tokio::test]
+async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    // `evaluate_triggers_for_execution` (issue #605's completion-trigger
+    // machinery) resolves shard routing via the process-global
+    // `GLOBAL_SHARD_ROUTER`/`GLOBAL_SHARDED_POOL` statics -- unlike the
+    // direct `start_or_load_workflow_execution`/child-spawn paths this
+    // file's other tests exercise, which need no router at all. Install a
+    // clean single-shard topology so `target_shard == source_shard` and the
+    // SAME-SHARD inline-start branch (the one carrying this test's P1 #1
+    // fix under test) is what actually runs, mirroring the convention in
+    // `workflow_id_targeted_tests.rs`/`transactional_start_tests.rs`.
+    autumn_harvest::shard::install_global_router(autumn_harvest::shard::ShardRouter::single());
+    let _sharded_pool = autumn_harvest::shard::ShardedDbPool::single(build_test_pool(&url));
+
+    let source_wf = leaked("quota_trigger_source");
+    let target_wf = leaked("quota_trigger_target");
+
+    let target_quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let mut target_info = wf_info(target_wf, quota_trigger_target);
+    target_info.quota = Some(target_quota_policy);
+
+    // `evaluate_triggers_for_execution` (like every other worker-driven admit
+    // path -- awaited/detached/timeout-race child spawn) resolves the
+    // target's declared quota policy from `GLOBAL_WORKFLOW_METADATA`, but
+    // that global is UNCONDITIONALLY REBUILT from the registry's own
+    // `WorkflowInfo.quota` fields the moment `HandlerRegistry::with_state*`
+    // runs (`worker.rs`, mirroring how it also seeds `concurrency`/`sla`/
+    // `retry_policy`) -- so a `MetadataGuard` held across `build_runtime_worker`
+    // below would be silently clobbered the instant the worker's registry is
+    // constructed. The guard is therefore used ONLY to seed the blocker's own
+    // admission via `start_root` (the bare/fresh path, which reads the SAME
+    // global directly with no registry in the loop) and dropped immediately
+    // after, exactly like the passing
+    // `awaited_child_spawn_honors_target_quota_parks_parent_then_succeeds`
+    // test above; `target_info.quota` is what makes the trigger's own
+    // admission see the policy once the worker is running.
+    let guard = MetadataGuard::install_one(target_wf, target_quota_policy).await;
+
+    // Occupy the ONE `max_active_executions` slot for key "acme", then
+    // delete its task row so it can never complete/free the slot on its own.
+    let blocker = start_root(
+        &mut conn,
+        target_wf,
+        &format!("blocker-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+    drop(guard);
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(blocker.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("delete blocker task row");
+
+    // Registered before the source starts, mirroring production order
+    // (`sync_completion_triggers` runs at startup, well before any source
+    // completes).
+    autumn_harvest::completion_trigger::sync_completion_triggers(
+        &mut conn,
+        &[
+            autumn_harvest::completion_trigger::CompletionTrigger::new(source_wf, target_wf)
+                .with_input_mapping(autumn_harvest::completion_trigger::InputMapping::Static(
+                    serde_json::json!({"tenant_id": "acme"}),
+                ))
+                .with_queue_name("default"),
+        ],
+    )
+    .await
+    .expect("register completion trigger");
+
+    let source = start_root(
+        &mut conn,
+        source_wf,
+        &format!("source-{}", Uuid::new_v4().simple()),
+        serde_json::json!({}),
+    )
+    .await;
+
+    let reg = registry(vec![wf_info(source_wf, quota_trigger_source), target_info]);
+    let worker = build_runtime_worker("w-946-trigger-quota", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+
+    // The money assertion: the source reaches COMPLETED even though its
+    // trigger's target is at quota cap. Pre-fix, `Err(QuotaExceeded)`
+    // propagating out of `evaluate_triggers_for_execution` rolled back the
+    // WHOLE persist transaction -- including the source's own
+    // `WorkflowCompleted` append -- leaving it stuck RUNNING forever with no
+    // error ever recorded.
+    wait_for_execution_state(&url, source, "COMPLETED").await;
+
+    #[derive(diesel::QueryableByName)]
+    struct OutboxCount {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let outbox_count = async |conn: &mut AsyncPgConnection| -> i64 {
+        diesel::sql_query(
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_completion_trigger_outbox \
+             WHERE source_exec_id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(source.as_uuid())
+        .get_result::<OutboxCount>(conn)
+        .await
+        .expect("count outbox rows")
+        .n
+    };
+    assert_eq!(
+        outbox_count(&mut conn).await,
+        1,
+        "a same-shard trigger blocked by the target's quota must be deferred \
+         to the durable outbox for retry"
+    );
+
+    let target_row_count_sql =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+    assert_eq!(
+        count_rows(&mut conn, target_row_count_sql, &[target_wf]).await,
+        1, // only the blocker
+        "no target execution should exist while the target's quota is at cap"
+    );
+
+    // Free the quota slot -- the outbox sweep (`enforce_completion_triggers_outbox`,
+    // folded into the worker's background timeout-checker loop, ticking every
+    // `poll_interval`) should now retry the deferred row and successfully
+    // start the target.
+    mark_terminal(&mut conn, blocker, "CANCELLED").await;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let n = count_rows(&mut conn, target_row_count_sql, &[target_wf]).await;
+        if n == 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "target row was never created by the outbox retry; last count was {n}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    #[derive(diesel::QueryableByName)]
+    struct TargetRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        quota_key: Option<String>,
+    }
+    let target_row: TargetRow = diesel::sql_query(
+        "SELECT quota_key FROM harvest_workflow_executions \
+         WHERE workflow_name = $1 AND id != $2",
+    )
+    .bind::<diesel::sql_types::Text, _>(target_wf)
+    .bind::<diesel::sql_types::Uuid, _>(blocker.as_uuid())
+    .get_result(&mut conn)
+    .await
+    .expect("retried target row must exist");
+    assert_eq!(
+        target_row.quota_key.as_deref(),
+        Some("acme"),
+        "the deferred target must still carry the tenant key resolved at \
+         trigger-fire time"
+    );
+
+    assert_eq!(
+        outbox_count(&mut conn).await,
+        0,
+        "the outbox row must be consumed once the deferred start succeeds"
+    );
 }

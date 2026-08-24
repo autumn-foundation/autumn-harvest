@@ -1645,6 +1645,14 @@ async fn child_workflow_terminate_cascade_on_parent_failure() {
     );
 }
 
+// Note: quota enforcement on a detached child spawn (issue #946, Codex
+// round-3 review) is exercised end-to-end through a real worker in
+// `quota_enforcement_tests.rs::detached_child_spawn_honors_target_quota_parks_parent_then_succeeds`,
+// which uses that file's env-var-aware harness
+// (`crate::integration_e2e::setup_test_database_url_or_env`) so it can run
+// against a local Postgres instance rather than requiring Docker the way
+// this file's `setup_test_db_url()` does.
+
 // ── Unit test: ParentClosePolicy serde round-trip ─────────────────────────────
 
 #[test]

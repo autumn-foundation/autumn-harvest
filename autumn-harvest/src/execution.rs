@@ -464,13 +464,23 @@ fn record_quota_rejected_metric(
 /// unbounded active executions/history/DLQ rows for a key well past its
 /// declared cap.
 ///
+/// `pub(crate)` (not private) so `worker.rs`'s spawned-child insertion paths
+/// ([`crate::worker::persist_all_started_child_workflows`]'s fan-out loop and
+/// [`crate::worker::insert_awaited_child_execution`]) can call the SAME
+/// enforcement after inserting a child's row, rather than duplicating the
+/// "subtract 1 for the row this call just inserted" contract documented
+/// below (issue #946, Codex round-3 review — a spawned child accumulates its
+/// own history/DLQ/active-execution footprint against its own declared
+/// quota exactly like any other registry-aware start, so it must not be
+/// invisible to enforcement).
+///
 /// `has_any_cap()` false (a declared `QuotaPolicy` with no `with_max_*`
 /// calls) and an unresolvable key (missing/null/non-object input field,
 /// mirroring the fail-open behavior `concurrency_key IS NULL` already has at
 /// claim time for issue #247) both skip enforcement entirely -- a no-policy
 /// workflow pays only the one cheap `Option` check (AC9's "zero default
 /// overhead").
-async fn enforce_quota_admission(
+pub(crate) async fn enforce_quota_admission(
     conn: &mut AsyncPgConnection,
     quota_policy: Option<crate::quota::QuotaPolicy>,
     quota_key: Option<&str>,
