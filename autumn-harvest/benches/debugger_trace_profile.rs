@@ -88,6 +88,8 @@
 #[path = "replay_profile_support.rs"]
 mod support;
 
+use std::time::Duration;
+
 use autumn_harvest::debugger::ReplayDebugger;
 use autumn_harvest::testing::HistorySnapshot;
 
@@ -101,6 +103,22 @@ fn env_usize(key: &str, default: usize) -> usize {
 fn main() {
     let n = env_usize("DEBUGGER_TRACE_PROFILE_N", 80);
     let reps = env_usize("DEBUGGER_TRACE_PROFILE_REPS", 1);
+    // Under `valgrind --tool=callgrind`/`--tool=dhat` a single step's O(k)
+    // prefix replay can run tens to hundreds of times slower in real
+    // wall-clock time than an uninstrumented build. `ReplayDebugger`'s
+    // per-step drive budget (`DEFAULT_STEP_TIMEOUT` = 5s) is measured
+    // against `std::time::Instant` -- a real OS clock, unaffected by
+    // CPU-bound instrumentation slowdown -- so in production it exists to
+    // catch a genuinely spinning workflow, not to bound how long a
+    // *profiler* is allowed to spend on one step. Raising it here is an
+    // instrumentation-headroom knob, orthogonal to the `DEFAULT_MAX_STEPS`
+    // "library defaults" framing in the module doc comment above (which is
+    // about step *count*, never step *wall-clock budget*): a step that
+    // still times out under this generous allowance means the workflow
+    // genuinely stopped making progress, which the assertion below catches
+    // and fails loudly on rather than silently profiling a truncated
+    // replay.
+    let step_timeout_secs = env_usize("DEBUGGER_TRACE_PROFILE_STEP_TIMEOUT_SECS", 60);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -122,8 +140,9 @@ fn main() {
             workflow_id: None,
             queue_name: None,
         };
-        let debugger =
-            ReplayDebugger::new().register_fn("sequential", support::sequential_workflow);
+        let debugger = ReplayDebugger::new()
+            .register_fn("sequential", support::sequential_workflow)
+            .step_timeout(Duration::from_secs(step_timeout_secs as u64));
 
         let trace = rt.block_on(debugger.trace_snapshot(snapshot));
         let trace = trace.expect("trace_snapshot must succeed for a profile run to be meaningful");
@@ -134,9 +153,27 @@ fn main() {
         );
         assert!(!trace.truncated, "trace must not be capped at N={n}");
         for step in &trace.steps {
+            // `replay_succeeded()` is the load-bearing check: `TimedOut` and
+            // `Panicked` steps leave `divergence: None` (the drive never
+            // reached a conclusion to compare against the recording), so
+            // checking `divergence.is_none()` alone would silently accept a
+            // profile run built from an incomplete replay -- exactly the
+            // false-clean failure mode `StepOutcome::replay_succeeded`'s own
+            // doc comment warns against.
+            assert!(
+                step.outcome.replay_succeeded(),
+                "step {} did not replay to a conclusion (outcome={:?}) -- a \
+                 profile run must not silently include a step that timed out \
+                 or panicked; raise DEBUGGER_TRACE_PROFILE_STEP_TIMEOUT_SECS \
+                 (currently {step_timeout_secs}s) if valgrind instrumentation \
+                 slowdown is the cause",
+                step.index,
+                step.outcome,
+            );
             assert!(
                 step.divergence.is_none(),
-                "step {} must not diverge for a profile run to be meaningful: {:?}",
+                "step {} reached a conclusion but diverged from the recorded \
+                 history -- not meaningful for a profile run: {:?}",
                 step.index,
                 step.divergence
             );

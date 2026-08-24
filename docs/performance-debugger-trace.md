@@ -116,10 +116,39 @@ default, not the CLI's). Every swept `n`
 (`20, 40, 80, 160` → `41, 81, 161, 321` events) stays under that cap, so no
 run in the sweep is truncated; the harness asserts `!trace.truncated` and
 `trace.steps.len() == total_events` to guarantee it is measuring the real
-uncapped cost, not an artifact of hitting the ceiling. It also asserts every
-step's `divergence.is_none()`, so a run that silently regressed into
-reporting spurious non-determinism would fail the harness rather than
-quietly profiling something other than the intended clean-replay path.
+uncapped cost, not an artifact of hitting the ceiling.
+
+The one deliberate deviation from library defaults is the **per-step wall-clock
+budget**: the harness calls `.step_timeout(Duration::from_secs(60))` rather
+than leaving `DEFAULT_STEP_TIMEOUT = 5s` in effect. That budget is checked
+against `std::time::Instant` — a real OS clock, unaffected by CPU-bound
+instrumentation slowdown — so under `valgrind --tool=callgrind`/`--tool=dhat`
+(which can run a single step's `O(k)` prefix replay tens to hundreds of times
+slower in wall-clock terms than an uninstrumented build) the production-sized
+5s budget risked tripping on a step that was making real progress, not
+spinning. Raising it is an instrumentation-headroom knob orthogonal to the
+`max_steps` framing above — it changes how long the harness is willing to
+*wait* for a step, never what work that step does, and a step that still
+exceeds even the raised budget is still a genuine, harness-failing signal
+(see below). Every capture cited in this document was re-verified against
+this fixed harness: total allocation bytes/blocks are byte-for-byte identical
+to captures taken before the budget was raised (see "What changed in this
+PR"), confirming the 5s default was never actually exceeded in the
+originally-published data — but the risk was real and the harness now closes
+it rather than relying on that having been true by luck.
+
+The harness asserts, for every step, both `step.outcome.replay_succeeded()`
+**and** `step.divergence.is_none()`. Checking `divergence.is_none()` alone is
+not sufficient: `StepOutcome::TimedOut` and `StepOutcome::Panicked` both leave
+`divergence: None` (per `StepOutcome::replay_succeeded`'s own doc comment,
+the drive never reached a conclusion to compare against the recording), so a
+run that silently timed out or panicked mid-step would report *no*
+divergence and pass a divergence-only check while actually profiling an
+incomplete, truncated replay rather than the intended clean-replay path.
+`replay_succeeded()` (`matches!(self, Suspended | ReachedTerminal)`) is the
+load-bearing check that rejects that failure mode; `divergence.is_none()` is
+kept alongside it to additionally reject a step that reached a conclusion but
+disagreed with the recorded history.
 
 ## Profile
 
@@ -138,10 +167,10 @@ done
 
 | `n` | events (`2n+1`) | Total Ir | Ratio vs. previous |
 |----:|-----------------:|---------:|--------------------:|
-| 20  | 41  |    18,842,911 | — |
-| 40  | 81  |    67,428,049 | 3.5784x |
-| 80  | 161 |   257,018,223 | 3.8117x |
-| 160 | 321 |   998,527,995 | 3.8850x |
+| 20  | 41  |    18,843,848 | — |
+| 40  | 81  |    67,429,086 | 3.5783x |
+| 80  | 161 |   257,019,327 | 3.8117x |
+| 160 | 321 |   998,529,380 | 3.8850x |
 
 Each doubling of `n` should scale total work by a factor approaching **4.0x**
 for a genuine `O(n²)` process (vs. `2.0x` for `O(n)`). The observed ratio
@@ -151,6 +180,16 @@ lower-order additive term (one-time harness/process setup, and the `O(n)`
 `workflow_input(&snapshot.events).clone()` per step), confirming the
 documented `O(N²)` class empirically rather than by reading the doc comment
 alone.
+
+These figures were re-captured against the harness described above (with the
+raised `step_timeout` and the strengthened `replay_succeeded()` assertion in
+place) and differ from an earlier capture by 937–1,385 instructions out of
+18.8M–998.5M total (0.0001%–0.005%) — fully attributable to the harness's own
+added code (one extra per-step `matches!` check across up to 321 steps, plus
+a one-time env-var read and `Duration` construction), not to any change in
+the profiled `trace_snapshot` workload itself. The ratios are unaffected to
+four significant figures (only the `n=40` ratio's fourth decimal digit moves,
+3.5784x → 3.5783x); the O(N²) scaling conclusion is identical either way.
 
 ### Instruction-count flat profile at n=80 (mechanism attribution)
 
@@ -231,6 +270,17 @@ Both allocation-count measures independently climb toward the same ~4.0x
 per-doubling signature the instruction-count scaling shows — three
 independent measures (Ir, allocation bytes, allocation blocks) agreeing on
 the same asymptotic trend.
+
+Re-verified byte-for-byte against fresh DHAT captures taken with the fixed
+harness (raised `step_timeout`, strengthened `replay_succeeded()` assertion,
+see "Workload" above): total bytes and total blocks at every `n` are
+identical to the figures published here — no measurable heap-allocation
+effect from the harness fix, unlike the (tiny, fully-explained) Ir delta
+above. This makes sense: neither reading an unset environment variable
+(`std::env::var` returns without allocating when the key is absent) nor
+constructing a `Duration`/calling the `.step_timeout(...)` builder allocates
+on the heap, so the fix changes instruction count slightly (extra
+comparisons/branches) but not the allocation-count evidence at all.
 
 ### Allocation-site attribution at n=80 (mechanism breakdown)
 
@@ -629,6 +679,26 @@ Nothing in production code. Only:
   "Cost" section, and that section's own wording was tightened to state
   explicitly that it describes the library `trace_snapshot` arm, not the
   packaged CLI's default (handler-free, O(N)) behavior.
+
+  **Revised a third time in response to a further Codex review comment**:
+  the harness's own assertion loop checked only `step.divergence.is_none()`,
+  which cannot detect a step that timed out or panicked mid-replay — both
+  leave `divergence: None` (nothing was ever compared against the
+  recording), so a run silently corrupted by, e.g., valgrind's real
+  wall-clock slowdown tripping the library's 5s `DEFAULT_STEP_TIMEOUT`
+  would have passed the old check while actually profiling an incomplete
+  trace. Fixed by also asserting `step.outcome.replay_succeeded()` (which
+  rejects `TimedOut`/`Panicked`) and by raising the harness's own
+  `step_timeout` to 60s — a real risk under callgrind/DHAT instrumentation,
+  investigated and closed rather than assumed away. Re-ran all four capture
+  sizes under both `--tool=dhat` and `--tool=callgrind` with the
+  strengthened assertion in place: every run passed (exit 0), directly
+  confirming that no step in the previously-published captures had actually
+  timed out or panicked. The re-captured DHAT totals are byte-for-byte
+  identical to what was already published; the re-captured Ir totals differ
+  by 0.0001%–0.005% (fully attributable to the harness's own added
+  instructions, not the profiled workload) and are updated above with an
+  explanation of the delta rather than silently left stale.
 - This document.
 
 `cargo fmt --all -- --check`, `cargo check -p autumn-harvest
