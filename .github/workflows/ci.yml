@@ -175,6 +175,22 @@ jobs:
       - name: Run docs/rnd/sqlite-feasibility.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration sqlite_feasibility_docs::"
 
+      # Issue #947: same reasoning as the two steps above, for the Temporal
+      # migration guide's anti-drift guards. A PR that edits only
+      # `docs/migrating-from-temporal.md` -- fixing a stale link, updating a
+      # citation, editing the worked-example prose -- matches the docs-only
+      # filter and skips the entire `test` matrix below, where every step is
+      # gated on `changes.outputs.code`. That is precisely the change class
+      # these guards exist to catch, so they run here in the ungated `lint`
+      # job instead.
+      #
+      # Guarded by
+      # `migrating_from_temporal_docs::guards_run_on_docs_only_changes`, which
+      # fails if this step is removed or becomes conditional. Quoted for the
+      # same trailing-`::` YAML reason as above.
+      - name: Run docs/migrating-from-temporal.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration migrating_from_temporal_docs::"
+
   test:
     name: Test (${{ matrix.os }})
     needs: [lint, changes]

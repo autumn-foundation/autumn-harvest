@@ -321,6 +321,87 @@ fn worked_example_code_block_matches_the_real_file() {
     );
 }
 
+/// `.github/workflows/ci.yml` skips its `test` job's steps entirely on a
+/// docs-only PR (every step there is gated on `changes.outputs.code ==
+/// 'true'`), and a PR touching only `docs/migrating-from-temporal.md` is
+/// exactly a docs-only PR. Without a step outside that gate, these guards
+/// -- the ones enforcing every promise this module makes -- would never
+/// execute on the change class most likely to break them: a stale link, a
+/// drifted citation, an edited worked-example snippet.
+///
+/// `docs/performance.md` and `docs/rnd/sqlite-feasibility.md` hit this same
+/// gap before this module existed and fixed it the same way: a dedicated
+/// step in the ungated `lint` job. This asserts that step exists for this
+/// module too, lives in `lint` (not the gated `test` matrix), and has not
+/// grown an `if:` condition that would put it back behind the same gate.
+#[test]
+fn guards_run_on_docs_only_changes() {
+    let workflow = read_normalized(&workspace_path(".github/workflows/ci.yml"));
+
+    // The step must exist, and must name this module as its filter -- a step
+    // that ran some *other* test would satisfy a looser check while leaving
+    // these guards just as unexecuted.
+    let step = workflow
+        .lines()
+        .find(|line| line.contains("--test integration migrating_from_temporal_docs::"))
+        .expect(
+            "ci.yml must run the migrating_from_temporal_docs guards from a step that is \
+             not gated on `changes.outputs.code`, or a docs-only PR -- the change class \
+             these guards exist for -- skips them entirely",
+        );
+    assert!(
+        step.trim_start().starts_with("run:"),
+        "expected the guard invocation to be a step `run:` line, found: {step}"
+    );
+
+    // It must live in `lint`, the ungated job. `test` is gated per-step on
+    // `changes.outputs.code`, so a step there proves nothing for docs-only PRs.
+    let lint_start = workflow
+        .find("\n  lint:")
+        .expect("ci.yml must define a `lint` job");
+    let test_start = workflow
+        .find("\n  test:")
+        .expect("ci.yml must define a `test` job");
+    let step_at = workflow
+        .find("--test integration migrating_from_temporal_docs::")
+        .expect("located above");
+    assert!(
+        step_at > lint_start && step_at < test_start,
+        "the migrating_from_temporal_docs guard step must live in the ungated `lint` job; \
+         a step in the `test` matrix is gated on `changes.outputs.code` and so does not \
+         run on a docs-only PR"
+    );
+
+    // And it must be unconditional. A step that grew an `if:` is back behind
+    // a gate -- which is the exact regression this test exists to prevent.
+    let block: &str = &workflow[lint_start..test_start];
+    let step_idx = block
+        .find("--test integration migrating_from_temporal_docs::")
+        .expect("step is inside the lint block");
+    let step_line_start = block[..step_idx].rfind("\n      - name:").unwrap_or(0);
+    let stanza = &block[step_line_start..step_idx];
+    assert!(
+        !stanza.contains("\n        if:"),
+        "the migrating_from_temporal_docs guard step has acquired an `if:` condition. It \
+         must run unconditionally: a condition is how these guards would stop running on \
+         docs-only PRs again. Stanza:\n{stanza}"
+    );
+}
+
+/// Read a file with line endings normalised to `\n`.
+///
+/// The structural helpers above locate boundaries with `\n`-anchored needles
+/// (`"\n  lint:"`, `"\n  test:"`, `"\n      - name:"`). A Windows checkout
+/// hands them `\r\n`, so each needle silently misses and the test fails with
+/// a "must define" panic that has nothing to do with the workflow file's
+/// actual contents. Normalising once here keeps the needle searches
+/// platform-agnostic rather than spreading `\r?` handling across each one.
+fn read_normalized(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+        .replace("\r\n", "\n")
+}
+
 fn is_separator_row(line: &str) -> bool {
     let inner = line.trim_matches('|');
     !inner.is_empty()

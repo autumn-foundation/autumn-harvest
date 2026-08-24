@@ -246,11 +246,17 @@ below is a concrete task, not a vague warning.
    you swap the two timeouts.
 5. **Map each Task Queue to a harvest queue.** Temporal's Task Queue is a
    plain string. Both workflow tasks and activity tasks route through it,
-   and a worker polls it. Harvest's equivalent is the `queue` attribute
-   (`#[activity(queue = "...")]`), plus the worker's queue list in
-   `WorkerConfig`. Harvest also routes within one queue by worker build ID
-   (issue #171) and by capability label. Use these if your Temporal
-   deployment used Task Queue naming conventions for the same purpose.
+   and a worker polls it. Harvest splits the two. An activity's queue comes
+   from the `queue` attribute (`#[activity(queue = "...")]`). A workflow's
+   own dispatch task uses a separate setting, chosen when you start it: the
+   `queue` field on the start request, or `StartWorkflowParams::queue_name`
+   from Rust code. Set both. If you omit the workflow-start queue, the
+   workflow task lands on `"default"`, even when every one of its
+   activities is routed correctly elsewhere. Cover every queue you use, on
+   both sides, in the worker's queue list in `WorkerConfig`. Harvest also
+   routes within one queue by worker build ID (issue #171) and by
+   capability label. Use these if your Temporal deployment used Task Queue
+   naming conventions for the same purpose.
 6. **Validate with `WorkflowReplayer` and `WorkflowTestEnv` before you ship.**
    `autumn_harvest::testing::WorkflowReplayer` replays a recorded event
    history against your ported workflow function. It reports whether the
@@ -286,10 +292,20 @@ your whole application.
    window, both engines may call the same downstream service for different
    executions. Examples are a payment gateway, an email provider, and a
    database write. Give every such activity a stable, request-scoped
-   idempotency key. Harvest's
-   `ctx.new_uuid()` (issue #384) mints one deterministically, if you need to
-   generate it inside the activity's owning workflow. Or reuse the
-   caller-supplied key you already use in Temporal.
+   idempotency key.
+
+   Derive that key before you route the request to either engine. Do not
+   mint it inside the workflow. A retry of the same logical request can
+   land on a different engine than the first attempt did, once its type's
+   routing flag flips. `ctx.new_uuid()` (issue #384) is deterministic only
+   within one harvest execution's own recorded history. It cannot match a
+   key a separate Temporal execution already used for the same request. So
+   pass one caller-supplied key into both engines' version of the activity
+   instead. Reuse the request key you already carry in Temporal, or the
+   request ID your upstream caller (a webhook, an API gateway) already
+   assigns. Reserve `ctx.new_uuid()` for a value that never needs to
+   survive a retry across engines, such as a correlation ID scoped to one
+   harvest run.
 5. **Watch both engines with the same discipline during the window.** Keep
    your existing Temporal dashboards running. Stand up the equivalent
    harvest dashboards before you flip the first flag. On the harvest side,
@@ -314,6 +330,17 @@ your whole application.
    Temporal's own visibility API can confirm this count. Confirm zero
    pending harvest starts still routed to Temporal for it. Then remove that
    type's Temporal worker code.
+
+   A long-lived entity workflow may never reach zero on its own. It loops
+   forever through `continueAsNew`, and nothing inside that loop ever
+   completes it. The [Worked example](#worked-example) below is exactly
+   this shape: it keeps renewing a subscription until a `cancel` signal
+   arrives. Do not wait for such an execution to drain. Hand its state
+   across explicitly, one execution at a time. Query its current state
+   from Temporal. Cancel the Temporal execution. Start a fresh harvest
+   execution, carrying that state forward as its input. Treat this as a
+   deliberate cutover step for each entity, not a bulk migration. Each one
+   is a live, stateful run. It is not disposable work.
 
 ## Worked example
 
