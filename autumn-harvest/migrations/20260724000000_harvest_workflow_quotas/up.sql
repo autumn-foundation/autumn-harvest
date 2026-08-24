@@ -13,6 +13,23 @@
 -- impact. Rows with no QuotaPolicy configured carry quota_key = NULL and are
 -- excluded by the partial indexes below, so a no-quota workflow pays zero
 -- storage/index overhead (issue #946 AC9).
+--
+-- KNOWN LIMITATION (issue #1226): this migration deliberately does NOT
+-- backfill quota_key for executions that were already active at the moment
+-- a quota policy is first declared/deployed for their workflow type. The
+-- key-resolution expression (`quota::resolve_quota_key`, e.g.
+-- `"input.tenant_id"`) is Rust application code, not something a pure-SQL
+-- migration can evaluate against each row's stored `input` JSON payload --
+-- backfilling it here would require re-implementing an arbitrary dot-path
+-- JSON field resolver in SQL and keeping it byte-for-byte in sync with the
+-- real one forever. The practical effect is a bounded rollout-window gap:
+-- an execution that started running *before* its workflow type's
+-- QuotaPolicy was deployed keeps `quota_key = NULL` for the rest of its
+-- run and is therefore invisible to `load_quota_usage`'s
+-- `(workflow_name, quota_key, state)` count until it completes, fails, or
+-- is otherwise collected -- it neither counts against nor is blocked by
+-- the newly-declared cap. See issue #1226 for the proposed registry-aware
+-- startup-reconciliation fix.
 
 ALTER TABLE harvest_workflow_executions
     ADD COLUMN IF NOT EXISTS quota_key TEXT NULL;

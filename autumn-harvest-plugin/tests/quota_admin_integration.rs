@@ -662,9 +662,11 @@ async fn plain_start_writes_a_failed_audit_row_when_quota_exceeded() {
         error_summary: String,
         #[diesel(sql_type = diesel::sql_types::Text)]
         status: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Int4>)]
+        shard_id: Option<i32>,
     }
     let rows: Vec<AuditRow> = diesel::sql_query(
-        "SELECT error_summary, status FROM harvest_audit_log \
+        "SELECT error_summary, status, shard_id FROM harvest_audit_log \
          WHERE target_id = $1 ORDER BY occurred_at DESC LIMIT 1",
     )
     .bind::<diesel::sql_types::Text, _>(wf)
@@ -677,6 +679,18 @@ async fn plain_start_writes_a_failed_audit_row_when_quota_exceeded() {
         .expect("a quota-rejected start must be audited");
     assert_eq!(row.status, "failed");
     assert_eq!(row.error_summary, "quota exceeded");
+    // Regression guard for the Codex round-5 finding on issue #946: routing
+    // has already resolved the target shard by the time the quota check
+    // rejects the start, so the audit row must record it (matching every
+    // other failure arm on this route, and the signal-with-start /
+    // update-with-start quota arms below) -- a quota-rejection audit row
+    // with a NULL shard is otherwise indistinguishable by shard in the
+    // audit trail precisely where enforcement is shard-local.
+    assert_eq!(
+        row.shard_id,
+        Some(0),
+        "quota-rejection audit row must record the resolved shard, not NULL"
+    );
 }
 
 #[tokio::test]

@@ -69,6 +69,21 @@
 //! at admission time, never recorded as an event, and never replayed. A
 //! workflow type with no declared [`QuotaPolicy`] leaves `quota_key = NULL`
 //! everywhere and pays zero enforcement overhead (issue #946 AC9).
+//!
+//! # Known limitation — pre-upgrade rollout gap (issue #1226)
+//!
+//! Because `quota_key` is resolved only at admission time, an execution
+//! that was already `RUNNING`/`PAUSED` *before* its workflow type's
+//! [`QuotaPolicy`] was declared/deployed keeps `quota_key = NULL` for the
+//! rest of its life — it is neither counted against the new cap nor
+//! blocked by it. The migration deliberately ships with no SQL backfill
+//! (the key-resolution expression is Rust application code, not something
+//! a pure-SQL migration can evaluate), so this is a bounded, self-healing
+//! rollout-window gap rather than a permanent one: pre-existing executions
+//! age out of it as they complete, fail, or are otherwise collected. A
+//! registry-aware startup reconciliation pass that re-resolves and
+//! backfills `quota_key` for such rows is tracked as a follow-up in
+//! issue #1226.
 
 #[cfg(feature = "db")]
 use diesel::sql_types::{BigInt, Nullable, Text};

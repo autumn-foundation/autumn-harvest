@@ -18105,7 +18105,13 @@ pub(crate) async fn start_workflow(
                 idempotency_key: None,
                 status: STATUS_FAILED,
                 error_summary: Some("quota exceeded"),
-                shard_id: None,
+                // Codex round-5 review: routing has already resolved `shard`
+                // and this audit row is written on that shard's own
+                // connection, matching every other failure arm here (and the
+                // signal-with-start/update-with-start quota arms) -- record
+                // it so a quota incident is attributable by shard in the
+                // audit trail precisely where enforcement is shard-local.
+                shard_id: Some(shard.as_i32()),
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;

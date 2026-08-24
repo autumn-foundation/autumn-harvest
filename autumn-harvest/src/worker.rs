@@ -8569,6 +8569,44 @@ async fn persist_all_started_child_workflows(
         )
         .await?;
 
+        // Issue #946, Codex round-5 review: pre-acquire every distinct quota
+        // advisory lock this fan-out will need, in one deterministic (sorted)
+        // order, BEFORE inserting any child row below. Without this, the
+        // per-child loop below acquires each `pg_advisory_xact_lock` one at a
+        // time as it iterates children in COMMAND order -- if two concurrent
+        // parents fan out to the same set of quota-governed keys in OPPOSITE
+        // command orders, each transaction can hold one key while waiting on
+        // the other (a classic ABBA wait-for cycle). Postgres resolves that
+        // by aborting one transaction with a raw `deadlock_detected` error,
+        // which is not `QuotaExceeded` and therefore not recovered by the
+        // loop below -- it propagates to `fail_execution_on_error` and
+        // terminally fails an otherwise-healthy parent over a transient
+        // serialization conflict, never a real quota breach. Sorting the
+        // lock-acquisition order makes a wait-for cycle impossible: every
+        // transaction that reaches this fan-out acquires the SAME keys in
+        // the SAME order, so no two transactions can ever hold a lock the
+        // other is waiting on. `lock_quota_key`'s `pg_advisory_xact_lock` is
+        // safely re-entrant within one session/transaction, so the per-child
+        // loop's own `enforce_quota_admission` -> `lock_quota_key` call below
+        // simply re-acquires what is already held here -- no other change
+        // needed. The set mirrors exactly what that loop would lock (a
+        // declared policy with `has_any_cap()` and a resolvable key), so no
+        // lock is taken here that the loop would not otherwise have taken.
+        let mut quota_lock_keys: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for child in &new_children {
+            let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
+            if let Some(policy) = defaults.quota
+                && policy.has_any_cap()
+                && let Some(key) = crate::quota::resolve_quota_key(policy.key_expr, &child.input)
+            {
+                quota_lock_keys.insert((child.workflow_name.clone(), key));
+            }
+        }
+        for (workflow_name, key) in &quota_lock_keys {
+            crate::quota::lock_quota_key(conn, workflow_name, key).await?;
+        }
+
         // Insert rows and enqueue tasks for new children.
         // Provenance ref for every child in this fan-out is the parent
         // execution id (issue #740); compute it once outside the loop.
