@@ -296,6 +296,11 @@ jobs:
       - name: Run long_lived_entity_deadline example tests (issue #772)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example long_lived_entity_deadline
+      # Quoted: an unquoted `#` after whitespace starts a YAML comment, which
+      # would silently truncate the step name at "(issue".
+      - name: "Run temporal_port_subscription_renewal example tests (issue #947)"
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example temporal_port_subscription_renewal
       - name: Run dag_data_flow example tests (issue #702)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing,unified-dag-execution --example dag_data_flow

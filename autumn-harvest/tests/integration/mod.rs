@@ -97,6 +97,7 @@ mod macros_workflow;
 mod metrics_coverage;
 mod metrics_integration;
 mod metrics_rs_adapter;
+mod migrating_from_temporal_docs;
 mod migration_hygiene;
 #[cfg(feature = "db")]
 mod mutex_tests;
