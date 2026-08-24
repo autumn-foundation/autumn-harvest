@@ -653,7 +653,7 @@ pub const fn claim_task_query() -> &'static str {
                    OR EXISTS ( \
                        SELECT 1 FROM harvest_rate_limit_buckets b \
                        WHERE b.key = harvest_task_queue.rate_limit_key \
-                         AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+                         AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_refill_rate ELSE NULL END, b.refill_rate)) >= 1.0 \
                    ) \
                ) \
              ORDER BY \
@@ -671,12 +671,12 @@ pub const fn claim_task_query() -> &'static str {
         ), \
         rate_limit_debit AS ( \
             UPDATE harvest_rate_limit_buckets b \
-            SET tokens = LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) - 1.0, \
+            SET tokens = LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_refill_rate ELSE NULL END, b.refill_rate)) - 1.0, \
                 last_refilled_at = NOW() \
             FROM candidate \
             WHERE b.key = candidate.rate_limit_key \
               AND NOT (candidate.activity_name = ANY($5)) \
-              AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+              AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_refill_rate ELSE NULL END, b.refill_rate)) >= 1.0 \
             RETURNING b.key AS debited_key \
         ), \
         claimed AS ( \
@@ -1565,7 +1565,7 @@ pub const fn oldest_pending_ages_query() -> &'static str {
                OR EXISTS ( \
                    SELECT 1 FROM harvest_rate_limit_buckets b \
                    WHERE b.key = harvest_task_queue.rate_limit_key \
-                     AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+                     AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_refill_rate ELSE NULL END, b.refill_rate)) >= 1.0 \
                ) \
            ) \
          GROUP BY queue_name"
@@ -3544,6 +3544,122 @@ pub async fn task_exists(conn: &mut AsyncPgConnection, task_id: Uuid) -> Harvest
     Ok(found.is_some())
 }
 
+// ---------------------------------------------------------------------------
+// TTL'd rate-limit / start-throttle runtime overrides (issue #945)
+// ---------------------------------------------------------------------------
+
+/// Server-side cap on how long an operator-declared TTL'd rate-limit/throttle
+/// override may live before it is force-expired, regardless of the caller's
+/// requested `ttl_secs` (issue #945).
+///
+/// A ceiling, not a floor: a request with `ttl_secs` above this is rejected
+/// `400` rather than silently clamped down, so an operator's intended expiry
+/// is never silently shortened without their knowledge. 24 hours is long
+/// enough to bridge a shift change but short enough that a forgotten override
+/// cannot silently outlive an incident it was meant to mitigate.
+pub const MAX_PACING_OVERRIDE_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// Renders the effective per-second token refill rate expression for a
+/// `harvest_rate_limit_buckets` row, honoring a live TTL'd operator override
+/// (issue #945).
+///
+/// Renders `COALESCE(CASE WHEN {alias}.override_expires_at > NOW() THEN
+/// {alias}.override_refill_rate ELSE NULL END, {alias}.refill_rate)`.
+/// `alias` qualifies every column reference, so this composes into any query
+/// aliasing the bucket table (`"b"` in the claim-time gates) or the bare table
+/// name itself (`"harvest_rate_limit_buckets"`, for the single-table
+/// statements that reference no alias). An expired or absent override
+/// (`override_expires_at` is `NULL` or not strictly in the future) falls
+/// through to the declared baseline `refill_rate` -- a plain `> NOW()`
+/// comparison evaluated fresh on every access, so reverting needs no
+/// background sweeper and no operator action.
+#[must_use]
+pub fn effective_refill_rate_expr(alias: &str) -> String {
+    format!(
+        "COALESCE(CASE WHEN {alias}.override_expires_at > NOW() THEN \
+         {alias}.override_refill_rate ELSE NULL END, {alias}.refill_rate)"
+    )
+}
+
+/// The burst-capacity sibling of [`effective_refill_rate_expr`] (issue #945).
+#[must_use]
+pub fn effective_burst_expr(alias: &str) -> String {
+    format!(
+        "COALESCE(CASE WHEN {alias}.override_expires_at > NOW() THEN \
+         {alias}.override_burst ELSE NULL END, {alias}.burst)"
+    )
+}
+
+/// Renders the full available-tokens expression for a
+/// `harvest_rate_limit_buckets` row (issue #945).
+///
+/// `LEAST(effective_burst, tokens + elapsed * effective_refill_rate)`,
+/// composing [`effective_burst_expr`] and [`effective_refill_rate_expr`] so
+/// every call site -- the claim-time gate, the dispatch-time debit, the
+/// refund, the throttled-key check, and the operator gauge -- derives the
+/// identical formula and can never drift.
+#[must_use]
+pub fn effective_available_tokens_expr(alias: &str) -> String {
+    format!(
+        "LEAST({burst}, {alias}.tokens + EXTRACT(EPOCH FROM (NOW() - {alias}.last_refilled_at)) * {rate})",
+        burst = effective_burst_expr(alias),
+        rate = effective_refill_rate_expr(alias),
+    )
+}
+
+/// The resolved effective rate-limit parameters for one bucket at a point in
+/// time (issue #945).
+///
+/// The *pure* (no-DB) counterpart to [`effective_available_tokens_expr`],
+/// used by the override-management HTTP handlers to report `override_active`
+/// and the effective values without a second query round-trip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EffectiveRateLimit {
+    /// The refill rate actually in effect: the override's, if active, else
+    /// the declared baseline.
+    pub refill_rate: f64,
+    /// The burst actually in effect: the override's, if active, else the
+    /// declared baseline.
+    pub burst: f64,
+    /// Whether a TTL'd override is currently in effect (`override_expires_at`
+    /// is set and strictly after `now`). An override expiring at exactly
+    /// `now` is NOT active -- matches the SQL `> NOW()` boundary rendered by
+    /// [`effective_refill_rate_expr`]/[`effective_burst_expr`].
+    pub override_active: bool,
+}
+
+/// Resolve the effective refill rate/burst for a bucket, mirroring the SQL
+/// `COALESCE(CASE WHEN override_expires_at > NOW() THEN override_x ELSE NULL
+/// END, x)` formula in pure Rust (issue #945).
+///
+/// Each field falls back to the declared baseline independently: an operator
+/// may override only `refill_rate` (or only `burst`) and the other continues
+/// to read from the baseline even while the override is active.
+#[must_use]
+pub fn resolve_effective_rate_limit(
+    refill_rate: f64,
+    burst: f64,
+    override_refill_rate: Option<f64>,
+    override_burst: Option<f64>,
+    override_expires_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> EffectiveRateLimit {
+    let override_active = override_expires_at.is_some_and(|expires| expires > now);
+    EffectiveRateLimit {
+        refill_rate: if override_active {
+            override_refill_rate.unwrap_or(refill_rate)
+        } else {
+            refill_rate
+        },
+        burst: if override_active {
+            override_burst.unwrap_or(burst)
+        } else {
+            burst
+        },
+        override_active,
+    }
+}
+
 /// Check which activities in the specified queues have pending tasks currently
 /// throttled by rate limits.
 ///
@@ -3556,6 +3672,11 @@ pub async fn task_exists(conn: &mut AsyncPgConnection, task_id: Uuid) -> Harvest
 /// (`dyn-rate:{expr}:{tenant}`, issue #699) embeds unbounded tenant input, the
 /// resolved key must never become a label; the activity name is bounded by the
 /// registered activity set, so it is what we return and label by.
+///
+/// Honors a live TTL'd rate-limit override (issue #945) via
+/// [`effective_available_tokens_expr`), so raising a limit's effective rate
+/// stops it reporting "throttled" here even though the declared baseline row is
+/// unchanged.
 ///
 /// # Errors
 ///
@@ -3570,7 +3691,8 @@ pub async fn check_throttled_keys(
         activity_name: String,
     }
 
-    let rows: Vec<Row> = diesel::sql_query(
+    let effective_tokens = effective_available_tokens_expr("b");
+    let rows: Vec<Row> = diesel::sql_query(format!(
         "SELECT DISTINCT q.activity_name \
          FROM harvest_task_queue q \
          JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key \
@@ -3578,8 +3700,8 @@ pub async fn check_throttled_keys(
            AND q.state = 'PENDING' \
            AND q.activity_name IS NOT NULL \
            AND q.scheduled_at <= NOW() \
-           AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) < 1.0"
-    )
+           AND {effective_tokens} < 1.0"
+    ))
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
     .load(conn)
     .await
@@ -3628,17 +3750,23 @@ pub async fn try_consume_rate_limit_token(
     // A single conditional UPDATE: the row is debited only if a token is
     // available. `RETURNING`/`EXISTS` reports whether the debit happened; a
     // missing bucket row or an empty bucket both yield `debited = false`.
-    let outcome: Option<Outcome> = diesel::sql_query(
+    //
+    // Honors a live TTL'd override (issue #945) via
+    // [`effective_available_tokens_expr`] -- the sole rate-limit enforcement
+    // point for circuit-breaker activities, so an operator override must take
+    // effect here with no worker restart.
+    let effective_tokens = effective_available_tokens_expr("harvest_rate_limit_buckets");
+    let outcome: Option<Outcome> = diesel::sql_query(format!(
         "WITH debited AS ( \
              UPDATE harvest_rate_limit_buckets \
-             SET tokens = LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) - 1.0, \
+             SET tokens = {effective_tokens} - 1.0, \
                  last_refilled_at = NOW() \
              WHERE key = $1 \
-               AND LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) >= 1.0 \
+               AND {effective_tokens} >= 1.0 \
              RETURNING key \
         ) \
-        SELECT EXISTS (SELECT 1 FROM debited) AS debited",
-    )
+        SELECT EXISTS (SELECT 1 FROM debited) AS debited"
+    ))
     .bind::<diesel::sql_types::Text, _>(key)
     .get_result(conn)
     .await
@@ -3726,6 +3854,9 @@ pub fn claimable_pending_demand_query() -> String {
     // `activity_pause::activity_pause_anti_join`, and the shape assertion in
     // `claim_gate_mirrors_carry_the_activity_pause_predicate` below.
     let activity_pause_gate = crate::activity_pause::activity_pause_anti_join("tq");
+    // Issue #945: honors a live TTL'd override so this coverage/demand read
+    // never disagrees with what `claim_task` (below) will actually admit.
+    let effective_tokens_b = effective_available_tokens_expr("b");
     format!(
         "SELECT tq.queue_name, tq.required_capabilities, tq.required_build_id, \
                 {sticky_owner_expr} AS sticky_owner, tq.activity_name, \
@@ -3763,7 +3894,7 @@ pub fn claimable_pending_demand_query() -> String {
                OR EXISTS ( \
                    SELECT 1 FROM harvest_rate_limit_buckets b \
                    WHERE b.key = tq.rate_limit_key \
-                     AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+                     AND {effective_tokens_b} >= 1.0 \
                ) \
            ) \
          GROUP BY tq.queue_name, tq.required_capabilities, tq.required_build_id, \
@@ -3878,12 +4009,18 @@ pub fn apply_activity_requirements<S: std::hash::BuildHasher>(
 }
 
 pub async fn refund_rate_limit_token(conn: &mut AsyncPgConnection, key: &str) -> HarvestResult<()> {
-    diesel::sql_query(
+    // Honors a live TTL'd override (issue #945): the refund caps at the
+    // *effective* burst (and re-applies pending refill at the *effective*
+    // rate) so a refund can never push tokens above what the override
+    // currently allows.
+    let effective_burst = effective_burst_expr("harvest_rate_limit_buckets");
+    let effective_refill_rate = effective_refill_rate_expr("harvest_rate_limit_buckets");
+    diesel::sql_query(format!(
         "UPDATE harvest_rate_limit_buckets \
-         SET tokens = LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate + 1.0), \
+         SET tokens = LEAST({effective_burst}, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * {effective_refill_rate} + 1.0), \
              last_refilled_at = NOW() \
-         WHERE key = $1",
-    )
+         WHERE key = $1"
+    ))
     .bind::<diesel::sql_types::Text, _>(key)
     .execute(conn)
     .await
@@ -3961,17 +4098,23 @@ pub struct RateLimitBucketSample {
 /// ([`crate::worker`]'s rate-limit sampler) aggregates across shards and forwards
 /// each row's `key` to the token/refill gauges.
 ///
+/// Projects the *effective* refill rate/tokens (issue #945) -- a bucket under a
+/// live TTL'd override reports the override's values here, not the declared
+/// baseline, so this gauge reflects what dispatch is actually enforcing.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
 pub async fn sample_rate_limit_buckets(
     conn: &mut AsyncPgConnection,
 ) -> HarvestResult<Vec<RateLimitBucketSample>> {
+    let effective_refill_rate = effective_refill_rate_expr("harvest_rate_limit_buckets");
+    let effective_tokens = effective_available_tokens_expr("harvest_rate_limit_buckets");
     diesel::sql_query(format!(
         "SELECT \
              key, \
-             refill_rate, \
-             LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) AS estimated_tokens \
+             {effective_refill_rate} AS refill_rate, \
+             {effective_tokens} AS estimated_tokens \
          FROM harvest_rate_limit_buckets {RATE_LIMIT_GAUGE_SAMPLER_FILTER}"
     ))
     .load(conn)
@@ -4480,6 +4623,49 @@ mod tests {
         );
     }
 
+    // ── TTL'd rate-limit override drift locks (issue #945) ──────────────────
+    //
+    // These sites are hand-copied literal SQL (2 of the 3 live inside
+    // `pub const fn` bodies, which cannot call runtime helpers), so nothing
+    // stops them drifting from `effective_available_tokens_expr` except a
+    // test asserting textual containment -- mirroring the queue-pause /
+    // activity-pause drift locks immediately above.
+
+    #[test]
+    fn claim_task_query_honors_the_effective_rate_limit_override() {
+        let sql = claim_task_query();
+        let effective = effective_available_tokens_expr("b");
+        // Three occurrences: the candidate EXISTS gate, and the
+        // rate_limit_debit CTE's own SET (the debit) and WHERE (the re-check
+        // immediately before debiting).
+        assert_eq!(
+            sql.matches(&effective).count(),
+            3,
+            "claim_task_query must apply the effective-rate-limit formula at \
+             the EXISTS gate and both halves of the rate_limit_debit CTE; \
+             got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn oldest_pending_ages_query_honors_the_effective_rate_limit_override() {
+        assert!(
+            oldest_pending_ages_query().contains(&effective_available_tokens_expr("b")),
+            "oldest_pending_ages must mirror the effective-rate-limit override, \
+             or the gauge reads stale post-override numbers"
+        );
+    }
+
+    #[test]
+    fn claimable_pending_demand_query_honors_the_effective_rate_limit_override() {
+        assert!(
+            claimable_pending_demand_query().contains(&effective_available_tokens_expr("b")),
+            "claimable_pending_demand_by_queue must mirror the effective-rate-limit \
+             override, or the stranded-work sampler misreports coverage while an \
+             override is active"
+        );
+    }
+
     // ── Dynamic per-key rate-limit bucket keys (issue #699) ─────────────────
 
     #[test]
@@ -4628,6 +4814,156 @@ mod tests {
         // must never emit an unbounded per-tenant key as a metric label.
         assert!(RATE_LIMIT_GAUGE_SAMPLER_FILTER.contains("NOT LIKE 'dyn-rate:%'"));
         assert!(RATE_LIMIT_GAUGE_SAMPLER_FILTER.contains("NOT LIKE 'start-throttle:%'"));
+    }
+
+    // -----------------------------------------------------------------------
+    // TTL'd rate-limit / start-throttle overrides (issue #945)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn max_pacing_override_ttl_secs_is_24_hours() {
+        assert_eq!(MAX_PACING_OVERRIDE_TTL_SECS, 86_400);
+    }
+
+    #[test]
+    fn effective_refill_rate_expr_renders_a_coalesced_case_expression() {
+        let rendered = effective_refill_rate_expr("b");
+        assert!(rendered.starts_with("COALESCE(CASE WHEN b.override_expires_at > NOW() THEN"));
+        assert!(rendered.contains("b.override_refill_rate ELSE NULL END"));
+        assert!(rendered.ends_with("b.refill_rate)"));
+    }
+
+    #[test]
+    fn effective_burst_expr_renders_a_coalesced_case_expression() {
+        let rendered = effective_burst_expr("b");
+        assert!(rendered.starts_with("COALESCE(CASE WHEN b.override_expires_at > NOW() THEN"));
+        assert!(rendered.contains("b.override_burst ELSE NULL END"));
+        assert!(rendered.ends_with("b.burst)"));
+    }
+
+    #[test]
+    fn effective_available_tokens_expr_composes_burst_and_refill_rate() {
+        let rendered = effective_available_tokens_expr("b");
+        assert!(rendered.starts_with("LEAST("));
+        // Contains both sub-expressions verbatim -- this is the drift-lock
+        // property every claim-gate/debit/refund/gauge SQL site relies on:
+        // any hand-copied occurrence of the burst or refill-rate formula must
+        // be an exact substring of what these two helpers independently
+        // render, or the containment assertions below (which mirror the
+        // actual SQL sites) would fail.
+        assert!(rendered.contains(&effective_burst_expr("b")));
+        assert!(rendered.contains(&effective_refill_rate_expr("b")));
+        assert!(rendered.contains("b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at))"));
+    }
+
+    #[test]
+    fn effective_expr_helpers_qualify_by_the_given_alias() {
+        // The un-aliased single-table call sites (`try_consume_rate_limit_token`,
+        // `refund_rate_limit_token`, `sample_rate_limit_buckets`) qualify every
+        // column with the bare table name -- Postgres permits qualifying an
+        // UPDATE/SELECT target by its own name even without an explicit alias.
+        let rendered = effective_available_tokens_expr("harvest_rate_limit_buckets");
+        assert!(rendered.contains("harvest_rate_limit_buckets.override_expires_at"));
+        assert!(rendered.contains("harvest_rate_limit_buckets.tokens"));
+        assert!(rendered.contains("harvest_rate_limit_buckets.last_refilled_at"));
+    }
+
+    #[test]
+    fn resolve_effective_rate_limit_with_no_override_returns_baseline() {
+        let now = Utc::now();
+        let effective = resolve_effective_rate_limit(5.0, 10.0, None, None, None, now);
+        assert_eq!(
+            effective,
+            EffectiveRateLimit {
+                refill_rate: 5.0,
+                burst: 10.0,
+                override_active: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_effective_rate_limit_with_active_override_both_fields() {
+        let now = Utc::now();
+        let expires = now + Duration::seconds(60);
+        let effective =
+            resolve_effective_rate_limit(5.0, 10.0, Some(50.0), Some(100.0), Some(expires), now);
+        assert_eq!(
+            effective,
+            EffectiveRateLimit {
+                refill_rate: 50.0,
+                burst: 100.0,
+                override_active: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_effective_rate_limit_only_refill_rate_overridden_burst_falls_back() {
+        let now = Utc::now();
+        let expires = now + Duration::seconds(60);
+        let effective =
+            resolve_effective_rate_limit(5.0, 10.0, Some(50.0), None, Some(expires), now);
+        assert_eq!(
+            effective,
+            EffectiveRateLimit {
+                refill_rate: 50.0,
+                burst: 10.0, // COALESCE falls through to the declared baseline
+                override_active: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_effective_rate_limit_only_burst_overridden_refill_rate_falls_back() {
+        let now = Utc::now();
+        let expires = now + Duration::seconds(60);
+        let effective =
+            resolve_effective_rate_limit(5.0, 10.0, None, Some(100.0), Some(expires), now);
+        assert_eq!(
+            effective,
+            EffectiveRateLimit {
+                refill_rate: 5.0, // COALESCE falls through to the declared baseline
+                burst: 100.0,
+                override_active: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_effective_rate_limit_expired_override_falls_back_to_baseline() {
+        let now = Utc::now();
+        let expired = now - Duration::seconds(1);
+        let effective =
+            resolve_effective_rate_limit(5.0, 10.0, Some(50.0), Some(100.0), Some(expired), now);
+        // Reverting needs no operator action and no background sweeper: a
+        // plain `> NOW()` comparison, evaluated fresh, is enough.
+        assert_eq!(
+            effective,
+            EffectiveRateLimit {
+                refill_rate: 5.0,
+                burst: 10.0,
+                override_active: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_effective_rate_limit_exact_now_boundary_is_not_active() {
+        // `override_expires_at == now` must NOT be considered active -- the
+        // SQL renders a strict `>`, not `>=`, and this pure-Rust mirror must
+        // agree exactly at the boundary.
+        let now = Utc::now();
+        let effective =
+            resolve_effective_rate_limit(5.0, 10.0, Some(50.0), Some(100.0), Some(now), now);
+        assert_eq!(
+            effective,
+            EffectiveRateLimit {
+                refill_rate: 5.0,
+                burst: 10.0,
+                override_active: false,
+            }
+        );
     }
 
     #[test]

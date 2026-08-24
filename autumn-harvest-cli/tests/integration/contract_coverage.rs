@@ -1340,3 +1340,80 @@ fn token_create_body_fields_are_documented() {
         "2027-01-01T00:00:00Z",
     ]);
 }
+
+// ── TTL'd runtime pacing overrides (issue #945) ─────────────────────────────
+
+#[test]
+fn rate_limit_override_is_covered() {
+    assert_covered(&[
+        "rate-limit",
+        "override",
+        "send_email",
+        "--refill-rate",
+        "50",
+        "--burst",
+        "100",
+        "--ttl-secs",
+        "300",
+    ]);
+}
+
+#[test]
+fn rate_limit_override_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "rate-limit",
+        "override",
+        "send_email",
+        "--refill-rate",
+        "50",
+        "--burst",
+        "100",
+        "--ttl-secs",
+        "300",
+    ]);
+}
+
+#[test]
+fn rate_limit_clear_is_covered() {
+    assert_covered(&["rate-limit", "clear", "send_email"]);
+}
+
+#[test]
+fn throttle_status_is_covered() {
+    assert_covered(&["throttle", "status"]);
+}
+
+#[test]
+fn throttle_override_is_covered() {
+    assert_covered(&[
+        "throttle",
+        "override",
+        "onboard_user",
+        "--refill-per-sec",
+        "2.5",
+        "--burst",
+        "5",
+        "--ttl-secs",
+        "600",
+    ]);
+}
+
+#[test]
+fn throttle_override_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "throttle",
+        "override",
+        "onboard_user",
+        "--refill-per-sec",
+        "2.5",
+        "--burst",
+        "5",
+        "--ttl-secs",
+        "600",
+    ]);
+}
+
+#[test]
+fn throttle_clear_is_covered() {
+    assert_covered(&["throttle", "clear", "onboard_user"]);
+}

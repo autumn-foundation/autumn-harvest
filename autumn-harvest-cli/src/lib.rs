@@ -804,6 +804,13 @@ enum Commands {
         #[command(subcommand)]
         command: RateLimitCommand,
     },
+    /// Manage workflow-start throttles (issue #607, TTL'd overrides added
+    /// in issue #945).
+    #[command(alias = "throttles")]
+    Throttle {
+        #[command(subcommand)]
+        command: ThrottleCommand,
+    },
     /// Manage batch operations.
     Batch {
         #[command(subcommand)]
@@ -2431,6 +2438,80 @@ enum RateLimitCommand {
         #[arg(long)]
         burst: f64,
     },
+    /// Set (or replace) a TTL'd runtime pacing override on top of a
+    /// declared per-activity rate limit (issue #945).
+    ///
+    /// Takes effect on the existing token-consumption path immediately,
+    /// with no worker restart; self-expires and reverts to the declared
+    /// baseline at the TTL with no further operator action. Each call
+    /// fully replaces the whole override.
+    Override {
+        /// Name of a registered activity that declares a static
+        /// (non-dynamic) rate limit.
+        activity_name: String,
+        /// Overridden token refill rate per second. At least one of
+        /// --refill-rate/--burst must be set.
+        #[arg(long)]
+        refill_rate: Option<f64>,
+        /// Overridden token bucket burst capacity. At least one of
+        /// --refill-rate/--burst must be set.
+        #[arg(long)]
+        burst: Option<f64>,
+        /// Seconds until the override self-expires and the declared
+        /// baseline resumes. Must be greater than zero and not exceed the
+        /// server-side cap (24h).
+        #[arg(long)]
+        ttl_secs: u64,
+    },
+    /// Clear a TTL'd runtime pacing override before its TTL elapses,
+    /// immediately reverting to the declared baseline with no worker
+    /// restart (issue #945).
+    Clear {
+        /// Name of a registered activity whose pacing override should be
+        /// cleared.
+        activity_name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ThrottleCommand {
+    /// Show the per-(`workflow_name`, `throttle_key`) deferred-start
+    /// backlog across all shards, including any active TTL'd pacing
+    /// override (issue #607, issue #945).
+    Status,
+    /// Set (or replace) a TTL'd runtime pacing override on top of a
+    /// declared workflow-start throttle (issue #945, extends issue #607).
+    ///
+    /// Takes effect on the existing token-consumption path immediately,
+    /// with no worker restart; self-expires and reverts to the declared
+    /// baseline at the TTL with no further operator action. Each call
+    /// fully replaces the whole override.
+    Override {
+        /// Name of a registered workflow that declares a static
+        /// (non-dynamic) start throttle.
+        workflow_name: String,
+        /// Overridden token refill rate per second. At least one of
+        /// --refill-per-sec/--burst must be set.
+        #[arg(long)]
+        refill_per_sec: Option<f64>,
+        /// Overridden token bucket burst capacity. At least one of
+        /// --refill-per-sec/--burst must be set.
+        #[arg(long)]
+        burst: Option<f64>,
+        /// Seconds until the override self-expires and the declared
+        /// baseline resumes. Must be greater than zero and not exceed the
+        /// server-side cap (24h).
+        #[arg(long)]
+        ttl_secs: u64,
+    },
+    /// Clear a TTL'd runtime pacing override before its TTL elapses,
+    /// immediately reverting to the declared baseline with no worker
+    /// restart (issue #945).
+    Clear {
+        /// Name of a registered workflow whose pacing override should be
+        /// cleared.
+        workflow_name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2794,6 +2875,7 @@ impl Cli {
             Commands::Activity { command } => activity_request(command),
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
             Commands::RateLimit { command } => Ok(rate_limit_request(command)),
+            Commands::Throttle { command } => Ok(throttle_request(command)),
             Commands::Batch { command } => batch_request(command),
             Commands::Audit { command } => Ok(audit_request(command)),
             Commands::Gate { command } => gate_request(command),
@@ -8809,6 +8891,60 @@ fn rate_limit_request(command: &RateLimitCommand) -> ApiRequest {
                 "burst": burst,
             })),
         ),
+        RateLimitCommand::Override {
+            activity_name,
+            refill_rate,
+            burst,
+            ttl_secs,
+        } => ApiRequest::post(
+            format!(
+                "/admin/rate-limits/{}/override",
+                path_segment(activity_name)
+            ),
+            Some(json!({
+                "refill_rate": refill_rate,
+                "burst": burst,
+                "ttl_secs": ttl_secs,
+            })),
+        ),
+        RateLimitCommand::Clear { activity_name } => ApiRequest {
+            method: ApiMethod::Delete,
+            path: format!(
+                "/admin/rate-limits/{}/override",
+                path_segment(activity_name)
+            ),
+            body: None,
+        },
+    }
+}
+
+fn throttle_request(command: &ThrottleCommand) -> ApiRequest {
+    match command {
+        ThrottleCommand::Status => ApiRequest::get("/admin/start-throttle"),
+        ThrottleCommand::Override {
+            workflow_name,
+            refill_per_sec,
+            burst,
+            ttl_secs,
+        } => ApiRequest::post(
+            format!(
+                "/admin/start-throttle/{}/override",
+                path_segment(workflow_name)
+            ),
+            Some(json!({
+                "refill_per_sec": refill_per_sec,
+                "burst": burst,
+                "ttl_secs": ttl_secs,
+            })),
+        ),
+        ThrottleCommand::Clear { workflow_name } => ApiRequest {
+            method: ApiMethod::Delete,
+            path: format!(
+                "/admin/start-throttle/{}/override",
+                path_segment(workflow_name)
+            ),
+            body: None,
+        },
     }
 }
 
@@ -11736,6 +11872,144 @@ mod reuse_policy_tests {
         assert!(rendered.contains("10.00"));
         assert!(rendered.contains("8.50"));
         assert!(rendered.contains("2026-05-22T22:00:00Z"));
+    }
+
+    // ── TTL'd runtime pacing overrides (issue #945) ─────────────────────
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn rate_limit_override_builds_post_request_with_both_fields() {
+        let req = parse(&[
+            "rate-limit",
+            "override",
+            "send_email",
+            "--refill-rate",
+            "50",
+            "--burst",
+            "100",
+            "--ttl-secs",
+            "300",
+        ])
+        .api_request()
+        .unwrap();
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/admin/rate-limits/send_email/override");
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["refill_rate"].as_f64().unwrap(), 50.0);
+        assert_eq!(body["burst"].as_f64().unwrap(), 100.0);
+        assert_eq!(body["ttl_secs"].as_u64().unwrap(), 300);
+    }
+
+    #[test]
+    fn rate_limit_override_omits_unset_optional_fields() {
+        let req = parse(&[
+            "rate-limit",
+            "override",
+            "send_email",
+            "--burst",
+            "100",
+            "--ttl-secs",
+            "60",
+        ])
+        .api_request()
+        .unwrap();
+        let body = req.body.as_ref().unwrap();
+        assert!(body["refill_rate"].is_null());
+        assert!(!body["burst"].is_null());
+    }
+
+    #[test]
+    fn rate_limit_override_url_escapes_activity_name() {
+        let req = parse(&[
+            "rate-limit",
+            "override",
+            "weird name",
+            "--refill-rate",
+            "1",
+            "--ttl-secs",
+            "60",
+        ])
+        .api_request()
+        .unwrap();
+        assert!(!req.path.contains(' '));
+        assert!(req.path.starts_with("/admin/rate-limits/"));
+        assert!(req.path.ends_with("/override"));
+    }
+
+    #[test]
+    fn rate_limit_clear_builds_delete_request_with_no_body() {
+        let req = parse(&["rate-limit", "clear", "send_email"])
+            .api_request()
+            .unwrap();
+        assert_eq!(req.method, ApiMethod::Delete);
+        assert_eq!(req.path, "/admin/rate-limits/send_email/override");
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn throttle_status_builds_get_request() {
+        let req = parse(&["throttle", "status"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/admin/start-throttle");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn throttle_override_builds_post_request_with_both_fields() {
+        let req = parse(&[
+            "throttle",
+            "override",
+            "onboard_user",
+            "--refill-per-sec",
+            "2.5",
+            "--burst",
+            "5",
+            "--ttl-secs",
+            "600",
+        ])
+        .api_request()
+        .unwrap();
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/admin/start-throttle/onboard_user/override");
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["refill_per_sec"].as_f64().unwrap(), 2.5);
+        assert_eq!(body["burst"].as_f64().unwrap(), 5.0);
+        assert_eq!(body["ttl_secs"].as_u64().unwrap(), 600);
+    }
+
+    #[test]
+    fn throttle_override_omits_unset_optional_fields() {
+        let req = parse(&[
+            "throttle",
+            "override",
+            "onboard_user",
+            "--refill-per-sec",
+            "2.5",
+            "--ttl-secs",
+            "60",
+        ])
+        .api_request()
+        .unwrap();
+        let body = req.body.as_ref().unwrap();
+        assert!(!body["refill_per_sec"].is_null());
+        assert!(body["burst"].is_null());
+    }
+
+    #[test]
+    fn throttle_clear_builds_delete_request_with_no_body() {
+        let req = parse(&["throttle", "clear", "onboard_user"])
+            .api_request()
+            .unwrap();
+        assert_eq!(req.method, ApiMethod::Delete);
+        assert_eq!(req.path, "/admin/start-throttle/onboard_user/override");
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn throttle_alias_throttles_resolves_to_the_same_command() {
+        let req = parse(&["throttles", "status"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/admin/start-throttle");
     }
 }
 
