@@ -515,6 +515,42 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 // the shape this is held to instead, and
 // `tests/queue_pause_tests.rs::claim_query_excludes_paused_queues_end_to_end`
 // for the DB-backed equivalence proof.
+//
+// NOTE (issue #247 / Ledger perf pass, buffers -96.9% idle / -98.4% under
+// contention @10k): `docs/performance.md`'s per-gate cost table flagged
+// `concurrency_key` as "the one genuinely expensive predicate on the claim
+// path" at +644% even with contention deliberately minimised (a cap high
+// enough to never block). The candidate-side gate used to be a per-row
+// correlated `SELECT COUNT(*) FROM harvest_task_queue inner_q WHERE
+// inner_q.concurrency_key = harvest_task_queue.concurrency_key AND
+// inner_q.task_type = harvest_task_queue.task_type AND inner_q.state =
+// 'RUNNING' AND inner_q.worker_id IS NOT NULL` — re-evaluated once per
+// candidate row the sort walks (the same `loops=N` shape the queue-pause fix
+// above closed), and its cost compounds with the size of the RUNNING
+// population sharing that row's key, since `COUNT(*)` cannot short-circuit.
+// `concurrency_pending_keys` below narrows to the `(concurrency_key,
+// task_type)` pairs actually present among this queue set's PENDING rows (so
+// the aggregate below never pays for concurrency keys the current claim
+// attempt cannot possibly select), and `concurrency_running_counts`
+// aggregates the RUNNING population for exactly those pairs into one
+// `MATERIALIZED` lookup table, evaluated once per claim rather than once per
+// row. The per-row check becomes a `COALESCE(single-row lookup, 0) < cap`
+// comparison with identical semantics to the original `COUNT(*) < cap` —
+// `COALESCE(..., 0)` reproduces the correlated subquery's implicit zero for a
+// key with no matching RUNNING rows (`concurrency_running_counts` never
+// materializes a zero-count row; `GROUP BY` only emits groups that exist).
+// The `claimed` CTE's own authoritative, `pg_try_advisory_xact_lock`-guarded
+// recheck below is a **separate, single-row** re-evaluation of the identical
+// correlated subquery against the one candidate this soft filter selected —
+// it is NOT rewritten, on purpose: it already runs at most once per claim
+// (never once per row), so it carries none of the cost this fix addresses,
+// and it is the one piece of this predicate that must stay a fresh,
+// serializable-under-the-advisory-lock read rather than a snapshot taken
+// before the lock was acquired. See
+// `claim_query_concurrency_gate_matches_the_authoritative_recheck` below for
+// the shape this pre-filter is held to, and
+// `tests/integration/concurrency_key_tests.rs` for the DB-backed correctness
+// proof (issue #247's own suite, unmodified by this rewrite).
 /// The task-claim query — extracted as a `const fn` (mirroring the
 /// `timeout.rs` `*_query()` convention) so its eligibility predicate is
 /// shape-testable without a database.
@@ -544,6 +580,19 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 /// fleet from being claimed: a total orchestration outage produced by a
 /// surgical containment control. Pinned by
 /// `claim_query_activity_pause_gate_never_holds_workflow_tasks`.
+///
+/// The per-key concurrency gate (issue #247) needs no new bind either:
+/// `concurrency_pending_keys` and `concurrency_running_counts` derive their
+/// bound entirely from columns already on `harvest_task_queue` (see the `NOTE`
+/// above `claim_task_query` for why this was rewritten and what it replaced).
+/// Both are `MATERIALIZED` for the same "evaluated once per claim" reason as
+/// `paused_queues`/`paused_activities`. `concurrency_running_counts` is
+/// intentionally scoped to `WHERE t.concurrency_key IN (SELECT ... FROM
+/// concurrency_pending_keys)` rather than aggregating the whole RUNNING
+/// population: a deployment can have many more distinct `concurrency_key`
+/// values with RUNNING work than this queue set's current PENDING backlog
+/// touches, and the aggregate must not pay for keys this claim attempt cannot
+/// possibly select.
 // The body is one SQL string literal; the line count is the query's, not
 // control flow's. `claim_task` carried the same allow before this query was
 // extracted for shape-testing.
@@ -561,6 +610,22 @@ pub const fn claim_task_query() -> &'static str {
          paused_activities AS MATERIALIZED ( \
              SELECT COALESCE(array_agg(activity_name), ARRAY[]::text[]) AS names \
              FROM harvest_activity_pauses \
+         ), \
+         concurrency_pending_keys AS MATERIALIZED ( \
+             SELECT DISTINCT concurrency_key, task_type \
+             FROM harvest_task_queue \
+             WHERE queue_name = ANY($2) \
+               AND state = 'PENDING' \
+               AND concurrency_key IS NOT NULL \
+               AND concurrency_cap IS NOT NULL \
+         ), \
+         concurrency_running_counts AS MATERIALIZED ( \
+             SELECT t.concurrency_key, t.task_type, COUNT(*) AS running_count \
+             FROM harvest_task_queue t \
+             WHERE t.state = 'RUNNING' \
+               AND t.worker_id IS NOT NULL \
+               AND t.concurrency_key IN (SELECT concurrency_key FROM concurrency_pending_keys) \
+             GROUP BY t.concurrency_key, t.task_type \
          ), \
          candidate AS ( \
              SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name \
@@ -589,13 +654,11 @@ pub const fn claim_task_query() -> &'static str {
                AND ( \
                    concurrency_key IS NULL \
                    OR concurrency_cap IS NULL \
-                   OR ( \
-                       SELECT COUNT(*) FROM harvest_task_queue inner_q \
-                       WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
-                         AND inner_q.task_type = harvest_task_queue.task_type \
-                         AND inner_q.state = 'RUNNING' \
-                         AND inner_q.worker_id IS NOT NULL \
-                   ) < harvest_task_queue.concurrency_cap \
+                   OR COALESCE(( \
+                       SELECT rc.running_count FROM concurrency_running_counts rc \
+                       WHERE rc.concurrency_key = harvest_task_queue.concurrency_key \
+                         AND rc.task_type = harvest_task_queue.task_type \
+                   ), 0) < harvest_task_queue.concurrency_cap \
                ) \
                AND ( \
                    required_build_id IS NULL \
@@ -4477,6 +4540,131 @@ mod tests {
         assert!(
             claimable_pending_demand_query().contains(&scoping),
             "claimable_pending_demand_by_queue must scope the activity-pause gate by task_type"
+        );
+    }
+
+    // ── Per-key concurrency: claim gate + its recheck (issue #247) ──────────
+
+    /// The candidate-side concurrency gate must resolve via the pre-filtered
+    /// `concurrency_running_counts` lookup, never the old per-row correlated
+    /// `COUNT(*)` subquery -- see the `NOTE` above `claim_task_query` for the
+    /// measured cost (`docs/performance.md`'s per-gate cost table: +644% even
+    /// with contention deliberately minimised, since a candidate-side subquery
+    /// re-runs once per row the sort walks toward `LIMIT 1`) that motivated
+    /// the rewrite.
+    ///
+    /// The `claimed` CTE's own authoritative, advisory-lock-guarded recheck is
+    /// deliberately NOT rewritten (see the `NOTE`): it already runs at most
+    /// once per claim, so a single, fresh, serializable-under-the-lock read is
+    /// both cheap and correctness-critical there -- reusing the pre-filtered
+    /// snapshot instead would let a race the advisory lock exists to close
+    /// slip through on a stale count. This test pins that the recheck remains
+    /// the untouched correlated form, so a future refactor cannot silently
+    /// collapse the two into one shared (and no-longer-fresh) lookup.
+    #[test]
+    fn claim_query_concurrency_gate_matches_the_authoritative_recheck() {
+        let sql = claim_task_query();
+        assert!(
+            sql.contains("concurrency_pending_keys AS MATERIALIZED"),
+            "the concurrency-key pre-filter must be forced to materialize \
+             once per claim, not be inlined back into a per-row correlated \
+             subquery; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("concurrency_running_counts AS MATERIALIZED"),
+            "the RUNNING-count aggregate must be forced to materialize once \
+             per claim; got:\n{sql}"
+        );
+        assert!(
+            sql.contains(
+                "concurrency_pending_keys AS MATERIALIZED ( \
+             SELECT DISTINCT concurrency_key, task_type \
+             FROM harvest_task_queue \
+             WHERE queue_name = ANY($2)"
+            ),
+            "concurrency_pending_keys must scope to this claim's own queue \
+             set ($2), not the whole table -- otherwise the aggregate below \
+             pays for every concurrency key in the deployment, not just the \
+             ones this claim attempt could possibly select; got:\n{sql}"
+        );
+        assert!(
+            sql.contains(
+                "concurrency_running_counts AS MATERIALIZED ( \
+             SELECT t.concurrency_key, t.task_type, COUNT(*) AS running_count \
+             FROM harvest_task_queue t \
+             WHERE t.state = 'RUNNING' \
+               AND t.worker_id IS NOT NULL \
+               AND t.concurrency_key IN (SELECT concurrency_key FROM concurrency_pending_keys) \
+             GROUP BY t.concurrency_key, t.task_type"
+            ),
+            "concurrency_running_counts must narrow to the pre-filtered key \
+             set and preserve the worker_id IS NOT NULL guard the old \
+             correlated subquery had; got:\n{sql}"
+        );
+        assert!(
+            sql.contains(
+                "OR COALESCE(( \
+                       SELECT rc.running_count FROM concurrency_running_counts rc \
+                       WHERE rc.concurrency_key = harvest_task_queue.concurrency_key \
+                         AND rc.task_type = harvest_task_queue.task_type \
+                   ), 0) < harvest_task_queue.concurrency_cap"
+            ),
+            "the candidate-side check must be a COALESCE(lookup, 0) < cap \
+             comparison against the materialized aggregate, reproducing the \
+             correlated subquery's implicit zero for a key with no matching \
+             RUNNING rows; got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("inner_q"),
+            "the old per-row correlated COUNT(*) subquery (aliased inner_q) \
+             must be gone from the candidate scan entirely; got:\n{sql}"
+        );
+
+        // The `claimed` CTE's authoritative recheck is a SEPARATE,
+        // deliberately-untouched, single-row re-evaluation -- pinned here so
+        // a future refactor cannot silently fold it into the same
+        // pre-filtered (and therefore stale-by-the-time-the-lock-is-held)
+        // lookup the candidate scan uses above.
+        assert!(
+            sql.contains(
+                "SELECT COUNT(*) FROM harvest_task_queue recheck \
+                              WHERE recheck.concurrency_key = candidate.concurrency_key \
+                                AND recheck.task_type = candidate.task_type \
+                                AND recheck.state = 'RUNNING' \
+                                AND recheck.worker_id IS NOT NULL"
+            ),
+            "the claimed CTE's authoritative recheck must remain the \
+             original correlated-subquery form, re-evaluated fresh under \
+             pg_try_advisory_xact_lock; got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("pg_try_advisory_xact_lock").count(),
+            1,
+            "the advisory-lock guard belongs only in the claimed CTE's \
+             recheck, exactly once; got:\n{sql}"
+        );
+    }
+
+    /// The concurrency-key gate must appear exactly once in the pre-filter
+    /// scan and exactly once in the authoritative recheck -- two occurrences
+    /// of `concurrency_running_counts`/`concurrency_pending_keys` total (one
+    /// CTE definition plus one reference each), mirroring
+    /// `queue_pause_gate_appears_once_in_the_claim_candidate_scan`'s "no
+    /// accidental duplication" intent for this gate's two-CTE shape.
+    #[test]
+    fn concurrency_gate_ctes_are_defined_and_referenced_exactly_once_each() {
+        let sql = claim_task_query();
+        assert_eq!(
+            sql.matches("concurrency_pending_keys").count(),
+            2,
+            "concurrency_pending_keys: one CTE definition + one reference \
+             from concurrency_running_counts's IN (...); got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("concurrency_running_counts").count(),
+            2,
+            "concurrency_running_counts: one CTE definition + one reference \
+             from the candidate-side COALESCE lookup; got:\n{sql}"
         );
     }
 
