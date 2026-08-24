@@ -248,18 +248,48 @@ Total: 45,300,388 bytes in 473,020 blocks
 
 category                                  bytes       %       blocks       %
 harness_fixture_setup                   366,142   0.81%        3,841   0.81%
-trace_snapshot_prefix_clone          27,425,216  60.54%      288,962  61.09%
-replay_prefix_or_context_build           12,880   0.03%          322   0.07%
+history_projection_one_time_build        952,740   2.10%        8,973   1.90%
+trace_snapshot_prefix_clone          29,277,294  64.63%      285,604  60.38%
+replay_prefix_or_context_build          242,757   0.54%        2,972   0.63%
 history_matcher_internals                     0   0.00%            0   0.00%
 workflow_reexecution                 14,437,593  31.87%      171,441  36.24%
-fmt_format_machinery                     11,706   0.03%          413   0.09%
-tokio_runtime                         3,042,973   6.72%        8,026   1.70%
-other                                     3,878   0.01%           15   0.00%
+fmt_format_machinery                          0   0.00%            0   0.00%
+tokio_runtime                             8,384   0.02%           12   0.00%
+other                                    15,478   0.03%          177   0.04%
 ```
 
-`other` (0.01% of bytes) is entirely fixed, ~3.9 KB of process-startup /
-`std::rt` / thread-attribute noise, present identically across every `n`
-swept — confirmed nothing meaningful escaped categorization.
+This table supersedes an earlier version of this note (see "What changed in
+this PR" for the review that prompted the correction): the categorizer's
+`tokio_runtime` and `trace_snapshot_prefix_clone` checks were both refined
+for precision, and a new `history_projection_one_time_build` bucket was
+split out. The grand totals (45,300,388 bytes / 473,020 blocks) are
+unchanged — only the internal categorization moved, exactly as expected
+from DHAT's own invariant that its totals don't depend on how allocations
+are grouped by stack.
+
+`other` (0.03% of bytes) is no longer a single fixed figure at every `n` —
+confirmed by directly decomposing its top stacks, not assumed. Two
+components: a genuinely fixed **~3.96 KB / 17 blocks**, present
+byte-for-byte identically at every swept `n` (process-startup / `std::rt` /
+`pthread_getattr_np` / thread-attribute noise — the same noise this section
+previously reported as the whole of `other`), plus a small, genuinely `O(n)`
+residual that **used to be hidden inside the old `tokio_runtime` bucket**
+and only became visible once that bucket's check was depth-limited (see
+below): a `144-bytes-per-step`, exactly-linear-in-`n` allocation whose
+innermost surviving frame is `<Vec<T> as
+alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter`, one frame above
+`trace_snapshot::{{closure}}` rather than at it — a further LLVM/Rust
+release-profile inlining variant of the same per-step
+`snapshot.events[..=step.index].to_vec()` call that neither of
+`trace_snapshot_prefix_clone`'s two conditions (a proximate-frame match, or
+a whole-stack `to_vec`/`Clone`/`clone` substring) catches, since this stack
+contains none of those substrings anywhere in its 9 frames. This is
+genuinely immaterial to every conclusion in this document (0.03% of total
+bytes at n=80, 0.013% at the largest swept n=160) and this categorizer is
+not chasing it further — recorded here in the same spirit that motivated
+this precision pass in the first place: confirming nothing meaningful is
+silently swept under an unaudited catch-all, not claiming the categorizer
+is now perfectly exhaustive.
 
 Re-running the same script at `n = 20, 40, 160` shows the categories moving
 exactly as the O(N²) hypothesis predicts:
@@ -267,21 +297,75 @@ exactly as the O(N²) hypothesis predicts:
 | category | n=20 | n=40 | n=80 | n=160 |
 |---|---:|---:|---:|---:|
 | `harness_fixture_setup` | 2.75% | 1.53% | 0.81% | 0.42% |
-| `trace_snapshot_prefix_clone` | 55.16% | 58.58% | **60.54%** | 61.59% |
+| `history_projection_one_time_build` | 7.18% | 3.98% | 2.10% | 1.08% |
+| `trace_snapshot_prefix_clone` | 56.96% | 61.82% | **64.63%** | 66.14% |
 | `workflow_reexecution` | 30.83% | 31.50% | 31.87% | 32.06% |
-| `tokio_runtime` | 10.95% | 8.25% | 6.72% | 5.90% |
+| `tokio_runtime` | 0.25% | 0.07% | 0.02% | 0.00% |
 
 `harness_fixture_setup` is a one-time `O(n)` cost (building the seed
 history once, before `trace_snapshot` is even called), so it shrinks as a
 share of the `O(n²)` total as `n` grows — exactly the behavior expected of
-an additive lower-order term. `tokio_runtime` (async task/waker machinery
-`drive_query_replay_async` runs on, once per step — `O(n)` total) shrinks
-the same way, for the same reason. `trace_snapshot_prefix_clone` and
-`workflow_reexecution` are both genuinely `O(n²)` (see "Hypothesis" below),
-so their combined share (86.0% → 90.1% → 92.4% → 93.6% across the sweep)
-converges toward the whole budget as `n → ∞`, and their *relative* split
-between the two stays roughly stable (~2:1 in favor of the prefix clone)
-because both scale at the same asymptotic order.
+an additive lower-order term. `history_projection_one_time_build` (the
+single, up-front `ReplayTrace::from_history_capped` pass over the whole
+history, before the per-step loop begins — see the bucket 2 rationale in
+`classify_dhat_allocations.py`'s docstring) shrinks the same way, for the
+same reason, and its own byte counts confirm the claim directly: they
+double almost exactly (239,580 → 477,300 → 952,740 → 1,904,308, each ratio
+1.99x–2.00x) as `n` doubles, the clean signature of a genuine `O(n)` pass
+rather than an approximation.
+
+`tokio_runtime` is now **essentially flat** across the whole sweep —
+8,384 bytes / 12 blocks at every single measured `n`, byte-for-byte and
+block-for-block identical — confirming it really is a small, fixed,
+one-time process-startup cost (async runtime `Builder::build`,
+`BlockingPool::new`, `Wheel::new`, and similar) entirely unrelated to
+workload size. **This corrects a materially wrong prior claim in this same
+document.** An earlier version of this table reported `tokio_runtime` at
+10.95% → 8.25% → 6.72% → 5.90% and described it as "async task/waker
+machinery `drive_query_replay_async` runs on, once per step". Both the
+numbers and the causal claim were wrong: a Codex review comment on this
+PR flagged that the bucket's check (`"tokio::" in joined`, a whole-stack
+substring search) was matching a distant *ancestor* frame —
+`tokio::runtime::scheduler::current_thread::CurrentThread::block_on`,
+which legitimately sits somewhere above literally every allocation in this
+`rt.block_on(debugger.trace_snapshot(snapshot))`-wrapped program — rather
+than the allocation's true, proximate cause.
+
+Investigating turned up a larger problem than the review comment itself
+implied. Measured directly against the n=80 capture, **99.72% of the old
+bucket's 3,042,973 bytes (3,034,589 bytes) was misattributed**, resolving
+to three genuine causes once the check is corrected: 72.0%
+(2,190,888 bytes, one single program point) was `trace_snapshot::{{closure}}`
+itself, its allocation's immediate caller; 27.4% (832,181 bytes) was
+`BTreeMap`/`serde_json::Value` serialization frames reached through
+`normalized_event_facts`/`command_payload`/`WorkflowEvent::serialize`; and
+0.4% (11,520 bytes) was the small `from_iter`-mediated per-step residual
+described in the `other` explanation above (its stack also happens to pass
+through `block_on`, so the old whole-stack check caught it too). In every
+one of these cases the `tokio::` marker appeared only 5–15 frames up the
+ancestor chain, never as the true cause. Every *genuinely* tokio-caused
+allocation in the same capture, by contrast, has its `tokio::` frame
+immediately above the allocator entry point, with zero exceptions — a
+clean, decisive, bimodal split that is itself the evidence the corrected
+check relies on. The categorizer's `tokio_runtime` check is now
+depth-limited to the allocation's own near-immediate caller (`fs[1]`/`fs[2]`,
+never a distant ancestor reached only through a 5-to-15-frame `block_on`
+chain); the misattributed 72.0% now lands in `trace_snapshot_prefix_clone`,
+the 27.4% splits across `history_projection_one_time_build` and
+`trace_snapshot_prefix_clone` depending on which pass it belongs to, and
+the 0.4% now lands, correctly, in `other`.
+
+`trace_snapshot_prefix_clone` and `workflow_reexecution` are both genuinely
+`O(n²)` (see "Hypothesis" below), so their combined share (87.8% → 93.3% →
+96.5% → 98.2% across the sweep) converges toward the whole budget as
+`n → ∞` — a tighter, cleaner convergence than the pre-correction figures
+(86.0% → 90.1% → 92.4% → 93.6%) showed, since the fix stops diluting both
+numerators with allocations that were never theirs. Their *relative* split
+between the two grows modestly across the sweep (1.85:1 → 1.96:1 → 2.03:1
+→ 2.06:1 in favor of the prefix clone) — both scale at the same asymptotic
+order, so the ratio was already approximately stable before this
+correction and remains so after it; this document does not claim it is
+perfectly constant.
 
 `history_matcher_internals` (`HistoryMatcher`/`match_history`/
 `drive_query_replay`'s own bookkeeping — walking an already-owned prefix and
@@ -362,7 +446,7 @@ persistent `Vec<WorkflowEvent>` across steps** (appending only the single
 newly-in-scope event at each step, instead of cloning the whole growing
 range from scratch every time) — turning `Σ(k=0..n-1) O(k+1)` clone-copies
 into a single `O(n)` sequence of one-element appends, addressing the
-dominant 60.5%-and-rising `trace_snapshot_prefix_clone` bucket directly.
+dominant 64.6%-and-rising `trace_snapshot_prefix_clone` bucket directly.
 
 **This is unsafe**, confirmed by direct source inspection, not merely
 inconvenient or unmeasured. `docs/performance-replay.md` documents a prior,
@@ -468,7 +552,7 @@ maintainer decision, not a unilateral commit:
    interactive tool, not unblocking anything currently broken.
 2. **`Arc`-wrap event payloads** (or whole `WorkflowEvent`s) so a prefix
    "clone" becomes cheap reference-count bumps rather than deep `Value`
-   clones — directly addressing the dominant 60.5%-and-rising
+   clones — directly addressing the dominant 64.6%-and-rising
    `trace_snapshot_prefix_clone` share. **This shrinks the constant factor,
    not the complexity class**: there are still `n` steps each doing `O(k)`
    work (now cheap refcount bumps instead of deep clones, but still linear
@@ -507,12 +591,40 @@ Nothing in production code. Only:
   allocation-site categorizer used above, mirroring
   `autumn-harvest-sqlite/scripts/classify_dhat_allocations.py`'s
   methodology (precedence-ordered, mutually-exclusive, exhaustive-partition-
-  asserted). Its `history_matcher_internals`/`replay_prefix_or_context_build`
-  precedence check was checked ahead of the latter (matcher frames are
-  always nested inside `replay_prefix`'s own drive call), and its docstring
-  now records — with the empirical evidence above — that this precedence
-  ordering makes no observable difference in practice, because every
-  function either bucket names is inlined away in this build profile.
+  asserted). Its `history_matcher_internals` bucket is checked ahead of
+  `replay_prefix_or_context_build` (matcher frames are always nested inside
+  `replay_prefix`'s own drive call), and its docstring records — with the
+  empirical evidence above — that this precedence ordering makes no
+  observable difference in practice, because every function either bucket
+  names is inlined away in this build profile.
+
+  **Revised twice in response to Codex review comments on this PR**, both
+  addressed together since the investigation showed them to be causally
+  linked (fixing one required correctly separating what was flowing into
+  the other): (1) the `tokio_runtime` check was a whole-stack `"tokio::" in
+  joined` substring search, which matched a distant `CurrentThread::block_on`
+  *ancestor* frame present above every allocation in this
+  `rt.block_on(...)`-wrapped program — measured to be misattributing 99.7%
+  of that bucket's bytes at n=80 (see the corrected per-n table above for
+  the full before/after). It is now depth-limited to the allocation's own
+  near-immediate caller. (2) The `trace_snapshot_prefix_clone` bucket's
+  whole-stack `"trace_snapshot" in joined` + `to_vec`/`Clone`/`clone`
+  substring check was conflating the genuine per-step `O(k)` prefix
+  `to_vec()` clone with the one-time, `O(n)` `ReplayTrace::from_history_capped`
+  decode pass that runs once, before the per-step loop even begins (both
+  share `trace_snapshot::{{closure}}` as a common ancestor frame, so a
+  whole-stack search cannot tell them apart) — confirmed by directly reading
+  `trace_snapshot`'s body, not inferred from the allocation data alone. A
+  new `history_projection_one_time_build` bucket, checked ahead of
+  `trace_snapshot_prefix_clone`, now separates that one-time decode cost;
+  `trace_snapshot_prefix_clone` itself gained a stronger, first-hand
+  proximate-frame check (`fs[1]` resolving directly to
+  `trace_snapshot::{{closure}}`) alongside the retained whole-stack fallback,
+  since LLVM's release-profile inlining is not uniform across call sites of
+  the same generic function and some of this loop's `to_vec()` calls leave
+  no `to_vec`-named frame anywhere on the stack at all. See the script's own
+  docstring for the full precedence rationale and the exact byte-level
+  evidence for both corrections.
 - `docs/replay-debugger.md` — cross-linked to this note from its existing
   "Cost" section, and that section's own wording was tightened to state
   explicitly that it describes the library `trace_snapshot` arm, not the
