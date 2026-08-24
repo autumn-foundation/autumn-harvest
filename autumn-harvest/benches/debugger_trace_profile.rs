@@ -1,7 +1,18 @@
 //! Deterministic (non-criterion) instruction/allocation-count profiling
 //! harness for `autumn_harvest::debugger::ReplayDebugger::trace_snapshot` --
-//! the prefix-replay engine behind the time-travel replay debugger (issue
-//! #949) and its `harvest debug` CLI entry point.
+//! the prefix-replay engine behind the **library** arm of the time-travel
+//! replay debugger (issue #949).
+//!
+//! This profiles the library API only. The shipped `harvest debug replay`
+//! CLI subcommand never calls `trace_snapshot` -- it is statically linked
+//! and cannot register an embedder's `#[workflow]` handler, which
+//! `trace_snapshot` requires, so it always builds its trace via the
+//! separate, cheaper, handler-free `ReplayTrace::from_history_capped`
+//! projection instead (confirmed by reading
+//! `autumn-harvest-cli/src/debug.rs::run_replay`). See
+//! `docs/performance-debugger-trace.md`'s "Scope" section for the full
+//! source-confirmed argument; this workload models a **library caller** of
+//! `ReplayDebugger`, not a default or flag-reachable CLI invocation.
 //!
 //! Wall-clock timing is unreliable on this (shared-vCPU) machine, so this
 //! binary is not measured with `cargo bench` / criterion timing. It is driven
@@ -36,11 +47,13 @@
 //! payload.
 //!
 //! `ReplayDebugger::new()` is driven with **library defaults** (no
-//! `.max_steps()` override) -- `DEFAULT_MAX_STEPS = 500` -- which is what a
-//! real `harvest debug` invocation gets without extra flags. `N` is kept
-//! small enough at every measured point that `2N + 1 < 500`, so no run in
-//! the sweep below is truncated by the cap; the reported scaling is the
-//! real default-configuration cost, not an artifact of hitting the ceiling.
+//! `.max_steps()` override) -- `DEFAULT_MAX_STEPS = 500` -- which is what an
+//! embedder gets from `ReplayDebugger::new()` without an explicit
+//! `.max_steps(...)` override (the packaged `harvest debug` CLI never
+//! reaches this code path at all -- see above). `N` is kept small enough at
+//! every measured point that `2N + 1 < 500`, so no run in the sweep below is
+//! truncated by the cap; the reported scaling is the real
+//! default-configuration cost, not an artifact of hitting the ceiling.
 //!
 //! `harness = false` + its own `main()` -- same shape as `replay_profile.rs`
 //! / `runtime_drive_profile.rs` -- so the compiled artifact is a plain

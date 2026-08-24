@@ -494,7 +494,12 @@ cheaper-to-clone representation used only here.
 Nothing in production code. Only:
 
 - `autumn-harvest/benches/debugger_trace_profile.rs` (new) — the profiling
-  harness described above.
+  harness described above. Its own module doc comment was tightened in
+  response to review — it originally described the workload's
+  `DEFAULT_MAX_STEPS` default as "what a real `harvest debug` invocation
+  gets," the same inaccuracy corrected in this document's "Scope" section;
+  it now states explicitly, with a pointer to the CLI's actual entry point,
+  that the packaged CLI never calls `trace_snapshot` at all.
 - `autumn-harvest/Cargo.toml` — registers the new `[[bench]]` target
   (`harness = false`, `required-features = ["debugger"]`, the same
   convention as every other deterministic profiling harness in this repo).
