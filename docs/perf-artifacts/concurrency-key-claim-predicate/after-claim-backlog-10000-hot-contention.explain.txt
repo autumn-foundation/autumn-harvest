@@ -1,5 +1,5 @@
 -- after: claim_task_query() @ backlog=10000, 4 queues, concurrency_key set + 2000 RUNNING rows spread across the same keys as the PENDING backlog --
-CTE Scan on claimed  (cost=484175.37..484175.39 rows=1 width=817) (actual rows=1 loops=1)
+CTE Scan on claimed  (cost=484235.37..484235.39 rows=1 width=817) (actual rows=1 loops=1)
   Output: claimed.id, claimed.queue_name, claimed.task_type, claimed.workflow_exec_id, claimed.activity_name, claimed.input, claimed.state, claimed.priority, claimed.worker_id, claimed.attempt, claimed.max_attempts, claimed.scheduled_at, claimed.started_at, claimed.completed_at, claimed.last_heartbeat_at, claimed.heartbeat_timeout, claimed.start_to_close, claimed.schedule_to_start, claimed.retry_policy, claimed.output, claimed.error, claimed.sticky_worker_id, claimed.sticky_until, claimed.sticky_timeout, claimed.trace_context, claimed.concurrency_key, claimed.concurrency_cap, claimed.heartbeat_details, claimed.required_build_id, claimed.activity_id, claimed.rate_limit_key, claimed.crash_strikes, claimed.schedule_to_close_at, claimed.required_capabilities, claimed.context_headers, claimed.created_at, claimed.wake_requested, claimed.session_id, claimed.capability_misses, claimed.capability_miss_workers, claimed.capability_miss_handler
   Buffers: shared hit=1541
   CTE paused_queues
@@ -19,14 +19,14 @@ CTE Scan on claimed  (cost=484175.37..484175.39 rows=1 width=817) (actual rows=1
           ->  Seq Scan on public.harvest_activity_pauses  (cost=0.00..16.00 rows=600 width=32) (actual rows=0 loops=1)
                 Output: harvest_activity_pauses.activity_name, harvest_activity_pauses.reason, harvest_activity_pauses.paused_by, harvest_activity_pauses.paused_at, harvest_activity_pauses.scope_shard_id
   CTE concurrency_pending_keys
-    ->  HashAggregate  (cost=593.00..595.56 rows=256 width=29) (actual rows=256 loops=1)
+    ->  HashAggregate  (cost=653.00..655.56 rows=256 width=29) (actual rows=256 loops=1)
           Output: harvest_task_queue.concurrency_key, harvest_task_queue.task_type
           Group Key: harvest_task_queue.concurrency_key, harvest_task_queue.task_type
           Batches: 1  Memory Usage: 61kB
           Buffers: shared hit=333
-          ->  Seq Scan on public.harvest_task_queue  (cost=0.00..543.00 rows=10000 width=29) (actual rows=10000 loops=1)
+          ->  Seq Scan on public.harvest_task_queue  (cost=0.00..603.00 rows=10000 width=29) (actual rows=10000 loops=1)
                 Output: harvest_task_queue.concurrency_key, harvest_task_queue.task_type
-                Filter: ((harvest_task_queue.concurrency_key IS NOT NULL) AND (harvest_task_queue.concurrency_cap IS NOT NULL) AND (harvest_task_queue.state = 'PENDING'::text) AND (harvest_task_queue.queue_name = ANY ('{harvest-bench-q-0,harvest-bench-q-1,harvest-bench-q-2,harvest-bench-q-3}'::text[])))
+                Filter: ((harvest_task_queue.concurrency_key IS NOT NULL) AND (harvest_task_queue.concurrency_cap IS NOT NULL) AND (harvest_task_queue.state = 'PENDING'::text) AND (harvest_task_queue.queue_name = ANY ('{harvest-bench-q-0,harvest-bench-q-1,harvest-bench-q-2,harvest-bench-q-3}'::text[])) AND (harvest_task_queue.scheduled_at <= now()))
                 Rows Removed by Filter: 2000
                 Buffers: shared hit=333
   CTE concurrency_running_counts
@@ -160,11 +160,11 @@ CTE Scan on claimed  (cost=484175.37..484175.39 rows=1 width=817) (actual rows=1
                       Output: harvest_task_queue_2.attempt, harvest_task_queue_2.ctid, harvest_task_queue_2.id
                       Index Cond: (harvest_task_queue_2.id = candidate_1.id)
                       Buffers: shared hit=3
-Query Identifier: -7170364520715493147
+Query Identifier: 7557541884044009804
 Planning:
   Buffers: shared hit=569 read=30
-Planning Time: 3.429 ms
+Planning Time: 3.122 ms
 JIT:
   Functions: 139
   Options: Inlining false, Optimization false, Expressions true, Deforming true
-Execution Time: 297.796 ms
+Execution Time: 311.458 ms

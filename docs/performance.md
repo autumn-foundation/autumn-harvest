@@ -50,8 +50,8 @@ this page says nothing about what they cost; see
   was a correlated `COUNT(*)` subquery, re-evaluated once per candidate row a
   claim visits rather than once per claim. Materializing the `RUNNING` count
   once per claim into a small pre-aggregated CTE cuts total buffers touched
-  across a real 10 000-row drain **-99.56%** at the headline scenario
-  (2 492 987 808 → 10 938 903). See
+  across a real 10 000-row drain **-99.23%** at the headline scenario
+  (1 385 001 432 → 10 727 317). See
   [the concurrency-key gate fix](#the-concurrency-key-gate-fix).
 * **Paused executions cost as much as live ones (+1403% p50), and the cost is
   table depth rather than anything specific to pausing.** An equal-*depth*
@@ -621,6 +621,7 @@ concurrency_pending_keys AS MATERIALIZED (
     FROM harvest_task_queue
     WHERE queue_name = ANY($2)
       AND state = 'PENDING'
+      AND scheduled_at <= NOW()
       AND concurrency_key IS NOT NULL
       AND concurrency_cap IS NOT NULL
 ),
@@ -688,18 +689,25 @@ rows — where the fixed version pays that cost exactly once, covering all 256
 distinct keys in one pass.
 
 A pre-existing external-merge sort spill at the 100 000-row idle depth
-(`Sort Method: external merge  Disk: 18392kB`) is present, at the identical
+(`Sort Method: external merge  Disk: 18384kB`) is present, at the identical
 disk size, in both the before and after plans — this fix does not introduce or
 change it (see issue #1215, which targets a different part of the query).
 Likewise the base-table scan feeding the `ORDER BY … LIMIT` is unchanged in
 shape between before and after at every depth (see issue #1177) — this fix
 touches only the concurrency-check predicate, not the candidate
-ordering/pushdown.
+ordering/pushdown. The specific scan type at the 100 000-row depth can itself
+vary *across* separate script runs (an earlier run captured a `Seq Scan`
+where this run captured an `Index Scan using idx_harvest_tq_poll`, purely
+from `ANALYZE` statistics/row-layout differences between fresh fixture
+builds — the same class of variance noted for the cumulative buffer count
+below); what stays constant within a single run's before/after pair, and
+what this claim actually depends on, is that the *before* and *after* halves
+of the same run always match each other.
 
 **Corroboration.** Wall-clock execution time for a *single* cold claim is
 **not** admissible corroboration at idle scale: it is flat to slightly worse
-at backlog=10 000 (131.4 ms → 138.7 ms) and backlog=100 000 (1 691.9 ms →
-1 786.1 ms), neither >2x nor in the same direction as the buffer win — the
+at backlog=10 000 (116.7 ms → 143.4 ms) and backlog=100 000 (1 629.0 ms →
+1 855.9 ms), neither >2x nor in the same direction as the buffer win — the
 concurrency-check subtree shrinks from tens/hundreds of thousands of buffers
 to essentially nothing, but that subtree is a small fraction of a single
 query's total cost at idle scale, where the `ORDER BY`/sort work
@@ -710,14 +718,14 @@ did not observe.
 
 At hot contention, wall-clock moves the same direction as buffers by more
 than 2x — the bar this page's own methodology sets for treating it as
-corroborating evidence: **1 510.6 ms → 297.8 ms (5.07x)**, alongside the
+corroborating evidence: **1 573.3 ms → 311.5 ms (5.05x)**, alongside the
 -99.25% buffer reduction above.
 
 **Cumulative, real-claim-loop evidence.** A `pg_stat_statements` snapshot of
 10 001 real `claim_task()` calls draining the full 10 000-row headline
 backlog (the same `ClaimGate::ConcurrencyKey` scenario the +644% p50 figure
 was measured under — 256 distinct keys, cap high enough never to block):
-total buffers **2 492 987 808 → 10 938 903** (**-99.56%**, 227.9x fewer
+total buffers **1 385 001 432 → 10 727 317** (**-99.23%**, 129.1x fewer
 buffers for the identical drain). Far larger than the single-cold-claim
 reduction above, because the pre-fix cost *compounds* across the drain: each
 of the 10 000 sequential `claim_task()` calls independently re-scans the
@@ -727,6 +735,17 @@ work across a full drain grows roughly with the *square* of backlog depth
 subquery cost), where the fix's per-call cost stays flat — bounded by
 distinct-key cardinality and the `RUNNING` population, not by the shrinking
 remaining backlog.
+
+The absolute *before* buffer count is sensitive to physical row/page layout
+after `ANALYZE`: an earlier run of this same script measured
+**2 492 987 808 → 10 938 903** on an identically-shaped fixture, roughly 1.8x
+higher on the *before* side than the **1 385 001 432** figure above, because
+the correlated subquery's cost depends on how `RUNNING`/`PENDING` rows happen
+to land on disk, while the fixed version's flat, bounded CTE cost barely
+moved between runs (10 938 903 → 10 727 317, -1.9%). The *relative* reduction
+is what to trust across reruns: both landed in the same -99%/100x+ regime,
+comfortably clearing this page's impact floor either way; reproduce it
+yourself rather than pinning to either absolute number.
 
 **Equivalence.** Both before and after runs claim the identical
 10 000-of-10 000 claimable rows (`claimed=10000 of 10000 claimable` in both
@@ -775,7 +794,7 @@ subtree-total table above. Re-running the same shape with 5 000 distinct
 keys instead of 256 (all other parameters held fixed: 10 000-row backlog,
 2 000 `RUNNING` rows, `NON_BLOCKING_CAP`) reproduces a **1 600 ms** single
 claim, worse than the pre-fix baseline's own hot-contention wall-clock
-(1 510.6 ms, see above) — the fix's own per-candidate-row `CTE Scan` becomes
+(1 573.3 ms, see above) — the fix's own per-candidate-row `CTE Scan` becomes
 the dominant cost once distinct-key cardinality is large enough. The
 underlying shape is O(candidate rows × distinct running key/type pairs);
 256 keys keeps that product small, thousands of keys does not.
