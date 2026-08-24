@@ -32351,7 +32351,20 @@ async fn get_start_throttle_pacing_override(
         Err(e) => return e.into_response(),
     };
 
-    let mut merged: Option<RateLimitBucket> = None;
+    // Issue #945 review (round 4, P2): the previous merge picked a single
+    // "representative" row across shards by raw `tokens` count alone --
+    // e.g. `existing.tokens <= b.tokens => existing`. That is the right
+    // heuristic for `list_rate_limits`'s worst-case-capacity diagnostic, but
+    // WRONG for reporting whether an OPERATOR OVERRIDE is active: after a
+    // documented partial SET/DELETE, shards can genuinely disagree about
+    // override state (one shard still under a live override, another
+    // cleared or never written), and picking by token count can silently
+    // surface the WRONG shard's `override_active` in either direction --
+    // reporting "no override" while one is still live elsewhere, or the
+    // reverse. Collect every reachable shard's row instead, and derive
+    // `override_active` from an explicit per-shard tally rather than a
+    // proxy metric that has nothing to do with override state.
+    let mut snapshots: Vec<(i32, Option<RateLimitBucket>)> = Vec::new();
     let mut any_reachable = false;
     let mut shard_errors: Vec<String> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
@@ -32371,12 +32384,7 @@ async fn get_start_throttle_pacing_override(
         {
             Ok(found) => {
                 any_reachable = true;
-                if let Some(b) = found {
-                    merged = Some(match merged {
-                        Some(existing) if existing.tokens <= b.tokens => existing,
-                        _ => b,
-                    });
-                }
+                snapshots.push((shard_id.as_i32(), found));
             }
             Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
         }
@@ -32394,41 +32402,123 @@ async fn get_start_throttle_pacing_override(
             .into_response();
     }
 
-    let response = match merged {
-        // A row was found: report the *persisted* baseline, not the
-        // registry's -- the separate, permanent `POST
-        // /admin/rate-limits/{key}` route can have changed `refill_rate`/
-        // `burst` independently, and dispatch reads the row, not the
-        // registry (issue #945 review, P2).
-        Some(b) => PacingOverrideResponse::build(
-            key,
-            b.refill_rate,
-            b.burst,
-            b.override_refill_rate,
-            b.override_burst,
-            b.override_expires_at,
-        ),
-        // No row on any *reachable* shard: nothing has been persisted yet,
-        // so the registry's declared value is exactly what a fresh bucket
-        // would be seeded at.
-        None => PacingOverrideResponse::build(
-            key,
-            declared_refill_rate,
-            declared_burst,
-            None,
-            None,
-            None,
-        ),
+    let now = chrono::Utc::now();
+    let is_active = |row: &Option<RateLimitBucket>| {
+        row.as_ref()
+            .is_some_and(|b| b.override_expires_at > Some(now))
     };
 
-    if shard_errors.is_empty() {
+    // Disagreement is deliberately NOT "do the raw `override_expires_at`
+    // timestamps match exactly" -- a normal, fully successful multi-shard
+    // SET writes each shard's TTL from that shard's own `NOW()`, so
+    // millisecond clock skew alone would make virtually every healthy
+    // multi-shard override report a false "disagreement". Instead:
+    // (a) shards disagreeing on the ACTIVE/INACTIVE boolean (the exact
+    //     failure Codex's example describes), or
+    // (b) every reachable shard agreeing "active" but with genuinely
+    //     different `(override_refill_rate, override_burst)` values.
+    let active_flags: Vec<bool> = snapshots.iter().map(|(_, row)| is_active(row)).collect();
+    let any_active = active_flags.iter().any(|&a| a);
+    let any_inactive = active_flags.iter().any(|&a| !a);
+    let active_state_disagrees = any_active && any_inactive;
+    let active_rows: Vec<&RateLimitBucket> = snapshots
+        .iter()
+        .filter(|(_, row)| is_active(row))
+        .filter_map(|(_, row)| row.as_ref())
+        .collect();
+    let active_values_disagree = active_rows.split_first().is_some_and(|(first, rest)| {
+        rest.iter().any(|b| {
+            b.override_refill_rate != first.override_refill_rate
+                || b.override_burst != first.override_burst
+        })
+    });
+    let disagreement = active_state_disagrees || active_values_disagree;
+
+    // Representative row for the top-level (flattened, 200/207-body)
+    // response: prefer an ACTIVE row whenever any shard has one -- an
+    // incident-response "is my override active?" check should never
+    // silently answer "no" while a live override still governs dispatch on
+    // ANY shard -- else fall back to whatever row was found (all inactive),
+    // else `None` (no row anywhere -- report the registry-declared
+    // baseline, matching a fresh bucket's seeded value).
+    //
+    // `.iter().next()` rather than `.first()`, with an explicit
+    // `#[allow(clippy::iter_next_slice)]`: diesel's `RunQueryDsl` is
+    // blanket-implemented for every type (including `Vec<&RateLimitBucket>`
+    // itself, before any deref-to-slice occurs), so a bare `.first()` call
+    // here is resolved to `RunQueryDsl::first` -- a DB query method -- not
+    // the slice method, and fails to compile against a plain in-memory Vec
+    // (confirmed: applying clippy's own suggested `.first()` fix reintroduces
+    // that exact compile error).
+    #[allow(clippy::iter_next_slice)]
+    let representative: Option<&RateLimitBucket> = active_rows
+        .iter()
+        .next()
+        .copied()
+        .or_else(|| snapshots.iter().find_map(|(_, row)| row.as_ref()));
+
+    let build_response = |b: Option<&RateLimitBucket>| {
+        b.map_or_else(
+            || {
+                // No row on any *reachable* shard: nothing has been
+                // persisted yet, so the registry's declared value is exactly
+                // what a fresh bucket would be seeded at.
+                PacingOverrideResponse::build(
+                    key.clone(),
+                    declared_refill_rate,
+                    declared_burst,
+                    None,
+                    None,
+                    None,
+                )
+            },
+            |b| {
+                // A row was found: report the *persisted* baseline, not the
+                // registry's -- the separate, permanent `POST
+                // /admin/rate-limits/{key}` route can have changed
+                // `refill_rate`/`burst` independently, and dispatch reads
+                // the row, not the registry (issue #945 review, P2).
+                PacingOverrideResponse::build(
+                    key.clone(),
+                    b.refill_rate,
+                    b.burst,
+                    b.override_refill_rate,
+                    b.override_burst,
+                    b.override_expires_at,
+                )
+            },
+        )
+    };
+
+    let response = build_response(representative);
+
+    if shard_errors.is_empty() && !disagreement {
         (axum::http::StatusCode::OK, axum::Json(response)).into_response()
     } else {
+        // Surface the full per-shard breakdown whenever the flattened
+        // top-level view can't be fully trusted -- either an unreachable
+        // shard (pre-existing) or a genuine cross-shard override
+        // disagreement (issue #945 review, P2). `shard_disagreement`
+        // distinguishes the two causes; `shards` lets an operator see
+        // exactly which shard(s) diverge rather than trusting a single
+        // silently-picked value.
+        let shards_json: serde_json::Map<String, serde_json::Value> = snapshots
+            .iter()
+            .map(|(shard_id, row)| {
+                let per_shard = build_response(row.as_ref());
+                (
+                    shard_id.to_string(),
+                    serde_json::to_value(per_shard).unwrap_or(serde_json::Value::Null),
+                )
+            })
+            .collect();
         (
             axum::http::StatusCode::MULTI_STATUS,
             axum::Json(serde_json::json!({
                 "override": response,
                 "shard_errors": shard_errors,
+                "shard_disagreement": disagreement,
+                "shards": shards_json,
             })),
         )
             .into_response()
@@ -44416,52 +44506,42 @@ async fn evaluate_eligibility_for_shard(
             #[diesel(sql_type = diesel::sql_types::Text)]
             key: String,
             #[diesel(sql_type = diesel::sql_types::Double)]
-            tokens: f64,
-            #[diesel(sql_type = diesel::sql_types::Double)]
-            burst: f64,
-            #[diesel(sql_type = diesel::sql_types::Double)]
-            refill_rate: f64,
-            #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-            last_refilled_at: chrono::DateTime<chrono::Utc>,
-            // Issue #945: without these, a live TTL'd operator override is
-            // invisible to this diagnostic and it reports stale saturation
-            // (in either direction) against the declared baseline instead of
-            // the rate `claim_task` is actually enforcing right now.
-            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
-            override_refill_rate: Option<f64>,
-            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
-            override_burst: Option<f64>,
-            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-            override_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+            effective_tokens: f64,
         }
 
-        let rows: Vec<RateLimitRow> = diesel::sql_query(
-            "SELECT key, tokens, burst, refill_rate, last_refilled_at, \
-                    override_refill_rate, override_burst, override_expires_at \
+        // Issue #945 review (round 4, P2): this used to re-derive "tokens
+        // available right now" in Rust via a flat `elapsed *
+        // effective.refill_rate`, applying whichever rate is effective AT
+        // THE MOMENT OF THE READ to the WHOLE elapsed interval. That is
+        // exactly the class of bug `queue::token_accrual_expr` was written
+        // to fix (issue #945 round-1 P1) for the claim-time SQL gate: once
+        // an operator override has expired mid-interval with no intervening
+        // write to settle the bucket, retroactively applying the reverted
+        // baseline rate to the portion of the interval the override was
+        // still throttling produces a phantom refill -- so this diagnostic
+        // could report a key as available when `claim_task` is still
+        // treating it as saturated (or the reverse). Delegating the whole
+        // computation to `queue::effective_available_tokens_expr` -- the
+        // SAME expression the claim-time gate, the dispatch-time debit, and
+        // the refund all use -- makes this diagnostic structurally unable to
+        // drift from what `claim_task` is actually enforcing, mirroring
+        // `check_throttled_keys`'s convention of doing the whole
+        // override-and-accrual computation in SQL rather than re-deriving it
+        // in Rust.
+        let effective_tokens_expr =
+            queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
+        let rows: Vec<RateLimitRow> = diesel::sql_query(format!(
+            "SELECT key, {effective_tokens_expr} AS effective_tokens \
              FROM harvest_rate_limit_buckets \
-             WHERE key = ANY($1)",
-        )
+             WHERE key = ANY($1)"
+        ))
         .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&rate_limit_keys)
         .load(&mut conn)
         .await
         .map_err(database_error)?;
 
-        let now = chrono::Utc::now();
         for r in rows {
-            let effective = queue::resolve_effective_rate_limit(
-                r.refill_rate,
-                r.burst,
-                r.override_refill_rate,
-                r.override_burst,
-                r.override_expires_at,
-                now,
-            );
-            let elapsed = now
-                .signed_duration_since(r.last_refilled_at)
-                .num_milliseconds() as f64
-                / 1000.0;
-            let current_tokens = (r.tokens + elapsed * effective.refill_rate).min(effective.burst);
-            if current_tokens < 1.0 {
+            if r.effective_tokens < 1.0 {
                 saturated_rate_limits.insert(r.key);
             }
         }

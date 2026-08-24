@@ -38,6 +38,7 @@ use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::throttle::ThrottlePolicy;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
+use autumn_harvest::workers::register_worker;
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
@@ -765,6 +766,130 @@ async fn rate_limit_override_expiring_mid_interval_does_not_phantom_refill_the_d
          moment a long-paused override's TTL lapses -- the bucket has only \
          accrued ~1 second's worth of tokens at the baseline rate, well \
          under the 1.0 needed to dispatch, task={task}"
+    );
+}
+
+// ── Round-4 review: the eligibility explainer must reuse the SAME piecewise ──
+// ── accrual formula the claim gate enforces, not re-derive it in Rust        ──
+//
+// `evaluate_eligibility_for_shard` (the `GET /admin/queues/{queue}/
+// eligibility` handler behind issue #611's operator triage endpoint)
+// independently re-computed "tokens available right now" in Rust via a flat
+// `elapsed_total * effective_refill_rate`, applying whichever rate is
+// effective AT THE MOMENT OF THE READ to the WHOLE elapsed interval -- the
+// exact class of bug `queue::token_accrual_expr` was written to fix at the
+// SQL layer for `claim_task` itself (issue #945 review, round 1, P1; see the
+// two tests immediately above this one). Because the diagnostic and the real
+// gate used two different formulas, an operator polling this endpoint during
+// an incident could be told a task is dispatchable ("no impediment") when
+// `claim_task` is, in fact, still refusing to claim it -- the worst possible
+// answer from a triage tool.
+//
+// Reuses the identical accrual shape as the two P1 tests above (an override
+// that was paused for essentially the WHOLE ~10-day span and expired only 1
+// second ago) so the assertion is robust to CI timing jitter by
+// construction: the buggy flat-rate shape clamps straight to the
+// burst (1000.0) ceiling regardless of exact overhead, while the correct
+// piecewise shape can only ever accrue the short post-expiry tail.
+#[tokio::test]
+async fn eligibility_endpoint_reports_the_saturation_claim_task_actually_enforces() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let name = leaked_name("send_email");
+    let queue = leaked_name("email-queue");
+    let worker_id = leaked_name("worker");
+    let mut info = rate_limited_activity_info(name, 0.01, 1000.0);
+    info.default_queue = Some(queue);
+    let app = build_app(&pool, vec![info], vec![]);
+
+    let mut conn = pool.get().await.expect("conn");
+
+    // Identical accrual shape to the second claim-path P1 test above
+    // (`..._does_not_phantom_refill_the_dispatch_gate`), including its
+    // deliberately SLOW 0.01/s baseline: the bucket was last settled 10
+    // DAYS ago, an override paused it at EXACTLY 0.0 tokens/sec for
+    // essentially that whole span, and the override expired only 1 second
+    // ago. The slow baseline keeps the correct post-expiry-tail accrual
+    // (~1s at 0.01/s) safely under the 1.0-token dispatch threshold even
+    // with this test's own wall-clock overhead (worker registration + an
+    // HTTP round trip) between the write and the eligibility read -- a
+    // FAST baseline (e.g. 1.0/s, as the pure-formula test above uses) would
+    // let that same overhead alone accrue >= 1.0 tokens and mask the bug.
+    // `claim_task` (proven by the test immediately above, with the same
+    // 0.01/s shape) refuses to claim this task -- the eligibility endpoint
+    // must agree.
+    set_bucket_accrual_state(
+        &mut conn,
+        name,
+        /* refill_rate */ 0.01,
+        /* burst */ 1000.0,
+        /* tokens */ 0.0,
+        /* last_refilled_seconds_ago */ 10.0 * 86_400.0,
+        /* override_refill_rate */ Some(0.0),
+        /* override_burst */ Some(1000.0),
+        /* override_expired_seconds_ago */ Some(1.0),
+    )
+    .await;
+
+    enqueue_gated_activity(&mut conn, queue, name).await;
+
+    // An otherwise perfectly eligible worker: right queue, right shard,
+    // fresh heartbeat, no build/sticky/capability constraint -- the ONLY
+    // thing that can make it ineligible is the rate-limit bucket above.
+    register_worker(
+        &mut conn,
+        worker_id,
+        &[queue.to_string()],
+        &[0],
+        10,
+        "localhost",
+        None,
+        "",
+        None,
+        &std::collections::HashMap::new(),
+        0,
+    )
+    .await
+    .expect("worker registration should succeed");
+
+    let (status, body) = get_json(&app, &format!("/admin/queues/{queue}/eligibility")).await;
+    assert_eq!(status, StatusCode::OK, "eligibility response: {body}");
+
+    // BUGGY (pre-fix) shape: `elapsed_total(~10 days) * effective_refill_rate
+    // (0.01, the reverted baseline)` is off by four orders of magnitude and
+    // clamps straight to the burst ceiling -- the diagnostic would read the
+    // bucket as FULL and report the worker ELIGIBLE, even though
+    // `claim_task` refuses the very same task.
+    //
+    // CORRECT (piecewise) shape: segment 1 (the ~10-day override-active
+    // span) contributes EXACTLY zero at override_refill_rate=0.0, so only
+    // the short post-expiry tail can have accrued -- well under the 1.0
+    // needed to dispatch at the slow 0.01/s baseline -- and the worker must
+    // be reported INELIGIBLE with `rate_limit_exhausted`, agreeing with the
+    // real claim gate.
+    let ineligible = body["ineligible_workers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("ineligible_workers must be an array: {body}"));
+    let entry = ineligible
+        .iter()
+        .find(|w| w["worker_id"] == json!(worker_id))
+        .unwrap_or_else(|| {
+            panic!(
+                "worker must be reported ineligible -- agreeing with the real \
+                 claim gate, which refuses this task -- not eligible via a \
+                 phantom instant refill applied across the whole ~10-day \
+                 interval; full response: {body}"
+            )
+        });
+    let reasons: Vec<&str> = entry["reason_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons.contains(&"rate_limit_exhausted"),
+        "expected rate_limit_exhausted, got {reasons:?}"
     );
 }
 
@@ -1799,4 +1924,131 @@ async fn get_start_throttle_pacing_override_returns_207_on_partial_shard_outage_
     );
     assert_eq!(overridden["override_refill_rate"], json!(1000.0));
     assert_eq!(overridden["override_burst"], json!(1000.0));
+}
+
+/// Two GENUINELY LIVE, fully reachable shards that DISAGREE on override
+/// state (issue #945 review, round 4, P2): shard 0 carries a live ACTIVE
+/// override; shard 1 has no override at all (a cleared/never-set row).
+///
+/// This is deliberately NOT an outage scenario -- both shards answer their
+/// query successfully, so `shard_errors` must be empty. The pre-fix merge
+/// picked a single "representative" row across shards by raw `tokens` count
+/// alone (`existing.tokens <= b.tokens => existing`), which has nothing to
+/// do with whether an override is active. Seeding the ACTIVE shard with
+/// MORE tokens than the INACTIVE shard reproduces the exact failure Codex's
+/// review named: a fully-reachable GET silently returning `200
+/// {"override_active": false}` while a live override still governs dispatch
+/// on shard 0.
+#[tokio::test]
+async fn get_start_throttle_pacing_override_reports_disagreement_across_live_shards() {
+    let (url_0, _container_0) = setup_one_shard().await;
+    let (url_1, _container_1) = setup_one_shard().await;
+    let pool_0 = build_pool(&url_0);
+    let pool_1 = build_pool(&url_1);
+
+    let name = leaked_name("onboard_user");
+    let key = autumn_harvest::throttle::bucket_key(name, "");
+
+    // Shard 0: a live ACTIVE override, seeded with MORE tokens than shard 1
+    // -- this is what makes the pre-fix "fewest tokens wins" merge pick the
+    // WRONG (inactive) shard as the representative.
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
+    {
+        let mut conn = pool_0.get().await.expect("shard 0 conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_rate_limit_buckets \
+             (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at, \
+              override_refill_rate, override_burst, override_expires_at) \
+             VALUES ($1, $2, $2, $3, NOW(), NOW(), NOW(), $4, $4, $5)",
+        )
+        .bind::<diesel::sql_types::Text, _>(&key)
+        .bind::<diesel::sql_types::Double, _>(5.0 / 60.0)
+        .bind::<diesel::sql_types::Double, _>(900.0)
+        .bind::<diesel::sql_types::Double, _>(1000.0)
+        .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+        .execute(&mut conn)
+        .await
+        .expect("seed shard 0 (active)");
+    }
+
+    // Shard 1: no override at all (NULL override columns), seeded with
+    // FEWER tokens than shard 0.
+    {
+        let mut conn = pool_1.get().await.expect("shard 1 conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_rate_limit_buckets \
+             (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at, \
+              override_refill_rate, override_burst, override_expires_at) \
+             VALUES ($1, $2, $2, $3, NOW(), NOW(), NOW(), NULL, NULL, NULL)",
+        )
+        .bind::<diesel::sql_types::Text, _>(&key)
+        .bind::<diesel::sql_types::Double, _>(5.0 / 60.0)
+        .bind::<diesel::sql_types::Double, _>(5.0)
+        .execute(&mut conn)
+        .await
+        .expect("seed shard 1 (inactive)");
+    }
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), pool_0);
+    pools.insert(ShardId::new(1), pool_1);
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+
+    let app = build_sharded_app(
+        HarvestDbPool::sharded(sharded_pool),
+        router,
+        vec![],
+        vec![static_throttled_info(name, "5/m", 5.0)],
+    );
+
+    let (status, body) = get_json(&app, &format!("/admin/start-throttle/{name}/override")).await;
+
+    // Both shards answered successfully -- this is a disagreement, not an
+    // outage, so `shard_errors` must be empty even though the status is
+    // 207.
+    assert!(
+        body["shard_errors"]
+            .as_array()
+            .is_some_and(std::vec::Vec::is_empty),
+        "both shards are fully reachable -- shard_errors must be empty: {body}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::MULTI_STATUS,
+        "a genuine cross-shard override disagreement must not be silently \
+         flattened into a plain 200: {body}"
+    );
+    assert_eq!(
+        body["shard_disagreement"],
+        json!(true),
+        "the two shards disagree on override state and must say so: {body}"
+    );
+
+    let overridden = &body["override"];
+    assert_eq!(
+        overridden["override_active"],
+        json!(true),
+        "the SAFE answer -- a live override on ANY shard must never be \
+         silently reported as inactive just because another shard has \
+         fewer raw tokens: {overridden}"
+    );
+    assert_eq!(overridden["override_refill_rate"], json!(1000.0));
+    assert_eq!(overridden["override_burst"], json!(1000.0));
+
+    let shards = &body["shards"];
+    assert_eq!(
+        shards["0"]["override_active"],
+        json!(true),
+        "per-shard breakdown must show shard 0 as active: {shards}"
+    );
+    assert_eq!(
+        shards["1"]["override_active"],
+        json!(false),
+        "per-shard breakdown must show shard 1 as inactive: {shards}"
+    );
 }
