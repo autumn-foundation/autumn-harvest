@@ -858,6 +858,115 @@ async fn throttle_override_activates_immediately_and_reverts_at_ttl_via_real_sta
     assert_eq!(entry["override_active"], json!(false));
 }
 
+// ── P1 review round 3: the SCANNER's candidate gate must honor an active   ──
+// ── override, not just the claim/dispatch gate (issue #945 review)         ──
+//
+// `throttle_override_activates_immediately_and_reverts_at_ttl_via_real_start_
+// route` above proves the override is honored on the *admission* path
+// (`reserve_or_defer`) and manually simulates a scanner tick by deleting the
+// backlog row directly -- it never actually drives `fire_due_throttled_
+// starts`. This test closes that gap: it drives the REAL scanner against a
+// backlog row that the BASELINE-only candidate gate would leave stranded
+// for the lifetime of any realistic test window (an effectively-frozen
+// 1/hour rate), and proves the scanner's own pre-filter honors the override
+// rate instead.
+
+#[tokio::test]
+async fn throttle_scanner_honors_active_override_in_its_candidate_gate() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let name = leaked_name("onboard_user");
+    // Baseline: 1 token per HOUR, burst 1 (~0.000278/s) -- so slow relative
+    // to this test's short sleep window that the scanner's candidate
+    // pre-filter would never select a drained bucket's backlog row within
+    // the lifetime of this test unless the override rate governs it: at
+    // 0.000278/s even a full second of elapsed time accrues under 0.0003
+    // tokens, four orders of magnitude below the 1.0 threshold.
+    let app = build_app(&pool, vec![], vec![static_throttled_info(name, "1/h", 1.0)]);
+
+    let start_uri = format!("/workflows/{name}/start");
+    let start = |workflow_id: &str| json!({ "workflow_id": workflow_id, "input": {} });
+
+    // First start burns the sole declared token -> admitted immediately.
+    let (status, body) = post_json(&app, &start_uri, start("scan-job-1")).await;
+    assert_eq!(status, StatusCode::CREATED, "first start: {body}");
+
+    // Second start (fresh workflow_id) finds the bucket empty at the
+    // effectively-frozen 1/hour baseline -> deferred, creating a pending
+    // `harvest_start_throttle` backlog row for the bucket key.
+    let (status, body) = post_json(&app, &start_uri, start("scan-job-2")).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "baseline should defer: {body}"
+    );
+    assert_eq!(body["throttled"], json!(true));
+
+    let bucket_key = autumn_harvest::throttle::bucket_key(name, "");
+
+    // Override with a much higher rate.
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/start-throttle/{name}/override"),
+        json!({ "refill_per_sec": 1000.0, "burst": 1000.0, "ttl_secs": 60 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "override response: {body}");
+    assert_eq!(body["override_active"], json!(true));
+
+    // Give the override rate a tiny, real window to accrue (1000 tokens/sec
+    // needs well under 1ms to reach the 1.0-token threshold; a short sleep
+    // here is just headroom against CI scheduling jitter, not load-bearing
+    // math).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Drive the REAL scanner directly -- not a manual row deletion. Money
+    // assertion: at the frozen 1/hour baseline this row can NEVER become a
+    // scanner candidate within any realistic test window, so a scanner that
+    // fires it here can only be honoring the ACTIVE OVERRIDE in its own
+    // candidate pre-filter (the exact site the P1 finding names).
+    let fired_count = {
+        let mut conn = pool.get().await.expect("conn");
+        autumn_harvest::throttle::fire_due_throttled_starts(
+            &mut conn,
+            &None,
+            &[],
+            &autumn_harvest::NoOpMetrics,
+        )
+        .await
+        .expect("scanner tick")
+    };
+    assert_eq!(
+        fired_count, 1,
+        "the scanner must fire the backlog row once the override makes tokens \
+         available, even though the frozen baseline rate never would -- if \
+         this is 0, the scanner's candidate gate is still baseline-only"
+    );
+
+    // The backlog row is gone -- the scanner actually claimed and fired it,
+    // not merely counted it.
+    {
+        let mut conn = pool.get().await.expect("conn");
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let row: Count = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM harvest_start_throttle WHERE bucket_key = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(&bucket_key)
+        .get_result(&mut conn)
+        .await
+        .expect("count backlog rows");
+        assert_eq!(
+            row.n, 0,
+            "the scanner-fired row must be deleted from the backlog, proving \
+             it was actually claimed and processed, not just observed"
+        );
+    }
+}
+
 // ── Workflow-start throttle: DELETE clears it early ─────────────────────────
 
 #[tokio::test]

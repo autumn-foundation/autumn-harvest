@@ -1260,8 +1260,8 @@ async fn fire_due_on_conn(
 
     // Claim + fire + delete the whole due batch in one transaction so each
     // `FOR UPDATE SKIP LOCKED` lock is held until its row is deleted (or left).
-    let fired: Vec<FiredThrottle> = Box::pin(conn
-        .transaction::<Vec<FiredThrottle>, crate::error::HarvestError, _>(async |conn| {
+    let fired: Vec<FiredThrottle> = Box::pin(
+        conn.transaction::<Vec<FiredThrottle>, crate::error::HarvestError, _>(async |conn| {
             let now = Utc::now();
             // Per-key-fair claim (code review P1, issue #607): a flat
             // `ORDER BY deferred_at ASC LIMIT N` lets one throttle key with a
@@ -1276,11 +1276,21 @@ async fn fire_due_on_conn(
             // `candidates` is pre-filtered to rows that are actually
             // examinable this tick -- either already past their
             // `schedule_to_start` deadline (must be examined so AC-c can
-            // time them out), or whose bucket's *snapshot* token level
-            // (`LEAST(burst, tokens + elapsed*refill_rate)`) currently
-            // shows >= 1.0 available (a genuinely exhausted bucket is
-            // excluded from the candidate set entirely, at any scale --
-            // code review, issue #607). Without this pre-filter, enough
+            // time them out), or whose bucket's *effective* token level
+            // (`effective_available_tokens_expr`, issue #945 -- honors a
+            // live TTL'd rate-limit override, not just the declared
+            // baseline `refill_rate`/`burst`) currently shows >= 1.0
+            // available (a genuinely exhausted bucket is excluded from the
+            // candidate set entirely, at any scale -- code review, issue
+            // #607). Using the baseline-only formula here would silently
+            // defeat an operator's own override: raising a throttled
+            // workflow's rate specifically to unstick its already-deferred
+            // backlog (the whole point of an override on this bucket
+            // family) would never make the pre-filter admit those rows,
+            // even though the debit below (`fire_claimed_throttle_row` ->
+            // `try_consume_rate_limit_token`) is already override-aware and
+            // would happily fire them if only they reached it (issue #945
+            // review, P1). Without this pre-filter, enough
             // concurrently-exhausted keys can permanently occupy the
             // entire batch with rows that can never fire regardless of
             // ordering: this round's earlier fix (rank-then-date
@@ -1303,7 +1313,9 @@ async fn fire_due_on_conn(
             // function, so the lock must be taken on the outer,
             // window-function-free SELECT (`FOR UPDATE OF t`, not a bare
             // `FOR UPDATE`).
-            let due_sql = "
+            let effective_tokens = crate::queue::effective_available_tokens_expr("b");
+            let due_sql = format!(
+                "
                 WITH candidates AS (
                     SELECT t.id, t.deferred_at,
                            ROW_NUMBER() OVER (
@@ -1313,10 +1325,7 @@ async fn fire_due_on_conn(
                     LEFT JOIN harvest_rate_limit_buckets b ON b.key = t.bucket_key
                     WHERE (t.expires_at IS NOT NULL AND t.expires_at < NOW())
                        OR b.key IS NULL
-                       OR LEAST(
-                              b.burst,
-                              b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate
-                          ) >= 1.0
+                       OR {effective_tokens} >= 1.0
                 ),
                 selected AS (
                     SELECT id FROM candidates WHERE rn <= $1
@@ -1328,7 +1337,8 @@ async fn fire_due_on_conn(
                 JOIN selected s ON s.id = t.id
                 ORDER BY t.deferred_at ASC
                 FOR UPDATE OF t SKIP LOCKED
-            ";
+            "
+            );
             let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
                 .bind::<diesel::sql_types::BigInt, _>(THROTTLE_FIRE_PER_KEY_CAP)
                 .bind::<diesel::sql_types::BigInt, _>(THROTTLE_FIRE_BATCH_SIZE)
@@ -1343,8 +1353,9 @@ async fn fire_due_on_conn(
                 }
             }
             Ok(results)
-        }))
-        .await?;
+        }),
+    )
+    .await?;
 
     Ok(fired)
 }
