@@ -8669,22 +8669,22 @@ async fn persist_all_started_child_workflows(
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
-            store::append_events_offloaded(
-                conn,
-                child.child_id,
-                &[child_started_event],
-                0,
-                registry.payload_offloader(),
-            )
-            .await?;
-            queue::enqueue(conn, &params).await?;
             // Enforce the child's OWN declared quota (issue #946) against the
             // row this same transaction just inserted -- the identical
             // insert-then-enforce contract `enforce_quota_admission` already
-            // has for every other registry-aware start path. A violation
-            // rolls back the WHOLE transaction (this child, any siblings
-            // already inserted in this loop, and any parent-side event
-            // appends recorded above) -- caught at this function's outer
+            // has for every other registry-aware start path. Run this
+            // BEFORE the child's own `WorkflowStarted` event is appended
+            // below: `enforce_quota_admission` documents (and the plain
+            // start path in `execution.rs` establishes) that the row it is
+            // called about has appended no events yet, so `history_bytes`
+            // reports usage strictly BEFORE this admission. Appending the
+            // event first would let the child's own start event count
+            // toward the very cap deciding whether to admit it -- an
+            // off-by-one that could wrongly reject a spawn that should have
+            // succeeded (Codex round-4 review). A violation rolls back the
+            // WHOLE transaction (this child, any siblings already inserted
+            // in this loop, and any parent-side event appends recorded
+            // above) -- caught at this function's outer
             // `conn.transaction(...)` call site below, which parks and wakes
             // the parent task rather than letting it reach
             // `fail_execution_on_error` and terminally fail the parent over
@@ -8697,6 +8697,15 @@ async fn persist_all_started_child_workflows(
                 Some(registry.telemetry().metrics.as_ref()),
             )
             .await?;
+            store::append_events_offloaded(
+                conn,
+                child.child_id,
+                &[child_started_event],
+                0,
+                registry.payload_offloader(),
+            )
+            .await?;
+            queue::enqueue(conn, &params).await?;
         }
 
         // Check for already-terminal children only in the re-park path
@@ -8985,6 +8994,25 @@ async fn insert_awaited_child_execution(
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
+    // Enforce quota BEFORE the child's own `WorkflowStarted` event is
+    // appended (issue #946, Codex round-4 review). `enforce_quota_admission`
+    // subtracts 1 from `active_executions` to exclude the row it is itself
+    // being called about, but its `history_bytes` check has NO such
+    // compensation -- it relies entirely on being called before any event
+    // exists for this row. Calling it AFTER the append (the pre-fix
+    // ordering) let the child's own just-appended `WorkflowStarted` payload
+    // count against the very admission deciding whether to allow it, which
+    // could wrongly reject a spawn whose usage was truly zero. This mirrors
+    // the reference ordering in `start_or_load_workflow_execution_collect`
+    // (execution.rs): INSERT -> enforce_quota_admission -> append event.
+    crate::execution::enforce_quota_admission(
+        conn,
+        defaults.quota,
+        child_quota_key.as_deref(),
+        &child.workflow_name,
+        Some(registry.telemetry().metrics.as_ref()),
+    )
+    .await?;
     store::append_events_offloaded(
         conn,
         child.child_id,
@@ -8994,14 +9022,6 @@ async fn insert_awaited_child_execution(
     )
     .await?;
     queue::enqueue(conn, &params).await?;
-    crate::execution::enforce_quota_admission(
-        conn,
-        defaults.quota,
-        child_quota_key.as_deref(),
-        &child.workflow_name,
-        Some(registry.telemetry().metrics.as_ref()),
-    )
-    .await?;
     Ok(())
 }
 
@@ -10189,6 +10209,29 @@ async fn create_detached_child_executions(
             .await
             .map_err(crate::error::database_error)?;
 
+        // Enforced right after the row INSERT but BEFORE the child's own
+        // `WorkflowStarted` event is appended (issue #946, Codex round-4
+        // review). `enforce_quota_admission` subtracts 1 from
+        // `active_executions` to exclude the row it is itself being called
+        // about, so it must run once that row genuinely exists -- but its
+        // `history_bytes` check has NO such compensation, so it must ALSO run
+        // before any event exists for this row (matching the reference
+        // ordering in `start_or_load_workflow_execution_collect`,
+        // execution.rs: INSERT -> enforce_quota_admission -> append event). A
+        // `QuotaExceeded` here rolls back the whole enclosing transaction
+        // (nothing durable was created) and propagates via `?` to whichever
+        // caller-side recovery point applies -- `recover_from_child_quota_
+        // exceeded` parks the PARENT's task and wakes it, rather than
+        // terminally failing it over the CHILD's tenant quota.
+        crate::execution::enforce_quota_admission(
+            conn,
+            detached_quota,
+            child_quota_key.as_deref(),
+            workflow_name.as_str(),
+            Some(registry.telemetry().metrics.as_ref()),
+        )
+        .await?;
+
         // Start child history.
         // Note: the ChildWorkflowSpawnedDetached event for the PARENT history is
         // written by the caller's pre_suspension_events_from_commands batch so
@@ -10227,21 +10270,6 @@ async fn create_detached_child_executions(
         )
         .in_scope(|| registry.telemetry().capture_trace_context());
         queue::enqueue(conn, &params).await?;
-        // Enforced AFTER insert+enqueue (issue #946): `enforce_quota_admission`
-        // subtracts 1 to exclude the row it is itself being called about, so it
-        // must run once that row genuinely exists. A `QuotaExceeded` here rolls
-        // back the whole enclosing transaction (nothing durable was created) and
-        // propagates via `?` to whichever caller-side recovery point applies --
-        // `recover_from_child_quota_exceeded` parks the PARENT's task and wakes
-        // it, rather than terminally failing it over the CHILD's tenant quota.
-        crate::execution::enforce_quota_admission(
-            conn,
-            detached_quota,
-            child_quota_key.as_deref(),
-            workflow_name.as_str(),
-            Some(registry.telemetry().metrics.as_ref()),
-        )
-        .await?;
     }
 
     Ok(())
@@ -12677,20 +12705,19 @@ async fn handle_suspended_workflow(
         .await
     };
 
-    // Issue #946, Codex round-3 review: a `QuotaExceeded` reaching here can
-    // originate from `persist_all_started_child_workflows`/
+    // Issue #946, Codex round-3/round-4 review: a `QuotaExceeded` reaching
+    // here can originate from `persist_all_started_child_workflows`/
     // `persist_child_timeout_race` (both already caught locally at their own
     // transaction boundary and never surface it this far) or from
     // `DetachedSpawnPersistence::persist` inside any of the OTHER branches
     // above (e.g. a bookkeeping-only or activity-scheduling cycle that also
-    // detaches a child). Park + wake rather than terminally failing this
-    // execution over an unrelated tenant's quota.
+    // detaches a child). Defer with a bounded backoff rather than terminally
+    // failing this execution over an unrelated tenant's quota.
     if let Err(ref error) = result
         && recover_from_child_quota_exceeded(
             conn,
             context.persistence.task.id,
             context.persistence.exec_id,
-            sticky,
             error,
         )
         .await?
@@ -12737,19 +12764,57 @@ async fn fail_execution_on_error<T>(
     Err(error)
 }
 
+/// Lower/upper bounds for the randomized reschedule delay after a child
+/// spawn is deferred by a full target-tenant quota (issue #946, Codex
+/// round-4 review). A worker-capacity-style congestion signal, not a
+/// worker-crash or divergent-build signal, so this uses a fixed (non-growing)
+/// jittered window rather than [`nd_block_backoff`]'s unbounded exponential
+/// ramp -- quota capacity is expected to free up on an ordinary timescale (a
+/// sibling execution of the target type completing, an operator clearing DLQ
+/// entries) rather than requiring a deploy rollback. Reuses
+/// [`crate::sessions::acquire_retry_backoff`], the same pure jittered-backoff
+/// primitive worker-session-slot contention already relies on, just with a
+/// window sized for DB-backed tenant-quota capacity rather than in-process
+/// semaphore contention.
+///
+/// Deliberately kept well under `wait_for_execution_state`'s 10s default test
+/// timeout (`tests/integration/integration_e2e.rs`): `acquire_retry_backoff`
+/// can draw arbitrarily close to `max`, and the requeued task still needs a
+/// subsequent worker poll to notice `scheduled_at` has arrived, so a max
+/// anywhere near 10s would make the "parks parent then succeeds" regression
+/// tests flaky under CI load. A 3s ceiling leaves several seconds of margin
+/// for that poll-interval + dispatch overhead while still comfortably
+/// avoiding a hot loop (the actual bug this backoff fixes -- see below).
+const QUOTA_RETRY_BACKOFF_MIN: Duration = Duration::from_millis(500);
+const QUOTA_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(3);
+
 /// If `error` is a quota-exceeded rejection (issue #946) surfaced while
 /// spawning a child workflow -- fan-out, the child-timeout race, a detached
 /// child, or an inline local activity's own detached spawn -- this is never
 /// the CALLER's fault: it is a capacity signal on the TARGET workflow type's
 /// tenant key. `enforce_quota_admission` is called only after the child row
-/// (and, for a detached child, its `WorkflowStarted` event) has already been
-/// inserted inside the enclosing transaction, so a `QuotaExceeded` here rolls
-/// that whole transaction back -- nothing durable was created. Terminally
-/// failing the CALLING execution over another tenant's quota would be wrong
-/// (`fail_task_and_execution` seals the run `FAILED`), so instead park the
-/// caller's task and wake it: the next poll re-drives this exact decision
-/// cycle from the unchanged recorded history and retries the spawn once the
-/// target tenant's quota has capacity again.
+/// has been inserted (and BEFORE its `WorkflowStarted`/`ChildWorkflowStarted`
+/// event is appended -- issue #946, Codex round-4 review) inside the
+/// enclosing transaction, so a `QuotaExceeded` here rolls that whole
+/// transaction back -- nothing durable was created. Terminally failing the
+/// CALLING execution over another tenant's quota would be wrong
+/// (`fail_task_and_execution` seals the run `FAILED`), so instead re-pend the
+/// caller's task with a bounded jittered backoff: the next scheduled poll
+/// re-drives this exact decision cycle from the unchanged recorded history
+/// and retries the spawn once the target tenant's quota has capacity again.
+///
+/// A `RUNNING` -> `PENDING`-at-`scheduled_at` requeue (via
+/// [`queue::requeue_for_retry`]), not a park-then-immediate-wake: nothing
+/// external will ever call [`queue::wake_workflow_task`] for THIS execution
+/// when the target's quota frees up (quota capacity is a property of OTHER
+/// executions of the target type, never an event tied to this caller's
+/// `exec_id`), so parking (which waits for an explicit wake) is the wrong
+/// primitive here and a park immediately followed by an unconditional wake
+/// degenerates into a zero-delay retry loop that hot-spins on a persistently
+/// full quota (e.g. `max_dead_letters`, which only clears via manual operator
+/// action) -- hammering the database with no backoff at all. A durably
+/// scheduled retry is self-throttling and survives a worker restart, unlike
+/// an in-process delayed-wake timer.
 ///
 /// Every OTHER call site that can reach this helper's callers with a
 /// `QuotaExceeded` already caught it locally at its own transaction boundary
@@ -12763,13 +12828,12 @@ async fn fail_execution_on_error<T>(
 /// activity's own detached-spawn persist.
 ///
 /// Returns `Ok(true)` (already handled -- caller should return `Ok(())`)
-/// when `error` was a quota rejection and park+wake succeeded; `Ok(false)`
-/// when the caller should fall through to its own error handling.
+/// when `error` was a quota rejection and the backoff requeue succeeded;
+/// `Ok(false)` when the caller should fall through to its own error handling.
 async fn recover_from_child_quota_exceeded(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
     exec_id: ExecutionId,
-    sticky: Option<queue::StickyHint<'_>>,
     error: &HarvestError,
 ) -> HarvestResult<bool> {
     let HarvestError::QuotaExceeded {
@@ -12782,6 +12846,11 @@ async fn recover_from_child_quota_exceeded(
     else {
         return Ok(false);
     };
+    let backoff = crate::sessions::acquire_retry_backoff(
+        rand::random::<f64>(),
+        QUOTA_RETRY_BACKOFF_MIN,
+        QUOTA_RETRY_BACKOFF_MAX,
+    );
     tracing::warn!(
         execution_id = %exec_id,
         target_workflow_name = %workflow_name,
@@ -12789,12 +12858,14 @@ async fn recover_from_child_quota_exceeded(
         resource = %resource,
         limit = *limit,
         current = *current,
-        "quota exceeded spawning a child workflow; parking the task to \
-         retry once capacity frees up rather than failing the execution \
-         over an unrelated tenant's quota",
+        backoff_ms = backoff.as_millis(),
+        "quota exceeded spawning a child workflow; deferring the retry with \
+         a bounded jittered backoff rather than immediately re-driving it or \
+         failing the execution over an unrelated tenant's quota",
     );
-    queue::park_workflow_task(conn, task_id, sticky).await?;
-    queue::wake_workflow_task(conn, exec_id).await?;
+    let backoff_chrono =
+        chrono::Duration::from_std(backoff).unwrap_or_else(|_| chrono::Duration::seconds(5));
+    queue::requeue_for_retry(conn, task_id, backoff_chrono, &error.to_string()).await?;
     Ok(true)
 }
 
@@ -15624,28 +15695,18 @@ async fn process_workflow_task(
                 {
                     Ok(outcome) => outcome,
                     Err(e) => {
-                        // Issue #946, Codex round-3 review: `run_local_
-                        // activity_inline` calls `DetachedSpawnPersistence::
-                        // persist` -> `create_detached_child_executions`,
-                        // which can reject with `QuotaExceeded` when the
-                        // detached child's OWN target quota is full. Park +
-                        // wake rather than terminally failing this
-                        // execution over an unrelated tenant's quota; the
-                        // transaction inside `run_local_activity_inline`
+                        // Issue #946, Codex round-3/round-4 review:
+                        // `run_local_activity_inline` calls
+                        // `DetachedSpawnPersistence::persist` ->
+                        // `create_detached_child_executions`, which can
+                        // reject with `QuotaExceeded` when the detached
+                        // child's OWN target quota is full. Defer with a
+                        // bounded backoff rather than terminally failing
+                        // this execution over an unrelated tenant's quota;
+                        // the transaction inside `run_local_activity_inline`
                         // already rolled back the whole cycle.
-                        let sticky = if sticky_timeout.is_zero() {
-                            None
-                        } else {
-                            Some(queue::StickyHint::new(worker_id, sticky_timeout))
-                        };
-                        if recover_from_child_quota_exceeded(
-                            conn,
-                            task.id,
-                            prepared.exec_id,
-                            sticky,
-                            &e,
-                        )
-                        .await?
+                        if recover_from_child_quota_exceeded(conn, task.id, prepared.exec_id, &e)
+                            .await?
                         {
                             return Ok(());
                         }
@@ -16944,27 +17005,17 @@ async fn process_workflow_task(
             // un-failed); a suspended/simple-terminal persist failure
             // (including this one) propagates so the caller can act on it.
             //
-            // Issue #946, Codex round-3 review: `persist_terminal_outcome_
-            // commands` calls `create_detached_child_executions` directly,
-            // so a `QuotaExceeded` from a detached child's target quota can
-            // surface here for the `is_terminal_with_commands` path. Park +
-            // wake rather than terminally failing this execution over an
-            // unrelated tenant's quota; the transaction above already rolled
-            // back the whole cycle, so nothing durable was created.
+            // Issue #946, Codex round-3/round-4 review: `persist_terminal_
+            // outcome_commands` calls `create_detached_child_executions`
+            // directly, so a `QuotaExceeded` from a detached child's target
+            // quota can surface here for the `is_terminal_with_commands`
+            // path. Defer with a bounded backoff rather than terminally
+            // failing this execution over an unrelated tenant's quota; the
+            // transaction above already rolled back the whole cycle, so
+            // nothing durable was created.
             if is_terminal_with_commands {
-                let sticky = if sticky_timeout.is_zero() {
-                    None
-                } else {
-                    Some(queue::StickyHint::new(worker_id, sticky_timeout))
-                };
-                if recover_from_child_quota_exceeded(
-                    conn,
-                    task.id,
-                    prepared.exec_id,
-                    sticky,
-                    &error,
-                )
-                .await?
+                if recover_from_child_quota_exceeded(conn, task.id, prepared.exec_id, &error)
+                    .await?
                 {
                     return Ok(());
                 }

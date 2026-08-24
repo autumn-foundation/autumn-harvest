@@ -1263,6 +1263,77 @@ async fn detached_child_spawn_in_mixed_batch_honors_target_quota_parks_parent_th
 }
 
 // ---------------------------------------------------------------------------
+// Issue #946, Codex round-4 review — `enforce_quota_admission`'s documented
+// "the just-inserted row has appended no events yet" contract was violated
+// at all three child-spawn call sites: each appended the child's own
+// `WorkflowStarted`/`ChildWorkflowStarted` event BEFORE calling
+// `enforce_quota_admission`, so `load_quota_usage`'s `history_bytes` SUM
+// counted that just-appended event against the very admission deciding
+// whether to allow it -- an off-by-one that could wrongly REJECT a child
+// spawn that should have succeeded (usage BEFORE this admission was truly
+// zero). Fixed by reordering each site to insert-the-row -> enforce-quota ->
+// THEN append the event, matching the plain start path's established
+// ordering (`start_or_load_workflow_execution_collect`: `enforce_quota_
+// admission` runs before `WorkflowStarted` is appended). A
+// `max_history_bytes(1)` cap makes this deterministic: ANY single
+// `WorkflowStarted`/`ChildWorkflowStarted` event's `pg_column_size` is
+// comfortably over 1 byte, so the pre-fix ordering rejects the spawn on
+// EVERY attempt (the parent never completes, hanging the test until
+// `wait_for_execution_state`'s 10s bound trips) while the fix admits it on
+// the first attempt (zero prior usage for a never-before-seen key, no
+// blocker execution needed).
+// ---------------------------------------------------------------------------
+
+/// A detached child spawn (`create_detached_child_executions`) must not be
+/// wrongly rejected by its OWN just-appended `WorkflowStarted` event
+/// counting toward the `history_bytes` admission it is itself part of.
+#[tokio::test]
+async fn detached_child_spawn_quota_check_excludes_its_own_just_appended_history_bytes() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let parent_wf_name = leaked("quota_detached_hb_parent");
+    let child_wf_name = leaked("quota_detached_hb_child");
+
+    let child_quota_policy = QuotaPolicy::new("tenant_id").with_max_history_bytes(1);
+    let mut child_info = wf_info(child_wf_name, detached_quota_child);
+    child_info.quota = Some(child_quota_policy);
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf_name,
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"child_type": child_wf_name}),
+    )
+    .await;
+
+    let reg = registry(vec![
+        wf_info(parent_wf_name, detached_quota_parent),
+        child_info,
+    ]);
+    let worker = build_runtime_worker("w-946-detached-hb", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+
+    // No blocker: with zero prior executions for this never-before-seen
+    // key, admission must succeed on the FIRST attempt. Before the fix,
+    // `history_bytes` counted the just-appended event and rejected every
+    // retry forever, hanging here until the 10s bound trips.
+    wait_for_execution_state(&url, parent, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    let child_row_count_sql =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+    assert_eq!(
+        count_rows(&mut conn, child_row_count_sql, &[child_wf_name]).await,
+        1,
+        "the detached child must be created on the first attempt despite \
+         max_history_bytes(1) -- its own start event must not count against \
+         the admission deciding whether to allow it"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Issue #946, Codex round-3 review — an AWAITED child spawn (`ctx.
 // spawn_child_workflow_raw`, whether a lone spawn or one of a genuine
 // fan-out, both dispatch through the same `persist_all_started_child_workflows`
@@ -1414,6 +1485,62 @@ async fn awaited_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
     );
 }
 
+/// An awaited child spawn (`persist_all_started_child_workflows`) must not
+/// be wrongly rejected by its OWN just-appended `WorkflowStarted` event
+/// counting toward the `history_bytes` admission it is itself part of
+/// (issue #946, Codex round-4 review — see the section comment above
+/// [`detached_child_spawn_quota_check_excludes_its_own_just_appended_history_bytes`]
+/// for the full rationale).
+#[tokio::test]
+async fn awaited_child_spawn_quota_check_excludes_its_own_just_appended_history_bytes() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let parent_wf_name = leaked("quota_awaited_hb_parent");
+    let child_wf_name = leaked("quota_awaited_hb_child");
+
+    let child_quota_policy = QuotaPolicy::new("tenant_id").with_max_history_bytes(1);
+    let mut child_info = wf_info(child_wf_name, awaited_quota_child);
+    child_info.quota = Some(child_quota_policy);
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf_name,
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"child_type": child_wf_name}),
+    )
+    .await;
+
+    let reg = registry(vec![
+        wf_info(parent_wf_name, awaited_quota_parent),
+        child_info,
+    ]);
+    let worker = build_runtime_worker("w-946-awaited-hb", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+
+    // No blocker: with zero prior executions for this never-before-seen
+    // key, admission must succeed on the FIRST attempt.
+    let final_state = wait_for_execution_state(&url, parent, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    assert_eq!(
+        final_state.output,
+        Some(serde_json::json!("awaited_child_done")),
+        "the parent's spawn_child_workflow_raw().await must resolve to the \
+         child's real completed output on the first attempt"
+    );
+    let child_row_count_sql =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+    assert_eq!(
+        count_rows(&mut conn, child_row_count_sql, &[child_wf_name]).await,
+        1,
+        "the awaited child must be created on the first attempt despite \
+         max_history_bytes(1) -- its own start event must not count against \
+         the admission deciding whether to allow it"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Issue #946, Codex round-3 review — the child-timeout-race primitive
 // (`ctx.spawn_child_workflow_timeout`, issue #779) dispatches through
@@ -1562,6 +1689,63 @@ async fn child_timeout_race_spawn_honors_target_quota_parks_parent_then_succeeds
         count_rows(&mut conn, child_row_count_sql, &[child_wf_name]).await,
         2, // the (now-cancelled) blocker + the newly-created race child
         "exactly one child should exist once quota capacity freed up"
+    );
+}
+
+/// A child-timeout-race child spawn (`persist_child_timeout_race` ->
+/// `insert_awaited_child_execution`) must not be wrongly rejected by its OWN
+/// just-appended `ChildWorkflowStarted`/`WorkflowStarted` events counting
+/// toward the `history_bytes` admission it is itself part of (issue #946,
+/// Codex round-4 review — see the section comment above
+/// [`detached_child_spawn_quota_check_excludes_its_own_just_appended_history_bytes`]
+/// for the full rationale).
+#[tokio::test]
+async fn child_timeout_race_spawn_quota_check_excludes_its_own_just_appended_history_bytes() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let parent_wf_name = leaked("quota_race_hb_parent");
+    let child_wf_name = leaked("quota_race_hb_child");
+
+    let child_quota_policy = QuotaPolicy::new("tenant_id").with_max_history_bytes(1);
+    let mut child_info = wf_info(child_wf_name, child_timeout_race_quota_child);
+    child_info.quota = Some(child_quota_policy);
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf_name,
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"child_type": child_wf_name}),
+    )
+    .await;
+
+    let reg = registry(vec![
+        wf_info(parent_wf_name, child_timeout_race_quota_parent),
+        child_info,
+    ]);
+    let worker = build_runtime_worker("w-946-race-hb", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+
+    // No blocker: with zero prior executions for this never-before-seen
+    // key, admission must succeed on the FIRST attempt.
+    let final_state = wait_for_execution_state(&url, parent, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    assert_eq!(
+        final_state.output,
+        Some(serde_json::json!({"child_won": true, "value": "race_child_done"})),
+        "parent's spawn_child_workflow_timeout().await must resolve on the \
+         CHILD branch on the first attempt"
+    );
+    let child_row_count_sql =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+    assert_eq!(
+        count_rows(&mut conn, child_row_count_sql, &[child_wf_name]).await,
+        1,
+        "the race child must be created on the first attempt despite \
+         max_history_bytes(1) -- its own start events must not count \
+         against the admission deciding whether to allow it"
     );
 }
 
