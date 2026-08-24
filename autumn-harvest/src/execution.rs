@@ -518,81 +518,6 @@ async fn enforce_quota_admission(
     Ok(())
 }
 
-/// Enforce the declared per-tenant resource quota (issue #946) BEFORE the
-/// `TerminateIfRunning` pre-check cancellation commits (P1 review finding).
-///
-/// [`enforce_quota_admission`] alone is not sufficient for
-/// `TerminateIfRunning` over an active (RUNNING/PAUSED) prior:
-/// [`start_or_load_workflow_execution`]'s doc comment documents that this
-/// case runs the cancellation as a genuinely separate, already-committed
-/// operation ("Transaction 1") BEFORE the replacement start ("Transaction
-/// 2", which is where `enforce_quota_admission` runs). If Transaction 2 is
-/// rejected by quota, Transaction 1's cancellation cannot be rolled back --
-/// the prior execution is left CANCELLED with no successor, which is worse
-/// than simply rejecting the request outright. This helper closes that gap
-/// by checking quota BEFORE Transaction 1 even begins, mirroring how POINT
-/// 1 (the admission-gate check immediately above this function's call site)
-/// already avoids the identical "cancel-then-block" problem for gated
-/// starts.
-///
-/// `existing_quota_key` is the `quota_key` column of the row about to be
-/// cancelled and replaced. When it equals the resolved `quota_key` for the
-/// new request, that row is exempted from the usage count: it is vacating
-/// its slot in the same key's population, so a same-key restart at exactly
-/// the cap must still be allowed -- mirroring [`enforce_quota_admission`]'s
-/// symmetric self-exemption for the row it is about to admit (there, the
-/// NEW row is already inserted and is subtracted back out; here, the OLD
-/// row has not yet been touched and is subtracted out in its place). A
-/// restart whose resolved key genuinely differs from the row's own key (the
-/// input's tenant field changed between requests) gets no such exemption --
-/// it is a real net-new admission against the NEW key's population, and the
-/// row about to be cancelled contributes nothing to it either way.
-///
-/// This is inherently a best-effort, pre-lock check: the two-transaction
-/// design (documented above) does not hold a lock across the gap between
-/// this check and Transaction 1's commit, so a burst of concurrent starts
-/// for the same key can still race past it in the narrow window before the
-/// advisory lock is (re-)acquired here on each call. `enforce_quota_admission`
-/// inside `replace_execution` remains the authoritative, lock-serialized
-/// check for the actual admission; this is defense-in-depth against the
-/// common case (quota already exceeded before the request even arrives),
-/// not a replacement for it.
-async fn enforce_quota_before_terminate_pre_check(
-    conn: &mut AsyncPgConnection,
-    quota_policy: Option<crate::quota::QuotaPolicy>,
-    quota_key: Option<&str>,
-    existing_quota_key: Option<&str>,
-    workflow_name: &str,
-    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
-) -> HarvestResult<()> {
-    let Some(policy) = quota_policy else {
-        return Ok(());
-    };
-    if !policy.has_any_cap() {
-        return Ok(());
-    }
-    let Some(key) = quota_key else {
-        return Ok(());
-    };
-
-    crate::quota::lock_quota_key(conn, workflow_name, key).await?;
-    let mut usage = crate::quota::load_quota_usage(conn, workflow_name, key).await?;
-    if existing_quota_key == Some(key) {
-        usage.active_executions = usage.active_executions.saturating_sub(1);
-    }
-    if let Some(violation) = crate::quota::check_quota(&usage, &policy) {
-        record_quota_rejected_metric(metrics, workflow_name, violation.resource);
-        return Err(HarvestError::QuotaExceeded {
-            workflow_name: workflow_name.to_string(),
-            key: key.to_string(),
-            resource: violation.resource,
-            limit: violation.limit,
-            current: violation.current,
-        });
-    }
-    Ok(())
-}
-
 /// Start a workflow execution or load the existing one, returning both the result
 /// and any deferred completion-trigger starts **without spawning them**.
 ///
@@ -736,10 +661,10 @@ pub async fn start_or_load_workflow_execution_collect(
     // `ConcurrencyPolicy`/`ThrottlePolicy` use (AC1) -- no second resolver.
     //
     // Resolved HERE, before the TerminateIfRunning pre-check below (issue
-    // #946 P1 review), so a quota-blocked TerminateIfRunning request can be
-    // rejected BEFORE the pre-check cancellation commits -- see
-    // `enforce_quota_before_terminate_pre_check`'s doc comment for why this
-    // ordering matters.
+    // #946 P1/P2 review), so `quota_key` is known in time to decide whether
+    // that pre-check even runs -- a quota-governed key skips it entirely and
+    // falls through to the atomic replace path instead; see the pre-check
+    // block's own comment for the full rationale.
     let quota_policy: Option<crate::quota::QuotaPolicy> =
         crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
             .read()
@@ -807,7 +732,28 @@ pub async fn start_or_load_workflow_execution_collect(
         return Err(HarvestError::AdmissionBlocked { gate_id, reason });
     }
 
+    // Route a quota-governed key through the fully atomic `inline_cancel` +
+    // `replace_execution` path instead (issue #946 P1/P2 review), by simply
+    // never entering this pre-check block when `quota_key.is_some()`: with
+    // the prior row left un-cancelled, the INSERT below is a no-op, which
+    // falls through to the FOR-UPDATE-locked `ActiveConflictBehavior::Terminate`
+    // branch (same `effective_active_conflict_behavior` result, since it is a
+    // pure function of `request.reuse_policy`/`request.conflict_policy`) --
+    // cancel-then-replace under ONE transaction and ONE row lock, so no
+    // concurrent admission for the same key can observe the freed slot
+    // between cancel and replace (P1), and `enforce_quota_admission` there
+    // runs strictly AFTER the prior row is sealed, so it is naturally
+    // excluded from every usage dimension -- not just `active_executions`
+    // (P2) -- with no separate self-exemption logic needed. A rejection
+    // there rolls the WHOLE sequence back, so the prior run is never left
+    // cancelled without a successor; this is strictly safer than the
+    // now-superseded pre-check-and-separately-commit shortcut below, whose
+    // `enforce_quota_before_terminate_pre_check` helper it replaced could not
+    // hold a lock across the gap to the later authoritative check. A
+    // non-quota-governed request (`quota_key.is_none()`, the common case)
+    // keeps the pre-check-cancel shortcut byte-for-byte unchanged.
     if terminate_via_pre_check
+        && quota_key.is_none()
         // Skip the pre-check cancellation when we're going to reject this fresh
         // start for a debounced workflow — otherwise we'd cancel the prior run
         // (Transaction 1) and then reject, leaving it cancelled with no successor.
@@ -816,24 +762,6 @@ pub async fn start_or_load_workflow_execution_collect(
             try_load_by_key(conn, request.workflow_name, request.workflow_id).await?
         && matches!(existing.state.as_str(), "RUNNING" | "PAUSED")
     {
-        // Enforce quota BEFORE cancelling the prior execution (issue #946 P1
-        // review): without this, a quota-blocked TerminateIfRunning request
-        // would still commit this pre-check cancellation (Transaction 1,
-        // already committed and un-rollback-able) before
-        // `enforce_quota_admission` inside `replace_execution` (Transaction
-        // 2, below) ever runs -- silently destroying the prior execution
-        // with no replacement, which is worse than simply rejecting the
-        // request. Mirrors POINT 1's admission-gate ordering above.
-        enforce_quota_before_terminate_pre_check(
-            conn,
-            quota_policy,
-            quota_key.as_deref(),
-            existing.quota_key.as_deref(),
-            request.workflow_name,
-            metrics,
-        )
-        .await?;
-
         let existing_exec_id = ExecutionId::from_uuid(existing.id);
         // Ignore Config errors: the execution may have transitioned to a terminal
         // state between the pre-check and the cancel lock. In that race the prior

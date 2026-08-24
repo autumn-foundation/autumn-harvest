@@ -1390,3 +1390,104 @@ async fn replace_execution_paths_still_succeed_when_not_over_cap() {
         .expect("a same-key refresh replace must succeed -- it is net-zero on active count");
     assert_eq!(active_count(&mut conn, wf, "roomy").await, 2);
 }
+
+/// Codex P2 (issue #946, round 1): `history_bytes`, not just
+/// `active_executions`, must be exempted for the row a `TerminateIfRunning`
+/// replace is about to seal -- and specifically on Site 1 (the
+/// `ActiveConflictBehavior::Terminate` path over a RUNNING/PAUSED existing,
+/// reached via the pre-check-cancel shortcut before the P1/P2 fix and via
+/// the atomic `inline_cancel` + `replace_execution` fallthrough after it).
+///
+/// Before the fix, `enforce_quota_before_terminate_pre_check` only ever
+/// subtracted the existing row's own contribution from
+/// `usage.active_executions`, never from `usage.history_bytes` -- so a
+/// same-key refresh under a tight `max_history_bytes` cap would be WRONGLY
+/// REJECTED the moment the row being replaced had accumulated ANY history of
+/// its own, even though that row is about to be sealed out of existence and
+/// contributes nothing to the key's population going forward. The fix
+/// (routing quota-governed keys through the atomic `inline_cancel` +
+/// `replace_execution` path instead) closes this for free: that path seals
+/// the existing row to CANCELLED *before* `enforce_quota_admission` runs, so
+/// the row is excluded from EVERY resource `QUOTA_USAGE_SQL`'s `active` CTE
+/// scopes by state -- `active_executions` and `history_bytes` alike -- with
+/// no special-cased exemption logic required for either.
+#[tokio::test]
+async fn replace_execution_terminate_if_running_exempts_the_replaced_runs_own_history_bytes() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let wf = leaked("quota_replace_tir_history_bytes");
+
+    // A 1-byte cap: any single row's own `WorkflowStarted` event already
+    // exceeds it (mirrors `history_bytes_cap_rejects_once_exceeded`'s
+    // pattern), so this key is only ever "under cap" while it has zero
+    // RUNNING/PAUSED rows of its own.
+    let policy = QuotaPolicy::new("tenant_id").with_max_history_bytes(1);
+    let _guard = MetadataGuard::install_one(wf, policy).await;
+
+    let workflow_id = format!("wid-{}", Uuid::new_v4().simple());
+    let (exec_id, outcome) = try_start(
+        &mut conn,
+        wf,
+        &workflow_id,
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+    outcome.expect("the FIRST start for a key must succeed: usage is zero before it exists");
+    assert_eq!(active_count(&mut conn, wf, "acme").await, 1);
+
+    // Sanity check the trap is real: a FRESH, unrelated `workflow_id` under
+    // the SAME key is rejected on `history_bytes` alone, proving the cap is
+    // genuinely breached by the first row's own recorded history (so the
+    // same-key replace below is not vacuously "under cap the whole time").
+    let (_unrelated_exec, unrelated_outcome) = try_start(
+        &mut conn,
+        wf,
+        &format!("wid-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+    let unrelated_err = unrelated_outcome.expect_err(
+        "an UNRELATED fresh start under the same key must be rejected on history_bytes",
+    );
+    assert_quota_exceeded(
+        &unrelated_err,
+        wf,
+        "acme",
+        QuotaResource::HistoryBytes,
+        1,
+        |c| c >= 1,
+    );
+
+    // Now replace the SAME row via `TerminateIfRunning` (Site 1 -- the
+    // existing row is still RUNNING at this point). Before the P1/P2 fix,
+    // this would ALSO have been wrongly rejected on `history_bytes`, since
+    // the pre-check helper only exempted `active_executions`. After the
+    // fix, the existing row is sealed to CANCELLED before the quota check
+    // runs, so it (and its history) is excluded entirely.
+    let exec_id2 = ExecutionId::new();
+    let mut p = params(
+        wf,
+        &workflow_id,
+        exec_id2,
+        serde_json::json!({"tenant_id": "acme"}),
+    );
+    p.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
+    let outcome2 = start_or_load_workflow_execution(&mut conn, p, None).await;
+
+    outcome2.expect(
+        "a same-key TerminateIfRunning replace must succeed: the row being \
+         replaced -- and its own history -- must be excluded from the \
+         history_bytes check, not just active_executions",
+    );
+    // `inline_cancel` appends a `WorkflowCancelled` event and sets CANCELLED
+    // first, but `replace_execution` then unconditionally seals the SAME
+    // row to CONTINUED_AS_NEW (its own doc comment: "existing is already
+    // sealed above (CONTINUED_AS_NEW) by the time this runs") -- the final
+    // observable state of the atomic `inline_cancel` + `replace_execution`
+    // sequence, pre-existing and unrelated to this fix. Either state
+    // excludes the row from `state IN ('RUNNING', 'PAUSED')`, which is all
+    // that matters for the quota exemption this test proves.
+    assert_eq!(row_state(&mut conn, exec_id).await, "CONTINUED_AS_NEW");
+    assert_eq!(row_state(&mut conn, exec_id2).await, "RUNNING");
+    assert_eq!(active_count(&mut conn, wf, "acme").await, 1);
+}
