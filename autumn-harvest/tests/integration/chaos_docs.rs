@@ -69,19 +69,67 @@ fn bash_block_containing<'a>(doc: &'a str, needle: &str) -> &'a str {
     }
 }
 
+/// Drop every line whose trimmed content starts with `#` from a block of bash
+/// source.
+///
+/// The doc's explanatory comment *about* the `chaos_tests::` filter contains
+/// the literal string `` chaos_tests:: `` (as prose: "Scope the run to
+/// `chaos_tests::`"), and separately the literal string
+/// `HARVEST_TEST_DATABASE_URL` (as prose: "the same `HARVEST_TEST_DATABASE_URL`
+/// database"). Checking a *whole* fenced block -- comments included -- for
+/// either token is therefore satisfiable by the prose alone: a regression
+/// that drops the filter from the actual command line, while leaving the
+/// comment describing what the command is *supposed* to do untouched, would
+/// pass an assertion that only inspects the raw block text. Stripping
+/// comment lines first makes every check below examine what the reader would
+/// actually copy-paste and run.
+fn strip_comment_lines(block: &str) -> String {
+    block
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn strip_comment_lines_removes_comments_but_keeps_commands() {
+    let block = "# a comment mentioning chaos_tests::\nreal_command --flag\n# another comment\nmore_command\n";
+    let stripped = strip_comment_lines(block);
+
+    assert!(
+        !stripped.contains("chaos_tests::"),
+        "comment-only content must not survive stripping; got:\n{stripped}"
+    );
+    assert!(
+        stripped.contains("real_command --flag"),
+        "actual command lines must survive stripping; got:\n{stripped}"
+    );
+    assert!(
+        stripped.contains("more_command"),
+        "actual command lines must survive stripping; got:\n{stripped}"
+    );
+}
+
 #[test]
 fn local_iteration_example_is_scoped_to_chaos_tests_module() {
     let doc = read_chaos_doc();
     let block = bash_block_containing(&doc, "HARVEST_TEST_DATABASE_URL");
+    // Comments stripped: checking the raw block would also pass if only the
+    // *comment describing* the filter survived while the command itself lost
+    // it -- this doc's own explanatory comment happens to contain the
+    // literal string `chaos_tests::` as prose, which would otherwise mask
+    // exactly the regression this test exists to catch.
+    let command_only = strip_comment_lines(block);
 
     assert!(
-        block.contains("chaos_tests::"),
-        "docs/testing/chaos.md's HARVEST_TEST_DATABASE_URL example must scope \
-         the run to `chaos_tests::` (the same filter CI's own chaos.yml uses) \
-         -- an unscoped `cargo test ... --test integration` invocation risks a \
-         chaos test's global TRUNCATE scrub racing a concurrent, unrelated \
-         integration-test module against the same shared database.\n\n\
-         block:\n{block}"
+        command_only.contains("chaos_tests::"),
+        "docs/testing/chaos.md's HARVEST_TEST_DATABASE_URL example COMMAND \
+         (comments excluded) must scope the run to `chaos_tests::` (the same \
+         filter CI's own chaos.yml uses) -- an unscoped `cargo test ... \
+         --test integration` invocation risks a chaos test's global TRUNCATE \
+         scrub racing a concurrent, unrelated integration-test module \
+         against the same shared database.\n\n\
+         command (comments stripped):\n{command_only}\n\nfull block:\n{block}"
     );
 
     // The whole `integration` binary must never be recommended unscoped
@@ -90,9 +138,9 @@ fn local_iteration_example_is_scoped_to_chaos_tests_module() {
     // invocation's shape untouched (e.g. a rewrite that renames the binary
     // flag but forgets to re-attach the module filter).
     assert!(
-        block.contains("--test integration"),
-        "expected the example to invoke the `integration` test binary; \
-         found:\n{block}"
+        command_only.contains("--test integration"),
+        "expected the example COMMAND (comments excluded) to invoke the \
+         `integration` test binary; command:\n{command_only}\n\nfull block:\n{block}"
     );
 }
 
