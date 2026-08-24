@@ -123,6 +123,7 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
 
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -231,6 +232,7 @@ async fn start_workflow_leaves_trace_context_null_when_no_propagator() {
     // Default registry uses NoOpPropagator → capture() returns None.
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,

@@ -4096,6 +4096,7 @@ mod tests {
 
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -5074,6 +5075,7 @@ mod tests {
         use crate::concurrency::ConcurrencyPolicy;
         let result = HarvestBuilder::new()
             .workflows(vec![WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -5115,6 +5117,7 @@ mod tests {
     /// for the `validate_workflow_throttle_policies` tests below.
     fn throttled_wf_info(throttle: crate::throttle::ThrottlePolicy) -> WorkflowInfo {
         WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -5228,6 +5231,7 @@ mod tests {
         use crate::concurrency::ConcurrencyPolicy;
         let result = HarvestBuilder::new()
             .workflows(vec![WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,

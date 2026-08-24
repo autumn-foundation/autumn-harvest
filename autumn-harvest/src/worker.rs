@@ -680,6 +680,7 @@ impl HandlerRegistry {
                             input_schema: w.input_schema,
                             sla: w.sla,
                             retry_policy: w.retry_policy.clone(),
+                            quota: w.quota,
                         },
                     )
                 })
@@ -8574,48 +8575,12 @@ async fn persist_all_started_child_workflows(
         let parent_exec_id_str = parent_exec_id.to_string();
         for child in &new_children {
             let child_workflow_id = child.child_id.to_string();
-            let child_wf_info = registry.workflows.get(child.workflow_name.as_str());
-            let (
-                owner,
-                runbook_url,
-                severity,
-                child_sla,
-                child_execution_timeout,
-                child_chain_execution_timeout,
-                child_retry_policy,
-            ) = child_wf_info.map_or((None, None, None, None, None, None, None), |w| {
-                (
-                    w.owner,
-                    w.runbook_url,
-                    w.severity,
-                    w.sla,
-                    w.execution_timeout,
-                    w.chain_execution_timeout,
-                    w.retry_policy.clone(),
-                )
-            });
-            let child_execution_timeout =
-                child_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-            let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
-            let child_deadline_at = child_execution_timeout.map(|d| chrono::Utc::now() + d);
-            let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
-            // A child is its own logical workflow → fresh chain origin
-            // (issue #617). Resolve the child's OWN `chain_execution_timeout`
-            // exactly like its per-run timeout above and anchor the chain
-            // deadline at the child's start. No builder ceiling is threaded
-            // into the spawn path, matching how `execution_timeout` is
-            // resolved here.
-            let child_chain_execution_timeout =
-                child_chain_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-            // `checked_add_signed` guards against `Duration::MAX` overflow
-            // (issue #617): `DateTime + Duration` panics; yield `None`.
-            let child_chain_deadline_at = child_chain_execution_timeout
-                .and_then(|d| chrono::Utc::now().checked_add_signed(d));
+            let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
             let child_row = NewWorkflowExecution {
                 continued_from_exec_id: None,
                 first_exec_id: None,
-                chain_execution_timeout: child_chain_execution_timeout,
-                chain_deadline_at: child_chain_deadline_at,
+                chain_execution_timeout: defaults.chain_execution_timeout,
+                chain_deadline_at: defaults.chain_deadline_at,
                 id: child.child_id.as_uuid(),
                 workflow_name: &child.workflow_name,
                 workflow_id: &child_workflow_id,
@@ -8624,23 +8589,22 @@ async fn persist_all_started_child_workflows(
                 input: child.input.clone(),
                 parent_id: Some(parent_exec_id.as_uuid()),
                 queue_name: &queue_name,
-                execution_timeout: child_execution_timeout,
-                deadline_at: child_deadline_at,
-                sla: child_sla,
-                sla_deadline_at: child_sla_deadline_at,
+                execution_timeout: defaults.execution_timeout,
+                deadline_at: defaults.deadline_at,
+                sla: defaults.sla,
+                sla_deadline_at: defaults.sla_deadline_at,
                 memo: None,
                 search_attrs: None,
                 assigned_build_id: parent_execution.assigned_build_id.clone(),
                 parent_close_policy: None, // awaited child
-                owner,
-                runbook_url,
-                severity,
+                owner: defaults.owner,
+                runbook_url: defaults.runbook_url,
+                severity: defaults.severity,
                 context_headers: parent_execution.context_headers.clone(),
                 schedule_id: None, // child workflows are not scheduled fires
                 scheduled_for: None,
                 workflow_attempt: 1,
-                workflow_retry_policy: child_retry_policy
-                    .and_then(|p| serde_json::to_value(&p).ok()),
+                workflow_retry_policy: defaults.retry_policy,
                 retry_of_exec_id: None,
                 origin: None, // child workflow, not a schedule fire (issue #534)
                 // Children get only builder-wide default callback
@@ -8650,6 +8614,15 @@ async fn persist_all_started_child_workflows(
                 start_source: Some(crate::types::StartSource::Child.as_str()),
                 start_source_ref: Some(parent_exec_id_str.as_str()),
                 started_by: None,
+                // An awaited child spawn is in-flight continuation of the
+                // parent's own already-admitted run, not a fresh admission
+                // (issue #946 AC3 scopes quota enforcement to registry-aware
+                // *start* paths) -- mirrors how continue-as-new/child-spawn
+                // are excluded from #247/#499/#607/#618's admission-time
+                // enforcement. `None` keeps the child invisible to quota
+                // accounting rather than double-counting it against
+                // whatever key the workflow type resolves.
+                quota_key: None,
             };
             let child_started_event = WorkflowEvent::WorkflowStarted {
                 input: child.input.clone(),
@@ -8744,6 +8717,77 @@ async fn persist_all_started_child_workflows(
     Ok(())
 }
 
+/// Per-child spawn defaults resolved from the target's OWN registered
+/// `WorkflowInfo`, never inherited from the parent — a child is its own
+/// logical workflow (issue #617/#487/#523).
+///
+/// Shared by every awaited-child spawn site
+/// ([`insert_awaited_child_execution`] and the fan-out loop in
+/// [`persist_all_started_child_workflows`]) so the resolution logic (and its
+/// `Duration::MAX`-overflow guard on the chain deadline) can never drift
+/// between them.
+struct ChildWorkflowDefaults {
+    owner: Option<&'static str>,
+    runbook_url: Option<&'static str>,
+    severity: Option<&'static str>,
+    sla: Option<chrono::Duration>,
+    sla_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    execution_timeout: Option<chrono::Duration>,
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    chain_execution_timeout: Option<chrono::Duration>,
+    chain_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    retry_policy: Option<serde_json::Value>,
+}
+
+fn resolve_child_workflow_defaults(
+    registry: &HandlerRegistry,
+    workflow_name: &str,
+) -> ChildWorkflowDefaults {
+    let child_wf_info = registry.workflows.get(workflow_name);
+    let (
+        owner,
+        runbook_url,
+        severity,
+        sla,
+        execution_timeout,
+        chain_execution_timeout,
+        retry_policy,
+    ) = child_wf_info.map_or((None, None, None, None, None, None, None), |w| {
+        (
+            w.owner,
+            w.runbook_url,
+            w.severity,
+            w.sla,
+            w.execution_timeout,
+            w.chain_execution_timeout,
+            w.retry_policy.clone(),
+        )
+    });
+    let execution_timeout = execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+    let sla = sla.and_then(|d| chrono::Duration::from_std(d).ok());
+    let deadline_at = execution_timeout.map(|d| chrono::Utc::now() + d);
+    let sla_deadline_at = sla.map(|d| chrono::Utc::now() + d);
+    // A child is its own logical workflow → fresh chain origin (issue #617).
+    let chain_execution_timeout =
+        chain_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+    // `checked_add_signed` guards against `Duration::MAX` overflow (issue
+    // #617): `DateTime + Duration` panics; yield `None` instead.
+    let chain_deadline_at =
+        chain_execution_timeout.and_then(|d| chrono::Utc::now().checked_add_signed(d));
+    ChildWorkflowDefaults {
+        owner,
+        runbook_url,
+        severity,
+        sla,
+        sla_deadline_at,
+        execution_timeout,
+        deadline_at,
+        chain_execution_timeout,
+        chain_deadline_at,
+        retry_policy: retry_policy.and_then(|p| serde_json::to_value(&p).ok()),
+    }
+}
+
 /// Insert a single genuinely-new **awaited** child execution row, append its own
 /// `WorkflowStarted` event, and enqueue its workflow task (issue #779).
 ///
@@ -8768,43 +8812,12 @@ async fn insert_awaited_child_execution(
     let child_workflow_id = child.child_id.to_string();
     // Provenance ref for the child is the parent execution id (issue #740).
     let parent_exec_id_str = parent_exec_id.to_string();
-    let child_wf_info = registry.workflows.get(child.workflow_name.as_str());
-    let (
-        owner,
-        runbook_url,
-        severity,
-        child_sla,
-        child_execution_timeout,
-        child_chain_execution_timeout,
-        child_retry_policy,
-    ) = child_wf_info.map_or((None, None, None, None, None, None, None), |w| {
-        (
-            w.owner,
-            w.runbook_url,
-            w.severity,
-            w.sla,
-            w.execution_timeout,
-            w.chain_execution_timeout,
-            w.retry_policy.clone(),
-        )
-    });
-    let child_execution_timeout =
-        child_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-    let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
-    let child_deadline_at = child_execution_timeout.map(|d| chrono::Utc::now() + d);
-    let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
-    // Child = its own logical workflow → fresh chain origin (issue #617).
-    let child_chain_execution_timeout =
-        child_chain_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-    // `checked_add_signed` guards against `Duration::MAX` overflow (issue #617):
-    // `DateTime + Duration` panics; yield `None` instead.
-    let child_chain_deadline_at =
-        child_chain_execution_timeout.and_then(|d| chrono::Utc::now().checked_add_signed(d));
+    let defaults = resolve_child_workflow_defaults(registry, &child.workflow_name);
     let child_row = NewWorkflowExecution {
         continued_from_exec_id: None,
         first_exec_id: None,
-        chain_execution_timeout: child_chain_execution_timeout,
-        chain_deadline_at: child_chain_deadline_at,
+        chain_execution_timeout: defaults.chain_execution_timeout,
+        chain_deadline_at: defaults.chain_deadline_at,
         id: child.child_id.as_uuid(),
         workflow_name: &child.workflow_name,
         workflow_id: &child_workflow_id,
@@ -8813,22 +8826,22 @@ async fn insert_awaited_child_execution(
         input: child.input.clone(),
         parent_id: Some(parent_exec_id.as_uuid()),
         queue_name: &queue_name,
-        execution_timeout: child_execution_timeout,
-        deadline_at: child_deadline_at,
-        sla: child_sla,
-        sla_deadline_at: child_sla_deadline_at,
+        execution_timeout: defaults.execution_timeout,
+        deadline_at: defaults.deadline_at,
+        sla: defaults.sla,
+        sla_deadline_at: defaults.sla_deadline_at,
         memo: None,
         search_attrs: None,
         assigned_build_id: parent_execution.assigned_build_id.clone(),
         parent_close_policy: None, // awaited child
-        owner,
-        runbook_url,
-        severity,
+        owner: defaults.owner,
+        runbook_url: defaults.runbook_url,
+        severity: defaults.severity,
         context_headers: parent_execution.context_headers.clone(),
         schedule_id: None, // child workflows are not scheduled fires
         scheduled_for: None,
         workflow_attempt: 1,
-        workflow_retry_policy: child_retry_policy.and_then(|p| serde_json::to_value(&p).ok()),
+        workflow_retry_policy: defaults.retry_policy,
         retry_of_exec_id: None,
         origin: None, // child workflow, not a schedule fire (issue #534)
         // Children get only builder-wide default callback targets, resolved at
@@ -8837,6 +8850,10 @@ async fn insert_awaited_child_execution(
         start_source: Some(crate::types::StartSource::Child.as_str()),
         start_source_ref: Some(parent_exec_id_str.as_str()),
         started_by: None,
+        // Same in-flight-continuation rationale as the sibling awaited-child
+        // spawn path above (issue #946 AC3) -- a child-timeout-race child
+        // (issue #779) is not a fresh admission.
+        quota_key: None,
     };
     let child_started_event = WorkflowEvent::WorkflowStarted {
         input: child.input.clone(),
@@ -9987,6 +10004,12 @@ async fn create_detached_child_executions(
             start_source: Some(crate::types::StartSource::Child.as_str()),
             start_source_ref: Some(parent_exec_id_str.as_str()),
             started_by: None,
+            // Same in-flight-continuation rationale as the awaited child
+            // spawn paths above (issue #946 AC3) -- a detached child spawn
+            // is not a fresh admission of the parent's own logical run, and
+            // ParentClosePolicy/#347 already governs its own independent
+            // lifecycle.
+            quota_key: None,
         };
 
         diesel::insert_into(harvest_workflow_executions::table)
@@ -13553,6 +13576,37 @@ async fn persist_workflow_continue_as_new(
         .as_deref()
         .unwrap_or(execution.workflow_name.as_str());
 
+    // Per-tenant quota key (issue #946). Continue-as-new is in-flight
+    // continuation of an already-admitted run, not a fresh admission, so --
+    // like the concurrency key just above -- this does NOT re-run
+    // enforcement (`quota::check_quota` is never called here). But unlike a
+    // plain bookkeeping value, `quota_key` backs an AGGREGATE accounting
+    // query (`quota::load_quota_usage`) that the tenant's NEXT genuinely-new
+    // admission reads: stamping `None` here would make the predecessor's
+    // active-execution slot (and its history bytes) silently invisible to
+    // that accounting the instant it continues-as-new, letting a looping
+    // entity workflow leak unbounded quota headroom on every hop. Same-type:
+    // carry the predecessor's already-resolved key forward verbatim (mirrors
+    // `execution.quota_key`, exactly like the concurrency key propagation
+    // below). Cross-type (#803): re-resolve against the TARGET type's own
+    // declared policy and the new input, reading `registry` directly --
+    // mirroring `resolve_workflow_concurrency` immediately below -- rather
+    // than the process-global `GLOBAL_WORKFLOW_METADATA` mirror, which is
+    // populated only by `HandlerRegistry::with_state_and_telemetry` and
+    // would silently resolve `None` for a `Worker` built from the raw
+    // `HandlerRegistry::new(..)` constructor even when `registry` itself
+    // has the target's `WorkflowInfo.quota` set correctly.
+    let successor_quota_key: Option<String> = new_workflow_type.as_deref().map_or_else(
+        || execution.quota_key.clone(),
+        |target| {
+            registry
+                .workflows
+                .get(target)
+                .and_then(|info| info.quota)
+                .and_then(|policy| crate::quota::resolve_quota_key(policy.key_expr, &input))
+        },
+    );
+
     let new_row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
         workflow_name: successor_workflow_name,
@@ -13607,6 +13661,7 @@ async fn persist_workflow_continue_as_new(
         start_source: Some(crate::types::StartSource::ContinueAsNew.as_str()),
         start_source_ref: Some(predecessor_exec_id_str.as_str()),
         started_by: None,
+        quota_key: successor_quota_key.as_deref(),
     };
     // Per-key concurrency (issue #247). Same-type: propagate the current task's
     // key so the continued run stays under the same fair-share cap. Cross-type
@@ -23995,6 +24050,7 @@ mod tests {
     #[test]
     fn handler_registry_indexes_by_name() {
         let wf = WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -27430,6 +27486,7 @@ mod tests {
     fn registry_knowing(workflow: &'static str, activity: &'static str) -> HandlerRegistry {
         HandlerRegistry::new(
             vec![WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -29921,6 +29978,7 @@ mod tests {
     /// Minimal registered workflow type for the #803 target-resolution tests.
     fn can803_wf_info(name: &'static str) -> WorkflowInfo {
         WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -30006,6 +30064,7 @@ mod tests {
             chain_deadline_at: Some(chrono::Utc::now() + chrono::Duration::seconds(80_000)),
             history_bloat_warned_at: None,
             triage_note: None,
+            quota_key: None,
             created_at: chrono::Utc::now(),
         }
     }

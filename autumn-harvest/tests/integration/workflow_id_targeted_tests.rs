@@ -144,6 +144,7 @@ async fn insert_running_row(
     exec_id: ExecutionId,
 ) {
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -227,6 +228,7 @@ async fn continue_as_new_atomically(
         }
 
         let row = NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: Some(pred.as_uuid()),
             first_exec_id: Some(pred.as_uuid()),
             id: succ.as_uuid(),
@@ -1228,6 +1230,7 @@ async fn randomized_cancel_by_id_continue_as_new_race_zero_misdeliveries() {
 
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

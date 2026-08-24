@@ -660,6 +660,7 @@ mod db_tests {
     ) {
         diesel::insert_into(harvest_workflow_executions::table)
             .values(NewWorkflowExecution {
+                quota_key: None,
                 continued_from_exec_id: None,
                 first_exec_id: None,
                 id: exec_id,

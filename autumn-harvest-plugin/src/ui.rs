@@ -10350,6 +10350,7 @@ mod tests {
         use chrono::Utc;
         use uuid::Uuid;
         autumn_harvest::models::WorkflowExecution {
+            quota_key: None,
             id: Uuid::new_v4(),
             workflow_name: "test_workflow".to_string(),
             workflow_id: "wf-1".to_string(),

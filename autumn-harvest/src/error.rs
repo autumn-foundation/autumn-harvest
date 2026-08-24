@@ -10,6 +10,7 @@
 
 use uuid::Uuid;
 
+use crate::quota::QuotaResource;
 use crate::types::{
     ExecutionId, ExternalAwaitId, ExternalCancelId, ExternalSignalId, ExternalTarget,
 };
@@ -450,6 +451,44 @@ pub enum HarvestError {
         gate_id: Uuid,
         /// Human-readable reason recorded on the gate.
         reason: String,
+    },
+
+    /// A workflow start was rejected because a declared
+    /// [`QuotaPolicy`](crate::quota::QuotaPolicy) cap for the resolved
+    /// tenant key has already been reached (issue #946).
+    ///
+    /// Returned by the admission check inside
+    /// [`crate::execution::start_or_load_workflow_execution_collect`] —
+    /// **before** any `WorkflowStarted` event is written. No execution row,
+    /// no event, and no task queue row are created for a rejected start; the
+    /// caller sees a clean rejection rather than a partially-admitted run.
+    ///
+    /// `current` is the usage observed at rejection time, *before* this
+    /// admission attempt — see [`crate::quota::check_quota`] for the exact
+    /// `current >= limit` boundary semantics.
+    ///
+    /// Surfaces as `429 Too Many Requests` at the management API layer with
+    /// a JSON body naming the exhausted `resource`, `key`, `limit`, and
+    /// `current` so callers can back off intelligently rather than retry
+    /// blindly (issue #946 AC4 — never a silent drop, never a `500`).
+    #[error(
+        "quota exceeded for workflow '{workflow_name}' key '{key}': \
+         {resource} at {current}/{limit}"
+    )]
+    QuotaExceeded {
+        /// The workflow type whose declared [`QuotaPolicy`](crate::quota::QuotaPolicy)
+        /// was violated.
+        workflow_name: String,
+        /// The resolved tenant key (the value produced by
+        /// [`crate::quota::resolve_quota_key`]).
+        key: String,
+        /// The exhausted resource dimension.
+        resource: QuotaResource,
+        /// The declared cap for `resource`.
+        limit: u64,
+        /// The usage observed at rejection time, before this admission
+        /// attempt.
+        current: u64,
     },
 
     /// Delivery of a `signal_external_workflow`/`signal_external_workflow_by_id`

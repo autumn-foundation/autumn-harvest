@@ -188,6 +188,7 @@ fn wf_info(
     retry_policy: Option<RetryPolicy>,
 ) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

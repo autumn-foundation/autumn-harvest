@@ -849,6 +849,7 @@ async fn child_fan_out_shares_seq_counter_with_activity_fan_out() {
 
 fn make_workflow_info(name: &'static str) -> autumn_harvest::info::WorkflowInfo {
     autumn_harvest::info::WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

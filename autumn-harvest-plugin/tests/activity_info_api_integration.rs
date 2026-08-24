@@ -123,6 +123,7 @@ fn correlate_activity(ctx: &autumn_harvest::ActivityContext, _input: Value) -> B
 
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

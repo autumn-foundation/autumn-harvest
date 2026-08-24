@@ -54,6 +54,7 @@ fn noop_workflow<'a>(
 
 fn workflow_info_named(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -185,6 +186,7 @@ async fn insert_execution(
         .await
         .expect("failed to connect to test database");
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),

@@ -410,6 +410,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/usage", RouteClass::ReadOnly),
     ("GET /admin/debounce", RouteClass::ReadOnly),
     ("GET /admin/start-throttle", RouteClass::ReadOnly),
+    // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
+    ("GET /admin/quotas", RouteClass::ReadOnly),
     // Workflow-type handler reachability (issue #520): read-only, no state mutation.
     (
         "GET /admin/workflow-types/reachability",
@@ -841,6 +843,8 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/usage",
     "GET /admin/debounce",
     "GET /admin/start-throttle",
+    // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
+    "GET /admin/quotas",
     "GET /admin/history/exports",
     "GET /admin/history/export-sample",
     "GET /admin/external-handoffs",
@@ -1014,6 +1018,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/usage", None),
     ("GET /admin/debounce", None),
     ("GET /admin/start-throttle", None),
+    // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
+    ("GET /admin/quotas", None),
     // Workflow-type handler reachability (issue #520): read-only.
     ("GET /admin/workflow-types/reachability", None),
     ("GET /admin/history/exports", None),

@@ -355,6 +355,11 @@ fn emit_workflow_companion(
                 debounce: ::std::option::Option::None,
                 batch: ::std::option::Option::None,
                 throttle: ::std::option::Option::None,
+                // DAGs carry no per-tenant quota (issue #946) -- the
+                // `#[dag]` macro has no `quota` attribute and DAG start
+                // paths bypass the registry-aware admission gates quota
+                // enforcement runs on.
+                quota: ::std::option::Option::None,
                 max_input_bytes: ::std::option::Option::None,
                 owner: #owner_expr,
                 runbook_url: #runbook_url_expr,

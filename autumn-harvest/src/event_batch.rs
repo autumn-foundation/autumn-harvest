@@ -391,6 +391,43 @@ const fn is_transient_error(e: &HarvestError) -> bool {
     matches!(e, HarvestError::Database(_) | HarvestError::Timeout { .. })
 }
 
+/// Re-defer backoff for a batch row blocked by an exhausted per-tenant quota
+/// (issue #946) at fire time. Mirrors `throttle.rs`/`debounce.rs`'s
+/// identically-named, identically-valued constant -- kept as a separate
+/// `const` per file purely for log/intent clarity; nothing depends on the
+/// three staying numerically equal.
+#[cfg(feature = "db")]
+const QUOTA_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Push a quota-blocked event-batch row's `fire_at` forward by
+/// [`QUOTA_REDEFER_BACKOFF`] (issue #946, Task #7 hardening) so it is
+/// re-attempted less often instead of thrashing the claim batch every
+/// scanner tick.
+///
+/// Unlike the generic non-transient-error path in [`fire_claimed_batch_row`]
+/// (which deletes the row outright -- correct for a request that can never
+/// succeed, e.g. a payload validation failure), a quota exhaustion is
+/// TEMPORARY: the tenant's usage frees up as an existing execution completes
+/// or is deleted. Deleting the row here would silently drop the batch's
+/// accumulated `buffered_payloads` forever. `harvest_event_batches` has no
+/// `max_fire_at`-style absolute cap (unlike `harvest_debounce`), so no clamp
+/// is needed. Runs inside the caller's fire transaction so the row-level
+/// `FOR UPDATE` lock is held through the update.
+#[cfg(feature = "db")]
+async fn redefer_event_batch_row(
+    conn: &mut AsyncPgConnection,
+    row_id: uuid::Uuid,
+    new_fire_at: DateTime<Utc>,
+) -> HarvestResult<()> {
+    diesel::sql_query("UPDATE harvest_event_batches SET fire_at = $2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(row_id)
+        .bind::<diesel::sql_types::Timestamptz, _>(new_fire_at)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
 #[cfg(feature = "db")]
 #[allow(clippy::type_complexity)]
 async fn fire_due_on_conn(
@@ -650,6 +687,39 @@ async fn fire_claimed_batch_row(
                 batch_key = %batch_key,
                 workflow_id = %workflow_id,
                 "batched start skipped: workflow_id already exists under reuse policy",
+            );
+            Ok(None)
+        }
+        // issue #946 (Task #7 hardening): a declared per-tenant quota is
+        // exhausted at fire time. Unlike the generic `Err(e)` non-transient
+        // path below (which deletes the row -- correct for a request that
+        // can never succeed) this is TEMPORARY, so the row is RE-DEFERRED
+        // (left, `fire_at` bumped with backoff) rather than dropped, and
+        // rather than propagated. Must be matched BEFORE the generic
+        // `Err(e)` arm: `is_transient_error` classifies `QuotaExceeded` as
+        // non-transient, so without this dedicated arm it would fall
+        // through to the delete-and-audit path, silently discarding the
+        // batch's accumulated `buffered_payloads` forever the moment a
+        // tenant's aggregate usage happened to be at its cap.
+        Err(HarvestError::QuotaExceeded {
+            workflow_name: quota_workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        }) => {
+            let now = Utc::now();
+            redefer_event_batch_row(conn, row_id, now + QUOTA_REDEFER_BACKOFF).await?;
+            tracing::debug!(
+                workflow_name = %quota_workflow_name,
+                batch_key = %batch_key,
+                workflow_id = %workflow_id,
+                quota_key = %key,
+                resource = %resource,
+                limit,
+                current,
+                "batched start blocked by a per-tenant quota at fire time; \
+                 re-deferred with backoff",
             );
             Ok(None)
         }

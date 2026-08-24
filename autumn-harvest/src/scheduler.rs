@@ -6371,6 +6371,50 @@ async fn drain_buffered_schedule_runs(
                     )
                     .await;
                 }
+                Err(HarvestError::QuotaExceeded {
+                    key,
+                    resource,
+                    limit,
+                    current,
+                    ..
+                }) => {
+                    // issue #946 (Task #7 hardening): a declared per-tenant quota
+                    // is exhausted. Unlike the generic `Err(error)` arm below
+                    // (which permanently drops the slot -- correct for a request
+                    // that can never succeed, e.g. a deleted workflow or a bad
+                    // input) this is TEMPORARY: the tenant's usage frees up as an
+                    // existing execution completes or is deleted. Re-insert the
+                    // slot the loop already popped via `buffered.remove(0)` above
+                    // so the persisted `buffered_runs` still carries it for the
+                    // next tick's drain attempt, rather than silently discarding
+                    // a buffered fire forever. Refund the throttle token first
+                    // (mirrors the generic arm), then stop draining this
+                    // schedule this tick -- every remaining slot for the same
+                    // workflow is equally likely to hit the same tenant cap, so
+                    // further attempts this tick would just repeat the block.
+                    //
+                    // `harvest.quota.rejected` was already recorded by
+                    // `start_or_load_workflow_execution_with_metrics` itself
+                    // (it was passed `Some(metrics.as_ref())` above) --
+                    // mirrors the `Blocked`/`QuotaBlocked` no-double-count
+                    // precedent in `completion_trigger.rs`.
+                    if let Some(ref bucket) = buffered_throttle_bucket {
+                        let _ = crate::queue::refund_rate_limit_token(conn, bucket).await;
+                    }
+                    buffered.insert(0, scheduled_for);
+                    tracing::debug!(
+                        workflow_name = %wf_name,
+                        workflow_id = %workflow_id,
+                        buffered_for = %scheduled_for,
+                        quota_key = %key,
+                        resource = %resource,
+                        limit,
+                        current,
+                        "harvest: buffered workflow run blocked by a per-tenant quota; \
+                         re-buffered for a later tick"
+                    );
+                    break;
+                }
                 Err(error) => {
                     // No run admitted — refund the reserved throttle token.
                     if let Some(ref bucket) = buffered_throttle_bucket {

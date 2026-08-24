@@ -568,6 +568,7 @@ fn strict_schema() -> serde_json::Value {
 
 fn wf_info_with_schema(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         name,

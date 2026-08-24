@@ -272,6 +272,13 @@ pub mod query;
 #[doc(hidden)] // internal implementation detail; no stability guarantee
 pub mod queue_fairness;
 pub mod queue_pause;
+/// Per-tenant resource quotas on executions, history, and DLQ (issue #946).
+///
+/// Pure types ([`quota::QuotaPolicy`], [`quota::QuotaResource`],
+/// [`quota::resolve_quota_key`], [`quota::check_quota`]) compile without the
+/// `db` feature; [`quota::load_quota_usage`]/[`quota::list_quota_usage`] are
+/// DB-gated.
+pub mod quota;
 pub mod replay;
 /// Stratified in-flight history sampling for the replay-drift gate (issue #798).
 ///

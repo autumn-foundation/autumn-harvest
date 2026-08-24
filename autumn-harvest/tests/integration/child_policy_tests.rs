@@ -222,6 +222,7 @@ async fn wait_for_workflow_task_parked(conn: &mut AsyncPgConnection, exec_id: Ex
 
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -254,6 +255,7 @@ fn wf_info_with_concurrency(
     concurrency: ConcurrencyPolicy,
 ) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -345,6 +347,7 @@ async fn insert_detached_child_execution(
     let child_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: child_exec_id.as_uuid(),
@@ -947,6 +950,7 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: child_exec_id.as_uuid(),

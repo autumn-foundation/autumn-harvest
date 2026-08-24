@@ -108,6 +108,7 @@ fn progress_workflow<'a>(
 
 fn progress_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -160,6 +161,7 @@ fn state_reading_workflow<'a>(
 
 fn state_reading_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -213,6 +215,7 @@ fn policy_branch_workflow<'a>(
 
 fn policy_branch_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

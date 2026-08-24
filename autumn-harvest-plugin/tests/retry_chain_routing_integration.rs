@@ -88,6 +88,7 @@ fn marker_workflow<'a>(
 
 fn marker_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

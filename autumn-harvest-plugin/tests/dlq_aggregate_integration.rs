@@ -172,6 +172,7 @@ async fn insert_execution(database_url: &str, shard: i32, workflow_name: &str) -
         .await
         .expect("failed to connect for execution insert");
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),

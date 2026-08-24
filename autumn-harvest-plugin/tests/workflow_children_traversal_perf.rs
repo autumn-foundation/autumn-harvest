@@ -215,6 +215,7 @@ const fn shard_for(index: usize) -> i32 {
 
 async fn insert_root(conn: &mut AsyncPgConnection, root: ExecutionId) {
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: root.as_uuid(),
@@ -272,6 +273,7 @@ async fn bulk_insert(conns: &mut [AsyncPgConnection; 2], nodes: &[Node], workflo
             let rows: Vec<NewWorkflowExecution> = chunk
                 .iter()
                 .map(|n| NewWorkflowExecution {
+                    quota_key: None,
                     continued_from_exec_id: None,
                     first_exec_id: None,
                     id: n.id.as_uuid(),

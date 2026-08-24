@@ -947,6 +947,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
     let workflow_input = serde_json::json!({"msg": "hello metrics"});
 
     let exec_row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -1024,6 +1025,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
 
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -1188,6 +1190,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),
@@ -1261,6 +1264,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
     );
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -1337,6 +1341,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),
@@ -1417,6 +1422,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
     let policy = WorkflowHistoryPolicy::default().with_event_hard_cap(2);
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -1499,6 +1505,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),
@@ -1580,6 +1587,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
     let registry = Arc::new(
         HandlerRegistry::new(
             vec![WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -1660,6 +1668,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
 
         diesel::insert_into(harvest_workflow_executions::table)
             .values(NewWorkflowExecution {
+                quota_key: None,
                 continued_from_exec_id: None,
                 first_exec_id: None,
                 id: exec_id.as_uuid(),
@@ -1744,6 +1753,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -1770,6 +1780,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -1918,6 +1929,7 @@ async fn history_bloat_counter_fires_once_when_a_still_suspended_execution_cross
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),
@@ -2015,6 +2027,7 @@ async fn history_bloat_counter_fires_once_when_a_still_suspended_execution_cross
         .with_history_bloat_warn_fraction(0.5);
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -2157,6 +2170,7 @@ async fn history_bloat_soft_threshold_not_crossed_by_a_contended_mutex_acquires_
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),
@@ -2251,6 +2265,7 @@ async fn history_bloat_soft_threshold_not_crossed_by_a_contended_mutex_acquires_
         .with_history_bloat_warn_fraction(0.5);
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -2395,6 +2410,7 @@ async fn history_bloat_counter_fires_even_when_the_same_decision_reaches_the_har
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),
@@ -2487,6 +2503,7 @@ async fn history_bloat_counter_fires_even_when_the_same_decision_reaches_the_har
         .with_history_bloat_warn_fraction(0.5);
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -2650,6 +2667,7 @@ async fn history_bloat_counter_does_not_fire_off_a_prospective_pending_command_c
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),
@@ -2733,6 +2751,7 @@ async fn history_bloat_counter_does_not_fire_off_a_prospective_pending_command_c
         .with_history_bloat_warn_fraction(0.75);
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -2857,6 +2876,7 @@ async fn history_bloat_counter_fires_exactly_once_across_two_real_live_suspensio
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),
@@ -2947,6 +2967,7 @@ async fn history_bloat_counter_fires_exactly_once_across_two_real_live_suspensio
         .with_history_bloat_warn_fraction(0.5);
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -3072,6 +3093,7 @@ async fn history_bloat_counter_never_fires_when_the_soft_threshold_is_disabled()
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),
@@ -3161,6 +3183,7 @@ async fn history_bloat_counter_never_fires_when_the_soft_threshold_is_disabled()
         .with_history_bloat_warn_fraction(0.0);
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -3260,6 +3283,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),
@@ -3340,6 +3364,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
     let policy = WorkflowHistoryPolicy::default().with_event_hard_cap(4);
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -3457,6 +3482,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),
@@ -3532,6 +3558,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -3558,6 +3585,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -3666,6 +3694,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: parent_exec_id.as_uuid(),
@@ -3741,6 +3770,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -3767,6 +3797,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -4007,6 +4038,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
     let workflow_input = serde_json::json!({"msg": "non-det"});
 
     let exec_row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -4093,6 +4125,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
 
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -4245,6 +4278,7 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
     let workflow_input = serde_json::json!({"msg": "sts test"});
 
     let exec_row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -4330,6 +4364,7 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
 
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -4401,6 +4436,7 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
 /// Verifies that `oldest_pending_ages` returns a positive age when there are
 /// eligible pending tasks, and returns an empty slice when the queue is drained
 /// (which is what causes the sampler to reset the gauge to 0).
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn oldest_pending_age_query_positive_then_zero_after_drain() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -4412,6 +4448,7 @@ async fn oldest_pending_age_query_positive_then_zero_after_drain() {
     let workflow_input = serde_json::json!({"msg": "age test"});
 
     let exec_row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -4533,6 +4570,7 @@ async fn oldest_pending_age_excludes_paused_executions() {
     let workflow_input = serde_json::json!({"msg": "paused age test"});
 
     let exec_row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -4644,6 +4682,7 @@ async fn oldest_pending_age_excludes_rate_limited_tasks() {
     let workflow_input = serde_json::json!({"msg": "rate limit age test"});
 
     let exec_row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -4789,6 +4828,7 @@ async fn oldest_pending_age_excludes_saturated_concurrency_cap() {
     let workflow_input = serde_json::json!({"msg": "concurrency cap age test"});
 
     let exec_row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -4910,6 +4950,7 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
     let workflow_input = serde_json::json!({});
 
     let exec_row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -4993,6 +5034,7 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
 
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -5057,6 +5099,7 @@ async fn update_completed_metric_fires_on_the_suspend_path() {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     let workflow_input = serde_json::json!({});
     let exec_row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -5140,6 +5183,7 @@ async fn update_completed_metric_fires_on_the_suspend_path() {
     );
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,

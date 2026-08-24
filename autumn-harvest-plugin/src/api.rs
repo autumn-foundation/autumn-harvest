@@ -5004,6 +5004,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(start_throttle_status).route_layer(require_admin.clone()),
         )
         .route(
+            "/admin/quotas",
+            // Admin-gated: the response includes raw quota_key values, which
+            // resolve from user/tenant-derived fields (issue #946). Parity with
+            // /admin/concurrency, /admin/debounce, and /admin/start-throttle.
+            get(list_quotas_handler).route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/rate-limits",
             get(list_rate_limits).route_layer(require_admin.clone()),
         )
@@ -6128,6 +6135,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/usage"),
         ("GET", "/admin/debounce"),
         ("GET", "/admin/start-throttle"),
+        ("GET", "/admin/quotas"),
         ("GET", "/admin/rate-limits"),
         ("POST", "/admin/rate-limits/{key}"),
         ("GET", "/admin/circuits"),
@@ -7506,6 +7514,11 @@ pub const fn management_api_response_fields()
         ("GET", "/batches/pending", None),
         ("GET", "/admin/debounce", None), // Vec<PendingDebounceRecord> (external model)
         ("GET", "/admin/start-throttle", None), // Vec<ThrottleBacklogEntry> (external model)
+        (
+            "GET",
+            "/admin/quotas",
+            Some(&["quotas", "status", "unavailable_shards"]),
+        ),
         ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucket> (external model)
         ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
         ("GET", "/admin/circuits", None), // Vec<CircuitSnapshot> (external model)
@@ -18065,6 +18078,50 @@ pub(crate) async fn start_workflow(
             )
                 .into_response()
         }
+        Err(HarvestError::QuotaExceeded {
+            workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        }) => {
+            // A fresh admission rejected by a declared per-tenant resource
+            // quota (issue #946, AC4): a typed 429 naming the exhausted
+            // resource/key/limit/current — never a silent drop, never the
+            // generic 503 catch-all `map_error` would otherwise apply. The
+            // rejection was already counted on `harvest.quota.rejected`
+            // (AC6) inside `start_or_load_workflow_execution_collect`
+            // itself, so no metric emission is needed at this HTTP layer.
+            if let Some(ref bucket) = throttle_reserved {
+                let _ = autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket).await;
+            }
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("quota exceeded"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "quota exceeded",
+                    "workflow_name": workflow_name,
+                    "key": key,
+                    "resource": resource.as_str(),
+                    "limit": limit,
+                    "current": current,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => {
             // The start failed for an unrelated reason; no run was admitted, so
             // refund the reserved throttle token.
@@ -20219,6 +20276,47 @@ pub(crate) async fn signal_with_start_workflow(
             )
                 .into_response()
         }
+        // A genuine fresh admission rejected by a declared per-tenant
+        // resource quota (issue #946, AC4): a typed 429 naming the
+        // exhausted resource/key/limit/current, mirroring the plain start
+        // route's arm exactly. Never raised for an attach, since the quota
+        // check runs only on the fresh-insert branch inside
+        // `start_or_load_workflow_execution_collect`. Already counted on
+        // `harvest.quota.rejected` (AC6) inside the primitive itself.
+        Err(HarvestError::QuotaExceeded {
+            workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        }) => {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("quota exceeded"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "quota exceeded",
+                    "workflow_name": workflow_name,
+                    "key": key,
+                    "resource": resource.as_str(),
+                    "limit": limit,
+                    "current": current,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => {
             let err_str = e.to_string();
             let ar = NewAuditRecord {
@@ -20925,6 +21023,48 @@ async fn update_with_start_workflow(
                 Json(serde_json::json!({
                     "error": "workflow is paused",
                     "execution_id": paused_exec_id.to_string(),
+                })),
+            )
+                .into_response()
+        }
+        // A genuine fresh admission rejected by a declared per-tenant
+        // resource quota (issue #946, AC4): a typed 429 naming the
+        // exhausted resource/key/limit/current, mirroring the plain start
+        // and signal-with-start routes' arms exactly. Never raised for an
+        // attach, since the quota check runs only on the fresh-insert
+        // branch inside `start_or_load_workflow_execution_collect`.
+        // Already counted on `harvest.quota.rejected` (AC6) inside the
+        // primitive itself.
+        Err(HarvestError::QuotaExceeded {
+            workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        }) => {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("quota exceeded"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "quota exceeded",
+                    "workflow_name": workflow_name,
+                    "key": key,
+                    "resource": resource.as_str(),
+                    "limit": limit,
+                    "current": current,
                 })),
             )
                 .into_response()
@@ -33820,6 +33960,118 @@ fn merge_paused_queue_rows(
         .collect()
 }
 
+/// `GET /admin/quotas` — usage-vs-limit per resolved `(workflow_name,
+/// quota_key)` pair (issue #946 AC5).
+///
+/// Cross-shard, `shard_fanout`-based like every other sensitive per-key admin
+/// read (`/admin/concurrency`, `/admin/debounce`, `/admin/start-throttle`): an
+/// unreachable shard degrades the response to `partial`/`unavailable` rather
+/// than failing the whole read (never a `500`).
+///
+/// **Quota enforcement is shard-LOCAL by design (issue #946 AC8)** — unlike a
+/// fleet-wide pause, the SAME `(workflow_name, quota_key)` pair can carry
+/// genuinely independent usage on every shard a tenant's traffic happens to
+/// land on (shard routing hashes on `workflow_id`, not the quota key), so the
+/// effective cap across the whole fleet is `per-shard-limit × shards touched`.
+/// The response therefore does NOT collapse a key's shards into one count —
+/// it sums for a fleet-wide-total convenience field (mirroring
+/// `/admin/concurrency`'s cross-shard sum) but always also lists the full
+/// per-shard breakdown, so an operator can see exactly which shard(s) a
+/// tenant is actually capped on.
+async fn list_quotas_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Value>, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+
+    let observations = observe_shards(&api_state, |shard_id, mut conn| async move {
+        ::autumn_harvest::quota::list_quota_usage(&mut conn)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (shard_id, row))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+
+    let collected = shard_fanout::collect_fanout_rows(observations);
+
+    Ok(Json(serde_json::json!({
+        "quotas": merge_quota_rows(collected.rows, &runtime.registry),
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
+}
+
+/// Merge per-shard quota usage rows into one entry per `(workflow_name,
+/// quota_key)` pair, summing for a fleet-wide total while preserving each
+/// shard's own count (issue #946 AC5).
+///
+/// The declared `limits` are resolved from the CURRENT registered
+/// `WorkflowInfo.quota` for `workflow_name` (never persisted with the usage
+/// rows themselves), so a policy edited after a key accrued usage is reported
+/// against the live policy, not a stale snapshot.
+fn merge_quota_rows(
+    rows: Vec<(i32, ::autumn_harvest::quota::QuotaKeyUsage)>,
+    registry: &HandlerRegistry,
+) -> Vec<Value> {
+    let mut by_key: std::collections::BTreeMap<
+        (String, String),
+        Vec<(i32, ::autumn_harvest::quota::QuotaKeyUsage)>,
+    > = std::collections::BTreeMap::new();
+    for (shard_id, row) in rows {
+        by_key
+            .entry((row.workflow_name.clone(), row.quota_key.clone()))
+            .or_default()
+            .push((shard_id, row));
+    }
+
+    by_key
+        .into_values()
+        .map(|mut shard_rows| {
+            shard_rows.sort_by_key(|(shard_id, _)| *shard_id);
+            let (workflow_name, quota_key) = {
+                let first = &shard_rows[0].1;
+                (first.workflow_name.clone(), first.quota_key.clone())
+            };
+
+            let total_active: i64 = shard_rows.iter().map(|(_, r)| r.active_executions).sum();
+            let total_history_bytes: i64 = shard_rows.iter().map(|(_, r)| r.history_bytes).sum();
+            let total_dead_letters: i64 = shard_rows.iter().map(|(_, r)| r.dead_letters).sum();
+
+            let policy = registry
+                .workflows
+                .get(&workflow_name)
+                .and_then(|info| info.quota);
+
+            serde_json::json!({
+                "workflow_name": workflow_name,
+                "quota_key": quota_key,
+                "usage": {
+                    "active_executions": total_active,
+                    "history_bytes": total_history_bytes,
+                    "dead_letters": total_dead_letters,
+                },
+                "limits": {
+                    "max_active_executions": policy.and_then(|p| p.max_active_executions),
+                    "max_history_bytes": policy.and_then(|p| p.max_history_bytes),
+                    "max_dead_letters": policy.and_then(|p| p.max_dead_letters),
+                },
+                "shards": shard_rows
+                    .iter()
+                    .map(|(shard_id, row)| serde_json::json!({
+                        "shard_id": shard_id,
+                        "active_executions": row.active_executions,
+                        "history_bytes": row.history_bytes,
+                        "dead_letters": row.dead_letters,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
 // ── Per-activity-type pause / resume (issue #807) ────────────────────────────
 //
 // The queue-pause sibling (#619) is the direct prior art for every helper in
@@ -39259,6 +39511,23 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         } => AutumnError::bad_request_msg(format!(
             "workflow execution already exists: {existing_exec_id} (state: {existing_state})"
         )),
+        // Safety-net fallback for a per-tenant resource quota rejection
+        // (issue #946) reached from a route that has no bespoke structured
+        // 429 arm of its own (every request-time `map_error` call site not
+        // already special-cased for `QuotaExceeded` below). AC4 requires
+        // this surface as a typed 429, never fall through to the generic
+        // `other => 503` catch-all.
+        HarvestError::QuotaExceeded {
+            workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        } => AutumnError::bad_request_msg(format!(
+            "quota exceeded for workflow '{workflow_name}' key '{key}': {resource} at \
+             {current}/{limit}"
+        ))
+        .with_status(axum::http::StatusCode::TOO_MANY_REQUESTS),
         HarvestError::Database(message) => AutumnError::service_unavailable_msg(message),
         other => AutumnError::service_unavailable_msg(other.to_string()),
     }
@@ -45862,6 +46131,7 @@ mod tests {
     fn dag_registration_marker_is_separate_from_workflow_registry() {
         let registry = Arc::new(HandlerRegistry::new(
             vec![autumn_harvest::WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -49269,6 +49539,7 @@ mod tests {
         Arc::new(HandlerRegistry::new(
             vec![
                 autumn_harvest::WorkflowInfo {
+                    quota: None,
                     declared_activities: None,
                     declared_children: None,
                     mcp: false,
@@ -49294,6 +49565,7 @@ mod tests {
                     retry_policy: None,
                 },
                 autumn_harvest::WorkflowInfo {
+                    quota: None,
                     declared_activities: None,
                     declared_children: None,
                     mcp: false,
@@ -50807,6 +51079,7 @@ mod tests {
 
     fn stub_workflow_execution() -> WorkflowExecution {
         WorkflowExecution {
+            quota_key: None,
             id: uuid::Uuid::new_v4(),
             workflow_name: "decode-wf".to_string(),
             workflow_id: "wf-1".to_string(),
@@ -51463,6 +51736,8 @@ mod tests {
             failed_at,
             owner: None,
             severity: None,
+            workflow_name: None,
+            quota_key: None,
         }
     }
 
@@ -51832,6 +52107,7 @@ mod tests {
         sla: Option<std::time::Duration>,
     ) -> autumn_harvest::WorkflowInfo {
         autumn_harvest::WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,

@@ -16093,6 +16093,7 @@ mod tests {
     async fn continue_as_new_as_takes_the_type_from_workflow_info() {
         let ctx = WorkflowContext::new_test();
         let info = crate::info::WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -23335,6 +23336,7 @@ mod tests {
 
     fn make_workflow_info(name: &'static str) -> crate::info::WorkflowInfo {
         crate::info::WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,

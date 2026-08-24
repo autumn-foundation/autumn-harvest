@@ -225,6 +225,7 @@ fn progress_workflow<'a>(
 
 fn progress_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

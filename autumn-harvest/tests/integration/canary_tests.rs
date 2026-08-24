@@ -259,6 +259,7 @@ fn build_pool(url: &str) -> DbPool {
 
 fn canary_wf_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         name: CANARY_WF,
@@ -286,6 +287,7 @@ fn canary_wf_info() -> WorkflowInfo {
 
 fn normal_wf_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         name: NORMAL_WF,

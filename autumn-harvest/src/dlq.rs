@@ -434,6 +434,17 @@ pub struct NewDeadLetterEntry {
 
 /// Insert a task into the dead-letter queue and return the generated DLQ entry ID.
 ///
+/// Denormalizes `workflow_name` and the resolved per-tenant `quota_key` (issue
+/// #946) onto the DLQ row itself, via a single indexed point lookup keyed on
+/// `entry.workflow_exec_id`. This mirrors the `owner`/`severity` denormalization
+/// precedent (issue #372): `max_dead_letters` quota accounting must never
+/// depend on the originating execution row still existing once retention
+/// (issue #737) collects it, and resolving it centrally here (rather than
+/// requiring every one of `dead_letter()`'s many call sites to pass it in)
+/// guarantees every DLQ insertion path gets correct quota bookkeeping for
+/// free. When `workflow_exec_id` is `None` (a non-workflow-scoped task), both
+/// columns are left `NULL`.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] on insert failure.
@@ -442,6 +453,21 @@ pub async fn dead_letter(
     entry: &NewDeadLetterEntry,
 ) -> HarvestResult<Uuid> {
     use crate::schema::harvest_dead_letters;
+    use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+
+    let (workflow_name, quota_key): (Option<String>, Option<String>) =
+        if let Some(exec_id) = entry.workflow_exec_id {
+            exec_dsl::harvest_workflow_executions
+                .find(exec_id)
+                .select((exec_dsl::workflow_name, exec_dsl::quota_key))
+                .first::<(String, Option<String>)>(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?
+                .map_or((None, None), |(name, key)| (Some(name), key))
+        } else {
+            (None, None)
+        };
 
     let row = NewDeadLetter {
         original_task_id: entry.original_task_id,
@@ -454,6 +480,8 @@ pub async fn dead_letter(
         attempts: entry.attempts,
         owner: entry.owner.as_deref(),
         severity: entry.severity.as_deref(),
+        workflow_name: workflow_name.as_deref(),
+        quota_key: quota_key.as_deref(),
     };
 
     let inserted: Vec<Uuid> = diesel::insert_into(harvest_dead_letters::table)

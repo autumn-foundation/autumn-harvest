@@ -583,6 +583,14 @@ pub struct WorkflowMetadata {
     pub sla: Option<std::time::Duration>,
     /// Declared workflow-type retry policy default (issue #523).
     pub retry_policy: Option<crate::policy::RetryPolicy>,
+    /// Declared per-tenant resource quota policy (issue #946), enforced at
+    /// admission inside `start_or_load_workflow_execution_collect` -- the
+    /// completion-trigger start path (both the same-shard inline start and
+    /// the cross-shard outbox relay) funnels through that same function, so
+    /// mirroring this field here is what makes a completion-trigger-started
+    /// workflow observe its declared quota just like every other
+    /// registry-aware start path.
+    pub quota: Option<crate::quota::QuotaPolicy>,
 }
 
 #[cfg(feature = "db")]
@@ -745,6 +753,23 @@ enum RelayOutcome {
     /// recorded the `harvest.admission.blocked` count (issue #618, PR #1014), so the
     /// relay does NOT re-record it — `reason` is kept only for the tracing log.
     Blocked { reason: String },
+    /// A declared per-tenant quota (issue #946, Task #7 hardening) is exhausted
+    /// on the target at relay time. Unlike `Blocked` (an operator-lifted
+    /// admission gate, with no natural "retry later" cadence, so the row is
+    /// dropped) this is TEMPORARY -- the tenant's usage frees up as an
+    /// existing execution completes or is deleted -- so the outbox row is
+    /// left claimable (neither deleted nor the fires row touched) rather than
+    /// dropped or propagated as an error. `enforce_completion_triggers_outbox`
+    /// naturally re-attempts an unclaimed row on its next scan; the core
+    /// start primitive already recorded `harvest.quota.rejected` inside
+    /// `start_or_load_workflow_execution_collect`, so the relay does NOT
+    /// re-record it here.
+    QuotaBlocked {
+        key: String,
+        resource: crate::quota::QuotaResource,
+        limit: u64,
+        current: u64,
+    },
 }
 
 /// Run the cross-shard completion-trigger relay's start/block decision through the
@@ -894,6 +919,35 @@ async fn relay_gate_checked_start(
                     .map_err(crate::error::database_error)?;
                     Ok(RelayOutcome::Blocked { reason })
                 }
+                // issue #946 (Task #7 hardening): a declared per-tenant quota
+                // is exhausted on the target at relay time. Must be matched
+                // BEFORE the generic `Err(e)` arm below: that arm propagates
+                // via `?` out of this whole claim transaction, which would
+                // (a) abort this relay attempt for no better reason than a
+                // TEMPORARY per-tenant condition and (b) -- since this
+                // function is called in a loop from
+                // `enforce_completion_triggers_outbox`, itself one of many
+                // `?`-chained scanner duties inside `enforce_timeouts_once`
+                // -- starve every OTHER completion-trigger relay this tick
+                // and every LATER scanner duty (history-ceiling enforcement,
+                // broken-session/mutex-lease reclaim, start-idempotency
+                // sweep, ...) on every tick for as long as this one
+                // quota-blocked target sits at the head of the outbox scan.
+                // Leave the row claimable (neither delete nor touch fires) so
+                // a later scan re-attempts it once the target's usage frees
+                // up.
+                Err(crate::error::HarvestError::QuotaExceeded {
+                    key,
+                    resource,
+                    limit,
+                    current,
+                    ..
+                }) => Ok(RelayOutcome::QuotaBlocked {
+                    key,
+                    resource,
+                    limit,
+                    current,
+                }),
                 Err(e) => Err(e),
                 Ok(_started) => {
                     // Fresh start OR an idempotent attach to a still-active run:
@@ -935,6 +989,25 @@ async fn relay_gate_checked_start(
             tracing::info!(
                 reason = %reason,
                 "[completion_trigger] cross-shard relay blocked by an admission gate on the real target queue; dropped the outbox row"
+            );
+        }
+        RelayOutcome::QuotaBlocked {
+            key,
+            resource,
+            limit,
+            current,
+        } => {
+            // `harvest.quota.rejected` was already recorded by the core start
+            // primitive inside `start_or_load_workflow_execution_collect`; the
+            // relay does NOT re-record it (issue #946, mirrors the `Blocked`
+            // arm's no-double-count precedent above).
+            tracing::debug!(
+                outbox_id = %outbox_id,
+                quota_key = %key,
+                resource = %resource,
+                limit,
+                current,
+                "[completion_trigger] cross-shard relay blocked by a per-tenant quota on the target; row left claimable for a later scan"
             );
         }
     }
@@ -1143,6 +1216,7 @@ pub fn evaluate_triggers_for_execution<'a>(
 
         let execution = execs_dsl::harvest_workflow_executions
             .find(exec_id.as_uuid())
+            .select(WorkflowExecution::as_select())
             .first::<WorkflowExecution>(conn)
             .await
             .optional()

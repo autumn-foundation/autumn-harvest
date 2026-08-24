@@ -4739,6 +4739,31 @@
     },
     {
       "method": "GET",
+      "path": "/admin/quotas",
+      "category": "admin",
+      "read_only": true,
+      "description": "List usage-vs-limit for every resolved `(workflow_name, quota_key)` pair with declared per-tenant resource quotas (issue #946). Each entry reports the current active-execution count, aggregate history bytes, and dead-letter count for the key against the workflow type's currently-registered `QuotaPolicy` limits. Admin-gated: like `/admin/concurrency`, `/admin/debounce`, and `/admin/start-throttle`, the quota_key resolves from user/tenant-derived input fields, so an unauthenticated caller could otherwise enumerate tenant identifiers across the fleet.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "quotas",
+          "status",
+          "unavailable_shards"
+        ],
+        "notes": "Quota enforcement is shard-local by design (issue #946 AC8): the same (workflow_name, quota_key) pair can carry independent usage on every shard a tenant's traffic happens to land on, since shard routing hashes on workflow_id, not the quota key -- so the effective cap across the whole fleet is per-shard-limit multiplied by shards touched. Each entry in `quotas` therefore reports both a fleet-wide `usage` object (active_executions, history_bytes, dead_letters, summed across shards for convenience) AND a `shards` array of per-shard objects {shard_id, active_executions, history_bytes, dead_letters} so an operator can see exactly which shard(s) a tenant is actually capped on. `limits` reports the workflow type's CURRENTLY registered QuotaPolicy caps (max_active_executions, max_history_bytes, max_dead_letters; each null when uncapped or the workflow type declares no quota policy at all) -- resolved live against the registry, not persisted with the usage rows, so an edited policy is reflected immediately rather than against a stale snapshot. An unreachable shard degrades the response to `status: \"partial\"` (naming it in `unavailable_shards`) rather than failing the whole read; usage totals then reflect only the reachable shards and are a lower bound."
+      },
+      "error_responses": [
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/batches/pending",
       "category": "workflow",
       "read_only": true,

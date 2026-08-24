@@ -148,6 +148,14 @@ pub const THROTTLE_FIRE_PER_KEY_CAP: i64 = 10;
 #[cfg(feature = "db")]
 const GATE_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
 
+/// Re-defer backoff for a row blocked by an exhausted per-tenant quota
+/// (issue #946) at fire time — same value and same rationale as
+/// [`GATE_REDEFER_BACKOFF`] (a separate constant purely for the log/intent
+/// clarity of naming the two distinct block causes independently; nothing
+/// depends on them staying numerically equal).
+#[cfg(feature = "db")]
+const QUOTA_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
+
 /// Maximum allowed byte length for a resolved throttle key.
 ///
 /// Keys longer than this are rejected at admission with
@@ -1141,6 +1149,43 @@ async fn fire_claimed_throttle_row(
                 gate_id = %gate_id,
                 reason = %reason,
                 "throttled start blocked by an admission gate at fire time; \
+                 re-deferred with backoff (row left, token refunded)",
+            );
+            Ok(None)
+        }
+        // issue #946 (Task #7 hardening): a declared per-tenant quota (#946)
+        // is exhausted at fire time. Unlike `AlreadyExists` above this is
+        // TEMPORARY — the tenant's usage can free up as an existing execution
+        // completes or is deleted — so the row is RE-DEFERRED (left, token
+        // refunded, `deferred_at` bumped with backoff), mirroring the
+        // `AdmissionBlocked` arm's exact shape, rather than dropped or
+        // (via a bare `?`) allowed to abort this whole scanner-tick's claim
+        // transaction. Un-caught, that `?` would roll back every OTHER
+        // already-started row in the same batch and propagate out through
+        // `enforce_timeouts_once`, starving every later scanner duty
+        // (history-ceiling enforcement, broken-session/mutex-lease reclaim,
+        // start-idempotency sweep, …) on every tick for as long as one
+        // quota-blocked tenant sits at the head of the claim queue — the
+        // exact "runaway tenant" scenario #946 exists to contain, turned
+        // into a fleet-wide scanner stall instead.
+        Err(crate::error::HarvestError::QuotaExceeded {
+            workflow_name,
+            key,
+            resource,
+            limit,
+            current,
+        }) => {
+            crate::queue::refund_rate_limit_token(conn, &bucket).await?;
+            redefer_throttle_row(conn, row_id, now + QUOTA_REDEFER_BACKOFF).await?;
+            tracing::debug!(
+                workflow_name = %workflow_name,
+                throttle_key = %throttle_key,
+                workflow_id = %workflow_id,
+                quota_key = %key,
+                resource = %resource,
+                limit,
+                current,
+                "throttled start blocked by a per-tenant quota at fire time; \
                  re-deferred with backoff (row left, token refunded)",
             );
             Ok(None)

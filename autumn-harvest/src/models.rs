@@ -209,6 +209,15 @@ pub struct WorkflowExecution {
     /// Metadata only -- never read on replay, never set at insert time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub triage_note: Option<String>,
+    /// Resolved per-tenant quota key (issue #946), stamped at admission time
+    /// from the workflow type's declared `QuotaPolicy::key_expr` resolved
+    /// against the start input. `None` when the workflow type declares no
+    /// quota policy, or the key expression could not be resolved from the
+    /// input. Never read on replay -- purely an admission-time bookkeeping
+    /// column that backs the `harvest_workflow_executions` quota-usage
+    /// aggregate queries in `quota.rs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_key: Option<String>,
 }
 
 /// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /
@@ -292,6 +301,12 @@ pub struct NewWorkflowExecution<'a> {
     /// Optional human/operator attribution for the start (issue #740). `None`
     /// when absent.
     pub started_by: Option<&'a str>,
+    /// Resolved per-tenant quota key (issue #946). `None` when the workflow
+    /// type declares no `QuotaPolicy`, or its key expression could not be
+    /// resolved against the start input. Stamped once at insert time;
+    /// required for the quota-usage aggregate queries in `quota.rs` to find
+    /// this execution's active-executions/history-bytes contribution.
+    pub quota_key: Option<&'a str>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
@@ -749,6 +764,13 @@ pub struct DeadLetter {
     pub failed_at: DateTime<Utc>,
     pub owner: Option<String>,
     pub severity: Option<String>,
+    /// Denormalized workflow type name (issue #946), mirroring the
+    /// owner/severity precedent so quota accounting never depends on the
+    /// originating execution row still existing.
+    pub workflow_name: Option<String>,
+    /// Denormalized resolved quota key (issue #946). `None` when the
+    /// originating workflow type had no declared `QuotaPolicy`.
+    pub quota_key: Option<String>,
 }
 
 /// Insert struct for moving a failed task to the dead-letter queue.
@@ -765,6 +787,11 @@ pub struct NewDeadLetter<'a> {
     pub attempts: i32,
     pub owner: Option<&'a str>,
     pub severity: Option<&'a str>,
+    /// Denormalized workflow type name (issue #946).
+    pub workflow_name: Option<&'a str>,
+    /// Denormalized resolved quota key (issue #946). `None` when the
+    /// originating workflow type had no declared `QuotaPolicy`.
+    pub quota_key: Option<&'a str>,
 }
 
 // ── ExternalTask ──────────────────────────────────────────────────────────────

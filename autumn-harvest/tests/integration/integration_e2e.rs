@@ -719,6 +719,7 @@ pub(crate) async fn load_child_executions_from_url(
 pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -781,6 +782,7 @@ pub(crate) async fn insert_workflow_execution_on_shard(
     // active index.
     let workflow_id = format!("e2e-wf-pinned-{}", Uuid::new_v4().simple());
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -837,6 +839,7 @@ pub(crate) async fn insert_workflow_execution_with_id(
 ) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -1216,6 +1219,7 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -1242,6 +1246,7 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -1276,6 +1281,7 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -1302,6 +1308,7 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -1580,6 +1587,7 @@ fn child_then_continue_as_new_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -1604,6 +1612,7 @@ fn child_then_continue_as_new_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -1718,6 +1727,7 @@ fn typed_child_failure_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -1742,6 +1752,7 @@ fn typed_child_failure_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -2036,6 +2047,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -2269,6 +2281,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -2432,6 +2445,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -2569,6 +2583,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -2719,6 +2734,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -2888,6 +2904,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
     let stats = Arc::new(HeartbeatResumeStats::default());
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -3299,6 +3316,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
+                    quota: None,
                     declared_activities: None,
                     declared_children: None,
                     mcp: false,
@@ -3471,6 +3489,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
+                    quota: None,
                     declared_activities: None,
                     declared_children: None,
                     mcp: false,
@@ -4028,6 +4047,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -4054,6 +4074,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -4080,6 +4101,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -4222,6 +4244,7 @@ fn child_fan_out_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -4248,6 +4271,7 @@ fn child_fan_out_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -4433,6 +4457,7 @@ fn ten_slow_children_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -4459,6 +4484,7 @@ fn ten_slow_children_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -4760,6 +4786,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
 
     let built = HarvestBuilder::new()
         .workflows(vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -5280,6 +5307,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -5413,6 +5441,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -5552,6 +5581,7 @@ async fn insert_named_workflow_execution(
 ) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -5976,6 +6006,7 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -6120,6 +6151,7 @@ async fn worker_continue_as_new_records_own_start_source_referencing_predecessor
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -6247,6 +6279,7 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -7745,6 +7778,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
     let wf_name = "scheduled_instant_workflow";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -7878,6 +7912,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
     let wf_name = "scheduled_slow_workflow";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -7998,6 +8033,7 @@ async fn workflow_schedule_pause_and_resume() {
     let wf_name = "scheduled_pause_resume_workflow";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -8312,6 +8348,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -8495,6 +8532,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
     let make_registry = || {
         Arc::new(HandlerRegistry::new(
             vec![WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -8603,6 +8641,7 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
 
     let result = HarvestBuilder::new()
         .workflows(vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -8975,6 +9014,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -9135,6 +9175,7 @@ async fn circuit_breaker_short_circuits_after_tripping() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -9277,6 +9318,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -9435,6 +9477,7 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
     let wf_name = "overlap_skip_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -9515,6 +9558,7 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
     let wf_name = "overlap_buffer_one_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -9604,6 +9648,7 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
     let wf_name = "overlap_buffer_all_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -9697,6 +9742,7 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
     let wf_name = "overlap_cancel_other_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -9785,6 +9831,7 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
     let wf_name = "overlap_terminate_other_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -9877,6 +9924,7 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
     let wf_name = "overlap_restart_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -10024,6 +10072,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
     let started_at = Utc::now();
     let deadline_at = started_at + execution_timeout;
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
@@ -10506,6 +10555,7 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
 
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -10841,6 +10891,7 @@ fn saga_activity_info(
 /// AC3 e2e — the compensated counter fires exactly once across the many
 /// genuine decision cycles a real worker takes through an activity-backed
 /// unwind, and each compensation activity executes exactly once.
+#[allow(clippy::too_many_lines)] // #946: required quota field tips this pre-existing literal-heavy test to 101 lines
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_saga_unwind_emits_compensated_counter_exactly_once_across_decision_cycles() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -10862,6 +10913,7 @@ async fn worker_saga_unwind_emits_compensated_counter_exactly_once_across_decisi
     );
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -11036,6 +11088,7 @@ fn slow_double_activity<'a>(
 fn windowed_fanout_e2e_registry() -> Arc<HandlerRegistry> {
     let make_wf =
         |name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn| WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -11098,6 +11151,7 @@ async fn insert_named_execution(
 ) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),

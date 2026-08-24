@@ -1130,6 +1130,7 @@ async fn scheduled_tick_supersede_emits_the_counters() {
     });
 
     let info = autumn_harvest::WorkflowInfo {
+        quota: None,
         name: "sched_latest_wins",
         module: "concurrency_supersede_tests",
         handler: noop,
@@ -1462,6 +1463,7 @@ async fn completion_trigger_supersede_emits_the_counters() {
                 input_schema: None,
                 sla: None,
                 retry_policy: None,
+                quota: None,
             },
         );
         *lock = Some(map);

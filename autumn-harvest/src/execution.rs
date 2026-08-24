@@ -429,6 +429,27 @@ fn record_start_gate_block(
     }
 }
 
+/// Emit `harvest.quota.rejected{workflow, resource}` (issue #946) for a fresh
+/// start rejected by a declared per-tenant [`crate::quota::QuotaPolicy`] cap.
+///
+/// Mirrors [`record_start_gate_block`] exactly: prefer the caller-supplied
+/// `metrics` recorder (the live worker/HTTP-request path always has one),
+/// falling back to the process-global admission-metrics recorder the plugin
+/// publishes at boot for the rarer background-scanner call sites that carry
+/// no recorder of their own. The resolved tenant key is deliberately never
+/// passed here -- see [`crate::telemetry::METRIC_QUOTA_REJECTED`] for why.
+fn record_quota_rejected_metric(
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    workflow_name: &str,
+    resource: crate::quota::QuotaResource,
+) {
+    if let Some(m) = metrics {
+        m.record_quota_rejected(workflow_name, resource.as_str());
+    } else if let Some(g) = crate::admission_gate::global_admission_metrics() {
+        g.record_quota_rejected(workflow_name, resource.as_str());
+    }
+}
+
 /// Start a workflow execution or load the existing one, returning both the result
 /// and any deferred completion-trigger starts **without spawning them**.
 ///
@@ -694,6 +715,27 @@ pub async fn start_or_load_workflow_execution_collect(
         .inherited_chain_deadline_at
         .or_else(|| effective_chain_timeout.and_then(|d| target_start_time.checked_add_signed(d)));
 
+    // Resolve the declared per-tenant quota policy (issue #946) from the
+    // process-global workflow metadata mirror -- the same registry-aware
+    // surface `concurrency`/`sla`/`retry_policy` already use to reach a
+    // `WorkflowInfo`'s admission-relevant fields from this core-crate
+    // function, which has no access to the plugin's live `HandlerRegistry`.
+    // `QuotaPolicy` is `Copy`, so this is a cheap read-lock + hashmap lookup,
+    // not a query -- a no-policy workflow pays only this (AC9 "zero default
+    // overhead"). The key is resolved via the SAME dot-path resolver
+    // `ConcurrencyPolicy`/`ThrottlePolicy` use (AC1) -- no second resolver.
+    let quota_policy: Option<crate::quota::QuotaPolicy> =
+        crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
+            .read()
+            .ok()
+            .and_then(|lock| {
+                lock.as_ref()
+                    .and_then(|map| map.get(request.workflow_name))
+                    .and_then(|meta| meta.quota)
+            });
+    let quota_key: Option<String> =
+        quota_policy.and_then(|p| crate::quota::resolve_quota_key(p.key_expr, &request.input));
+
     let row = NewWorkflowExecution {
         continued_from_exec_id: None,
         first_exec_id: None,
@@ -739,6 +781,7 @@ pub async fn start_or_load_workflow_execution_collect(
         start_source: Some(request.start_source.as_str()),
         start_source_ref: request.start_source_ref,
         started_by: request.started_by,
+        quota_key: quota_key.as_deref(),
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
@@ -765,9 +808,10 @@ pub async fn start_or_load_workflow_execution_collect(
         let row = row;
         let enqueue = enqueue.clone();
         let request = request.clone();
-        // `gate`, `metrics`, and `shard_id_value` are all `Copy`, so the
-        // `async |conn|` closure captures them directly from the enclosing
-        // function's environment.
+        let quota_key = quota_key.clone();
+        // `gate`, `metrics`, `shard_id_value`, and `quota_policy` (issue
+        // #946) are all `Copy`, so the `async |conn|` closure captures them
+        // directly from the enclosing function's environment.
         let mut tx_deferred_checks = Vec::new();
 
         // Authoritative locked gate (issue #618, PR #1014). For every
@@ -862,6 +906,57 @@ pub async fn start_or_load_workflow_execution_collect(
                         cap_bytes: request.max_workflow_input_bytes,
                         workflow_type: request.workflow_name.to_string(),
                         activity_name: None,
+                    });
+                }
+            }
+            // Enforce the declared per-tenant resource quota (issue #946),
+            // scoped to the fresh-insert path exactly like the payload cap
+            // above -- an ATTACH to an existing execution never reaches
+            // here, so a reuse-policy attach can never be rejected by a cap
+            // meant to bound admission. `has_any_cap()` false (a declared
+            // `QuotaPolicy` with no `with_max_*` calls) and an unresolvable
+            // key (missing/null/non-object input field, mirroring the
+            // fail-open behavior `concurrency_key IS NULL` already has at
+            // claim time for issue #247) both skip enforcement entirely --
+            // a no-policy workflow pays only the one cheap `Option` check
+            // above (AC9's "zero default overhead").
+            if let Some(policy) = quota_policy
+                && policy.has_any_cap()
+                && let Some(ref key) = quota_key
+            {
+                // Serialize check-then-admit for this key under a
+                // transaction-scoped advisory lock (auto-released at commit
+                // or rollback) so concurrent starts for the same key can't
+                // all observe stale pre-admission usage and jointly
+                // overshoot the cap -- the same race `lock_concurrency_key`
+                // closes for issue #247, under a namespace-disjoint key so
+                // the two primitives' advisory locks can never collide.
+                crate::quota::lock_quota_key(conn, request.workflow_name, key).await?;
+                let mut usage =
+                    crate::quota::load_quota_usage(conn, request.workflow_name, key).await?;
+                // The row inserted above is already RUNNING and therefore
+                // already counted in `usage.active_executions` -- subtract
+                // it back out so `current` reports usage BEFORE this
+                // admission, matching `check_quota`'s documented contract
+                // (and the success metric's "capped at exactly 100": the
+                // 100th admission must observe current=99, not 100).
+                // `history_bytes`/`dead_letters` need no such adjustment:
+                // the just-inserted row has appended no events yet
+                // (`WorkflowStarted` is appended below, AFTER this check)
+                // and has no dead-letter rows of its own.
+                usage.active_executions = usage.active_executions.saturating_sub(1);
+                if let Some(violation) = crate::quota::check_quota(&usage, &policy) {
+                    record_quota_rejected_metric(
+                        metrics,
+                        request.workflow_name,
+                        violation.resource,
+                    );
+                    return Err(HarvestError::QuotaExceeded {
+                        workflow_name: request.workflow_name.to_string(),
+                        key: key.clone(),
+                        resource: violation.resource,
+                        limit: violation.limit,
+                        current: violation.current,
                     });
                 }
             }

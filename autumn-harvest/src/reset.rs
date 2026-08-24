@@ -1410,6 +1410,18 @@ async fn insert_fork_execution(
         start_source: Some(crate::types::StartSource::Reset.as_str()),
         start_source_ref: Some(source_exec_id_str.as_str()),
         started_by: None,
+        // A reset fork is an operator intervention that bypasses every other
+        // admission-time policy in this INSERT (no gate check, no cap
+        // enforcement) -- issue #946 AC3 scopes quota enforcement to
+        // registry-aware *start* paths (plain start, signal-/update-with-start,
+        // batch, schedule tick/backfill, debounce/throttle fires), which does
+        // not include reset. `None` here keeps the fork invisible to quota
+        // accounting rather than silently double-counting it against
+        // whatever key its original admission resolved: `load_quota_usage`'s
+        // `WHERE quota_key = $2` never matches NULL, and `list_quota_usage`
+        // filters `WHERE quota_key IS NOT NULL`, so a reset fork neither
+        // consumes headroom nor is blocked by one.
+        quota_key: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -1684,6 +1696,7 @@ mod tests {
             started_by: None,
             history_bloat_warned_at: None,
             triage_note: None,
+            quota_key: None,
         }
     }
 

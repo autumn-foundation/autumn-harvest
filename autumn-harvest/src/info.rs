@@ -510,6 +510,20 @@ pub struct WorkflowInfo {
     /// later by a scanner as tokens refill. `None` = no throttle; start behavior
     /// is byte-for-byte unchanged.
     pub throttle: Option<crate::throttle::ThrottlePolicy>,
+    /// Optional per-tenant resource quota on aggregate stock — active
+    /// executions, history bytes, and/or dead letters — sharing a resolved
+    /// key (issue #946).
+    ///
+    /// Unlike [`concurrency`](Self::concurrency) (in-flight parallelism) and
+    /// [`throttle`](Self::throttle) (admission rate), quota bounds
+    /// *accumulated* footprint. Checked once at admission, before any
+    /// `WorkflowStarted` event is written; a violated cap surfaces as
+    /// [`HarvestError::QuotaExceeded`](crate::error::HarvestError::QuotaExceeded)
+    /// (HTTP `429`) with no execution created.
+    ///
+    /// `None` = no quota; start behavior is byte-for-byte unchanged (issue
+    /// #946 AC9).
+    pub quota: Option<crate::quota::QuotaPolicy>,
     /// Per-workflow-type override for the workflow-input size cap (issue #252).
     ///
     /// When set, this raises (never lowers) the global `max_workflow_input_bytes`
@@ -632,6 +646,24 @@ impl WorkflowInfo {
     #[must_use]
     pub const fn with_throttle(mut self, policy: crate::throttle::ThrottlePolicy) -> Self {
         self.throttle = Some(policy);
+        self
+    }
+
+    /// Attach a per-tenant resource quota (issue #946).
+    ///
+    /// Fluent builder method — call after the companion function:
+    /// ```rust,ignore
+    /// use autumn_harvest::quota::QuotaPolicy;
+    ///
+    /// .workflows(vec![
+    ///     import_job_info().with_quota(
+    ///         QuotaPolicy::new("input.tenant_id").with_max_active_executions(100),
+    ///     )
+    /// ])
+    /// ```
+    #[must_use]
+    pub const fn with_quota(mut self, policy: crate::quota::QuotaPolicy) -> Self {
+        self.quota = Some(policy);
         self
     }
 
@@ -1605,6 +1637,10 @@ impl DagInfo {
             debounce: None,
             batch: None,
             throttle: None,
+            // DAGs carry no per-tenant quota (issue #946) -- the `#[dag]`
+            // macro has no `quota` attribute and DAG start paths bypass the
+            // registry-aware admission gates quota enforcement runs on.
+            quota: None,
             max_input_bytes: None,
             owner: self.owner,
             runbook_url: self.runbook_url,
@@ -1645,6 +1681,7 @@ impl std::fmt::Debug for WorkflowInfo {
             .field("debounce", &self.debounce)
             .field("batch", &self.batch)
             .field("throttle", &self.throttle)
+            .field("quota", &self.quota)
             .field("max_input_bytes", &self.max_input_bytes)
             .field("owner", &self.owner)
             .field("runbook_url", &self.runbook_url)
@@ -1769,6 +1806,7 @@ mod tests {
             debounce: None,
             batch: None,
             throttle: None,
+            quota: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1802,6 +1840,7 @@ mod tests {
             debounce: None,
             batch: None,
             throttle: None,
+            quota: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1832,6 +1871,7 @@ mod tests {
             debounce: None,
             batch: None,
             throttle: None,
+            quota: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1862,6 +1902,7 @@ mod tests {
             debounce: None,
             batch: None,
             throttle: None,
+            quota: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1897,6 +1938,7 @@ mod tests {
             debounce: None,
             batch: None,
             throttle: None,
+            quota: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1930,6 +1972,7 @@ mod tests {
             debounce: None,
             batch: None,
             throttle: None,
+            quota: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1980,6 +2023,7 @@ mod tests {
             debounce: None,
             batch: None,
             throttle: None,
+            quota: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -2022,6 +2066,7 @@ mod tests {
             debounce: None,
             batch: None,
             throttle: None,
+            quota: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -2061,6 +2106,7 @@ mod tests {
             debounce: None,
             batch: None,
             throttle: None,
+            quota: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -2108,6 +2154,7 @@ mod tests {
             debounce: None,
             batch: None,
             throttle: None,
+            quota: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -2148,6 +2195,7 @@ mod tests {
             debounce: None,
             batch: None,
             throttle: None,
+            quota: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -2183,6 +2231,7 @@ mod tests {
             debounce: None,
             batch: None,
             throttle: None,
+            quota: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -2420,6 +2469,7 @@ mod tests {
             debounce: None,
             batch: None,
             throttle: None,
+            quota: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -2500,6 +2550,7 @@ mod tests {
             debounce: None,
             batch: None,
             throttle: None,
+            quota: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,

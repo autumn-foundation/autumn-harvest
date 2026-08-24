@@ -214,6 +214,7 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
 
     Arc::new(HandlerRegistry::with_state(
         vec![autumn_harvest::info::WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -648,6 +649,7 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
 
     Arc::new(HandlerRegistry::with_state(
         vec![autumn_harvest::info::WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,

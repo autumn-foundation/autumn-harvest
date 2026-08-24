@@ -209,6 +209,7 @@ async fn seed_execution(url: &str, shard: i32, workflow_name: &str, state: &str)
         .expect("connect");
     let wf_id = format!("{workflow_name}-{}", Uuid::new_v4().simple());
     let row = NewWorkflowExecution {
+        quota_key: None,
         id: exec_id.as_uuid(),
         workflow_name,
         workflow_id: &wf_id,

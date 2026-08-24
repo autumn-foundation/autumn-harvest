@@ -108,6 +108,7 @@ fn iface_workflow<'a>(
 
 fn iface_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -135,6 +136,7 @@ fn iface_info() -> WorkflowInfo {
 
 fn plain_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -164,6 +166,7 @@ fn plain_info() -> WorkflowInfo {
 /// document must have all three arrays empty (FIX 4 / AC3).
 fn empty_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
