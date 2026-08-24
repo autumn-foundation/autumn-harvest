@@ -98,7 +98,7 @@ async fn subscription_renewal(
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(())
+    unreachable!("continue_as_new suspends the run and never resolves")
 }
 
 fn main() {
@@ -108,9 +108,9 @@ fn main() {
     println!("  docs/migrating-from-temporal.md#worked-example");
     println!();
     println!("Deliver the cancel signal over the management API:");
-    println!("  curl -X POST /api/harvest/workflows/{{exec_id}}/signal \\");
+    println!("  curl -X POST /api/harvest/workflows/{{exec_id}}/signal/cancel \\");
     println!("       -H 'Content-Type: application/json' \\");
-    println!("       -d '{{\"signal_name\": \"cancel\", \"payload\": null}}'");
+    println!("       -d 'null'");
     println!();
     println!("Register on a HarvestBuilder:");
     println!("  .workflows(workflows![subscription_renewal])");
@@ -190,7 +190,17 @@ mod tests {
         ];
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
 
-        let result = subscription_renewal(&ctx, SubscriptionState { cycles: 3 }).await;
+        // The cancellation check must precede the only suspending call in
+        // this path (`execute_activity`). If a regression removes that
+        // ordering, the workflow blocks forever on an oneshot channel with
+        // no executor to resolve it. Bound the await so such a regression
+        // fails fast with a clear message, instead of hanging the test.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            subscription_renewal(&ctx, SubscriptionState { cycles: 3 }),
+        )
+        .await
+        .expect("workflow must not suspend when a cancellation was already recorded");
         assert!(
             result.is_ok(),
             "a pre-recorded cancellation must complete the run cleanly: {result:?}"
@@ -205,9 +215,71 @@ mod tests {
         );
     }
 
+    /// The mid-wait cancelled path: `charge_card` already ran, and a
+    /// `cancel` signal arrived while the workflow was suspended on the
+    /// `next-billing-cycle` timer. The module docs above claim the
+    /// `ctx.timer(...)` call itself is the flush point for a signal
+    /// recorded between `TimerStarted` and `TimerFired`. This test proves
+    /// it: the loop must stop, and must not push a `ContinueAsNew`
+    /// command.
+    #[tokio::test]
+    async fn cancellation_recorded_mid_wait_stops_the_loop_before_continuing() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            started_event(json!(SubscriptionState { cycles: 3 })),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge_card".into(),
+                input: json!(3),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("next-billing-cycle"),
+                duration_secs: 30 * 24 * 60 * 60,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::Value::Null,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("next-billing-cycle"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        // Every suspending call in this path (the activity, then the
+        // timer) is already resolved by the recorded history above, so
+        // this replay never touches a live oneshot channel. Bound it
+        // anyway, for the same defense-in-depth reason as the pre-start
+        // test above.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            subscription_renewal(&ctx, SubscriptionState { cycles: 3 }),
+        )
+        .await
+        .expect("workflow must not suspend once the full history has been replayed");
+        assert!(
+            result.is_ok(),
+            "a mid-wait cancellation must complete the run cleanly: {result:?}"
+        );
+
+        let commands = ctx.drain_commands();
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::ContinueAsNew { .. })),
+            "must not continue the loop after observing a mid-wait cancellation: {commands:?}"
+        );
+    }
+
     /// The recorded, non-cancelled history replays deterministically — the
-    /// same guarantee `WorkflowReplayer` gives Temporal's `WorkflowReplayer`
-    /// (same name, different SDK) does.
+    /// same guarantee `WorkflowReplayer` gives Temporal's own
+    /// `WorkflowReplayer` (same name, in the Temporal .NET and PHP SDKs)
+    /// does.
     #[tokio::test]
     async fn non_cancelled_history_replays_deterministically() {
         let outcome = WorkflowTestEnv::new()

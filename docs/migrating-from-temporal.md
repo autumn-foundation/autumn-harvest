@@ -2,11 +2,12 @@
 
 This guide helps you move a Temporal workflow application to autumn-harvest.
 It is for a Rust team that runs Temporal today. It gives an accurate,
-itemized answer to one question: what does it cost to port this workflow?
+itemized answer to one question: what does it cost to port one workflow
+type?
 
 Read [`comparison.md`](comparison.md) first, if you have not chosen harvest
-yet. That page answers *why* you should choose harvest, or *whether* you
-should. This page answers *how* to move.
+yet. That page answers whether you should choose harvest, and why. This
+page answers how to move.
 
 Every claim below links to shipped, verifiable evidence. The evidence is an
 issue number you can open on GitHub, or a file in this repository. A claim
@@ -18,8 +19,8 @@ issue](https://github.com/autumn-foundation/autumn-harvest/issues/new).
 This guide assumes:
 
 - You write your workflows and activities in Rust today. Or your workflows
-  use a non-Rust Temporal SDK, and you plan to rewrite them in Rust as part
-  of the move. Harvest ships a Rust SDK only. See
+  use a non-Rust Temporal SDK. In that case, you plan to rewrite them in
+  Rust as part of the move. Harvest ships a Rust SDK only. See
   [No equivalent yet](#no-equivalent-yet).
 - You want to port workflow *types* one at a time, not all at once. The
   [Dual-run cutover playbook](#dual-run-cutover-playbook) below shows how.
@@ -41,14 +42,14 @@ Use this guide in three steps:
 This guide does **not** cover:
 
 - **Automatic Temporal history import.** Harvest cannot read a Temporal
-  workflow history and resume it. The two engines use different event
-  models. Temporal's `HistoryEvent` and harvest's `WorkflowEvent` are not
-  interchangeable. No conversion between them exists. None is planned. A
-  workflow execution that is in flight on Temporal at cutover stays on
-  Temporal. It runs to completion there and drains from the Temporal side
-  on its own. Harvest starts only *new* executions of the ported workflow
-  type. See the [Dual-run cutover playbook](#dual-run-cutover-playbook) for
-  the sequence.
+  workflow history. It cannot resume one either. The two engines use
+  different event models. Temporal's `HistoryEvent` and harvest's
+  `WorkflowEvent` are not interchangeable. No conversion between them
+  exists. None is planned. A workflow execution that is in flight on
+  Temporal at cutover stays on Temporal. It runs to completion there. It
+  drains from the Temporal side on its own. Harvest starts only *new*
+  executions of the ported workflow type. See the [Dual-run cutover
+  playbook](#dual-run-cutover-playbook) for the sequence.
 - **Automated code migration (codemods).** You port each workflow function
   by hand. Use the [Concept mapping](#concept-mapping) table and the
   [Workflow-porting checklist](#workflow-porting-checklist).
@@ -56,8 +57,8 @@ This guide does **not** cover:
   Temporal only. See [`comparison.md`](comparison.md) for how harvest
   compares to DBOS, Inngest, Hatchet, and Restate.
 - **Building a feature harvest does not have yet.** The [No equivalent
-  yet](#no-equivalent-yet) section names each gap plainly. It does not paper
-  over any of them.
+  yet](#no-equivalent-yet) section names each gap plainly. It does not
+  hide any of them.
 
 ## Concept mapping
 
@@ -101,7 +102,7 @@ the claim yourself.
 | Hand-rolled cancellable/renewable wait (no first-class Temporal primitive) | `ctx.start_timer` / `TimerHandle` | issue #768 |
 | `continueAsNew()` | `ctx.continue_as_new(input)` | Core primitive |
 | Same-workflow-type-only continuation (Temporal requires this) | `ctx.continue_as_new_as` / `ctx.continue_as_new_as_type` (cross-type continuation) | issue #803 |
-| Hand-rolled memo/search-attribute carryover between scheduled runs | `ctx.last_completion_result()` / `ctx.last_error()` | issue #488 |
+| Hand-rolled output/error carryover between scheduled runs | `ctx.last_completion_result()` / `ctx.last_error()` | issue #488 |
 
 ### Child workflows
 
@@ -172,8 +173,9 @@ names each gap plainly. It does not imply a workaround exists.
 - **Multi-region / global namespaces.** Harvest runs against one or more
   Postgres shards. See [`sharding.md`](sharding.md). Harvest does not
   replicate workflow state across geographic regions. It does not fail a
-  region over automatically. This is a real gap for a Temporal deployment
-  that relies on global namespace replication for disaster recovery.
+  region over automatically. Together, these two limits are a real gap for
+  a Temporal deployment that relies on global namespace replication for
+  disaster recovery.
 - **Non-Rust SDKs.** Harvest ships a Rust SDK only. Suppose your Temporal
   workflows are in Go, TypeScript, Java, Python, .NET, or PHP. You rewrite
   them in Rust to move to harvest. No bridge or interop layer exists.
@@ -206,8 +208,9 @@ below is a concrete task, not a vague warning.
    `#[derive(serde::Serialize, serde::Deserialize)]` to each type that
    crossed a Temporal activity or workflow boundary. Suppose you used a
    custom Temporal payload codec for compression or encryption. Harvest's
-   equivalent is a `PayloadCodec` (issue #608). The two are not the same
-   shape. Port the codec logic, not the wire format.
+   equivalent is a `PayloadCodec`
+   ([ADR-0003](adr/0003-payload-codec-event-boundary.md)). The two are not
+   the same shape. Port the codec logic, not the wire format.
 3. **Translate each retry policy.** Temporal's `RetryPolicy` and harvest's
    `RetryPolicy` cover the same five fields, under different names:
 
@@ -223,7 +226,7 @@ below is a concrete task, not a vague warning.
    `JitterPolicy::None`, `Full`, `Equal`, and `Decorrelated`. Use these if
    your Temporal retry policy used jittered backoff.
 4. **Translate each timeout name.** This is the single most common porting
-   mistake. Two names are inverted between the engines:
+   mistake. The two engines invert the meaning of two timeout names:
 
    | Temporal timeout | Bounds | Harvest equivalent |
    |---|---|---|
@@ -235,11 +238,12 @@ below is a concrete task, not a vague warning.
    | **Workflow Execution Timeout** — bounds **the whole continue-as-new chain** | Every run from the first start to the final completion | `#[workflow(chain_execution_timeout = "...")]` (issue #617) |
 
    Read this table carefully. The two engines name the same pair of concepts
-   in opposite order. Temporal's *Run* Timeout bounds one run — the narrow
-   scope. Its *Execution* Timeout bounds the whole continue-as-new chain —
-   the wide scope. Harvest's naming runs the other way. `execution_timeout`
-   is the narrow one. `chain_execution_timeout` is the wide one. A name
-   match without a check against this table swaps the two.
+   in opposite order. Temporal's *Run* Timeout bounds one run. That is the
+   narrow scope. Its *Execution* Timeout bounds the whole continue-as-new
+   chain. That is the wide scope. Harvest's naming runs the other way.
+   `execution_timeout` is the narrow one. `chain_execution_timeout` is the
+   wide one. Match each name against this table. If you skip this check,
+   you swap the two timeouts.
 5. **Map each Task Queue to a harvest queue.** Temporal's Task Queue is a
    plain string. Both workflow tasks and activity tasks route through it,
    and a worker polls it. Harvest's equivalent is the `queue` attribute
@@ -250,12 +254,12 @@ below is a concrete task, not a vague warning.
 6. **Validate with `WorkflowReplayer` and `WorkflowTestEnv` before you ship.**
    `autumn_harvest::testing::WorkflowReplayer` replays a recorded event
    history against your ported workflow function. It reports whether the
-   function is deterministic — the harvest analogue of Temporal's own
-   replay tester. `autumn_harvest::testing::WorkflowTestEnv` drives a
+   function is deterministic. This is the harvest analogue of Temporal's
+   own replay tester. `autumn_harvest::testing::WorkflowTestEnv` drives a
    workflow function end-to-end without a database. Use it to assert the
-   function's behavior — which activities it calls, what it returns — as a
-   plain `#[tokio::test]`. The [Worked example](#worked-example) below uses
-   both.
+   function's behavior. It checks which activities the function calls, and
+   what it returns, as a plain `#[tokio::test]`. The [Worked
+   example](#worked-example) below uses both.
 
 ## Dual-run cutover playbook
 
@@ -274,25 +278,31 @@ your whole application.
    a realistic set of recorded, or hand-built, histories. Confirm
    `WorkflowTestEnv` covers its main branches.
 3. **Order types by dependency, not by size.** Cut over a leaf workflow type
-   first — one with no child workflows, and no downstream workflow that
-   signals it. Cut over a parent workflow type only after every workflow
-   type it spawns as a child already runs live on harvest. Or cut it over
-   after you confirm the parent tolerates a Temporal child.
+   first. A leaf type has no child workflows, and no downstream workflow
+   that signals it. Cut over a parent workflow type only after every
+   workflow type it spawns as a child already runs live on harvest. Or cut
+   it over after you confirm the parent tolerates a Temporal child.
 4. **Make every shared downstream activity idempotent.** During the cutover
    window, both engines may call the same downstream service for different
-   executions — a payment gateway, an email provider, a database write. Give
-   every such activity a stable, request-scoped idempotency key. Harvest's
+   executions. Examples are a payment gateway, an email provider, and a
+   database write. Give every such activity a stable, request-scoped
+   idempotency key. Harvest's
    `ctx.new_uuid()` (issue #384) mints one deterministically, if you need to
    generate it inside the activity's owning workflow. Or reuse the
    caller-supplied key you already use in Temporal.
 5. **Watch both engines with the same discipline during the window.** Keep
    your existing Temporal dashboards running. Stand up the equivalent
-   harvest dashboards before you flip the first flag. [`comparison.md`](comparison.md)
-   covers the observability surface. See also [`telemetry.md`](telemetry.md)
-   for the OpenTelemetry surface, and [`docs/dashboards/`](dashboards/) for
-   the starter Grafana pack. A per-type cutover means each type's error rate
-   and latency stay directly comparable across the two engines for the
-   whole window.
+   harvest dashboards before you flip the first flag. On the harvest side,
+   watch the `harvest.workflow.terminal` counter for the ported type's
+   completed/failed/cancelled rate. Also watch its dead letter queue (DLQ)
+   for tasks that ran out of retries. On the Temporal side, watch the
+   open-workflow count for that type through Temporal's own visibility API.
+   It should trend to zero as harvest takes over new starts.
+   [`comparison.md`](comparison.md) covers the wider observability surface.
+   See also [`telemetry.md`](telemetry.md) for the OpenTelemetry surface,
+   and [`docs/dashboards/`](dashboards/) for the starter Grafana pack. A
+   per-type cutover means each type's error rate and latency stay directly
+   comparable across the two engines for the whole window.
 6. **Keep a rollback path per type.** A flag flipped back sends new starts
    to Temporal again. An in-flight harvest execution of that type still runs
    to completion on harvest. The flip does not migrate it back, for the same
@@ -300,10 +310,10 @@ your whole application.
    back once you deregister its Temporal worker code. Keep that worker
    deployed, even if idle, until you are certain you will not roll back.
 7. **Retire the Temporal worker for a type only after its queue is empty on
-   both sides.** Confirm zero in-flight Temporal executions of that type —
-   Temporal's own visibility API answers this. Confirm zero pending harvest
-   starts still routed to Temporal for it. Then remove that type's Temporal
-   worker code.
+   both sides.** Confirm zero in-flight Temporal executions of that type.
+   Temporal's own visibility API can confirm this count. Confirm zero
+   pending harvest starts still routed to Temporal for it. Then remove that
+   type's Temporal worker code.
 
 ## Worked example
 
@@ -402,7 +412,7 @@ async fn subscription_renewal(
 
     // Registration only stores the handler -- it does not dispatch inline.
     // This cheap deterministic primitive call flushes it before the check
-    // below, since nothing else runs first.
+    // below, since nothing else runs first. See the module docs above.
     let _ = ctx.system_now();
 
     // A cancellation already recorded before this run started stops the
@@ -427,12 +437,14 @@ async fn subscription_renewal(
         return Ok(());
     }
 
-    let next = SubscriptionState { cycles: state.cycles + 1 };
+    let next = SubscriptionState {
+        cycles: state.cycles + 1,
+    };
     ctx.continue_as_new(serde_json::to_value(next).map_err(|e| e.to_string())?)
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(())
+    unreachable!("continue_as_new suspends the run and never resolves")
 }
 ```
 
@@ -444,19 +456,19 @@ async fn subscription_renewal(
   `ctx.register_signal_handler_raw` (issue #546). It is also push-based, and
   also fire-and-forget. Do not reach for `wait_for_signal` here. That is
   harvest's *pull*-based primitive. It matches Temporal's `condition()`
-  helper instead, and it blocks one code point rather than reacting from
-  anywhere. See the [Signals](#signals) row above.
+  helper instead. It blocks one code point, rather than reacting from
+  anywhere in the workflow body. See the [Signals](#signals) row above.
 - **Dispatch timing.** Temporal's `setHandler` callback fires as soon as the
   signal arrives, mid-await. Harvest's push handler dispatches only on the
   *next* history-consulting call the workflow body makes. A signal recorded
   before this run even started needs a flush point before the first
   `cancelled` check, since nothing else has run yet. The port adds
   `ctx.system_now()` for exactly this. It is a cheap deterministic
-  primitive call, not an activity or a timer, so it costs nothing. A signal
-  that arrives during the later `ctx.timer(...)` wait needs no such extra
-  call. That wait is itself the flush point, and dispatches the moment it
-  resolves. See the module documentation in the worked example file for the
-  full dispatch-timing contract.
+  primitive call, not an activity or a timer. It costs nothing to call. A
+  signal that arrives during the later `ctx.timer(...)` wait needs no such
+  extra call. That wait is itself the flush point. It dispatches the
+  handler the moment it resolves. See the module documentation in the
+  worked example file for the full dispatch-timing contract.
 - **Activity dispatch.** `proxyActivities` plus a plain function call
   becomes `ctx.execute_activity(&charge_card_info(), input)`. The
   `#[activity]` macro generates the `charge_card_info()` function. It
@@ -466,8 +478,9 @@ async fn subscription_renewal(
   harvest timer needs a stable `id` string. Temporal's sleep needs no name.
   Reuse a descriptive constant, as in `"next-billing-cycle"` above.
 - **`continueAsNew`.** Both sides carry the incremented `cycles` value
-  forward, and reset the event history. Harvest's `continue_as_new` takes a
-  `serde_json::Value`. The state is serialized explicitly at the call site.
+  forward. Both sides reset the event history. Harvest's `continue_as_new`
+  takes a `serde_json::Value`. You serialize the state explicitly at the
+  call site.
 
 Read the full worked example file for the embedded tests. One test exercises
 the non-cancelled path: the activity runs, and the loop continues. One test
@@ -483,9 +496,9 @@ cargo test -p autumn-harvest --no-default-features --features testing \
 
 ## Related
 
-- [`comparison.md`](comparison.md) explains why, or whether, you should
-  choose harvest over Temporal, DBOS, Inngest, Hatchet, or Restate. It uses
-  the same evidence-linked standard as this page.
+- [`comparison.md`](comparison.md) explains whether you should choose
+  harvest over Temporal, DBOS, Inngest, Hatchet, or Restate, and why. It
+  uses the same evidence-linked standard as this page.
 - [`docs/getting-started/`](getting-started/) is the from-scratch tutorial.
   Use it if you are learning harvest's primitives for the first time,
   instead of porting existing Temporal code.

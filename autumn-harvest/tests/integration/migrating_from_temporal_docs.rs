@@ -280,6 +280,47 @@ fn ci_workflow_exercises_the_worked_example() {
     );
 }
 
+/// The guide embeds the harvest side of the worked example as a Rust code
+/// fence, next to the Temporal TypeScript original, so a reader can compare
+/// the two without leaving the page. A copy that drifts from the real,
+/// compiling file is worse than no copy at all -- it teaches the wrong
+/// thing. Keep the embedded snippet byte-identical to the source of truth.
+#[test]
+fn worked_example_code_block_matches_the_real_file() {
+    let guide = read_doc(GUIDE_PATH);
+    let example = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join(format!("{EXAMPLE_NAME}.rs")),
+    )
+    .unwrap_or_else(|error| panic!("failed to read examples/{EXAMPLE_NAME}.rs: {error}"));
+
+    let doc_start = "### Harvest (Rust)\n\n```rust\n";
+    let start = guide.find(doc_start).unwrap_or_else(|| {
+        panic!("expected to find the '{doc_start:?}' code fence in {GUIDE_PATH}")
+    }) + doc_start.len();
+    let end = guide[start..]
+        .find("\n```\n")
+        .unwrap_or_else(|| panic!("expected the Harvest (Rust) code fence to close"));
+    let doc_snippet = guide[start..start + end].trim();
+
+    let file_start = "use autumn_harvest::prelude::*;";
+    let file_start_idx = example
+        .find(file_start)
+        .unwrap_or_else(|| panic!("expected {EXAMPLE_NAME}.rs to start with {file_start:?}"));
+    let file_end_marker = "\n\nfn main()";
+    let file_end_idx = example[file_start_idx..]
+        .find(file_end_marker)
+        .unwrap_or_else(|| panic!("expected a {file_end_marker:?} marker after the workflow fn"));
+    let file_snippet = example[file_start_idx..file_start_idx + file_end_idx].trim();
+
+    assert_eq!(
+        doc_snippet, file_snippet,
+        "the guide's embedded `### Harvest (Rust)` code block has drifted from the real \
+         examples/{EXAMPLE_NAME}.rs file -- keep the two byte-identical"
+    );
+}
+
 fn is_separator_row(line: &str) -> bool {
     let inner = line.trim_matches('|');
     !inner.is_empty()
