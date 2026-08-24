@@ -222,9 +222,21 @@ below is a concrete task, not a vague warning.
    | `maximumInterval` | `max_interval` |
    | `nonRetryableErrorTypes` | `non_retryable_errors` |
 
-   Copy each value across. Harvest also supports the same jitter shapes:
-   `JitterPolicy::None`, `Full`, `Equal`, and `Decorrelated`. Use these if
-   your Temporal retry policy used jittered backoff.
+   Check `maximumAttempts` before you copy it. In Temporal, `0` and an
+   omitted field both mean unlimited attempts. Harvest has no such value.
+   `max_attempts` is always a hard, finite cap. A copy of `0` does not
+   give you unlimited retries. It gives you zero. `RetryPolicy::next_delay`
+   stops the first retry once the attempt count reaches `max_attempts`, so
+   a cap of `0` blocks even that first retry. Leaving the field out is not
+   safe either. Harvest's default cap is `3`. Set an explicit
+   `max_attempts` for every activity that used Temporal's unlimited-retry
+   pattern. If the activity should keep retrying until an outer deadline,
+   not until it runs out of attempts, set a high `max_attempts`. Pair it
+   with `schedule_to_close` (checklist item 4, below) as the real bound.
+
+   Harvest also supports the same jitter shapes: `JitterPolicy::None`,
+   `Full`, `Equal`, and `Decorrelated`. Use these if your Temporal retry
+   policy used jittered backoff.
 4. **Translate each timeout name.** This is the single most common porting
    mistake. The two engines invert the meaning of two timeout names:
 
@@ -335,12 +347,38 @@ your whole application.
    forever through `continueAsNew`, and nothing inside that loop ever
    completes it. The [Worked example](#worked-example) below is exactly
    this shape: it keeps renewing a subscription until a `cancel` signal
-   arrives. Do not wait for such an execution to drain. Hand its state
-   across explicitly, one execution at a time. Query its current state
-   from Temporal. Cancel the Temporal execution. Start a fresh harvest
-   execution, carrying that state forward as its input. Treat this as a
-   deliberate cutover step for each entity, not a bulk migration. Each one
-   is a live, stateful run. It is not disposable work.
+   arrives. Do not wait for such an execution to drain.
+
+   Do not take a live snapshot of its state. Do not start harvest from
+   that snapshot either. A query against a running execution can go stale
+   immediately. The execution can still advance after you read it. It can
+   process a new signal. It can finish an activity that changes its
+   state. Cancellation does not close this gap. Temporal delivers a
+   cancellation as an interruption at the workflow's next await point. It
+   does not stop an activity already in flight. It does not undo a side
+   effect that activity already committed. Either race can start harvest
+   from a stale value. It can repeat a side effect the old execution
+   already performed. In the worked example, that means charging the same
+   billing cycle twice.
+
+   Hand the state across through the workflow's own signal instead. Use
+   the same `cancel` signal shown below. Send it. Wait for the execution
+   to reach `COMPLETED` on its own. It reaches that state at the point in
+   its loop where it already checks the signal. Only then read its final
+   state. Read it through a query against that now-closed execution, or
+   through its return value, if the workflow returns one. A closed
+   execution cannot advance further. This read cannot go stale. A query
+   against a running execution can. Start the harvest execution only
+   after that read, carrying the result forward as its input. The defined
+   point can sit behind a long wait, such as the worked example's 30-day
+   timer. The handoff then takes that long too. Accept that wait. Or,
+   before you begin this type's cutover, change the workflow to race the
+   wait against the signal instead. Harvest's `ctx.receive_signal_timeout`
+   (issue #476) is the primitive for that race on the harvest side.
+
+   Treat each entity's handoff as a deliberate cutover step, not a bulk
+   migration. Each one is a live, stateful run. It is not disposable
+   work.
 
 ## Worked example
 
