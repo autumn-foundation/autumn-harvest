@@ -2838,6 +2838,8 @@ async fn zz_capture_concurrency_key_claim_evidence() {
     // contention -- it isolates the correlated-subquery cost, not a change
     // in which rows are claimable.
     {
+        const HOT_CONTENTION_ROWS: i64 = 2_000;
+
         let scenario = Scenario {
             backlog: headline_scenario().backlog,
             claimers: 1,
@@ -2848,7 +2850,6 @@ async fn zz_capture_concurrency_key_claim_evidence() {
         let seeded = db::seed(&mut conn, scenario).await;
         let queues = db::queue_names(scenario);
 
-        const HOT_CONTENTION_ROWS: i64 = 2_000;
         diesel::sql_query(format!(
             "WITH keys AS ( \
                  SELECT concurrency_key, task_type, \
