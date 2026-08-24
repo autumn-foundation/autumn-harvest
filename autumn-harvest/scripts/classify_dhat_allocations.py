@@ -46,15 +46,43 @@ meaningful share of allocations and misattributing them to "other".
    between) -- this is fundamentally a *cloning* cost caused by
    `trace_snapshot`, not an *internal-matching* cost caused by
    `HistoryMatcher`, so it is attributed to its true origin.
-3. `replay_prefix_or_context_build` -- `replay_prefix`,
+3. `history_matcher_internals` -- `HistoryMatcher`, `match_history`, or
+   `drive_query_replay` on the stack -- checked AHEAD of bucket 4 below,
+   not after, because these frames are always *nested inside*
+   `replay_prefix`'s own `drive_query_replay_async(...).await` (confirmed
+   by reading `replay_prefix`'s body in `debugger.rs`), so any stack
+   carrying both markers has this as the more specific, innermost cause --
+   the identical precedence principle bucket 2 above already applies to
+   `trace_snapshot_prefix_clone` vs. its descendants. This is the actual
+   replay-matching machinery that walks the (already-owned,
+   already-cloned) prefix and decides what the workflow function does
+   next.
+
+   KNOWN LIMITATION, empirically confirmed rather than assumed: in this
+   workspace's default `cargo bench` release profile (`debug = false`,
+   confirmed unchanged even after rebuilding with `-C debuginfo=2`), every
+   function this bucket's markers name is fully inlined away and never
+   appears as its own frame in DHAT's resolved call stack -- grepping the
+   raw `ftbl` for `HistoryMatcher` / `match_history` / `drive_query_replay`
+   / `replay_prefix` / `match_activity` / `scan_activity_terminal` returns
+   zero matches at every swept input size, with or without debug info, and
+   swapping this bucket's precedence against bucket 4's changes nothing
+   (both orderings observe the same empty marker set on every captured
+   stack). So a `0` count here means "unobservable by this methodology",
+   not "free" -- any allocation this code performs is silently folded into
+   whichever caller frame survived inlining (most plausibly
+   `trace_snapshot::{{closure}}`, landing in bucket 2, or the
+   workflow-driving frames feeding bucket 5). See
+   `docs/performance-debugger-trace.md`'s "Allocation-site attribution"
+   section for the full investigation this note summarizes.
+4. `replay_prefix_or_context_build` -- `replay_prefix`,
    `for_replay_canary_with_state`, or `register_declarative_handlers` on the
-   stack (and bucket 2 didn't already match). Per-step `WorkflowContext`
+   stack (and buckets 2-3 didn't already match). Per-step `WorkflowContext`
    construction and declarative-handler registration overhead, distinct
-   from the prefix clone above.
-4. `history_matcher_internals` -- `HistoryMatcher`, `match_history`, or
-   `drive_query_replay` on the stack. The actual replay-matching machinery
-   that walks the (already-owned, already-cloned) prefix and decides what
-   the workflow function does next.
+   from the prefix clone above. In practice this bucket is populated almost
+   entirely via `for_replay_canary_with_state`/`register_declarative_handlers`:
+   `replay_prefix` itself is also inlined away (see bucket 3's note above)
+   and never survives as its own frame either.
 5. `workflow_reexecution` -- `sequential_workflow` or `activity_payload` on
    the stack (build_history already excluded by bucket 1's precedence).
    This is the WORKFLOW'S OWN CODE re-running from the top of its `for`
@@ -85,18 +113,25 @@ def classify(joined: str) -> str:
         "to_vec" in joined or "Clone" in joined or "clone" in joined
     ):
         return "trace_snapshot_prefix_clone"
-    if (
-        "replay_prefix" in joined
-        or "for_replay_canary_with_state" in joined
-        or "register_declarative_handlers" in joined
-    ):
-        return "replay_prefix_or_context_build"
+    # Checked BEFORE replay_prefix_or_context_build: HistoryMatcher /
+    # match_history / drive_query_replay frames are always nested *inside*
+    # replay_prefix's own drive_query_replay_async(...).await, so on a
+    # stack carrying both markers this is the more specific, innermost
+    # cause -- see bucket 3's docstring note above for why this precedence
+    # is, empirically, unreachable in a release-profile capture regardless
+    # of which way it is ordered (both markers are fully inlined away).
     if (
         "HistoryMatcher" in joined
         or "match_history" in joined
         or "drive_query_replay" in joined
     ):
         return "history_matcher_internals"
+    if (
+        "replay_prefix" in joined
+        or "for_replay_canary_with_state" in joined
+        or "register_declarative_handlers" in joined
+    ):
+        return "replay_prefix_or_context_build"
     if "sequential_workflow" in joined or "activity_payload" in joined:
         return "workflow_reexecution"
     if "core::fmt" in joined or "alloc::fmt" in joined:

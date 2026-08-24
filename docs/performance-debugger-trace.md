@@ -1,12 +1,13 @@
 # `ReplayDebugger::trace_snapshot`: quantifying the documented O(N²) prefix-replay cost, and why the obvious local fix is unsafe
 
 This note profiles `autumn_harvest::debugger::ReplayDebugger::trace_snapshot`
-(issue #949, the engine behind the `harvest debug` time-travel replay
-debugger) against a realistic workload, turns its already-documented `O(N²)`
-cost into precise, reproducible numbers, and investigates whether a local
-(non-architectural) constant-factor reduction is available. It is not: the
-one plausible local candidate is ruled out with concrete source evidence for
-a real correctness hazard, not merely an unmeasured or below-floor gain.
+(issue #949's **library** replay-debugger arm — see "Scope" below, not the
+packaged `harvest debug` CLI subcommand) against a realistic workload, turns
+its already-documented `O(N²)` cost into precise, reproducible numbers, and
+investigates whether a local (non-architectural) constant-factor reduction is
+available. It is not: the one plausible local candidate is ruled out with
+concrete source evidence for a real correctness hazard, not merely an
+unmeasured or below-floor gain.
 Wall-clock timing is not admissible evidence on this (shared-vCPU) machine —
 every number below is a deterministic instruction or allocation count from
 `valgrind --tool=callgrind` / `valgrind --tool=dhat`, reproducible bit-for-bit
@@ -32,16 +33,59 @@ and `docs/replay-debugger.md`'s "Cost" section frames it qualitatively:
 > replay each history once.
 
 So the complexity class was already known and already has a sanctioned
-mitigation (`DEFAULT_MAX_STEPS = 500`, `--max-steps` on the CLI). Neither
-existing doc gives concrete numbers, mechanism attribution, or answers
-whether the constant factor behind that class is addressable without raising
-or lowering the cap. That is what this note adds: an empirical confirmation
-of the scaling curve across four input sizes, a precise allocation-site
-attribution of what dominates the constant factor, and — because the
-allocation-site data makes an "obvious" local fix look tempting — a
-source-confirmed explanation of exactly why that fix would silently corrupt
-results, closing off a plausible-sounding but unsound future change before
-anyone attempts it.
+mitigation (`DEFAULT_MAX_STEPS = 500`, or `.max_steps(...)` for a library
+caller — see "Scope" immediately below for why this is a library-side knob,
+not a CLI flag). Neither existing doc gives concrete numbers, mechanism
+attribution, or answers whether the constant factor behind that class is
+addressable without raising or lowering the cap. That is what this note
+adds: an empirical confirmation of the scaling curve across four input
+sizes, a precise allocation-site attribution of what dominates the constant
+factor, and — because the allocation-site data makes an "obvious" local fix
+look tempting — a source-confirmed explanation of exactly why that fix would
+silently corrupt results, closing off a plausible-sounding but unsound
+future change before anyone attempts it.
+
+## Scope: the library API, not the `harvest debug` CLI
+
+`ReplayDebugger::trace_snapshot` is one of **two arms** `docs/replay-debugger.md`
+documents, and this note profiles only the one that requires an embedder to
+register their own compiled `#[workflow]` handler
+(`ReplayDebugger::register_fn`/`.trace_json`/`.trace_snapshot`). **The shipped
+`harvest debug replay` CLI subcommand never reaches this code path at all** —
+confirmed by reading its entry point
+(`autumn-harvest-cli/src/debug.rs::run_replay`), which unconditionally builds
+its trace via:
+
+```rust
+let trace = ReplayTrace::from_history_capped(
+    snapshot.workflow_name.clone(),
+    snapshot.execution_id,
+    &snapshot.events,
+    max_steps.unwrap_or(usize::MAX),
+);
+```
+
+— the **handler-free** projection `debugger.rs`'s own `# Cost` module-doc
+section states is "always O(N) and needs no registered code at all". The
+packaged `harvest` binary is statically linked and cannot register arbitrary
+embedder workflow functions (`docs/replay-debugger.md`'s "The two arms"
+section states this constraint directly), so it structurally cannot invoke
+the prefix-replay path profiled below; grepping the whole workspace confirms
+`trace_snapshot`/`trace_json` are called only from library consumers —
+tests, examples, and this benchmark — never from `autumn-harvest-cli`'s
+production `run_replay`/`debug_tui` code. `harvest debug replay --max-steps N`
+is a real CLI flag, but it caps the CLI's own (cheap, O(N)) handler-free
+walk, not the O(N²) cost this note measures.
+
+So every workload-configuration claim below (`ReplayDebugger::new()` at
+"library defaults", `DEFAULT_MAX_STEPS`) describes **an embedder calling
+`ReplayDebugger` directly from their own Rust program**, not a default or
+flag-reachable behavior of the packaged `harvest debug` command. An earlier
+draft of this note conflated the two and claimed this workload models "a
+real `harvest debug` invocation" — that framing was wrong and is corrected
+here; the underlying instruction/allocation numbers are unaffected by the
+correction (they were always measuring the library API), only their scope
+was mis-stated.
 
 ## Workload
 
@@ -64,8 +108,11 @@ item with a nested `items` array — `serde_json::Value::Object` is
 `BTreeMap`'s clone machinery).
 
 `ReplayDebugger::new()` is driven with **library defaults** — no
-`.max_steps()` override, so `DEFAULT_MAX_STEPS = 500` applies, exactly what
-a real `harvest debug` invocation gets without extra flags. Every swept `n`
+`.max_steps()` override, so `DEFAULT_MAX_STEPS = 500` applies: exactly what
+an embedder gets from `ReplayDebugger::new()` without an explicit
+`.max_steps(...)` override (see "Scope" above — the packaged `harvest debug`
+CLI never reaches this code path, so "default" here means the library's
+default, not the CLI's). Every swept `n`
 (`20, 40, 80, 160` → `41, 81, 161, 321` events) stays under that cap, so no
 run in the sweep is truncated; the harness asserts `!trace.truncated` and
 `trace.steps.len() == total_events` to guarantee it is measuring the real
@@ -239,11 +286,35 @@ because both scale at the same asymptotic order.
 `history_matcher_internals` (`HistoryMatcher`/`match_history`/
 `drive_query_replay`'s own bookkeeping — walking an already-owned prefix and
 deciding what command comes next) is **exactly 0 bytes at every measured
-size**: matching an already-recorded event against expected command state is
-comparatively cheap pointer/enum-tag work next to allocating, cloning,
-comparing, and dropping whole `Value` trees, so none of it shows up as its
-own distinguishable allocation site at all — it is fully subsumed into calls
-already attributed to the two dominant buckets above.
+size** — but this is a limit of what the categorizer can observe, not
+evidence that the underlying work is cheap. Confirmed empirically, not
+assumed: (1) grepping the raw DHAT frame table (`ftbl`) for
+`HistoryMatcher`, `match_history`, `drive_query_replay`, `replay_prefix`,
+`match_activity`, and `scan_activity_terminal` returns **zero matches** at
+every swept size — none of these functions appears as its own frame in any
+resolved call stack; (2) swapping this bucket's precedence to check *before*
+`replay_prefix_or_context_build` (on the theory that a stack carrying both
+markers was being misattributed to the wrong, less-specific bucket) changes
+**nothing** — re-running the categorizer against the same captures with the
+swapped order produces byte-for-byte identical output, because there is no
+stack in the data carrying either marker for either ordering to disambiguate
+between; (3) rebuilding the harness with full DWARF debug info
+(`RUSTFLAGS="-C debuginfo=2"`) and re-capturing at `n=80` reproduces the
+identical total (45,300,388 bytes) and the identical zero-match result for
+the same six function names. Together these three independent checks
+confirm the true cause: in this workspace's default `cargo bench` release
+profile, every one of these functions is **fully inlined away** and its call
+frame is physically absent from the runtime stack DHAT captures — no
+debug-info flag can recover a frame that was never emitted, and only a
+DWARF-inline-aware tool (e.g. `addr2line -i`) can synthesize the logical
+inline chain after the fact, which this categorizer does not attempt. So a
+`0` here means "unobservable by this methodology," not "free": any
+allocation this code performs is silently folded into whichever caller
+frame survived inlining — most plausibly `trace_snapshot::{{closure}}`,
+landing in the `trace_snapshot_prefix_clone` bucket, or the
+workflow-driving frames feeding `workflow_reexecution`. See
+`autumn-harvest/scripts/classify_dhat_allocations.py`'s own docstring for
+the same finding recorded alongside the categorizer's precedence rationale.
 
 ## Hypothesis (source-confirmed, not inferred from the number alone)
 
@@ -431,7 +502,16 @@ Nothing in production code. Only:
   allocation-site categorizer used above, mirroring
   `autumn-harvest-sqlite/scripts/classify_dhat_allocations.py`'s
   methodology (precedence-ordered, mutually-exclusive, exhaustive-partition-
-  asserted).
+  asserted). Its `history_matcher_internals`/`replay_prefix_or_context_build`
+  precedence check was checked ahead of the latter (matcher frames are
+  always nested inside `replay_prefix`'s own drive call), and its docstring
+  now records — with the empirical evidence above — that this precedence
+  ordering makes no observable difference in practice, because every
+  function either bucket names is inlined away in this build profile.
+- `docs/replay-debugger.md` — cross-linked to this note from its existing
+  "Cost" section, and that section's own wording was tightened to state
+  explicitly that it describes the library `trace_snapshot` arm, not the
+  packaged CLI's default (handler-free, O(N)) behavior.
 - This document.
 
 `cargo fmt --all -- --check`, `cargo check -p autumn-harvest
