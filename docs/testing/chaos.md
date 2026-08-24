@@ -25,7 +25,7 @@ discards — **no branch, no atomic load, no code at all** at the call site. The
 hot path is untouched.
 
 When the feature is **on** but the harness is disarmed, `hit`/`hit_fallible`/
-`should_drop_notify` are a single `Relaxed` atomic load followed by an early
+`should_drop_notify` are a single `SeqCst` atomic load followed by an early
 return — no lock, no `.await` yield.
 
 The harness introduces **no** production semantic change: no new `WorkflowEvent`
@@ -173,9 +173,16 @@ printed seed replays in one command — the AC5 "≥ 5" floor is only imposed on
 CHAOS_SEEDS=8 cargo test -p autumn-harvest --features chaos --test integration \
   chaos_seeded_convergence_sweep -- --nocapture
 
-# Point at an already-migrated local Postgres for fast iteration:
+# Point at an already-migrated local Postgres for fast iteration. Scope the
+# run to `chaos_tests::` — the same filter CI itself uses — rather than the
+# whole `integration` binary: chaos tests share a global `DB_BODY_SERIAL`
+# lock over the shared database, but no *other* integration-test module
+# joins that lock, so an unscoped run risks a chaos test's scrub()
+# (a `TRUNCATE`) racing a concurrent, unrelated module's assertions against
+# the same `HARVEST_TEST_DATABASE_URL` database:
 HARVEST_TEST_DATABASE_URL=postgres://harvest@127.0.0.1:5432/harvest_chaos \
-  CHAOS_SEEDS=8 cargo test -p autumn-harvest --features chaos --test integration
+  CHAOS_SEEDS=8 cargo test -p autumn-harvest --features chaos --test integration \
+  chaos_tests::
 ```
 
 Without `HARVEST_TEST_DATABASE_URL` the suite spins a fresh migrated Postgres 16
