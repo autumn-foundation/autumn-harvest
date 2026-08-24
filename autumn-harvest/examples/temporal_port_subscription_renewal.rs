@@ -43,11 +43,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubscriptionState {
+    pub subscription_id: String,
     pub cycles: u32,
 }
 
 /// A downstream idempotency key, plus the cycle number it applies to. See
-/// checklist item 4 in the migration guide: every side-effecting activity
+/// playbook step 4 in the migration guide: every side-effecting activity
 /// call needs its own caller-supplied key, derived from state already in
 /// history, so a retried attempt cannot charge the card twice.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,10 +90,13 @@ async fn subscription_renewal(
         return Ok(());
     }
 
-    // `ctx.workflow_id()` is stable across every replay and every retry of
-    // this run, so pairing it with the cycle number gives a key that is
-    // both deterministic and unique per charge.
-    let idempotency_key = format!("{}-cycle-{}", ctx.workflow_id(), state.cycles);
+    // Derive the key from `subscription_id`, not from `ctx.workflow_id()` or
+    // the execution id. Playbook step 4 in the migration guide needs a key
+    // the caller supplies before routing the request to either engine.
+    // `subscription_id` is that key: it names the same subscription on both
+    // sides of a dual-run cutover, no matter which engine's own internal id
+    // the request happens to carry.
+    let idempotency_key = format!("{}-cycle-{}", state.subscription_id, state.cycles);
     let _: () = ctx
         .execute_activity(
             &charge_card_info(),
@@ -116,6 +120,7 @@ async fn subscription_renewal(
     }
 
     let next = SubscriptionState {
+        subscription_id: state.subscription_id.clone(),
         cycles: state.cycles + 1,
     };
     ctx.continue_as_new(serde_json::to_value(next).map_err(|e| e.to_string())?)
@@ -167,7 +172,10 @@ mod tests {
             .mock_activity("charge_card", |_| Ok(json!(null)))
             .run(
                 subscription_renewal_info().handler,
-                json!(SubscriptionState { cycles: 0 }),
+                json!(SubscriptionState {
+                    subscription_id: "sub-42".to_string(),
+                    cycles: 0,
+                }),
             )
             .await;
 
@@ -205,8 +213,12 @@ mod tests {
     /// `cancel_signal_recorded_before_start_skips_billing_charge` test.
     #[tokio::test]
     async fn cancellation_recorded_before_start_skips_the_charge() {
+        let subscription_id = "sub-42".to_string();
         let events = vec![
-            started_event(json!(SubscriptionState { cycles: 3 })),
+            started_event(json!(SubscriptionState {
+                subscription_id: subscription_id.clone(),
+                cycles: 3,
+            })),
             WorkflowEvent::SignalReceived {
                 signal_name: "cancel".into(),
                 payload: serde_json::Value::Null,
@@ -221,7 +233,13 @@ mod tests {
         // fails fast with a clear message, instead of hanging the test.
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            subscription_renewal(&ctx, SubscriptionState { cycles: 3 }),
+            subscription_renewal(
+                &ctx,
+                SubscriptionState {
+                    subscription_id,
+                    cycles: 3,
+                },
+            ),
         )
         .await
         .expect("workflow must not suspend when a cancellation was already recorded");
@@ -249,8 +267,12 @@ mod tests {
     #[tokio::test]
     async fn cancellation_recorded_mid_wait_stops_the_loop_before_continuing() {
         let activity_id = ActivityExecId::new();
+        let subscription_id = "sub-42".to_string();
         let events = vec![
-            started_event(json!(SubscriptionState { cycles: 3 })),
+            started_event(json!(SubscriptionState {
+                subscription_id: subscription_id.clone(),
+                cycles: 3,
+            })),
             WorkflowEvent::ActivityScheduled {
                 activity_id,
                 name: "charge_card".into(),
@@ -282,7 +304,13 @@ mod tests {
         // test above.
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            subscription_renewal(&ctx, SubscriptionState { cycles: 3 }),
+            subscription_renewal(
+                &ctx,
+                SubscriptionState {
+                    subscription_id,
+                    cycles: 3,
+                },
+            ),
         )
         .await
         .expect("workflow must not suspend once the full history has been replayed");
@@ -310,7 +338,10 @@ mod tests {
             .mock_activity("charge_card", |_| Ok(json!(null)))
             .run(
                 subscription_renewal_info().handler,
-                json!(SubscriptionState { cycles: 0 }),
+                json!(SubscriptionState {
+                    subscription_id: "sub-42".to_string(),
+                    cycles: 0,
+                }),
             )
             .await;
         assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
@@ -321,6 +352,51 @@ mod tests {
         assert!(
             matches!(report.status, ReplayStatus::ReplaySucceeded),
             "recorded history must replay deterministically:\n{report}"
+        );
+    }
+
+    /// The idempotency key must come from `subscription_id`, an identity
+    /// the caller supplies before routing the request to either engine.
+    /// It must never come from `ctx.workflow_id()` or the execution id.
+    ///
+    /// Playbook step 4 in the migration guide states this rule. A key
+    /// minted from harvest-internal identity would mint a *different* key
+    /// after a re-route between engines during a dual-run cutover. A
+    /// retried charge would then slip through under the fresh key and
+    /// double-charge the customer. `WorkflowTestEnv` leaves
+    /// `ctx.workflow_id()` as an empty string by default, so a regression
+    /// to that derivation would produce `"-cycle-0"`, not the asserted
+    /// `"sub-42-cycle-0"`, and this test would catch it.
+    #[tokio::test]
+    async fn idempotency_key_is_derived_from_subscription_id_not_workflow_identity() {
+        let seen_key: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let seen_key_handle = seen_key.clone();
+        let outcome = WorkflowTestEnv::new()
+            .mock_activity("charge_card", move |input| {
+                let req: ChargeRequest = serde_json::from_value(input)
+                    .expect("charge_card input must deserialize as ChargeRequest");
+                *seen_key_handle.lock().unwrap() = Some(req.idempotency_key);
+                Ok(json!(null))
+            })
+            .run(
+                subscription_renewal_info().handler,
+                json!(SubscriptionState {
+                    subscription_id: "sub-42".to_string(),
+                    cycles: 0,
+                }),
+            )
+            .await;
+        assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+
+        let key = seen_key
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("charge_card must have been called");
+        assert_eq!(
+            key, "sub-42-cycle-0",
+            "the idempotency key must come from subscription_id, not from \
+             ctx.workflow_id() or the execution id"
         );
     }
 }

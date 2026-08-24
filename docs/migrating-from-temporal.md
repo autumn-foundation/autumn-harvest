@@ -80,10 +80,26 @@ the claim yourself.
 | Temporal primitive | Harvest equivalent | Reference |
 |---|---|---|
 | Signal handler, `defineSignal` + `setHandler` (fire-and-forget, push) | `ctx.register_signal_handler` / `register_signal_handler_raw` | issue #546 |
-| Blocking wait, `condition(predicate, timeout?)` | `ctx.wait_for_signal` / `ctx.receive_signal` / `ctx.receive_signal_timeout` | issue #476 (deadline variant); core primitive (plain wait) |
+| Blocking wait for one signal, `condition(() => received, timeout?)` | `ctx.wait_for_signal` / `ctx.receive_signal` / `ctx.receive_signal_timeout` | issue #476 (deadline variant); core primitive (plain wait) |
+| Blocking wait on many signals or a custom condition, `condition(predicate, timeout?)` (no direct harvest equivalent) | Signal handlers plus an explicit poll loop | issue #546 |
 | `SignalWithStart` | `signal_with_start_workflow_execution`, `POST /workflows/{name}/signal-with-start` | issue #244 |
 | Non-blocking signal check (no first-class Temporal equivalent) | `ctx.try_receive_signal` / `ctx.drain_signals` | issue #775 |
 | Duplicate-safe signal delivery (Temporal has no first-class dedup key) | `Idempotency-Key` header on standalone signal delivery | issue #521, issue #753 |
+
+`condition()` in Temporal accepts any predicate over workflow state. It is
+not limited to one named signal. A predicate such as `approved ||
+cancelled` needs two independent signals to feed one wait. Harvest's
+signal-wait primitives resolve on one named signal only. Harvest has no
+direct equivalent for a multi-signal `condition()` call.
+
+Port a multi-signal `condition()` call as an explicit loop. Register a push
+handler for each signal (`ctx.register_signal_handler`, issue #546). Have
+each handler set its own flag. Loop on `ctx.timer` at a fixed interval.
+Check the combined predicate after each wait. Stop the loop when the
+predicate is true. If the original `condition()` call took a timeout, race
+this loop against a deadline the same way. Pick a poll interval that trades
+reaction speed against timer and task-queue churn. This is more code than
+one `condition()` call. It is the closest direct port available today.
 
 ### Queries and updates
 
@@ -422,7 +438,6 @@ import {
   setHandler,
   sleep,
   continueAsNew,
-  workflowInfo,
 } from '@temporalio/workflow';
 import type * as activities from './activities';
 
@@ -433,6 +448,7 @@ const { chargeCard } = proxyActivities<typeof activities>({
 export const cancelSignal = defineSignal('cancel');
 
 export interface SubscriptionState {
+  subscriptionId: string;
   cycles: number;
 }
 
@@ -451,10 +467,13 @@ export async function subscriptionRenewal(
     return state;
   }
 
-  // workflowInfo().workflowId is stable across every retry of this run, so
-  // pairing it with the cycle number gives a key that is both deterministic
-  // and unique per charge.
-  const idempotencyKey = `${workflowInfo().workflowId}-cycle-${state.cycles}`;
+  // Derive the key from state.subscriptionId, not from
+  // workflowInfo().workflowId. Playbook step 4 needs a key the caller
+  // supplies before routing the request to either engine. subscriptionId
+  // is that key: it names the same subscription on both sides of a
+  // dual-run cutover, no matter which engine's own internal id the request
+  // happens to carry.
+  const idempotencyKey = `${state.subscriptionId}-cycle-${state.cycles}`;
   await chargeCard(idempotencyKey, state.cycles);
 
   // Wait for the next billing cycle. A cancel signal delivered during this
@@ -465,10 +484,11 @@ export async function subscriptionRenewal(
   // be the next cycle, not the current one, or a resumed run repeats the
   // charge that already happened.
   if (cancelled) {
-    return { cycles: state.cycles + 1 };
+    return { subscriptionId: state.subscriptionId, cycles: state.cycles + 1 };
   }
 
   await continueAsNew<typeof subscriptionRenewal>({
+    subscriptionId: state.subscriptionId,
     cycles: state.cycles + 1,
   });
 }
@@ -484,11 +504,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubscriptionState {
+    pub subscription_id: String,
     pub cycles: u32,
 }
 
 /// A downstream idempotency key, plus the cycle number it applies to. See
-/// checklist item 4 in the migration guide: every side-effecting activity
+/// playbook step 4 in the migration guide: every side-effecting activity
 /// call needs its own caller-supplied key, derived from state already in
 /// history, so a retried attempt cannot charge the card twice.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -530,10 +551,13 @@ async fn subscription_renewal(
         return Ok(());
     }
 
-    // `ctx.workflow_id()` is stable across every replay and every retry of
-    // this run, so pairing it with the cycle number gives a key that is
-    // both deterministic and unique per charge.
-    let idempotency_key = format!("{}-cycle-{}", ctx.workflow_id(), state.cycles);
+    // Derive the key from `subscription_id`, not from `ctx.workflow_id()` or
+    // the execution id. Playbook step 4 in the migration guide needs a key
+    // the caller supplies before routing the request to either engine.
+    // `subscription_id` is that key: it names the same subscription on both
+    // sides of a dual-run cutover, no matter which engine's own internal id
+    // the request happens to carry.
+    let idempotency_key = format!("{}-cycle-{}", state.subscription_id, state.cycles);
     let _: () = ctx
         .execute_activity(
             &charge_card_info(),
@@ -557,6 +581,7 @@ async fn subscription_renewal(
     }
 
     let next = SubscriptionState {
+        subscription_id: state.subscription_id.clone(),
         cycles: state.cycles + 1,
     };
     ctx.continue_as_new(serde_json::to_value(next).map_err(|e| e.to_string())?)
@@ -593,11 +618,14 @@ async fn subscription_renewal(
   `#[activity]` macro generates the `charge_card_info()` function. It
   carries the `start_to_close` timeout, and any retry policy. You never
   pass those by hand at the call site.
-- **Idempotency key.** Both sides derive a request-scoped key from the
-  current execution's own stable id, right before the billing call:
-  `ctx.workflow_id()` on the harvest side, `workflowInfo().workflowId` on
-  the Temporal side. See checklist item 4, above, for why a caller-supplied
-  key matters for every side-effecting activity, not just this one.
+- **Idempotency key.** Both sides derive a request-scoped key from
+  `subscriptionId` (`subscription_id` in Rust), right before the billing
+  call. That field carries the entity's own stable id, not the workflow or
+  execution id Temporal or harvest happens to assign this particular run.
+  See playbook step 4, above: the key must come from state the caller
+  supplies before routing the request to either engine, so a re-route
+  during a dual-run cutover cannot mint a fresh key and let a retried
+  charge through twice.
 - **The timer.** `sleep('30 days')` becomes `ctx.timer(id, seconds)`. Every
   harvest timer needs a stable `id` string. Temporal's sleep needs no name.
   Reuse a descriptive constant, as in `"next-billing-cycle"` above.
