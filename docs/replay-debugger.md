@@ -368,6 +368,12 @@ harvest debug replay huge.json --max-steps 200
 The trace reports `truncated: true` so a capped view is never mistaken for a
 complete one.
 
+See `docs/performance-debugger-trace.md` for the measured Ir/allocation
+scaling behind that `O(N²)` claim, a precise allocation-site attribution of
+what dominates it, and why the obvious local fix (reusing one growing prefix
+buffer across steps instead of re-cloning it) is unsafe rather than merely
+unimplemented.
+
 ---
 
 ## Reference
