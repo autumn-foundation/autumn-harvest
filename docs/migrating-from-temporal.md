@@ -298,8 +298,22 @@ your whole application.
 3. **Order types by dependency, not by size.** Cut over a leaf workflow type
    first. A leaf type has no child workflows, and no downstream workflow
    that signals it. Cut over a parent workflow type only after every
-   workflow type it spawns as a child already runs live on harvest. Or cut
-   it over after you confirm the parent tolerates a Temporal child.
+   workflow type it spawns as a child already runs live on harvest.
+
+   `ctx.spawn_child_workflow` only starts another harvest execution. It
+   cannot start, signal, or await a Temporal execution. A ported parent
+   cannot simply tolerate a child type still on Temporal, because nothing
+   in harvest can reach that child at all. If a parent must cut over
+   before every one of its children does, replace each such child spawn
+   with an explicit bridge instead. Write an ordinary harvest activity
+   that calls Temporal's own client API. Have it start the child, then
+   poll for the child's result, or await a callback for it. Give that
+   bridge activity the same idempotency key discipline from step 4,
+   below, so a retried bridge call cannot start the same Temporal child
+   twice. Propagate a harvest cancellation into a Temporal cancel request
+   through the same bridge. Building this bridge is real engineering
+   work. It is not a compatibility check. Prefer the dependency order
+   above whenever you can.
 4. **Make every shared downstream activity idempotent.** During the cutover
    window, both engines may call the same downstream service for different
    executions. Examples are a payment gateway, an email provider, and a
@@ -365,16 +379,23 @@ your whole application.
    the same `cancel` signal shown below. Send it. Wait for the execution
    to reach `COMPLETED` on its own. It reaches that state at the point in
    its loop where it already checks the signal. Only then read its final
-   state. Read it through a query against that now-closed execution, or
-   through its return value, if the workflow returns one. A closed
-   execution cannot advance further. This read cannot go stale. A query
-   against a running execution can. Start the harvest execution only
-   after that read, carrying the result forward as its input. The defined
-   point can sit behind a long wait, such as the worked example's 30-day
-   timer. The handoff then takes that long too. Accept that wait. Or,
-   before you begin this type's cutover, change the workflow to race the
-   wait against the signal instead. Harvest's `ctx.receive_signal_timeout`
-   (issue #476) is the primitive for that race on the harvest side.
+   state. The [Worked example](#worked-example) below shows one way. Each
+   `if (cancelled)` branch returns the state where harvest must resume.
+   The two branches differ. The first branch returns the input unchanged.
+   Nothing happened yet this run. The second branch returns the next
+   cycle, not the current cycle. `chargeCard` already ran for the current
+   cycle before that branch's check. Returning the current cycle from
+   that branch would charge it again. If your own workflow returns
+   nothing useful, query the now-closed execution for its state instead.
+   A closed execution cannot advance further. Neither read method can go
+   stale. A query against a still-running execution can. Start the
+   harvest execution only after that read, carrying the result forward as
+   its input. The defined point can sit behind a long wait, such as the
+   worked example's 30-day timer. The handoff then takes that long too.
+   Accept that wait. Or, before you begin this type's cutover, change the
+   workflow to race the wait against the signal instead. Harvest's
+   `ctx.receive_signal_timeout` (issue #476) is the primitive for that
+   race on the harvest side.
 
    Treat each entity's handoff as a deliberate cutover step, not a bulk
    migration. Each one is a live, stateful run. It is not disposable
@@ -401,6 +422,7 @@ import {
   setHandler,
   sleep,
   continueAsNew,
+  workflowInfo,
 } from '@temporalio/workflow';
 import type * as activities from './activities';
 
@@ -416,26 +438,34 @@ export interface SubscriptionState {
 
 export async function subscriptionRenewal(
   state: SubscriptionState,
-): Promise<void> {
+): Promise<SubscriptionState | void> {
   let cancelled = false;
   setHandler(cancelSignal, () => {
     cancelled = true;
   });
 
   // A cancellation already recorded before this run started stops the loop
-  // immediately.
+  // immediately. Nothing happened yet this run, so the checkpoint below is
+  // the input unchanged.
   if (cancelled) {
-    return;
+    return state;
   }
 
-  await chargeCard(state.cycles);
+  // workflowInfo().workflowId is stable across every retry of this run, so
+  // pairing it with the cycle number gives a key that is both deterministic
+  // and unique per charge.
+  const idempotencyKey = `${workflowInfo().workflowId}-cycle-${state.cycles}`;
+  await chargeCard(idempotencyKey, state.cycles);
 
   // Wait for the next billing cycle. A cancel signal delivered during this
   // wait is observed as soon as the wait resolves.
   await sleep('30 days');
 
+  // chargeCard already ran for this cycle, above. The checkpoint below must
+  // be the next cycle, not the current one, or a resumed run repeats the
+  // charge that already happened.
   if (cancelled) {
-    return;
+    return { cycles: state.cycles + 1 };
   }
 
   await continueAsNew<typeof subscriptionRenewal>({
@@ -457,10 +487,24 @@ pub struct SubscriptionState {
     pub cycles: u32,
 }
 
+/// A downstream idempotency key, plus the cycle number it applies to. See
+/// checklist item 4 in the migration guide: every side-effecting activity
+/// call needs its own caller-supplied key, derived from state already in
+/// history, so a retried attempt cannot charge the card twice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChargeRequest {
+    pub idempotency_key: String,
+    pub cycles: u32,
+}
+
 #[activity(start_to_close = "30s")]
-async fn charge_card(_ctx: &ActivityContext, cycles: u32) -> Result<(), String> {
-    // ... real billing call goes here ...
-    println!("charged card for cycle {cycles}");
+async fn charge_card(_ctx: &ActivityContext, req: ChargeRequest) -> Result<(), String> {
+    // A real billing call goes here, passing req.idempotency_key through to
+    // the payment provider's own idempotency-key parameter.
+    println!(
+        "charged card for cycle {} (idempotency key: {})",
+        req.cycles, req.idempotency_key
+    );
     Ok(())
 }
 
@@ -486,8 +530,18 @@ async fn subscription_renewal(
         return Ok(());
     }
 
+    // `ctx.workflow_id()` is stable across every replay and every retry of
+    // this run, so pairing it with the cycle number gives a key that is
+    // both deterministic and unique per charge.
+    let idempotency_key = format!("{}-cycle-{}", ctx.workflow_id(), state.cycles);
     let _: () = ctx
-        .execute_activity(&charge_card_info(), state.cycles)
+        .execute_activity(
+            &charge_card_info(),
+            ChargeRequest {
+                idempotency_key,
+                cycles: state.cycles,
+            },
+        )
         .await
         .map_err(|e| e.to_string())?;
 
@@ -539,6 +593,11 @@ async fn subscription_renewal(
   `#[activity]` macro generates the `charge_card_info()` function. It
   carries the `start_to_close` timeout, and any retry policy. You never
   pass those by hand at the call site.
+- **Idempotency key.** Both sides derive a request-scoped key from the
+  current execution's own stable id, right before the billing call:
+  `ctx.workflow_id()` on the harvest side, `workflowInfo().workflowId` on
+  the Temporal side. See checklist item 4, above, for why a caller-supplied
+  key matters for every side-effecting activity, not just this one.
 - **The timer.** `sleep('30 days')` becomes `ctx.timer(id, seconds)`. Every
   harvest timer needs a stable `id` string. Temporal's sleep needs no name.
   Reuse a descriptive constant, as in `"next-billing-cycle"` above.

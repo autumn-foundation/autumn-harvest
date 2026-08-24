@@ -46,10 +46,24 @@ pub struct SubscriptionState {
     pub cycles: u32,
 }
 
+/// A downstream idempotency key, plus the cycle number it applies to. See
+/// checklist item 4 in the migration guide: every side-effecting activity
+/// call needs its own caller-supplied key, derived from state already in
+/// history, so a retried attempt cannot charge the card twice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChargeRequest {
+    pub idempotency_key: String,
+    pub cycles: u32,
+}
+
 #[activity(start_to_close = "30s")]
-async fn charge_card(_ctx: &ActivityContext, cycles: u32) -> Result<(), String> {
-    // ... real billing call goes here ...
-    println!("charged card for cycle {cycles}");
+async fn charge_card(_ctx: &ActivityContext, req: ChargeRequest) -> Result<(), String> {
+    // A real billing call goes here, passing req.idempotency_key through to
+    // the payment provider's own idempotency-key parameter.
+    println!(
+        "charged card for cycle {} (idempotency key: {})",
+        req.cycles, req.idempotency_key
+    );
     Ok(())
 }
 
@@ -75,8 +89,18 @@ async fn subscription_renewal(
         return Ok(());
     }
 
+    // `ctx.workflow_id()` is stable across every replay and every retry of
+    // this run, so pairing it with the cycle number gives a key that is
+    // both deterministic and unique per charge.
+    let idempotency_key = format!("{}-cycle-{}", ctx.workflow_id(), state.cycles);
     let _: () = ctx
-        .execute_activity(&charge_card_info(), state.cycles)
+        .execute_activity(
+            &charge_card_info(),
+            ChargeRequest {
+                idempotency_key,
+                cycles: state.cycles,
+            },
+        )
         .await
         .map_err(|e| e.to_string())?;
 
