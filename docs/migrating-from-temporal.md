@@ -218,13 +218,24 @@ below is a concrete task, not a vague warning.
    Most often, that primitive is `ctx.system_now()`, `ctx.new_uuid()`, or
    `ctx.side_effect()`.
 2. **Map your payload types.** Temporal serializes activity and workflow
-   payloads through a configurable `DataConverter`. The default converter is
-   JSON, with optional compression or encryption codecs. Harvest serializes
-   every input and output as `serde_json::Value` through `serde`. Add
-   `#[derive(serde::Serialize, serde::Deserialize)]` to each type that
-   crossed a Temporal activity or workflow boundary. Suppose you used a
-   custom Temporal payload codec for compression or encryption. Harvest's
-   equivalent is a `PayloadCodec`
+   payloads through a configurable `DataConverter`. Temporal's default
+   converter is not plain JSON. It is a chain of converters. Temporal
+   tries each payload against the chain in order: a null check, then raw
+   bytes, then Protobuf, then JSON as the final fallback for a plain
+   object. A `Buffer`, a `Uint8Array`, or a Protobuf message crossing a
+   Temporal boundary is not JSON on the wire. This holds even with no
+   custom codec configured. List every payload type that crosses each
+   activity or workflow boundary before you port it. Harvest serializes
+   every input and output as `serde_json::Value` through `serde`. For a
+   type that already went through the JSON fallback, add
+   `#[derive(serde::Serialize, serde::Deserialize)]`. For a raw-bytes or a
+   Protobuf type, write an explicit conversion to a JSON-serializable
+   shape first. Convert a raw byte buffer to a base64 string, or to a
+   byte array. Convert a Protobuf message to its JSON mapping, through
+   the Protobuf library's own JSON codec, or through a hand-written
+   struct. Suppose you used a custom Temporal payload codec for
+   compression or encryption on top of this chain. Harvest's equivalent
+   is a `PayloadCodec`
    ([ADR-0003](adr/0003-payload-codec-event-boundary.md)). The two are not
    the same shape. Port the codec logic, not the wire format.
 3. **Translate each retry policy.** Temporal's `RetryPolicy` and harvest's
@@ -367,6 +378,14 @@ your whole application.
    reason history import does not run forward. Do not flip a type's flag
    back once you deregister its Temporal worker code. Keep that worker
    deployed, even if idle, until you are certain you will not roll back.
+
+   This rollback only routes new work. It does not send an
+   already-cut-over execution back to Temporal. That gap rarely matters
+   for a short-lived workflow type, since its harvest execution finishes
+   on its own soon after the flag flips back. It matters for a long-lived
+   entity type. Such an execution can loop forever through `continueAsNew`
+   and never finish on its own, so this rollback cannot reach it. See the
+   reverse handoff at the end of step 7, below, for what to do instead.
 7. **Retire the Temporal worker for a type only after its queue is empty on
    both sides.** Confirm zero in-flight Temporal executions of that type.
    Temporal's own visibility API can confirm this count. Confirm zero
@@ -416,6 +435,22 @@ your whole application.
    Treat each entity's handoff as a deliberate cutover step, not a bulk
    migration. Each one is a live, stateful run. It is not disposable
    work.
+
+   Build a reverse handoff only if a long-lived entity's cutover must
+   roll back. Mirror the forward handoff above, in the other direction.
+   Send the entity's `cancel` signal to its harvest execution. Wait for
+   that execution to reach `COMPLETED`. Then read its final state. Read
+   it from the execution's own return value, if the ported workflow's
+   cancellation branches carry one. This guide's own worked example does
+   not. Both of its cancellation branches return `()`. The worked example
+   only demonstrates the forward direction. Read the final state instead
+   from a query handler against the closed execution (issue #612). This
+   is the same fallback named above for a workflow whose return value
+   carries nothing useful. Start a fresh Temporal execution from that
+   read. This guide does not ship this reverse handoff. You build it
+   only if you need one. Decide this before you cut over a long-lived
+   entity type. Confirm you can accept harvest as that entity's
+   permanent home, if its cutover does not go well.
 
 ## Worked example
 
