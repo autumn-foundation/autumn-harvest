@@ -351,9 +351,8 @@ Temporal-style Schedule object.
 
 - **[README](../README.md)** — project overview and quick start.
 - **[Getting started](getting-started/README.md)** — the chapter-by-chapter guide.
-- **Temporal migration guide** — _planned_
+- **[Temporal migration guide](migrating-from-temporal.md)**
   ([#947](https://github.com/autumn-foundation/autumn-harvest/issues/947)): a
-  move-from-Temporal / dual-run cutover playbook. That page does not exist yet;
-  when it ships it will link back here, making the cross-reference bidirectional.
-  This page answers _why / whether_ harvest; the migration guide will answer
+  concept map, a workflow-porting checklist, and a dual-run cutover playbook.
+  This page answers _why / whether_ harvest; the migration guide answers
   _how_ to move.

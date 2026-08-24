@@ -83,3 +83,6 @@ Start with [Chapter 1 →](01-project-skeleton.md)
 - **Comparison.** [`comparison.md`](../comparison.md) positions harvest against
   Temporal, DBOS, Inngest, Hatchet, and Restate — every harvest claim linked to
   shipped evidence, with an honest section on where harvest is behind.
+- **Migrating from Temporal.** [`migrating-from-temporal.md`](../migrating-from-temporal.md)
+  is a concept map, a workflow-porting checklist, and a dual-run cutover
+  playbook, with a worked side-by-side example.

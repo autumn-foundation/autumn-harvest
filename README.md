@@ -23,6 +23,10 @@ Weighing harvest against Temporal, DBOS, Inngest, Hatchet, or Restate? See the
 honest, evidence-linked [comparison page](docs/comparison.md) — it names
 harvest's own gaps, not just its strengths.
 
+Moving an existing Temporal deployment? See the
+[Temporal migration guide](docs/migrating-from-temporal.md) — a concept
+map, a workflow-porting checklist, and a dual-run cutover playbook.
+
 ## Quick example
 
 Try it end-to-end: `cargo run -p quickstart` (see [`examples/quickstart/`](examples/quickstart/)).
