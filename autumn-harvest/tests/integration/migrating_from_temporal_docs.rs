@@ -288,12 +288,11 @@ fn ci_workflow_exercises_the_worked_example() {
 #[test]
 fn worked_example_code_block_matches_the_real_file() {
     let guide = read_doc(GUIDE_PATH);
-    let example = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+    let example = read_normalized(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("examples")
             .join(format!("{EXAMPLE_NAME}.rs")),
-    )
-    .unwrap_or_else(|error| panic!("failed to read examples/{EXAMPLE_NAME}.rs: {error}"));
+    );
 
     let doc_start = "### Harvest (Rust)\n\n```rust\n";
     let start = guide.find(doc_start).unwrap_or_else(|| {
@@ -390,12 +389,14 @@ fn guards_run_on_docs_only_changes() {
 
 /// Read a file with line endings normalised to `\n`.
 ///
-/// The structural helpers above locate boundaries with `\n`-anchored needles
-/// (`"\n  lint:"`, `"\n  test:"`, `"\n      - name:"`). A Windows checkout
-/// hands them `\r\n`, so each needle silently misses and the test fails with
-/// a "must define" panic that has nothing to do with the workflow file's
-/// actual contents. Normalising once here keeps the needle searches
-/// platform-agnostic rather than spreading `\r?` handling across each one.
+/// Every needle search in this module -- markdown headers, code-fence
+/// markers, table separators, workflow-file structural boundaries such as
+/// `"\n  lint:"` -- is anchored on `\n`. A Windows checkout hands
+/// `fs::read_to_string` `\r\n` line endings by default, so each needle
+/// silently misses and a test fails with a panic that has nothing to do
+/// with the file's actual contents. Normalising once here (`read_doc`
+/// delegates to this too) keeps every needle search platform-agnostic
+/// rather than spreading `\r?` handling across each one.
 fn read_normalized(path: &Path) -> String {
     fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
@@ -449,8 +450,7 @@ fn issue_refs(text: &str) -> BTreeSet<u32> {
 }
 
 fn read_doc(relative: &str) -> String {
-    fs::read_to_string(workspace_path(relative))
-        .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"))
+    read_normalized(&workspace_path(relative))
 }
 
 fn workspace_path(relative: &str) -> PathBuf {
