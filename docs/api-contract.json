@@ -1173,6 +1173,10 @@
           "description": "Duplicate workflow_id with conflicting reuse policy, or conflict_policy=fail over an ACTIVE (RUNNING/PAUSED) prior (issue #685)."
         },
         {
+          "status": 429,
+          "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (an attach to an existing run never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"} naming which of max_active_executions / max_history_bytes / max_dead_letters was hit and the usage observed immediately before this admission (current excludes the would-be admission itself). No execution row, event, or task queue row is created for a rejected start. Never returned for a workflow with no declared QuotaPolicy."
+        },
+        {
           "status": 503,
           "description": "Admission blocked by an active gate (including the debounce-key shard gate for debounced starts). A retry of an already-successful idempotency_key start (issue #808) bypasses the gate and returns the existing execution as a 200 no-op instead, since it is not fresh admission; a genuinely fresh keyed start is still gated."
         },
@@ -1281,6 +1285,10 @@
         {
           "status": 409,
           "description": "Duplicate workflow_id with id_reuse_policy=reject_duplicate."
+        },
+        {
+          "status": 429,
+          "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (attaching to an existing run and delivering the signal to it never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"}, mirroring the plain start route's arm exactly. Never returned for a workflow with no declared QuotaPolicy."
         },
         {
           "status": 500,
@@ -1412,6 +1420,10 @@
         {
           "status": 422,
           "description": "Update validator rejected the update_args."
+        },
+        {
+          "status": 429,
+          "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (attaching to an existing run and admitting the update against it never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"}, mirroring the plain start route's arm exactly. Never returned for a workflow with no declared QuotaPolicy."
         },
         {
           "status": 500,

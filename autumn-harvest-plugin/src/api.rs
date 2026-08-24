@@ -18111,14 +18111,13 @@ pub(crate) async fn start_workflow(
             let _ = audit::insert_audit(&mut conn, &ar).await;
             (
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "error": "quota exceeded",
-                    "workflow_name": workflow_name,
-                    "key": key,
-                    "resource": resource.as_str(),
-                    "limit": limit,
-                    "current": current,
-                })),
+                Json(quota_exceeded_body(
+                    &workflow_name,
+                    &key,
+                    resource,
+                    limit,
+                    current,
+                )),
             )
                 .into_response()
         }
@@ -20306,14 +20305,13 @@ pub(crate) async fn signal_with_start_workflow(
             let _ = audit::insert_audit(&mut conn, &ar).await;
             (
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "error": "quota exceeded",
-                    "workflow_name": workflow_name,
-                    "key": key,
-                    "resource": resource.as_str(),
-                    "limit": limit,
-                    "current": current,
-                })),
+                Json(quota_exceeded_body(
+                    &workflow_name,
+                    &key,
+                    resource,
+                    limit,
+                    current,
+                )),
             )
                 .into_response()
         }
@@ -21058,14 +21056,13 @@ async fn update_with_start_workflow(
             let _ = audit::insert_audit(&mut conn, &ar).await;
             (
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "error": "quota exceeded",
-                    "workflow_name": workflow_name,
-                    "key": key,
-                    "resource": resource.as_str(),
-                    "limit": limit,
-                    "current": current,
-                })),
+                Json(quota_exceeded_body(
+                    &workflow_name,
+                    &key,
+                    resource,
+                    limit,
+                    current,
+                )),
             )
                 .into_response()
         }
@@ -39448,6 +39445,32 @@ async fn stream_workflow_progress(
         .into_response()
 }
 
+/// Shared flat JSON body for a `HarvestError::QuotaExceeded` 429 response
+/// (issue #946, AC4) -- the single source of truth for the wire shape used
+/// by every bespoke route arm (`start_workflow`, `signal_with_start_workflow`,
+/// `update_with_start_workflow`) that constructs its own `(StatusCode,
+/// Json<..>)` response (rather than going through [`map_error`], since each
+/// of those routes must also perform a route-specific audit-record insert
+/// and throttle-token refund the shared [`map_error`] fallback below cannot
+/// do). Extracted so the three previously hand-duplicated `serde_json::json!`
+/// literals can never silently drift apart.
+fn quota_exceeded_body(
+    workflow_name: &str,
+    key: &str,
+    resource: autumn_harvest::quota::QuotaResource,
+    limit: u64,
+    current: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "error": "quota exceeded",
+        "workflow_name": workflow_name,
+        "key": key,
+        "resource": resource.as_str(),
+        "limit": limit,
+        "current": current,
+    })
+}
+
 pub(crate) fn map_error(error: HarvestError) -> AutumnError {
     match error {
         HarvestError::NotFound(message)
@@ -39514,20 +39537,36 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         // Safety-net fallback for a per-tenant resource quota rejection
         // (issue #946) reached from a route that has no bespoke structured
         // 429 arm of its own (every request-time `map_error` call site not
-        // already special-cased for `QuotaExceeded` below). AC4 requires
-        // this surface as a typed 429, never fall through to the generic
-        // `other => 503` catch-all.
+        // already special-cased for `QuotaExceeded` above -- e.g. the manual
+        // schedule-trigger route). AC4 requires this surface as a typed 429
+        // naming the exhausted resource with STRUCTURED (not just prose)
+        // fields, never a fall-through to the generic `other => 503`
+        // catch-all. `map_error` returns `AutumnError`, which always
+        // serializes through the RFC 7807 Problem Details envelope (see
+        // `autumn_web::error::AutumnError::into_response`) -- there is no
+        // way to emit the bespoke arms' flat `quota_exceeded_body` shape
+        // from here without widening `map_error`'s signature across its
+        // ~100 other call sites, so this reuses the framework's OWN
+        // established idiom for attaching structured, field-keyed data to
+        // an error response (`AutumnError::validation`'s `errors: [{field,
+        // messages}]` extension, the same mechanism every validation-style
+        // 4xx elsewhere in this codebase already relies on), with the
+        // status overridden from its 422 default to 429.
         HarvestError::QuotaExceeded {
             workflow_name,
             key,
             resource,
             limit,
             current,
-        } => AutumnError::bad_request_msg(format!(
-            "quota exceeded for workflow '{workflow_name}' key '{key}': {resource} at \
-             {current}/{limit}"
-        ))
-        .with_status(axum::http::StatusCode::TOO_MANY_REQUESTS),
+        } => {
+            let mut details = std::collections::HashMap::new();
+            details.insert("workflow_name".to_string(), vec![workflow_name]);
+            details.insert("key".to_string(), vec![key]);
+            details.insert("resource".to_string(), vec![resource.as_str().to_string()]);
+            details.insert("limit".to_string(), vec![limit.to_string()]);
+            details.insert("current".to_string(), vec![current.to_string()]);
+            AutumnError::validation(details).with_status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+        }
         HarvestError::Database(message) => AutumnError::service_unavailable_msg(message),
         other => AutumnError::service_unavailable_msg(other.to_string()),
     }

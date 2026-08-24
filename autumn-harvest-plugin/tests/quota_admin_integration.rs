@@ -283,9 +283,18 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
 }
 
 async fn post_start(app: &HarvestApiApp, wf: &str, body: Value) -> (StatusCode, Value) {
+    post_json(app, &format!("/workflows/{wf}/start"), body).await
+}
+
+/// Generic `POST {uri}` JSON helper -- used by [`post_start`] and by the
+/// `signal-with-start`/`update-with-start` 429-body-shape tests below (issue
+/// #946, the P2 test-coverage gap: both routes carry their own bespoke
+/// `HarvestError::QuotaExceeded` arm in `api.rs`, byte-identical to the plain
+/// start route's, and neither had HTTP-level coverage).
+async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, Value) {
     let request = Request::builder()
         .method("POST")
-        .uri(format!("/workflows/{wf}/start"))
+        .uri(uri)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -713,4 +722,125 @@ async fn plain_start_is_unaffected_when_workflow_has_no_quota_policy() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "body: {body}");
+}
+
+// ---------------------------------------------------------------------------
+// Section C -- 429 admission mapping on the two other registry-aware fresh-
+// start entry points (issue #946 AC3/AC4): `signal-with-start` (#244) and
+// `update-with-start` (#479). Both carry their own bespoke
+// `HarvestError::QuotaExceeded` arm in `api.rs` -- copy-pasted from, and
+// byte-identical in shape to, the plain-start route's arm exercised in
+// Section B above -- but neither had HTTP-level coverage of that arm (a P2
+// test-coverage gap flagged by an earlier review agent). Neither route needs
+// a registered signal/update handler for this: the quota check runs inside
+// the shared core admission primitive before any signal/update-specific
+// validation is even reached for a name with no matching handler.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn signal_with_start_returns_429_with_structured_body_when_quota_exceeded() {
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let wf = "quota_sws_429_wf";
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    insert_running_execution(&url, 0, wf, "acme").await;
+    let app = build_app(&pool, vec![quota_info(wf, policy)]);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{wf}/signal-with-start"),
+        json!({
+            "workflow_id": "sws-over-cap-1",
+            "start_input": {"tenant_id": "acme"},
+            "signal_name": "approve",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "body: {body}");
+    assert_eq!(body["error"], json!("quota exceeded"));
+    assert_eq!(body["workflow_name"], json!(wf));
+    assert_eq!(body["key"], json!("acme"));
+    assert_eq!(body["resource"], json!("active_executions"));
+    assert_eq!(body["limit"], json!(1));
+    assert_eq!(body["current"], json!(1));
+
+    // No fresh execution was admitted, and no signal was staged for the
+    // (never-created) target -- a rejected fresh admission must leave zero
+    // trace, exactly like the plain-start route.
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let row: Count = diesel::sql_query(
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions \
+         WHERE workflow_name = $1 AND quota_key = $2",
+    )
+    .bind::<diesel::sql_types::Text, _>(wf)
+    .bind::<diesel::sql_types::Text, _>("acme")
+    .get_result(&mut conn)
+    .await
+    .expect("count rows");
+    assert_eq!(
+        row.n, 1,
+        "a rejected fresh signal-with-start must not create a phantom execution row"
+    );
+}
+
+#[tokio::test]
+async fn update_with_start_returns_429_with_structured_body_when_quota_exceeded() {
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let wf = "quota_uws_429_wf";
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    insert_running_execution(&url, 0, wf, "acme").await;
+    let app = build_app(&pool, vec![quota_info(wf, policy)]);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{wf}/update-with-start"),
+        json!({
+            "workflow_id": "uws-over-cap-1",
+            "start_input": {"tenant_id": "acme"},
+            "update_name": "bump_priority",
+            "update_args": {},
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "body: {body}");
+    assert_eq!(body["error"], json!("quota exceeded"));
+    assert_eq!(body["workflow_name"], json!(wf));
+    assert_eq!(body["key"], json!("acme"));
+    assert_eq!(body["resource"], json!("active_executions"));
+    assert_eq!(body["limit"], json!(1));
+    assert_eq!(body["current"], json!(1));
+
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let row: Count = diesel::sql_query(
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions \
+         WHERE workflow_name = $1 AND quota_key = $2",
+    )
+    .bind::<diesel::sql_types::Text, _>(wf)
+    .bind::<diesel::sql_types::Text, _>("acme")
+    .get_result(&mut conn)
+    .await
+    .expect("count rows");
+    assert_eq!(
+        row.n, 1,
+        "a rejected fresh update-with-start must not create a phantom execution row"
+    );
 }

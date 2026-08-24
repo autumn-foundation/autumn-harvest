@@ -278,6 +278,26 @@ async fn active_count(conn: &mut AsyncPgConnection, workflow_name: &str, quota_k
     .await
 }
 
+/// Read a single execution row's persisted `state` column -- used by the
+/// `replace_execution` (issue #946 P1) regression tests below to prove a
+/// REJECTED replace rolls back the whole transaction, including the seal of
+/// the row being replaced (it must still read its pre-replace state, never
+/// left half-sealed).
+async fn row_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String {
+    #[derive(diesel::QueryableByName)]
+    struct State {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+    }
+    let row: State =
+        diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .get_result(conn)
+            .await
+            .expect("row must exist");
+    row.state
+}
+
 async fn assert_no_execution_row(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     #[derive(diesel::QueryableByName)]
     struct Count {
@@ -960,14 +980,20 @@ async fn continue_as_new_cross_type_to_no_quota_workflow_clears_quota_key() {
 /// concurrency: every attempt races against every other attempt on its own
 /// connection via `tokio::spawn`, not a sequential loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+// `tenant_a_*`/`tenant_b_*` are deliberately parallel-named (the whole point
+// of the test is a side-by-side comparison of the two tenants' outcomes) --
+// renaming them to satisfy clippy's Levenshtein-distance heuristic would
+// make the assertions below harder to read, not clearer.
+#[allow(clippy::similar_names)]
 async fn concurrent_runaway_tenant_is_capped_while_a_second_tenant_is_unaffected() {
+    const CAP: usize = 20;
+    const OVERFLOW_ATTEMPTS: usize = 60; // total burst >> cap, guarantees rejections
+    const TENANT_B_ATTEMPTS: usize = 15; // a well-behaved sibling tenant, unaffected
+
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
     let wf = leaked("quota_runaway");
-    const CAP: usize = 20;
-    const OVERFLOW_ATTEMPTS: usize = 60; // total burst >> cap, guarantees rejections
-    const TENANT_B_ATTEMPTS: usize = 15; // a well-behaved sibling tenant, unaffected
 
     let policy = QuotaPolicy::new("tenant_id")
         .with_max_active_executions(u32::try_from(CAP).expect("CAP fits in u32"));
@@ -1036,7 +1062,7 @@ async fn concurrent_runaway_tenant_is_capped_while_a_second_tenant_is_unaffected
                     QuotaResource::ActiveExecutions,
                     "the only declared cap is active_executions"
                 );
-                assert_eq!(limit, CAP as u64);
+                assert_eq!(limit, u64::try_from(CAP).expect("CAP fits in u64"));
                 if is_tenant_a {
                     assert_eq!(key, "runaway-tenant");
                     tenant_a_rejected += 1;
@@ -1089,10 +1115,278 @@ async fn concurrent_runaway_tenant_is_capped_while_a_second_tenant_is_unaffected
     // invariant, now proven to hold under genuine concurrent contention).
     assert_eq!(
         active_count(&mut conn, wf, "runaway-tenant").await,
-        CAP as i64
+        i64::try_from(CAP).expect("CAP fits in i64")
     );
     assert_eq!(
         active_count(&mut conn, wf, "well-behaved-tenant").await,
-        TENANT_B_ATTEMPTS as i64
+        i64::try_from(TENANT_B_ATTEMPTS).expect("TENANT_B_ATTEMPTS fits in i64")
     );
+}
+
+// ---------------------------------------------------------------------------
+// P1 regression -- `replace_execution` is a SECOND row-creation branch
+// inside `start_or_load_workflow_execution_collect`'s transaction (reached
+// by `AllowDuplicateFailedOnly`/`TerminateIfRunning`/a conflict-driven
+// `Terminate`), and it originally bypassed quota enforcement entirely.
+// Every test above exercises only the `on_conflict_do_nothing()`
+// fresh-insert branch (via `AllowDuplicate`, the default reuse policy) --
+// none of them would have caught this. Each test below targets exactly one
+// of the three `replace_execution` call sites and would have FAILED before
+// the fix (the replace silently succeeded instead of being rejected).
+// ---------------------------------------------------------------------------
+
+/// Site 2 (`AllowDuplicateFailedOnly` over a FAILED prior): resurrecting a
+/// terminal row into a fresh ACTIVE execution is a pure net **+1** to the
+/// key's active population (the terminal prior contributed zero before the
+/// replace, so nothing offsets the new row) -- looped across N distinct
+/// `workflow_id`s, each with its own already-failed prior, this is the
+/// concrete "accumulate unbounded active executions well past the declared
+/// cap" vector review agent 1 identified.
+#[tokio::test]
+async fn replace_execution_allow_duplicate_failed_only_enforces_quota_on_resurrection() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let wf = leaked("quota_replace_afo");
+
+    // 1. No quota policy installed yet -- an unconstrained start, then a
+    //    terminal failure (an ordinary completed-with-failure run).
+    let workflow_id = format!("wid-{}", Uuid::new_v4().simple());
+    let (exec_id, outcome) = try_start(
+        &mut conn,
+        wf,
+        &workflow_id,
+        serde_json::json!({"tenant_id": "t1"}),
+    )
+    .await;
+    outcome.expect("initial start (no policy yet) must succeed");
+    mark_terminal(&mut conn, exec_id, "FAILED").await;
+
+    // 2. NOW install a quota policy whose cap is ALREADY saturated by an
+    //    unrelated, distinct-`workflow_id` execution -- so any further
+    //    active admission for key "t1" (including a resurrection of the
+    //    just-failed row above) must be rejected.
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let _guard = MetadataGuard::install_one(wf, policy).await;
+    start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "t1"})).await;
+    assert_eq!(active_count(&mut conn, wf, "t1").await, 1);
+
+    // 3. Before the P1 fix, `replace_execution` (reached here via
+    //    `AllowDuplicateFailedOnly` over a FAILED prior) never called
+    //    `enforce_quota_admission` at all -- this would have silently
+    //    resurrected the failed row into a fresh ACTIVE execution.
+    let exec_id2 = ExecutionId::new();
+    let mut p = params(
+        wf,
+        &workflow_id,
+        exec_id2,
+        serde_json::json!({"tenant_id": "t1"}),
+    );
+    p.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
+    let outcome2 = start_or_load_workflow_execution(&mut conn, p, None).await;
+
+    let err = outcome2.expect_err(
+        "resurrecting a FAILED row into a fresh active execution must still \
+         be quota-checked, exactly like any other admission",
+    );
+    assert_quota_exceeded(&err, wf, "t1", QuotaResource::ActiveExecutions, 1, |c| {
+        c == 1
+    });
+
+    // Rolled back atomically: no phantom row for the rejected attempt, the
+    // original row is STILL FAILED (never resurrected), and the key's
+    // active population is untouched.
+    assert_no_execution_row(&mut conn, exec_id2).await;
+    assert_eq!(row_state(&mut conn, exec_id).await, "FAILED");
+    assert_eq!(active_count(&mut conn, wf, "t1").await, 1);
+}
+
+/// Site 3 (`TerminateIfRunning` over a genuinely TERMINAL prior, e.g.
+/// COMPLETED): the identical bypass shape as Site 2 above, reached through
+/// the OTHER reuse policy that routes a terminal-existing row into
+/// `replace_execution`.
+#[tokio::test]
+async fn replace_execution_terminate_if_running_enforces_quota_over_a_terminal_prior() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let wf = leaked("quota_replace_tir_terminal");
+
+    let workflow_id = format!("wid-{}", Uuid::new_v4().simple());
+    let (exec_id, outcome) = try_start(
+        &mut conn,
+        wf,
+        &workflow_id,
+        serde_json::json!({"tenant_id": "t1"}),
+    )
+    .await;
+    outcome.expect("initial start (no policy yet) must succeed");
+    mark_terminal(&mut conn, exec_id, "COMPLETED").await;
+
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let _guard = MetadataGuard::install_one(wf, policy).await;
+    start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "t1"})).await;
+    assert_eq!(active_count(&mut conn, wf, "t1").await, 1);
+
+    // Before the P1 fix, `replace_execution` (reached here via
+    // `TerminateIfRunning` over a terminal COMPLETED prior) never called
+    // `enforce_quota_admission`.
+    let exec_id2 = ExecutionId::new();
+    let mut p = params(
+        wf,
+        &workflow_id,
+        exec_id2,
+        serde_json::json!({"tenant_id": "t1"}),
+    );
+    p.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
+    let outcome2 = start_or_load_workflow_execution(&mut conn, p, None).await;
+
+    let err = outcome2.expect_err(
+        "TerminateIfRunning over a terminal (COMPLETED) prior must still be \
+         quota-checked when it creates a fresh active execution",
+    );
+    assert_quota_exceeded(&err, wf, "t1", QuotaResource::ActiveExecutions, 1, |c| {
+        c == 1
+    });
+
+    assert_no_execution_row(&mut conn, exec_id2).await;
+    assert_eq!(row_state(&mut conn, exec_id).await, "COMPLETED");
+    assert_eq!(active_count(&mut conn, wf, "t1").await, 1);
+}
+
+/// Site 1 (`ActiveConflictBehavior::Terminate`, existing RUNNING/PAUSED):
+/// unlike Sites 2/3, replacing an ALREADY-active row is a quota-**neutral**
+/// swap for the SAME key (the old row's -1 offsets the new row's +1) -- so
+/// the real bypass here is not about looping against one stable
+/// `workflow_id`, but about the request's resolved key CHANGING between the
+/// original start and the `TerminateIfRunning` replace call. Before the P1
+/// fix this let a caller grow an ALREADY-SATURATED key's population by
+/// retargeting an unrelated, still-running execution at it via
+/// `TerminateIfRunning`, with zero quota check anywhere in the path.
+#[tokio::test]
+async fn replace_execution_terminate_if_running_enforces_the_new_requests_resolved_key() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let wf = leaked("quota_replace_tir_crosskey");
+
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let _guard = MetadataGuard::install_one(wf, policy).await;
+
+    // Saturate "victim-tenant"'s cap of 1 via an unrelated, distinct
+    // `workflow_id`.
+    start_ok(
+        &mut conn,
+        wf,
+        serde_json::json!({"tenant_id": "victim-tenant"}),
+    )
+    .await;
+    assert_eq!(active_count(&mut conn, wf, "victim-tenant").await, 1);
+
+    // A SEPARATE, still-RUNNING execution E, originally started under a
+    // DIFFERENT key ("attacker-tenant") that is itself exactly at its own
+    // (unrelated) cap of 1.
+    let workflow_id_e = format!("wid-{}", Uuid::new_v4().simple());
+    let (exec_id_e, outcome_e) = try_start(
+        &mut conn,
+        wf,
+        &workflow_id_e,
+        serde_json::json!({"tenant_id": "attacker-tenant"}),
+    )
+    .await;
+    outcome_e.expect("E must start under its own, unsaturated key");
+    assert_eq!(active_count(&mut conn, wf, "attacker-tenant").await, 1);
+
+    // Now re-target E's SAME `workflow_id` with `TerminateIfRunning`, but
+    // this request body resolves to "victim-tenant" -- the
+    // ALREADY-SATURATED key. Before the P1 fix, `replace_execution`
+    // (`ActiveConflictBehavior::Terminate`) never called
+    // `enforce_quota_admission`, so E would have been silently sealed and
+    // replaced by a fresh execution counted against "victim-tenant",
+    // growing that key's population to 2 past its declared cap of 1.
+    let exec_id_e2 = ExecutionId::new();
+    let mut p = params(
+        wf,
+        &workflow_id_e,
+        exec_id_e2,
+        serde_json::json!({"tenant_id": "victim-tenant"}),
+    );
+    p.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
+    let outcome2 = start_or_load_workflow_execution(&mut conn, p, None).await;
+
+    let err = outcome2.expect_err(
+        "a TerminateIfRunning replace that resolves to an ALREADY-saturated \
+         key must be rejected, exactly like a fresh admission would be",
+    );
+    assert_quota_exceeded(
+        &err,
+        wf,
+        "victim-tenant",
+        QuotaResource::ActiveExecutions,
+        1,
+        |c| c == 1,
+    );
+
+    // The rejection rolled back atomically: no phantom row for the failed
+    // attempt, E is STILL RUNNING under its original key (never sealed --
+    // the whole `replace_execution` call, including the seal step, rolled
+    // back together with the failed quota check), and both keys' active
+    // populations are untouched.
+    assert_no_execution_row(&mut conn, exec_id_e2).await;
+    assert_eq!(row_state(&mut conn, exec_id_e).await, "RUNNING");
+    assert_eq!(active_count(&mut conn, wf, "victim-tenant").await, 1);
+    assert_eq!(active_count(&mut conn, wf, "attacker-tenant").await, 1);
+}
+
+/// The fix must not over-reject: a `replace_execution` admission still
+/// succeeds normally when the resolved key is well under its cap (Site 2),
+/// and a quota-**neutral** same-key refresh (Site 1) succeeds even when the
+/// key is already exactly at its cap, since it is a net-zero swap.
+#[tokio::test]
+async fn replace_execution_paths_still_succeed_when_not_over_cap() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let wf = leaked("quota_replace_under_cap");
+
+    let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(2);
+    let _guard = MetadataGuard::install_one(wf, policy).await;
+
+    // AllowDuplicateFailedOnly over a FAILED prior, well under cap.
+    let wid1 = format!("wid-{}", Uuid::new_v4().simple());
+    let (exec1, o1) = try_start(
+        &mut conn,
+        wf,
+        &wid1,
+        serde_json::json!({"tenant_id": "roomy"}),
+    )
+    .await;
+    o1.expect("initial start");
+    mark_terminal(&mut conn, exec1, "FAILED").await;
+
+    let exec1b = ExecutionId::new();
+    let mut p1 = params(wf, &wid1, exec1b, serde_json::json!({"tenant_id": "roomy"}));
+    p1.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
+    start_or_load_workflow_execution(&mut conn, p1, None)
+        .await
+        .expect("a replace well under cap must still succeed -- the fix must not over-reject");
+    assert_eq!(active_count(&mut conn, wf, "roomy").await, 1);
+
+    // TerminateIfRunning over a RUNNING existing, bringing the key to
+    // EXACTLY its cap first, then a same-key refresh at the cap boundary
+    // (net-zero on active count) must still succeed.
+    let wid2 = format!("wid-{}", Uuid::new_v4().simple());
+    let (_exec2, o2) = try_start(
+        &mut conn,
+        wf,
+        &wid2,
+        serde_json::json!({"tenant_id": "roomy"}),
+    )
+    .await;
+    o2.expect("initial start");
+    assert_eq!(active_count(&mut conn, wf, "roomy").await, 2);
+
+    let exec2b = ExecutionId::new();
+    let mut p2 = params(wf, &wid2, exec2b, serde_json::json!({"tenant_id": "roomy"}));
+    p2.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
+    start_or_load_workflow_execution(&mut conn, p2, None)
+        .await
+        .expect("a same-key refresh replace must succeed -- it is net-zero on active count");
+    assert_eq!(active_count(&mut conn, wf, "roomy").await, 2);
 }
