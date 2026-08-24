@@ -4640,7 +4640,7 @@ mod tests {
             ),
             "the claimed CTE's authoritative recheck must remain the \
              original correlated-subquery form, re-evaluated fresh under \
-             pg_try_advisory_xact_lock; got:\n{sql}"
+             the advisory-lock guard; got:\n{sql}"
         );
         assert_eq!(
             sql.matches("pg_try_advisory_xact_lock").count(),
