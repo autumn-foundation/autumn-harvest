@@ -653,7 +653,7 @@ pub const fn claim_task_query() -> &'static str {
                    OR EXISTS ( \
                        SELECT 1 FROM harvest_rate_limit_buckets b \
                        WHERE b.key = harvest_task_queue.rate_limit_key \
-                         AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_refill_rate ELSE NULL END, b.refill_rate)) >= 1.0 \
+                         AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
                    ) \
                ) \
              ORDER BY \
@@ -671,12 +671,12 @@ pub const fn claim_task_query() -> &'static str {
         ), \
         rate_limit_debit AS ( \
             UPDATE harvest_rate_limit_buckets b \
-            SET tokens = LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_refill_rate ELSE NULL END, b.refill_rate)) - 1.0, \
+            SET tokens = LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) - 1.0, \
                 last_refilled_at = NOW() \
             FROM candidate \
             WHERE b.key = candidate.rate_limit_key \
               AND NOT (candidate.activity_name = ANY($5)) \
-              AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_refill_rate ELSE NULL END, b.refill_rate)) >= 1.0 \
+              AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
             RETURNING b.key AS debited_key \
         ), \
         claimed AS ( \
@@ -1565,7 +1565,7 @@ pub const fn oldest_pending_ages_query() -> &'static str {
                OR EXISTS ( \
                    SELECT 1 FROM harvest_rate_limit_buckets b \
                    WHERE b.key = harvest_task_queue.rate_limit_key \
-                     AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_refill_rate ELSE NULL END, b.refill_rate)) >= 1.0 \
+                     AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
                ) \
            ) \
          GROUP BY queue_name"
@@ -3590,20 +3590,58 @@ pub fn effective_burst_expr(alias: &str) -> String {
     )
 }
 
+/// Renders the piecewise token-accrual expression -- the token budget that
+/// has accrued since `last_refilled_at` -- honoring a TTL'd operator
+/// override that may have EXPIRED partway through the elapsed interval
+/// (issue #945 review, P1).
+///
+/// A naive `elapsed * effective_refill_rate` (applying "whichever rate is
+/// effective right now" to the WHOLE elapsed interval) is wrong once an
+/// override has expired with no intervening write to settle the bucket: it
+/// retroactively applies the (now-reverted) baseline rate to the portion of
+/// the interval the override was still throttling, producing a phantom
+/// instant refill the moment the TTL lapses. This instead splits the
+/// accrual into two segments at the override's expiry -- or, when there is
+/// no override at all, collapses the split point to `last_refilled_at` so
+/// segment 1 is empty and the whole formula degenerates to the pre-#945
+/// flat-rate shape:
+///
+/// ```text
+/// EB      := COALESCE(override_expires_at, last_refilled_at)
+/// seg1    := GREATEST(0, EXTRACT(EPOCH FROM (LEAST(EB, NOW()) - last_refilled_at))) * COALESCE(override_refill_rate, refill_rate)
+/// seg2    := GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(EB, last_refilled_at)))) * refill_rate
+/// accrued := seg1 + seg2
+/// ```
+///
+/// Segment 1 accrues at the override's rate (if any) up to the earlier of
+/// "now" and the override's expiry; segment 2 accrues at the always-baseline
+/// rate for whatever remains after that boundary. The `COALESCE(...,
+/// last_refilled_at)` in `EB` is load-bearing: `LEAST`/`GREATEST` ignore a
+/// NULL argument rather than propagating it, so comparing a genuinely-absent
+/// `override_expires_at` directly against `last_refilled_at` would silently
+/// double-count the elapsed interval across both segments.
+#[must_use]
+fn token_accrual_expr(alias: &str) -> String {
+    format!(
+        "GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE({alias}.override_expires_at, {alias}.last_refilled_at), NOW()) - {alias}.last_refilled_at))) * COALESCE({alias}.override_refill_rate, {alias}.refill_rate) + \
+         GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE({alias}.override_expires_at, {alias}.last_refilled_at), {alias}.last_refilled_at)))) * {alias}.refill_rate"
+    )
+}
+
 /// Renders the full available-tokens expression for a
 /// `harvest_rate_limit_buckets` row (issue #945).
 ///
-/// `LEAST(effective_burst, tokens + elapsed * effective_refill_rate)`,
-/// composing [`effective_burst_expr`] and [`effective_refill_rate_expr`] so
-/// every call site -- the claim-time gate, the dispatch-time debit, the
-/// refund, the throttled-key check, and the operator gauge -- derives the
-/// identical formula and can never drift.
+/// `LEAST(effective_burst, tokens + token_accrual)`, composing
+/// [`effective_burst_expr`] and [`token_accrual_expr`] so every call site --
+/// the claim-time gate, the dispatch-time debit, the refund, the
+/// throttled-key check, and the operator gauge -- derives the identical,
+/// override-expiry-aware formula and can never drift.
 #[must_use]
 pub fn effective_available_tokens_expr(alias: &str) -> String {
     format!(
-        "LEAST({burst}, {alias}.tokens + EXTRACT(EPOCH FROM (NOW() - {alias}.last_refilled_at)) * {rate})",
+        "LEAST({burst}, {alias}.tokens + {accrual})",
         burst = effective_burst_expr(alias),
-        rate = effective_refill_rate_expr(alias),
+        accrual = token_accrual_expr(alias),
     )
 }
 
@@ -4010,14 +4048,16 @@ pub fn apply_activity_requirements<S: std::hash::BuildHasher>(
 
 pub async fn refund_rate_limit_token(conn: &mut AsyncPgConnection, key: &str) -> HarvestResult<()> {
     // Honors a live TTL'd override (issue #945): the refund caps at the
-    // *effective* burst (and re-applies pending refill at the *effective*
-    // rate) so a refund can never push tokens above what the override
-    // currently allows.
+    // *effective* burst and re-applies pending accrual via the same
+    // piecewise, override-expiry-aware formula every other reader/writer
+    // uses (issue #945 review, P1) -- so a refund can never push tokens
+    // above what the override currently allows, nor retroactively apply a
+    // reverted rate across a lapsed TTL.
     let effective_burst = effective_burst_expr("harvest_rate_limit_buckets");
-    let effective_refill_rate = effective_refill_rate_expr("harvest_rate_limit_buckets");
+    let accrual = token_accrual_expr("harvest_rate_limit_buckets");
     diesel::sql_query(format!(
         "UPDATE harvest_rate_limit_buckets \
-         SET tokens = LEAST({effective_burst}, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * {effective_refill_rate} + 1.0), \
+         SET tokens = LEAST({effective_burst}, tokens + {accrual} + 1.0), \
              last_refilled_at = NOW() \
          WHERE key = $1"
     ))
@@ -4847,13 +4887,75 @@ mod tests {
         assert!(rendered.starts_with("LEAST("));
         // Contains both sub-expressions verbatim -- this is the drift-lock
         // property every claim-gate/debit/refund/gauge SQL site relies on:
-        // any hand-copied occurrence of the burst or refill-rate formula must
-        // be an exact substring of what these two helpers independently
-        // render, or the containment assertions below (which mirror the
-        // actual SQL sites) would fail.
+        // any hand-copied occurrence of the burst formula or of the
+        // piecewise token-accrual formula must be an exact substring of what
+        // these two helpers independently render, or the containment
+        // assertions elsewhere (which mirror the actual SQL sites) would
+        // fail.
         assert!(rendered.contains(&effective_burst_expr("b")));
-        assert!(rendered.contains(&effective_refill_rate_expr("b")));
-        assert!(rendered.contains("b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at))"));
+        assert!(rendered.contains(&token_accrual_expr("b")));
+        assert_eq!(
+            rendered,
+            format!(
+                "LEAST({}, b.tokens + {})",
+                effective_burst_expr("b"),
+                token_accrual_expr("b")
+            ),
+            "effective_available_tokens_expr must be exactly \
+             LEAST(effective_burst, tokens + token_accrual) with no extra \
+             wrapping or reordering"
+        );
+    }
+
+    #[test]
+    fn token_accrual_expr_splits_accrual_at_the_override_expiry_not_the_whole_interval() {
+        // The bug this formula fixes (issue #945 review, P1): a naive
+        // `elapsed * effective_refill_rate` applies "whichever rate is
+        // effective right now" to the WHOLE elapsed interval, so an override
+        // that expired partway through the interval retroactively refills at
+        // the (now-reverted) baseline rate for the portion it was still
+        // supposed to be throttling. The fix must be genuinely piecewise:
+        // segment 1 accrues at the override's rate (if any) only up to the
+        // earlier of "now" and the override's expiry; segment 2 accrues at
+        // the *always-baseline* rate -- never a CASE-WHEN-on-expiry rate --
+        // for whatever remains after that boundary.
+        let rendered = token_accrual_expr("b");
+
+        // Segment 1's boundary collapses to `last_refilled_at` when there is
+        // no override (`COALESCE(b.override_expires_at, b.last_refilled_at)`),
+        // which is what makes an unset override degenerate segment 1 to zero
+        // duration rather than double-counting the interval.
+        assert!(
+            rendered.contains("LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW())"),
+            "segment 1 must be bounded by the override's expiry (or, absent \
+             one, last_refilled_at) rather than the whole elapsed interval; \
+             got:\n{rendered}"
+        );
+        // Segment 1 accrues at the override's rate when active.
+        assert!(
+            rendered.contains("COALESCE(b.override_refill_rate, b.refill_rate)"),
+            "segment 1 must accrue at the override's rate when one is set; \
+             got:\n{rendered}"
+        );
+        // Segment 2 accrues at the plain baseline rate -- critically, NOT a
+        // `CASE WHEN override_expires_at > NOW()` conditional, since the
+        // whole point of segment 2 is "the portion of the interval AFTER
+        // the override lapsed always used the baseline rate."
+        assert!(
+            rendered.ends_with("* b.refill_rate"),
+            "segment 2 must accrue at the plain baseline rate with no \
+             conditional wrapping; got:\n{rendered}"
+        );
+        // Both segments are floored at zero so a boundary ordering that
+        // would otherwise go negative (e.g. an override already expired
+        // before last_refilled_at) contributes nothing rather than
+        // subtracting from the other segment.
+        assert_eq!(
+            rendered.matches("GREATEST(0, EXTRACT(EPOCH FROM").count(),
+            2,
+            "both segments must be floored at zero via GREATEST(0, ...); \
+             got:\n{rendered}"
+        );
     }
 
     #[test]

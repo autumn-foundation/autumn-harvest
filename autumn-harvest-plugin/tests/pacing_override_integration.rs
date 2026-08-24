@@ -269,6 +269,80 @@ async fn set_bucket_tokens(conn: &mut AsyncPgConnection, key: &str, tokens: f64)
     .expect("set tokens");
 }
 
+/// Directly writes every accrual-relevant column on a `harvest_rate_limit_buckets`
+/// row -- baseline rate/burst, current `tokens`, `last_refilled_at` (anchored
+/// `last_refilled_seconds_ago` seconds in the past), and the TTL'd override
+/// fields (anchored so the override EXPIRED `override_expired_seconds_ago`
+/// seconds ago, when `Some`) -- bypassing both `ensure_rate_limit_bucket`'s
+/// insert-only semantics and the HTTP override route's `NOW() + ttl` /
+/// positive-rate validation, so a P1-regression scenario (an override that
+/// expired PARTWAY through the elapsed interval, with no intervening write
+/// to settle the bucket) can be constructed deterministically (issue #945
+/// review, P1).
+#[allow(clippy::too_many_arguments)]
+async fn set_bucket_accrual_state(
+    conn: &mut AsyncPgConnection,
+    key: &str,
+    refill_rate: f64,
+    burst: f64,
+    tokens: f64,
+    last_refilled_seconds_ago: f64,
+    override_refill_rate: Option<f64>,
+    override_burst: Option<f64>,
+    override_expired_seconds_ago: Option<f64>,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets \
+             (key, refill_rate, burst, tokens, last_refilled_at, \
+              override_refill_rate, override_burst, override_expires_at) \
+         VALUES ( \
+             $1, $2, $3, $4, NOW() - make_interval(secs => $5), $6, $7, \
+             CASE WHEN $8::DOUBLE PRECISION IS NULL THEN NULL \
+                  ELSE NOW() - make_interval(secs => $8) END \
+         ) \
+         ON CONFLICT (key) DO UPDATE SET \
+             refill_rate = EXCLUDED.refill_rate, \
+             burst = EXCLUDED.burst, \
+             tokens = EXCLUDED.tokens, \
+             last_refilled_at = EXCLUDED.last_refilled_at, \
+             override_refill_rate = EXCLUDED.override_refill_rate, \
+             override_burst = EXCLUDED.override_burst, \
+             override_expires_at = EXCLUDED.override_expires_at",
+    )
+    .bind::<diesel::sql_types::Text, _>(key)
+    .bind::<diesel::sql_types::Double, _>(refill_rate)
+    .bind::<diesel::sql_types::Double, _>(burst)
+    .bind::<diesel::sql_types::Double, _>(tokens)
+    .bind::<diesel::sql_types::Double, _>(last_refilled_seconds_ago)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(override_refill_rate)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(override_burst)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(override_expired_seconds_ago)
+    .execute(conn)
+    .await
+    .expect("set bucket accrual state");
+}
+
+/// Reads the LIVE numeric result of `queue::effective_available_tokens_expr`
+/// executed against a real Postgres row -- the strongest possible proof that
+/// the rendered SQL, not just its string shape, computes the mathematically
+/// correct piecewise accrual (issue #945 review, P1).
+async fn read_available_tokens(conn: &mut AsyncPgConnection, key: &str) -> f64 {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        available: f64,
+    }
+    let expr = queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
+    diesel::sql_query(format!(
+        "SELECT {expr} AS available FROM harvest_rate_limit_buckets WHERE key = $1"
+    ))
+    .bind::<diesel::sql_types::Text, _>(key)
+    .get_result::<Row>(conn)
+    .await
+    .expect("read available tokens")
+    .available
+}
+
 async fn insert_execution(conn: &mut AsyncPgConnection) -> uuid::Uuid {
     let id = uuid::Uuid::new_v4();
     diesel::sql_query(
@@ -382,14 +456,22 @@ async fn rate_limit_override_activates_immediately_and_reverts_at_ttl_with_no_re
         );
     }
 
-    // Drain the bucket again and let the TTL lapse with NO operator action
-    // (nothing calls DELETE .../override here).
+    // Let the TTL fully lapse with NO operator action (nothing calls
+    // DELETE .../override here) BEFORE draining the bucket again. The
+    // drain-to-zero must land strictly AFTER the override has expired:
+    // resetting the bucket WHILE the override is still counting down
+    // would let tokens legitimately re-accrue at the (still-active)
+    // override rate for whatever life it has left -- correct
+    // piecewise-accrual math (issue #945 review, P1), but not what this
+    // step is proving. This step proves the narrower, AC2-literal claim:
+    // a FRESH drain taken strictly after `expires_at` is governed purely
+    // by the reverted baseline rate, with zero override residue.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
     let task2 = {
         let mut conn = pool.get().await.expect("conn");
         set_bucket_tokens(&mut conn, name, 0.0).await;
         enqueue_gated_activity(&mut conn, queue, name).await
     };
-    tokio::time::sleep(Duration::from_millis(2_500)).await;
 
     {
         let mut conn = pool.get().await.expect("conn");
@@ -474,6 +556,122 @@ async fn rate_limit_override_delete_reverts_immediately_before_ttl() {
     }
 }
 
+// ── P1 review: piecewise accrual across an override that expired          ──
+// ── mid-interval with no intervening write (issue #945 review)            ──
+//
+// A naive `elapsed * effective_refill_rate` applies "whichever rate is
+// effective RIGHT NOW" to the WHOLE elapsed interval. Once an override has
+// expired with no intervening debit/refund to settle the bucket, that
+// retroactively refills at the (now-reverted) baseline rate for the portion
+// of the interval the override was still supposed to be throttling -- a
+// phantom instant refill the moment the TTL lapses. Both tests below fix the
+// bucket's `last_refilled_at`/`override_expires_at` far enough in the past,
+// with the override's own accrual rate pinned to EXACTLY `0.0`, that segment
+// 1 (the override-active portion) provably contributes ZERO tokens
+// regardless of how much real wall-clock overhead the test itself adds --
+// only segment 2 (the short post-expiry tail, at the fast baseline rate)
+// can accrue anything, so the assertions are robust to CI timing jitter by
+// construction, not by a narrow numeric tolerance.
+
+#[tokio::test]
+async fn rate_limit_override_expiring_mid_interval_accrues_piecewise_not_the_reverted_baseline_across_the_whole_interval()
+ {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let name = leaked_name("send_email");
+    let mut conn = pool.get().await.expect("conn");
+
+    // Baseline: a comparatively fast 1 token/sec. Override: fully paused
+    // (0.0 tokens/sec) for the whole time it was active. The bucket was
+    // last settled 10 DAYS ago and the override expired only 1 second ago
+    // (i.e. it was active for the ENTIRE ~10-day span minus that last
+    // second, then reverted to baseline just before "now" plus whatever
+    // this test's own overhead adds). This is the shape that actually
+    // exercises the P1 bug: almost the WHOLE elapsed interval was
+    // legitimately override-governed (and paused), with only a sliver of
+    // genuine post-expiry baseline accrual.
+    set_bucket_accrual_state(
+        &mut conn,
+        name,
+        /* refill_rate */ 1.0,
+        /* burst */ 1000.0,
+        /* tokens */ 0.0,
+        /* last_refilled_seconds_ago */ 10.0 * 86_400.0,
+        /* override_refill_rate */ Some(0.0),
+        /* override_burst */ Some(1000.0),
+        /* override_expired_seconds_ago */ Some(1.0),
+    )
+    .await;
+
+    let available = read_available_tokens(&mut conn, name).await;
+
+    // BUGGY (pre-fix) shape: `elapsed_total(~10 days) * baseline_rate(1.0)`
+    // is enormous and clamps to the burst ceiling -- the token bucket would
+    // read as FULL (1000.0) the instant the TTL lapsed, even though the
+    // override was paused for all but the last second of that 10-day span.
+    assert!(
+        available < 1000.0,
+        "must not clamp to the full burst via a phantom instant refill at \
+         the reverted baseline rate applied across the WHOLE elapsed \
+         interval; available={available}"
+    );
+    // CORRECT (piecewise) shape: segment 1 (the ~10-day override-active
+    // span) contributes EXACTLY zero at override_refill_rate=0.0 regardless
+    // of its exact duration, so only segment 2 -- the ~1-second post-expiry
+    // tail, plus this test's own real overhead -- can accrue anything, at
+    // the 1 token/sec baseline. Generous even against tens of seconds of
+    // CI overhead, while still an order of magnitude below the buggy 1000.0.
+    assert!(
+        (0.0..100.0).contains(&available),
+        "expected only the short post-expiry tail (~1s of accrual at \
+         1 token/sec, plus test overhead) to have accrued, not a refill \
+         proportional to the whole 10-day interval; available={available}"
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_override_expiring_mid_interval_does_not_phantom_refill_the_dispatch_gate() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let name = leaked_name("send_email");
+    let queue = leaked_name("email-queue");
+    let mut conn = pool.get().await.expect("conn");
+
+    // Identical accrual shape to the pure-formula test above (an override
+    // that was paused for essentially the WHOLE ~10-day span and expired
+    // only 1 second ago), but proven through the REAL dispatch/claim path
+    // (the same gate every activity task is admitted through), not a raw
+    // SELECT of the formula. The baseline rate here is deliberately much
+    // slower (0.01/s, vs. 1.0/s above) so that even a generous multi-
+    // second margin for this test's OWN wall-clock overhead between the
+    // write and the claim keeps the correct segment-2 accrual (~1 second
+    // of post-expiry tail at 0.01/s) safely under the 1.0-token dispatch
+    // threshold, while the buggy flat-rate shape (applying 0.01/s across
+    // the whole ~10-day interval) is off by four orders of magnitude and
+    // clamps straight to the burst ceiling either way.
+    set_bucket_accrual_state(
+        &mut conn,
+        name,
+        /* refill_rate */ 0.01,
+        /* burst */ 1000.0,
+        /* tokens */ 0.0,
+        /* last_refilled_seconds_ago */ 10.0 * 86_400.0,
+        /* override_refill_rate */ Some(0.0),
+        /* override_burst */ Some(1000.0),
+        /* override_expired_seconds_ago */ Some(1.0),
+    )
+    .await;
+
+    let task = enqueue_gated_activity(&mut conn, queue, name).await;
+    assert!(
+        claim(&mut conn, queue).await.is_none(),
+        "a task must NOT become claimable via a phantom instant refill the \
+         moment a long-paused override's TTL lapses -- the bucket has only \
+         accrued ~1 second's worth of tokens at the baseline rate, well \
+         under the 1.0 needed to dispatch, task={task}"
+    );
+}
+
 // ── Workflow-start throttle: activation + TTL auto-revert via real /start ──
 
 #[tokio::test]
@@ -532,13 +730,17 @@ async fn throttle_override_activates_immediately_and_reverts_at_ttl_via_real_sta
         "override must activate the very next /start call with no restart: {body}"
     );
 
-    // Drain the bucket back to zero and let the TTL lapse with no operator
-    // action (nothing calls DELETE here).
+    // Let the TTL fully lapse with no operator action (nothing calls
+    // DELETE here) BEFORE draining the bucket back to zero. The drain
+    // must land strictly AFTER the override has expired -- see the
+    // matching comment on the rate-limit-side TTL test above for why
+    // resetting mid-override would legitimately re-accrue tokens at the
+    // still-active override rate under correct piecewise-accrual math.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
     {
         let mut conn = pool.get().await.expect("conn");
         set_bucket_tokens(&mut conn, &bucket_key, 0.0).await;
     }
-    tokio::time::sleep(Duration::from_millis(2_500)).await;
 
     let (status, body) = post_json(&app, &start_uri, start("job-4")).await;
     assert_eq!(

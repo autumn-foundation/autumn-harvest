@@ -32504,14 +32504,11 @@ async fn set_start_throttle_pacing_override(
         }
     }
 
-    if !shard_errors.is_empty() && !any_success {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({ "errors": shard_errors })),
-        )
-            .into_response();
-    }
-
+    // Attempt the audit write *before* deciding the response -- including on
+    // total shard failure (issue #945 review, P2). A fully-failed
+    // administrative override attempt must still leave an audit trail; the
+    // early `503` below is deferred until after this write is attempted so it
+    // can never bypass it.
     let status = if shard_errors.is_empty() {
         STATUS_SUCCEEDED
     } else {
@@ -32556,6 +32553,14 @@ async fn set_start_throttle_pacing_override(
             return AutumnError::service_unavailable_msg("audit DB connection unavailable")
                 .into_response();
         }
+    }
+
+    if !shard_errors.is_empty() && !any_success {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
     }
 
     let response = PacingOverrideResponse::build(
@@ -32648,14 +32653,11 @@ async fn clear_start_throttle_pacing_override(
         }
     }
 
-    if !shard_errors.is_empty() && !any_success {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({ "errors": shard_errors })),
-        )
-            .into_response();
-    }
-
+    // Attempt the audit write *before* deciding the response -- including on
+    // total shard failure (issue #945 review, P2). A fully-failed
+    // administrative override attempt must still leave an audit trail; the
+    // early `503` below is deferred until after this write is attempted so it
+    // can never bypass it.
     let status = if shard_errors.is_empty() {
         STATUS_SUCCEEDED
     } else {
@@ -32700,6 +32702,14 @@ async fn clear_start_throttle_pacing_override(
             return AutumnError::service_unavailable_msg("audit DB connection unavailable")
                 .into_response();
         }
+    }
+
+    if !shard_errors.is_empty() && !any_success {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
     }
 
     let response =
@@ -33292,14 +33302,11 @@ async fn set_rate_limit_pacing_override(
         }
     }
 
-    if !shard_errors.is_empty() && !any_success {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({ "errors": shard_errors })),
-        )
-            .into_response();
-    }
-
+    // Attempt the audit write *before* deciding the response -- including on
+    // total shard failure (issue #945 review, P2). A fully-failed
+    // administrative override attempt must still leave an audit trail; the
+    // early `503` below is deferred until after this write is attempted so it
+    // can never bypass it.
     let status = if shard_errors.is_empty() {
         STATUS_SUCCEEDED
     } else {
@@ -33344,6 +33351,14 @@ async fn set_rate_limit_pacing_override(
             return AutumnError::service_unavailable_msg("audit DB connection unavailable")
                 .into_response();
         }
+    }
+
+    if !shard_errors.is_empty() && !any_success {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
     }
 
     let response = PacingOverrideResponse::build(
@@ -33437,14 +33452,11 @@ async fn clear_rate_limit_pacing_override(
         }
     }
 
-    if !shard_errors.is_empty() && !any_success {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({ "errors": shard_errors })),
-        )
-            .into_response();
-    }
-
+    // Attempt the audit write *before* deciding the response -- including on
+    // total shard failure (issue #945 review, P2). A fully-failed
+    // administrative override attempt must still leave an audit trail; the
+    // early `503` below is deferred until after this write is attempted so it
+    // can never bypass it.
     let status = if shard_errors.is_empty() {
         STATUS_SUCCEEDED
     } else {
@@ -33489,6 +33501,14 @@ async fn clear_rate_limit_pacing_override(
             return AutumnError::service_unavailable_msg("audit DB connection unavailable")
                 .into_response();
         }
+    }
+
+    if !shard_errors.is_empty() && !any_success {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
     }
 
     let response =
