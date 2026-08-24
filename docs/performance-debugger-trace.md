@@ -312,8 +312,8 @@ Total: 45,300,388 bytes in 473,020 blocks
 category                                  bytes       %       blocks       %
 harness_fixture_setup                   366,142   0.81%        3,841   0.81%
 history_projection_one_time_build        952,740   2.10%        8,973   1.90%
-trace_snapshot_prefix_clone          29,277,294  64.63%      285,604  60.38%
-replay_prefix_or_context_build          242,757   0.54%        2,972   0.63%
+trace_snapshot_prefix_clone          29,110,827  64.26%      283,924  60.02%
+replay_prefix_or_context_build          409,224   0.90%        4,652   0.98%
 history_matcher_internals                     0   0.00%            0   0.00%
 workflow_reexecution                 14,437,593  31.87%      171,441  36.24%
 fmt_format_machinery                          0   0.00%            0   0.00%
@@ -328,7 +328,12 @@ for precision, and a new `history_projection_one_time_build` bucket was
 split out. The grand totals (45,300,388 bytes / 473,020 blocks) are
 unchanged — only the internal categorization moved, exactly as expected
 from DHAT's own invariant that its totals don't depend on how allocations
-are grouped by stack.
+are grouped by stack. **Updated a further time** in response to a later
+review comment: `trace_snapshot_prefix_clone`'s whole-stack fallback
+condition was being checked too early — ahead of buckets 4 and 5 instead
+of after them — so it was absorbing a slice of their allocations; the
+table above already reflects that fix. See the note following the
+`tokio_runtime` deep-dive below for the exact evidence.
 
 `other` (0.03% of bytes) is no longer a single fixed figure at every `n` —
 confirmed by directly decomposing its top stacks, not assumed. Two
@@ -361,7 +366,7 @@ exactly as the O(N²) hypothesis predicts:
 |---|---:|---:|---:|---:|
 | `harness_fixture_setup` | 2.75% | 1.53% | 0.81% | 0.42% |
 | `history_projection_one_time_build` | 7.18% | 3.98% | 2.10% | 1.08% |
-| `trace_snapshot_prefix_clone` | 56.96% | 61.82% | **64.63%** | 66.14% |
+| `trace_snapshot_prefix_clone` | 55.71% | 61.13% | **64.26%** | 65.95% |
 | `workflow_reexecution` | 30.83% | 31.50% | 31.87% | 32.06% |
 | `tokio_runtime` | 0.25% | 0.07% | 0.02% | 0.00% |
 
@@ -418,17 +423,61 @@ the 27.4% splits across `history_projection_one_time_build` and
 `trace_snapshot_prefix_clone` depending on which pass it belongs to, and
 the 0.4% now lands, correctly, in `other`.
 
+`trace_snapshot_prefix_clone`'s own check was **further refined** after
+this same round of review, for the identical class of bug bucket 8's fix
+above addresses: the whole-stack `"trace_snapshot" in joined` fallback
+(condition (b)) cannot distinguish "`trace_snapshot` is a distant
+ancestor" from "`trace_snapshot::{{closure}}` is the true proximate
+cause" — a further Codex review comment on this PR flagged that this lets
+`render_command`/`command_payload` allocations (bucket 5's own named
+descendants, which run nested inside `replay_prefix`, itself called from
+`trace_snapshot`'s per-step loop, so `trace_snapshot` genuinely IS an
+ancestor of their allocations too, just not the most specific one) get
+swept into this bucket instead of `replay_prefix_or_context_build`.
+Measured directly at n=80 against the categorizer's precedence ordering
+before this fix: **166,467 bytes (0.37% of the 45,300,388-byte capture, 7
+program points, every one resolving to `render_command`/`command_payload`
+further up the stack) were misattributed this way** — small relative to
+the bucket's ~64% share, but real and previously undetected. The
+reviewer's broader question — whether this bucket's ~64% share as a whole
+could be trusted at all without excluding named descendants — does not
+hold up beyond that narrow slice: the remaining 29,110,827 bytes (99.63%
+of this bucket's total after the fix) are dominated (90.73% of the
+fallback-matched subset) by `BTreeMap::clone::clone_subtree` sitting
+directly at the allocation's proximate frame — a deeper LLVM inlining
+variant of the same per-step `to_vec()`/`clone()` mechanism condition (a)
+already catches at a shallower inlining depth, not a different mechanism.
+Fixed by moving buckets 4 and 5's checks ahead of condition (b) in the
+code (condition (a) — the direct proximate-frame match — stays checked
+first and unconditionally, since a stack's own immediate caller can only
+ever be one function and therefore cannot collide with a descendant
+marker). The misattributed volume now lands, correctly, in
+`replay_prefix_or_context_build`; measured across the full sweep it grows
+with `n` at roughly the same rate as the rest of the bucket's `O(n²)`
+mechanism (41,607 → 83,227 → 166,467 → 333,074 bytes at n=20/40/80/160,
+each ratio ≈2.00x per doubling — consistent with
+`render_command`/`command_payload` running once per drained command per
+step, the same fresh-replay-per-step design, just attributed to a more
+specific function). See `classify_dhat_allocations.py`'s own docstring
+(the "KNOWN FIX" note under bucket 3) for the full precedence rationale.
+
 `trace_snapshot_prefix_clone` and `workflow_reexecution` are both genuinely
-`O(n²)` (see "Hypothesis" below), so their combined share (87.8% → 93.3% →
-96.5% → 98.2% across the sweep) converges toward the whole budget as
+`O(n²)` (see "Hypothesis" below), so their combined share (86.5% → 92.6% →
+96.1% → 98.0% across the sweep) converges toward the whole budget as
 `n → ∞` — a tighter, cleaner convergence than the pre-correction figures
 (86.0% → 90.1% → 92.4% → 93.6%) showed, since the fix stops diluting both
-numerators with allocations that were never theirs. Their *relative* split
-between the two grows modestly across the sweep (1.85:1 → 1.96:1 → 2.03:1
-→ 2.06:1 in favor of the prefix clone) — both scale at the same asymptotic
-order, so the ratio was already approximately stable before this
-correction and remains so after it; this document does not claim it is
-perfectly constant.
+numerators with allocations that were never theirs. (This combined-share
+figure moved slightly again, from an intermediate 87.8% → 93.3% → 96.5% →
+98.2%, after the `render_command`/`command_payload` fix immediately
+above: that fix moves bytes out of `trace_snapshot_prefix_clone` into a
+*third* bucket, `replay_prefix_or_context_build`, which this combined
+figure never counted, so removing them from the numerator here — without
+adding them anywhere this figure sums — pulls the total down slightly.)
+Their *relative* split between the two grows modestly across the sweep
+(1.81:1 → 1.94:1 → 2.02:1 → 2.06:1 in favor of the prefix clone) — both
+scale at the same asymptotic order, so the ratio was already
+approximately stable before this correction and remains so after it;
+this document does not claim it is perfectly constant.
 
 `history_matcher_internals` (`HistoryMatcher`/`match_history`/
 `drive_query_replay`'s own bookkeeping — walking an already-owned prefix and
@@ -509,7 +558,7 @@ persistent `Vec<WorkflowEvent>` across steps** (appending only the single
 newly-in-scope event at each step, instead of cloning the whole growing
 range from scratch every time) — turning `Σ(k=0..n-1) O(k+1)` clone-copies
 into a single `O(n)` sequence of one-element appends, addressing the
-dominant 64.6%-and-rising `trace_snapshot_prefix_clone` bucket directly.
+dominant 64.3%-and-rising `trace_snapshot_prefix_clone` bucket directly.
 
 **This is unsafe**, confirmed by direct source inspection, not merely
 inconvenient or unmeasured. `docs/performance-replay.md` documents a prior,
@@ -615,7 +664,7 @@ maintainer decision, not a unilateral commit:
    interactive tool, not unblocking anything currently broken.
 2. **`Arc`-wrap event payloads** (or whole `WorkflowEvent`s) so a prefix
    "clone" becomes cheap reference-count bumps rather than deep `Value`
-   clones — directly addressing the dominant 64.6%-and-rising
+   clones — directly addressing the dominant 64.3%-and-rising
    `trace_snapshot_prefix_clone` share. **This shrinks the constant factor,
    not the complexity class**: there are still `n` steps each doing `O(k)`
    work (now cheap refcount bumps instead of deep clones, but still linear
@@ -728,6 +777,36 @@ Nothing in production code. Only:
   load-bearing, environment-independent evidence for the scaling
   conclusion — distinct from the absolute Ir counts, which do require a
   matching environment to reproduce exactly.
+
+  **Revised a fifth time in response to a further Codex review comment**:
+  `trace_snapshot_prefix_clone`'s whole-stack fallback condition
+  (condition (b)) was checked ahead of buckets 4
+  (`history_matcher_internals`) and 5 (`replay_prefix_or_context_build`)
+  in the categorizer, so it could not distinguish "`trace_snapshot` is a
+  distant ancestor of this allocation" from "`trace_snapshot::{{closure}}`
+  is the true proximate cause" — the identical bug class already fixed for
+  `tokio_runtime` earlier in this same document, just narrower. Measured
+  directly at n=80: 166,467 bytes (0.37% of the 45,300,388-byte capture, 7
+  program points, all `render_command`/`command_payload`) were
+  misattributed away from bucket 5 into this bucket. The reviewer's
+  broader implication — that this bucket's ~64% share as a whole could not
+  be trusted without excluding named descendants — does not hold beyond
+  that narrow slice: 99.63% of the bucket's total is confirmed, by
+  proximate-frame grouping, to genuinely be the prefix-clone mechanism
+  (dominated by `BTreeMap::clone::clone_subtree` at the proximate frame, a
+  deeper LLVM inlining variant of the same mechanism condition (a) already
+  catches shallower). Fixed by moving buckets 4 and 5's checks ahead of
+  condition (b) in the code, while condition (a) (the direct
+  proximate-frame match) stays checked first and unconditionally, since it
+  structurally cannot collide with either bucket's descendant markers. All
+  four capture sizes were re-classified with the fixed script; the
+  "Allocation-site attribution" section above reflects the corrected
+  `trace_snapshot_prefix_clone` / `replay_prefix_or_context_build` figures
+  and the recomputed combined-share/ratio figures that depend on them. The
+  underlying DHAT captures are unchanged — this is a categorization-only
+  fix, verified by re-running `classify_dhat_allocations.py`'s own
+  exhaustive-partition assertion against all four captures (it still
+  passes: category totals still sum to each capture's exact grand total).
 - This document.
 
 `cargo fmt --all -- --check`, `cargo check -p autumn-harvest

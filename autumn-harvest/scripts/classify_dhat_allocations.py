@@ -64,14 +64,18 @@ meaningful share of allocations and misattributing them to "other".
 3. `trace_snapshot_prefix_clone` -- EITHER (a) `fs[1]` (the allocation's
    proximate, immediate caller -- see the module docstring above) is
    `trace_snapshot::{{closure}}` itself, with no further Rust-named callee
-   in between, OR (b) `trace_snapshot` appears anywhere on the stack
-   together with a `to_vec`/`Clone`/`clone` marker (and bucket 2 above
-   didn't already claim it). This is the per-step
-   `snapshot.events[..=step.index].to_vec()` call (plus the per-step
-   `input.clone()` beside it) in `trace_snapshot`'s loop: at step `k` it
-   clones `k + 1` `WorkflowEvent`s (many carrying `serde_json::Value`
-   payloads, `BTreeMap`-backed with no `preserve_order` feature) into a
-   fresh owned `Vec` handed to `replay_prefix`.
+   in between -- checked HERE, unconditionally, immediately after bucket
+   2 -- OR (b) `trace_snapshot` appears anywhere on the stack together
+   with a `to_vec`/`Clone`/`clone` marker, a whole-stack substring
+   fallback checked LATER in the code, AFTER buckets 4 and 5 below have
+   had a chance to claim the pp first (see the "KNOWN FIX" note at the
+   end of this bullet for why). Both conditions identify the same
+   mechanism: the per-step `snapshot.events[..=step.index].to_vec()` call
+   (plus the per-step `input.clone()` beside it) in `trace_snapshot`'s
+   loop -- at step `k` it clones `k + 1` `WorkflowEvent`s (many carrying
+   `serde_json::Value` payloads, `BTreeMap`-backed with no
+   `preserve_order` feature) into a fresh owned `Vec` handed to
+   `replay_prefix`.
 
    Condition (a) exists because LLVM's release-profile inlining is not
    uniform across call sites of the same generic function (confirmed
@@ -91,17 +95,50 @@ meaningful share of allocations and misattributing them to "other".
    wrapped workload) happens to also appear somewhere in its 30-frame
    capture.
 
+   KNOWN FIX, empirically confirmed and measured (in response to a
+   further Codex review comment): condition (b)'s whole-stack substring
+   search cannot distinguish "`trace_snapshot` is a distant ANCESTOR of
+   this allocation" from "`trace_snapshot::{{closure}}` is this
+   allocation's own proximate cause" -- the identical ambiguity already
+   fixed for `tokio_runtime` below (bucket 8), and for the same root
+   reason: `render_command`/`command_payload` (bucket 5's own named
+   descendants -- they run nested inside `replay_prefix`, itself called
+   from `trace_snapshot`'s per-step loop, so `trace_snapshot` genuinely IS
+   an ancestor of their allocations too, just not the most specific one)
+   were being swept into THIS bucket by condition (b) purely because
+   `trace_snapshot` also appears somewhere in their ancestor chain.
+   Measured directly at n=80 against the marker set this script shipped
+   with before this fix: 166,467 bytes (0.37% of the 45,300,388-byte
+   capture, 7 program points, every one resolving to
+   `render_command`/`command_payload` further up the stack) were
+   misattributed this way -- small, but real, and previously undetected.
+   Fixed identically to bucket 8's fix: condition (a) stays checked HERE
+   (a stack's own immediate proximate caller can only ever be one
+   function, so it structurally cannot collide with -- or need to defer
+   to -- bucket 4/5's descendant markers), but condition (b) moved, in
+   the code, to run AFTER buckets 4 and 5 (see their notes below), so a
+   pp naming one of their more specific descendants is claimed there
+   first. The remaining 29,110,827 bytes (99.63% of this bucket's total
+   after the fix, dominated -- 90.73% of the fallback subset -- by
+   `BTreeMap::clone::clone_subtree` sitting directly at the proximate
+   frame, with `String::clone` and `to_vec_in::ConvertVec::to_vec` making
+   up the rest) are unaffected by this fix and remain correctly
+   attributed to this bucket: the review comment that prompted this
+   investigation additionally questioned whether this bucket's reported
+   share as a whole could be trusted at all without excluding named
+   descendants -- it can, for the vast majority of it; only the narrow
+   166,467-byte slice above needed correcting.
+
 4. `history_matcher_internals` -- `HistoryMatcher`, `match_history`, or
-   `drive_query_replay` on the stack -- checked AHEAD of bucket 5 below,
-   not after, because these frames are always *nested inside*
-   `replay_prefix`'s own `drive_query_replay_async(...).await` (confirmed
-   by reading `replay_prefix`'s body in `debugger.rs`), so any stack
-   carrying both markers has this as the more specific, innermost cause --
-   the identical precedence principle bucket 3 above already applies to
-   `trace_snapshot_prefix_clone` vs. its descendants. This is the actual
-   replay-matching machinery that walks the (already-owned,
-   already-cloned) prefix and decides what the workflow function does
-   next.
+   `drive_query_replay` on the stack -- checked AHEAD of bucket 5 below
+   AND ahead of bucket 3's condition (b) fallback above (see that
+   bullet's "KNOWN FIX" note), because these frames are always *nested
+   inside* `replay_prefix`'s own `drive_query_replay_async(...).await`
+   (confirmed by reading `replay_prefix`'s body in `debugger.rs`), so any
+   stack carrying both markers has this as the more specific, innermost
+   cause. This is the actual replay-matching machinery that walks the
+   (already-owned, already-cloned) prefix and decides what the workflow
+   function does next.
 
    KNOWN LIMITATION, empirically confirmed rather than assumed: in this
    workspace's default `cargo bench` release profile (`debug = false`,
@@ -111,11 +148,14 @@ meaningful share of allocations and misattributing them to "other".
    raw `ftbl` for `HistoryMatcher` / `match_history` / `drive_query_replay`
    / `replay_prefix` / `match_activity` / `scan_activity_terminal` returns
    zero matches at every swept input size, with or without debug info, and
-   swapping this bucket's precedence against bucket 5's changes nothing
-   (both orderings observe the same empty marker set on every captured
-   stack). So a `0` count here means "unobservable by this methodology",
-   not "free" -- any allocation this code performs is silently folded into
-   whichever caller frame survived inlining (most plausibly
+   this bucket observes the same empty marker set (zero pps) regardless of
+   its precedence relative to bucket 3's condition (b) or bucket 5 --
+   the reordering below fixed a real, measured misattribution for bucket
+   5 (see bucket 3's note above), but has no measurable effect on THIS
+   bucket specifically, since it never receives any pps either way. So a
+   `0` count here means "unobservable by this methodology", not "free" --
+   any allocation this code performs is silently folded into whichever
+   caller frame survived inlining (most plausibly
    `trace_snapshot::{{closure}}`, landing in bucket 3, or the
    workflow-driving frames feeding bucket 6). See
    `docs/performance-debugger-trace.md`'s "Allocation-site attribution"
@@ -123,8 +163,12 @@ meaningful share of allocations and misattributing them to "other".
 
 5. `replay_prefix_or_context_build` -- `replay_prefix`,
    `for_replay_canary_with_state`, `register_declarative_handlers`,
-   `render_command`, or `command_payload` on the stack (and buckets 2-4
-   didn't already match). Per-step `WorkflowContext` construction,
+   `render_command`, or `command_payload` on the stack (and buckets 2, 4,
+   and bucket 3's condition (a) didn't already match). Checked ahead of
+   bucket 3's condition (b) fallback above -- see that bullet's "KNOWN
+   FIX" note for the empirical misattribution this ordering closes (166
+   KB / 7 program points at n=80, all `render_command`/`command_payload`).
+   Per-step `WorkflowContext` construction,
    declarative-handler registration, and command-rendering overhead --
    confirmed by reading `replay_prefix`'s body: it is called once per step
    (from `trace_snapshot`'s loop), builds a fresh `WorkflowContext` via
@@ -212,27 +256,38 @@ def classify(joined: str, frames: list[str]) -> str:
     # frames[0] is always the allocator entry point; frames[1] is the true,
     # proximate Rust-level call site. Reaching trace_snapshot's own closure
     # directly there (condition (a)) is stronger, first-hand evidence than
-    # the whole-stack substring search (condition (b)) -- see this bucket's
-    # docstring note above for why both are needed.
-    proximate_is_trace_snapshot = len(frames) > 1 and "trace_snapshot::{{closure}}" in frames[1]
-    if proximate_is_trace_snapshot or (
-        "trace_snapshot" in joined
-        and ("to_vec" in joined or "Clone" in joined or "clone" in joined)
-    ):
+    # the whole-stack substring search (condition (b), checked further
+    # below, AFTER buckets 4 and 5) -- checked here, unconditionally,
+    # because a stack's own immediate caller can only ever be one function
+    # and therefore cannot collide with -- or need to defer to -- bucket
+    # 4/5's descendant markers below. See this bucket's docstring "KNOWN
+    # FIX" note above.
+    if len(frames) > 1 and "trace_snapshot::{{closure}}" in frames[1]:
         return "trace_snapshot_prefix_clone"
-    # Checked BEFORE replay_prefix_or_context_build: HistoryMatcher /
-    # match_history / drive_query_replay frames are always nested *inside*
-    # replay_prefix's own drive_query_replay_async(...).await, so on a
-    # stack carrying both markers this is the more specific, innermost
-    # cause -- see bucket 4's docstring note above for why this precedence
-    # is, empirically, unreachable in a release-profile capture regardless
-    # of which way it is ordered (both markers are fully inlined away).
+    # Checked BEFORE replay_prefix_or_context_build (and before bucket 3's
+    # condition (b) fallback below): HistoryMatcher / match_history /
+    # drive_query_replay frames are always nested *inside* replay_prefix's
+    # own drive_query_replay_async(...).await, so on a stack carrying both
+    # markers this is the more specific, innermost cause -- see bucket 4's
+    # docstring note above for why this precedence is, empirically,
+    # unreachable in a release-profile capture regardless of ordering
+    # (both markers are fully inlined away).
     if (
         "HistoryMatcher" in joined
         or "match_history" in joined
         or "drive_query_replay" in joined
     ):
         return "history_matcher_internals"
+    # Checked BEFORE bucket 3's condition (b) fallback below:
+    # render_command / command_payload / replay_prefix /
+    # for_replay_canary_with_state / register_declarative_handlers are
+    # more specific, nested descendants of trace_snapshot's per-step
+    # loop -- condition (b) below cannot tell "trace_snapshot is a
+    # distant ancestor" from "trace_snapshot is the proximate cause", so
+    # it must defer to a more specific match here first. See bucket 3's
+    # docstring "KNOWN FIX" note above for the empirical misattribution
+    # (166,467 bytes / 7 program points at n=80, all
+    # render_command/command_payload) this ordering closes.
     if (
         "replay_prefix" in joined
         or "for_replay_canary_with_state" in joined
@@ -241,6 +296,13 @@ def classify(joined: str, frames: list[str]) -> str:
         or "command_payload" in joined
     ):
         return "replay_prefix_or_context_build"
+    # Condition (b): the whole-stack substring fallback for
+    # trace_snapshot_prefix_clone, deliberately checked LAST among buckets
+    # 3-5 -- see bucket 3's docstring "KNOWN FIX" note above.
+    if "trace_snapshot" in joined and (
+        "to_vec" in joined or "Clone" in joined or "clone" in joined
+    ):
+        return "trace_snapshot_prefix_clone"
     if "sequential_workflow" in joined or "activity_payload" in joined:
         return "workflow_reexecution"
     if "core::fmt" in joined or "alloc::fmt" in joined:
