@@ -11,7 +11,20 @@ unmeasured or below-floor gain.
 Wall-clock timing is not admissible evidence on this (shared-vCPU) machine —
 every number below is a deterministic instruction or allocation count from
 `valgrind --tool=callgrind` / `valgrind --tool=dhat`, reproducible bit-for-bit
-on any machine.
+across repeated runs of the same compiled binary. That determinism is scoped
+to **a fixed profiling environment, not "any machine"**: Callgrind counts the
+instructions the executable actually executes, and a different rustc/cargo
+version, valgrind version, or libc build can change codegen or which
+CPU-dispatched libc routine gets selected — changing the exact counts without
+changing the O(N²) conclusion they support. Every number in this document was
+captured with `rustc 1.94.1 (e408947bf 2026-03-25)` / `cargo 1.94.1
+(29ea6fb6a 2026-03-24)`, `valgrind-3.22.0`, on `x86_64-unknown-linux-gnu` with
+Ubuntu `glibc 2.39`; reproducing the absolute figures exactly requires
+matching that environment. Reproducing the *scaling conclusion* — the
+monotonic climb toward a 4.0x ratio per doubling of `n` (O(N²), not the exact
+Ir count at each point) — does not; see "Instruction-count scaling (the
+asymptotic argument)" below, which is the load-bearing evidence, not the
+absolute counts in isolation.
 
 **This is a findings-only document.** No production code changed as part of
 this investigation — see "What changed in this PR" below.
@@ -699,6 +712,22 @@ Nothing in production code. Only:
   by 0.0001%–0.005% (fully attributable to the harness's own added
   instructions, not the profiled workload) and are updated above with an
   explanation of the delta rather than silently left stale.
+
+  **Revised a fourth time in response to a further Codex review comment**:
+  the opening paragraph claimed every number below is "reproducible
+  bit-for-bit on any machine" — overreaching, since Callgrind counts the
+  instructions the compiled executable actually executes, and a different
+  rustc/cargo version, valgrind version, or libc build can change codegen
+  or which CPU-dispatched libc routine gets selected, changing the exact
+  counts on a different machine without changing the O(N²) conclusion they
+  support. Fixed by scoping the determinism claim to a fixed profiling
+  environment, recording the exact versions used to capture every number in
+  this document (`rustc`/`cargo` 1.94.1, `valgrind-3.22.0`,
+  `x86_64-unknown-linux-gnu`, Ubuntu `glibc 2.39`), and pointing at the
+  "Instruction-count scaling" section's ratio-based argument as the
+  load-bearing, environment-independent evidence for the scaling
+  conclusion — distinct from the absolute Ir counts, which do require a
+  matching environment to reproduce exactly.
 - This document.
 
 `cargo fmt --all -- --check`, `cargo check -p autumn-harvest
