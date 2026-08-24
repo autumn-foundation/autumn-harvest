@@ -45,6 +45,14 @@ this page says nothing about what they cost; see
 * **Only one predicate is genuinely expensive: per-key concurrency (+644% p50).**
   Build-id routing (+13%), the rate-limit gate (+2%) and the circuit-breaker
   tracked set (+4%) are cheap or free.
+* **The per-key concurrency predicate (#247) — flagged above as the one
+  genuinely expensive gate — has since been fixed.** Its candidate-side gate
+  was a correlated `COUNT(*)` subquery, re-evaluated once per candidate row a
+  claim visits rather than once per claim. Materializing the `RUNNING` count
+  once per claim into a small pre-aggregated CTE cuts total buffers touched
+  across a real 10 000-row drain **-99.56%** at the headline scenario
+  (2 492 987 808 → 10 938 903). See
+  [the concurrency-key gate fix](#the-concurrency-key-gate-fix).
 * **Paused executions cost as much as live ones (+1403% p50), and the cost is
   table depth rather than anything specific to pausing.** An equal-*depth*
   control with no PAUSED rows costs the same (+1383%), so the operational
@@ -378,7 +386,9 @@ What each row exercises, and what it means:
   (a shorter earlier run reported +306% over 174 samples; this 657-sample run
   reports +644%), which is consistent with the `COUNT(*)` subquery counting a
   `RUNNING` population that the benchmark itself is growing. Read it as
-  "expensive and load-dependent", not as a fixed multiplier.
+  "expensive and load-dependent", not as a fixed multiplier. **This
+  predicate's candidate-side gate has since been fixed** — see
+  [the concurrency-key gate fix](#the-concurrency-key-gate-fix).
 * **`double_backlog` (+1383%)** — the control described above. Not a predicate:
   the cost of doubling table depth, full stop.
 * **`paused_rows` (+1% vs the control)** — 10 000 rows belonging to PAUSED
@@ -573,6 +583,173 @@ which also covers resuming the queue). Reproduce with
 `autumn-harvest/scripts/queue_pause_claim_perf_repro.sh`, which needs either
 `HARVEST_TEST_DATABASE_URL` (an admin connection string) or a reachable Docker
 daemon for its testcontainer fallback — not both.
+
+## The concurrency-key gate fix
+
+The `concurrency_key` row above — flagged as "the one genuinely expensive
+predicate on the claim path" — was measured, not yet fixed, when this page
+first shipped. This section closes that gap: it fixes the predicate the
+attribution table indicts and measures the result against the same headline
+scenario the +644% figure came from.
+
+**Mechanism.** `claim_task_query()`'s pre-fix per-key concurrency gate
+(issue #247) is a *correlated* `COUNT(*)` subquery on the candidate side:
+
+```sql
+( concurrency_key IS NULL
+  OR concurrency_cap IS NULL
+  OR ( SELECT COUNT(*) FROM harvest_task_queue inner_q
+       WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key
+         AND inner_q.task_type = harvest_task_queue.task_type
+         AND inner_q.state = 'RUNNING'
+         AND inner_q.worker_id IS NOT NULL
+     ) < harvest_task_queue.concurrency_cap
+)
+```
+
+Postgres re-evaluates this once per candidate row the outer scan visits, not
+once per claim — the same anti-pattern as the queue-pause predicate above, but
+here the subquery scans `harvest_task_queue` for `RUNNING` rows sharing the
+same key rather than a small operator-facing pause table, so its cost is
+*load*-dependent (it grows with the `RUNNING` population), not just
+*depth*-dependent. The fix replaces it with two `MATERIALIZED` CTEs, computed
+once per claim rather than once per candidate row:
+
+```sql
+concurrency_pending_keys AS MATERIALIZED (
+    SELECT DISTINCT concurrency_key, task_type
+    FROM harvest_task_queue
+    WHERE queue_name = ANY($2)
+      AND state = 'PENDING'
+      AND concurrency_key IS NOT NULL
+      AND concurrency_cap IS NOT NULL
+),
+concurrency_running_counts AS MATERIALIZED (
+    SELECT t.concurrency_key, t.task_type, COUNT(*) AS running_count
+    FROM harvest_task_queue t
+    WHERE t.state = 'RUNNING'
+      AND t.worker_id IS NOT NULL
+      AND t.concurrency_key IN (SELECT concurrency_key FROM concurrency_pending_keys)
+    GROUP BY t.concurrency_key, t.task_type
+)
+...
+( concurrency_key IS NULL
+  OR concurrency_cap IS NULL
+  OR COALESCE((
+       SELECT rc.running_count FROM concurrency_running_counts rc
+       WHERE rc.concurrency_key = harvest_task_queue.concurrency_key
+         AND rc.task_type = harvest_task_queue.task_type
+     ), 0) < harvest_task_queue.concurrency_cap
+)
+```
+
+`concurrency_pending_keys` bounds the second CTE's join to only the keys
+actually present in the current backlog (never the whole `RUNNING`
+population), and both CTEs are evaluated once regardless of how many
+candidate rows are later filtered against them. The `claimed` CTE's
+authoritative, race-safe recheck — the same correlated `COUNT(*)`, guarded by
+`pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint)`, run
+once on the single winning row after it is already locked — is untouched: the
+fix rewrites only the *filtering* pass over many candidate rows, not the
+*authoritative* recheck on the one row that wins the claim. Confirmed
+byte-for-byte identical before/after: at the hot-contention scale below, both
+plans show the identical
+`Aggregate (actual rows=1 loops=1) Buffers: shared hit=10` /
+`Bitmap Heap Scan ... Heap Blocks: exact=8` subtree for that recheck node.
+
+**Measurement.** `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF)`
+of a single cold claim, isolated to the concurrency-check subtree specifically
+— the part of the plan this fix changes — against the reference environment
+above. Full artifacts (before/after `EXPLAIN` at each `BACKLOG_SWEEP` depth,
+plus a hot-contention variant and a `pg_stat_statements` snapshot) are
+committed under
+[`docs/perf-artifacts/concurrency-key-claim-predicate/`](perf-artifacts/concurrency-key-claim-predicate/).
+
+| Scenario | Buffers, concurrency-check subtree (before) | Buffers (after) | Δ |
+|:--|--:|--:|--:|
+| idle, backlog=1 000 | 1 000 (`loops=1000`) | 1 (CTE never executed; the `RUNNING`-side probe short-circuits) | **-99.9%** |
+| idle, backlog=10 000 (headline) | 10 000 (`loops=10000`) | 1 (never executed) | **-99.99%** |
+| idle, backlog=100 000 | 100 000 (`loops=100000`) | 1 (never executed) | **-99.999%** |
+| hot contention (10 000 backlog + 2 000 `RUNNING` rows spread across the same ~256 keys) | 98 124 (`loops=10000`) | 733 (`concurrency_pending_keys`: 333 + `concurrency_running_counts`: 400, both `loops=1`) | **-99.25%** |
+
+At every idle depth, Postgres's own planner *lazily skips*
+`concurrency_pending_keys` entirely — the plan reports it `(never executed)`
+— because the cheaper `concurrency_running_counts` probe returns 0 rows first
+via `COALESCE(..., 0)`, and nothing in an idle backlog has a `RUNNING` peer to
+check. The pre-fix plan has no equivalent short-circuit: the correlated
+subquery runs once per candidate row regardless of whether any `RUNNING` row
+could possibly exist, so its buffer cost tracks the loop count 1:1 (1 000 →
+10 000 → 100 000, exactly matching backlog depth). Under hot contention, where
+the short-circuit can't fire (`concurrency_pending_keys` materializes
+`actual rows=256 loops=1`), the pre-fix candidate-side aggregate instead costs
+98 124 buffers across its 10 000 loops — each of those 10 000 independent
+per-row probes now does real index-scan work against the populated `RUNNING`
+rows — where the fixed version pays that cost exactly once, covering all 256
+distinct keys in one pass.
+
+A pre-existing external-merge sort spill at the 100 000-row idle depth
+(`Sort Method: external merge  Disk: 18392kB`) is present, at the identical
+disk size, in both the before and after plans — this fix does not introduce or
+change it (see issue #1215, which targets a different part of the query).
+Likewise the base-table scan feeding the `ORDER BY … LIMIT` is unchanged in
+shape between before and after at every depth (see issue #1177) — this fix
+touches only the concurrency-check predicate, not the candidate
+ordering/pushdown.
+
+**Corroboration.** Wall-clock execution time for a *single* cold claim is
+**not** admissible corroboration at idle scale: it is flat to slightly worse
+at backlog=10 000 (131.4 ms → 138.7 ms) and backlog=100 000 (1 691.9 ms →
+1 786.1 ms), neither >2x nor in the same direction as the buffer win — the
+concurrency-check subtree shrinks from tens/hundreds of thousands of buffers
+to essentially nothing, but that subtree is a small fraction of a single
+query's total cost at idle scale, where the `ORDER BY`/sort work
+[the plan](#the-plan) already identifies as the dominant cost still
+dominates. Buffers, not wall-clock, is what the idle-scale rows above are
+measured against; this page does not claim a single-query wall-clock win it
+did not observe.
+
+At hot contention, wall-clock moves the same direction as buffers by more
+than 2x — the bar this page's own methodology sets for treating it as
+corroborating evidence: **1 510.6 ms → 297.8 ms (5.07x)**, alongside the
+-99.25% buffer reduction above.
+
+**Cumulative, real-claim-loop evidence.** A `pg_stat_statements` snapshot of
+10 001 real `claim_task()` calls draining the full 10 000-row headline
+backlog (the same `ClaimGate::ConcurrencyKey` scenario the +644% p50 figure
+was measured under — 256 distinct keys, cap high enough never to block):
+total buffers **2 492 987 808 → 10 938 903** (**-99.56%**, 227.9x fewer
+buffers for the identical drain). Far larger than the single-cold-claim
+reduction above, because the pre-fix cost *compounds* across the drain: each
+of the 10 000 sequential `claim_task()` calls independently re-scans the
+remaining candidate backlog through its own correlated subquery, so the total
+work across a full drain grows roughly with the *square* of backlog depth
+(10 000 + 9 999 + … candidate-row evaluations, each paying its own per-row
+subquery cost), where the fix's per-call cost stays flat — bounded by
+distinct-key cardinality and the `RUNNING` population, not by the shrinking
+remaining backlog.
+
+**Equivalence.** Both before and after runs claim the identical
+10 000-of-10 000 claimable rows (`claimed=10000 of 10000 claimable` in both
+`{before,after}-fixture-summary.txt`), with identical seeded/claimable row
+counts at every swept depth and an identical hot-contention seed shape
+(`running_rows_added=2000` in both). `calls=10001` matches exactly between
+before and after in the `pg_stat_statements` snapshot — the fix changes
+per-call cost, not the number of claim attempts needed to drain the backlog.
+Correctness of the underlying enforcement is unchanged and covered by
+`tests/integration/integration_e2e.rs`'s existing
+`concurrency_cap_limits_concurrent_claims_cluster_wide`,
+`concurrency_cap_shared_key_budget_is_not_doubled`,
+`concurrency_cap_failure_frees_slot_and_does_not_wedge_queue`,
+`concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key` and
+`per_key_concurrency_cap_enforced_across_fleet` (unmodified by this change; all
+five pass unchanged against the fixed query). Two new unit tests —
+`queue::tests::claim_query_concurrency_gate_matches_the_authoritative_recheck`
+and
+`queue::tests::concurrency_gate_ctes_are_defined_and_referenced_exactly_once_each`
+— pin the query's shape directly. Reproduce with
+`autumn-harvest/scripts/concurrency_key_claim_perf_repro.sh`, which needs
+either `HARVEST_TEST_DATABASE_URL` (an admin connection string) or a reachable
+Docker daemon for its testcontainer fallback — not both.
 
 ## Enqueue throughput
 
@@ -905,6 +1082,11 @@ from the benchmark are directly comparable.
   [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
 * `autumn-harvest/scripts/queue_pause_claim_perf_repro.sh` — regenerates that
   evidence from a clean checkout.
+* `docs/perf-artifacts/concurrency-key-claim-predicate/` — committed
+  before/after `EXPLAIN`/`pg_stat_statements` evidence for
+  [the concurrency-key gate fix](#the-concurrency-key-gate-fix).
+* `autumn-harvest/scripts/concurrency_key_claim_perf_repro.sh` — regenerates
+  that evidence from a clean checkout.
 * `docs/performance-capability-labels.md` — the capability-labels claim
   predicate (#382) measurement referenced above.
 * `docs/perf-artifacts/capability-labels-claim-predicate/` — committed
