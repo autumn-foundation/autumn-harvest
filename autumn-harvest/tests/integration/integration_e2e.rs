@@ -222,7 +222,25 @@ const INIT_SQL: &str = concat!(
     // migration also adds the partial `idx_harvest_tq_activity_pause` index on
     // `harvest_task_queue`; that index is a performance aid rather than a
     // correctness requirement, but it ships in the same file.
-    include_str!("../../migrations/20260722000000_harvest_activity_pause/up.sql")
+    include_str!("../../migrations/20260722000000_harvest_activity_pause/up.sql"),
+    "\n",
+    // issue #843: idx_harvest_wfx_retry_of. Performance-only (CREATE INDEX,
+    // no column added, no correctness dependency), included for schema
+    // fidelity with the latest migration set.
+    include_str!("../../migrations/20260723000000_harvest_retry_chain_index/up.sql"),
+    "\n",
+    // issue #945: override_refill_rate/override_burst/override_expires_at
+    // columns on harvest_rate_limit_buckets. REQUIRED, not optional --
+    // `claim_task_query()`'s rate-limit token-availability expression
+    // references `b.override_expires_at`/`b.override_refill_rate`/
+    // `b.override_burst` unconditionally (Postgres resolves every column
+    // reference in a query at parse time, regardless of whether that branch
+    // is reached for a given row), so without these columns EVERY claim in
+    // this suite (and in every suite that borrows
+    // `setup_test_database_url_or_env` from here) fails with
+    // `column b.override_expires_at does not exist` -- even for tasks with
+    // no rate limit configured at all.
+    include_str!("../../migrations/20260724000000_harvest_pacing_overrides/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
