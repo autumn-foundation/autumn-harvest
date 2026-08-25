@@ -304,6 +304,7 @@ fn instant_workflow<'a>(
 
 fn instant_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

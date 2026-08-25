@@ -862,6 +862,24 @@ pub const METRIC_ADMISSION_BLOCKED: &str = "harvest.admission.blocked";
 /// Gauge: current number of active admission gates.
 pub const METRIC_ADMISSION_GATES_ACTIVE: &str = "harvest.admission.gates_active";
 
+/// Counter: incremented each time a fresh workflow start is rejected because
+/// its resolved per-tenant [`crate::quota::QuotaPolicy`] key is at or over
+/// one of its declared caps (issue #946).
+///
+/// Labels:
+///   - `"workflow"` (= [`METRIC_LABEL_WORKFLOW`]) — the workflow type name.
+///   - `"resource"` (= [`METRIC_LABEL_RESOURCE`]) — which cap was exhausted
+///     (`"active_executions"`, `"history_bytes"`, or `"dead_letters"`, per
+///     [`crate::quota::QuotaResource::as_str`]).
+///
+/// The *resolved tenant key* is deliberately **not** a label — it is
+/// caller/tenant-controlled input and would be unbounded cardinality. Per-key
+/// usage-vs-quota is instead surfaced via `GET /admin/quotas`, mirroring how
+/// the admission gate keeps its per-key detail off `harvest.admission.blocked`
+/// and exposes it through the equivalent read route instead. Per ADR-0001 §7,
+/// `execution.id` is never a label here either.
+pub const METRIC_QUOTA_REJECTED: &str = "harvest.quota.rejected";
+
 /// Counter: incremented each time a start producer that is **exempt-by-design**
 /// from the admission gate relays a workflow start (issue #618).
 ///
@@ -1458,6 +1476,9 @@ pub const METRIC_LABEL_NAME: &str = "name";
 pub const METRIC_LABEL_REASON: &str = "reason";
 /// Metric label: the concurrency group key.
 pub const METRIC_LABEL_KEY: &str = "key";
+/// Which per-tenant [`crate::quota::QuotaResource`] cap was exhausted
+/// (issue #946): `"active_executions"`, `"history_bytes"`, `"dead_letters"`.
+pub const METRIC_LABEL_RESOURCE: &str = "resource";
 /// Metric label: the query handler name (`query.name`).
 pub const METRIC_LABEL_QUERY: &str = "query.name";
 /// Metric label: terminal outcome (e.g. `"delivered"`, `"failed"`).
@@ -1981,6 +2002,17 @@ pub trait MetricsRecorder: Send + Sync {
     /// nothing is silently slipping an active gate.
     fn record_admission_bypassed(&self, producer: &str) {
         let _ = producer;
+    }
+
+    /// A fresh workflow start was rejected because its resolved per-tenant
+    /// quota key is at or over a declared cap (issue #946).
+    ///
+    /// `workflow` is the workflow type name; `resource` is the bounded
+    /// [`crate::quota::QuotaResource::as_str`] value naming the exhausted
+    /// cap. The resolved tenant key is intentionally not passed here — see
+    /// [`METRIC_QUOTA_REJECTED`] for why.
+    fn record_quota_rejected(&self, workflow: &str, resource: &str) {
+        let _ = (workflow, resource);
     }
 
     /// A workflow task entered the executor on a worker.

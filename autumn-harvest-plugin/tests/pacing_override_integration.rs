@@ -206,6 +206,7 @@ fn static_throttled_info(name: &'static str, rate: &str, burst: f64) -> Workflow
         throttle: Some(
             ThrottlePolicy::from_rate_str(rate, Some(burst), None, None).expect("valid rate"),
         ),
+        quota: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,

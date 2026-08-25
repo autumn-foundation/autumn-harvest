@@ -1857,6 +1857,7 @@ fn noop_scheduler_handler<'a>(
 fn make_throttled_registry(workflow_name: &'static str) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,

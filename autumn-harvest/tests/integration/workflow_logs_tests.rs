@@ -768,6 +768,7 @@ fn logging_workflow_across_cycles<'a>(
 
 fn workflow_info(name: &'static str, handler: autumn_harvest::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

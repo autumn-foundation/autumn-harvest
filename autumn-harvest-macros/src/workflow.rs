@@ -49,6 +49,20 @@ struct ThrottleArgs {
     schedule_to_start: Option<String>,
 }
 
+/// Per-tenant resource quota (issue #946). `key` is required; each of the
+/// three caps is independently optional -- a policy may declare just one,
+/// two, or all three (mirroring `QuotaPolicy`'s own `with_*` builder chain).
+struct QuotaArgs {
+    key_expr: String,
+    max_active_executions: Option<u32>,
+    /// Already parsed at attribute-parse time via [`parse_byte_size_macro`]
+    /// (e.g. `"10MiB"` -> `10_485_760`), mirroring `#[workflow(max_input_bytes
+    /// = "8MiB")]`'s own compile-time byte-size validation -- a typo is a
+    /// build error, not a registration-time panic.
+    max_history_bytes: Option<u64>,
+    max_dead_letters: Option<u32>,
+}
+
 /// Validate a rate string like `"100/m"` at macro-expansion time so a typo is a
 /// build error, not a registration-time panic from the emitted `.expect(...)`.
 /// Mirrors the runtime `autumn_harvest::throttle::parse_rate` grammar.
@@ -95,6 +109,11 @@ struct WorkflowAttrs {
     /// Start-throttle policy (issue #607). Parsed from
     /// `#[workflow(throttle(rate = "100/m", burst = 20, key = "input.tenant_id", schedule_to_start = "5m"))]`.
     throttle: Option<ThrottleArgs>,
+    /// Per-tenant resource quota (issue #946). Parsed from
+    /// `#[workflow(quota(key = "input.tenant_id", max_active_executions = 100,
+    /// max_history_bytes = "10MiB", max_dead_letters = 50))]`. `key` is
+    /// required; the three caps are each independently optional.
+    quota: Option<QuotaArgs>,
     /// Per-workflow-type cap override in bytes (issue #252). Parsed from
     /// `#[workflow(max_input_bytes = "8MiB")]` at compile time.
     max_input_bytes: Option<u64>,
@@ -301,6 +320,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         debounce: None,
         batch: None,
         throttle: None,
+        quota: None,
         max_input_bytes: None,
         owner: None,
         runbook: None,
@@ -563,6 +583,64 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                 schedule_to_start,
             });
             Ok(())
+        } else if meta.path.is_ident("quota") {
+            let mut key_expr: Option<String> = None;
+            let mut max_active_executions: Option<u32> = None;
+            let mut max_history_bytes: Option<u64> = None;
+            let mut max_dead_letters: Option<u32> = None;
+            meta.parse_nested_meta(|inner| {
+                if inner.path.is_ident("key") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    key_expr = Some(value.value());
+                    Ok(())
+                } else if inner.path.is_ident("max_active_executions") {
+                    // Unlike `concurrency`'s `limit`, zero is a deliberately
+                    // supported value (`QuotaPolicy::has_any_cap`'s own test
+                    // suite covers it) -- it means "block every start for this
+                    // key", not an author mistake, so it is not rejected here.
+                    let value: syn::LitInt = inner.value()?.parse()?;
+                    let n: u32 = value.base10_parse()?;
+                    max_active_executions = Some(n);
+                    Ok(())
+                } else if inner.path.is_ident("max_history_bytes") {
+                    // Byte-size string (e.g. "10MiB"), validated at compile
+                    // time via the same helper `#[workflow(max_input_bytes =
+                    // "8MiB")]` uses, so a typo is a build error rather than a
+                    // registration-time panic.
+                    let value: LitStr = inner.value()?.parse()?;
+                    let s = value.value();
+                    let bytes = parse_byte_size_macro(&s).ok_or_else(|| {
+                        syn::Error::new_spanned(
+                            &value,
+                            format!(
+                                "invalid quota `max_history_bytes` byte size '{s}'; \
+                                 expected format like \"10MiB\", \"512KiB\", \"4MB\""
+                            ),
+                        )
+                    })?;
+                    max_history_bytes = Some(bytes);
+                    Ok(())
+                } else if inner.path.is_ident("max_dead_letters") {
+                    let value: syn::LitInt = inner.value()?.parse()?;
+                    let n: u32 = value.base10_parse()?;
+                    max_dead_letters = Some(n);
+                    Ok(())
+                } else {
+                    Err(inner.error(
+                        "expected `key`, `max_active_executions`, `max_history_bytes`, or `max_dead_letters`",
+                    ))
+                }
+            })?;
+            let key_expr = key_expr.ok_or_else(|| {
+                syn::Error::new(proc_macro2::Span::call_site(), "quota requires `key = \"...\"`")
+            })?;
+            result.quota = Some(QuotaArgs {
+                key_expr,
+                max_active_executions,
+                max_history_bytes,
+                max_dead_letters,
+            });
+            Ok(())
         } else if meta.path.is_ident("allow_nondeterministic_apis") {
             result.allow_nondeterministic_apis = crate::attr_util::parse_bool_flag(&meta)?;
             Ok(())
@@ -615,7 +693,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `execution_timeout`, `chain_execution_timeout`, `sla`, `concurrency`, `debounce`, `batch`, `throttle`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, `retry`, `mcp`, `activities`, `children`, or `allow_nondeterministic_apis`",
+                "unsupported attribute: expected `execution_timeout`, `chain_execution_timeout`, `sla`, `concurrency`, `debounce`, `batch`, `throttle`, `quota`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, `retry`, `mcp`, `activities`, `children`, or `allow_nondeterministic_apis`",
             ))
         }
     })
@@ -953,6 +1031,35 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Emit quota as Option<QuotaPolicy> (issue #946). `max_history_bytes` is
+    // already a compile-time-validated `u64` (parsed above via
+    // `parse_byte_size_macro`), so no runtime `.expect(...)` is needed here --
+    // unlike `throttle`/`debounce`, which defer duration-string parsing to
+    // `::autumn_harvest::task_duration` at registration time.
+    let quota_expr = match attrs.quota {
+        None => quote! { ::std::option::Option::None },
+        Some(QuotaArgs {
+            key_expr,
+            max_active_executions,
+            max_history_bytes,
+            max_dead_letters,
+        }) => {
+            let mut policy = quote! {
+                ::autumn_harvest::quota::QuotaPolicy::new(#key_expr)
+            };
+            if let Some(n) = max_active_executions {
+                policy = quote! { #policy.with_max_active_executions(#n) };
+            }
+            if let Some(b) = max_history_bytes {
+                policy = quote! { #policy.with_max_history_bytes(#b) };
+            }
+            if let Some(n) = max_dead_letters {
+                policy = quote! { #policy.with_max_dead_letters(#n) };
+            }
+            quote! { ::std::option::Option::Some(#policy) }
+        }
+    };
+
     let max_input_bytes_expr = attrs
         .max_input_bytes
         .map_or_else(|| quote! { None }, |b| quote! { Some(#b) });
@@ -1025,6 +1132,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 debounce: #debounce_expr,
                 batch: #batch_expr,
                 throttle: #throttle_expr,
+                quota: #quota_expr,
                 max_input_bytes: #max_input_bytes_expr,
                 owner: #owner_expr,
                 runbook_url: #runbook_url_expr,

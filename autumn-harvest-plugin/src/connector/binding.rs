@@ -709,6 +709,7 @@ mod tests {
 
     fn wf(name: &'static str) -> WorkflowInfo {
         WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             name,

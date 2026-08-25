@@ -357,6 +357,7 @@ mod db_tests {
         handler: autumn_harvest::info::WorkflowHandlerFn,
     ) -> WorkflowInfo {
         WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -531,6 +532,7 @@ mod db_tests {
     ) -> ExecutionId {
         let exec_id = ExecutionId::new_for_shard(autumn_harvest::types::ShardId::new(0));
         let row = NewWorkflowExecution {
+            quota_key: None,
             id: exec_id.as_uuid(),
             workflow_name,
             workflow_id: &format!("wf-{}", exec_id.as_uuid()),

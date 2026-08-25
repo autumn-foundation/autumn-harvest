@@ -595,6 +595,7 @@ fn builder_rejects_workflow_name_collision_with_auto_registered_dag() {
     use autumn_harvest::info::WorkflowInfo;
 
     let colliding_workflow = WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

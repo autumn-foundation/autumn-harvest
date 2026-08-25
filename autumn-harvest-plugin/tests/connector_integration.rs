@@ -137,6 +137,7 @@ fn noop_workflow<'a>(
 
 fn workflow_info(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

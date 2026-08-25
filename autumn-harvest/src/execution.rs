@@ -429,6 +429,105 @@ fn record_start_gate_block(
     }
 }
 
+/// Emit `harvest.quota.rejected{workflow, resource}` (issue #946) for a fresh
+/// start rejected by a declared per-tenant [`crate::quota::QuotaPolicy`] cap.
+///
+/// Mirrors [`record_start_gate_block`] exactly: prefer the caller-supplied
+/// `metrics` recorder (the live worker/HTTP-request path always has one),
+/// falling back to the process-global admission-metrics recorder the plugin
+/// publishes at boot for the rarer background-scanner call sites that carry
+/// no recorder of their own. The resolved tenant key is deliberately never
+/// passed here -- see [`crate::telemetry::METRIC_QUOTA_REJECTED`] for why.
+fn record_quota_rejected_metric(
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    workflow_name: &str,
+    resource: crate::quota::QuotaResource,
+) {
+    if let Some(m) = metrics {
+        m.record_quota_rejected(workflow_name, resource.as_str());
+    } else if let Some(g) = crate::admission_gate::global_admission_metrics() {
+        g.record_quota_rejected(workflow_name, resource.as_str());
+    }
+}
+
+/// Enforce the declared per-tenant resource quota (issue #946) against a
+/// row this transaction just inserted, before its `WorkflowStarted` event is
+/// appended. **The single source of truth for quota enforcement** -- shared
+/// by BOTH row-creation branches inside
+/// [`start_or_load_workflow_execution_collect`]'s transaction: the
+/// `on_conflict_do_nothing()` fresh-insert branch, and [`replace_execution`]
+/// (reached by `AllowDuplicateFailedOnly`/`TerminateIfRunning`/a
+/// conflict-driven `Terminate` replacing a prior row). Before this helper
+/// existed, `replace_execution`'s three call sites bypassed enforcement
+/// entirely, letting a caller loop `TerminateIfRunning` or
+/// `AllowDuplicateFailedOnly` against one stable `workflow_id` to accumulate
+/// unbounded active executions/history/DLQ rows for a key well past its
+/// declared cap.
+///
+/// `pub(crate)` (not private) so `worker.rs`'s spawned-child insertion paths
+/// ([`crate::worker::persist_all_started_child_workflows`]'s fan-out loop and
+/// [`crate::worker::insert_awaited_child_execution`]) can call the SAME
+/// enforcement after inserting a child's row, rather than duplicating the
+/// "subtract 1 for the row this call just inserted" contract documented
+/// below (issue #946, Codex round-3 review — a spawned child accumulates its
+/// own history/DLQ/active-execution footprint against its own declared
+/// quota exactly like any other registry-aware start, so it must not be
+/// invisible to enforcement).
+///
+/// `has_any_cap()` false (a declared `QuotaPolicy` with no `with_max_*`
+/// calls) and an unresolvable key (missing/null/non-object input field,
+/// mirroring the fail-open behavior `concurrency_key IS NULL` already has at
+/// claim time for issue #247) both skip enforcement entirely -- a no-policy
+/// workflow pays only the one cheap `Option` check (AC9's "zero default
+/// overhead").
+pub(crate) async fn enforce_quota_admission(
+    conn: &mut AsyncPgConnection,
+    quota_policy: Option<crate::quota::QuotaPolicy>,
+    quota_key: Option<&str>,
+    workflow_name: &str,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> HarvestResult<()> {
+    let Some(policy) = quota_policy else {
+        return Ok(());
+    };
+    if !policy.has_any_cap() {
+        return Ok(());
+    }
+    let Some(key) = quota_key else {
+        return Ok(());
+    };
+
+    // Serialize check-then-admit for this key under a transaction-scoped
+    // advisory lock (auto-released at commit or rollback) so concurrent
+    // starts for the same key can't all observe stale pre-admission usage
+    // and jointly overshoot the cap -- the same race `lock_concurrency_key`
+    // closes for issue #247, under a namespace-disjoint key so the two
+    // primitives' advisory locks can never collide.
+    crate::quota::lock_quota_key(conn, workflow_name, key).await?;
+    let mut usage = crate::quota::load_quota_usage(conn, workflow_name, key).await?;
+    // The row this admission just inserted is already RUNNING and therefore
+    // already counted in `usage.active_executions` -- subtract it back out
+    // so `current` reports usage BEFORE this admission, matching
+    // `check_quota`'s documented contract (and the success metric's
+    // "capped at exactly 100": the 100th admission must observe
+    // current=99, not 100). `history_bytes`/`dead_letters` need no such
+    // adjustment: the just-inserted row has appended no events yet
+    // (`WorkflowStarted` is appended by the caller, AFTER this check) and
+    // has no dead-letter rows of its own.
+    usage.active_executions = usage.active_executions.saturating_sub(1);
+    if let Some(violation) = crate::quota::check_quota(&usage, &policy) {
+        record_quota_rejected_metric(metrics, workflow_name, violation.resource);
+        return Err(HarvestError::QuotaExceeded {
+            workflow_name: workflow_name.to_string(),
+            key: key.to_string(),
+            resource: violation.resource,
+            limit: violation.limit,
+            current: violation.current,
+        });
+    }
+    Ok(())
+}
+
 /// Start a workflow execution or load the existing one, returning both the result
 /// and any deferred completion-trigger starts **without spawning them**.
 ///
@@ -561,6 +660,70 @@ pub async fn start_or_load_workflow_execution_collect(
     let policy = build_routing::get_build_policy(conn, request.queue_name).await?;
     let assigned_build = policy.map(|p| p.resolve_assigned_build(exec_id));
 
+    // Resolve the declared per-tenant quota policy (issue #946) from the
+    // process-global workflow metadata mirror -- the same registry-aware
+    // surface `concurrency`/`sla`/`retry_policy` already use to reach a
+    // `WorkflowInfo`'s admission-relevant fields from this core-crate
+    // function, which has no access to the plugin's live `HandlerRegistry`.
+    // `QuotaPolicy` is `Copy`, so this is a cheap read-lock + hashmap lookup,
+    // not a query -- a no-policy workflow pays only this (AC9 "zero default
+    // overhead"). The key is resolved via the SAME dot-path resolver
+    // `ConcurrencyPolicy`/`ThrottlePolicy` use (AC1) -- no second resolver.
+    //
+    // Resolved HERE, before the TerminateIfRunning pre-check below (issue
+    // #946 P1/P2 review), so `quota_key` is known in time to decide whether
+    // that pre-check even runs -- a quota-governed key skips it entirely and
+    // falls through to the atomic replace path instead; see the pre-check
+    // block's own comment for the full rationale.
+    let quota_policy: Option<crate::quota::QuotaPolicy> =
+        crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
+            .read()
+            .ok()
+            .and_then(|lock| {
+                lock.as_ref()
+                    .and_then(|map| map.get(request.workflow_name))
+                    .and_then(|meta| meta.quota)
+            });
+    let quota_key: Option<String> =
+        quota_policy.and_then(|p| crate::quota::resolve_quota_key(p.key_expr, &request.input));
+    // A resolved key is stamped onto the row for EVERY admission that has
+    // one -- including a retry-exempt admission below, which still tags its
+    // row for future usage accounting -- so this bound must be checked
+    // unconditionally here, before that exemption is even computed. It must
+    // also run before ANY DB work: an unbounded caller-controlled string
+    // reaching the indexed `quota_key` column can otherwise raise a raw
+    // Postgres "index row size exceeds maximum" error instead of a clean,
+    // typed rejection (issue #946 Codex review, "bound resolved quota keys
+    // before indexing them"). Rejecting rather than truncating/hashing is
+    // deliberate -- see `quota::MAX_QUOTA_KEY_BYTES`'s doc comment for why.
+    if let Some(key) = quota_key.as_deref()
+        && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
+    {
+        return Err(crate::error::HarvestError::PayloadTooLarge {
+            kind: crate::error::PayloadKind::QuotaKey,
+            observed_bytes,
+            cap_bytes: crate::quota::MAX_QUOTA_KEY_BYTES,
+            workflow_type: request.workflow_name.to_string(),
+            activity_name: None,
+        });
+    }
+    // A workflow-level retry (#523) continuation must never be blocked by a
+    // quota that has since filled up (issue #946 Codex round-2 review): it
+    // is in-flight continuation of an already-admitted logical run, not a
+    // fresh admission, exactly like the `gate: None` and
+    // `concurrency_on_conflict: Defer` exemptions this same function already
+    // grants a retry continuation elsewhere. `retry_of_exec_id` is set
+    // `Some` at exactly one call site in the whole codebase -- the retry
+    // continuation in `worker.rs` -- so it is an unambiguous signal here.
+    // `quota_key` itself stays resolved unconditionally above so the new
+    // row is still correctly tagged for FUTURE usage accounting; only the
+    // *enforcement* is skipped for this one admission.
+    let quota_enforcement_policy = if request.retry_of_exec_id.is_some() {
+        None
+    } else {
+        quota_policy
+    };
+
     // For TerminateIfRunning: if there is an existing RUNNING execution, cancel
     // it (Transaction 1) before the start transaction below (Transaction 2). A
     // crash between the two leaves the prior workflow CANCELLED with no new run;
@@ -616,7 +779,28 @@ pub async fn start_or_load_workflow_execution_collect(
         return Err(HarvestError::AdmissionBlocked { gate_id, reason });
     }
 
+    // Route a quota-governed key through the fully atomic `inline_cancel` +
+    // `replace_execution` path instead (issue #946 P1/P2 review), by simply
+    // never entering this pre-check block when `quota_key.is_some()`: with
+    // the prior row left un-cancelled, the INSERT below is a no-op, which
+    // falls through to the FOR-UPDATE-locked `ActiveConflictBehavior::Terminate`
+    // branch (same `effective_active_conflict_behavior` result, since it is a
+    // pure function of `request.reuse_policy`/`request.conflict_policy`) --
+    // cancel-then-replace under ONE transaction and ONE row lock, so no
+    // concurrent admission for the same key can observe the freed slot
+    // between cancel and replace (P1), and `enforce_quota_admission` there
+    // runs strictly AFTER the prior row is sealed, so it is naturally
+    // excluded from every usage dimension -- not just `active_executions`
+    // (P2) -- with no separate self-exemption logic needed. A rejection
+    // there rolls the WHOLE sequence back, so the prior run is never left
+    // cancelled without a successor; this is strictly safer than the
+    // now-superseded pre-check-and-separately-commit shortcut below, whose
+    // `enforce_quota_before_terminate_pre_check` helper it replaced could not
+    // hold a lock across the gap to the later authoritative check. A
+    // non-quota-governed request (`quota_key.is_none()`, the common case)
+    // keeps the pre-check-cancel shortcut byte-for-byte unchanged.
     if terminate_via_pre_check
+        && quota_key.is_none()
         // Skip the pre-check cancellation when we're going to reject this fresh
         // start for a debounced workflow — otherwise we'd cancel the prior run
         // (Transaction 1) and then reject, leaving it cancelled with no successor.
@@ -739,6 +923,7 @@ pub async fn start_or_load_workflow_execution_collect(
         start_source: Some(request.start_source.as_str()),
         start_source_ref: request.start_source_ref,
         started_by: request.started_by,
+        quota_key: quota_key.as_deref(),
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
@@ -765,7 +950,9 @@ pub async fn start_or_load_workflow_execution_collect(
         let row = row;
         let enqueue = enqueue.clone();
         let request = request.clone();
-        // `gate`, `metrics`, and `shard_id_value` are all `Copy`, so the
+        let quota_key = quota_key.clone();
+        // `gate`, `metrics`, `shard_id_value`, `quota_policy`, and
+        // `quota_enforcement_policy` (issue #946) are all `Copy`, so the
         // `async |conn|` closure captures them directly from the enclosing
         // function's environment.
         let mut tx_deferred_checks = Vec::new();
@@ -865,6 +1052,25 @@ pub async fn start_or_load_workflow_execution_collect(
                     });
                 }
             }
+            // Enforce the declared per-tenant resource quota (issue #946),
+            // scoped to the fresh-insert path exactly like the payload cap
+            // above -- an ATTACH to an existing execution never reaches
+            // here, so a reuse-policy attach can never be rejected by a cap
+            // meant to bound admission. See `enforce_quota_admission` --
+            // this is ALSO called from `replace_execution`, the other
+            // row-creation branch inside this same transaction, so the two
+            // paths can never enforce the cap differently. Pass
+            // `quota_enforcement_policy` (not the bare `quota_policy`) so a
+            // workflow-level retry continuation is exempt (see its
+            // definition above) while a genuinely fresh start is not.
+            enforce_quota_admission(
+                conn,
+                quota_enforcement_policy,
+                quota_key.as_deref(),
+                request.workflow_name,
+                metrics,
+            )
+            .await?;
             // Resolve last-completion-result carryover (issue #488).
             // Runs inside the same transaction on the same shard-local
             // connection so the read is consistent with the just-inserted
@@ -1041,9 +1247,19 @@ pub async fn start_or_load_workflow_execution_collect(
                         &mut tx_deferred_checks,
                     )
                     .await?;
-                    let (started_wf, mut extra_deferred) =
-                        replace_execution(conn, existing, &row, &enqueue, exec_id, &request, now)
-                            .await?;
+                    let (started_wf, mut extra_deferred) = replace_execution(
+                        conn,
+                        existing,
+                        &row,
+                        &enqueue,
+                        exec_id,
+                        &request,
+                        now,
+                        quota_enforcement_policy,
+                        quota_key.as_deref(),
+                        metrics,
+                    )
+                    .await?;
                     deferred.append(&mut extra_deferred);
                     // A replacement is a fresh admission too (issue #811, Codex
                     // round 2): shed other runs on the key, not just our own prior.
@@ -1084,7 +1300,16 @@ pub async fn start_or_load_workflow_execution_collect(
                             }
                             // Only these two explicitly abnormal states start fresh.
                             let (started_wf, mut deferred) = replace_execution(
-                                conn, existing, &row, &enqueue, exec_id, &request, now,
+                                conn,
+                                existing,
+                                &row,
+                                &enqueue,
+                                exec_id,
+                                &request,
+                                now,
+                                quota_enforcement_policy,
+                                quota_key.as_deref(),
+                                metrics,
                             )
                             .await?;
                             // Replacing our own terminal prior still admits a new
@@ -1126,9 +1351,19 @@ pub async fn start_or_load_workflow_execution_collect(
                             workflow_id: request.workflow_id.to_string(),
                         });
                     }
-                    let (started_wf, mut extra_deferred) =
-                        replace_execution(conn, existing, &row, &enqueue, exec_id, &request, now)
-                            .await?;
+                    let (started_wf, mut extra_deferred) = replace_execution(
+                        conn,
+                        existing,
+                        &row,
+                        &enqueue,
+                        exec_id,
+                        &request,
+                        now,
+                        quota_enforcement_policy,
+                        quota_key.as_deref(),
+                        metrics,
+                    )
+                    .await?;
                     // Same as the two arms above: a replacement admits a new run
                     // (issue #811, Codex round 2).
                     let (sup_metrics, mut sup_deferred) =
@@ -1978,6 +2213,7 @@ async fn run_latest_wins_supersede(
     Ok((metrics, outcome.deferred_starts))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn replace_execution(
     conn: &mut AsyncPgConnection,
     existing: WorkflowExecution,
@@ -1986,6 +2222,9 @@ async fn replace_execution(
     new_exec_id: ExecutionId,
     request: &StartWorkflowParams<'_>,
     now: chrono::DateTime<Utc>,
+    quota_policy: Option<crate::quota::QuotaPolicy>,
+    quota_key: Option<&str>,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<(StartedWorkflowExecution, Vec<DeferredTriggerStart>)> {
     if request.start_at.is_some_and(|sa| sa < now) {
         return Err(HarvestError::Config(
@@ -2024,6 +2263,25 @@ async fn replace_execution(
             });
         }
     }
+    // Enforce the declared per-tenant resource quota (issue #946) on this
+    // replacement admission too -- `replace_execution` is a SECOND
+    // row-creation path (reached by `AllowDuplicateFailedOnly`,
+    // `TerminateIfRunning`, and a conflict-driven `Terminate`), and without
+    // this a caller could loop one of those reuse policies against a stable
+    // `workflow_id` to accumulate unbounded active executions/history/DLQ
+    // rows for a key well past its declared cap. `existing` is already
+    // sealed above (CONTINUED_AS_NEW) by the time this runs, so it
+    // contributes zero to `active_executions` -- no double-adjustment is
+    // needed beyond what `enforce_quota_admission` already does for the
+    // just-inserted row.
+    enforce_quota_admission(
+        conn,
+        quota_policy,
+        quota_key,
+        request.workflow_name,
+        metrics,
+    )
+    .await?;
     let start_timestamp = if request.delay.is_some_and(|d| d > chrono::Duration::zero())
         || request.start_at.is_some()
     {

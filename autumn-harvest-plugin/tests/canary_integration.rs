@@ -173,6 +173,7 @@ async fn seed_canary_execution(
         .expect("connect");
     let wf_id = format!("{CANARY_WORKFLOW}-{}", Uuid::new_v4().simple());
     let row = NewWorkflowExecution {
+        quota_key: None,
         id: exec_id.as_uuid(),
         workflow_name: CANARY_WORKFLOW,
         workflow_id: &wf_id,

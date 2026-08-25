@@ -2844,6 +2844,7 @@ fn big_side_effect_workflow<'a>(
 /// value, and the literal keeps the cap under test visible at the call site.
 fn capped_wf_info(max_input_bytes: Option<u64>) -> autumn_harvest::info::WorkflowInfo {
     autumn_harvest::info::WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         name: "wf",

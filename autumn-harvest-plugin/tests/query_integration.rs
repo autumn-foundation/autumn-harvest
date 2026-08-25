@@ -151,6 +151,7 @@ fn continue_as_new_workflow<'a>(
 
 fn progress_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -178,6 +179,7 @@ fn progress_info() -> WorkflowInfo {
 
 fn continue_as_new_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -245,6 +247,7 @@ fn deadline_probe_workflow<'a>(
 
 fn deadline_probe_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -272,6 +275,7 @@ fn deadline_probe_info() -> WorkflowInfo {
 
 fn spin_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

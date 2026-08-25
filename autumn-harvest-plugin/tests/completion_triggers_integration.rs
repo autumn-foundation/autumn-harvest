@@ -132,6 +132,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -157,6 +158,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 severity: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -182,6 +184,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 severity: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -210,6 +213,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
             // a source whose force-terminate fires `Terminated` triggers, plus the
             // two distinct targets the test registers triggers against.
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -235,6 +239,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 severity: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -260,6 +265,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 severity: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -2441,6 +2447,7 @@ async fn test_runner_startup_fails_on_sync_failure() {
     let built = autumn_harvest::HarvestBuilder::new()
         .workflows(vec![
             autumn_harvest::info::WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -2465,6 +2472,7 @@ async fn test_runner_startup_fails_on_sync_failure() {
                 severity: None,
             },
             autumn_harvest::info::WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,

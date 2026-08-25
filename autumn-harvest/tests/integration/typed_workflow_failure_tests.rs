@@ -261,6 +261,7 @@ mod db_handle_surface {
         let exec_id = ExecutionId::new();
         diesel::insert_into(dsl::harvest_workflow_executions)
             .values(&NewWorkflowExecution {
+                quota_key: None,
                 id: exec_id.as_uuid(),
                 workflow_name: "typed_failing_wf",
                 workflow_id: &format!("wf-typed-{}", Uuid::new_v4()),

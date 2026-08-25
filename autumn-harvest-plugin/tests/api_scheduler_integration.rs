@@ -278,6 +278,7 @@ async fn patch_json(
 fn approval_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -311,6 +312,7 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -337,6 +339,7 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -741,6 +744,7 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
     let seeded_run_id = uuid::Uuid::new_v4();
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: seeded_run_id,
@@ -1083,6 +1087,7 @@ async fn seed_scheduled_activity_task_from_url(
         .expect("failed to connect for scheduled activity seed");
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&autumn_harvest::models::NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),
@@ -1925,6 +1930,7 @@ fn classic_interval_pipeline_info() -> DagInfo {
 
 fn workflow_info_named(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -2985,6 +2991,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
     let web_runtime = HarvestRunner::start(
         autumn_harvest::HarvestBuilder::new()
             .workflows(vec![WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -3031,6 +3038,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
     let runner = HarvestRunner::start(
         autumn_harvest::HarvestBuilder::new()
             .workflows(vec![WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -3120,6 +3128,7 @@ async fn worker_enqueues_multiple_activity_commands_from_one_workflow_task() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -3184,6 +3193,7 @@ async fn worker_does_not_reschedule_inflight_parallel_activity_after_sibling_com
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -3257,6 +3267,7 @@ async fn worker_resolves_parallel_sibling_tasks_that_share_activity_name() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -3317,6 +3328,7 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -3386,6 +3398,7 @@ async fn worker_does_not_append_completion_after_activity_timeout() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -4024,6 +4037,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
     let pool = build_test_pool(&database_url);
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -5925,6 +5939,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -6045,6 +6060,7 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -8071,6 +8087,7 @@ async fn insert_running_execution_for(database_url: &str, wf_name: &str) {
         .expect("connect for running execution seed");
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&autumn_harvest::models::NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),

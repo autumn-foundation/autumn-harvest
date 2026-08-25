@@ -72,6 +72,7 @@ fn delay_workflow<'a>(
 fn delay_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![autumn_harvest::info::WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,

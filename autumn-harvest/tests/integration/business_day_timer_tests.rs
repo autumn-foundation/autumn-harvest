@@ -118,6 +118,7 @@ fn registry_with_calendars(calendars: BusinessCalendars) -> Arc<HandlerRegistry>
 
 fn sla_flow_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -223,6 +224,7 @@ fn sla_flow_handler(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'
 async fn seed_workflow(conn: &mut AsyncPgConnection, input: serde_json::Value) -> ExecutionId {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     let row = NewWorkflowExecution {
+        quota_key: None,
         id: exec_id.as_uuid(),
         workflow_name: "sla_flow",
         workflow_id: &format!("wf-{}", exec_id.as_uuid()),

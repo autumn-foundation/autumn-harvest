@@ -101,6 +101,7 @@ fn build_web_pool(url: &str) -> diesel_async::pooled_connection::deadpool::Pool<
 
 fn wf_info(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

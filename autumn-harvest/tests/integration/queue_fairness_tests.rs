@@ -67,6 +67,7 @@ async fn insert_execution_for_queue(
 ) -> ExecutionId {
     let exec_id = ExecutionId::new();
     let row = autumn_harvest::models::NewWorkflowExecution {
+        quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),

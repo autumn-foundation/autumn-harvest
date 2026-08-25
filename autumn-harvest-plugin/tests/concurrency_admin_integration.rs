@@ -78,6 +78,7 @@ fn dummy_workflow<'a>(
 
 fn info(name: &'static str, policy: Option<ConcurrencyPolicy>) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

@@ -346,6 +346,12 @@ pub fn canary_workflow_info(workflow_name: String, per_probe_timeout: Duration) 
         debounce: None,
         batch: None,
         throttle: None,
+        // The canary is a reserved, non-user-facing probe workflow -- not
+        // registered via `#[workflow(quota(...))]` -- so it carries no
+        // per-tenant quota (issue #946). It also isn't resolved through any
+        // `#[workflow(concurrency(...))]`-style tenant key, so there is
+        // nothing for a quota to key off of even if one were desired.
+        quota: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,

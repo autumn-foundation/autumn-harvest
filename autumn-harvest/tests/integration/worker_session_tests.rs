@@ -97,6 +97,7 @@ mod db_tests {
     async fn insert_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
         let exec_id = ExecutionId::new();
         let row = NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: exec_id.as_uuid(),
@@ -753,6 +754,7 @@ mod db_tests {
 
         let registry = std::sync::Arc::new(HandlerRegistry::new(
             vec![WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,

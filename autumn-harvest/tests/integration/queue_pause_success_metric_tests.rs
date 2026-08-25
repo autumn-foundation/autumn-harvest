@@ -101,6 +101,7 @@ fn held_workflow_handler(
 
 fn registry() -> Arc<HandlerRegistry> {
     let wf = WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

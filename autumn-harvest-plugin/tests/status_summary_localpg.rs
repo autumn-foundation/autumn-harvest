@@ -171,6 +171,7 @@ async fn seed_running_execution(url: &str, shard: i32) -> Uuid {
         .expect("connect");
     let wf_id = format!("onboarding-{}", Uuid::new_v4().simple());
     let row = NewWorkflowExecution {
+        quota_key: None,
         id: exec_id.as_uuid(),
         workflow_name: "onboarding",
         workflow_id: &wf_id,

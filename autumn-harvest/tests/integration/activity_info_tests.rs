@@ -206,6 +206,7 @@ fn workflow_info(
     handler: autumn_harvest::info::WorkflowHandlerFn,
 ) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -299,6 +300,7 @@ async fn seed_workflow(
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     let workflow_id = format!("wf-{}", exec_id.as_uuid());
     let row = NewWorkflowExecution {
+        quota_key: None,
         id: exec_id.as_uuid(),
         workflow_name,
         workflow_id: &workflow_id,

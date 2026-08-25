@@ -68,6 +68,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     let registry = HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -92,6 +93,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,
@@ -120,6 +122,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
                 retry_policy: None,
             },
             WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,

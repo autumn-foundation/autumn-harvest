@@ -209,6 +209,7 @@ fn two_shard_router() -> ShardRouter {
 
 fn workflow_info() -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

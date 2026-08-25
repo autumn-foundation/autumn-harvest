@@ -148,6 +148,12 @@ diesel::table! {
         /// `PATCH /workflows/{id}/triage`. NULL = no note. Metadata only --
         /// never read on replay, never appends a `WorkflowEvent`.
         triage_note -> Nullable<Text>,
+        /// Resolved per-tenant quota key (issue #946). Set at INSERT time from
+        /// `QuotaPolicy::key_expr` resolved against the start input; NULL when
+        /// the workflow type has no declared `QuotaPolicy` or the key could not
+        /// be resolved from the input. Never read on replay -- purely an
+        /// admission-time bookkeeping column backing the quota usage counts.
+        quota_key -> Nullable<Text>,
     }
 }
 
@@ -407,6 +413,13 @@ diesel::table! {
         failed_at -> Timestamptz,
         owner -> Nullable<Text>,
         severity -> Nullable<Text>,
+        /// Denormalized workflow type name (issue #946), mirroring the
+        /// owner/severity precedent so quota accounting never depends on the
+        /// originating execution row still existing.
+        workflow_name -> Nullable<Text>,
+        /// Denormalized resolved quota key (issue #946). NULL when the
+        /// originating workflow type had no declared `QuotaPolicy`.
+        quota_key -> Nullable<Text>,
     }
 }
 

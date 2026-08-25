@@ -116,6 +116,7 @@ fn phase_two_awaits_signal<'a>(
 
 fn wf(name: &'static str, handler: WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,

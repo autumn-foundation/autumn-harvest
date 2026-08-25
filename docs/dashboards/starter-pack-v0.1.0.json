@@ -1679,6 +1679,55 @@
           "description": "Starts relayed by producers that are exempt-by-design from an admission gate (issue #618). Currently only the outbox relay; a non-zero rate during an incident shows already-accepted in-flight work draining past the gate rather than slipping it silently."
         },
         {
+          "id": 932,
+          "type": "timeseries",
+          "title": "Quota rejections",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 62
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, resource) (rate(harvest_quota_rejected_total{workflow=~\"$workflow\"}[$__rate_interval]))",
+              "legendFormat": "{{workflow}} {{resource}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Fresh workflow starts rejected because a resolved per-tenant quota key was at or over its declared active-executions, history-bytes, or dead-letters cap (issue #946). Per-key usage-vs-limit is visible at GET /api/harvest/admin/quotas."
+        },
+        {
           "id": 31,
           "type": "timeseries",
           "title": "Admission gates active",

@@ -440,6 +440,7 @@ async fn reset_fork_completes_with_current_code_and_observes_buffered_signal() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,

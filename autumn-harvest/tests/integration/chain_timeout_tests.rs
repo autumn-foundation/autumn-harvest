@@ -65,6 +65,7 @@ async fn insert_named_running(
     let exec_id = ExecutionId::new();
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&autumn_harvest::models::NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             chain_execution_timeout: None,
@@ -492,6 +493,7 @@ fn chain_can_workflow<'a>(
 fn chain_can_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -611,6 +613,7 @@ fn leaked_name(prefix: &str) -> &'static str {
 fn named_registry(name: &'static str, handler: WorkflowHandlerFn) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,
@@ -916,6 +919,7 @@ async fn scheduler_tick_applies_fleet_wide_chain_ceiling() {
     let registry = Arc::new(
         HandlerRegistry::new(
             vec![WorkflowInfo {
+                quota: None,
                 declared_activities: None,
                 declared_children: None,
                 mcp: false,

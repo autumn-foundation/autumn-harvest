@@ -400,6 +400,18 @@ The durable named mutex `ctx.mutex(key).acquire()` (the `harvest_mutex_locks` / 
 
 ---
 
+## Per-tenant resource quotas are shard-local (issue #946)
+
+Declared per-tenant quotas (`#[workflow(quota(key = "input.tenant_id", max_active_executions = 100, max_history_bytes = …, max_dead_letters = …))]`, or `WorkflowInfo::with_quota(QuotaPolicy)`) are enforced **within a shard**, the same scope as the per-key concurrency limits, the workflow-start throttle, per-key activity rate limits, and the durable mutex above. The `quota_key` resolved at start time (via the identical `resolve_concurrency_key` dot-path resolver #247 already uses — there is no second resolver) is stamped on `harvest_workflow_executions.quota_key`; usage — the `RUNNING`/`SUSPENDED`/`PAUSED` execution count, the aggregate `harvest_events` payload bytes, and the DLQ row count for that key — is computed with a single indexed query **against the workflow's own shard only**, inside the same admission transaction the `FOR UPDATE`-locked start already runs. A cross-shard execution row for the same tenant key is invisible to the check.
+
+**Consequence**: a tenant whose workflows spread across N shards via rendezvous hashing effectively gets `declared-limit × N` of each resource fleet-wide, not the declared limit globally. This is the exact "`per-shard-limit × shards`" behaviour the per-key concurrency and rate-limit sections above already document, applied to quotas. Cross-shard coordinated quotas are **explicitly out of scope** (per issue #946) for the same Postgres-native reasons as every other per-key primitive on this page: a genuinely global cap would require a coordination service or a bounded-inaccuracy gossip protocol, both of which conflict with the shard-local, no-cross-shard-transaction design this engine is built around.
+
+**Achieving a true global cap** for a tenant's aggregate resource footprint requires routing every one of that tenant's executions to a **single** shard — see [Explicit shard placement and data residency](#explicit-shard-placement-and-data-residency-issue-697) above (derive the same `residency_key`/`shard_id` you pin on from the same tenant field the quota's `key` expression resolves). With all of a tenant's executions confined to one shard, that shard's quota check sees every one of them and the declared limit is the tenant's true fleet-wide ceiling.
+
+**Adding a shard** to a deployment using per-tenant quotas follows the same procedure as the [per-key concurrency section](#adding-a-shard-to-a-deployment-that-uses-per-key-concurrency) above: a tenant whose workflows begin landing on the new shard (because it entered `writable_shards`) gets a *fresh* quota budget on that shard, independent of whatever usage already exists on its prior shard(s), until the rebalancing settles.
+
+---
+
 ## Cross-shard keyset pagination for `GET /workflows`
 
 When `page_size` (or `cursor` / `order`) is present on a `GET /workflows` request, the engine performs a **k-way merge** across all shards so the caller sees a single globally-ordered result set without knowing which shard each execution lives on.

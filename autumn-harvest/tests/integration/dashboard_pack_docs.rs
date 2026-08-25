@@ -126,6 +126,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_payload_offloaded_total",
     "harvest_admission_blocked_total",
     "harvest_admission_bypassed_total",
+    "harvest_quota_rejected_total",
     "harvest_rate_limit_throttled_total",
     "harvest_webhook_received_total",
     "harvest_webhook_rejected_total",
@@ -325,6 +326,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_admission_blocked", &["scope", "reason"]),
     ("harvest_admission_bypassed", &["producer"]),
     ("harvest_admission_gates_active", &[]),
+    ("harvest_quota_rejected", &["workflow", "resource"]),
     (
         "harvest_payload_bytes",
         &["payload_kind", "workflow_type", "activity_name"],

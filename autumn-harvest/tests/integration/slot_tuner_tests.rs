@@ -110,6 +110,7 @@ fn slow_activity<'a>(
 fn build_registry(telemetry: Arc<TelemetryConfig>) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            quota: None,
             declared_activities: None,
             declared_children: None,
             mcp: false,

@@ -222,6 +222,7 @@ async fn wait_for_workflow_task_parked(conn: &mut AsyncPgConnection, exec_id: Ex
 
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -254,6 +255,7 @@ fn wf_info_with_concurrency(
     concurrency: ConcurrencyPolicy,
 ) -> WorkflowInfo {
     WorkflowInfo {
+        quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
@@ -345,6 +347,7 @@ async fn insert_detached_child_execution(
     let child_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: child_exec_id.as_uuid(),
@@ -947,6 +950,7 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&NewWorkflowExecution {
+            quota_key: None,
             continued_from_exec_id: None,
             first_exec_id: None,
             id: child_exec_id.as_uuid(),
@@ -1640,6 +1644,14 @@ async fn child_workflow_terminate_cascade_on_parent_failure() {
         "Terminate-policy child should have ParentClosed error; rows: {child_rows:?}"
     );
 }
+
+// Note: quota enforcement on a detached child spawn (issue #946, Codex
+// round-3 review) is exercised end-to-end through a real worker in
+// `quota_enforcement_tests.rs::detached_child_spawn_honors_target_quota_parks_parent_then_succeeds`,
+// which uses that file's env-var-aware harness
+// (`crate::integration_e2e::setup_test_database_url_or_env`) so it can run
+// against a local Postgres instance rather than requiring Docker the way
+// this file's `setup_test_db_url()` does.
 
 // ── Unit test: ParentClosePolicy serde round-trip ─────────────────────────────
 
