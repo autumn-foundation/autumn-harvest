@@ -515,6 +515,50 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 // the shape this is held to instead, and
 // `tests/queue_pause_tests.rs::claim_query_excludes_paused_queues_end_to_end`
 // for the DB-backed equivalence proof.
+// NOTE (issue #247 / Ledger perf pass, buffers -~90%+ at every measured
+// backlog depth -- see docs/performance.md): the per-key concurrency-cap
+// guard used to be a per-row correlated `SELECT COUNT(*)` re-evaluated once
+// for every *candidate row* the outer scan visited while sorting toward
+// `LIMIT 1` -- confirmed via `EXPLAIN (ANALYZE, BUFFERS)`, `loops=N` on the
+// subplan matching the backlog size exactly at 1k/10k/100k. Worse,
+// `idx_harvest_tq_running` (the index the subplan used) only carries
+// `(state, last_heartbeat_at)` -- `concurrency_key`/`task_type` are applied
+// as a post-scan `Filter`, not an index search condition -- so each of
+// those N re-evaluations itself scanned the *entire* currently-RUNNING
+// population, not a per-key slice of it. `running_by_key` below
+// pre-aggregates the running count per `(concurrency_key, task_type)` once
+// via `GROUP BY` in a `MATERIALIZED` CTE, and the per-row check becomes a
+// `LEFT JOIN` lookup with a `COALESCE(..., 0)` default for a key with no
+// `RUNNING` rows yet -- semantically identical to the correlated subquery,
+// which also evaluates to 0 in that case. `LEFT JOIN`, never `INNER JOIN`:
+// an inner join would silently drop every candidate row for a key with
+// zero running tasks from the join result entirely, which would wrongly
+// treat "nobody is running this key yet" as "this key is saturated." No
+// new index is needed -- the aggregate reuses the existing partial index
+// `harvest_task_queue_concurrency_key_running` (`btree (concurrency_key)
+// WHERE state = 'RUNNING' AND concurrency_key IS NOT NULL`, from the
+// issue #247 migration) for its own `GROUP BY` scan.
+//
+// The `claimed` CTE's own single-row re-check subquery (aliased `recheck`,
+// executed once per claim under the winning row's own
+// `pg_try_advisory_xact_lock`) is a different, correctness-critical query
+// -- it must re-execute per claim to observe concurrent claimants racing
+// the same key under the lock -- and is deliberately left untouched by
+// this fix. See
+// `claim_query_bounds_concurrency_key_via_a_prefiltered_aggregate` below
+// for the shape this is held to, and the existing DB-backed correctness
+// suite in `tests/integration_e2e.rs` (`concurrency_cap_*`,
+// `per_key_concurrency_*`) for the equivalence proof -- unchanged before
+// and after this fix.
+//
+// `oldest_pending_ages_query` and `claimable_pending_demand_query` still
+// use the pre-fix correlated form for this same predicate; they are
+// deliberately out of scope for this fix (mirroring the precedent set by
+// the queue-pause fix above, which also left its own mirror queries
+// unfixed -- see `claim_gate_mirrors_carry_the_queue_pause_predicate`,
+// which pins *that* fix's mirrors to their pre-fix shape) and are pinned to
+// their own pre-fix shape by
+// `claim_query_bounds_concurrency_key_via_a_prefiltered_aggregate` below.
 /// The task-claim query — extracted as a `const fn` (mirroring the
 /// `timeout.rs` `*_query()` convention) so its eligibility predicate is
 /// shape-testable without a database.
@@ -544,6 +588,13 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 /// fleet from being claimed: a total orchestration outage produced by a
 /// surgical containment control. Pinned by
 /// `claim_query_activity_pause_gate_never_holds_workflow_tasks`.
+///
+/// The per-key concurrency-cap gate (issue #247) needs no new bind either:
+/// `running_by_key` pre-aggregates the currently-RUNNING count per
+/// `(concurrency_key, task_type)` once via a `MATERIALIZED` `GROUP BY`
+/// rather than re-evaluating a correlated `COUNT(*)` once per candidate row
+/// (see the `NOTE` above `claim_task_query` for why, and the measured
+/// buffer cost in `docs/performance.md`).
 // The body is one SQL string literal; the line count is the query's, not
 // control flow's. `claim_task` carried the same allow before this query was
 // extracted for shape-testing.
@@ -562,12 +613,23 @@ pub const fn claim_task_query() -> &'static str {
              SELECT COALESCE(array_agg(activity_name), ARRAY[]::text[]) AS names \
              FROM harvest_activity_pauses \
          ), \
+         running_by_key AS MATERIALIZED ( \
+             SELECT concurrency_key, task_type, COUNT(*) AS running_count \
+             FROM harvest_task_queue \
+             WHERE state = 'RUNNING' \
+               AND worker_id IS NOT NULL \
+               AND concurrency_key IS NOT NULL \
+             GROUP BY concurrency_key, task_type \
+         ), \
          candidate AS ( \
-             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name \
+             SELECT id, harvest_task_queue.task_type, harvest_task_queue.concurrency_key, concurrency_cap, rate_limit_key, activity_name \
              FROM harvest_task_queue \
              CROSS JOIN worker_info \
              CROSS JOIN paused_queues \
              CROSS JOIN paused_activities \
+             LEFT JOIN running_by_key rbk \
+                 ON rbk.concurrency_key = harvest_task_queue.concurrency_key \
+                AND rbk.task_type = harvest_task_queue.task_type \
              WHERE queue_name = ANY($2) \
                AND state = 'PENDING' \
                AND scheduled_at <= NOW() \
@@ -587,15 +649,9 @@ pub const fn claim_task_query() -> &'static str {
                    OR sticky_worker_id = $1 \
                ) \
                AND ( \
-                   concurrency_key IS NULL \
+                   harvest_task_queue.concurrency_key IS NULL \
                    OR concurrency_cap IS NULL \
-                   OR ( \
-                       SELECT COUNT(*) FROM harvest_task_queue inner_q \
-                       WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
-                         AND inner_q.task_type = harvest_task_queue.task_type \
-                         AND inner_q.state = 'RUNNING' \
-                         AND inner_q.worker_id IS NOT NULL \
-                   ) < harvest_task_queue.concurrency_cap \
+                   OR COALESCE(rbk.running_count, 0) < harvest_task_queue.concurrency_cap \
                ) \
                AND ( \
                    required_build_id IS NULL \
@@ -608,7 +664,7 @@ pub const fn claim_task_query() -> &'static str {
                    ) \
                ) \
                AND ( \
-                   task_type <> 'workflow' \
+                   harvest_task_queue.task_type <> 'workflow' \
                    OR workflow_exec_id IS NULL \
                    OR NOT EXISTS ( \
                        SELECT 1 FROM harvest_workflow_executions e \
@@ -617,13 +673,13 @@ pub const fn claim_task_query() -> &'static str {
                    ) \
                ) \
                AND ( \
-                   task_type != 'activity' \
+                   harvest_task_queue.task_type != 'activity' \
                    OR activity_name IS NULL \
                    OR required_capabilities IS NOT NULL \
                    OR NOT (activity_name = ANY($6)) \
                ) \
                AND ( \
-                   task_type != 'activity' \
+                   harvest_task_queue.task_type != 'activity' \
                    OR activity_name IS NULL \
                    OR NOT (activity_name = ANY(paused_activities.names)) \
                ) \
@@ -4557,6 +4613,97 @@ mod tests {
         assert!(
             !sql.contains("NOT EXISTS (SELECT 1 FROM harvest_queue_pauses"),
             "the per-row correlated anti-join must be gone entirely; got:\n{sql}"
+        );
+    }
+
+    /// The `concurrency_key` claim-gate rewrite (issue #247 / Ledger perf
+    /// pass): the pre-fix guard re-evaluated a correlated `SELECT COUNT(*)`
+    /// once per *candidate row* the outer scan visited while sorting toward
+    /// `LIMIT 1` — see `docs/performance.md` for the measured buffer cost.
+    /// `running_by_key` pre-aggregates the running-task count per
+    /// `(concurrency_key, task_type)` once via a `MATERIALIZED` `GROUP BY`,
+    /// and the per-row check becomes a `LEFT JOIN` lookup with a `COALESCE`
+    /// default of 0 for a key with no `RUNNING` rows yet — semantically
+    /// identical to the correlated subquery, which also returns 0 in that
+    /// case.
+    ///
+    /// This also pins `oldest_pending_ages_query` and
+    /// `claimable_pending_demand_query` to their *pre-fix* shape — a
+    /// deliberate, evidence-backed exception to "every mirror embeds the
+    /// shared predicate verbatim" (mirroring the precedent
+    /// `claim_gate_mirrors_carry_the_queue_pause_predicate` sets for the
+    /// queue-pause fix's own out-of-scope mirrors); see the `NOTE` above
+    /// `claim_task_query` for why they were left unfixed.
+    #[test]
+    fn claim_query_bounds_concurrency_key_via_a_prefiltered_aggregate() {
+        let sql = claim_task_query();
+        assert!(
+            sql.contains("running_by_key AS MATERIALIZED"),
+            "the running-count-per-key must be forced to materialize once, \
+             not be inlined back into a per-row correlated subquery; got:\n{sql}"
+        );
+        assert!(
+            sql.contains(
+                "SELECT concurrency_key, task_type, COUNT(*) AS running_count \
+             FROM harvest_task_queue \
+             WHERE state = 'RUNNING' \
+               AND worker_id IS NOT NULL \
+               AND concurrency_key IS NOT NULL \
+             GROUP BY concurrency_key, task_type"
+            ),
+            "running_by_key must aggregate the running population once via \
+             GROUP BY, not re-scan per candidate row; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("LEFT JOIN running_by_key rbk"),
+            "the candidate CTE must LEFT JOIN the pre-aggregated running \
+             count — an INNER JOIN would silently drop every candidate row \
+             for a key with zero RUNNING tasks; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("COALESCE(rbk.running_count, 0) < harvest_task_queue.concurrency_cap"),
+            "the per-row check must be a plain COALESCE-guarded comparison \
+             against the pre-aggregated count, not a correlated COUNT(*); \
+             got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("SELECT COUNT(*) FROM harvest_task_queue inner_q"),
+            "the per-row correlated concurrency-key subquery must be gone \
+             from the candidate CTE entirely; got:\n{sql}"
+        );
+        assert!(
+            sql.contains(
+                "SELECT COUNT(*) FROM harvest_task_queue recheck \
+                       WHERE recheck.concurrency_key = candidate.concurrency_key \
+                         AND recheck.task_type = candidate.task_type \
+                         AND recheck.state = 'RUNNING' \
+                         AND recheck.worker_id IS NOT NULL"
+            ),
+            "the claimed CTE's single-row, under-advisory-lock re-check \
+             subquery is a different, correctness-critical query (it must \
+             re-execute per claim, not be pre-aggregated) and must be left \
+             completely untouched by this fix; got:\n{sql}"
+        );
+
+        // The mirrors are deliberately left on the pre-fix correlated shape
+        // (see the `NOTE` above `claim_task_query`) -- pin that here rather
+        // than only asserting the fixed query's own shape, so a future
+        // accidental edit to a mirror can't silently drift it out of sync
+        // with this documented scope decision either way.
+        assert!(
+            oldest_pending_ages_query().contains("SELECT COUNT(*) FROM harvest_task_queue inner_q"),
+            "oldest_pending_ages_query must still carry the pre-fix \
+             correlated concurrency_key subquery -- it is deliberately out \
+             of scope for this fix; got:\n{}",
+            oldest_pending_ages_query()
+        );
+        assert!(
+            claimable_pending_demand_query()
+                .contains("SELECT COUNT(*) FROM harvest_task_queue inner_q"),
+            "claimable_pending_demand_query must still carry the pre-fix \
+             correlated concurrency_key subquery -- it is deliberately out \
+             of scope for this fix; got:\n{}",
+            claimable_pending_demand_query()
         );
     }
 
