@@ -4047,7 +4047,7 @@
       "path": "/admin/rate-limits",
       "category": "admin",
       "read_only": true,
-      "description": "List all active rate limit token buckets and current token levels.",
+      "description": "List all active rate limit token buckets and current token levels. In a sharded deployment each key's row on EVERY reachable shard is collected and merged into one entry -- never flattened to a single shard's row picked by raw token count alone, which could silently hide a live override on another shard (issue #945 review, round 5, P2). Each entry surfaces the declared baseline (refill_rate, burst), the raw override columns (override_refill_rate, override_burst, override_expires_at) if one was ever set, and four computed fields resolving what is actually enforced right now: override_active (true iff a live override exists on ANY reachable shard for this key), effective_refill_rate, effective_burst (both from the representative row: an active shard's row when any shard has one, else whichever row was found), and shard_disagreement (true when reachable shards disagree on override state or on resolved effective values -- see the /admin/start-throttle/{workflow_name}/override notes for the exact comparison rule) (issue #945).",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -4106,6 +4106,311 @@
         {
           "status": 500,
           "description": "Database write error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/rate-limits/{activity_name}/override",
+      "category": "admin",
+      "read_only": false,
+      "description": "Set (or replace) a TTL'd runtime pacing override on top of a declared per-activity rate limit (issue #945). Takes effect on the existing token-consumption path immediately, with no worker restart; self-expires and reverts to the declared baseline at expires_at with no further operator action. The write is fanned out to the bucket row on EVERY readable shard (rate-limit buckets are shard-local); a write reaching only SOME shards is reported as 207, not 200 -- see the success-response notes.",
+      "idempotency": "Idempotent: each call fully replaces the whole override (a field omitted from a later call reverts that field to the declared baseline rather than being merged forward with an earlier call).",
+      "params": [
+        {
+          "name": "activity_name",
+          "in": "path",
+          "required": true,
+          "description": "Name of a registered activity that declares a static (non-dynamic) rate limit."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "refill_rate",
+            "required": false,
+            "description": "Overridden token refill rate per second. At least one of refill_rate/burst must be set."
+          },
+          {
+            "name": "burst",
+            "required": false,
+            "description": "Overridden token bucket burst capacity. At least one of refill_rate/burst must be set."
+          },
+          {
+            "name": "ttl_secs",
+            "required": true,
+            "description": "Seconds until the override self-expires and the declared baseline resumes. Must be greater than zero and not exceed the server-side cap (24h)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "key",
+          "declared_refill_rate",
+          "declared_burst",
+          "override_refill_rate",
+          "override_burst",
+          "override_active",
+          "effective_refill_rate",
+          "effective_burst",
+          "expires_at"
+        ],
+        "notes": "A write reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] } -- the override is NOT in effect on the shards named in shard_errors, so a subsequent read/dispatch there still sees the prior state (or the declared baseline if none was ever set); re-issue the request (it is idempotent). The reported override/effective values reflect the PERSISTED row from whichever shard's write is used to build the response, not the request body verbatim -- the separate, permanent POST /admin/rate-limits/{key} route (issue #332) can independently change a bucket's declared refill_rate/burst per shard, so the two may already disagree across shards even before this call. A fully applied request returns plain 200 and omits shard_errors."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Non-finite/non-positive refill_rate or burst, both fields omitted, or ttl_secs is zero or exceeds the server cap."
+        },
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "activity_name is not registered, or is registered but declares no rate limit."
+        },
+        {
+          "status": 409,
+          "description": "activity_name uses a dynamic per-key rate limit (issue #699); a pacing override targets a single static bucket and cannot disambiguate which resolved tenant key's bucket to override."
+        },
+        {
+          "status": 503,
+          "description": "Total shard outage: no readable shard's bucket write succeeded (body { \"errors\": [\"shard {id}: {error}\", ...] }), or every write succeeded but the resulting audit record could not be written (in which case the override write may still have partially or fully taken effect despite the 503 -- read GET /admin/rate-limits to confirm)."
+        }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/rate-limits/{activity_name}/override",
+      "category": "admin",
+      "read_only": false,
+      "description": "Clear a TTL'd runtime pacing override before its TTL elapses, immediately reverting to the declared baseline with no worker restart (issue #945). The clear is fanned out to the bucket row on EVERY readable shard; a clear reaching only SOME shards is reported as 207, not 200 -- see the success-response notes.",
+      "idempotency": "Idempotent: clearing an activity with no active override still returns 200 reporting the declared baseline (override_active: false).",
+      "params": [
+        {
+          "name": "activity_name",
+          "in": "path",
+          "required": true,
+          "description": "Name of a registered activity that declares a static (non-dynamic) rate limit."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "key",
+          "declared_refill_rate",
+          "declared_burst",
+          "override_refill_rate",
+          "override_burst",
+          "override_active",
+          "effective_refill_rate",
+          "effective_burst",
+          "expires_at"
+        ],
+        "notes": "A clear reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] }. The override REMAINS ACTIVE (unless independently expired) on the shards named in shard_errors -- the clear did not reach them -- so a subsequent read/dispatch there can still observe the overridden rate; re-issue the request (it is idempotent). A fully applied clear returns plain 200 and omits shard_errors, with override_active: false."
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "activity_name is not registered, or is registered but declares no rate limit."
+        },
+        {
+          "status": 409,
+          "description": "activity_name uses a dynamic per-key rate limit (issue #699)."
+        },
+        {
+          "status": 503,
+          "description": "Total shard outage: no readable shard's bucket clear succeeded (body { \"errors\": [\"shard {id}: {error}\", ...] }), or every clear succeeded but the resulting audit record could not be written (in which case the clear may still have partially or fully taken effect despite the 503 -- read GET /admin/rate-limits to confirm)."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/start-throttle/{workflow_name}/override",
+      "category": "admin",
+      "read_only": false,
+      "description": "Set (or replace) a TTL'd runtime pacing override on top of a declared workflow-start throttle (issue #945, extends issue #607). Takes effect on the existing token-consumption path immediately, with no worker restart; self-expires and reverts to the declared baseline at expires_at with no further operator action. The write is fanned out to the bucket row on EVERY readable shard (start-throttle buckets are shard-local, like activity rate-limit buckets); a write reaching only SOME shards is reported as 207, not 200 -- see the success-response notes.",
+      "idempotency": "Idempotent: each call fully replaces the whole override (a field omitted from a later call reverts that field to the declared baseline rather than being merged forward with an earlier call).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Name of a registered workflow that declares a static (non-dynamic) start throttle."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "refill_per_sec",
+            "required": false,
+            "description": "Overridden token refill rate per second. At least one of refill_per_sec/burst must be set."
+          },
+          {
+            "name": "burst",
+            "required": false,
+            "description": "Overridden token bucket burst capacity. At least one of refill_per_sec/burst must be set."
+          },
+          {
+            "name": "ttl_secs",
+            "required": true,
+            "description": "Seconds until the override self-expires and the declared baseline resumes. Must be greater than zero and not exceed the server-side cap (24h)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "key",
+          "declared_refill_rate",
+          "declared_burst",
+          "override_refill_rate",
+          "override_burst",
+          "override_active",
+          "effective_refill_rate",
+          "effective_burst",
+          "expires_at"
+        ],
+        "notes": "A write reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] } -- the override is NOT in effect on the shards named in shard_errors, so a deferred-start row already queued there still sees the prior state (or the declared baseline if none was ever set); re-issue the request (it is idempotent). The reported override/effective values reflect the PERSISTED row from whichever shard's write is used to build the response, not the request body verbatim. A fully applied request returns plain 200 and omits shard_errors."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Non-finite/non-positive refill_per_sec or burst, both fields omitted, or ttl_secs is zero or exceeds the server cap."
+        },
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "workflow_name is not registered, or is registered but declares no start throttle."
+        },
+        {
+          "status": 409,
+          "description": "workflow_name uses a dynamic per-key start throttle; a pacing override targets a single static bucket and cannot disambiguate which resolved tenant key's bucket to override."
+        },
+        {
+          "status": 503,
+          "description": "Total shard outage: no readable shard's bucket write succeeded (body { \"errors\": [\"shard {id}: {error}\", ...] }), or every write succeeded but the resulting audit record could not be written (in which case the override write may still have partially or fully taken effect despite the 503 -- read GET /admin/start-throttle/{workflow_name}/override to confirm)."
+        }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/start-throttle/{workflow_name}/override",
+      "category": "admin",
+      "read_only": false,
+      "description": "Clear a TTL'd runtime pacing override before its TTL elapses, immediately reverting to the declared baseline with no worker restart (issue #945). The clear is fanned out to the bucket row on EVERY readable shard; a clear reaching only SOME shards is reported as 207, not 200 -- see the success-response notes.",
+      "idempotency": "Idempotent: clearing a workflow with no active override still returns 200 reporting the declared baseline (override_active: false).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Name of a registered workflow that declares a static (non-dynamic) start throttle."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "key",
+          "declared_refill_rate",
+          "declared_burst",
+          "override_refill_rate",
+          "override_burst",
+          "override_active",
+          "effective_refill_rate",
+          "effective_burst",
+          "expires_at"
+        ],
+        "notes": "A clear reaching only SOME readable shards returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...] }. The override REMAINS ACTIVE (unless independently expired) on the shards named in shard_errors -- the clear did not reach them -- so a deferred-start row already queued there can still observe the overridden rate; re-issue the request (it is idempotent). A fully applied clear returns plain 200 and omits shard_errors, with override_active: false."
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "workflow_name is not registered, or is registered but declares no start throttle."
+        },
+        {
+          "status": 409,
+          "description": "workflow_name uses a dynamic per-key start throttle."
+        },
+        {
+          "status": 503,
+          "description": "Total shard outage: no readable shard's bucket clear succeeded (body { \"errors\": [\"shard {id}: {error}\", ...] }), or every clear succeeded but the resulting audit record could not be written (in which case the clear may still have partially or fully taken effect despite the 503 -- read GET /admin/start-throttle/{workflow_name}/override to confirm)."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/start-throttle/{workflow_name}/override",
+      "category": "admin",
+      "read_only": true,
+      "description": "Read-only companion to the SET/DELETE routes above (issue #945): resolves and reports a workflow's TTL'd pacing-override state directly against the bucket the token-consumption path actually reads, independent of whether the workflow currently has any deferred-start backlog. GET /admin/start-throttle only surfaces override state for a workflow while it has pending backlog rows; this route answers reliably even when the backlog has fully drained but the override is still running for the rest of its TTL, or before any pressure has occurred at all. Buckets are shard-local (issue #607/#247); the top-level 200/207 body reports whichever reachable shard has a LIVE override whenever any shard does -- never the mere fewest-remaining-tokens row, since raw token count says nothing about whether an operator override is active (issue #945 review, round 4, P2). A read reaching only SOME shards, OR one where reachable shards genuinely disagree on override state, is reported as 207, not 200 -- see the success-response notes.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Name of a registered workflow that declares a static (non-dynamic) start throttle."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "key",
+          "declared_refill_rate",
+          "declared_burst",
+          "override_refill_rate",
+          "override_burst",
+          "override_active",
+          "effective_refill_rate",
+          "effective_burst",
+          "expires_at"
+        ],
+        "notes": "A read reaching only SOME readable shards, OR a read of shards that disagree on override state, returns 207 Multi-Status with body { \"override\": <the same fields as the 200 body>, \"shard_errors\": [\"shard {id}: {error}\", ...], \"shard_disagreement\": <bool>, \"shards\": { \"<shard_id>\": <per-shard body, same fields as the 200 body>, ... } }. `override` (the flattened top-level view) prefers a LIVE override on ANY reachable shard -- it never silently reports override_active:false merely because a different (inactive) shard happens to have fewer raw tokens. `shard_disagreement` compares each shard's RESOLVED EFFECTIVE (refill_rate, burst) -- not the raw override_refill_rate/override_burst columns -- so it is true both when reachable shards disagree on the active/inactive boolean, and when byte-identical override columns nonetheless resolve to different effective values because a partial legacy POST /admin/rate-limits/{key} (issue #332) left the shards with divergent persisted BASELINES and an omitted override field falls back to each shard's own (diverged) baseline (issue #945 review, round 5, P2). Millisecond clock skew on override_expires_at alone across a normal successful multi-shard SET does not count as disagreement. `shards` is present whenever the response is 207 (both the shard-outage and the disagreement case) and lists every REACHABLE shard's own view (shard IDs named only in shard_errors are omitted, since their row could not be read). A fully reachable, fully agreeing read returns plain 200 and omits shard_errors/shard_disagreement/shards."
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "workflow_name is not registered, or is registered but declares no start throttle."
+        },
+        {
+          "status": 409,
+          "description": "workflow_name uses a dynamic per-key start throttle; a pacing override targets a single static bucket and cannot disambiguate which resolved tenant key's bucket to read."
+        },
+        {
+          "status": 503,
+          "description": "Total shard outage: not a single readable shard could be reached (body { \"errors\": [\"shard {id}: {error}\", ...] }). This is deliberately distinct from a healthy \"no override configured\" 200 -- a total outage must never be silently reported as if nothing were overridden."
         }
       ]
     },
@@ -4723,7 +5028,7 @@
       "path": "/admin/start-throttle",
       "category": "admin",
       "read_only": true,
-      "description": "Return the per-(workflow_name, throttle_key) deferred-start backlog across all shards (issue #607). Each group represents starts that were paced by a start throttle and durably deferred because the per-key token bucket was empty; they are admitted later by the throttle scanner as tokens refill. Fields: workflow_name, throttle_key (\"\" for an unkeyed/global-per-workflow throttle), deferred_count, oldest_deferred_at, shard_id. Sorted by deferred_count descending. Lets an operator confirm a throttle is active and watch the backlog drain.",
+      "description": "Return the per-(workflow_name, throttle_key) deferred-start backlog across all shards (issue #607). Each group represents starts that were paced by a start throttle and durably deferred because the per-key token bucket was empty; they are admitted later by the throttle scanner as tokens refill. Fields: workflow_name, throttle_key (\"\" for an unkeyed/global-per-workflow throttle), deferred_count, oldest_deferred_at, shard_id. Each group is also joined against that key's shared token bucket, surfacing declared_refill_rate, declared_burst, override_refill_rate, override_burst, override_active, effective_refill_rate, effective_burst, and expires_at, so an operator can see whether a runtime pacing override is in effect for the throttle backing this key (issue #945; bucket-derived fields are null when no matching bucket row exists). Sorted by deferred_count descending. Lets an operator confirm a throttle is active and watch the backlog drain.",
       "params": [],
       "request_body": null,
       "success_response": {
