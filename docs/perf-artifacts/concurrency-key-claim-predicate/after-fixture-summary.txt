@@ -1,0 +1,6 @@
+label=after
+backlog=1000 queues=4 seeded_rows=1000 claimable_rows=1000
+backlog=10000 queues=4 seeded_rows=10000 claimable_rows=10000
+backlog=100000 queues=4 seeded_rows=100000 claimable_rows=100000
+hot_contention: backlog=10000 queues=4 seeded_rows=10000 claimable_rows=10000 running_rows_added=2000
+stat_snapshot: backlog=10000 claimed=10000 gate=concurrency_key
