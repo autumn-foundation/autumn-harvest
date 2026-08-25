@@ -165,3 +165,120 @@ each rep rebuilds its own history — never reuses/clones a prior one, so no
 extra `Clone` cost leaks into the measured call) are read from the
 environment if a different history size or more valgrind wall-time headroom
 is needed.
+
+## Negative result: the same fix does *not* apply to `ActivityScheduled.input`
+
+The `ActivityCompleted.output` fix above naturally raises the question:
+does its sibling field, `ActivityScheduled.input`, have the same
+redundant-clone shape? It does not, and applying the identical `mem::take`
+pattern there is a measured **regression**, not an improvement — recorded
+here so nobody re-attempts it without re-deriving this from scratch.
+
+### Hypothesis
+
+`HistoryMatcher::match_activity` (non-strict) never reads the recorded
+`ActivityScheduled.input` field (it destructures it with `..`), and
+`match_activity_strict` reads it exactly once, by reference, purely for a
+`recorded_input != input` equality check — neither path clones it. The
+recorded input therefore incurs its (unavoidable, since `Value::Object` is
+`BTreeMap`-backed and its drop recurses per node) full structural drop cost
+exactly once, whenever the owning `Vec<WorkflowEvent>` is finally dropped at
+the end of the replay session. Isolating `replay_from_events`'s own cost
+from `build_history` setup (`valgrind --tool=callgrind
+--toggle-collect='*replay_from_events*'`) shows `drop_in_place<WorkflowEvent>`
+accounting for ~19.4% of that isolated window's instructions, called 10,001
+times. The hypothesis: mirroring the `ActivityCompleted.output` fix —
+`mem::take`ing `input`/`recorded_input` at match time, leaving `Value::Null`
+behind — would make that eventual drop trivial and reduce total
+instructions, by direct analogy to the accepted fix above.
+
+### Why this hypothesis is wrong
+
+The analogy breaks on the one detail that made the original fix a genuine
+win: `ActivityCompleted.output` was being **cloned** (`output.clone()`) to
+produce the match's return value while the original stayed in the event —
+so the *original* code paid for one clone (N new heap allocations) plus two
+full drops (the original's, and the clone's) for memory that only ever
+needed to exist once. `mem::take` collapsed that to zero clones and one
+drop — a genuine 2-of-3 reduction.
+
+`ActivityScheduled.input`/`recorded_input` was never cloned by either match
+function — only compared by reference (or not read at all, in the
+non-strict path). There is no redundant work to eliminate. The single
+`Vec<WorkflowEvent>` drop that frees this memory has to happen exactly once
+regardless of *when* it happens; `mem::take`ing it at match time doesn't
+remove that unavoidable drop, it only **relocates** it earlier in time,
+while adding the cost of a fresh `if let` pattern-match + mutable re-borrow
+on every one of the 10,001 events. Net effect: the same total deallocation
+work, plus pure branching overhead with nothing offsetting it.
+
+### Change tested (reverted — not present in the shipped source)
+
+`autumn-harvest/src/replay.rs`: added, in both `match_activity` (before
+`self.cursor += 1;`, after the name-match check passes) and
+`match_activity_strict` (after `result` resolves to `Ok`, before
+`self.cursor += 1;`), a mutable re-borrow of `self.events[self.cursor]`
+that `std::mem::take`s the `input` field, mirroring
+`scan_activity_terminal`'s accepted `output` fix exactly:
+
+```diff
+@@ match_activity, after the name-match check, before self.cursor += 1 @@
++        if let WorkflowEvent::ActivityScheduled { input, .. } = &mut self.events[self.cursor] {
++            let _ = std::mem::take(input);
++        }
+         self.cursor += 1;
+         self.scan_activity_terminal(activity_id, self.cursor)
+
+@@ match_activity_strict, after `result` resolves Ok, before self.cursor += 1 @@
++        if let WorkflowEvent::ActivityScheduled { input, .. } = &mut self.events[self.cursor] {
++            let _ = std::mem::take(input);
++        }
+         self.cursor += 1;
+         self.scan_activity_terminal(activity_id, self.cursor)
+```
+
+### Measurement
+
+Same binary build methodology, same `valgrind --tool=callgrind
+--branch-sim=no --cache-sim=no` invocation, same session, same defaults
+(`REPLAY_PROFILE_N=5000`, `REPLAY_PROFILE_REPS=1`), controlled A/B via
+`git stash`/`git stash drop` so both runs used identical toolchain state
+apart from this one change:
+
+| | Instructions (Ir) |
+|---|---|
+| Before (clean `HEAD`) | 189,169,774 |
+| After (`mem::take` on `ActivityScheduled.input` in both match fns) | 189,349,123 |
+| **Delta** | **+179,349 (+0.095%) — a regression** |
+
+The "before" number reproduces the fix's own documented figure
+(189,162,617, §Measurement above) to within the same "handful of
+instructions" determinism noise this doc already calls out (0.004%
+difference between runs there) — confirming the methodology and toolchain
+state are directly comparable, and that the +0.095% delta measured here is
+a real effect, not noise (roughly 25× the observed noise floor).
+
+Correctness was unaffected either way — `cargo test -p autumn-harvest
+--no-default-features --features testing --lib` (2,148 tests) and `--test
+integration` (1,617 tests) both passed with the change applied, and `cargo
+build`/`clippy -p autumn-harvest --lib --benches --all-features -- -D
+warnings` were clean. The change was reverted purely because it moved the
+wrong direction on the one counter this repo's Bolt agent gates on — not
+because of any correctness issue.
+
+### Conclusion
+
+`ActivityScheduled.input`/`recorded_input`'s drop cost, visible in the
+profile as part of `drop_in_place<WorkflowEvent>`, is **inherent** given the
+current data model: `HistoryMatcher` retains the full history —including
+recorded inputs — for the life of a replay session (required so
+`match_activity_strict` can compare against it), and that memory has to be
+freed exactly once, no matter when. Reducing it further would mean not
+retaining the full input in the first place (e.g. discarding a matched
+event's payload from the retained `Vec` once it can no longer be needed, or
+restructuring what `WorkflowEvent`/`HistoryMatcher` store) — a change to the
+data structure's ownership model, which this repo's Bolt agent charter
+requires asking a maintainer about before attempting, not a local
+match-site fix. Reported here as a stopping point per that same charter's
+"if top entries are inherent work, that's a legitimate finding, report and
+stop."
