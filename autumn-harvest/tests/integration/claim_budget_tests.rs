@@ -2155,6 +2155,348 @@ async fn zz_capture_queue_pause_claim_evidence() {
     );
 }
 
+/// Generates the committed before/after evidence for the concurrency-key
+/// claim-gate rewrite in `queue::claim_task_query()`'s `candidate` CTE
+/// (issue #247 / Ledger perf pass).
+///
+/// `docs/performance.md`'s existing attribution-table sweep (issue #786)
+/// already measures the `concurrency_key` gate's cost in isolation
+/// (**+644%** over `Baseline` at the 10k-backlog headline scenario) but does
+/// not attempt a fix. This capture supplies the before/after pair for one.
+///
+/// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
+/// repeatable CI assertion — its output is read by a human reviewing the PR,
+/// not asserted on. See
+/// `autumn-harvest/scripts/concurrency_key_claim_perf_repro.sh`, which runs
+/// this exact test twice — once against the pre-fix shape of `queue.rs`,
+/// once against the current tree — to produce the paired
+/// `docs/perf-artifacts/concurrency-key-claim-gate/` files the PR cites.
+///
+/// Self-detects which shape it is currently measuring by inspecting
+/// `queue::claim_task_query()`'s own text (`running_by_key AS MATERIALIZED`
+/// present or absent), so a single invocation always writes to the
+/// correctly-labelled `before-*`/`after-*` files regardless of which
+/// revision happens to be checked out — there is no separate "old" copy of
+/// the query text to drift out of sync with the real function.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[ignore = "evidence generator, not a CI assertion -- run via \
+            autumn-harvest/scripts/concurrency_key_claim_perf_repro.sh"]
+#[allow(clippy::too_many_lines)] // one-shot evidence capture, not a CI assertion
+async fn zz_capture_concurrency_key_claim_evidence() {
+    use diesel::QueryableByName;
+    use diesel_async::RunQueryDsl;
+
+    #[derive(QueryableByName)]
+    struct ExplainRow {
+        #[diesel(sql_type = diesel::sql_types::Text, column_name = "QUERY PLAN")]
+        query_plan: String,
+    }
+
+    #[derive(QueryableByName, Debug)]
+    struct StatRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        query: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        calls: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        shared_blks_hit: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        shared_blks_read: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        total_buffers: i64,
+    }
+
+    let Some(bench) = bench_db_or_skip().await else {
+        eprintln!("no database reachable; nothing captured");
+        return;
+    };
+
+    let raw = autumn_harvest::queue::claim_task_query();
+    let label = if raw.contains("running_by_key AS MATERIALIZED") {
+        "after"
+    } else {
+        "before"
+    };
+    eprintln!("== capturing label={label} (auto-detected from claim_task_query() text) ==");
+
+    let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("autumn-harvest/ has a workspace-root parent")
+        .join("docs")
+        .join("perf-artifacts")
+        .join("concurrency-key-claim-gate");
+    std::fs::create_dir_all(&out_dir).expect("create artifact output directory");
+
+    let mut summary_lines: Vec<String> = vec![format!("label={label}")];
+
+    // One EXPLAIN capture per published backlog depth -- shows the cost is
+    // driven by candidate rows scanned (loops=N), not a fixed per-call
+    // overhead, corroborating the mechanism claim rather than just the
+    // headline number.
+    for backlog in super::claim_bench_support::BACKLOG_SWEEP {
+        let scenario = Scenario {
+            backlog,
+            claimers: 1,
+            queues: 4,
+            gate: ClaimGate::ConcurrencyKey,
+        };
+
+        let mut conn = db::connect(&bench.url).await;
+        let seeded = db::seed(&mut conn, scenario).await;
+
+        let queues = db::queue_names(scenario);
+        let queue_list = queues
+            .iter()
+            .map(|q| format!("'{q}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let cb = db::circuit_breaker_set(scenario.gate);
+        let cb_list = cb
+            .iter()
+            .map(|a| format!("'{a}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let literals = [
+            format!("'{}-worker-0'", db::BENCH_PREFIX),
+            format!("ARRAY[{queue_list}]::text[]"),
+            format!("'{}'", db::worker_build_id(scenario.gate)),
+            "NULL".to_string(),
+            format!("ARRAY[{cb_list}]::text[]"),
+            "ARRAY[]::text[]".to_string(),
+        ];
+        assert!(
+            !raw.contains(&format!("${}", literals.len() + 1)),
+            "claim_task_query() grew a seventh bind; extend `literals` before \
+             this capture can be trusted",
+        );
+        let mut sql = raw.to_string();
+        for (i, literal) in literals.iter().enumerate().rev() {
+            sql = sql.replace(&format!("${}", i + 1), literal);
+        }
+
+        // `EXPLAIN ANALYZE` really executes the statement -- including the
+        // UPDATE CTEs -- so it runs inside a transaction that is rolled back;
+        // otherwise producing the plan would itself consume a task.
+        diesel::sql_query("BEGIN")
+            .execute(&mut conn)
+            .await
+            .expect("begin");
+        let loaded: Result<Vec<ExplainRow>, _> = diesel::sql_query(format!(
+            "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF) {sql}"
+        ))
+        .load(&mut conn)
+        .await;
+        diesel::sql_query("ROLLBACK")
+            .execute(&mut conn)
+            .await
+            .expect("rollback");
+
+        // The transaction is already rolled back above regardless of whether
+        // `loaded` is `Ok` or `Err`, so panicking here on failure leaves no
+        // dangling transaction. A failure must abort the capture, not get
+        // serialized as plan text: the shell harness only checks for the
+        // trailing completion marker, so a swallowed EXPLAIN failure here
+        // would let a run with no real plan for this backlog depth pass as
+        // successfully reproduced evidence.
+        let plan_text = loaded
+            .unwrap_or_else(|e| {
+                panic!(
+                    "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, TIMING OFF) \
+                     failed for backlog={backlog}: {e} -- the literal \
+                     substitution of claim_task_query() above is likely stale \
+                     against a query shape change; see the `literals` array"
+                )
+            })
+            .into_iter()
+            .map(|r| r.query_plan)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let file_name = format!("{label}-claim-backlog-{backlog}.explain.txt");
+        std::fs::write(
+            out_dir.join(&file_name),
+            format!(
+                "-- {label}: claim_task_query() @ backlog={backlog}, 4 queues, \
+                 ClaimGate::ConcurrencyKey (256 keys, cap=1_000_000, never blocks) --\n{plan_text}\n"
+            ),
+        )
+        .expect("write explain artifact");
+        eprintln!("wrote {file_name}");
+
+        summary_lines.push(format!(
+            "backlog={backlog} queues={} seeded_rows={} claimable_rows={}",
+            scenario.queues, seeded.seeded_rows, seeded.claimable_rows,
+        ));
+    }
+
+    // A `pg_stat_statements` snapshot from the *real* `claim_task()` production
+    // function (not the literal-substituted EXPLAIN text above), so the
+    // committed snapshot reflects exactly the code path a live worker takes.
+    // Fresh connection + fresh seed at the published headline scale, with the
+    // gate overridden to `ConcurrencyKey` (the headline scenario's own
+    // `gate: ClaimGate::Baseline` leaves the column NULL, which is not what
+    // this capture exists to measure).
+    let mut stats_conn = db::connect(&bench.url).await;
+    let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+        .execute(&mut stats_conn)
+        .await;
+    diesel::sql_query(
+        "SELECT pg_stat_statements_reset(0, \
+                (SELECT oid FROM pg_database WHERE datname = current_database()), 0)",
+    )
+    .execute(&mut stats_conn)
+    .await
+    .expect(
+        "pg_stat_statements_reset(...) failed -- without a clean reset, a \
+             stale entry from a prior run of this exact harness (same \
+             schema, same literal query text, different ephemeral database) \
+             could corrupt this capture's top-10-by-buffers ranking; the \
+             HARVEST_TEST_DATABASE_URL role must be able to reset \
+             statistics for its own database (superuser, or explicitly \
+             granted EXECUTE on this function)",
+    );
+
+    // Deliberately NOT the headline scenario's 10 000-row backlog: the
+    // pre-fix `concurrency_key` guard's per-subplan-execution cost grows
+    // with the number of currently-RUNNING rows, because
+    // `idx_harvest_tq_running` only carries `(state, last_heartbeat_at)` --
+    // `concurrency_key`/`task_type` are applied as a post-scan `Filter`, not
+    // an index search condition (see the mechanism note above
+    // `claim_task_query()`). Measured directly: draining a full 10 000-row
+    // backlog through the unfixed query decelerated sharply as the RUNNING
+    // population grew (~1 000 real claims in ~12 minutes and still
+    // slowing), which would make the "before" half of this capture
+    // impractically slow. A smaller, still-genuinely-realistic backlog
+    // keeps the same `KEY_CARDINALITY` (256 keys) while staying wall-clock
+    // tractable; the EXPLAIN sweep above already covers the full published
+    // `BACKLOG_SWEEP` range (1 000/10 000/100 000), including the exact
+    // headline depth, for the primary per-statement buffer evidence.
+    let stat_scenario = Scenario {
+        backlog: 2_000,
+        gate: ClaimGate::ConcurrencyKey,
+        ..headline_scenario()
+    };
+    let seeded = db::seed(&mut stats_conn, stat_scenario).await;
+    let queues = db::queue_names(stat_scenario);
+
+    // Drive the real claim path repeatedly so pg_stat_statements accumulates
+    // real, attributed `calls`/buffer counters for the production query text
+    // -- not just the single literal-substituted EXPLAIN above.
+    let mut claimed = 0usize;
+    let ceiling = seeded.claimable_rows + 10;
+    loop {
+        let result = autumn_harvest::queue::claim_task(
+            &mut stats_conn,
+            &queues,
+            "ledger-evidence-worker",
+            "",
+            None,
+            &[],
+            &[],
+        )
+        .await
+        .expect("claim_task must not error");
+        match result {
+            Some(_) => {
+                claimed += 1;
+                assert!(
+                    claimed <= ceiling,
+                    "claimed more rows than were seeded -- bug in the capture loop"
+                );
+            }
+            None => break,
+        }
+    }
+    eprintln!(
+        "stat-snapshot claim loop: claimed={claimed} of {} claimable",
+        seeded.claimable_rows
+    );
+
+    let stats_rows: Vec<StatRow> = diesel::sql_query(
+        "SELECT query, calls, shared_blks_hit, shared_blks_read, \
+                (shared_blks_hit + shared_blks_read) AS total_buffers \
+         FROM pg_stat_statements \
+         WHERE query ILIKE '%harvest_task_queue%' \
+           AND dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+         ORDER BY total_buffers DESC LIMIT 10",
+    )
+    .load(&mut stats_conn)
+    .await
+    .expect(
+        "pg_stat_statements query failed -- it must be preloaded via \
+         shared_preload_libraries (the Docker fallback container already \
+         does this; an external HARVEST_TEST_DATABASE_URL target must too) \
+         for this capture to produce real evidence rather than a silent \
+         placeholder",
+    );
+
+    assert!(
+        !stats_rows.is_empty(),
+        "pg_stat_statements returned zero rows matching '%harvest_task_queue%' \
+         for the current database, even though {claimed} real claim_task() \
+         calls (plus one terminal None) were just driven above -- check \
+         pg_stat_statements.track (must be 'all' or 'top', not 'none')",
+    );
+
+    let expected_calls =
+        i64::try_from(claimed + 1).expect("claimed count fits in i64 at this test's scale");
+    let claim_row = stats_rows
+        .iter()
+        .find(|r| r.query.contains("rate_limit_debit"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no pg_stat_statements row matched the production \
+                 claim_task_query() shape (looked for the `rate_limit_debit` \
+                 CTE); got: {stats_rows:?}"
+            )
+        });
+    assert_eq!(
+        claim_row.calls, expected_calls,
+        "pg_stat_statements reports {} calls for the production claim_task_query() \
+         row, expected {expected_calls} ({claimed} successful claims + 1 terminal \
+         None) -- the snapshot may include stale or foreign calls despite the \
+         reset and dbid scope above",
+        claim_row.calls,
+    );
+
+    let stats_text = stats_rows
+        .iter()
+        .map(|r| {
+            format!(
+                "calls={} shared_blks_hit={} shared_blks_read={} total_buffers={}\nquery={}\n",
+                r.calls, r.shared_blks_hit, r.shared_blks_read, r.total_buffers, r.query,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(
+        out_dir.join(format!("{label}-pg_stat_statements.txt")),
+        format!(
+            "-- {label}: pg_stat_statements @ backlog={} (ClaimGate::ConcurrencyKey, \
+             256 keys, real claim_task() calls; smaller than the published \
+             BACKLOG_SWEEP headline depth for wall-clock tractability -- see \
+             the mechanism note above `claim_task_query()`) --\n{stats_text}\n",
+            stat_scenario.backlog
+        ),
+    )
+    .expect("write pg_stat_statements artifact");
+
+    summary_lines.push(format!(
+        "stat_snapshot: backlog={} claimed={}",
+        stat_scenario.backlog, claimed,
+    ));
+    std::fs::write(
+        out_dir.join(format!("{label}-fixture-summary.txt")),
+        summary_lines.join("\n") + "\n",
+    )
+    .expect("write fixture summary");
+
+    eprintln!(
+        "== capture complete: label={label}, artifacts in {} ==",
+        out_dir.display()
+    );
+}
+
 /// Generates the committed evidence for the capability-labels claim-path
 /// predicate (issue #382 / Ledger perf pass), documented in
 /// `docs/performance.md` and `docs/performance-capability-labels.md`.
