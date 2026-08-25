@@ -186,10 +186,14 @@ recorded input therefore incurs its (unavoidable, since `Value::Object` is
 `BTreeMap`-backed and its drop recurses per node) full structural drop cost
 exactly once, whenever the owning `Vec<WorkflowEvent>` is finally dropped at
 the end of the replay session. Isolating `replay_from_events`'s own cost
-from `build_history` setup (`valgrind --tool=callgrind
+from `build_history` setup (`valgrind --tool=callgrind --collect-atstart=no
 --toggle-collect='*replay_from_events*'`) shows `drop_in_place<WorkflowEvent>`
 accounting for ~19.4% of that isolated window's instructions, called 10,001
-times. The hypothesis: mirroring the `ActivityCompleted.output` fix —
+times. (`--collect-atstart=no` is required here: Callgrind collects from
+process start by default, and `--toggle-collect` flips collection at
+function entry/exit — without `--collect-atstart=no` this invocation would
+profile everything *around* `replay_from_events` instead of the call
+itself.) The hypothesis: mirroring the `ActivityCompleted.output` fix —
 `mem::take`ing `input`/`recorded_input` at match time, leaving `Value::Null`
 behind — would make that eventual drop trivial and reduce total
 instructions, by direct analogy to the accepted fix above.
@@ -297,17 +301,32 @@ because of any correctness issue.
 
 ### Conclusion
 
-`ActivityScheduled.input`/`recorded_input`'s drop cost, visible in the
-profile as part of `drop_in_place<WorkflowEvent>`, is **inherent** given the
-current data model: `HistoryMatcher` retains the full history —including
-recorded inputs — for the life of a replay session (required so
+`ActivityScheduled.input`/`recorded_input`'s **total** drop cost, visible
+in the profile as part of `drop_in_place<WorkflowEvent>`, is **inherent**
+given the current data model: `HistoryMatcher` retains the full history —
+including recorded inputs — for the life of a replay session (required so
 `match_activity_strict` can compare against it), and that memory has to be
-freed exactly once, no matter when. Reducing it further would mean not
-retaining the full input in the first place (e.g. discarding a matched
-event's payload from the retained `Vec` once it can no longer be needed, or
-restructuring what `WorkflowEvent`/`HistoryMatcher` store) — a change to the
-data structure's ownership model, which this repo's Bolt agent charter
-requires asking a maintainer about before attempting, not a local
-match-site fix. Reported here as a stopping point per that same charter's
-"if top entries are inherent work, that's a legitimate finding, report and
-stop."
+freed exactly once, no matter when. On the **instruction-count** axis this
+report gates on, that's the whole story: the already-tested local
+`mem::take` patch above shows that *when* the drop happens is not
+inherent — a purely local match-site change, with no data-structure
+rewrite, already achieves early release/post-match discard — but doing it
+earlier does not reduce total Ir, and measurably costs a small amount
+(+0.095%). Only reducing the drop's *existence* — not retaining the full
+input at all — would need the broader change (restructuring what
+`WorkflowEvent`/`HistoryMatcher` store), which this repo's Bolt agent
+charter requires asking a maintainer about before attempting.
+
+On a **different** axis — peak memory rather than instruction count — the
+already-tested patch's early release could plausibly lower peak heap usage
+across a long/wide replay session, since dead-but-retained payloads would
+stop accumulating until the session-end `Vec` drop. That is untested here:
+this report's evidence is `iai-callgrind`-class instruction counting, not
+`dhat`, and the two are separate admissible-evidence categories under this
+repo's Bolt charter with separate impact floors. If peak memory — not
+instruction count — is the actual concern, the already-tested `mem::take`
+patch (small Ir cost and all) is the natural candidate for a dedicated
+`dhat` peak-heap measurement before being dismissed on memory grounds; that
+measurement is not attempted here. Reported as a stopping point on the
+**instruction-count** axis specifically, per this charter's "if top
+entries are inherent work, that's a legitimate finding, report and stop."
