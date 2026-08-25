@@ -171,8 +171,10 @@ is needed.
 The `ActivityCompleted.output` fix above naturally raises the question:
 does its sibling field, `ActivityScheduled.input`, have the same
 redundant-clone shape? It does not, and applying the identical `mem::take`
-pattern there is a measured **regression**, not an improvement — recorded
-here so nobody re-attempts it without re-deriving this from scratch.
+pattern to it is a measured **regression** on the path this benchmark
+actually exercises — recorded here so nobody re-attempts it without
+re-deriving this from scratch. (See the "Scope" note below: this harness
+only ever exercises `match_activity_strict`, not `match_activity`.)
 
 ### Hypothesis
 
@@ -203,14 +205,36 @@ needed to exist once. `mem::take` collapsed that to zero clones and one
 drop — a genuine 2-of-3 reduction.
 
 `ActivityScheduled.input`/`recorded_input` was never cloned by either match
-function — only compared by reference (or not read at all, in the
-non-strict path). There is no redundant work to eliminate. The single
-`Vec<WorkflowEvent>` drop that frees this memory has to happen exactly once
-regardless of *when* it happens; `mem::take`ing it at match time doesn't
-remove that unavoidable drop, it only **relocates** it earlier in time,
-while adding the cost of a fresh `if let` pattern-match + mutable re-borrow
-on every one of the 10,001 events. Net effect: the same total deallocation
-work, plus pure branching overhead with nothing offsetting it.
+function — only compared by reference in `match_activity_strict`, or not
+read at all in `match_activity` (non-strict). There is no redundant work to
+eliminate. The single `Vec<WorkflowEvent>` drop that frees this memory has
+to happen exactly once regardless of *when* it happens; `mem::take`ing it
+at match time doesn't remove that unavoidable drop, it only **relocates**
+it earlier in time, while adding the cost of a fresh `if let`
+pattern-match + mutable re-borrow once per `ActivityScheduled` match —
+5,000 times for this benchmark's `n = 5000` activities, not once per raw
+event. (The 10,001 figure above belongs to `drop_in_place<WorkflowEvent>`,
+which *does* run once per element when the whole vector is finally freed —
+`WorkflowStarted` + 5,000 `ActivityScheduled` + 5,000 `ActivityCompleted` —
+but that's a different count from how many times the added pattern-match
+itself executes; an earlier revision of this doc conflated the two.) Net
+effect: the same total deallocation work, plus pure branching overhead on
+half as many call sites as first claimed here, with nothing offsetting it.
+
+**Scope — strict replay only.** `replay_profile.rs` drives
+`WorkflowReplayer::replay_from_events`, which always constructs its context
+via `run_workflow_strict`/`run_workflow_strict_advancing_clock`, both of
+which set `strict_replay = true`. `context.rs`'s activity dispatch is an
+exclusive branch (`if self.strict_replay { match_activity_strict } else {
+match_activity }`), so this benchmark only ever calls
+`match_activity_strict` — the identical change made to `match_activity`
+(the non-strict path a live worker's ordinary production replay uses) was
+compiled in but **never executed** by this harness. The measured +0.095%
+regression below is attributable entirely to the strict-path copy;
+`match_activity`'s copy is untested by this specific harness, not
+independently confirmed regressive on its own — though the same "nothing
+was ever cloned here" argument applies to it structurally, and a dedicated
+non-strict-path benchmark would be needed to measure it directly.
 
 ### Change tested (reverted — not present in the shipped source)
 
@@ -237,6 +261,11 @@ that `std::mem::take`s the `input` field, mirroring
          self.scan_activity_terminal(activity_id, self.cursor)
 ```
 
+Both copies were added for architectural symmetry with the accepted
+`output` fix, but only the `match_activity_strict` copy is reachable from
+this benchmark (see "Scope" above) — `match_activity`'s copy contributes
+nothing to the measurement below.
+
 ### Measurement
 
 Same binary build methodology, same `valgrind --tool=callgrind
@@ -248,7 +277,7 @@ apart from this one change:
 | | Instructions (Ir) |
 |---|---|
 | Before (clean `HEAD`) | 189,169,774 |
-| After (`mem::take` on `ActivityScheduled.input` in both match fns) | 189,349,123 |
+| After (`mem::take` on `ActivityScheduled.input`; strict path only, per Scope above) | 189,349,123 |
 | **Delta** | **+179,349 (+0.095%) — a regression** |
 
 The "before" number reproduces the fix's own documented figure
