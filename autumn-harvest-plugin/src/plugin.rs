@@ -1495,7 +1495,7 @@ async fn start_harvest_runtime(
     api_state.set_health_requires_shard_readiness(harvest_config.readiness.require_shard_readiness);
     api_state
         .set_workflow_result_notification_database_url(workflow_result_notification_url.clone());
-    ensure_runtime_migrations(state.profile(), &app_config, &harvest_config)?;
+    ensure_runtime_migrations(state.profile(), &app_config, &harvest_config).await?;
 
     let runtime_state = state.clone();
     let app_pool = state.pool().cloned();
@@ -2362,7 +2362,53 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
     api_state.clear();
 }
 
-fn ensure_runtime_migrations(
+/// Runs pending-migration checks for the outbox, Harvest storage, and plugin
+/// Harvest storage databases, awaiting the result off the calling task's own
+/// async executor thread.
+///
+/// `autumn_web::migrate::run_pending`/`pending_migrations` are synchronous.
+/// Against a plaintext connection they route through a genuinely-sync libpq
+/// (`PgConnection::establish`) path and merely block the calling thread
+/// briefly. Against a TLS-requiring `sslmode` (`require`/`verify-ca`/
+/// `verify-full`) they instead reuse the *current* Tokio runtime handle and
+/// call `Handle::block_on` on it -- which Tokio forbids (and panics on) when
+/// called from a thread that is already driving that runtime's own async
+/// tasks. `start_harvest_runtime` runs inside an `on_startup` hook on exactly
+/// such a thread, so calling the blocking body directly here panicked the
+/// whole startup task the instant the configured database URL required TLS.
+///
+/// `tokio::task::spawn_blocking` moves the blocking body onto a dedicated
+/// blocking-pool thread, where a nested `block_on` is the sanctioned pattern
+/// (this is precisely the "`spawn_blocking` tasks (the startup migration path)"
+/// case `autumn_web`'s own `establish_migration_connection` doc comment calls
+/// out as safe), so the TLS branch can complete normally instead of panicking.
+async fn ensure_runtime_migrations(
+    profile: &str,
+    app_config: &AutumnConfig,
+    harvest_config: &HarvestRuntimeConfig,
+) -> autumn_web::AutumnResult<()> {
+    let profile = profile.to_owned();
+    let app_config = app_config.clone();
+    let harvest_config = harvest_config.clone();
+
+    match tokio::task::spawn_blocking(move || {
+        ensure_runtime_migrations_blocking(&profile, &app_config, &harvest_config)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(join_error) => Err(AutumnError::service_unavailable_msg(format!(
+            "harvest runtime migrations task failed to join: {join_error}"
+        ))),
+    }
+}
+
+/// The synchronous migration-check body. **Must never be called from a thread
+/// that is currently driving a Tokio runtime's async tasks** -- against a
+/// TLS-requiring database URL it panics (see [`ensure_runtime_migrations`]).
+/// Sync contexts (the CLI) and `spawn_blocking` tasks are both fine; call
+/// [`ensure_runtime_migrations`] from an async context instead.
+fn ensure_runtime_migrations_blocking(
     profile: &str,
     app_config: &AutumnConfig,
     harvest_config: &HarvestRuntimeConfig,
@@ -3180,6 +3226,62 @@ mod tests {
             .expect("external mode should resolve a dedicated harvest pool");
 
         assert_eq!(harvest_pool.status().max_size, 10);
+    }
+
+    /// Fixture for the two tests below: an embedded-mode `AutumnConfig`/
+    /// `HarvestRuntimeConfig` pair whose database URL requires TLS
+    /// (`sslmode=require`), pointed at a port nothing is listening on.
+    /// `127.0.0.1:1` refuses the connection almost instantly on every
+    /// platform, so these tests are hermetic and fast -- no real
+    /// TLS-enabled Postgres server is needed. Reaching
+    /// `autumn_web::migrate`'s rustls connection path at all is what
+    /// triggers the "`block_on` from within a runtime" hazard, before any
+    /// network I/O happens -- so whether the target is actually reachable
+    /// is irrelevant to what these tests exercise.
+    fn tls_url_fixture() -> (AutumnConfig, HarvestRuntimeConfig) {
+        let app_config = AutumnConfig {
+            database: DatabaseConfig {
+                url: Some("postgres://user:pass@127.0.0.1:1/harvest?sslmode=require".to_owned()),
+                ..DatabaseConfig::default()
+            },
+            ..AutumnConfig::default()
+        };
+        (app_config, HarvestRuntimeConfig::default())
+    }
+
+    /// Pins that the fixture above genuinely exercises the TLS/rustls
+    /// migration-connection path: called unwrapped from an async task (the
+    /// shape a `#[tokio::test]` gives, matching the real `on_startup` hook
+    /// that calls `ensure_runtime_migrations`), the rustls branch reuses
+    /// this task's own runtime handle and calls `Handle::block_on` on it --
+    /// which Tokio forbids from a thread already driving that runtime's
+    /// async tasks, and panics. This is what proves the `spawn_blocking`
+    /// wrapper in `ensure_runtime_migrations` (tested below) is load
+    /// bearing, not incidental.
+    #[tokio::test]
+    #[should_panic(expected = "Cannot start a runtime from within a runtime")]
+    async fn ensure_runtime_migrations_blocking_panics_if_called_directly_from_an_async_task() {
+        let (app_config, harvest_config) = tls_url_fixture();
+        let _ = ensure_runtime_migrations_blocking("dev", &app_config, &harvest_config);
+    }
+
+    /// Regression test for `ensure_runtime_migrations` failing on a
+    /// TLS-enabled Postgres: it must be safely callable from within an
+    /// async context (replicating the real `start_harvest_runtime`/
+    /// `on_startup` call site) against a TLS-requiring database URL.
+    /// Before the fix this panicked the calling task instead of returning
+    /// an ordinary connection error.
+    #[tokio::test]
+    async fn ensure_runtime_migrations_does_not_panic_on_a_tls_requiring_database_url() {
+        let (app_config, harvest_config) = tls_url_fixture();
+
+        let result = ensure_runtime_migrations("dev", &app_config, &harvest_config).await;
+
+        assert!(
+            result.is_err(),
+            "127.0.0.1:1 refuses the connection, so this must fail cleanly with an \
+             ordinary error rather than panicking the calling task: {result:?}"
+        );
     }
 
     #[test]
