@@ -216,7 +216,7 @@ const INIT_SQL: &str = concat!(
     ),
     // issue #946: quota_key column on harvest_workflow_executions, referenced
     // by every WorkflowExecution::as_select() read-back in this suite.
-    include_str!("../../autumn-harvest/migrations/20260724000000_harvest_workflow_quotas/up.sql"),
+    include_str!("../../autumn-harvest/migrations/20260725000000_harvest_workflow_quotas/up.sql"),
 );
 
 type HarvestApiApp = axum::Router;

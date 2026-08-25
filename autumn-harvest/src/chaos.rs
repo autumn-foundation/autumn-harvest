@@ -25,7 +25,7 @@
 //! off, an injection point is a `const _: ChaosPoint = ...;` item that the
 //! compiler discards, so there is no branch, no atomic load, no code at all at
 //! the call site. When the feature is *on* but the harness is disarmed, [`hit`]
-//! is a single `Relaxed` atomic load followed by an early return with no lock
+//! is a single `SeqCst` atomic load followed by an early return with no lock
 //! and no `.await` yield.
 //!
 //! ## Determinism (AC3)
@@ -273,18 +273,19 @@ mod controller {
     /// the harness forever.
     const HOLD_MAX: Duration = Duration::from_secs(15);
 
-    static ARMED: AtomicBool = AtomicBool::new(false);
     static STATE: RwLock<Option<Arc<ChaosState>>> = RwLock::new(None);
     static SERIAL: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
     static HOOK_INSTALLED: Once = Once::new();
     /// Monotonic source of per-arm generation ids. Starts at 1 so `0` is a
     /// never-armed sentinel (see [`ARMED_GEN`]).
     static NEXT_GEN: AtomicU64 = AtomicU64::new(1);
-    /// The generation of the currently-armed plan, or `0` when disarmed. A
-    /// resolved action only fires when the state it was resolved from still
-    /// carries this generation — so a fault resolved by a spawned task that
-    /// outlived its plan can never leak into a later test (issue #940, Codex
-    /// review round 1).
+    /// The generation of the currently-armed plan, or `0` when disarmed. This
+    /// is the *sole* armed/disarmed signal — see [`entry_snapshot`] for why an
+    /// earlier revision's separate `ARMED: AtomicBool` was removed. A resolved
+    /// action only fires when the state it was resolved from still carries
+    /// this generation — so a fault resolved by a spawned task that outlived
+    /// its plan can never leak into a later test (issue #940, Codex review
+    /// round 1).
     static ARMED_GEN: AtomicU64 = AtomicU64::new(0);
 
     /// An injected fault error. Surfaces at a [`chaos_fallible!`] site as
@@ -875,35 +876,129 @@ mod controller {
 
     /// Atomically snapshot the armed state *and* the generation it belongs to.
     ///
-    /// The disarmed fast path is a single `Relaxed` load and early return — no
-    /// lock, no clone — so the zero-cost-when-disarmed property the entry
-    /// points ([`hit`]/[`hit_fallible`]/[`should_drop_notify`]) document still
-    /// holds. When armed, the generation is captured *before* the `STATE` read
-    /// and the state is rejected (returns `None`) unless it belongs to that
-    /// same generation.
+    /// The disarmed fast path is a single `SeqCst` load of [`ARMED_GEN`] and
+    /// early return — no lock, no clone — so the zero-cost-when-disarmed
+    /// property the entry points ([`hit`]/[`hit_fallible`]/[`should_drop_notify`])
+    /// document still holds. `ARMED_GEN` is the *sole* armed/disarmed sentinel
+    /// (`0` == disarmed, see its own doc comment) as well as the generation to
+    /// fence the subsequent `STATE` read against — there is deliberately no
+    /// separate flag.
     ///
-    /// This closes the gap the old two-load entry (`ARMED` bool, then
-    /// `current_state`) left open: a task that observed the harness armed under
-    /// one plan, was preempted across a guard drop + re-arm, then read `STATE`
-    /// would otherwise adopt the *newer* plan's state and resolve (firing) a
-    /// directive it was never meant to. Fencing on the captured entry
-    /// generation makes such a straddling task a no-op. [`arm`] publishes
+    /// An earlier revision of this function read a standalone `ARMED: AtomicBool`
+    /// (with `Relaxed` ordering) *and* `ARMED_GEN` as two separate atomics. A
+    /// task that read `ARMED` while true, was then preempted across a full
+    /// guard drop + re-arm to a *different* plan, and resumed reading
+    /// `ARMED_GEN`/`STATE` would observe the *incoming* plan's pair — which is
+    /// trivially self-consistent (both belong to the same, newer generation) —
+    /// and wrongly resolve (firing) a directive belonging to a plan it was
+    /// never entered under. The two-flag design also had a false-negative
+    /// mirror image: `arm` published `STATE` and `ARMED_GEN` before flipping
+    /// `ARMED` true, so a reader observing exactly that window would see a
+    /// stale `ARMED == false` and silently skip fault injection under a plan
+    /// that was, by every other measure, already live. Deleting the
+    /// standalone flag and using `ARMED_GEN` alone eliminates both of *these*
+    /// directions by construction: there is no longer a second,
+    /// independently-ordered *read* left to go stale relative to it.
+    ///
+    /// A narrower, structurally different window remains in [`arm`] itself:
+    /// `STATE` and `ARMED_GEN` are still two separate atomics, so a
+    /// concurrent reader can observe `ARMED_GEN == 0` for an instant after
+    /// `STATE` has already been overwritten with the new plan — a real-time
+    /// interleaving, not a stale cached read. This is inherent to publishing
+    /// two atomics rather than one (closing it fully would need something
+    /// like a single `ArcSwap` carrying both the state and its generation in
+    /// one atomic swap) and is benign: unlike the deleted `ARMED` bool, it
+    /// can only ever produce a transient, self-detecting *false negative* — a
+    /// request momentarily sees "disarmed" and skips injection, which the
+    /// reproducer's own `actions_fired() >= 1` anti-vacuity assert would
+    /// catch — never the false-positive misfire the two-flag design risked.
+    /// It is also no wider than the window that already existed pre-fix.
+    ///
+    /// The state read that remains — `ARMED_GEN` then `STATE` — is fenced by
+    /// the generation-mismatch check exactly as before: [`arm`] publishes
     /// `STATE` before `ARMED_GEN`, so observing a generation implies its state
     /// is already visible; the only rejected pairs are genuinely torn (entry
-    /// generation from the outgoing plan, `STATE` from the incoming one). The
-    /// generation is fenced *again* at fire time via
+    /// generation from an outgoing plan, `STATE` already the incoming one's).
+    /// The generation is fenced *again* at fire time via
     /// [`ChaosState::fire_if_current`], so a disarm landing after this snapshot
-    /// still fires nothing. `SeqCst` pairs with the stores in [`arm`]/`Drop`.
+    /// still fires nothing.
+    ///
+    /// A `#[cfg(test)]`-only rendezvous (see [`maybe_pause_entry_snapshot`])
+    /// sits between the two reads below -- absent from every non-test build,
+    /// including a real `--features chaos` binary, so it costs nothing
+    /// outside `cargo test`. `entry_snapshot_rejects_a_straddled_read_of_the_real_production_path`
+    /// uses it to pause THIS function on a real OS thread and drive a
+    /// genuine concurrent disarm+rearm across the pause, proving this exact
+    /// function -- not a hand-reconstructed stand-in -- rejects a straddled
+    /// read (Codex review round 3, issue #1202: the sibling
+    /// `entry_snapshot_transitions_cleanly_where_the_removed_two_read_shape_straddled`
+    /// test below only replays the REMOVED shape's bug against a clone,
+    /// `vulnerable_two_read_shape`, and so cannot detect a regression that
+    /// reintroduces an equivalent stale-decision defect into this real
+    /// function).
     fn entry_snapshot() -> Option<Arc<ChaosState>> {
-        if !ARMED.load(Ordering::Relaxed) {
+        let entry_gen = ARMED_GEN.load(Ordering::SeqCst);
+        if entry_gen == 0 {
             return None;
         }
-        let entry_gen = ARMED_GEN.load(Ordering::SeqCst);
+        #[cfg(test)]
+        maybe_pause_entry_snapshot();
         let state = current_state()?;
         if state.generation != entry_gen {
             return None;
         }
         Some(state)
+    }
+
+    /// Test-only rendezvous consulted by [`entry_snapshot`] between its two
+    /// reads (see [`maybe_pause_entry_snapshot`]). `None` -- the default, and
+    /// the only state outside an explicit [`install_entry_snapshot_test_pause`]
+    /// call -- costs a single mutex lock with nothing to do; only a test that
+    /// has armed the pause pays for the rendezvous itself.
+    #[cfg(test)]
+    static ENTRY_SNAPSHOT_TEST_PAUSE: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    > = Mutex::new(None);
+
+    /// Arm a one-shot pause for the *next* call to [`entry_snapshot`] that
+    /// observes the harness armed (an already-disarmed call returns before
+    /// ever reaching the rendezvous, so it never blocks on this). Returns a
+    /// `(reached, release)` pair: `reached.recv()` blocks the caller until
+    /// the paused call is parked at the rendezvous; sending on (or dropping)
+    /// `release` lets the paused call proceed to its second read.
+    #[cfg(test)]
+    fn install_entry_snapshot_test_pause() -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        *ENTRY_SNAPSHOT_TEST_PAUSE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// Consumed at most once per [`install_entry_snapshot_test_pause`] call
+    /// -- `take()`, not a peek -- so an unrelated concurrent `entry_snapshot`
+    /// call could never also consume this test's rendezvous. In practice
+    /// this is moot: `arm`'s process-wide `SERIAL` lock means only one test
+    /// can be armed at a time, so no other call can reach an armed
+    /// `entry_snapshot` while this rendezvous is installed -- but `take`
+    /// keeps that true by construction rather than by relying on it.
+    #[cfg(test)]
+    fn maybe_pause_entry_snapshot() {
+        let taken = ENTRY_SNAPSHOT_TEST_PAUSE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((reached_tx, release_rx)) = taken {
+            let _ = reached_tx.send(());
+            let _ = release_rx.recv();
+        }
     }
 
     /// Install a chaining panic hook (once, idempotently) that prints a compact
@@ -951,10 +1046,9 @@ mod controller {
         let generation = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
         let state = Arc::new(ChaosState::from_plan(plan, generation));
         *STATE.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&state));
-        // Publish the generation before flipping ARMED, so any hit that observes
-        // ARMED=true also observes the matching ARMED_GEN.
+        // Publish STATE, then ARMED_GEN — the sole armed/disarmed signal a
+        // reader checks (see `entry_snapshot`).
         ARMED_GEN.store(generation, Ordering::SeqCst);
-        ARMED.store(true, Ordering::SeqCst);
         ChaosGuard {
             _serial: serial,
             state,
@@ -1025,9 +1119,9 @@ mod controller {
         fn drop(&mut self) {
             // Clear armed state first, *then* let `_serial` drop (after this
             // body) so another `arm()` can never observe a half-torn-down
-            // state. Disarm the generation too, so any resolved action still
-            // in flight against this state is fenced by `fire_if_current`.
-            ARMED.store(false, Ordering::SeqCst);
+            // state. Disarm the generation (the sole armed/disarmed signal —
+            // see `entry_snapshot`) so any resolved action still in flight
+            // against this state is fenced by `fire_if_current`.
             ARMED_GEN.store(0, Ordering::SeqCst);
             *STATE.write().unwrap_or_else(PoisonError::into_inner) = None;
             self.state.release_all_holds();
@@ -1036,7 +1130,7 @@ mod controller {
 
     /// A named injection point in the production code path.
     ///
-    /// The disarmed fast path is a single `Relaxed` atomic load and early
+    /// The disarmed fast path is a single `SeqCst` atomic load and early
     /// return — no lock, no `.await` yield. Invoked via the `chaos_point!`
     /// macro; call sites never reference this directly.
     ///
@@ -1159,7 +1253,7 @@ mod controller {
     ///
     /// Consumes a hit and returns `true` only when the armed plan resolves a
     /// [`DropNotify`](Action::DropNotify) at `point`. The disarmed fast path is
-    /// a single `Relaxed` atomic load.
+    /// a single `SeqCst` atomic load.
     #[must_use]
     pub fn should_drop_notify(point: ChaosPoint) -> bool {
         // One consistent (state, generation) snapshot — see `entry_snapshot`.
@@ -1503,10 +1597,13 @@ mod controller {
 
         // ---- Fix 3 (Codex review round 2): the entry snapshot rejects a state
         //      whose generation != the armed generation, so a task that
-        //      straddled a disarm+rearm between the `ARMED` read and the `STATE`
-        //      read cannot adopt a *newer* plan's directive. Unlike Fix 1 (a
-        //      *captured* Arc fenced at fire time), this rejects the torn read at
-        //      the entry point, before `resolve` even bumps the hit counter -----
+        //      straddled a disarm+rearm between the `ARMED_GEN` read and the
+        //      `STATE` read cannot adopt a *newer* plan's directive. Unlike
+        //      Fix 1 (a *captured* Arc fenced at fire time), this rejects the
+        //      torn read at the entry point, before `resolve` even bumps the
+        //      hit counter. (Fix 4, below, later removed a separate `ARMED`
+        //      bool this window used to sit behind; this generation-mismatch
+        //      fence is unchanged and still the mechanism this test exercises.) --
 
         #[tokio::test]
         async fn entry_snapshot_rejects_a_torn_state_from_a_different_generation() {
@@ -1538,6 +1635,173 @@ mod controller {
                 "a state whose generation == ARMED_GEN is consistent and accepted",
             );
             // `_guard` drop restores STATE=None / disarmed for the next test.
+        }
+
+        // ---- Fix 4 (Codex review round 4, issue #1202 / #940 follow-up): the
+        //      entry point used to read `ARMED` (a bare bool) and `ARMED_GEN`
+        //      (the generation) as two SEPARATE atomics. A task preempted
+        //      between those two reads could observe `ARMED == true` under an
+        //      outgoing plan, resume after a *full* disarm + re-arm to a
+        //      different plan, and then read the *incoming* plan's
+        //      `ARMED_GEN`/`STATE` pair -- which is trivially self-consistent
+        //      (both belong to the same, newer generation) -- so the mismatch
+        //      fence (Fix 3, above) never fires and the straggling task
+        //      wrongly adopts the newer plan's directive.
+        //
+        //      `vulnerable_two_read_shape` below is a byte-for-byte copy of
+        //      the *removed* algorithm (what `entry_snapshot` used to be),
+        //      resurrected here only so this test can prove the straddle was
+        //      real: it takes a caller-supplied `observed_armed` bool --
+        //      standing in for the stale `ARMED` read a preempted task would
+        //      have captured before the transition -- then reads whatever
+        //      `ARMED_GEN`/`STATE` are CURRENT. Driving it through a real
+        //      arm -> disarm -> re-arm sequence, with the captured boolean
+        //      held stale across that transition, shows it wrongly returns
+        //      `Some` for the newer generation.
+        //
+        //      The fix deletes the standalone boolean entirely: `ARMED_GEN`
+        //      alone is now both the armed/disarmed sentinel (`0` = disarmed)
+        //      and the generation to fence against (see `entry_snapshot`), so
+        //      there is no separate first read left for a task to straddle --
+        //      the vulnerable shape can no longer be constructed from
+        //      `entry_snapshot`'s actual (single-read) sequence. A task can
+        //      still be preempted *between* the `ARMED_GEN` read and the
+        //      `STATE` read, but that is exactly the pre-existing Fix-3 window
+        //      (a mismatched generation), already covered above.
+        //
+        //      The straddle also has a *false-negative* mirror image, verified
+        //      directly against the real (pre-fix) `entry_snapshot` during
+        //      development of this fix: `arm` publishes `STATE` and
+        //      `ARMED_GEN` *before* flipping `ARMED` true, so a reader
+        //      observing exactly that window -- `ARMED_GEN`/`STATE` already a
+        //      valid, self-consistent pair, `ARMED` still stale-`false` --
+        //      would incorrectly see the harness as disarmed and silently
+        //      skip fault injection the plan believes is live. Poking
+        //      `ARMED.store(false, ..)` on a freshly-armed guard and asserting
+        //      `entry_snapshot().is_some()` failed against the pre-fix code
+        //      and passes once `ARMED` no longer exists to read; that
+        //      transient check is not kept here (it referenced a static this
+        //      fix deletes) but is recorded in this comment for anyone
+        //      re-deriving the fix's justification.
+
+        /// The exact two-read shape `entry_snapshot` used before this fix,
+        /// resurrected here only to prove the straddle it permitted. Not
+        /// reachable from production code; deleting the real `ARMED` static
+        /// (this fix) makes this shape unconstructable there.
+        fn vulnerable_two_read_shape(observed_armed: bool) -> Option<Arc<ChaosState>> {
+            if !observed_armed {
+                return None;
+            }
+            let entry_gen = ARMED_GEN.load(Ordering::SeqCst);
+            let state = current_state()?;
+            if state.generation != entry_gen {
+                return None;
+            }
+            Some(state)
+        }
+
+        #[tokio::test]
+        async fn entry_snapshot_transitions_cleanly_where_the_removed_two_read_shape_straddled() {
+            let guard1 = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
+            let gen1 = ARMED_GEN.load(Ordering::SeqCst);
+            assert_ne!(gen1, 0, "gen1 must be armed here");
+            assert!(
+                entry_snapshot().is_some_and(|s| s.generation == gen1),
+                "a fresh call while gen1 is armed observes gen1",
+            );
+
+            // "Step 1" of the removed shape: a task observes the harness armed
+            // under gen1 and captures that bare boolean, intending to read the
+            // generation and state next.
+            let observed_armed_under_gen1 = true;
+
+            // The task is preempted here: a *full* disarm (guard1 drop)
+            // happens before it resumes. The real entry point, called fresh
+            // in this fully-disarmed window, correctly observes nothing armed.
+            drop(guard1);
+            assert!(
+                entry_snapshot().is_none(),
+                "a fresh call in the disarmed window observes nothing armed",
+            );
+
+            // ...then a re-arm to a *different* plan completes, still before
+            // the preempted task resumes.
+            let guard2 = arm(ChaosPlan::scripted()).await;
+            let gen2 = ARMED_GEN.load(Ordering::SeqCst);
+            assert_ne!(gen2, gen1, "gen2 must be a genuinely different generation");
+            assert!(
+                entry_snapshot().is_some_and(|s| s.generation == gen2),
+                "a fresh call while gen2 is armed observes gen2, not gen1",
+            );
+
+            // Resumed: "step 2" of the removed shape reads whatever is CURRENT
+            // now (gen2's), using the stale boolean captured under gen1. This
+            // is the bug: the removed shape treats a stale "yes, something was
+            // armed" as license to adopt whatever is armed NOW, regardless of
+            // which plan that stale observation actually belonged to.
+            let vulnerable_result = vulnerable_two_read_shape(observed_armed_under_gen1);
+            assert!(
+                vulnerable_result.is_some_and(|s| s.generation == gen2),
+                "documents the bug: the removed two-read shape wrongly adopts \
+                 gen2's state for a task whose entry belonged to gen1",
+            );
+
+            drop(guard2);
+        }
+
+        // ---- Codex review round 3 (issue #1202): the test above only proves
+        //      the REMOVED two-read shape was buggy by calling a
+        //      hand-reconstructed clone (`vulnerable_two_read_shape`) -- it
+        //      never exercises the REAL `entry_snapshot` under an actual
+        //      straddle, so it would not catch a regression that
+        //      reintroduces an equivalent stale-decision defect (a separate
+        //      flag or otherwise) into the real function. This test closes
+        //      that gap: it pauses the REAL `entry_snapshot` (via the
+        //      `#[cfg(test)]`-only rendezvous installed next to it) on a
+        //      genuine OS thread, between its own two reads, and drives a
+        //      real concurrent disarm+rearm across the pause. ----
+
+        #[tokio::test]
+        async fn entry_snapshot_rejects_a_straddled_read_of_the_real_production_path() {
+            // `entry_snapshot` itself is synchronous; it is run here on a
+            // real `std::thread` (not a tokio task) because the pause hook
+            // below blocks with `std::sync::mpsc`, not a tokio channel. The
+            // blocking `reached_rx.recv()` a few lines down runs on this
+            // test's own (current-thread) tokio executor, which is fine: the
+            // only thing it is waiting on is the separately-spawned
+            // `std::thread`, not any other tokio task on this runtime.
+            let guard1 = arm(ChaosPlan::scripted().kill_at(WORKER_PERSIST_BEFORE_COMMIT)).await;
+            let gen1 = ARMED_GEN.load(Ordering::SeqCst);
+            assert_ne!(gen1, 0, "gen1 must be armed here");
+
+            let (reached_rx, release_tx) = install_entry_snapshot_test_pause();
+            let handle = std::thread::spawn(entry_snapshot);
+            reached_rx
+                .recv()
+                .expect("the real entry_snapshot must reach the rendezvous while armed");
+
+            // While the spawned call is parked between its own two reads
+            // (having already captured entry_gen == gen1), perform a REAL
+            // disarm + rearm to a different plan -- genuine concurrency, not
+            // a simulated STATE poke like the Fix-3 test above.
+            drop(guard1);
+            let guard2 = arm(ChaosPlan::scripted()).await;
+            let gen2 = ARMED_GEN.load(Ordering::SeqCst);
+            assert_ne!(gen1, gen2, "gen2 must be a genuinely different generation");
+
+            release_tx
+                .send(())
+                .expect("the paused call must still be waiting on release");
+            let result = handle.join().expect("entry_snapshot thread must not panic");
+
+            assert!(
+                result.is_none(),
+                "the real entry_snapshot must reject a read straddled across a \
+                 genuine concurrent disarm+rearm -- it must not silently adopt \
+                 gen2's state for an entry that began while gen1 was armed",
+            );
+
+            drop(guard2);
         }
 
         #[test]

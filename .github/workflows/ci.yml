@@ -175,6 +175,37 @@ jobs:
       - name: Run docs/rnd/sqlite-feasibility.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration sqlite_feasibility_docs::"
 
+      # Issue #1202: same reasoning as the two steps above, for
+      # docs/testing/chaos.md's worked local-iteration example. It lives
+      # under `docs/`, so a PR that edits only that page — e.g. dropping the
+      # `chaos_tests::` scope from the `HARVEST_TEST_DATABASE_URL` example,
+      # which risks a chaos test's global TRUNCATE scrub racing a concurrent,
+      # unrelated integration-test module against the same shared database —
+      # sets `code=false` and skips the entire `test` matrix. That is
+      # precisely the change class these guards exist to catch.
+      #
+      # Guarded by `chaos_docs::chaos_docs_guards_run_on_docs_only_changes`,
+      # which fails if this step is removed or becomes conditional. Quoted
+      # for the same trailing-`::` YAML reason as above.
+      - name: Run docs/testing/chaos.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration chaos_docs::"
+
+      # Issue #947: same reasoning as the two steps above, for the Temporal
+      # migration guide's anti-drift guards. A PR that edits only
+      # `docs/migrating-from-temporal.md` -- fixing a stale link, updating a
+      # citation, editing the worked-example prose -- matches the docs-only
+      # filter and skips the entire `test` matrix below, where every step is
+      # gated on `changes.outputs.code`. That is precisely the change class
+      # these guards exist to catch, so they run here in the ungated `lint`
+      # job instead.
+      #
+      # Guarded by
+      # `migrating_from_temporal_docs::guards_run_on_docs_only_changes`, which
+      # fails if this step is removed or becomes conditional. Quoted for the
+      # same trailing-`::` YAML reason as above.
+      - name: Run docs/migrating-from-temporal.md guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration migrating_from_temporal_docs::"
+
   test:
     name: Test (${{ matrix.os }})
     needs: [lint, changes]
@@ -296,6 +327,11 @@ jobs:
       - name: Run long_lived_entity_deadline example tests (issue #772)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example long_lived_entity_deadline
+      # Quoted: an unquoted `#` after whitespace starts a YAML comment, which
+      # would silently truncate the step name at "(issue".
+      - name: "Run temporal_port_subscription_renewal example tests (issue #947)"
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example temporal_port_subscription_renewal
       - name: Run dag_data_flow example tests (issue #702)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing,unified-dag-execution --example dag_data_flow

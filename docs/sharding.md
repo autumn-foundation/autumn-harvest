@@ -382,6 +382,16 @@ Per-key **activity** rate-limit buckets (`dyn-rate:{key_expr}:{resolved}` in `ha
 
 ---
 
+## TTL'd pacing overrides apply per shard, fanned out to all of them (issue #945)
+
+A runtime pacing override (`POST`/`DELETE /admin/rate-limits/{activity_name}/override` and `POST`/`DELETE /admin/start-throttle/{workflow_name}/override`) layers a temporary, self-expiring quota change on top of an **existing, statically-declared** rate limit or throttle. Because that underlying bucket is itself shard-local — each shard database holds its own independent `harvest_rate_limit_buckets` row for the same bucket key — a single override call **fans out and writes the same override to every shard**, mirroring the pre-existing `set_rate_limit`/`declare_compat` fan-out pattern (issue #332). This is what makes "one CLI call, effective everywhere in under a minute" true for a multi-shard deployment: the operator does not need to know which shards a given activity/workflow's traffic lands on.
+
+**Consequence**: a partial fan-out failure (one shard's database unreachable while the others succeed) can leave the override live on some shards and absent on others until retried — the response reports per-shard failures (`shard_errors`) and the audit record for that call is marked failed when any shard did not receive the write, so this state is never silent. If every shard fails, the call returns `503` with no override applied anywhere. Because expiry is enforced by each shard reading its own row's `override_expires_at > NOW()` independently, there is no cross-shard coordination of *when* an override reverts — every shard's copy reverts on its own clock at the same wall-clock instant, with no drift beyond ordinary clock skew between shard hosts.
+
+**Dynamically per-key-keyed policies are out of scope.** A pacing override targets a *single* declared bucket key. A rate limit declared with a dynamic per-key key expression (`#[activity(rate_limit(key = "input.tenant_id", ...))]`, issue #699 above) or a throttle declared with a `key_expr` fans out into many independent per-tenant buckets at runtime — there is no single bucket for an override to target, so `POST .../override` against such a policy is rejected `409 Conflict` rather than silently doing nothing or overriding an arbitrarily-chosen tenant's bucket.
+
+---
+
 ## Durable mutex is shard-local (issue #691)
 
 The durable named mutex `ctx.mutex(key).acquire()` (the `harvest_mutex_locks` / `harvest_mutex_waiters` tables) is enforced **within a shard**, exactly the same scope as the per-key concurrency limits above. The lock table, the FIFO waiter queue, and the `pg_advisory_xact_lock` that serializes each acquire/release/reclaim all live on the workflow's own shard, so "at most one holder per key" holds only among executions that resolve to that shard.

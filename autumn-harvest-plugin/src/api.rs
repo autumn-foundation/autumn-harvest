@@ -41,16 +41,18 @@ use autumn_harvest::audit::{
     OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
     OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_QUEUE_PAUSE,
-    OP_QUEUE_RESUME, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
-    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
-    OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN,
-    OP_WORKFLOW_ANNOTATE, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE,
-    OP_WORKFLOW_RERUN, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL,
-    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
-    OP_WORKFLOW_UPDATE_WITH_START, RouteClass, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT,
-    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE,
-    TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_QUEUE_RESUME, OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR, OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+    OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
+    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE,
+    OP_START_THROTTLE_PACING_OVERRIDE_CLEAR, OP_START_THROTTLE_PACING_OVERRIDE_SET,
+    OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN, OP_WORKFLOW_ANNOTATE,
+    OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RERUN,
+    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
+    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, RouteClass,
+    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH,
+    TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RATE_LIMIT, TARGET_RETENTION,
+    TARGET_SCHEDULE, TARGET_TASK, TARGET_THROTTLE, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
     deny_readonly_mutation,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
@@ -5018,6 +5020,35 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/admin/rate-limits/{key}",
             post(set_rate_limit).route_layer(require_admin.clone()),
         )
+        // TTL'd runtime pacing overrides (issue #945): distinct from the
+        // permanent `/admin/rate-limits/{key}` route above — these overlay a
+        // *declared* per-activity rate limit / workflow-start throttle with a
+        // temporary quota change that self-expires, so a downstream-outage
+        // mitigation can never be forgotten.
+        .route(
+            "/admin/rate-limits/{activity_name}/override",
+            post(set_rate_limit_pacing_override).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/rate-limits/{activity_name}/override",
+            delete(clear_rate_limit_pacing_override).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/start-throttle/{workflow_name}/override",
+            post(set_start_throttle_pacing_override).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/start-throttle/{workflow_name}/override",
+            delete(clear_start_throttle_pacing_override).route_layer(require_admin.clone()),
+        )
+        // Read-only companion to the SET/DELETE routes above: surfaces an
+        // active override even when the workflow has no current deferred-
+        // start backlog, closing a visibility gap the backlog-driven
+        // `/admin/start-throttle` listing has by construction (issue #945).
+        .route(
+            "/admin/start-throttle/{workflow_name}/override",
+            get(get_start_throttle_pacing_override).route_layer(require_admin.clone()),
+        )
         .route(
             "/admin/circuits",
             get(list_circuits).route_layer(require_admin.clone()),
@@ -6138,6 +6169,12 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/quotas"),
         ("GET", "/admin/rate-limits"),
         ("POST", "/admin/rate-limits/{key}"),
+        // ── TTL'd runtime pacing overrides (issue #945) ───────────────────
+        ("POST", "/admin/rate-limits/{activity_name}/override"),
+        ("DELETE", "/admin/rate-limits/{activity_name}/override"),
+        ("POST", "/admin/start-throttle/{workflow_name}/override"),
+        ("DELETE", "/admin/start-throttle/{workflow_name}/override"),
+        ("GET", "/admin/start-throttle/{workflow_name}/override"),
         ("GET", "/admin/circuits"),
         ("GET", "/admin/circuits/{activity_name}"),
         ("POST", "/admin/circuits/{activity_name}/force-open"),
@@ -6496,6 +6533,27 @@ pub const fn management_api_request_fields()
             "POST",
             "/admin/rate-limits/{key}",
             Some(&["refill_rate", "burst"]),
+        ),
+        // ── TTL'd runtime pacing overrides (issue #945) ───────────────────────
+        (
+            "POST",
+            "/admin/rate-limits/{activity_name}/override",
+            Some(&["refill_rate", "burst", "ttl_secs"]),
+        ),
+        (
+            "DELETE",
+            "/admin/rate-limits/{activity_name}/override",
+            Some(&[]),
+        ),
+        (
+            "POST",
+            "/admin/start-throttle/{workflow_name}/override",
+            Some(&["refill_per_sec", "burst", "ttl_secs"]),
+        ),
+        (
+            "DELETE",
+            "/admin/start-throttle/{workflow_name}/override",
+            Some(&[]),
         ),
         (
             "POST",
@@ -7513,14 +7571,98 @@ pub const fn management_api_response_fields()
         ),
         ("GET", "/batches/pending", None),
         ("GET", "/admin/debounce", None), // Vec<PendingDebounceRecord> (external model)
-        ("GET", "/admin/start-throttle", None), // Vec<ThrottleBacklogEntry> (external model)
+        ("GET", "/admin/start-throttle", None), // Vec<ThrottleBacklogEntry> (declared baseline + effective/override state, issue #945)
         (
             "GET",
             "/admin/quotas",
             Some(&["quotas", "status", "unavailable_shards"]),
         ),
-        ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucket> (external model)
+        ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucketView> (declared baseline + effective/override state, issue #945)
         ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
+        // ── TTL'd runtime pacing overrides (issue #945) ───────────────────────
+        // Every route below returns the identical PacingOverrideResponse shape
+        // on the happy 200 path; a partial-shard SET/CLEAR write instead
+        // returns 207 with {"override": ..., "shard_errors": [...]}. The
+        // read-only GET companion for the start-throttle override never
+        // writes, so it never returns 207.
+        (
+            "POST",
+            "/admin/rate-limits/{activity_name}/override",
+            Some(&[
+                "key",
+                "declared_refill_rate",
+                "declared_burst",
+                "override_refill_rate",
+                "override_burst",
+                "override_active",
+                "effective_refill_rate",
+                "effective_burst",
+                "expires_at",
+            ]),
+        ),
+        (
+            "DELETE",
+            "/admin/rate-limits/{activity_name}/override",
+            Some(&[
+                "key",
+                "declared_refill_rate",
+                "declared_burst",
+                "override_refill_rate",
+                "override_burst",
+                "override_active",
+                "effective_refill_rate",
+                "effective_burst",
+                "expires_at",
+            ]),
+        ),
+        (
+            "POST",
+            "/admin/start-throttle/{workflow_name}/override",
+            Some(&[
+                "key",
+                "declared_refill_rate",
+                "declared_burst",
+                "override_refill_rate",
+                "override_burst",
+                "override_active",
+                "effective_refill_rate",
+                "effective_burst",
+                "expires_at",
+            ]),
+        ),
+        (
+            "DELETE",
+            "/admin/start-throttle/{workflow_name}/override",
+            Some(&[
+                "key",
+                "declared_refill_rate",
+                "declared_burst",
+                "override_refill_rate",
+                "override_burst",
+                "override_active",
+                "effective_refill_rate",
+                "effective_burst",
+                "expires_at",
+            ]),
+        ),
+        // Read-only companion to the SET/DELETE routes above (issue #945):
+        // surfaces an active override even when the workflow has no current
+        // deferred-start backlog. Same PacingOverrideResponse shape.
+        (
+            "GET",
+            "/admin/start-throttle/{workflow_name}/override",
+            Some(&[
+                "key",
+                "declared_refill_rate",
+                "declared_burst",
+                "override_refill_rate",
+                "override_burst",
+                "override_active",
+                "effective_refill_rate",
+                "effective_burst",
+                "expires_at",
+            ]),
+        ),
         ("GET", "/admin/circuits", None), // Vec<CircuitSnapshot> (external model)
         (
             "GET",
@@ -13919,13 +14061,20 @@ async fn rate_limit_gate_status(
         return Ok(RateLimitGateStatus::default());
     }
     // Mirrors the gate's own refill expression exactly, so the two can never
-    // disagree about whether a present bucket admits a claim.
-    let rows: Vec<KeyRow> = diesel::sql_query(
-        "SELECT key, \
-                (LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) >= 1.0) AS admissible \
+    // disagree about whether a present bucket admits a claim. Reuses
+    // `queue::effective_available_tokens_expr` (issue #945) rather than a
+    // hand-copied literal, so a live TTL'd operator override is honored here
+    // too -- otherwise this diagnostic would keep reporting a key as
+    // rate-limited (or admissible) after an operator raised (or lowered) its
+    // limit via the pacing-override endpoints, exactly the class of
+    // diagnostic-vs-gate divergence this function's own doc comment exists to
+    // rule out.
+    let effective_tokens = queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
+    let rows: Vec<KeyRow> = diesel::sql_query(format!(
+        "SELECT key, ({effective_tokens} >= 1.0) AS admissible \
          FROM harvest_rate_limit_buckets \
-         WHERE key = ANY($1)",
-    )
+         WHERE key = ANY($1)"
+    ))
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(keys)
     .load(conn)
     .await
@@ -14460,11 +14609,16 @@ async fn get_workflow_stack(
             #[diesel(sql_type = diesel::sql_types::Text)]
             key: String,
         }
-        let rows: Vec<KeyRow> = diesel::sql_query(
+        // Honors a live TTL'd rate-limit override (issue #945) via
+        // `queue::effective_available_tokens_expr` -- otherwise a task the
+        // operator just unblocked by raising its limit would keep showing as
+        // `activity_rate_limited` here.
+        let effective_tokens = queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
+        let rows: Vec<KeyRow> = diesel::sql_query(format!(
             "SELECT key FROM harvest_rate_limit_buckets \
              WHERE key = ANY($1) \
-               AND LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) < 1.0"
-        )
+               AND {effective_tokens} < 1.0"
+        ))
         .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&rate_limit_keys)
         .load(&mut conn)
         .await
@@ -32254,6 +32408,668 @@ async fn start_throttle_status(
     Ok(Json(all))
 }
 
+/// `GET /admin/start-throttle/{workflow_name}/override` — read a workflow's
+/// TTL'd pacing-override state directly, independent of any current
+/// deferred-start backlog (issue #945).
+///
+/// `GET /admin/start-throttle` above is driven by `harvest_start_throttle`
+/// backlog rows and therefore only surfaces a workflow's override state
+/// *while it currently has pending backlog* -- an operator who sets a
+/// preemptive override before any pressure exists, or checks back once the
+/// backlog has already drained (the common case: the override is still
+/// running for the rest of its TTL, but nothing is deferred any more), would
+/// otherwise see no trace of a still-live override on ANY read surface. This
+/// route answers the narrower, always-reliable question directly: it
+/// resolves the exact same bucket key the SET/DELETE override routes use
+/// (`throttle::bucket_key(workflow_name, "")`) and reads
+/// `harvest_rate_limit_buckets` straight, with zero dependency on backlog
+/// state.
+///
+/// Aggregates across shards using the same "worst-case" (fewest remaining
+/// tokens) merge [`list_rate_limits`] uses -- buckets are shard-local (issue
+/// #607/#247, see `docs/sharding.md`), so a partial multi-shard write
+/// (surfaced as `207` by the SET/DELETE routes on a partial failure) can in
+/// principle leave shards disagreeing about the override; this route reports
+/// one representative view rather than one row per shard.
+///
+/// **A total shard outage returns `503`, and a partial outage returns `207`
+/// naming the unreachable shard(s) in `shard_errors`** -- an incident-
+/// response status read that silently degraded a real live override (or one
+/// living only on the unreachable shard) into a bare `200
+/// {"override_active": false}` would be worse than an explicit failure
+/// (issue #945 review, P2).
+///
+/// `declared_*` reflects the *persisted* bucket-row baseline
+/// (`refill_rate`/`burst`) when a row is found on any reachable shard -- the
+/// same value dispatch actually enforces, since the separate, permanent
+/// `POST /admin/rate-limits/{key}` route can change it independently of the
+/// registry (see [`PacingOverrideResponse`]) -- and falls back to the live
+/// registry declaration only when no bucket row exists yet on any reachable
+/// shard, matching a fresh bucket's seeded value.
+///
+/// `404`/`409` mirror [`set_start_throttle_pacing_override`]'s registry
+/// validation. A registered, statically-throttled workflow whose bucket row
+/// does not exist yet (never touched by an admission attempt or an
+/// override) reports the declared baseline with `override_active: false`
+/// rather than `404` -- "no override configured" is a valid, common answer,
+/// not an error.
+#[allow(clippy::too_many_lines)]
+async fn get_start_throttle_pacing_override(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(workflow_name): Path<String>,
+) -> impl axum::response::IntoResponse {
+    use autumn_harvest::schema::harvest_rate_limit_buckets::dsl::{
+        harvest_rate_limit_buckets, key as bucket_key_col,
+    };
+
+    let runtime = match api_state.runtime().map_err(map_error) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
+        return AutumnError::not_found_msg(format!("workflow '{workflow_name}' is not registered"))
+            .into_response();
+    };
+    let Some(policy) = workflow.throttle else {
+        return AutumnError::not_found_msg(format!(
+            "workflow '{workflow_name}' has no declared start throttle; nothing to read"
+        ))
+        .into_response();
+    };
+    if let Some(expr) = policy.key_expr {
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' uses a dynamic per-key start throttle \
+             (key expression '{expr}'); a pacing override targets a single \
+             static bucket and cannot be applied to a dynamically-keyed policy"
+        ))
+        .with_status(axum::http::StatusCode::CONFLICT)
+        .into_response();
+    }
+    let declared_refill_rate = policy.refill_per_sec;
+    let declared_burst = policy.burst;
+    let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+
+    // Issue #945 review (round 4, P2): the previous merge picked a single
+    // "representative" row across shards by raw `tokens` count alone --
+    // e.g. `existing.tokens <= b.tokens => existing`. That is the right
+    // heuristic for `list_rate_limits`'s worst-case-capacity diagnostic, but
+    // WRONG for reporting whether an OPERATOR OVERRIDE is active: after a
+    // documented partial SET/DELETE, shards can genuinely disagree about
+    // override state (one shard still under a live override, another
+    // cleared or never written), and picking by token count can silently
+    // surface the WRONG shard's `override_active` in either direction --
+    // reporting "no override" while one is still live elsewhere, or the
+    // reverse. Collect every reachable shard's row instead, and derive
+    // `override_active` from an explicit per-shard tally rather than a
+    // proxy metric that has nothing to do with override state.
+    let mut snapshots: Vec<(i32, Option<RateLimitBucket>)> = Vec::new();
+    let mut any_reachable = false;
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match harvest_rate_limit_buckets
+            .filter(bucket_key_col.eq(&key))
+            .select(RateLimitBucket::as_select())
+            .first::<RateLimitBucket>(&mut conn)
+            .await
+            .optional()
+        {
+            Ok(found) => {
+                any_reachable = true;
+                snapshots.push((shard_id.as_i32(), found));
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
+    }
+
+    // A total shard outage must not be misreported as "no override
+    // configured" (issue #945 review, P2) -- this is an incident-response
+    // status read, and a silent false negative here is worse than an
+    // explicit failure.
+    if !shard_errors.is_empty() && !any_reachable {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+
+    let now = chrono::Utc::now();
+    let is_active = |row: &Option<RateLimitBucket>| {
+        row.as_ref()
+            .is_some_and(|b| b.override_expires_at > Some(now))
+    };
+
+    // Disagreement is deliberately NOT "do the raw `override_expires_at`
+    // timestamps match exactly" -- a normal, fully successful multi-shard
+    // SET writes each shard's TTL from that shard's own `NOW()`, so
+    // millisecond clock skew alone would make virtually every healthy
+    // multi-shard override report a false "disagreement". Instead defer to
+    // `queue::pacing_shards_disagree`, comparing each shard's *resolved
+    // effective* `(refill_rate, burst)` rather than the raw
+    // `override_refill_rate`/`override_burst` columns (issue #945 review,
+    // round 5): a partial legacy `POST /admin/rate-limits/{key}` fan-out
+    // (issue #332) can leave shards with divergent persisted BASELINES, so
+    // two shards can carry byte-identical override columns yet enforce
+    // genuinely different pacing once an omitted override field falls back
+    // to each shard's own (diverged) baseline -- comparing raw columns
+    // alone would miss exactly that case.
+    let active_rows: Vec<&RateLimitBucket> = snapshots
+        .iter()
+        .filter(|(_, row)| is_active(row))
+        .filter_map(|(_, row)| row.as_ref())
+        .collect();
+    let effective_per_shard: Vec<queue::EffectiveRateLimit> = snapshots
+        .iter()
+        .map(|(_, row)| {
+            row.as_ref().map_or_else(
+                // No row on this reachable shard yet: report the declared
+                // baseline with no override active -- consistent with
+                // `build_response`'s own None-row fallback below.
+                || {
+                    queue::resolve_effective_rate_limit(
+                        declared_refill_rate,
+                        declared_burst,
+                        None,
+                        None,
+                        None,
+                        now,
+                    )
+                },
+                |b| {
+                    queue::resolve_effective_rate_limit(
+                        b.refill_rate,
+                        b.burst,
+                        b.override_refill_rate,
+                        b.override_burst,
+                        b.override_expires_at,
+                        now,
+                    )
+                },
+            )
+        })
+        .collect();
+    let disagreement = queue::pacing_shards_disagree(&effective_per_shard);
+
+    // Representative row for the top-level (flattened, 200/207-body)
+    // response: prefer an ACTIVE row whenever any shard has one -- an
+    // incident-response "is my override active?" check should never
+    // silently answer "no" while a live override still governs dispatch on
+    // ANY shard -- else fall back to whatever row was found (all inactive),
+    // else `None` (no row anywhere -- report the registry-declared
+    // baseline, matching a fresh bucket's seeded value).
+    //
+    // `.iter().next()` rather than `.first()`, with an explicit
+    // `#[allow(clippy::iter_next_slice)]`: diesel's `RunQueryDsl` is
+    // blanket-implemented for every type (including `Vec<&RateLimitBucket>`
+    // itself, before any deref-to-slice occurs), so a bare `.first()` call
+    // here is resolved to `RunQueryDsl::first` -- a DB query method -- not
+    // the slice method, and fails to compile against a plain in-memory Vec
+    // (confirmed: applying clippy's own suggested `.first()` fix reintroduces
+    // that exact compile error).
+    #[allow(clippy::iter_next_slice)]
+    let representative: Option<&RateLimitBucket> = active_rows
+        .iter()
+        .next()
+        .copied()
+        .or_else(|| snapshots.iter().find_map(|(_, row)| row.as_ref()));
+
+    let build_response = |b: Option<&RateLimitBucket>| {
+        b.map_or_else(
+            || {
+                // No row on any *reachable* shard: nothing has been
+                // persisted yet, so the registry's declared value is exactly
+                // what a fresh bucket would be seeded at.
+                PacingOverrideResponse::build(
+                    key.clone(),
+                    declared_refill_rate,
+                    declared_burst,
+                    None,
+                    None,
+                    None,
+                )
+            },
+            |b| {
+                // A row was found: report the *persisted* baseline, not the
+                // registry's -- the separate, permanent `POST
+                // /admin/rate-limits/{key}` route can have changed
+                // `refill_rate`/`burst` independently, and dispatch reads
+                // the row, not the registry (issue #945 review, P2).
+                PacingOverrideResponse::build(
+                    key.clone(),
+                    b.refill_rate,
+                    b.burst,
+                    b.override_refill_rate,
+                    b.override_burst,
+                    b.override_expires_at,
+                )
+            },
+        )
+    };
+
+    let response = build_response(representative);
+
+    if shard_errors.is_empty() && !disagreement {
+        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
+    } else {
+        // Surface the full per-shard breakdown whenever the flattened
+        // top-level view can't be fully trusted -- either an unreachable
+        // shard (pre-existing) or a genuine cross-shard override
+        // disagreement (issue #945 review, P2). `shard_disagreement`
+        // distinguishes the two causes; `shards` lets an operator see
+        // exactly which shard(s) diverge rather than trusting a single
+        // silently-picked value.
+        let shards_json: serde_json::Map<String, serde_json::Value> = snapshots
+            .iter()
+            .map(|(shard_id, row)| {
+                let per_shard = build_response(row.as_ref());
+                (
+                    shard_id.to_string(),
+                    serde_json::to_value(per_shard).unwrap_or(serde_json::Value::Null),
+                )
+            })
+            .collect();
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "override": response,
+                "shard_errors": shard_errors,
+                "shard_disagreement": disagreement,
+                "shards": shards_json,
+            })),
+        )
+            .into_response()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StartThrottlePacingOverrideRequest {
+    refill_per_sec: Option<f64>,
+    burst: Option<f64>,
+    ttl_secs: u64,
+}
+
+/// `POST /admin/start-throttle/{workflow_name}/override` — set (or replace) a
+/// TTL'd runtime pacing override on top of a *declared* workflow-start
+/// throttle (issue #945).
+///
+/// Mirrors `set_rate_limit_pacing_override` exactly (same replace-not-merge
+/// semantics, same TTL validation via [`pacing_override_expiry`], same
+/// shared upsert SQL against `harvest_rate_limit_buckets`), but resolves the
+/// declared baseline from `WorkflowInfo.throttle`
+/// (`#[workflow(throttle(...))]`, issue #607) and the shared bucket key via
+/// [`autumn_harvest::throttle::bucket_key`] rather than the activity-side
+/// `rate_limit_key` convention. An unkeyed/global throttle resolves its
+/// bucket key with an empty resolved-key component
+/// (`throttle::bucket_key(workflow_name, "")`), matching the resolution the
+/// throttle admission path itself uses for a policy with no `key_expr`.
+///
+/// `404` when `workflow_name` is not registered, or is registered but
+/// declares no throttle. `409` when the throttle is dynamically per-key
+/// (`throttle(key = ...)`, issue #607) — a pacing override targets one
+/// static bucket and cannot disambiguate which resolved tenant key's bucket
+/// to override. `400` on a non-finite/non-positive `refill_per_sec`/`burst`,
+/// an omitted `refill_per_sec`/`burst` pair, or a `ttl_secs` of zero or
+/// above the server cap.
+#[allow(clippy::too_many_lines)]
+async fn set_start_throttle_pacing_override(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(workflow_name): Path<String>,
+    Json(request): Json<StartThrottlePacingOverrideRequest>,
+) -> impl axum::response::IntoResponse {
+    if let Some(rate) = request.refill_per_sec
+        && (!rate.is_finite() || rate <= 0.0)
+    {
+        return AutumnError::bad_request_msg(
+            "refill_per_sec must be a finite number greater than zero",
+        )
+        .into_response();
+    }
+    if let Some(burst) = request.burst
+        && (!burst.is_finite() || burst < 1.0)
+    {
+        return AutumnError::bad_request_msg("burst must be a finite number, at least 1.0")
+            .into_response();
+    }
+    if request.refill_per_sec.is_none() && request.burst.is_none() {
+        return AutumnError::bad_request_msg(
+            "must override at least one of refill_per_sec or burst",
+        )
+        .into_response();
+    }
+    let expires_at = match pacing_override_expiry(request.ttl_secs) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+
+    let runtime = match api_state.runtime().map_err(map_error) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
+        return AutumnError::not_found_msg(format!("workflow '{workflow_name}' is not registered"))
+            .into_response();
+    };
+    let Some(policy) = workflow.throttle else {
+        return AutumnError::not_found_msg(format!(
+            "workflow '{workflow_name}' has no declared start throttle; nothing to override"
+        ))
+        .into_response();
+    };
+    if let Some(expr) = policy.key_expr {
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' uses a dynamic per-key start throttle \
+             (key expression '{expr}'); a pacing override targets a single \
+             static bucket and cannot be applied to a dynamically-keyed policy"
+        ))
+        .with_status(axum::http::StatusCode::CONFLICT)
+        .into_response();
+    }
+    let declared_refill_rate = policy.refill_per_sec;
+    let declared_burst = policy.burst;
+    let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/start-throttle/{workflow_name}/override";
+
+    let mut any_success = false;
+    let mut shard_errors: Vec<String> = Vec::new();
+    let mut persisted_baseline: Option<(f64, f64)> = None;
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match diesel::sql_query(pacing_override_upsert_sql())
+            .bind::<diesel::sql_types::Text, _>(&key)
+            .bind::<diesel::sql_types::Double, _>(declared_refill_rate)
+            .bind::<diesel::sql_types::Double, _>(declared_burst)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(
+                request.refill_per_sec,
+            )
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(request.burst)
+            .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+            .get_results::<PersistedBaseline>(&mut conn)
+            .await
+        {
+            Ok(rows) => {
+                any_success = true;
+                if persisted_baseline.is_none()
+                    && let Some(row) = rows.into_iter().next()
+                {
+                    persisted_baseline = Some((row.refill_rate, row.burst));
+                }
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
+    }
+
+    // Attempt the audit write *before* deciding the response -- including on
+    // total shard failure (issue #945 review, P2). A fully-failed
+    // administrative override attempt must still leave an audit trail; the
+    // early `503` below is deferred until after this write is attempted so it
+    // can never bypass it.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_START_THROTTLE_PACING_OVERRIDE_SET,
+        target_type: TARGET_THROTTLE,
+        target_id: Some(key.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match acquire_conn(pool.default_pool()).await {
+        Ok(mut conn) => {
+            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                tracing::error!(
+                    error = %audit_err,
+                    "audit insert failed for start_throttle.pacing_override.set"
+                );
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "audit DB connection unavailable for start_throttle.pacing_override.set"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    if !shard_errors.is_empty() && !any_success {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+
+    // Report the persisted baseline the write just confirmed (issue #945
+    // review, P2), falling back to the registry only in the pathological
+    // case where every reachable shard's write raced past the
+    // `!any_success` guard above without ever returning a row.
+    let (baseline_refill_rate, baseline_burst) =
+        persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
+    let response = PacingOverrideResponse::build(
+        key,
+        baseline_refill_rate,
+        baseline_burst,
+        request.refill_per_sec,
+        request.burst,
+        Some(expires_at),
+    );
+
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "override": response,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// `DELETE /admin/start-throttle/{workflow_name}/override` — clear a TTL'd
+/// runtime pacing override before its TTL elapses (issue #945).
+///
+/// Idempotent: clearing a workflow with no active override still returns
+/// `200` reporting the declared baseline (`override_active: false`). `404`/
+/// `409` mirror [`set_start_throttle_pacing_override`]'s registry-lookup
+/// validation.
+#[allow(clippy::too_many_lines)]
+async fn clear_start_throttle_pacing_override(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(workflow_name): Path<String>,
+) -> impl axum::response::IntoResponse {
+    let runtime = match api_state.runtime().map_err(map_error) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let Some(workflow) = runtime.registry().workflows.get(&workflow_name) else {
+        return AutumnError::not_found_msg(format!("workflow '{workflow_name}' is not registered"))
+            .into_response();
+    };
+    let Some(policy) = workflow.throttle else {
+        return AutumnError::not_found_msg(format!(
+            "workflow '{workflow_name}' has no declared start throttle; nothing to override"
+        ))
+        .into_response();
+    };
+    if let Some(expr) = policy.key_expr {
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' uses a dynamic per-key start throttle \
+             (key expression '{expr}'); a pacing override targets a single \
+             static bucket and cannot be applied to a dynamically-keyed policy"
+        ))
+        .with_status(axum::http::StatusCode::CONFLICT)
+        .into_response();
+    }
+    let declared_refill_rate = policy.refill_per_sec;
+    let declared_burst = policy.burst;
+    let key = autumn_harvest::throttle::bucket_key(&workflow_name, "");
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "DELETE /admin/start-throttle/{workflow_name}/override";
+
+    let mut any_success = false;
+    let mut shard_errors: Vec<String> = Vec::new();
+    let mut persisted_baseline: Option<(f64, f64)> = None;
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match diesel::sql_query(pacing_override_clear_sql())
+            .bind::<diesel::sql_types::Text, _>(&key)
+            .get_results::<PersistedBaseline>(&mut conn)
+            .await
+        {
+            Ok(rows) => {
+                any_success = true;
+                if persisted_baseline.is_none()
+                    && let Some(row) = rows.into_iter().next()
+                {
+                    persisted_baseline = Some((row.refill_rate, row.burst));
+                }
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
+    }
+
+    // Attempt the audit write *before* deciding the response -- including on
+    // total shard failure (issue #945 review, P2). A fully-failed
+    // administrative override attempt must still leave an audit trail; the
+    // early `503` below is deferred until after this write is attempted so it
+    // can never bypass it.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+        target_type: TARGET_THROTTLE,
+        target_id: Some(key.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match acquire_conn(pool.default_pool()).await {
+        Ok(mut conn) => {
+            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                tracing::error!(
+                    error = %audit_err,
+                    "audit insert failed for start_throttle.pacing_override.clear"
+                );
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "audit DB connection unavailable for start_throttle.pacing_override.clear"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    if !shard_errors.is_empty() && !any_success {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+
+    // Report the persisted (now-reverted) baseline the clear just confirmed
+    // (issue #945 review, P2). `persisted_baseline` is `None` only when the
+    // bucket never existed on any reachable shard -- the documented
+    // idempotent-clear-of-an-unset-bucket case -- in which case the registry
+    // declaration is exactly correct, since a bucket that has never been
+    // written can only ever agree with it.
+    let (baseline_refill_rate, baseline_burst) =
+        persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
+    let response =
+        PacingOverrideResponse::build(key, baseline_refill_rate, baseline_burst, None, None, None);
+
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "override": response,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
+}
+
 async fn pending_event_batches(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Vec<autumn_harvest::event_batch::PendingEventBatchRecord>>, AutumnError> {
@@ -32283,16 +33099,19 @@ async fn pending_event_batches(
 
 async fn list_rate_limits(
     Extension(api_state): Extension<HarvestApiState>,
-) -> Result<Json<Vec<RateLimitBucket>>, AutumnError> {
+) -> Result<Json<Vec<RateLimitBucketView>>, AutumnError> {
     use autumn_harvest::schema::harvest_rate_limit_buckets::dsl::harvest_rate_limit_buckets;
 
     let pool = api_state.storage_pool().map_err(map_error)?;
 
     // Aggregate across all shards so operators see every configured key.
-    // Rate-limit config is written to all shards by `set_rate_limit`; per-shard
-    // token counters diverge at runtime.  Deduplicate by key, keeping the entry
-    // with the fewest remaining tokens (worst-case view across the fleet).
-    let mut merged: std::collections::BTreeMap<String, RateLimitBucket> =
+    // Rate-limit config is written to all shards by `set_rate_limit`; a TTL'd
+    // pacing override (issue #945) can also diverge across shards after a
+    // partial write or an outage recovery. Collect EVERY shard's row per key
+    // -- not just a single "representative" pick -- so cross-shard override
+    // disagreement can be detected rather than silently hidden behind
+    // whichever shard's row happened to be kept (issue #945 review, round 5).
+    let mut per_key: std::collections::BTreeMap<String, Vec<RateLimitBucket>> =
         std::collections::BTreeMap::new();
 
     for (_shard, shard_pool) in pool.iter_shards() {
@@ -32304,23 +33123,70 @@ async fn list_rate_limits(
             .map_err(database_error)
             .map_err(map_error)?;
         for b in buckets {
-            use std::collections::btree_map::Entry;
-            match merged.entry(b.key.clone()) {
-                Entry::Vacant(e) => {
-                    e.insert(b);
-                }
-                Entry::Occupied(mut e) => {
-                    // Keep the most-depleted view (lowest tokens) so operators see
-                    // the worst-case shard rather than an optimistically full one.
-                    if b.tokens < e.get().tokens {
-                        e.insert(b);
-                    }
-                }
-            }
+            per_key.entry(b.key.clone()).or_default().push(b);
         }
     }
 
-    Ok(Json(merged.into_values().collect()))
+    let now = chrono::Utc::now();
+    Ok(Json(
+        per_key
+            .into_values()
+            .map(|rows| build_rate_limit_bucket_view(&rows, now))
+            .collect(),
+    ))
+}
+
+/// Merges one key's per-shard `RateLimitBucket` rows into a single
+/// [`RateLimitBucketView`], reporting cross-shard override disagreement
+/// (issue #945 review, round 5) alongside the pre-existing worst-case
+/// (lowest-tokens) representative-row selection.
+///
+/// # Panics
+///
+/// Never in practice: `rows` is always non-empty here, built from the
+/// `BTreeMap<String, Vec<RateLimitBucket>>` entries in [`list_rate_limits`],
+/// which only ever inserts a key alongside at least one row.
+fn build_rate_limit_bucket_view(
+    rows: &[RateLimitBucket],
+    now: chrono::DateTime<chrono::Utc>,
+) -> RateLimitBucketView {
+    let effective_per_shard: Vec<queue::EffectiveRateLimit> = rows
+        .iter()
+        .map(|b| {
+            queue::resolve_effective_rate_limit(
+                b.refill_rate,
+                b.burst,
+                b.override_refill_rate,
+                b.override_burst,
+                b.override_expires_at,
+                now,
+            )
+        })
+        .collect();
+    let disagreement = queue::pacing_shards_disagree(&effective_per_shard);
+
+    // Representative row: prefer an ACTIVE override row whenever any shard
+    // has one -- an operator scanning this list for "which keys are
+    // currently overridden right now?" must never silently miss one just
+    // because a *different*, non-overridden shard happened to have fewer
+    // tokens (issue #945 review, round 5; mirrors
+    // `get_start_throttle_pacing_override`'s round-4 fix). Among a
+    // homogeneous set (all active, or all inactive), keep the pre-existing
+    // worst-case (lowest tokens) heuristic so operators still see the most
+    // depleted shard rather than an optimistically full one.
+    let is_active =
+        |b: &RateLimitBucket| b.override_expires_at.is_some_and(|expires| expires > now);
+    let representative = rows
+        .iter()
+        .filter(|b| is_active(b))
+        .min_by(|a, b| a.tokens.total_cmp(&b.tokens))
+        .or_else(|| rows.iter().min_by(|a, b| a.tokens.total_cmp(&b.tokens)))
+        .expect("rows is always non-empty (see fn docs)");
+
+    RateLimitBucketView {
+        shard_disagreement: disagreement,
+        ..RateLimitBucketView::from(representative.clone())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -32416,6 +33282,709 @@ async fn set_rate_limit(
         )));
     }
     Ok(Json(BasicAck { ok: true }))
+}
+
+// ── TTL'd Pacing Overrides (rate limits + start throttles, issue #945) ─────
+//
+// A temporary, self-expiring layer on top of an already-*declared* rate
+// limit / start throttle. Distinct from the legacy `POST
+// /admin/rate-limits/{key}` above, which permanently rewrites a bucket's
+// baseline: these routes never touch `refill_rate`/`burst`, only the
+// additive `override_*` columns, and require no worker restart (the
+// effective-value SQL in `queue::effective_refill_rate_expr`/
+// `effective_burst_expr` is consulted fresh on every claim/dispatch) and no
+// operator action to revert (a plain `override_expires_at > NOW()` check).
+
+/// Validates a pacing-override TTL and computes its absolute expiry
+/// (issue #945).
+///
+/// `ttl_secs` must be non-zero — an override with no lifetime is meaningless
+/// (use the permanent `POST /admin/rate-limits/{key}` route for a durable
+/// change) — and must not exceed [`queue::MAX_PACING_OVERRIDE_TTL_SECS`], the
+/// server-side ceiling that guards against a forgotten override silently
+/// outliving the incident it was meant to mitigate.
+fn pacing_override_expiry(ttl_secs: u64) -> Result<chrono::DateTime<chrono::Utc>, AutumnError> {
+    if ttl_secs == 0 {
+        return Err(AutumnError::bad_request_msg(
+            "ttl_secs must be greater than zero",
+        ));
+    }
+    let max = u64::try_from(queue::MAX_PACING_OVERRIDE_TTL_SECS).unwrap_or(u64::MAX);
+    if ttl_secs > max {
+        return Err(AutumnError::bad_request_msg(format!(
+            "ttl_secs must not exceed the server cap of {max} seconds ({} hours)",
+            max / 3600
+        )));
+    }
+    let delta = chrono::Duration::seconds(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
+    let now = chrono::Utc::now();
+    Ok(now.checked_add_signed(delta).unwrap_or(now))
+}
+
+/// Response body for the TTL'd pacing-override SET/CLEAR/GET routes (issue
+/// #945).
+///
+/// `declared_*` is the baseline `effective_*`/`override_active` are computed
+/// against. It MUST be the persisted bucket row's own `refill_rate`/`burst`
+/// columns whenever a row exists, never passed through unread from the
+/// registered `#[activity(rate_limit(...))]` / `#[workflow(throttle(...))]`
+/// policy — the two can diverge, because the separate, permanent
+/// `POST /admin/rate-limits/{key}` route (issue #332/#699) can change a
+/// bucket's baseline columns independently, and this override's upsert/clear
+/// SQL deliberately never touches `refill_rate`/`burst` itself. Reporting
+/// the registry value in that situation would compute an `effective_*`
+/// dispatch is not actually enforcing (issue #945 review, P2). Every SET/
+/// CLEAR call site therefore reads the row's baseline back via the shared
+/// SQL builders' `RETURNING refill_rate, burst` clause
+/// ([`PersistedBaseline`]) and passes *that* here, falling back to the live
+/// registry declaration only when no bucket row exists yet on any reachable
+/// shard — a fresh bucket is always seeded at the registry's declared value
+/// (see [`pacing_override_upsert_sql`]), so the two necessarily agree there.
+/// `override_*` reports the raw override state just written (`None` after a
+/// clear). `effective_*`/`override_active` mirror
+/// [`queue::resolve_effective_rate_limit`] — what dispatch is actually
+/// enforcing right now, computed without a second query round-trip.
+#[derive(Debug, Serialize)]
+struct PacingOverrideResponse {
+    key: String,
+    declared_refill_rate: f64,
+    declared_burst: f64,
+    override_refill_rate: Option<f64>,
+    override_burst: Option<f64>,
+    override_active: bool,
+    effective_refill_rate: f64,
+    effective_burst: f64,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl PacingOverrideResponse {
+    fn build(
+        key: String,
+        declared_refill_rate: f64,
+        declared_burst: f64,
+        override_refill_rate: Option<f64>,
+        override_burst: Option<f64>,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        let effective = queue::resolve_effective_rate_limit(
+            declared_refill_rate,
+            declared_burst,
+            override_refill_rate,
+            override_burst,
+            expires_at,
+            chrono::Utc::now(),
+        );
+        Self {
+            key,
+            declared_refill_rate,
+            declared_burst,
+            override_refill_rate,
+            override_burst,
+            override_active: effective.override_active,
+            effective_refill_rate: effective.refill_rate,
+            effective_burst: effective.burst,
+            expires_at,
+        }
+    }
+}
+
+/// Rate-limit bucket state surfaced by `GET /admin/rate-limits` (issue
+/// #945): every field the pre-#945 raw-model response already carried
+/// (`key`/`refill_rate`/`burst`/`tokens`/`last_refilled_at`/`created_at`/
+/// `updated_at`/`override_refill_rate`/`override_burst`/
+/// `override_expires_at`) is preserved **unchanged** -- an existing
+/// consumer parsing e.g. `entry["burst"]` keeps working -- plus four new
+/// computed fields: `override_active`, `effective_refill_rate`,
+/// `effective_burst` resolve what dispatch is actually enforcing right now;
+/// `shard_disagreement` (round 5) reports whether the fleet's shards
+/// disagree on that state.
+///
+/// This is purely additive on top of the raw `RateLimitBucket` shape;
+/// nothing is renamed or removed.
+#[derive(Debug, Clone, Serialize)]
+struct RateLimitBucketView {
+    key: String,
+    refill_rate: f64,
+    burst: f64,
+    tokens: f64,
+    last_refilled_at: chrono::DateTime<chrono::Utc>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    override_refill_rate: Option<f64>,
+    override_burst: Option<f64>,
+    override_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether `override_expires_at` is set and strictly in the future
+    /// (issue #945).
+    override_active: bool,
+    /// The refill rate actually enforced right now: the override's, when
+    /// `override_active`, else the declared baseline `refill_rate`.
+    effective_refill_rate: f64,
+    /// The burst actually enforced right now: the override's, when
+    /// `override_active`, else the declared baseline `burst`.
+    effective_burst: f64,
+    /// Whether the shards backing this key's rows disagree on override
+    /// state or resolved effective pacing (issue #945 review, round 5).
+    /// `false` for a single-shard row on its own -- this field is only ever
+    /// set `true` by [`build_rate_limit_bucket_view`], which has the
+    /// multi-shard context [`From<RateLimitBucket>`] lacks. When `true`,
+    /// the other fields above still reflect a best-effort representative
+    /// shard (preferring an active override), but an operator should not
+    /// treat them as authoritative for every shard.
+    shard_disagreement: bool,
+}
+
+impl From<RateLimitBucket> for RateLimitBucketView {
+    fn from(b: RateLimitBucket) -> Self {
+        let effective = queue::resolve_effective_rate_limit(
+            b.refill_rate,
+            b.burst,
+            b.override_refill_rate,
+            b.override_burst,
+            b.override_expires_at,
+            chrono::Utc::now(),
+        );
+        Self {
+            key: b.key,
+            refill_rate: b.refill_rate,
+            burst: b.burst,
+            tokens: b.tokens,
+            last_refilled_at: b.last_refilled_at,
+            created_at: b.created_at,
+            updated_at: b.updated_at,
+            override_refill_rate: b.override_refill_rate,
+            override_burst: b.override_burst,
+            override_expires_at: b.override_expires_at,
+            override_active: effective.override_active,
+            effective_refill_rate: effective.refill_rate,
+            effective_burst: effective.burst,
+            shard_disagreement: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_bucket_view_tests {
+    use super::{RateLimitBucket, RateLimitBucketView};
+    use chrono::{TimeZone as _, Utc};
+
+    fn bucket(
+        override_refill_rate: Option<f64>,
+        override_burst: Option<f64>,
+        override_expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> RateLimitBucket {
+        let ts = Utc.with_ymd_and_hms(2026, 7, 24, 12, 0, 0).unwrap();
+        RateLimitBucket {
+            key: "send_email".to_string(),
+            refill_rate: 5.0,
+            burst: 10.0,
+            tokens: 3.0,
+            last_refilled_at: ts,
+            created_at: ts,
+            updated_at: ts,
+            override_refill_rate,
+            override_burst,
+            override_expires_at,
+        }
+    }
+
+    #[test]
+    fn no_override_reports_declared_as_effective() {
+        let view = RateLimitBucketView::from(bucket(None, None, None));
+        assert!(!view.override_active);
+        // Existing (pre-#945) field names are preserved unchanged for the
+        // list endpoint -- no rename, purely additive.
+        assert_eq!(view.key, "send_email");
+        assert!((view.refill_rate - 5.0).abs() < 1e-9);
+        assert!((view.burst - 10.0).abs() < 1e-9);
+        assert!((view.tokens - 3.0).abs() < 1e-9);
+        assert_eq!(view.override_expires_at, None);
+        // New computed fields.
+        assert!((view.effective_refill_rate - 5.0).abs() < 1e-9);
+        assert!((view.effective_burst - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn active_override_reports_override_as_effective() {
+        let expires = Utc::now() + chrono::Duration::seconds(300);
+        let view = RateLimitBucketView::from(bucket(Some(50.0), Some(100.0), Some(expires)));
+        assert!(view.override_active);
+        assert!((view.refill_rate - 5.0).abs() < 1e-9);
+        assert!((view.burst - 10.0).abs() < 1e-9);
+        assert!((view.effective_refill_rate - 50.0).abs() < 1e-9);
+        assert!((view.effective_burst - 100.0).abs() < 1e-9);
+        assert_eq!(view.override_expires_at, Some(expires));
+    }
+
+    #[test]
+    fn expired_override_falls_back_to_declared_as_effective() {
+        let expired = Utc::now() - chrono::Duration::seconds(1);
+        let view = RateLimitBucketView::from(bucket(Some(50.0), Some(100.0), Some(expired)));
+        assert!(!view.override_active);
+        assert!((view.effective_refill_rate - 5.0).abs() < 1e-9);
+        assert!((view.effective_burst - 10.0).abs() < 1e-9);
+        // The raw override columns are still surfaced even when expired --
+        // an operator can see what the last (now-lapsed) override was.
+        assert_eq!(view.override_refill_rate, Some(50.0));
+        assert_eq!(view.override_expires_at, Some(expired));
+    }
+}
+
+/// Builds the `INSERT ... ON CONFLICT (key) DO UPDATE` statement that sets
+/// (or replaces) a bucket's TTL'd pacing override (issue #945).
+///
+/// **Settles the token bucket in the same statement that rewrites the
+/// effective rate.** Neither `tokens` nor `last_refilled_at` may be left
+/// untouched here: [`queue::effective_available_tokens_expr`] re-rates the
+/// *entire* elapsed-since-last-refill window at whichever rate happens to be
+/// effective at the *next read* -- so a write that only flips the
+/// `override_*` columns would let a bucket that has been idle for hours
+/// suddenly "accrue" hours' worth of tokens under a brand-new, much higher
+/// override rate the instant it is set (an unbounded phantom credit bounded
+/// only by the newly-set burst). Settling first -- computing how many tokens
+/// had genuinely accrued under the OLD effective rate, capped at the NEW
+/// effective burst, and stamping `last_refilled_at = NOW()` -- closes that
+/// gap. This is safe as one atomic `UPDATE`/`INSERT ... ON CONFLICT`
+/// statement because Postgres evaluates every `SET`-clause expression
+/// against the row's pre-update values, so the settle expression (which
+/// still reads the OLD `override_*` columns) and the `override_*` columns
+/// being overwritten by this same statement cannot race each other.
+/// Mirrors the pre-existing `set_rate_limit` legacy handler's identical
+/// settle-on-rewrite pattern.
+///
+/// On first-ever bucket creation (the `VALUES` branch, no prior row to
+/// settle from), `tokens` seeds at `COALESCE($5, $3)` -- the just-set
+/// override burst if one was supplied in this same call, else the declared
+/// baseline burst -- so a bucket created with a simultaneous override starts
+/// fully topped up under the override's cap, not the (possibly lower or
+/// higher) declared one.
+fn pacing_override_upsert_sql() -> String {
+    let effective_tokens = queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
+    format!(
+        "INSERT INTO harvest_rate_limit_buckets \
+         (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at, \
+          override_refill_rate, override_burst, override_expires_at) \
+         VALUES ($1, $2, $3, COALESCE($5, $3), NOW(), NOW(), NOW(), $4, $5, $6) \
+         ON CONFLICT (key) DO UPDATE \
+         SET override_refill_rate = $4, \
+             override_burst = $5, \
+             override_expires_at = $6, \
+             tokens = LEAST(COALESCE($5, harvest_rate_limit_buckets.burst), {effective_tokens}), \
+             last_refilled_at = NOW(), \
+             updated_at = NOW() \
+         RETURNING refill_rate, burst"
+    )
+}
+
+/// Row returned by the `RETURNING refill_rate, burst` clause on
+/// [`pacing_override_upsert_sql`]/[`pacing_override_clear_sql`] -- the
+/// bucket's *persisted* baseline immediately after the write, which the
+/// SET/CLEAR handlers thread into [`PacingOverrideResponse::build`] instead
+/// of the registry-declared value (issue #945 review, P2: the separate,
+/// permanent `POST /admin/rate-limits/{key}` route can have changed these
+/// columns independently, and this override's `ON CONFLICT`/`UPDATE` never
+/// touches them).
+#[derive(diesel::QueryableByName)]
+struct PersistedBaseline {
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    refill_rate: f64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    burst: f64,
+}
+
+/// Builds the `UPDATE ... WHERE key = $1` statement that clears a bucket's
+/// pacing override (issue #945).
+///
+/// Settles the bucket for the identical reason [`pacing_override_upsert_sql`]
+/// does, in the opposite direction: without settling, clearing a
+/// high-refill-rate override on a bucket that has been idle leaves the
+/// *pre-clear* elapsed window to be re-rated at the (usually much lower)
+/// declared baseline rate the instant it is cleared, discarding tokens the
+/// bucket had genuinely earned under the override that was in effect right
+/// up until this statement runs. The settle expression still reads the OLD
+/// (about-to-be-cleared) `override_*` columns -- Postgres evaluates every
+/// `SET`-clause expression against pre-update values -- then the outer
+/// `LEAST(harvest_rate_limit_buckets.burst, ...)` re-caps to the *post-clear*
+/// declared burst, since the override may have granted a higher cap than the
+/// baseline.
+fn pacing_override_clear_sql() -> String {
+    let effective_tokens = queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
+    format!(
+        "UPDATE harvest_rate_limit_buckets \
+         SET override_refill_rate = NULL, override_burst = NULL, override_expires_at = NULL, \
+             tokens = LEAST(harvest_rate_limit_buckets.burst, {effective_tokens}), \
+             last_refilled_at = NOW(), \
+             updated_at = NOW() \
+         WHERE key = $1 \
+         RETURNING refill_rate, burst"
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitPacingOverrideRequest {
+    refill_rate: Option<f64>,
+    burst: Option<f64>,
+    ttl_secs: u64,
+}
+
+/// `POST /admin/rate-limits/{activity_name}/override` — set (or replace) a
+/// TTL'd runtime pacing override on top of a *declared* per-activity rate
+/// limit (issue #945).
+///
+/// Each call **replaces** the whole override — a field omitted from this
+/// call reverts to the declared baseline even if a *previous* call had
+/// overridden it, rather than being merged forward with that earlier call.
+///
+/// `404` when `activity_name` is not a registered activity, or is registered
+/// but declares no rate limit. `409` when the activity's rate limit is
+/// dynamically per-key (`rate_limit(key = ...)`, issue #699) — a pacing
+/// override targets one static bucket and cannot disambiguate which
+/// resolved tenant key's bucket to override. `400` on a non-finite/
+/// non-positive `refill_rate`/`burst`, an omitted `refill_rate`/`burst`
+/// pair, or a `ttl_secs` of zero or above the server cap.
+#[allow(clippy::too_many_lines)]
+async fn set_rate_limit_pacing_override(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(activity_name): Path<String>,
+    Json(request): Json<RateLimitPacingOverrideRequest>,
+) -> impl axum::response::IntoResponse {
+    if let Some(rate) = request.refill_rate
+        && (!rate.is_finite() || rate <= 0.0)
+    {
+        return AutumnError::bad_request_msg(
+            "refill_rate must be a finite number greater than zero",
+        )
+        .into_response();
+    }
+    if let Some(burst) = request.burst
+        && (!burst.is_finite() || burst < 1.0)
+    {
+        return AutumnError::bad_request_msg("burst must be a finite number, at least 1.0")
+            .into_response();
+    }
+    if request.refill_rate.is_none() && request.burst.is_none() {
+        return AutumnError::bad_request_msg("must override at least one of refill_rate or burst")
+            .into_response();
+    }
+    let expires_at = match pacing_override_expiry(request.ttl_secs) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+
+    let runtime = match api_state.runtime().map_err(map_error) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let Some(activity) = runtime.registry().activities.get(&activity_name) else {
+        return AutumnError::not_found_msg(format!("activity '{activity_name}' is not registered"))
+            .into_response();
+    };
+    let Some(declared_refill_rate) = activity.rate_limit_rps else {
+        return AutumnError::not_found_msg(format!(
+            "activity '{activity_name}' has no declared rate limit; nothing to override"
+        ))
+        .into_response();
+    };
+    if let Some(expr) = activity.rate_limit_key_expr {
+        return AutumnError::bad_request_msg(format!(
+            "activity '{activity_name}' uses a dynamic per-key rate limit \
+             (key expression '{expr}'); a pacing override targets a single \
+             static bucket and cannot be applied to a dynamically-keyed policy"
+        ))
+        .with_status(axum::http::StatusCode::CONFLICT)
+        .into_response();
+    }
+    let declared_burst = activity.rate_limit_burst.unwrap_or(declared_refill_rate);
+    let key: String = activity
+        .rate_limit_key
+        .map_or_else(|| activity_name.clone(), std::string::ToString::to_string);
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/rate-limits/{activity_name}/override";
+
+    let mut any_success = false;
+    let mut shard_errors: Vec<String> = Vec::new();
+    let mut persisted_baseline: Option<(f64, f64)> = None;
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match diesel::sql_query(pacing_override_upsert_sql())
+            .bind::<diesel::sql_types::Text, _>(&key)
+            .bind::<diesel::sql_types::Double, _>(declared_refill_rate)
+            .bind::<diesel::sql_types::Double, _>(declared_burst)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(request.refill_rate)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(request.burst)
+            .bind::<diesel::sql_types::Timestamptz, _>(expires_at)
+            .get_results::<PersistedBaseline>(&mut conn)
+            .await
+        {
+            Ok(rows) => {
+                any_success = true;
+                if persisted_baseline.is_none()
+                    && let Some(row) = rows.into_iter().next()
+                {
+                    persisted_baseline = Some((row.refill_rate, row.burst));
+                }
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
+    }
+
+    // Attempt the audit write *before* deciding the response -- including on
+    // total shard failure (issue #945 review, P2). A fully-failed
+    // administrative override attempt must still leave an audit trail; the
+    // early `503` below is deferred until after this write is attempted so it
+    // can never bypass it.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+        target_type: TARGET_RATE_LIMIT,
+        target_id: Some(key.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match acquire_conn(pool.default_pool()).await {
+        Ok(mut conn) => {
+            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                tracing::error!(
+                    error = %audit_err,
+                    "audit insert failed for rate_limit.pacing_override.set"
+                );
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "audit DB connection unavailable for rate_limit.pacing_override.set"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    if !shard_errors.is_empty() && !any_success {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+
+    // Report the persisted baseline the write just confirmed (issue #945
+    // review, P2), falling back to the registry only in the pathological
+    // case where every reachable shard's write raced past the
+    // `!any_success` guard above without ever returning a row.
+    let (baseline_refill_rate, baseline_burst) =
+        persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
+    let response = PacingOverrideResponse::build(
+        key,
+        baseline_refill_rate,
+        baseline_burst,
+        request.refill_rate,
+        request.burst,
+        Some(expires_at),
+    );
+
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "override": response,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// `DELETE /admin/rate-limits/{activity_name}/override` — clear a TTL'd
+/// runtime pacing override before its TTL elapses (issue #945).
+///
+/// Idempotent: clearing an activity with no active override still returns
+/// `200` reporting the declared baseline (`override_active: false`). `404`/
+/// `409` mirror [`set_rate_limit_pacing_override`]'s registry-lookup
+/// validation.
+#[allow(clippy::too_many_lines)]
+async fn clear_rate_limit_pacing_override(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(activity_name): Path<String>,
+) -> impl axum::response::IntoResponse {
+    let runtime = match api_state.runtime().map_err(map_error) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let Some(activity) = runtime.registry().activities.get(&activity_name) else {
+        return AutumnError::not_found_msg(format!("activity '{activity_name}' is not registered"))
+            .into_response();
+    };
+    let Some(declared_refill_rate) = activity.rate_limit_rps else {
+        return AutumnError::not_found_msg(format!(
+            "activity '{activity_name}' has no declared rate limit; nothing to override"
+        ))
+        .into_response();
+    };
+    if let Some(expr) = activity.rate_limit_key_expr {
+        return AutumnError::bad_request_msg(format!(
+            "activity '{activity_name}' uses a dynamic per-key rate limit \
+             (key expression '{expr}'); a pacing override targets a single \
+             static bucket and cannot be applied to a dynamically-keyed policy"
+        ))
+        .with_status(axum::http::StatusCode::CONFLICT)
+        .into_response();
+    }
+    let declared_burst = activity.rate_limit_burst.unwrap_or(declared_refill_rate);
+    let key: String = activity
+        .rate_limit_key
+        .map_or_else(|| activity_name.clone(), std::string::ToString::to_string);
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "DELETE /admin/rate-limits/{activity_name}/override";
+
+    let mut any_success = false;
+    let mut shard_errors: Vec<String> = Vec::new();
+    let mut persisted_baseline: Option<(f64, f64)> = None;
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match diesel::sql_query(pacing_override_clear_sql())
+            .bind::<diesel::sql_types::Text, _>(&key)
+            .get_results::<PersistedBaseline>(&mut conn)
+            .await
+        {
+            Ok(rows) => {
+                any_success = true;
+                if persisted_baseline.is_none()
+                    && let Some(row) = rows.into_iter().next()
+                {
+                    persisted_baseline = Some((row.refill_rate, row.burst));
+                }
+            }
+            Err(e) => shard_errors.push(format!("shard {}: {e}", shard_id.as_i32())),
+        }
+    }
+
+    // Attempt the audit write *before* deciding the response -- including on
+    // total shard failure (issue #945 review, P2). A fully-failed
+    // administrative override attempt must still leave an audit trail; the
+    // early `503` below is deferred until after this write is attempted so it
+    // can never bypass it.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+        target_type: TARGET_RATE_LIMIT,
+        target_id: Some(key.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match acquire_conn(pool.default_pool()).await {
+        Ok(mut conn) => {
+            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                tracing::error!(
+                    error = %audit_err,
+                    "audit insert failed for rate_limit.pacing_override.clear"
+                );
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "audit DB connection unavailable for rate_limit.pacing_override.clear"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    if !shard_errors.is_empty() && !any_success {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+
+    // Report the persisted (now-reverted) baseline the clear just confirmed
+    // (issue #945 review, P2). `persisted_baseline` is `None` only when the
+    // bucket never existed on any reachable shard -- the documented
+    // idempotent-clear-of-an-unset-bucket case -- in which case the registry
+    // declaration is exactly correct, since a bucket that has never been
+    // written can only ever agree with it.
+    let (baseline_refill_rate, baseline_burst) =
+        persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
+    let response =
+        PacingOverrideResponse::build(key, baseline_refill_rate, baseline_burst, None, None, None);
+
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "override": response,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
 }
 
 // ── Circuit Breaker Management (issue #369) ─────────────────────────────────
@@ -43333,32 +44902,42 @@ async fn evaluate_eligibility_for_shard(
             #[diesel(sql_type = diesel::sql_types::Text)]
             key: String,
             #[diesel(sql_type = diesel::sql_types::Double)]
-            tokens: f64,
-            #[diesel(sql_type = diesel::sql_types::Double)]
-            burst: f64,
-            #[diesel(sql_type = diesel::sql_types::Double)]
-            refill_rate: f64,
-            #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-            last_refilled_at: chrono::DateTime<chrono::Utc>,
+            effective_tokens: f64,
         }
 
-        let rows: Vec<RateLimitRow> = diesel::sql_query(
-            "SELECT key, tokens, burst, refill_rate, last_refilled_at \
+        // Issue #945 review (round 4, P2): this used to re-derive "tokens
+        // available right now" in Rust via a flat `elapsed *
+        // effective.refill_rate`, applying whichever rate is effective AT
+        // THE MOMENT OF THE READ to the WHOLE elapsed interval. That is
+        // exactly the class of bug `queue::token_accrual_expr` was written
+        // to fix (issue #945 round-1 P1) for the claim-time SQL gate: once
+        // an operator override has expired mid-interval with no intervening
+        // write to settle the bucket, retroactively applying the reverted
+        // baseline rate to the portion of the interval the override was
+        // still throttling produces a phantom refill -- so this diagnostic
+        // could report a key as available when `claim_task` is still
+        // treating it as saturated (or the reverse). Delegating the whole
+        // computation to `queue::effective_available_tokens_expr` -- the
+        // SAME expression the claim-time gate, the dispatch-time debit, and
+        // the refund all use -- makes this diagnostic structurally unable to
+        // drift from what `claim_task` is actually enforcing, mirroring
+        // `check_throttled_keys`'s convention of doing the whole
+        // override-and-accrual computation in SQL rather than re-deriving it
+        // in Rust.
+        let effective_tokens_expr =
+            queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
+        let rows: Vec<RateLimitRow> = diesel::sql_query(format!(
+            "SELECT key, {effective_tokens_expr} AS effective_tokens \
              FROM harvest_rate_limit_buckets \
-             WHERE key = ANY($1)",
-        )
+             WHERE key = ANY($1)"
+        ))
         .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&rate_limit_keys)
         .load(&mut conn)
         .await
         .map_err(database_error)?;
 
         for r in rows {
-            let elapsed = chrono::Utc::now()
-                .signed_duration_since(r.last_refilled_at)
-                .num_milliseconds() as f64
-                / 1000.0;
-            let current_tokens = (r.tokens + elapsed * r.refill_rate).min(r.burst);
-            if current_tokens < 1.0 {
+            if r.effective_tokens < 1.0 {
                 saturated_rate_limits.insert(r.key);
             }
         }

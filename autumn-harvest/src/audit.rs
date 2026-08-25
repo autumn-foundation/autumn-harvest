@@ -101,6 +101,27 @@ pub const OP_EXTERNAL_ACTIVITY_FAIL: &str = "external_activity.fail";
 pub const OP_WORKER_DRAIN: &str = "worker.drain";
 /// Audit operation: Overrode rate-limiting parameters.
 pub const OP_RATE_LIMIT_OVERRIDE: &str = "rate_limit_override";
+/// Audit operation: Set (or updated) a TTL'd runtime pacing override on a
+/// declared per-activity rate limit (issue #945).
+///
+/// Distinct from the legacy [`OP_RATE_LIMIT_OVERRIDE`] (issue #332), which is
+/// a permanent write to a bucket's baseline `refill_rate`/`burst`: this
+/// records a *temporary*, self-expiring layer on top of that baseline that
+/// requires no worker restart to take effect and no operator action to
+/// revert.
+pub const OP_RATE_LIMIT_PACING_OVERRIDE_SET: &str = "rate_limit.pacing_override.set";
+/// Audit operation: Cleared a TTL'd runtime pacing override on a declared
+/// per-activity rate limit before its TTL elapsed (issue #945).
+pub const OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR: &str = "rate_limit.pacing_override.clear";
+/// Audit operation: Set (or updated) a TTL'd runtime pacing override on a
+/// declared workflow-start throttle (issue #945).
+///
+/// See [`OP_RATE_LIMIT_PACING_OVERRIDE_SET`] -- same TTL'd-layer semantics,
+/// applied to a `#[workflow(throttle(...))]` bucket instead of an activity's.
+pub const OP_START_THROTTLE_PACING_OVERRIDE_SET: &str = "start_throttle.pacing_override.set";
+/// Audit operation: Cleared a TTL'd runtime pacing override on a declared
+/// workflow-start throttle before its TTL elapsed (issue #945).
+pub const OP_START_THROTTLE_PACING_OVERRIDE_CLEAR: &str = "start_throttle.pacing_override.clear";
 /// Audit operation: Opened an SSE execution event stream (issue #324).
 pub const OP_EXECUTION_STREAM_OPEN: &str = "execution.stream.open";
 /// Audit operation: Closed an SSE execution event stream (issue #324).
@@ -203,6 +224,8 @@ pub const TARGET_EXTERNAL_ACTIVITY: &str = "external_activity";
 pub const TARGET_ACTIVITY: &str = "activity";
 pub const TARGET_WORKER: &str = "worker";
 pub const TARGET_RATE_LIMIT: &str = "rate_limit";
+/// Audit target type for workflow-start throttle operations (issues #607, #945).
+pub const TARGET_THROTTLE: &str = "throttle";
 pub const TARGET_BUILD_ROUTING: &str = "build_routing";
 /// Audit target type for completion-callback delivery operations (issue #605).
 pub const TARGET_CALLBACK_DELIVERY: &str = "completion_callback_delivery";
@@ -524,6 +547,33 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     ("POST /workers/{worker_id}/drain", RouteClass::Mutating),
     ("POST /admin/rate-limits/{key}", RouteClass::Mutating),
+    // TTL'd runtime pacing overrides for a declared per-activity rate limit
+    // (issue #945): a temporary layer atop the baseline, not a permanent
+    // write like the legacy route directly above.
+    (
+        "POST /admin/rate-limits/{activity_name}/override",
+        RouteClass::Mutating,
+    ),
+    (
+        "DELETE /admin/rate-limits/{activity_name}/override",
+        RouteClass::Mutating,
+    ),
+    // TTL'd runtime pacing overrides for a declared workflow-start throttle
+    // (issue #945). Same semantics as the rate-limit pair above.
+    (
+        "POST /admin/start-throttle/{workflow_name}/override",
+        RouteClass::Mutating,
+    ),
+    (
+        "DELETE /admin/start-throttle/{workflow_name}/override",
+        RouteClass::Mutating,
+    ),
+    // Read-only companion: resolves an override's live state directly,
+    // independent of any current deferred-start backlog (issue #945).
+    (
+        "GET /admin/start-throttle/{workflow_name}/override",
+        RouteClass::ReadOnly,
+    ),
     ("POST /batch-operations", RouteClass::Mutating),
     // Batch workflow start (issue #357)
     ("POST /workflows/batch_start", RouteClass::Mutating),
@@ -744,6 +794,12 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_EXTERNAL_ACTIVITY_FAIL,
     OP_WORKER_DRAIN,
     OP_RATE_LIMIT_OVERRIDE,
+    // TTL'd runtime pacing overrides for rate limits and start-throttles
+    // (issue #945)
+    OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+    OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+    OP_START_THROTTLE_PACING_OVERRIDE_SET,
+    OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
     OP_BUILD_POLICY_SET,
     OP_BUILD_COMPAT_DECLARE,
     OP_BUILD_COMPAT_REVOKE,
@@ -845,6 +901,9 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/start-throttle",
     // Per-tenant resource quota usage-vs-limit report (issue #946): read-only.
     "GET /admin/quotas",
+    // Read-only pacing-override lookup (issue #945); the SET/DELETE mutations
+    // above (OP_START_THROTTLE_PACING_OVERRIDE_SET/CLEAR) are audited.
+    "GET /admin/start-throttle/{workflow_name}/override",
     "GET /admin/history/exports",
     "GET /admin/history/export-sample",
     "GET /admin/external-handoffs",
@@ -1076,6 +1135,24 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         "POST /admin/rate-limits/{key}",
         Some(OP_RATE_LIMIT_OVERRIDE),
     ),
+    // TTL'd runtime pacing overrides (issue #945)
+    (
+        "POST /admin/rate-limits/{activity_name}/override",
+        Some(OP_RATE_LIMIT_PACING_OVERRIDE_SET),
+    ),
+    (
+        "DELETE /admin/rate-limits/{activity_name}/override",
+        Some(OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR),
+    ),
+    (
+        "POST /admin/start-throttle/{workflow_name}/override",
+        Some(OP_START_THROTTLE_PACING_OVERRIDE_SET),
+    ),
+    (
+        "DELETE /admin/start-throttle/{workflow_name}/override",
+        Some(OP_START_THROTTLE_PACING_OVERRIDE_CLEAR),
+    ),
+    ("GET /admin/start-throttle/{workflow_name}/override", None),
     // Batch operations
     ("GET /batch-operations", None),
     ("POST /batch-operations", Some(OP_BATCH_SUBMIT)),
@@ -1585,6 +1662,83 @@ mod tests {
                 "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #807)"
             );
         }
+    }
+
+    #[test]
+    fn pacing_override_routes_are_classified_and_audited() {
+        // TTL'd runtime pacing overrides for a declared per-activity rate
+        // limit and a declared workflow-start throttle (issue #945). This
+        // dedicated test -- not just the general exhaustiveness guards, which
+        // only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against
+        // each OTHER -- is what catches a route dropped from BOTH lists at
+        // once.
+        //
+        // Both the set and the clear are audited under NEW, distinct ops from
+        // the legacy `OP_RATE_LIMIT_OVERRIDE` (a permanent baseline write),
+        // since a TTL'd override is a fundamentally different, self-expiring
+        // operation.
+        for (route, op) in [
+            (
+                "POST /admin/rate-limits/{activity_name}/override",
+                OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+            ),
+            (
+                "DELETE /admin/rate-limits/{activity_name}/override",
+                OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+            ),
+            (
+                "POST /admin/start-throttle/{workflow_name}/override",
+                OP_START_THROTTLE_PACING_OVERRIDE_SET,
+            ),
+            (
+                "DELETE /admin/start-throttle/{workflow_name}/override",
+                OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+            ),
+        ] {
+            assert!(
+                CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, c)| *r == route && *c == RouteClass::Mutating),
+                "{route} must be classified RouteClass::Mutating in CLASSIFIED_ROUTES (issue #945)"
+            );
+            assert!(
+                ALL_MUTATION_ROUTES
+                    .iter()
+                    .any(|(r, mapped)| *r == route && *mapped == Some(op)),
+                "{route} must map to {op} in ALL_MUTATION_ROUTES (issue #945)"
+            );
+            assert!(
+                AUDITED_OPERATIONS.contains(&op),
+                "{op} must be registered in AUDITED_OPERATIONS (issue #945)"
+            );
+            assert_ne!(
+                op, OP_RATE_LIMIT_OVERRIDE,
+                "a TTL'd pacing override must use a distinct op from the legacy permanent override (issue #945)"
+            );
+        }
+
+        // Read-only companion to the start-throttle SET/DELETE pair above
+        // (issue #945): resolves an override's live state directly, so it is
+        // ReadOnly (never Mutating -- it writes nothing) and, having no audit
+        // op, must map to `None` in ALL_MUTATION_ROUTES rather than being
+        // silently absent from the manifest entirely.
+        let get_route = "GET /admin/start-throttle/{workflow_name}/override";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == get_route && *c == RouteClass::ReadOnly),
+            "{get_route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #945)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, mapped)| *r == get_route && mapped.is_none()),
+            "{get_route} must map to None in ALL_MUTATION_ROUTES -- it is read-only (issue #945)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&get_route),
+            "{get_route} should be listed in EXCLUDED_ROUTES, matching its GET /admin/circuits/{{activity_name}} sibling (issue #945)"
+        );
     }
 
     #[test]

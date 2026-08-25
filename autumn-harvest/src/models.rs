@@ -566,6 +566,17 @@ pub struct RateLimitBucket {
     pub last_refilled_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// TTL'd operator override refill rate (issue #945); `None` when no
+    /// override refill rate has been declared (an override may set only
+    /// `override_burst`).
+    pub override_refill_rate: Option<f64>,
+    /// TTL'd operator override burst (issue #945); `None` when no override
+    /// burst has been declared.
+    pub override_burst: Option<f64>,
+    /// The override is active (and `override_refill_rate`/`override_burst`
+    /// take precedence, per-field, over the declared baseline) while this is
+    /// set and in the future (issue #945).
+    pub override_expires_at: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for a rate limit bucket.

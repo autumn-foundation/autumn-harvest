@@ -1100,6 +1100,73 @@ async fn eris_require_auth_blocks_trigger_schedule() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
+// ── TTL'd runtime pacing overrides (issue #945) — admin-gated ────────────────
+//
+// All five pacing-override routes (2 rate-limit, 2 start-throttle, plus the
+// read-only start-throttle-override lookup) carry `require_admin` at the
+// route-registration site (`api.rs`'s `harvest_api_router`). Mirroring every
+// other admin route in this file, an unauthenticated request never even
+// reaches that per-route gate — `RequireAuth`, wrapping the whole router,
+// already rejects it with 401 first. This proves the pacing-override routes
+// are wired into the SAME auth chain as every other admin-gated route, not
+// silently left unauthenticated.
+
+#[tokio::test]
+async fn eris_require_auth_blocks_set_rate_limit_override() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/admin/rate-limits/send_email/override",
+            r#"{"refill_rate": 100.0, "ttl_secs": 60}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_clear_rate_limit_override() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(delete("/admin/rate-limits/send_email/override"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_set_start_throttle_override() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/admin/start-throttle/onboard_user/override",
+            r#"{"refill_per_sec": 100.0, "ttl_secs": 60}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_clear_start_throttle_override() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(delete("/admin/start-throttle/onboard_user/override"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_require_auth_blocks_get_start_throttle_override() {
+    let app = authenticated_app();
+    let res = app
+        .oneshot(get("/admin/start-throttle/onboard_user/override"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
 // ── Read-only operator role (issue #776) ──────────────────────────────────────
 //
 // Headline success-metric test (AC1/AC2, no DB): a synthetic router mounts a

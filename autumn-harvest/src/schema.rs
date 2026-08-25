@@ -609,6 +609,17 @@ diesel::table! {
         last_refilled_at -> Timestamptz,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        /// TTL'd operator override (issue #945). `NULL` = no override refill
+        /// rate declared; falls back to `refill_rate` while an override is
+        /// active.
+        override_refill_rate -> Nullable<Double>,
+        /// TTL'd operator override (issue #945). `NULL` = no override burst
+        /// declared; falls back to `burst` while an override is active.
+        override_burst -> Nullable<Double>,
+        /// The override is active while this is set and in the future; once
+        /// it elapses every consumer reverts to the declared baseline with no
+        /// operator action or background sweeper needed (issue #945).
+        override_expires_at -> Nullable<Timestamptz>,
     }
 }
 

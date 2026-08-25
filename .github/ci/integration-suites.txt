@@ -127,6 +127,7 @@ linux        autumn-harvest-plugin  history_bloat_integration        -          
 linux        autumn-harvest-plugin  interface_schema_integration     -                          -
 linux        autumn-harvest-plugin  legal_hold_integration           -                          -
 linux        autumn-harvest-plugin  lineage_tree_integration         -                          -
+linux        autumn-harvest-plugin  pacing_override_integration      -                          -
 linux        autumn-harvest-plugin  progress_stream_integration      -                          -
 linux        autumn-harvest-plugin  query_integration                -                          -
 linux        autumn-harvest-plugin  queue_coverage_integration       -                          -

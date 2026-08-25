@@ -442,7 +442,7 @@ struct QuotaUsageRow {
 /// "cheap by construction... never a full-table scan per admission").
 ///
 /// `active` and `dl` each hit the partial indexes created by migration
-/// `20260724000000_harvest_workflow_quotas`
+/// `20260725000000_harvest_workflow_quotas`
 /// (`idx_harvest_we_quota_active`/`idx_harvest_dl_quota`); `history` joins
 /// `harvest_events` on `workflow_exec_id`, served by the existing
 /// `(workflow_exec_id, event_id)` index — bounded to the rows belonging to
