@@ -20,8 +20,14 @@ that calls `ctx.execute_activity_raw` `n = 5_000` times (the same `n`
 `replay_bench.rs`'s `bench_replay_10k` uses), producing a 10,001-event
 history (`WorkflowStarted` + 5,000 × `ActivityScheduled`/`ActivityCompleted`
 pairs), driven through `WorkflowReplayer::replay_from_events` in strict
-replay mode — the code path that runs on every worker task pickup and on
-every deploy-time replay-canary sample.
+replay mode — the code path `WorkflowReplayer` itself uses (testing/CI
+fixture verification, this benchmark included) and the deploy-time
+replay-canary uses. An *ordinary* worker's production replay of a live
+task pickup runs the separate non-strict path instead (`context.rs`'s
+activity dispatch defaults `strict_replay = false`, dispatching to
+`match_activity` rather than `match_activity_strict`) — see the "Scope"
+note in the negative-result section below for why that distinction
+matters for at least one of the two functions this doc covers.
 
 Unlike `replay_bench.rs`'s `Value::Null` payloads, each activity here carries
 a realistic ~230-byte JSON record (`activity_payload`, an order line item
