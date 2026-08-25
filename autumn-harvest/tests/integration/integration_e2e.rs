@@ -222,7 +222,18 @@ const INIT_SQL: &str = concat!(
     // migration also adds the partial `idx_harvest_tq_activity_pause` index on
     // `harvest_task_queue`; that index is a performance aid rather than a
     // correctness requirement, but it ships in the same file.
-    include_str!("../../migrations/20260722000000_harvest_activity_pause/up.sql")
+    include_str!("../../migrations/20260722000000_harvest_activity_pause/up.sql"),
+    "\n",
+    // issue #843: idx_harvest_wfx_retry_of. Index-only (no column), so its
+    // absence is silent (never a "column does not exist" failure) -- included
+    // for faithfulness to the on-disk migration set, mirroring every other
+    // entry in this bundle.
+    include_str!("../../migrations/20260723000000_harvest_retry_chain_index/up.sql"),
+    "\n",
+    // issue #946: quota_key column on harvest_workflow_executions, referenced
+    // by every WorkflowExecution::as_select() read-back in this suite (and in
+    // every suite that borrows `setup_test_database_url_or_env` from here).
+    include_str!("../../migrations/20260724000000_harvest_workflow_quotas/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -337,7 +348,11 @@ const LEGACY_INIT_SQL: &str = concat!(
     // issue #804 (round 6): `TaskQueueItem` selects the companion distinct-misser
     // set on the same claim, so omitting it fails the legacy path's claim exactly
     // as omitting `capability_misses` would.
-    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';\n"
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';\n",
+    // issue #946: WorkflowExecution::as_select() (the modern start path's
+    // read-back) references the quota_key column even for a fresh (no quota
+    // policy configured) execution.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS quota_key TEXT NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
