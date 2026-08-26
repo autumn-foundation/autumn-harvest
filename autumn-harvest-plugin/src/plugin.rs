@@ -45,6 +45,59 @@ const OUTBOX_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/app"
 /// forever: exactly the partition wedge the feature exists to prevent.
 const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/harvest");
 
+/// Hand Harvest's embedded migration sets to Autumn, which owns applying them
+/// (autumn-web 0.7's [`AppBuilder::plugin_migrations`]).
+///
+/// Autumn applies every registered set inside `setup_database`, i.e. *before*
+/// any `on_startup` hook runs, so `start_harvest_runtime` always observes an
+/// already-migrated database. It also keeps the same dev/prod policy the plugin
+/// applied by hand before: auto-apply under the `dev` profile, warn-only
+/// otherwise (run a one-shot `autumn migrate` before rolling prod replicas).
+///
+/// Registering here rather than migrating ourselves is what lets Autumn resolve
+/// **version collisions across plugins**. Diesel's `__diesel_schema_migrations`
+/// is keyed by version alone, so two independently authored migrations picking
+/// the same timestamp would otherwise silently skip one of them forever. Autumn
+/// sees every registered set at once and tracks the loser under a substitute
+/// version so both still apply.
+///
+/// # Why the harvest sets are conditional
+///
+/// `plugin_migrations` can only target the application's primary database.
+/// Under [`HarvestMode::Embedded`] (the default) that *is* the Harvest
+/// database, so Autumn can own all three sets. Under [`HarvestMode::Split`] /
+/// [`HarvestMode::External`], Harvest storage is a **separate** database that
+/// Autumn has no handle on — those two sets stay on the plugin's own apply path
+/// in [`ensure_runtime_migrations`], which connects to `harvest.database.url`
+/// directly.
+///
+/// The outbox set is unconditional: the transactional-outbox table an embedder
+/// writes to in their own business transaction always lives in the application
+/// database, in every mode.
+///
+/// If the Harvest config cannot be loaded here, the harvest sets are left
+/// unregistered rather than guessed at — applying them to the app database on a
+/// mode we could not read would create Harvest tables in the wrong place.
+/// `start_harvest_runtime` reloads the same config and surfaces the identical
+/// error, so the app fails to boot rather than running unmigrated.
+fn register_plugin_migrations(app: AppBuilder) -> AppBuilder {
+    let app = app.plugin_migrations("autumn-harvest-plugin (outbox)", OUTBOX_MIGRATIONS);
+
+    match HarvestRuntimeConfig::load().map(|config| config.mode) {
+        Ok(HarvestMode::Embedded) => app
+            .plugin_migrations("autumn-harvest", HARVEST_MIGRATIONS)
+            .plugin_migrations("autumn-harvest-plugin", PLUGIN_HARVEST_MIGRATIONS),
+        Ok(HarvestMode::Split | HarvestMode::External) => app,
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "harvest config unreadable while registering migrations; deferring to startup"
+            );
+            app
+        }
+    }
+}
+
 struct OutboxRuntime {
     shutdown: CancellationToken,
     handle: JoinHandle<()>,
@@ -994,6 +1047,10 @@ impl Plugin for HarvestPlugin {
         } = self;
         #[cfg(not(feature = "mcp"))]
         let _ = (mcp_tool_middleware, mcp_tools_enabled, mcp_tools_prefix);
+
+        // Autumn owns migrations for every set that lives in the application
+        // database (autumn-web 0.7). See `register_plugin_migrations`.
+        let app = register_plugin_migrations(app);
 
         let api_state = HarvestApiState::new();
 
@@ -2366,22 +2423,24 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
 /// Harvest storage databases, awaiting the result off the calling task's own
 /// async executor thread.
 ///
-/// `autumn_web::migrate::run_pending`/`pending_migrations` are synchronous.
-/// Against a plaintext connection they route through a genuinely-sync libpq
-/// (`PgConnection::establish`) path and merely block the calling thread
-/// briefly. Against a TLS-requiring `sslmode` (`require`/`verify-ca`/
-/// `verify-full`) they instead reuse the *current* Tokio runtime handle and
-/// call `Handle::block_on` on it -- which Tokio forbids (and panics on) when
-/// called from a thread that is already driving that runtime's own async
-/// tasks. `start_harvest_runtime` runs inside an `on_startup` hook on exactly
-/// such a thread, so calling the blocking body directly here panicked the
-/// whole startup task the instant the configured database URL required TLS.
+/// `autumn_web::migrate::run_pending`/`pending_migrations` are synchronous and
+/// genuinely block the calling thread: as of autumn-web 0.7 both route through
+/// `with_migration_connection!`, which runs the connect *and* the migration
+/// body on a freshly spawned `std::thread::scope` thread and `join()`s it.
+/// `spawn_blocking` keeps that join off an async worker thread, where it would
+/// otherwise stall the worker for the full duration of the migration.
 ///
-/// `tokio::task::spawn_blocking` moves the blocking body onto a dedicated
-/// blocking-pool thread, where a nested `block_on` is the sanctioned pattern
-/// (this is precisely the "`spawn_blocking` tasks (the startup migration path)"
-/// case `autumn_web`'s own `establish_migration_connection` doc comment calls
-/// out as safe), so the TLS branch can complete normally instead of panicking.
+/// Historical note (issue #1232): under autumn-web 0.6 this wrapper was also
+/// required for *correctness*, not just for scheduling hygiene. A
+/// TLS-requiring `sslmode` (`require`/`verify-ca`/`verify-full`) used to reuse
+/// the *current* Tokio runtime handle and call `Handle::block_on` on it --
+/// which Tokio forbids (and panics on) from a thread already driving that
+/// runtime's tasks, exactly what an `on_startup` hook is. autumn-web 0.7 fixed
+/// that upstream by moving the whole operation onto a thread that has never
+/// entered a runtime, so the TLS path is now safe from any caller context.
+/// `migration_body_is_safe_to_call_directly_from_an_async_context` below pins
+/// that upstream guarantee, so a regression in it is caught here rather than
+/// resurfacing as a production startup panic.
 async fn ensure_runtime_migrations(
     profile: &str,
     app_config: &AutumnConfig,
@@ -2413,21 +2472,27 @@ fn ensure_runtime_migrations_blocking(
     app_config: &AutumnConfig,
     harvest_config: &HarvestRuntimeConfig,
 ) -> autumn_web::AutumnResult<()> {
-    if let Some(app_database_url) = app_config.database.url.as_deref() {
-        apply_migrations_for_profile(
-            profile,
-            app_database_url,
-            OUTBOX_MIGRATIONS,
-            "Harvest workflow outbox",
-        )?;
-    }
-
+    // Autumn owns every set that lives in the APPLICATION database -- the
+    // outbox always, plus the two Harvest sets under `Embedded`, where the
+    // application database *is* the Harvest database. They are registered in
+    // `register_plugin_migrations` and applied during `setup_database`, before
+    // this startup hook runs. Under `Embedded` there is therefore nothing left
+    // for the plugin to migrate.
     let harvest_database_url = match harvest_config.mode {
-        HarvestMode::Embedded => app_config.database.url.as_deref().ok_or_else(|| {
-            AutumnError::service_unavailable_msg(
-                "autumn-harvest requires database.url when harvest.mode is embedded",
-            )
-        })?,
+        HarvestMode::Embedded => {
+            // Still validate the invariant Autumn cannot check for us: with no
+            // `database.url` there is no Harvest storage at all, and failing
+            // here is far clearer than a missing-table error later.
+            if app_config.database.url.is_none() {
+                return Err(AutumnError::service_unavailable_msg(
+                    "autumn-harvest requires database.url when harvest.mode is embedded",
+                ));
+            }
+            return Ok(());
+        }
+        // A dedicated Harvest database Autumn has no handle on: `plugin_migrations`
+        // only ever targets the application's primary database, so these two sets
+        // are applied here, against `harvest.database.url`.
         HarvestMode::Split | HarvestMode::External => {
             harvest_config.database.url.as_deref().ok_or_else(|| {
                 AutumnError::service_unavailable_msg(
@@ -2445,9 +2510,9 @@ fn ensure_runtime_migrations_blocking(
     )?;
 
     // Plugin-owned tables that live in the harvest database (issue #944's
-    // connector dead-letter table). Applied to the same URL as the core
-    // migrations above so `Split`/`External` deployments get them where the
-    // code that writes them actually connects.
+    // connector dead-letter table). Applied to the same dedicated URL as the
+    // core migrations above so `Split`/`External` deployments get them where
+    // the code that writes them actually connects.
     apply_migrations_for_profile(
         profile,
         harvest_database_url,
@@ -3229,9 +3294,9 @@ mod tests {
         assert_eq!(harvest_pool.status().max_size, 10);
     }
 
-    /// Fixture for the two tests below: an embedded-mode `AutumnConfig`/
-    /// `HarvestRuntimeConfig` pair whose database URL requires TLS
-    /// (`sslmode=require`), pointed at a port nothing is listening on.
+    /// Fixture for the two tests below: a `Split`-mode `AutumnConfig`/
+    /// `HarvestRuntimeConfig` pair whose **Harvest** database URL requires
+    /// TLS (`sslmode=require`), pointed at a port nothing is listening on.
     /// `127.0.0.1:1` refuses the connection almost instantly on every
     /// platform, so these tests are hermetic and fast -- no real
     /// TLS-enabled Postgres server is needed. Reaching
@@ -3239,31 +3304,104 @@ mod tests {
     /// triggers the "`block_on` from within a runtime" hazard, before any
     /// network I/O happens -- so whether the target is actually reachable
     /// is irrelevant to what these tests exercise.
+    ///
+    /// `Split` (rather than `Embedded`) is load bearing: since Autumn took
+    /// ownership of the application database's migrations via
+    /// `plugin_migrations`, a dedicated Harvest database is the *only* thing
+    /// the plugin still migrates itself, so it is the only mode that reaches
+    /// the connection path this regression is about. Under `Embedded`,
+    /// `ensure_runtime_migrations_blocking` returns before connecting and both
+    /// tests below would pass vacuously.
     fn tls_url_fixture() -> (AutumnConfig, HarvestRuntimeConfig) {
         let app_config = AutumnConfig {
             database: DatabaseConfig {
-                url: Some("postgres://user:pass@127.0.0.1:1/harvest?sslmode=require".to_owned()),
+                url: Some("postgres://user:pass@127.0.0.1:1/app".to_owned()),
                 ..DatabaseConfig::default()
             },
             ..AutumnConfig::default()
         };
-        (app_config, HarvestRuntimeConfig::default())
+        let harvest_config = HarvestRuntimeConfig {
+            mode: HarvestMode::Split,
+            database: crate::config::HarvestDatabaseConfig {
+                url: Some("postgres://user:pass@127.0.0.1:1/harvest?sslmode=require".to_owned()),
+            },
+            ..HarvestRuntimeConfig::default()
+        };
+        (app_config, harvest_config)
     }
 
-    /// Pins that the fixture above genuinely exercises the TLS/rustls
-    /// migration-connection path: called unwrapped from an async task (the
-    /// shape a `#[tokio::test]` gives, matching the real `on_startup` hook
-    /// that calls `ensure_runtime_migrations`), the rustls branch reuses
-    /// this task's own runtime handle and calls `Handle::block_on` on it --
-    /// which Tokio forbids from a thread already driving that runtime's
-    /// async tasks, and panics. This is what proves the `spawn_blocking`
-    /// wrapper in `ensure_runtime_migrations` (tested below) is load
-    /// bearing, not incidental.
+    /// Pins the ownership split itself: under `Embedded` the plugin migrates
+    /// nothing (Autumn applied the registered sets during `setup_database`,
+    /// before this startup hook ran), so the body returns `Ok` **without**
+    /// dialling the database -- proven here by a URL that would otherwise
+    /// fail to connect. This is what makes `tls_url_fixture`'s use of
+    /// `Split` necessary rather than incidental.
+    #[test]
+    fn embedded_mode_migrates_nothing_and_never_connects() {
+        let app_config = AutumnConfig {
+            database: DatabaseConfig {
+                url: Some("postgres://user:pass@127.0.0.1:1/app".to_owned()),
+                ..DatabaseConfig::default()
+            },
+            ..AutumnConfig::default()
+        };
+        let harvest_config = HarvestRuntimeConfig {
+            mode: HarvestMode::Embedded,
+            ..HarvestRuntimeConfig::default()
+        };
+
+        let result = ensure_runtime_migrations_blocking("dev", &app_config, &harvest_config);
+
+        assert!(
+            result.is_ok(),
+            "embedded mode must short-circuit before connecting: {result:?}"
+        );
+    }
+
+    /// The one invariant Autumn cannot check for us: `Embedded` means "Harvest
+    /// lives in the application database", so with no `database.url` there is
+    /// no Harvest storage at all. Failing here beats a missing-table error
+    /// deep in the first workflow start.
+    #[test]
+    fn embedded_mode_without_a_database_url_is_rejected() {
+        let harvest_config = HarvestRuntimeConfig {
+            mode: HarvestMode::Embedded,
+            ..HarvestRuntimeConfig::default()
+        };
+
+        let result =
+            ensure_runtime_migrations_blocking("dev", &AutumnConfig::default(), &harvest_config);
+
+        assert!(
+            result.is_err(),
+            "embedded mode with no database.url must be rejected: {result:?}"
+        );
+    }
+
+    /// Pins the autumn-web 0.7 upstream fix that the wrapper's original
+    /// rationale depended on (issue #1232): the synchronous migration body is
+    /// now safe to call *directly* from an async task -- the shape a
+    /// `#[tokio::test]` gives, matching the real `on_startup` hook -- even
+    /// against a TLS-requiring URL. Under 0.6 the rustls branch reused this
+    /// task's own runtime handle and panicked with "Cannot start a runtime
+    /// from within a runtime"; 0.7 runs connect and body on a freshly spawned
+    /// thread that has never entered a runtime.
+    ///
+    /// `ensure_runtime_migrations` still wraps this in `spawn_blocking`, now
+    /// purely so the blocking `join()` never stalls an async worker thread.
+    /// If a future autumn-web reintroduces the ambient-runtime dependency,
+    /// this test fails loudly here instead of at a customer's startup.
     #[tokio::test]
-    #[should_panic(expected = "Cannot start a runtime from within a runtime")]
-    async fn ensure_runtime_migrations_blocking_panics_if_called_directly_from_an_async_task() {
+    async fn migration_body_is_safe_to_call_directly_from_an_async_context() {
         let (app_config, harvest_config) = tls_url_fixture();
-        let _ = ensure_runtime_migrations_blocking("dev", &app_config, &harvest_config);
+
+        let result = ensure_runtime_migrations_blocking("dev", &app_config, &harvest_config);
+
+        assert!(
+            result.is_err(),
+            "127.0.0.1:1 refuses the connection, so this must return an ordinary \
+             error rather than panicking the calling task: {result:?}"
+        );
     }
 
     /// Regression test for `ensure_runtime_migrations` failing on a

@@ -115,6 +115,35 @@ Declared dependencies are also surfaced per workflow type on
 `GET /api/harvest/workflows/registered`, so a service can publish its dependency
 graph without anyone reading Rust source.
 
+## Migrations
+
+`HarvestPlugin` **registers** its migration sets with Autumn rather than
+applying them itself, so they follow the same rules as your app's own and every
+other plugin's. Autumn applies them during database setup, which runs before any
+startup hook — the Harvest runtime therefore always boots against an
+already-migrated schema.
+
+- **`dev` profile** — pending migrations are applied automatically at startup.
+- **Every other profile** — pending migrations are *reported as warnings and not
+  applied*. Run a one-shot `autumn migrate` in your deploy pipeline **before**
+  rolling web replicas.
+
+Registering rather than applying is also what lets Autumn resolve version
+collisions between plugins: Diesel's `__diesel_schema_migrations` is keyed by
+version alone, so two independently authored migrations that reuse a version
+would otherwise silently skip one of them. Autumn sees every registered set at
+once, tracks the loser under a substitute version so both still apply, and logs
+it at `INFO`.
+
+Two cases still apply their own migrations, because Autumn has no handle on the
+target database:
+
+- **`harvest.mode = "split"` / `"external"`** — the plugin applies the Harvest
+  sets against `harvest.database.url`. Same sets, same databases as before; only
+  the component doing the applying differs.
+- **Multi-shard deployments** — each Harvest shard database needs the full set
+  applied. See [`sharding.md`](../sharding.md).
+
 ## Dashboard
 
 `http://localhost:3000/api/harvest/ui` shows live executions, event histories,

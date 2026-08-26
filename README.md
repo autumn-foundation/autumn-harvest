@@ -929,8 +929,9 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 
 ## Status
 
-Version 0.5.0 wraps the Phase 4 surface plus additive management API contract
-coverage: DAG scheduling, `#[dag]`, trigger rules, signal delivery,
+Version 0.6.0 builds on the Phase 4 surface (see
+[`CHANGELOG.md`](CHANGELOG.md) for this release's full entry list). The core
+surface is broad: DAG scheduling, `#[dag]`, trigger rules, signal delivery,
 `ctx.wait_for_signal`, query registration/dispatch, the management API,
 workflow result waiting, dead-letter list/replay/aggregation endpoints,
 pause/resume controls, DAG retry from failed nodes, timezone-aware cron
