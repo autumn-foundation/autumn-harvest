@@ -1,5 +1,5 @@
 {
-  "version": "0.5.0",
+  "version": "0.6.0",
   "contract_version": "1",
   "description": "Versioned machine-readable baseline of every registered workflow type's published input/output/error JSON Schema (issue #373), used by `harvest schema check` to gate backward-incompatible payload changes before they DLQ in-flight executions (issue #794). Stored schemas are canonicalised: only the pure annotations (title/description/$comment/$schema/$id/examples/deprecated/readOnly/writeOnly) are stripped, so a doc-comment edit never dirties this file. Every other keyword is compared — see `compatibility.analysed_keywords` for the set the differ classifies, and `compatibility.unanalysed_keyword_policy` for what happens to the rest. Regenerate with `harvest schema update`; a breaking change must be acknowledged with a recorded justification. See docs/workflow-schema-contract-guide.md.",
   "compatibility": {
