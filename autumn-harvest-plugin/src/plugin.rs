@@ -75,27 +75,31 @@ const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrati
 /// writes to in their own business transaction always lives in the application
 /// database, in every mode.
 ///
-/// If the Harvest config cannot be loaded here, the harvest sets are left
-/// unregistered rather than guessed at — applying them to the app database on a
-/// mode we could not read would create Harvest tables in the wrong place.
-/// `start_harvest_runtime` reloads the same config and surfaces the identical
-/// error, so the app fails to boot rather than running unmigrated.
+/// If the Harvest config cannot be loaded here, registration fails immediately
+/// rather than guessing: applying the sets to the app database for an unknown
+/// mode could create Harvest tables in the wrong place, while registering only
+/// the outbox would let migration-only commands report false success.
 fn register_plugin_migrations(app: AppBuilder) -> AppBuilder {
     let app = app.plugin_migrations("autumn-harvest-plugin (outbox)", OUTBOX_MIGRATIONS);
 
-    match HarvestRuntimeConfig::load().map(|config| config.mode) {
-        Ok(HarvestMode::Embedded) => app
+    match migration_registration_mode(HarvestRuntimeConfig::load()) {
+        HarvestMode::Embedded => app
             .plugin_migrations("autumn-harvest", HARVEST_MIGRATIONS)
             .plugin_migrations("autumn-harvest-plugin", PLUGIN_HARVEST_MIGRATIONS),
-        Ok(HarvestMode::Split | HarvestMode::External) => app,
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                "harvest config unreadable while registering migrations; deferring to startup"
-            );
-            app
-        }
+        HarvestMode::Split | HarvestMode::External => app,
     }
+}
+
+/// Resolve the topology before migration registration. This must be fail-fast:
+/// `autumn migrate` builds plugins but does not execute their startup hooks, so
+/// deferring a configuration error would let that command report success after
+/// registering only the application outbox migrations.
+fn migration_registration_mode(
+    config: Result<HarvestRuntimeConfig, autumn_web::config::ConfigError>,
+) -> HarvestMode {
+    config
+        .unwrap_or_else(|error| panic!("cannot register Harvest migrations: {error}"))
+        .mode
 }
 
 struct OutboxRuntime {
@@ -3328,6 +3332,17 @@ mod tests {
             ..HarvestRuntimeConfig::default()
         };
         (app_config, harvest_config)
+    }
+
+    /// Migration-only commands build plugins without running startup hooks, so
+    /// invalid Harvest configuration must fail during registration rather than
+    /// silently producing an incomplete migration plan.
+    #[test]
+    #[should_panic(expected = "cannot register Harvest migrations: configuration error: bad mode")]
+    fn migration_registration_rejects_unreadable_harvest_config() {
+        migration_registration_mode(Err(autumn_web::config::ConfigError::Validation(
+            "bad mode".to_owned(),
+        )));
     }
 
     /// Pins the ownership split itself: under `Embedded` the plugin migrates
