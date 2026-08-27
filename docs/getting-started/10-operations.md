@@ -117,11 +117,11 @@ graph without anyone reading Rust source.
 
 ## Migrations
 
-`HarvestPlugin` **registers** its migration sets with Autumn rather than
-applying them itself, so they follow the same rules as your app's own and every
-other plugin's. Autumn applies them during database setup, which runs before any
-startup hook — the Harvest runtime therefore always boots against an
-already-migrated schema.
+In the default `embedded` mode, `HarvestPlugin` **registers** its migration sets
+with Autumn rather than applying them itself, so they follow the same rules as
+your app's own and every other plugin's. Autumn applies them during database
+setup, which runs before any startup hook — the Harvest runtime therefore boots
+against an already-migrated schema.
 
 - **`dev` profile** — pending migrations are applied automatically at startup.
 - **Every other profile** — pending migrations are *reported as warnings and not
@@ -135,12 +135,32 @@ would otherwise silently skip one of them. Autumn sees every registered set at
 once, tracks the loser under a substitute version so both still apply, and logs
 it at `INFO`.
 
-Two cases still apply their own migrations, because Autumn has no handle on the
-target database:
+Two cases need a separate migration procedure because Autumn has no handle on
+the target database:
 
-- **`harvest.mode = "split"` / `"external"`** — the plugin applies the Harvest
-  sets against `harvest.database.url`. Same sets, same databases as before; only
-  the component doing the applying differs.
+- **`harvest.mode = "split"` / `"external"`** — `autumn migrate` applies only
+  the application-database set (the workflow-start outbox). In non-`dev`
+  profiles, the plugin only checks the dedicated Harvest database and warns
+  about pending migrations; it does **not** apply them. Before rolling replicas,
+  run `autumn migrate`, then apply both Harvest sets to the URL configured as
+  `harvest.database.url`:
+
+  ```bash
+  autumn migrate
+
+  diesel migration run \
+    --database-url "$HARVEST_DATABASE_URL" \
+    --migration-dir autumn-harvest/migrations
+  diesel migration run \
+    --database-url "$HARVEST_DATABASE_URL" \
+    --migration-dir autumn-harvest-plugin/migrations/harvest
+  ```
+
+  Set `HARVEST_DATABASE_URL` to the same value as `harvest.database.url`, and
+  run these commands from the workspace root (or adjust the migration paths to
+  the installed source tree). Do not roll replicas if any command fails. See
+  the [0.6.0 upgrade guide](../upgrading/0.6.0.md#split--external-mode-still-applies-its-own-harvest-migrations)
+  for the ownership table and complete procedure.
 - **Multi-shard deployments** — each Harvest shard database needs the full set
   applied. See [`sharding.md`](../sharding.md).
 
