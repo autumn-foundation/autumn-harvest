@@ -160,14 +160,14 @@ fn generated_cargo_toml_uses_cratesio_version_deps_and_no_path() {
     let cargo = file_content(&files, "Cargo.toml");
     assert!(cargo.contains("name = \"my-app\""), "cargo: {cargo}");
     assert!(
-        cargo.contains("autumn-harvest = { version = \"0.4\""),
+        cargo.contains("autumn-harvest = { version = \"0.6\""),
         "cargo: {cargo}"
     );
     assert!(
-        cargo.contains("autumn-harvest-plugin = \"0.4\""),
+        cargo.contains("autumn-harvest-plugin = \"0.6\""),
         "cargo: {cargo}"
     );
-    assert!(cargo.contains("autumn-web = \"0.5\""), "cargo: {cargo}");
+    assert!(cargo.contains("autumn-web = \"0.7\""), "cargo: {cargo}");
     assert!(cargo.contains("features = [\"db\"]"), "cargo: {cargo}");
     assert!(
         !cargo.contains("path ="),
