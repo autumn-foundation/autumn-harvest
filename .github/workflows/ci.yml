@@ -517,12 +517,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Scaffold a project with `harvest new`
         run: cargo run -p autumn-harvest-cli --bin harvest -- new demo_app --path "${RUNNER_TEMP}/scaffold"
-      - name: Build the scaffolded project against published crates.io deps
-        # NO `[patch.crates-io]`: the scaffold pins `autumn-harvest = "0.4"`,
-        # `autumn-harvest-plugin = "0.4"`, `autumn-web = "0.5"`, all resolved
-        # from crates.io — exactly what a real user gets from `harvest new` +
-        # `cargo build`. This is the honest AC-2 guard (published API, not trunk).
-        run: cargo build --manifest-path "${RUNNER_TEMP}/scaffold/Cargo.toml"
+      - name: Build the scaffolded project against the release candidates
+        # Harvest 0.6 is not available on crates.io until this release lands.
+        # Patch only the two workspace crates under test; autumn-web 0.7 still
+        # resolves from crates.io, just as it will for users of `harvest new`.
+        run: |
+          cargo build --manifest-path "${RUNNER_TEMP}/scaffold/Cargo.toml" \
+            --config 'patch.crates-io.autumn-harvest.path="autumn-harvest"' \
+            --config 'patch.crates-io.autumn-harvest-plugin.path="autumn-harvest-plugin"'
       - name: Run the scaffold and assert a workflow reaches COMPLETED
         # Boots the generated app, triggers its workflow, and polls the execution
         # to a terminal state — the literal AC-8 assertion ("generate, build, and

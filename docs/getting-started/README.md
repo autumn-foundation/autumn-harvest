@@ -43,9 +43,10 @@ Start with [Chapter 1 →](01-project-skeleton.md)
 
 ## Where to go next
 
-- **Upgrading.** [`upgrading/0.5.0.md`](../upgrading/0.5.0.md) is the
-  0.4.0 → 0.5.0 upgrade guide — dependency bumps, additive migrations, and the
-  small set of source-breaking / behavior changes to verify against your code.
+- **Upgrading.** [`upgrading/0.6.0.md`](../upgrading/0.6.0.md) is the current
+  0.5.0 → 0.6.0 upgrade guide — the `autumn-web` 0.7 bump and the move to
+  Autumn-owned plugin migrations. [`upgrading/0.5.0.md`](../upgrading/0.5.0.md)
+  covers the previous 0.4.0 → 0.5.0 hop.
 - **Reference example.** [`examples/billing-autumn-web/`](../../examples/billing-autumn-web/)
   is a full subscription-checkout integration: outbox → workflow start, saga
   compensation, child workflow, version gate, signal handoff, and a scheduled

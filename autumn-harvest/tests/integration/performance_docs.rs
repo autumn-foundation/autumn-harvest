@@ -36,8 +36,42 @@ fn performance_doc_path() -> PathBuf {
     repo_root().join("docs/performance.md")
 }
 
-fn changelog_fragment_path() -> PathBuf {
-    repo_root().join("docs/changelog.d/pr-786-claim-throughput-benchmark.md")
+/// Marker opening the collated home of the released performance narrative.
+///
+/// Until the 0.6.0 collation sweep this prose lived in
+/// `docs/changelog.d/pr-786-claim-throughput-benchmark.md`. Collation folds
+/// every fragment into `CHANGELOG.md` (condensed to one bullet) and
+/// `CLAUDE.md`'s phase list (verbatim) and then deletes it, so the fragment
+/// path stopped existing and every guard below panicked on the read. The
+/// verbatim copy is the one these guards need — a condensed bullet no longer
+/// carries the per-gate figures they cross-check — so they now read the phase
+/// entry out of `CLAUDE.md` instead.
+const RELEASED_PERF_ENTRY_MARKER: &str =
+    "- **Tooling** — Task-claim / enqueue throughput benchmark";
+
+fn claude_md_path() -> PathBuf {
+    repo_root().join("CLAUDE.md")
+}
+
+/// The released performance narrative, extracted from `CLAUDE.md`'s phase list.
+///
+/// Scoped to the single entry rather than handing the guards the whole file:
+/// several of them ban a superseded phrasing, and an unscoped read would let an
+/// unrelated entry elsewhere in a 10 000-line file trip — or mask — a check.
+fn released_perf_entry() -> String {
+    let text = read_normalized(&claude_md_path());
+    let start = text.find(RELEASED_PERF_ENTRY_MARKER).unwrap_or_else(|| {
+        panic!(
+            "CLAUDE.md must contain the claim-benchmark phase entry \
+             (marker: {RELEASED_PERF_ENTRY_MARKER:?}); the performance guards \
+             cross-check the published tables against it"
+        )
+    });
+    let rest = &text[start + RELEASED_PERF_ENTRY_MARKER.len()..];
+    let end = rest.find("\n- **").map_or(text.len(), |off| {
+        start + RELEASED_PERF_ENTRY_MARKER.len() + off
+    });
+    text[start..end].to_string()
 }
 
 /// Read a file with line endings normalised to `\n`.
@@ -643,7 +677,7 @@ fn changelog_fragment_quotes_the_published_figures() {
         .get("double_backlog")
         .expect("the control row must exist");
 
-    let fragment = read_normalized(&changelog_fragment_path());
+    let fragment = released_perf_entry();
 
     // The control's multiplier is the one the retracted attribution was built
     // on, so it is the one most likely to be left stale. Read the current value
@@ -1074,7 +1108,7 @@ fn overview_docs_do_not_claim_complete_predicate_coverage() {
 /// only disagrees with the code.
 #[test]
 fn the_released_entry_does_not_promise_pid_liveness_protection() {
-    let fragment = read_normalized(&changelog_fragment_path());
+    let fragment = released_perf_entry();
     let leading = fragment
         .lines()
         .next()
@@ -1131,7 +1165,7 @@ fn the_released_entry_does_not_promise_pid_liveness_protection() {
 /// drawn from it was withdrawn — a class the figure check cannot see.
 #[test]
 fn the_changelog_leading_entry_does_not_publish_the_retracted_bound() {
-    let fragment = read_normalized(&changelog_fragment_path());
+    let fragment = released_perf_entry();
     let leading = fragment
         .lines()
         .next()
@@ -1200,15 +1234,25 @@ fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
         "conservative",
     ];
 
-    for (label, path) in [
-        ("docs/performance.md", performance_doc_path()),
-        ("the changelog fragment", changelog_fragment_path()),
+    // Pairs of (label, already-extracted text) rather than (label, path): the
+    // released entry is one item inside a 10 000-line `CLAUDE.md`, so handing
+    // this loop that whole file would let an unrelated entry's "28%" trip — or
+    // mask — the scan below.
+    for (label, source) in [
+        (
+            "docs/performance.md",
+            read_normalized(&performance_doc_path()),
+        ),
+        (
+            "the released performance entry in CLAUDE.md",
+            released_perf_entry(),
+        ),
     ] {
         // A character window, not a line window: `docs/performance.md` is hard
-        // wrapped at ~78 columns while the changelog fragment's released entry
-        // is a single 40 000-character line, so any line-based span is either
-        // too small for one document or the whole of the other.
-        let text = collapse_ws(&read_normalized(&path));
+        // wrapped at ~78 columns while the released entry is a single
+        // 40 000-character line, so any line-based span is either too small for
+        // one document or the whole of the other.
+        let text = collapse_ws(&source);
         for (idx, _) in text.match_indices("28%") {
             let lo = idx.saturating_sub(WINDOW);
             let hi = (idx + WINDOW).min(text.len());
@@ -1264,7 +1308,7 @@ fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
 fn changelog_leading_entry_per_gate_figures_match_the_published_table() {
     let doc = read_performance_doc();
     let rows = parse_gate_table(&doc);
-    let fragment = read_normalized(&changelog_fragment_path());
+    let fragment = released_perf_entry();
     let leading = fragment
         .lines()
         .next()
@@ -1337,7 +1381,7 @@ fn changelog_leading_entry_per_gate_figures_match_the_published_table() {
 #[test]
 fn changelog_headline_millisecond_figures_still_appear_on_the_page() {
     let doc = read_performance_doc();
-    let fragment = read_normalized(&changelog_fragment_path());
+    let fragment = released_perf_entry();
     let leading = fragment
         .lines()
         .next()

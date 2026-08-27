@@ -269,7 +269,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "autumn-harvest"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "autumn-harvest-macros",
  "base64 0.22.1",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "autumn-harvest",
  "chrono",
@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-macros"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-plugin"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "autumn-harvest",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-redis"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "autumn-harvest",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-sqlite"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "autumn-harvest",
  "chrono",
@@ -411,9 +411,9 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7c3cc82d45db1edbede071cd1e83c80076dd65f1283813337bd6dff145cae54"
+checksum = "7d31acef53e1a927937ea56b2820f2db113d90c7cebcb2061a5850af3d946f88"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -422,14 +422,14 @@ dependencies = [
 
 [[package]]
 name = "autumn-web"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4fcabead11e2f9ceee9a44420a68a6692c7b228abd26a9ee3f73aa68ef8bd2f"
+checksum = "be9699fb1820106108ac4a023754f797bc2095e6689313dcb2b689d76f090cdc"
 dependencies = [
  "aes-gcm",
  "autumn-macros",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bcrypt",
  "brotli",
  "bytes",
@@ -490,6 +490,7 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "url",
  "uuid",
  "validator",
@@ -927,6 +928,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64-simd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -957,7 +964,7 @@ dependencies = [
 
 [[package]]
 name = "billing-autumn-web"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",
@@ -2130,9 +2137,9 @@ dependencies = [
 
 [[package]]
 name = "diesel"
-version = "2.3.10"
+version = "2.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29fe29a87fb84c631ffb3ba21798c4b1f3a964701ba78f0dce4bf8668562ec88"
+checksum = "715377c6e464cb44bb89bd8487584240516c8d5052bc645d6babc50bb8be46c3"
 dependencies = [
  "bitflags 2.11.1",
  "byteorder",
@@ -2871,11 +2878,11 @@ dependencies = [
 
 [[package]]
 name = "hashlink"
-version = "0.11.1"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "824e001ac4f3012dd16a264bec811403a67ca9deb6c102fc5049b32c4574b35f"
+checksum = "32069d97bb81e38fa67eab65e3393bf804bb85969f2bc06bf13f64aef5aba248"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
 ]
 
 [[package]]
@@ -3554,9 +3561,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.37.0"
+version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
+checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
 dependencies = [
  "cc",
  "pkg-config",
@@ -4724,7 +4731,7 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quickstart"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",
@@ -5302,9 +5309,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.39.0"
+version = "0.40.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0d2b0146dd9661bf67bb107c0bb2a55064d556eeb3fc314151b957f313bcd4e"
+checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
 dependencies = [
  "bitflags 2.11.1",
  "fallible-iterator 0.3.0",
@@ -5477,7 +5484,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "saga-choreography"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "autumn-harvest",
  "chrono",
@@ -5972,7 +5979,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "standalone-runner"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",

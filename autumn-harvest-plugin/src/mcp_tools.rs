@@ -825,6 +825,47 @@ pub fn build_mcp_tool_routes(
     routes
 }
 
+/// Build the `OpenAPI` descriptor for one generated MCP tool route.
+///
+/// Split out of [`build_tool_route`] purely to keep that function under the
+/// `clippy::too_many_lines` threshold; it has no other caller.
+fn build_tool_api_doc(
+    spec: &ToolRouteSpec,
+    path: &'static str,
+    operation_id: &'static str,
+) -> autumn_web::openapi::ApiDoc {
+    autumn_web::openapi::ApiDoc {
+        method: spec.method,
+        path,
+        operation_id,
+        summary: Some(leak(spec.summary.clone())),
+        description: Some(leak(spec.description.clone())),
+        path_params: Box::leak(spec.path_params.clone().into_boxed_slice()),
+        request_body: spec
+            .body_component
+            .clone()
+            .map(|name| autumn_web::openapi::SchemaEntry {
+                name: leak(name),
+                kind: autumn_web::openapi::SchemaKind::Ref,
+                // Legacy short-name ref (no globally-unique identity); autumn-web 0.6.
+                identity: None,
+            }),
+        response: spec
+            .response_component
+            .map(|name| autumn_web::openapi::SchemaEntry {
+                name,
+                kind: autumn_web::openapi::SchemaKind::Ref,
+                // Legacy short-name ref (no globally-unique identity); autumn-web 0.6.
+                identity: None,
+            }),
+        success_status: 200,
+        register_schemas: Some(register_harvest_mcp_schemas),
+        mcp_tool: true,
+        mcp_stream: spec.stream,
+        ..Default::default()
+    }
+}
+
 fn build_tool_route(
     spec: &ToolRouteSpec,
     api_state: crate::api::HarvestApiState,
@@ -914,36 +955,7 @@ fn build_tool_route(
         None => handler,
     };
 
-    let api_doc = autumn_web::openapi::ApiDoc {
-        method: spec.method,
-        path,
-        operation_id,
-        summary: Some(leak(spec.summary.clone())),
-        description: Some(leak(spec.description.clone())),
-        path_params: Box::leak(spec.path_params.clone().into_boxed_slice()),
-        request_body: spec
-            .body_component
-            .clone()
-            .map(|name| autumn_web::openapi::SchemaEntry {
-                name: leak(name),
-                kind: autumn_web::openapi::SchemaKind::Ref,
-                // Legacy short-name ref (no globally-unique identity); autumn-web 0.6.
-                identity: None,
-            }),
-        response: spec
-            .response_component
-            .map(|name| autumn_web::openapi::SchemaEntry {
-                name,
-                kind: autumn_web::openapi::SchemaKind::Ref,
-                // Legacy short-name ref (no globally-unique identity); autumn-web 0.6.
-                identity: None,
-            }),
-        success_status: 200,
-        register_schemas: Some(register_harvest_mcp_schemas),
-        mcp_tool: true,
-        mcp_stream: spec.stream,
-        ..Default::default()
-    };
+    let api_doc = build_tool_api_doc(spec, path, operation_id);
 
     autumn_web::Route {
         method: method_for(spec.method),
@@ -957,6 +969,9 @@ fn build_tool_route(
         idempotency: autumn_web::RouteIdempotency::Direct,
         // Inherit the global request-timeout deadline (autumn-web 0.6).
         timeout: autumn_web::RouteTimeout::Inherit,
+        // Generated API routes carry no SEO meta (autumn-web 0.7): EMPTY is
+        // what a route attribute without `seo(...)` produces.
+        seo: autumn_web::SeoRouteDefaults::EMPTY,
     }
 }
 
